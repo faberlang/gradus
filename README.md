@@ -29,6 +29,22 @@ broadcast is limited). A linear+MSE training loop matches finite differences,
 and an MLP exemplum landed. Gradus's job is to wrap that capability into a
 clean, self-contained user library.
 
+### Seam status (rebaselined 2026-08-03)
+
+The gradient seam (`exempla/gradient-seam`) **compiles and executes end to end
+through `faber run -t fmir` with the current release faber toolchain**
+(v1.4.0, includes faber `180bcef`): forward loss via `gradient.simple_loss`,
+companion backward `gradient.loss_backward` across the `importa` boundary
+(SEM004), and the per-element FD comparison all run; the companion gradient
+matches finite differences to ~1e-11. The two U1 compiler blockers this seam
+depends on — SEM004 and LIB-MIR — are resolved on that toolchain. The seam
+fixture header's "faber run -t fmir fails (LIB-MIR gate)" claim is stale.
+
+Caveat: `./scripta/check-compile` resolves `faber` from PATH and currently
+fails on the seam consumer (SEM004) when the on-PATH binary is the stale
+2026-08-01 debug build — refresh the toolchain before trusting that gate.
+Full evidence: `radix/docs/factory/gpu-training-lowering/gradus-seam-rebaseline.md`.
+
 ## Design principles
 
 - **JAX-shaped, not PyTorch-shaped.** Models are pure functions:
