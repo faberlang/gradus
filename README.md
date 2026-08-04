@@ -16,9 +16,10 @@ generated code — not a runtime tape replay.
 | --- | --- |
 | Foundation (math, tensor) | Scaffold — day-one target |
 | Gradient wrapper | Scaffold — wraps `@ radix backward` |
-| Optimizers | Planned — SGD first, then Adam |
-| Loss functions | Planned — MSE first, then cross-entropy |
-| NN primitives | Planned — Linear, activation, norm, embedding |
+| Optimizers | **Shipped (S4-A)** — static-shape SGD: `sgd_step_2x2`, `sgd_step_4x4` |
+| Loss functions | **Shipped (S4-A)** — static-shape MSE: `mse_2x2`, `mse_4x4` |
+| NN primitives | **Shipped (S4-A)** — static-shape linear + GELU: `linear_2x2`, `linear_4x4`, `gelu_4x4` |
+| Training steps | **Shipped (S4-A)** — static-shape update: `train_step_2x2`, `train_step_4x4` |
 | Attention / transformer | Planned — nanoGPT forcing function |
 | GPU training | Blocked on mir-swarm device gradient rung |
 
@@ -90,12 +91,35 @@ Full evidence: `radix/docs/factory/gpu-training-lowering/gradus-seam-rebaseline.
 | Reverse-mode AD (all differentiable AIR tensor ops) | **Shipped** (Radix mir-autograd campaign) | Radix |
 | `gradus:tensor` genus | **Horizon 1** (architecture checkpoint complete) | Gradus |
 | `gradus:gradient` wrapper | **Horizon 1** (architecture checkpoint complete) | Gradus |
-| Linear regression + FD gradient proof | **Horizon 2** | Gradus |
-| SGD, MSE loss | **Horizon 2** | Gradus |
-| MLP with GELU, cross-entropy | **Horizon 3–4** | Gradus |
+| Linear regression + FD gradient proof | **Shipped (S4-A)** — first CPU seam proof | Gradus |
+| SGD, MSE loss | **Shipped (S4-A)** — static-shape overloads | Gradus |
+| MLP with GELU, cross-entropy | **Planned (S4-B)** — MLP migration on the same API | Gradus |
 | Attention, transformer | **Horizon 5–6** | Gradus |
 | nanoGPT on Shakespeare (CPU) | **Planned** (Horizon 7 forcing-function demo) | Gradus |
 | nanoGPT on GPU (10–100× faster) | **Planned** (Horizon 8 — depends on Radix/hosts) | Radix + hosts |
+
+## Static-shape surface (S4-A)
+
+The first concrete Gradus surface is bounded to the first two callers
+(`gpu-training-lowering` stage-4-delivery.md P1). Raw `tensor<f32, [shape]>`
+values, explicit parameters, explicit gradients, scalar learning rates, and
+explicit update tuples — no universal parameter registry, model class, or
+device/backend handle:
+
+- `gradus:nn` — `linear_2x2`, `linear_4x4`, `gelu_4x4`
+- `gradus:loss` — `mse_2x2`, `mse_4x4`
+- `gradus:optimize` — `sgd_step_2x2`, `sgd_step_4x4`
+- `gradus:train` — `train_step_2x2`, `train_step_4x4` (explicit current
+  parameters + explicit trainable gradients + scalar lr → explicit tuple of
+  updated parameters)
+
+The linear-regression exemplum (`examples/training/linear-regression`) was
+migrated onto this surface as the seam proof; its package-owned model function
+retains its single explicit `@ radix backward` annotation. Known toolchain
+constraint: the FMIR stepper cannot yet resolve library-to-library calls, so
+`train_step_*` currently carries the update math inline (mirroring
+`optimize.sgd_step_*`) rather than calling it; revisit when that runtime gap
+closes.
 
 ## Import
 
