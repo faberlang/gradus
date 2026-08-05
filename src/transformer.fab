@@ -3,11 +3,150 @@
 # Public import: importa ex "gradus:transformer" privata transformer
 # Depends on: gradus:tensor, gradus:gradient, gradus:nn, gradus:attention
 #
-# Will split into nested leaves when ≥2 transformer components are implemented:
+# S6-G1 (gpu-training-lowering stage-6-delivery.md): first concrete
+# static-shape transformer block for the BERT-tiny fragment shapes
+# (B=2, D=8, H=1). The fragment's block:
+#   pre-LN → attention → output projection → residual →
+#   post-LN → FFN (linear → GELU → linear) → residual → pre-loss LN
+# Biases are per-channel [8] via the S6-C2 addita_bias contract (the
+# fragment's [2,8] workaround is removed — U8 owns the consumer migration).
+#
+# Will split into nested leaves when ≥2 transformer components are
+# implemented:
 #   gradus:transformer/block      block = attn + ffn + residual + norm
 #   gradus:transformer/position   positional encoding (learned, sinusoidal, RoPE)
 #   gradus:transformer/head       output projection (logits)
 #
 # Architectural rule: a transformer composes primitives and attention blocks.
 # It does not own its training loop. This module must not import from
-# gradus:train.
+# gradus:train. No module owns a backend or device handle.
+#
+# KNOWN TOOLCHAIN CONSTRAINT: every public function in this module is
+# self-contained (tensor ops only, no calls to other Gradus functions) — the
+# FMIR stepper cannot resolve calls FROM a library function TO another
+# library function ("FaberScript unsupported: provider sym#N"). For that
+# reason bert_tiny_block_2x8 inlines the attention + FFN sub-block math
+# instead of calling attention_block_2x8 / ffn_block_2x8 (the S4-A
+# train_step_4x4 precedent). The sub-blocks stay callable from package code
+# (package→library calls link fine).
+
+# -------------------------------------------------------------------------
+# attention_block_2x8 — pre-LN → Q/K/V → scores → softmax → context →
+#   output projection → residual. Returns r1 = x + attn_ob [2,8].
+# -------------------------------------------------------------------------
+
+functio attention_block_2x8(
+    tensor<f32, [2,8]> x,
+    tensor<f32, [8]> ln1_s,
+    tensor<f32, [8]> ln1_o,
+    tensor<f32, [8,8]> wq,   tensor<f32, [8]> bq,
+    tensor<f32, [8,8]> wk,   tensor<f32, [8]> bk,
+    tensor<f32, [8,8]> wv,   tensor<f32, [8]> bv,
+    tensor<f32, [8,8]> wo,   tensor<f32, [8]> bo,
+    tensor<f32, [2,2]> scale
+) → tensor<f32, [2,8]> {
+    fixum tensor<f32, [2,8]> ln1 ← x.laminatio(1, 1.0e-5, ln1_s, ln1_o)
+
+    fixum tensor<f32, [2,8]> q   ← ln1.matmul(wq)
+    fixum tensor<f32, [2,8]> qb  ← q.addita_bias(bq)
+    fixum tensor<f32, [2,8]> k   ← ln1.matmul(wk)
+    fixum tensor<f32, [2,8]> kb  ← k.addita_bias(bk)
+    fixum tensor<f32, [2,8]> v   ← ln1.matmul(wv)
+    fixum tensor<f32, [2,8]> vb  ← v.addita_bias(bv)
+
+    fixum tensor<f32, [8,2]> kt      ← kb.transpone()
+    fixum tensor<f32, [2,2]> scores  ← qb.matmul(kt)
+    fixum tensor<f32, [2,2]> scaled  ← scores.multiplica(scale)
+    fixum tensor<f32, [2,2]> attn    ← scaled.activatio_softmax()
+    fixum tensor<f32, [2,8]> context ← attn.matmul(vb)
+
+    fixum tensor<f32, [2,8]> ao   ← context.matmul(wo)
+    fixum tensor<f32, [2,8]> aob  ← ao.addita_bias(bo)
+    fixum tensor<f32, [2,8]> r1   ← x.addita(aob)
+    redde r1
+}
+
+# -------------------------------------------------------------------------
+# ffn_block_2x8 — post-LN → FFN (linear → GELU → linear) → residual.
+#   Returns r2 = ln2 + h2b [2,8].
+# -------------------------------------------------------------------------
+
+functio ffn_block_2x8(
+    tensor<f32, [2,8]> x,
+    tensor<f32, [8]> ln2_s,
+    tensor<f32, [8]> ln2_o,
+    tensor<f32, [8,8]> wf1,  tensor<f32, [8]> bf1,
+    tensor<f32, [8,8]> wf2,  tensor<f32, [8]> bf2
+) → tensor<f32, [2,8]> {
+    fixum tensor<f32, [2,8]> ln2 ← x.laminatio(1, 1.0e-5, ln2_s, ln2_o)
+
+    fixum tensor<f32, [2,8]> h1   ← ln2.matmul(wf1)
+    fixum tensor<f32, [2,8]> h1b  ← h1.addita_bias(bf1)
+    fixum tensor<f32, [2,8]> a1   ← h1b.gelu()
+    fixum tensor<f32, [2,8]> h2   ← a1.matmul(wf2)
+    fixum tensor<f32, [2,8]> h2b  ← h2.addita_bias(bf2)
+    fixum tensor<f32, [2,8]> r2   ← ln2.addita(h2b)
+    redde r2
+}
+
+# -------------------------------------------------------------------------
+# bert_tiny_block_2x8 — the fragment's full transformer block (B=2, D=8):
+#   pre-LN → attention → output proj → residual → post-LN → FFN → residual →
+#   pre-loss LN. Returns ln3 [2,8].
+#   18 trainable params + frozen dk_scale in; the pre-loss LN output out.
+#   Inlines the attention + FFN sub-block math (stepper lib→lib gap, above).
+# -------------------------------------------------------------------------
+
+functio bert_tiny_block_2x8(
+    tensor<f32, [2,8]> x,
+    tensor<f32, [8]> ln1_s,   tensor<f32, [8]> ln1_o,
+    tensor<f32, [8,8]> wq,    tensor<f32, [8]> bq,
+    tensor<f32, [8,8]> wk,    tensor<f32, [8]> bk,
+    tensor<f32, [8,8]> wv,    tensor<f32, [8]> bv,
+    tensor<f32, [8,8]> wo,    tensor<f32, [8]> bo,
+    tensor<f32, [8]> ln2_s,   tensor<f32, [8]> ln2_o,
+    tensor<f32, [8,8]> wf1,   tensor<f32, [8]> bf1,
+    tensor<f32, [8,8]> wf2,   tensor<f32, [8]> bf2,
+    tensor<f32, [8]> ln3_s,   tensor<f32, [8]> ln3_o,
+    tensor<f32, [2,2]> scale
+) → tensor<f32, [2,8]> {
+    # Pre-LN
+    fixum tensor<f32, [2,8]> ln1 ← x.laminatio(1, 1.0e-5, ln1_s, ln1_o)
+
+    # Q/K/V projections (per-channel [8] biases, S6-C2 addita_bias)
+    fixum tensor<f32, [2,8]> q   ← ln1.matmul(wq)
+    fixum tensor<f32, [2,8]> qb  ← q.addita_bias(bq)
+    fixum tensor<f32, [2,8]> k   ← ln1.matmul(wk)
+    fixum tensor<f32, [2,8]> kb  ← k.addita_bias(bk)
+    fixum tensor<f32, [2,8]> v   ← ln1.matmul(wv)
+    fixum tensor<f32, [2,8]> vb  ← v.addita_bias(bv)
+
+    # Scaled dot-product attention
+    fixum tensor<f32, [8,2]> kt      ← kb.transpone()
+    fixum tensor<f32, [2,2]> scores  ← qb.matmul(kt)
+    fixum tensor<f32, [2,2]> scaled  ← scores.multiplica(scale)
+    fixum tensor<f32, [2,2]> attn    ← scaled.activatio_softmax()
+    fixum tensor<f32, [2,8]> context ← attn.matmul(vb)
+
+    # Output projection + residual 1
+    fixum tensor<f32, [2,8]> ao   ← context.matmul(wo)
+    fixum tensor<f32, [2,8]> aob  ← ao.addita_bias(bo)
+    fixum tensor<f32, [2,8]> r1   ← x.addita(aob)
+
+    # Post-LN
+    fixum tensor<f32, [2,8]> ln2 ← r1.laminatio(1, 1.0e-5, ln2_s, ln2_o)
+
+    # FFN (linear → GELU → linear)
+    fixum tensor<f32, [2,8]> h1   ← ln2.matmul(wf1)
+    fixum tensor<f32, [2,8]> h1b  ← h1.addita_bias(bf1)
+    fixum tensor<f32, [2,8]> a1   ← h1b.gelu()
+    fixum tensor<f32, [2,8]> h2   ← a1.matmul(wf2)
+    fixum tensor<f32, [2,8]> h2b  ← h2.addita_bias(bf2)
+
+    # Residual 2
+    fixum tensor<f32, [2,8]> r2   ← ln2.addita(h2b)
+
+    # Pre-loss LN
+    fixum tensor<f32, [2,8]> ln3 ← r2.laminatio(1, 1.0e-5, ln3_s, ln3_o)
+    redde ln3
+}
