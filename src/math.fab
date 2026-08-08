@@ -1,16 +1,672 @@
-# Tensor-aware math foundation.
-#
-# Own copy — independent of Norma. Gradus is self-contained; a user of Gradus
-# never imports from Norma, and vice versa.
+# Pure operation families — PML1-U4 (elementwise, reduce, matmul, cast,
+# concat/slice) over the production tensor surface (gradus:tensor U1),
+# dtype contract (gradus:dtype U2), and shape rules (gradus:shape U3).
 #
 # Public import: importa ex "gradus:math" privata math
-# Depends on: nothing (foundation layer)
+# Depends on: gradus:tensor (Tensor), gradus:dtype (DType + casta), gradus:shape
+# (broadcastum / quantitas). DAG: math → tensor → dtype; math → shape.
 #
-# Will own: scalar math helpers, shape utilities, and numeric constants needed
-# across Gradus modules. Tensor-typed operations live in gradus:tensor; this
-# module holds the scalar foundation those operations build on.
+# --- Families -------------------------------------------------------------
+#
+#   * construction — structa(datos, forma): validated tensor construction
+#     mapped onto MathError (tensor.structa remains the raw constructor),
+#     so op pipelines carry one error vocabulary end to end.
+#   * elementwise — add/sub/mul/div (binary, broadcast per forma.broadcastum)
+#     and neg/abs (unary). Result dtype equals the operand dtype; a dtype
+#     mismatch fails closed (TypoMismatch) — promotion is an explicit casta
+#     step, never implicit (capsule rule). Division follows f32 semantics:
+#     division by zero yields ±Inf/NaN (representable in F32), it does not
+#     throw — non-finite handling is the dtype cast contract's concern.
+#   * reduce — summa / media over one axis. Axis must be in [0, rank); a
+#     zero-length reduction axis fails closed (no degenerate empty sums).
+#   * matmul — rank-2 x rank-2 matrix multiply ([M,K] x [K,N] → [M,N]).
+#     Higher-rank batched matmul is a later admission row (R3: support rows,
+#     not hard-coded generics); this row is documented here.
+#   * cast — casta(t, nomen): elementwise value cast via the dtype contract,
+#     entered by dtype NAME ("f32"/"f16"/"i32"/"u8", the serialized tag form
+#     of dtype-schema-1.0.0). Result keeps the shape and takes the target
+#     tag; failures are MathError.NonFinita (float→int of NaN/±Inf),
+#     MathError.Superfluitas (overflow / above F16 max), and
+#     MathError.NomenIgnotum (unknown name) — the dtype cast rules, mapped
+#     into the uniform family vocabulary.
+#   * concat/slice — concatenatio(partes, axis) joins tensors along one axis
+#     (equal rank/dtype/shape except the axis); segmentum(t, axis, initium,
+#     finis) slices along one axis with closed-open bounds [initium, finis).
+#
+# --- Contracts ------------------------------------------------------------
+#
+# Construction: every op returns a validated, consistent Tensor (valet holds,
+# result shape ceiling-checked via forma.quantitas before allocation).
+# Validation: inputs are validated fail-closed before any result is built
+# (shape broadcastability, axis ranges, inner dims, dtype parity, slice
+# bounds, ceilings). Error: one typed MathError vocabulary with distinct
+# variants per failure class and a textus causa (render via math.causa);
+# shape-rule failures (dims/ceilings) keep their FormaError identity mapped
+# into MathError. Serialization: the op surface is the tensor construction
+# contract — a result is a Tensor that round-trips through
+# tensor.figura/typus/valet/quantitas; value bytes are PML1-U7.
+#
+# --- Compiler-lane notes (probed 2026-08-08, faber 1.6.0-rc.1) ------------
+#
+#   * Cross-module enum variants cannot be referenced in library context
+#     (SEM001 unknown_variant, qualified or not) — so a shape.FormaError
+#     cannot be matched here. Shape-rule failures are therefore mapped onto
+#     MathError by their documented causa text (shape.proba asserts those
+#     strings), keeping variant identity. Residual for the compiler lane.
+#   * Proba-importability: file-interface snapshots skip exports whose
+#     signatures carry cross-module nominal discretio types (WARN014
+#     file_interface_export_skipped; e.g. tensor.structa_typo takes
+#     dtype.DType). The cast entry is therefore name-based (textus), and the
+#     dtype tag stays internal. Same finding already recorded for
+#     structa_typo in PML1-U2.
+#   * The tensor → math import edge (U1, unused) is dropped: this module
+#     now owns tensor-typed ops, so math → tensor is the live edge.
+#   * Receiver-method rule (gradus AGENTS.md) yields to the delivery-assigned
+#     home for this surface: the families are free functions on the staged
+#     Tensor carrier, not genus methods (the Tensor genus lives in tensor.fab,
+#     outside U4's write scope). Residual for the Mind.
 
-# Finite-difference epsilon for gradient validation.
-# Default 1e-5 — small enough for local linearity, large enough to avoid
-# float32 rounding error dominating the central-difference quotient.
-fixum f32 epsilon ← (0.00001 ∷ f32)
+importa ex "gradus:dtype" privata dtype
+importa ex "gradus:shape" privata forma
+importa ex "gradus:tensor" privata tensor
+
+# -------------------------------------------------------------------------
+# MathError — typed error vocabulary of the pure operation families. Every
+# variant carries a textus causa (mirror of tensor/dtype/shape).
+# -------------------------------------------------------------------------
+
+discretio MathError {
+    DimensioNegativa { textus causa }
+    DimensioSupraLimitem { textus causa }
+    ProductumSupraLimitem { textus causa }
+    FormaMismatch { textus causa }
+    GradusMismatch { textus causa }
+    Incompatibilis { textus causa }
+    TypoMismatch { textus causa }
+    ElementaMismatch { textus causa }
+    NonFinita { textus causa }
+    Superfluitas { textus causa }
+    NomenIgnotum { textus causa }
+}
+
+functio causa(MathError e) → textus {
+    discerne e {
+        casu DimensioNegativa fixum causa { redde causa }
+        casu DimensioSupraLimitem fixum causa { redde causa }
+        casu ProductumSupraLimitem fixum causa { redde causa }
+        casu FormaMismatch fixum causa { redde causa }
+        casu GradusMismatch fixum causa { redde causa }
+        casu Incompatibilis fixum causa { redde causa }
+        casu TypoMismatch fixum causa { redde causa }
+        casu ElementaMismatch fixum causa { redde causa }
+        casu NonFinita fixum causa { redde causa }
+        casu Superfluitas fixum causa { redde causa }
+        casu NomenIgnotum fixum causa { redde causa }
+    }
+}
+
+# -------------------------------------------------------------------------
+# Private helpers.
+# -------------------------------------------------------------------------
+
+# Broadcast two operand shapes with a typed error mapping (FormaError →
+# MathError, variant identity preserved via the documented causa text).
+@ privata
+functio _forma_broadcast(lista<numerus> a, lista<numerus> b) → lista<numerus> ⇥ MathError {
+    fac {
+        redde forma.broadcastum(a, b)
+    }
+    cape err {
+        fixum textus c ← forma.causa(err)
+        si c ≡ "negative dimension" {
+            iace finge DimensioNegativa { causa = c }
+        }
+        si c ≡ "dimension above ceiling" {
+            iace finge DimensioSupraLimitem { causa = c }
+        }
+        si c ≡ "element count above ceiling" {
+            iace finge ProductumSupraLimitem { causa = c }
+        }
+        iace finge FormaMismatch { causa = c }
+    }
+}
+
+# Bounded element count of a shape, ceiling-validated (gate before any
+# allocation; same fail-closed mapping as _forma_broadcast).
+@ privata
+functio _quantitas_valid(lista<numerus> f) → numerus ⇥ MathError {
+    fac {
+        redde forma.quantitas(f)
+    }
+    cape err {
+        fixum textus c ← forma.causa(err)
+        si c ≡ "negative dimension" {
+            iace finge DimensioNegativa { causa = c }
+        }
+        si c ≡ "dimension above ceiling" {
+            iace finge DimensioSupraLimitem { causa = c }
+        }
+        si c ≡ "element count above ceiling" {
+            iace finge ProductumSupraLimitem { causa = c }
+        }
+        iace finge FormaMismatch { causa = c }
+    }
+}
+
+# Operand flat index for a result flat index under right-aligned broadcast.
+# result coords are decomposed right-to-left; the operand reads dims of 1 as
+# coordinate 0 and missing leading dims as 0 (scalar/singleton broadcast).
+@ privata
+functio _index_broadcast(numerus planus, lista<numerus> result, lista<numerus> forma) → numerus {
+    fixum numerus lr ← result.longitudo()
+    fixum numerus lf ← forma.longitudo()
+    varia numerus res ← planus
+    varia numerus out ← 0
+    varia numerus stride ← 1
+    varia numerus k ← 0
+    dum k < lr {
+        fixum numerus dr ← result.accipe(lr - 1 - k) vel 1
+        fixum numerus c ← res % dr
+        varia numerus ci ← 0
+        varia numerus df ← 1
+        si k < lf {
+            df ← forma.accipe(lf - 1 - k) vel 1
+            si df ≡ 1 {
+                ci ← 0
+            }
+            secus {
+                ci ← c
+            }
+        }
+        out ← out + ci * stride
+        stride ← stride * df
+        res ← res / dr
+        k ← k + 1
+    }
+    redde out
+}
+
+# Source flat index for a reduce result: output flat index o (over the
+# reduced shape) with reduction coordinate j along axis.
+@ privata
+functio _index_axis(numerus planus, numerus j, lista<numerus> f, numerus axis) → numerus {
+    fixum numerus r ← f.longitudo()
+    varia numerus p ← planus
+    varia numerus out ← 0
+    varia numerus stride ← 1
+    varia numerus k ← 0
+    dum k < r {
+        fixum numerus idx ← r - 1 - k
+        fixum numerus dim ← f.accipe(idx) vel 1
+        varia numerus c ← 0
+        si idx ≡ axis {
+            c ← j
+        }
+        secus {
+            c ← p % dim
+            p ← p / dim
+        }
+        out ← out + c * stride
+        stride ← stride * dim
+        k ← k + 1
+    }
+    redde out
+}
+
+# Row-major coordinate vector for a flat index (left-to-right order).
+@ privata
+functio _coordinata(numerus planus, lista<numerus> forma) → lista<numerus> {
+    fixum numerus r ← forma.longitudo()
+    varia lista<numerus> coords ← vacua
+    varia numerus p ← planus
+    varia numerus total ← 1
+    itera ex forma fixum dim {
+        total ← total * dim
+    }
+    varia numerus i ← 0
+    dum i < r {
+        fixum numerus dim ← forma.accipe(i) vel 1
+        fixum numerus stride ← total / dim
+        fixum numerus c ← p / stride
+        coords.appende(c)
+        p ← p - c * stride
+        total ← stride
+        i ← i + 1
+    }
+    redde coords
+}
+
+# Row-major flat index of a coordinate vector within forma, with the axis
+# coordinate replaced by axis_local (concat/slice mapping).
+@ privata
+functio _planus_axis(lista<numerus> coords, numerus axis, numerus axis_local, lista<numerus> forma) → numerus {
+    fixum numerus r ← forma.longitudo()
+    varia numerus planus ← 0
+    varia numerus stride ← 1
+    varia numerus k ← 0
+    dum k < r {
+        fixum numerus idx ← r - 1 - k
+        fixum numerus dim ← forma.accipe(idx) vel 1
+        varia numerus c ← coords.accipe(idx) vel 0
+        si idx ≡ axis {
+            c ← axis_local
+        }
+        planus ← planus + c * stride
+        stride ← stride * dim
+        k ← k + 1
+    }
+    redde planus
+}
+
+# Dtype parity check — ops are fail-closed on mismatched tags; promotion is
+# an explicit casta step.
+@ privata
+functio _typo_par(tensor.Tensor a, tensor.Tensor b) → bivalens ⇥ MathError {
+    si non (a.typus() ≡ b.typus()) {
+        iace finge TypoMismatch { causa = "dtype mismatch" }
+    }
+    redde verum
+}
+
+# -------------------------------------------------------------------------
+# Family: construction — validated tensor construction through the family
+# error vocabulary. tensor.structa remains the raw validated constructor;
+# this entry maps its TensorError failures onto MathError so op pipelines
+# (and the family tests) carry one error type end to end. Part of the U4
+# "construction/validation/error" contract for the families.
+# -------------------------------------------------------------------------
+
+functio structa(lista<f32> datos, lista<numerus> forma) → tensor.Tensor ⇥ MathError {
+    fac {
+        redde tensor.structa(datos, forma)
+    }
+    cape err {
+        fixum textus c ← tensor.causa(err)
+        si c ≡ "negative dimension" {
+            iace finge DimensioNegativa { causa = c }
+        }
+        si c ≡ "element count mismatch" {
+            iace finge ElementaMismatch { causa = c }
+        }
+        iace finge FormaMismatch { causa = c }
+    }
+}
+
+# -------------------------------------------------------------------------
+# Family: elementwise.
+# -------------------------------------------------------------------------
+
+functio add(tensor.Tensor a, tensor.Tensor b) → tensor.Tensor ⇥ MathError {
+    fixum lista<numerus> fa ← a.figura()
+    fixum lista<numerus> fb ← b.figura()
+    fixum lista<numerus> fr ← _forma_broadcast(fa, fb)
+    fixum numerus total ← _quantitas_valid(fr)
+    fixum bivalens _ ← _typo_par(a, b)
+    varia lista<f32> out ← vacua
+    itera ab 0‥total fixum i {
+        fixum numerus ia ← _index_broadcast(i, fr, fa)
+        fixum numerus ib ← _index_broadcast(i, fr, fb)
+        fixum f32 va ← a.datos.accipe(ia) vel (0.0 ∷ f32)
+        fixum f32 vb ← b.datos.accipe(ib) vel (0.0 ∷ f32)
+        out.appende(va + vb)
+    }
+    redde tensor.Tensor { dtype = a.typus(), forma = fr, datos = out }
+}
+
+functio sub(tensor.Tensor a, tensor.Tensor b) → tensor.Tensor ⇥ MathError {
+    fixum lista<numerus> fa ← a.figura()
+    fixum lista<numerus> fb ← b.figura()
+    fixum lista<numerus> fr ← _forma_broadcast(fa, fb)
+    fixum numerus total ← _quantitas_valid(fr)
+    fixum bivalens _ ← _typo_par(a, b)
+    varia lista<f32> out ← vacua
+    itera ab 0‥total fixum i {
+        fixum numerus ia ← _index_broadcast(i, fr, fa)
+        fixum numerus ib ← _index_broadcast(i, fr, fb)
+        fixum f32 va ← a.datos.accipe(ia) vel (0.0 ∷ f32)
+        fixum f32 vb ← b.datos.accipe(ib) vel (0.0 ∷ f32)
+        out.appende(va - vb)
+    }
+    redde tensor.Tensor { dtype = a.typus(), forma = fr, datos = out }
+}
+
+functio mul(tensor.Tensor a, tensor.Tensor b) → tensor.Tensor ⇥ MathError {
+    fixum lista<numerus> fa ← a.figura()
+    fixum lista<numerus> fb ← b.figura()
+    fixum lista<numerus> fr ← _forma_broadcast(fa, fb)
+    fixum numerus total ← _quantitas_valid(fr)
+    fixum bivalens _ ← _typo_par(a, b)
+    varia lista<f32> out ← vacua
+    itera ab 0‥total fixum i {
+        fixum numerus ia ← _index_broadcast(i, fr, fa)
+        fixum numerus ib ← _index_broadcast(i, fr, fb)
+        fixum f32 va ← a.datos.accipe(ia) vel (0.0 ∷ f32)
+        fixum f32 vb ← b.datos.accipe(ib) vel (0.0 ∷ f32)
+        out.appende(va * vb)
+    }
+    redde tensor.Tensor { dtype = a.typus(), forma = fr, datos = out }
+}
+
+functio div(tensor.Tensor a, tensor.Tensor b) → tensor.Tensor ⇥ MathError {
+    fixum lista<numerus> fa ← a.figura()
+    fixum lista<numerus> fb ← b.figura()
+    fixum lista<numerus> fr ← _forma_broadcast(fa, fb)
+    fixum numerus total ← _quantitas_valid(fr)
+    fixum bivalens _ ← _typo_par(a, b)
+    varia lista<f32> out ← vacua
+    itera ab 0‥total fixum i {
+        fixum numerus ia ← _index_broadcast(i, fr, fa)
+        fixum numerus ib ← _index_broadcast(i, fr, fb)
+        fixum f32 va ← a.datos.accipe(ia) vel (0.0 ∷ f32)
+        fixum f32 vb ← b.datos.accipe(ib) vel (0.0 ∷ f32)
+        out.appende(va / vb)
+    }
+    redde tensor.Tensor { dtype = a.typus(), forma = fr, datos = out }
+}
+
+functio neg(tensor.Tensor t) → tensor.Tensor ⇥ MathError {
+    fixum lista<numerus> f ← t.figura()
+    fixum numerus total ← _quantitas_valid(f)
+    varia lista<f32> out ← vacua
+    itera ab 0‥total fixum i {
+        fixum f32 v ← t.datos.accipe(i) vel (0.0 ∷ f32)
+        out.appende((0.0 ∷ f32) - v)
+    }
+    redde tensor.Tensor { dtype = t.typus(), forma = f, datos = out }
+}
+
+functio abs(tensor.Tensor t) → tensor.Tensor ⇥ MathError {
+    fixum lista<numerus> f ← t.figura()
+    fixum numerus total ← _quantitas_valid(f)
+    varia lista<f32> out ← vacua
+    itera ab 0‥total fixum i {
+        fixum f32 v ← t.datos.accipe(i) vel (0.0 ∷ f32)
+        out.appende(v.absolutum())
+    }
+    redde tensor.Tensor { dtype = t.typus(), forma = f, datos = out }
+}
+
+# -------------------------------------------------------------------------
+# Family: reduce (summa / media over one axis).
+# -------------------------------------------------------------------------
+
+functio summa(tensor.Tensor t, numerus axis) → tensor.Tensor ⇥ MathError {
+    fixum lista<numerus> f ← t.figura()
+    fixum numerus r ← f.longitudo()
+    si r ≡ 0 {
+        iace finge GradusMismatch { causa = "reduce requires rank >= 1" }
+    }
+    si axis < 0 aut axis ≥ r {
+        iace finge GradusMismatch { causa = "axis out of range" }
+    }
+    fixum numerus dim ← f.accipe(axis) vel 1
+    si dim ≡ 0 {
+        iace finge ElementaMismatch { causa = "empty reduction axis" }
+    }
+    varia lista<numerus> fr ← vacua
+    varia numerus i ← 0
+    dum i < r {
+        si i ≠ axis {
+            fr.appende(f.accipe(i) vel 1)
+        }
+        i ← i + 1
+    }
+    varia lista<f32> out ← vacua
+    varia numerus total ← 1
+    itera ex f fixum d {
+        total ← total * d
+    }
+    fixum numerus outer ← total / dim
+    varia numerus o ← 0
+    dum o < outer {
+        varia f32 s ← (0.0 ∷ f32)
+        varia numerus j ← 0
+        dum j < dim {
+            fixum numerus idx ← _index_axis(o, j, f, axis)
+            s ← s + (t.datos.accipe(idx) vel (0.0 ∷ f32))
+            j ← j + 1
+        }
+        out.appende(s)
+        o ← o + 1
+    }
+    redde tensor.Tensor { dtype = t.typus(), forma = fr, datos = out }
+}
+
+functio media(tensor.Tensor t, numerus axis) → tensor.Tensor ⇥ MathError {
+    fixum lista<numerus> f ← t.figura()
+    fixum numerus r ← f.longitudo()
+    si r ≡ 0 {
+        iace finge GradusMismatch { causa = "reduce requires rank >= 1" }
+    }
+    si axis < 0 aut axis ≥ r {
+        iace finge GradusMismatch { causa = "axis out of range" }
+    }
+    fixum numerus dim ← f.accipe(axis) vel 1
+    si dim ≡ 0 {
+        iace finge ElementaMismatch { causa = "empty reduction axis" }
+    }
+    varia lista<numerus> fr ← vacua
+    varia numerus i ← 0
+    dum i < r {
+        si i ≠ axis {
+            fr.appende(f.accipe(i) vel 1)
+        }
+        i ← i + 1
+    }
+    varia lista<f32> out ← vacua
+    varia numerus total ← 1
+    itera ex f fixum d {
+        total ← total * d
+    }
+    fixum numerus outer ← total / dim
+    fixum f32 divisor ← (dim ↦ f32)
+    varia numerus o ← 0
+    dum o < outer {
+        varia f32 s ← (0.0 ∷ f32)
+        varia numerus j ← 0
+        dum j < dim {
+            fixum numerus idx ← _index_axis(o, j, f, axis)
+            s ← s + (t.datos.accipe(idx) vel (0.0 ∷ f32))
+            j ← j + 1
+        }
+        out.appende(s / divisor)
+        o ← o + 1
+    }
+    redde tensor.Tensor { dtype = t.typus(), forma = fr, datos = out }
+}
+
+# -------------------------------------------------------------------------
+# Family: matmul (rank-2 x rank-2). Higher-rank batched matmul is a later
+# admission row (R3 — support rows, not hard-coded generics).
+# -------------------------------------------------------------------------
+
+functio matmul(tensor.Tensor a, tensor.Tensor b) → tensor.Tensor ⇥ MathError {
+    fixum lista<numerus> fa ← a.figura()
+    fixum lista<numerus> fb ← b.figura()
+    si fa.longitudo() ≠ 2 {
+        iace finge GradusMismatch { causa = "matmul requires rank-2 operands" }
+    }
+    si fb.longitudo() ≠ 2 {
+        iace finge GradusMismatch { causa = "matmul requires rank-2 operands" }
+    }
+    fixum bivalens _ ← _typo_par(a, b)
+    fixum numerus m ← fa.accipe(0) vel 1
+    fixum numerus k ← fa.accipe(1) vel 1
+    fixum numerus kb ← fb.accipe(0) vel 1
+    fixum numerus n ← fb.accipe(1) vel 1
+    si k ≠ kb {
+        iace finge Incompatibilis { causa = "inner dimensions mismatch" }
+    }
+    fixum lista<numerus> fr ← [m, n]
+    fixum numerus total ← _quantitas_valid(fr)
+    varia lista<f32> out ← vacua
+    varia numerus i ← 0
+    dum i < m {
+        varia numerus j ← 0
+        dum j < n {
+            varia f32 s ← (0.0 ∷ f32)
+            varia numerus p ← 0
+            dum p < k {
+                fixum f32 va ← a.datos.accipe(i * k + p) vel (0.0 ∷ f32)
+                fixum f32 vb ← b.datos.accipe(p * n + j) vel (0.0 ∷ f32)
+                s ← s + va * vb
+                p ← p + 1
+            }
+            out.appende(s)
+            j ← j + 1
+        }
+        i ← i + 1
+    }
+    redde tensor.Tensor { dtype = a.typus(), forma = fr, datos = out }
+}
+
+# -------------------------------------------------------------------------
+# Family: cast — elementwise value cast via the dtype contract, entered by
+# dtype NAME (the serialized tag form, dtype-schema-1.0.0). The tag entry
+# exists because a `dtype.DType` parameter would make this export
+# unprobe-importable (compiler lane: file-interface skips exports carrying
+# cross-module nominal discretio types, WARN014). Error contract:
+# MathError.NonFinita / Superfluitas (dtype cast rules, fail-closed) and
+# NomenIgnotum for an unknown dtype name.
+# -------------------------------------------------------------------------
+
+@ privata
+functio _typus_ex_nomine(textus nomen) → dtype.DType ⇥ MathError {
+    fac {
+        redde dtype.ex_nomine(nomen)
+    }
+    cape err {
+        fixum textus c ← dtype.causa(err)
+        iace finge NomenIgnotum { causa = c }
+    }
+}
+
+functio casta(tensor.Tensor t, textus nomen) → tensor.Tensor ⇥ MathError {
+    fixum dtype.DType scopum ← _typus_ex_nomine(nomen)
+    varia lista<f32> out ← vacua
+    itera ex t.datos fixum v {
+        fac {
+            fixum f32 cv ← dtype.casta(v, t.typus(), scopum)
+            out.appende(cv)
+        }
+        cape err {
+            fixum textus c ← dtype.causa(err)
+            si c ≡ "non-finite value in cast to i32" aut c ≡ "non-finite value in cast to u8" {
+                iace finge NonFinita { causa = c }
+            }
+            iace finge Superfluitas { causa = c }
+        }
+    }
+    redde tensor.Tensor { dtype = scopum, forma = t.figura(), datos = out }
+}
+
+# -------------------------------------------------------------------------
+# Family: concat / slice.
+# -------------------------------------------------------------------------
+
+functio concatenatio(lista<tensor.Tensor> partes, numerus axis) → tensor.Tensor ⇥ MathError {
+    si partes.longitudo() ≡ 0 {
+        iace finge ElementaMismatch { causa = "empty concat list" }
+    }
+    fixum tensor.Tensor primus ← partes.accipe(0)
+    fixum lista<numerus> f0 ← primus.figura()
+    fixum numerus r ← f0.longitudo()
+    si r ≡ 0 {
+        iace finge GradusMismatch { causa = "concat requires rank >= 1" }
+    }
+    si axis < 0 aut axis ≥ r {
+        iace finge GradusMismatch { causa = "axis out of range" }
+    }
+    varia lista<numerus> axis_dims ← vacua
+    varia lista<numerus> offsets ← vacua
+    varia numerus acc ← 0
+    itera ex partes fixum part {
+        fixum lista<numerus> f ← part.figura()
+        si f.longitudo() ≠ r {
+            iace finge GradusMismatch { causa = "concat rank mismatch" }
+        }
+        si non (part.typus() ≡ primus.typus()) {
+            iace finge TypoMismatch { causa = "dtype mismatch" }
+        }
+        varia numerus k ← 0
+        dum k < r {
+            fixum numerus dk ← f.accipe(k) vel 1
+            fixum numerus d0 ← f0.accipe(k) vel 1
+            si k ≠ axis et dk ≠ d0 {
+                iace finge Incompatibilis { causa = "concat dimension mismatch" }
+            }
+            k ← k + 1
+        }
+        fixum numerus adim ← f.accipe(axis) vel 1
+        axis_dims.appende(adim)
+        offsets.appende(acc)
+        acc ← acc + adim
+    }
+    varia lista<numerus> fr ← vacua
+    varia numerus k ← 0
+    dum k < r {
+        varia numerus d0 ← f0.accipe(k) vel 1
+        si k ≡ axis {
+            d0 ← acc
+        }
+        fr.appende(d0)
+        k ← k + 1
+    }
+    fixum numerus total ← _quantitas_valid(fr)
+    fixum numerus nparts ← partes.longitudo()
+    varia lista<f32> out ← vacua
+    itera ab 0‥total fixum o {
+        fixum lista<numerus> coords ← _coordinata(o, fr)
+        fixum numerus ca ← coords.accipe(axis) vel 0
+        varia numerus chosen ← 0
+        varia numerus j ← 0
+        dum j < nparts {
+            fixum numerus off ← offsets.accipe(j) vel 0
+            fixum numerus adim ← axis_dims.accipe(j) vel 1
+            si ca ≥ off et ca < off + adim {
+                chosen ← j
+            }
+            j ← j + 1
+        }
+        fixum numerus off ← offsets.accipe(chosen) vel 0
+        fixum tensor.Tensor part ← partes.accipe(chosen)
+        fixum numerus idx ← _planus_axis(coords, axis, ca - off, part.figura())
+        out.appende(part.datos.accipe(idx) vel (0.0 ∷ f32))
+    }
+    redde tensor.Tensor { dtype = primus.typus(), forma = fr, datos = out }
+}
+
+functio segmentum(tensor.Tensor t, numerus axis, numerus initium, numerus finis) → tensor.Tensor ⇥ MathError {
+    fixum lista<numerus> f ← t.figura()
+    fixum numerus r ← f.longitudo()
+    si r ≡ 0 {
+        iace finge GradusMismatch { causa = "slice requires rank >= 1" }
+    }
+    si axis < 0 aut axis ≥ r {
+        iace finge GradusMismatch { causa = "axis out of range" }
+    }
+    fixum numerus dim ← f.accipe(axis) vel 1
+    si initium < 0 aut finis < initium aut finis > dim {
+        iace finge Incompatibilis { causa = "slice bounds out of range" }
+    }
+    fixum numerus len ← finis - initium
+    varia lista<numerus> fr ← vacua
+    varia numerus i ← 0
+    dum i < r {
+        varia numerus d ← f.accipe(i) vel 1
+        si i ≡ axis {
+            d ← len
+        }
+        fr.appende(d)
+        i ← i + 1
+    }
+    fixum numerus total ← _quantitas_valid(fr)
+    varia lista<f32> out ← vacua
+    itera ab 0‥total fixum o {
+        fixum lista<numerus> coords ← _coordinata(o, fr)
+        fixum numerus ca ← coords.accipe(axis) vel 0
+        fixum numerus idx ← _planus_axis(coords, axis, ca + initium, f)
+        out.appende(t.datos.accipe(idx) vel (0.0 ∷ f32))
+    }
+    redde tensor.Tensor { dtype = t.typus(), forma = fr, datos = out }
+}
