@@ -33,7 +33,7 @@ _none_
 
 | Goal | Status | Done | goal | campaign | delivery | ledger | council | evidence | other |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| [production-ml-library](production-ml-library/CAMPAIGN.md) | planned | — | 0 | 1 | 8 | 0 | 0 | 0 | 1 |
+| [production-ml-library](production-ml-library/CAMPAIGN.md) | planned | — | 0 | 1 | 8 | 1 | 0 | 0 | 11 |
 
 ## Archived
 
