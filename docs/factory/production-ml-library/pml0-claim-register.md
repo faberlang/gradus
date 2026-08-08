@@ -83,7 +83,7 @@ claims and their truth; it does not admit support.
 
 ## 2. Populated Gradus rows (claim rows)
 
-| claim | status | owner | evidence ref | campaign stage |
+| claim | claim state | owner | evidence ref | campaign stage |
 | --- | --- | --- | --- | --- |
 | Compiler-generated reverse-mode companions are available to training (autograd wrapper) | `accepted` | gradus (training, `gradus:gradient`) | `pml0-module-dag.md` §1/§3 (gradient = training, 2 `functio`: `nil`, `simple_loss`); `pml0-numerical-baseline.md` §Module coverage (gradient 2, 0 proba); CAMPAIGN.md §Ground Truth ("The compiler generates reverse-mode companions", radix AIR) | PML4 |
 | Static-shape SGD optimization step exists and is proven (`sgd_step_2x2/_4x4`) | `accepted` | gradus (training, `gradus:optimize`) | `src/optimize.fab` (live, 2 `functio` per `pml0-module-dag.md` §1); `pml0-proof-api-ledger.md` rows 10–11 (disposition: **retire** — no external caller; update math inlined in `train_step_2x2/_4x4`) | PML4 |
@@ -100,7 +100,7 @@ These rows record surfaces that are **claimed-off** in this register: no
 admission claim exists, so the register can never be read as saying Gradus
 admits these formats. `none` is the non-claim marker, not a claim status.
 
-| claim | status | owner | evidence ref | campaign stage |
+| claim | claim state | owner | evidence ref | campaign stage |
 | --- | --- | --- | --- | --- |
 | GGUF model admission (Gradus admits a GGUF model row) | `none` | gradus (model admission; parsing today in `norma:model`) | `pml0-support-matrix-schema.md` §2/§3 (schema only, **zero** populated product rows; R1–R11 fail-closed); `pml0-norma-model-decision.md` (migrate into Gradus at PML2, not now; no dual authority); `pml0-model-capsule-contract.md` (capsule is the typed handoff; raw bytes not a trust anchor) | PML2 |
 | Safetensors model admission (Gradus admits a Safetensors model row) | `none` | gradus (model admission; parsing today in `norma:model`) | `pml0-support-matrix-schema.md` §2/§3 (zero populated rows; fail-closed); `pml0-norma-model-decision.md` (migrate at PML2, not now); `pml0-model-capsule-contract.md` | PML2 |
@@ -148,7 +148,7 @@ cd /Users/ianzepp/work/faberlang/gradus
 # 1. Schema section + closed status vocabulary present.
 grep -c '`accepted` / `partial` / `in flight`' docs/factory/production-ml-library/pml0-claim-register.md   # >= 1
 # 2. At least 6 populated Gradus claim rows, each with a status from the
-#    closed vocabulary (statuses appear as `status` in the §2 table column).
+#    closed vocabulary (statuses appear in the §2 table's `claim state` column).
 grep -c '^| .*`accepted`' docs/factory/production-ml-library/pml0-claim-register.md          # 5
 grep -c '^| .*`partial`' docs/factory/production-ml-library/pml0-claim-register.md           # 1
 grep -c '^| .*`in flight`' docs/factory/production-ml-library/pml0-claim-register.md         # 2
