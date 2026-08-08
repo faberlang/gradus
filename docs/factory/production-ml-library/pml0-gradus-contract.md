@@ -84,11 +84,13 @@ semantics) and separate-inference-product decision before further
 implementation. Model runtime and serving never land in faber, radix, or
 hosts.
 
-## 3. Gate artifacts (U2–U9) — what each froze
+## 3. Gate artifacts (U2–U9) and the claim register (U12) — what each froze
 
 PML0's gate items each produced a committed artifact. This contract summarizes
 them; each summary defers to the artifact by path. All are in this directory
-(`gradus/docs/factory/production-ml-library/`).
+(`gradus/docs/factory/production-ml-library/`); the U12 claim register
+(`pml0-claim-register.md`) is summarized here as the companion this contract
+consumes for claim status (§6).
 
 ### U2 — Public symbol inventory → `pml0-symbol-inventory.md`
 
@@ -181,6 +183,21 @@ observations, reset, cancellation, errors; host-device ABI + manifest-version
 relationship; version-bump authority + rejection/migration policy; frozen-now
 vs reserved-seam split; exclusion clause (no device handle, no HTTP policy).
 Read-only facts from `gi3-contract.md` and NGAB0's §Abi (§2.1 here).
+
+### U12 — Claim register → `pml0-claim-register.md`
+
+The cross-campaign claim/capability register (PML0-U12, committed at gradus
+`2b4fc58`): 8 populated Gradus claim rows (5 `accepted`, 1 `partial`, 2
+`in flight`) under the closed status vocabulary `accepted` / `partial` /
+`in flight`, plus 2 non-claim rows (`none`, register §3) for the claimed-off
+GGUF/Safetensors admission surfaces. Each row carries a single owner, a
+committed evidence ref, and the PML stage owning the production contract.
+**Effect on this contract**: register status is never product support —
+support reads only from admitted support-matrix rows (§4.3, U5), of which
+PML0 commits zero. The attention and transformer rows confirm the shipped
+static-shape slice (`scaled_dot_product_2x8`, `bert_tiny_block_2x8`) as
+`in flight`: the fixed-shape slice is caller-backed, the general surface is
+unclaimed until its PML3 production contract.
 
 ## 4. The ownership matrix (restated from U4)
 
@@ -279,8 +296,9 @@ paid external GPU operation here.
 - **Consumed by**: PML1–PML7 deliveries (module graph, ownership, support
   posture, interface revision); NGAB0 §OwnershipMatrix exchange partner;
   PML0-U11 (GI4+ ownership amendment — the sibling required output);
-  PML0-U12 (claim register rows never read as product support); PML0-U13
-  (joint receipts; migration receipts name the packet revision).
+  PML0-U12 (`pml0-claim-register.md` — claim register rows never read as
+  product support); PML0-U13 (joint receipts; migration receipts name the
+  packet revision).
 - **Related required output**: `radix/docs/factory/gpu-inference-gguf/
   gi4-ownership-amendment.md` + migration map (U11, Gate B) — the ownership
   amendment that makes the clauses cited in U7 §2 read as historical, not
@@ -312,9 +330,12 @@ cd /Users/ianzepp/work/faberlang/gradus
 python3 ../radix/scripta/generate-factory-readme.py --factory-root docs/factory
 python3 ../radix/scripta/generate-factory-readme.py --factory-root docs/factory --check   # exit 0
 git diff --check
+# 6. Claim register linked by path (U12 §3 summary + §6 relationship).
+grep -c 'pml0-claim-register.md' docs/factory/production-ml-library/pml0-gradus-contract.md   # 5 (4 doc refs + this validation line)
 ```
 
-Outcome: each U2–U9 artifact is linked by path; the interface-packet revision
+Outcome: each U2–U9 artifact is linked by path; the U12 claim register
+(`pml0-claim-register.md`) is linked by path; the interface-packet revision
 (`846b97e` / `pml0-interface-packet v1`) is named; the ownership matrix and
 the three headline non-goals are restated; the factory README regenerates
 fresh (`--check` exit 0); `git diff --check` clean. Closeout per

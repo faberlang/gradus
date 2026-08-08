@@ -20,7 +20,7 @@ generated code — not a runtime tape replay.
 | Loss functions | **Shipped (S4-A)** — static-shape MSE: `mse_2x2`, `mse_4x4` |
 | NN primitives | **Shipped (S4-A)** — static-shape linear + GELU: `linear_2x2`, `linear_4x4`, `gelu_4x4` |
 | Training steps | **Shipped (S4-A)** — static-shape update: `train_step_2x2`, `train_step_4x4` |
-| Attention / transformer | Planned — nanoGPT forcing function |
+| Attention / transformer | **Shipped (S6-G1)** — static-shape BERT-tiny slice (`scaled_dot_product_2x8`, `bert_tiny_block_2x8`); general surface remains planned |
 | GPU training | Blocked on mir-swarm device gradient rung |
 
 The compiler's autograd capability is shipped (campaign `mir-autograd`, closed
