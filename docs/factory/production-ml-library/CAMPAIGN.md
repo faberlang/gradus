@@ -250,7 +250,7 @@ hosts own physical storage.
 
 ### PML2 — Model, format, tokenizer, and checkpoint admission
 
-**Status**: active — PML2 U1–U6 delivered and admitted (435ccd6, 07291d6, b392fc8, f12deaf, d6954ab/22041e6, 02fae61); C3 trio-deletion boundary BLOCKED at closeout by live transitive-closure references (CTO Q3 gate 469d929f); consumer decouple required before deletion; PML3 next
+**Status**: delivered/accepted — PML2 U1–U6 delivered and admitted (435ccd6, 07291d6, b392fc8, f12deaf, d6954ab/22041e6, 02fae61); C3 trio-deletion boundary EXECUTED at the closeout re-run (faber-runtime trio git rm after the decouple 9a0295e/08d195f; transitive-closure gate PASSED — zero live references; no forwarding shims); PML3 next
 **Owner**: Gradus; Norma participates only in the controlled source migration.
 **Source**: PML0/PML1, `norma/src/model.fab`, GI0-GI2 model/oracle contracts,
 and admitted legal fixtures.
