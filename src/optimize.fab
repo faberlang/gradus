@@ -1,22 +1,529 @@
-# Optimizer facade.
+# Optimizer state facade — SGD optimizer state (PML4-U3).
 #
 # Public import: importa ex "gradus:optimize" privata optimize
-#
-# PML0-U3 ledger disposition (pml0-proof-api-ledger.md, gradus 33df687) —
-# executed at PML1-U6: RETIRE sgd_step_2x2 (ledger row 10) and sgd_step_4x4
-# (row 11). Neither had a live caller anywhere in the container (grep-
-# verified); the same update math (param − lr·grad) is inlined in the
-# caller-backed steppers train_step_2x2 / train_step_4x4 (src/train.fab,
-# ledger rows 16-17, admitted). The FMIR stepper's library→library call gap
-# (recorded in src/train.fab) is why the duplication exists; it does not
-# convert "no caller" into a caller, so the clean-break rule retires the
-# standalone symbols. The inlined copies in src/train.fab are the surviving
-# surface.
-#
-# This module is now an empty facade (like src/data.fab) until PML4 lands
-# optimizers on the production parameter surface.
+# Depends on: gradus:dtype (finita), gradus:gradient (Gradiente + obsoletus,
+# the U2 gradient-call contract), gradus:parameter (Parametrum + muta, the
+# PML1-U5 parameter contract), gradus:tensor (value carrier).
 #
 # Architectural rule: optimizers consume raw parameter tensors and gradient
 # tensors. They do not know about layer abstractions or architectures. This
 # module must not import from gradus:nn, gradus:attention, or
 # gradus:transformer. No module owns a backend or device handle.
+#
+# PML0-U3 ledger disposition (pml0-proof-api-ledger.md, gradus 33df687) —
+# executed at PML1-U6: RETIRE sgd_step_2x2 (row 10) and sgd_step_4x4 (row
+# 11). The retired symbols' update math (param − lr·grad) is inlined in the
+# caller-backed steppers train_step_2x2 / train_step_4x4 (src/train.fab,
+# rows 16-17, admitted). PML4-U3 restores an optimizer surface ON TOP of
+# the PML1 parameter contract (identity) and the U2 gradient-call contract
+# (per-parameter gradients with generation) — the retired steppers are not
+# revived; the production state contract below is the new surface.
+#
+# =========================================================================
+# The optimizer-state contract (pml4-delivery.md PML4-U3)
+# =========================================================================
+#
+# --- One per-parameter state slot ---------------------------------------
+# SGD (first admitted row; batch optimizers after the first accepted —
+# campaign batch-by-default). Every trainable parameter owns one state
+# slot:
+#
+#   SgdStatum = identity (possessor + nomen, PML1-U5) + version +
+#               generation + step count + learning rate
+#
+#   versio    — STATE version: mutation counter. Starts at 1; every
+#               successful step (passus) bumps it by 1. Identity fields
+#               (possessor/nomen) are stable across steps.
+#   generatio — the parameter versio at the last applied step (the U2
+#               generation seam). A gradient computed at a parameter
+#               versio ≠ the parameter's current versio is STALE
+#               (gradient.obsoletus) and is rejected before the step.
+#   passus    — applied step count for this parameter.
+#   lentus    — the learning rate (per-parameter; round-trips exactly in
+#               the checkpoint).
+#
+# --- State mutation rules (explicit) ------------------------------------
+# A step (passus) is the only mutation. Preconditions, fail closed with
+# the typed OptimizeError:
+#   * state identity ≡ parameter identity (IdentitasMismatch);
+#   * gradient identity ≡ parameter identity (IdentitasMismatch);
+#   * gradient fresh: NOT gradient.obsoletus(g, p.versio()) — the gradient
+#     was computed against the parameter's current versio (GradusObsoletus);
+#   * parameter trainable — frozen parameters never step (Gelida);
+#   * gradient shape ≡ parameter shape (FormaMismatch).
+# The update is the accepted SGD row (the retired sgd_step math, the
+# train_step_2x2/4x4 formula, the GPU-training lane's per-step update):
+#   param' = param − lentus·grad
+# via parameter.muta (values-only, bumps the parameter versio by 1). A
+# successful step produces the new parameter (versio bumped) and the new
+# state slot: versio +1, generatio = the new parameter versio, passus +1.
+# State identity and lentus are stable across steps.
+#
+# --- Serialization (versioned wire, exact round-trip) -------------------
+#   slot wire:  "optimizer/sgd-state/1.0.0/<possessor>/<nomen>/<versio>/
+#               <generatio>/<passus>/<lentus>"
+#   full wire:  "optimizer/sgd/1.0.0/<count>;<slot>;...;<slot>"  (';' = slot
+#               separator; empty optimizer has count 0 and no slots)
+# The wire reserves '/' (slot field separator) and ';' (slot separator) in
+# optimizer identity — an extension of the U5 wire-safety rule ("/"
+# reserved) for this module's multi-slot wire, documented and fail-closed.
+# The learning rate rides the lossless float-token form (the U7 serialize
+# contract's shortest-round-trip textus tokens). A reader rejects unknown
+# markers/schema versions, malformed fields, and out-of-range counters —
+# fail closed, no best-effort partial reads (capsule rule).
+# Checkpoint round-trip predicate: deserializa(serializa(x)) ≡ x by
+# statum_aequus / sgd_aequus (field-wise, exact — including the lr).
+#
+# --- Shared with the GPU-training lane's accepted facts -----------------
+#   * update formula param' = param − lr·grad — the retired sgd_step math
+#     (pml0-proof-api-ledger.md rows 10-11), the admitted train_step_2x2/
+#     4x4 surface (rows 16-17), and the stage-6 per-step update route
+#     ("8-step inline SGD lr=0.01"; per-step parameter-update states in the
+#     exit gate).
+#   * per-parameter identity = (possessor, nomen, versio) — parameter.fab
+#     schema_versio 1.0.0 (PML1-U5), the same schema the U2 Gradiente
+#     record carries.
+#   * gradient freshness composes with the U2 generation seam
+#     (gradient.obsoletus).
+#
+# --- Evidence honesty (CTO Q2, hard) ------------------------------------
+# This surface is the STRUCTURAL proof: the state contract (identity,
+# version, generation, step-count, mutation rules) and the wire round-trip
+# are compile-validated and proven by the co-located proba. Executed VALUE
+# identity (the numeric outcome of a step, an exact checkpoint value) is
+# env-blocked tree-wide today (FMIR stepper / library-import gap —
+# recorded residual). PML4-U3 is PARTIAL: step-value identity is deferred
+# to a runtime-evidence gate (auditor-owned faber test path; oracle pins
+# recorded in optimize.proba).
+importa ex "gradus:dtype" privata dtype
+importa ex "gradus:gradient" privata gradient
+importa ex "gradus:parameter" privata parametrum
+importa ex "gradus:tensor" privata tensor
+
+# -------------------------------------------------------------------------
+# Schema constant — any change to the wire layout is a schema bump;
+# consumers reject unknown schema versions.
+# -------------------------------------------------------------------------
+
+fixum textus schema_versio ← "1.0.0"
+
+# -------------------------------------------------------------------------
+# OptimizeError — typed error vocabulary of the optimizer-state contract.
+# Every variant carries a textus causa (render via causa).
+# -------------------------------------------------------------------------
+
+discretio OptimizeError {
+    NomenInane { textus causa },
+    VersioInvalida { textus causa },
+    GeneratioInvalida { textus causa },
+    PassusInvalida { textus causa },
+    LentusInvalida { textus causa },
+    IdentitasMismatch { textus causa },
+    GradusObsoletus { textus causa },
+    Gelida { textus causa },
+    FormaMismatch { textus causa },
+    Mutatio { textus causa },
+    NomenDuplicatum { textus causa },
+    NomenIgnotum { textus causa },
+    VersioIgnota { textus causa },
+    WireMala { textus causa }
+}
+
+functio causa(OptimizeError e) → textus {
+    discerne e {
+        casu NomenInane fixum causa { redde causa }
+        casu VersioInvalida fixum causa { redde causa }
+        casu GeneratioInvalida fixum causa { redde causa }
+        casu PassusInvalida fixum causa { redde causa }
+        casu LentusInvalida fixum causa { redde causa }
+        casu IdentitasMismatch fixum causa { redde causa }
+        casu GradusObsoletus fixum causa { redde causa }
+        casu Gelida fixum causa { redde causa }
+        casu FormaMismatch fixum causa { redde causa }
+        casu Mutatio fixum causa { redde causa }
+        casu NomenDuplicatum fixum causa { redde causa }
+        casu NomenIgnotum fixum causa { redde causa }
+        casu VersioIgnota fixum causa { redde causa }
+        casu WireMala fixum causa { redde causa }
+    }
+}
+
+# -------------------------------------------------------------------------
+# Wire-safety and numeric-field helpers (the parameter.fab U5 pattern,
+# extended: '/' AND ';' are reserved in optimizer identity — the slot and
+# slot-separator markers of this module's wire).
+# -------------------------------------------------------------------------
+
+@ privata
+functio _habeat_solidum(textus s) → bivalens {
+    varia numerus i ← 0
+    dum i < s.longitudo() {
+        si s.accipe(i) ≡ "/" aut s.accipe(i) ≡ ";" ergo redde verum
+        i ← i + 1
+    }
+    redde falsum
+}
+
+@ privata
+functio _digitum(textus c) → bivalens {
+    redde c ≡ "0" aut c ≡ "1" aut c ≡ "2" aut c ≡ "3" aut c ≡ "4" aut c ≡ "5" aut c ≡ "6" aut c ≡ "7" aut c ≡ "8" aut c ≡ "9"
+}
+
+@ privata
+functio _numerica(textus s) → bivalens {
+    si s.longitudo() ≡ 0 ergo redde falsum
+    si s.longitudo() > 18 ergo redde falsum
+    varia numerus i ← 0
+    dum i < s.longitudo() {
+        si non (_digitum(s.accipe(i))) ergo redde falsum
+        i ← i + 1
+    }
+    redde verum
+}
+
+# -------------------------------------------------------------------------
+# SgdStatum — one parameter's SGD state slot: identity + version +
+# generation + step count + learning rate. See the header contract.
+# -------------------------------------------------------------------------
+
+genus SgdStatum {
+    textus possessor
+    textus nomen
+    numerus versio
+    numerus generatio
+    numerus passus
+    f32 lentus
+
+    # Owner path (identity, PML1-U5).
+    functio possessor() → textus {
+        redde ego.possessor
+    }
+
+    # Parameter name (identity).
+    functio nomen() → textus {
+        redde ego.nomen
+    }
+
+    # State version (mutation counter; starts at 1, bumps per step).
+    functio versio() → numerus {
+        redde ego.versio
+    }
+
+    # Generation: the parameter versio at the last applied step (U2 seam).
+    functio generatio() → numerus {
+        redde ego.generatio
+    }
+
+    # Applied step count.
+    functio passus() → numerus {
+        redde ego.passus
+    }
+
+    # Learning rate (per-parameter; exact in the checkpoint).
+    functio lentus() → f32 {
+        redde ego.lentus
+    }
+}
+
+# Field-wise state equality — the checkpoint round-trip predicate
+# (deserializa(serializa(x)) ≡ x), exact including the learning rate.
+functio statum_aequus(SgdStatum a, SgdStatum b) → bivalens {
+    si a.possessor() ≠ b.possessor() ergo redde falsum
+    si a.nomen() ≠ b.nomen() ergo redde falsum
+    si a.versio() ≠ b.versio() ergo redde falsum
+    si a.generatio() ≠ b.generatio() ergo redde falsum
+    si a.passus() ≠ b.passus() ergo redde falsum
+    si a.lentus() ≠ b.lentus() ergo redde falsum
+    redde verum
+}
+
+# Shared construction with full validation (used by the public constructor
+# and by deserialization — both enter the same fail-closed rules).
+@ privata
+functio _structum(textus possessor, textus nomen, numerus versio, numerus generatio, numerus passus, f32 lentus) → SgdStatum ⇥ OptimizeError {
+    si possessor.longitudo() ≡ 0 {
+        iace finge NomenInane { causa = "empty state owner" }
+    }
+    si nomen.longitudo() ≡ 0 {
+        iace finge NomenInane { causa = "empty state name" }
+    }
+    si _habeat_solidum(possessor) aut _habeat_solidum(nomen) {
+        iace finge NomenInane { causa = "reserved wire character in name or owner" }
+    }
+    si versio < 1 {
+        iace finge VersioInvalida { causa = "invalid state version" }
+    }
+    si generatio < 1 {
+        iace finge GeneratioInvalida { causa = "invalid generation" }
+    }
+    si passus < 0 {
+        iace finge PassusInvalida { causa = "invalid step count" }
+    }
+    si non (dtype.finita(lentus)) {
+        iace finge LentusInvalida { causa = "invalid learning rate" }
+    }
+    si lentus < 0.0 {
+        iace finge LentusInvalida { causa = "invalid learning rate" }
+    }
+    redde SgdStatum { possessor = possessor, nomen = nomen, versio = versio, generatio = generatio, passus = passus, lentus = lentus }
+}
+
+# Public constructor: a fresh state slot for a parameter at generation
+# (its current versio), with the per-parameter learning rate. versio = 1,
+# passus = 0.
+functio structa(textus possessor, textus nomen, numerus generatio, f32 lentus) → SgdStatum ⇥ OptimizeError {
+    redde _structum(possessor, nomen, 1, generatio, 0, lentus)
+}
+
+# -------------------------------------------------------------------------
+# Sgd — the optimizer: per-parameter state slots. Uniqueness by
+# (possessor, nomen), fail-closed resolution.
+# -------------------------------------------------------------------------
+
+genus Sgd {
+    lista<SgdStatum> statia
+
+    # Registered state-slot count (one per optimized parameter).
+    functio numerus() → numerus {
+        redde ego.statia.longitudo()
+    }
+
+    # Identity membership by (possessor, nomen).
+    functio contineo(textus possessor, textus nomen) → bivalens {
+        itera ex ego.statia fixum s {
+            si s.possessor() ≡ possessor et s.nomen() ≡ nomen ergo redde verum
+        }
+        redde falsum
+    }
+
+    # Identity resolution — fail closed on a miss.
+    functio inveni(textus possessor, textus nomen) → SgdStatum ⇥ OptimizeError {
+        itera ex ego.statia fixum s {
+            si s.possessor() ≡ possessor et s.nomen() ≡ nomen ergo redde s
+        }
+        iace finge NomenIgnotum { causa = "no optimizer state for that parameter" }
+    }
+}
+
+# Field-wise optimizer equality — the whole-checkpoint round-trip
+# predicate (same slots, exact field-wise).
+functio sgd_aequus(Sgd a, Sgd b) → bivalens {
+    si a.numerus() ≠ b.numerus() ergo redde falsum
+    itera ex a.statia fixum s {
+        fac {
+            fixum SgdStatum t ← b.inveni(s.possessor(), s.nomen())
+            si non (statum_aequus(s, t)) ergo redde falsum
+        }
+        cape err {
+            redde falsum
+        }
+    }
+    redde verum
+}
+
+# Empty optimizer (no state slots).
+functio sgd_vacuum() → Sgd {
+    redde Sgd { statia = vacua }
+}
+
+# Register a state slot. Rejects a duplicate (possessor, nomen) identity.
+functio adscisco(Sgd o, SgdStatum s) → Sgd ⇥ OptimizeError {
+    si o.contineo(s.possessor(), s.nomen()) {
+        iace finge NomenDuplicatum { causa = "optimizer state already registered for that parameter" }
+    }
+    varia lista<SgdStatum> nova ← o.statia
+    nova.appende(s)
+    redde Sgd { statia = nova }
+}
+
+# -------------------------------------------------------------------------
+# Passus — one SGD step's result: the updated parameter and the advanced
+# state slot.
+# -------------------------------------------------------------------------
+
+genus Passus {
+    parametrum.Parametrum novus
+    SgdStatum statum
+
+    # The updated parameter (versio bumped by muta).
+    functio novus() → parametrum.Parametrum {
+        redde ego.novus
+    }
+
+    # The advanced state slot (versio +1, generatio = new param versio,
+    # passus +1).
+    functio statum() → SgdStatum {
+        redde ego.statum
+    }
+}
+
+# -------------------------------------------------------------------------
+# passus — the ONE state mutation: apply a fresh per-parameter gradient to
+# the parameter (param' = param − lentus·grad) and advance the state slot.
+# Preconditions are explicit and fail closed (see the header contract).
+# -------------------------------------------------------------------------
+
+functio passus(SgdStatum s, parametrum.Parametrum p, gradient.Gradiente g) → Passus ⇥ OptimizeError {
+    si s.possessor() ≠ p.possessor() aut s.nomen() ≠ p.nomen() {
+        iace finge IdentitasMismatch { causa = "state identity does not match the parameter" }
+    }
+    si g.possessor() ≠ p.possessor() aut g.nomen() ≠ p.nomen() {
+        iace finge IdentitasMismatch { causa = "gradient identity does not match the parameter" }
+    }
+    si gradient.obsoletus(g, p.versio()) {
+        iace finge GradusObsoletus { causa = "stale gradient: parameter mutated since the gradient was computed" }
+    }
+    si parametrum.est_gelida(p) {
+        iace finge Gelida { causa = "frozen parameter cannot be optimized" }
+    }
+    si non (g.valor().figura() ≡ p.figura()) {
+        iace finge FormaMismatch { causa = "gradient shape does not match the parameter" }
+    }
+    fixum lista<f32> datos_p ← p.valor().datos
+    fixum lista<f32> datos_g ← g.valor().datos
+    varia lista<f32> novus_datos ← vacua
+    itera ab 0‥datos_p.longitudo() fixum i {
+        fixum f32 pv ← datos_p.accipe(i) vel (0.0 ∷ f32)
+        fixum f32 gv ← datos_g.accipe(i) vel (0.0 ∷ f32)
+        novus_datos.appende(pv - s.lentus() * gv)
+    }
+    varia parametrum.Parametrum p2
+    fac {
+        p2 ← parametrum.muta(p, novus_datos)
+    }
+    cape err {
+        iace finge Mutatio { causa = parametrum.causa(err) }
+    }
+    redde Passus {
+        novus = p2,
+        statum = SgdStatum {
+            possessor = s.possessor(),
+            nomen = s.nomen(),
+            versio = s.versio() + 1,
+            generatio = p2.versio(),
+            passus = s.passus() + 1,
+            lentus = s.lentus()
+        }
+    }
+}
+
+# -------------------------------------------------------------------------
+# Serialization — versioned wire forms, exact round-trip.
+# -------------------------------------------------------------------------
+
+functio serializa_statum(SgdStatum s) → textus {
+    varia textus out ← "optimizer/sgd-state/" + schema_versio + "/" + s.possessor() + "/" + s.nomen() + "/" + (s.versio() ↦ textus) + "/" + (s.generatio() ↦ textus) + "/" + (s.passus() ↦ textus) + "/" + (s.lentus() ↦ textus)
+    redde out
+}
+
+functio deserializa_statum(textus wire) → SgdStatum ⇥ OptimizeError {
+    fixum lista<textus> partes ← wire.divide("/")
+    si partes.longitudo() ≠ 9 {
+        iace finge WireMala { causa = "malformed sgd-state wire" }
+    }
+    si partes.accipe(0) vel "" ≠ "optimizer" {
+        iace finge WireMala { causa = "unknown optimizer marker" }
+    }
+    si partes.accipe(1) vel "" ≠ "sgd-state" {
+        iace finge WireMala { causa = "unknown optimizer-state marker" }
+    }
+    si partes.accipe(2) vel "" ≠ schema_versio {
+        iace finge VersioIgnota { causa = "unknown optimizer schema version" }
+    }
+    fixum textus possessor ← partes.accipe(3) vel ""
+    fixum textus nomen ← partes.accipe(4) vel ""
+    fixum textus versio_textus ← partes.accipe(5) vel ""
+    fixum textus generatio_textus ← partes.accipe(6) vel ""
+    fixum textus passus_textus ← partes.accipe(7) vel ""
+    fixum textus lentus_textus ← partes.accipe(8) vel ""
+    varia numerus versio ← 0
+    varia numerus generatio ← 0
+    varia numerus passus ← 0
+    varia f32 lentus ← (0.0 ∷ f32)
+    si non (_numerica(versio_textus)) {
+        iace finge WireMala { causa = "malformed state version in optimizer wire" }
+    }
+    fac {
+        versio ← versio_textus ↦ numerus
+    }
+    cape err {
+        iace finge WireMala { causa = "malformed state version in optimizer wire" }
+    }
+    si non (_numerica(generatio_textus)) {
+        iace finge WireMala { causa = "malformed generation in optimizer wire" }
+    }
+    fac {
+        generatio ← generatio_textus ↦ numerus
+    }
+    cape err {
+        iace finge WireMala { causa = "malformed generation in optimizer wire" }
+    }
+    si non (_numerica(passus_textus)) {
+        iace finge WireMala { causa = "malformed step count in optimizer wire" }
+    }
+    fac {
+        passus ← passus_textus ↦ numerus
+    }
+    cape err {
+        iace finge WireMala { causa = "malformed step count in optimizer wire" }
+    }
+    fac {
+        lentus ← lentus_textus ↦ f32
+    }
+    cape err {
+        iace finge WireMala { causa = "malformed learning rate in optimizer wire" }
+    }
+    redde _structum(possessor, nomen, versio, generatio, passus, lentus)
+}
+
+# The whole-optimizer (checkpoint) wire: count-prefixed, ';'-separated
+# slots. The empty optimizer is "optimizer/sgd/1.0.0/0" (no slots).
+functio serializa(Sgd o) → textus {
+    varia textus out ← "optimizer/sgd/" + schema_versio + "/" + (o.numerus() ↦ textus)
+    itera ex o.statia fixum s {
+        out ← out + ";" + serializa_statum(s)
+    }
+    redde out
+}
+
+functio deserializa(textus wire) → Sgd ⇥ OptimizeError {
+    fixum lista<textus> partes ← wire.divide(";")
+    si partes.longitudo() < 1 {
+        iace finge WireMala { causa = "malformed optimizer wire" }
+    }
+    fixum lista<textus> caput ← (partes.accipe(0) vel "").divide("/")
+    si caput.longitudo() ≠ 4 {
+        iace finge WireMala { causa = "malformed optimizer wire header" }
+    }
+    si caput.accipe(0) vel "" ≠ "optimizer" {
+        iace finge WireMala { causa = "unknown optimizer marker" }
+    }
+    si caput.accipe(1) vel "" ≠ "sgd" {
+        iace finge WireMala { causa = "unknown optimizer marker" }
+    }
+    si caput.accipe(2) vel "" ≠ schema_versio {
+        iace finge VersioIgnota { causa = "unknown optimizer schema version" }
+    }
+    fixum textus count_textus ← caput.accipe(3) vel ""
+    si non (_numerica(count_textus)) {
+        iace finge WireMala { causa = "malformed slot count in optimizer wire" }
+    }
+    varia numerus count ← 0
+    fac {
+        count ← count_textus ↦ numerus
+    }
+    cape err {
+        iace finge WireMala { causa = "malformed slot count in optimizer wire" }
+    }
+    si count ≠ partes.longitudo() - 1 {
+        iace finge WireMala { causa = "slot count mismatch in optimizer wire" }
+    }
+    varia lista<SgdStatum> statia ← vacua
+    varia numerus i ← 1
+    dum i < partes.longitudo() {
+        fixum SgdStatum s ← deserializa_statum(partes.accipe(i) vel "")
+        statia.appende(s)
+        i ← i + 1
+    }
+    redde Sgd { statia = statia }
+}
