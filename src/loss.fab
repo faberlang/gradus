@@ -21,6 +21,312 @@
 #   mse_2x8 row 9 — bert-tiny-fragment train.fab:375;
 #                   bert-gradus-probe train.fab:356,373
 
+# =========================================================================
+# PML4-U1 (production-ml-library/pml4-delivery.md) — production loss surface.
+#
+# Shape-generic loss functions over the PML1 staged tensor carrier
+# (gradus:tensor Tensor): mse and cross_entropy. They use the staged carrier
+# (runtime shapes), so their shapes are runtime facts (R3: no one-row/
+# one-shape narrowing in the public API). Every failure is a typed LossError
+# with a textus causa.
+#
+# The three admitted fixed-shape MSE rows above are preserved as the admitted
+# caller surface; their formula is exactly the general mse() over the same
+# element arithmetic (mean((p − t)²)) — one documented formula, two entry
+# styles. New callers use the tensor-surface functions.
+#
+# --- Formulas (matching the accepted GPU-training proofs) -----------------
+#   mse(p, t)        = mean((p − t)²) over all elements — the loss of the
+#                      linear-regression (2×2), MLP (4×4), and BERT-tiny
+#                      (2×8) training proofs.
+#   cross_entropy    = mean over rows of (logsumexp(logits_row) −
+#                      logits_row[target]) — the classification / next-token
+#                      path. logsumexp uses the numerically stabilized form
+#                      max + ln(Σ_c exp(z_c − max)); exp via the base-e
+#                      exponentiation with a sign split so potentia is only
+#                      ever called with a non-negative exponent (the accepted
+#                      GELU tanh precedent), ln self-hosted by range
+#                      reduction + the atanh series (no scalar log builtin
+#                      exists in the compiler surface — probed 2026-08-09).
+#
+# --- Determinism contract (PML4-U1 "deterministic seeds") -----------------
+# Both losses are pure, deterministic functions: no RNG, no global state, no
+# hidden reduction order. Iteration is fixed row-major over the flat storage,
+# so equal inputs produce bit-identical outputs. A training run seeded with
+# the same data therefore reproduces identical losses; the full
+# seed/RNG-machinery contract (state + RNG + epoch/step, checkpoint resume)
+# is PML4-U5's.
+#
+# --- Non-finite handling (capsule rule — fail closed, no silent tolerance) -
+# Any non-finite (NaN/±Inf) value in an input fails closed with
+# LossError.NonFinita before any arithmetic. Division by zero cannot occur:
+# empty inputs (0 elements / 0 rows / 0 classes) fail closed first.
+#
+# --- Compiler-boundary notes ----------------------------------------------
+#   * The staged carrier (runtime shape) exists precisely so shape-generic
+#     library functions typecheck in library context (SEM014 holes do not
+#     unify); this surface follows the PML3 nn/math precedent.
+#   * Cross-entropy numerics: the CPU reference evaluates the documented
+#     formulas in f64; this surface is f32 self-hosted. The co-located
+#     proba pins the f64 oracle values within a documented 5e-4 absolute
+#     tolerance (approximata), matching the nn/attention/transformer
+#     posture. Execution is env-blocked tree-wide today (FMIR stepper /
+#     library-import gap — recorded residual); the proba is the
+#     compile-level proof of the same contract.
+#
+# --- Seams ----------------------------------------------------------------
+#   * optimizer state, schedules, train/eval mode, metrics, seeds (RNG) —
+#     PML4-U3+ (gradus:optimize / gradus:train). A loss is a differentiable
+#     function, not an optimization concern: this module must not import
+#     from gradus:optimize or gradus:nn.
+
+importa ex "gradus:dtype" privata dtype
+importa ex "gradus:shape" privata forma
+importa ex "gradus:tensor" privata tensor
+
+# -------------------------------------------------------------------------
+# LossError — typed error vocabulary of the loss surface. Every variant
+# carries a textus causa (render via causa), mirroring the tensor/shape/
+# dtype/math/nn error contract.
+# -------------------------------------------------------------------------
+
+discretio LossError {
+    DimensioNegativa { textus causa },
+    DimensioSupraLimitem { textus causa },
+    ProductumSupraLimitem { textus causa },
+    GradusMismatch { textus causa },
+    FormaMismatch { textus causa },
+    TypoMismatch { textus causa },
+    ElementaMismatch { textus causa },
+    Incompatibilis { textus causa },
+    NonFinita { textus causa }
+}
+
+functio causa(LossError e) → textus {
+    discerne e {
+        casu DimensioNegativa fixum causa { redde causa }
+        casu DimensioSupraLimitem fixum causa { redde causa }
+        casu ProductumSupraLimitem fixum causa { redde causa }
+        casu GradusMismatch fixum causa { redde causa }
+        casu FormaMismatch fixum causa { redde causa }
+        casu TypoMismatch fixum causa { redde causa }
+        casu ElementaMismatch fixum causa { redde causa }
+        casu Incompatibilis fixum causa { redde causa }
+        casu NonFinita fixum causa { redde causa }
+    }
+}
+
+# -------------------------------------------------------------------------
+# Private helpers.
+# -------------------------------------------------------------------------
+
+# Bounded element count with the module's typed error mapping (FormaError →
+# LossError, variant identity preserved via the documented causa text — same
+# pattern as math.fab / nn.fab).
+@ privata
+functio _quantitas_valid(lista<numerus> f) → numerus ⇥ LossError {
+    fac {
+        redde forma.quantitas(f)
+    }
+    cape err {
+        fixum textus c ← forma.causa(err)
+        si c ≡ "negative dimension" {
+            iace finge DimensioNegativa { causa = c }
+        }
+        si c ≡ "dimension above ceiling" {
+            iace finge DimensioSupraLimitem { causa = c }
+        }
+        si c ≡ "element count above ceiling" {
+            iace finge ProductumSupraLimitem { causa = c }
+        }
+        iace finge FormaMismatch { causa = c }
+    }
+}
+
+# Dtype parity + F32 gate for the pair losses (mse). Promotion is an
+# explicit casta step, never implicit; only the F32 row is admitted.
+@ privata
+functio _typo_par_duo(tensor.Tensor a, tensor.Tensor b) → bivalens ⇥ LossError {
+    fixum textus ta ← dtype.nomen(a.typus())
+    fixum textus tb ← dtype.nomen(b.typus())
+    si ta ≠ tb {
+        iace finge TypoMismatch { causa = "dtype mismatch" }
+    }
+    si ta ≠ "f32" {
+        iace finge TypoMismatch { causa = "unsupported dtype for loss" }
+    }
+    redde verum
+}
+
+# F32-only gate for the unary-tag loss (cross_entropy logits).
+@ privata
+functio _typo_f32(tensor.Tensor t) → bivalens ⇥ LossError {
+    si dtype.nomen(t.typus()) ≠ "f32" {
+        iace finge TypoMismatch { causa = "unsupported dtype for loss" }
+    }
+    redde verum
+}
+
+# e^x via the base-e exponentiation with a sign split: potentia is only
+# ever called with a non-negative exponent (1/e^{−x} for x < 0), matching
+# the accepted GELU tanh precedent — no negative-power runtime claim.
+fixum f32 E ← (2.718281828459045 ∷ f32)
+fixum f32 LN_2 ← (0.6931471805599453 ∷ f32)
+
+@ privata
+functio _exponens(f32 x) → f32 {
+    si x ≥ 0.0 {
+        redde E.potentia(x)
+    }
+    redde 1.0 / E.potentia(0.0 - x)
+}
+
+# ln(x) for x > 0 (callers guarantee x > 0): range-reduce x into [1, 2) by
+# repeated halving/doubling, then the atanh series ln(m) = 2·Σ y^(2n+1)/(2n+1)
+# with y = (m−1)/(m+1) ∈ [0, 1/3). 16 terms leave the remainder below f32
+# epsilon; the k·ln(2) correction is exact to f32.
+@ privata
+functio _logarithmus(f32 x) → f32 {
+    varia f32 m ← x
+    varia numerus k ← 0
+    dum m > 2.0 {
+        m ← m / 2.0
+        k ← k + 1
+    }
+    dum m < 1.0 {
+        m ← m * 2.0
+        k ← k - 1
+    }
+    varia f32 y ← (m - 1.0) / (m + 1.0)
+    varia f32 y2 ← y * y
+    varia f32 term ← y
+    varia f32 sum ← y
+    varia numerus n ← 1
+    dum n < 16 {
+        term ← term * y2
+        sum ← sum + term / ((2 * n + 1) ↦ f32)
+        n ← n + 1
+    }
+    redde 2.0 * sum + (k ↦ f32) * LN_2
+}
+
+# -------------------------------------------------------------------------
+# Family: mse — mean((prediction − target)²) over the staged carrier.
+# Any shape (the admitted 2×2 / 4×4 / 2×8 rows included); the shape must
+# match, both operands must be F32-tagged, and every input value must be
+# finite (fail closed). Deterministic: fixed row-major iteration, no RNG.
+# -------------------------------------------------------------------------
+
+functio mse(tensor.Tensor prediction, tensor.Tensor target) → f32 ⇥ LossError {
+    fixum lista<numerus> fp ← prediction.figura()
+    fixum lista<numerus> ft ← target.figura()
+    si non (fp ≡ ft) {
+        iace finge FormaMismatch { causa = "prediction and target shapes differ" }
+    }
+    fixum bivalens _ ← _typo_par_duo(prediction, target)
+    fixum numerus total ← _quantitas_valid(fp)
+    si total ≡ 0 {
+        iace finge ElementaMismatch { causa = "empty loss input" }
+    }
+    itera ex prediction.datos fixum v {
+        si non (dtype.finita(v)) {
+            iace finge NonFinita { causa = "non-finite prediction" }
+        }
+    }
+    itera ex target.datos fixum v {
+        si non (dtype.finita(v)) {
+            iace finge NonFinita { causa = "non-finite target" }
+        }
+    }
+    varia f32 acc ← (0.0 ∷ f32)
+    itera ab 0‥total fixum i {
+        fixum f32 p ← prediction.datos.accipe(i) vel (0.0 ∷ f32)
+        fixum f32 t ← target.datos.accipe(i) vel (0.0 ∷ f32)
+        fixum f32 d ← p - t
+        acc ← acc + d * d
+    }
+    redde acc / (total ↦ f32)
+}
+
+# -------------------------------------------------------------------------
+# Family: cross_entropy — mean over rows of (logsumexp(logits_row) −
+# logits_row[target]) over the staged carrier. The classification /
+# next-token path: logits are rank-2 [N, C] F32; target is rank-1 [N]
+# I32-tagged class indices (the integer domain of the dtype lattice). Row
+# logsumexp uses the stabilized max + ln(Σ exp(z − max)) form. Labels must
+# be exact integers in [0, C) and all inputs finite (fail closed).
+# Deterministic: fixed row-major iteration, no RNG.
+# -------------------------------------------------------------------------
+
+functio cross_entropy(tensor.Tensor logits, tensor.Tensor target) → f32 ⇥ LossError {
+    fixum lista<numerus> fl ← logits.figura()
+    si fl.longitudo() ≠ 2 {
+        iace finge GradusMismatch { causa = "cross_entropy requires rank-2 logits" }
+    }
+    fixum bivalens _ ← _typo_f32(logits)
+    si dtype.nomen(target.typus()) ≠ "i32" {
+        iace finge TypoMismatch { causa = "cross_entropy target must be i32 class indices" }
+    }
+    fixum numerus n ← fl.accipe(0) vel 1
+    fixum numerus c ← fl.accipe(1) vel 1
+    si n ≡ 0 {
+        iace finge ElementaMismatch { causa = "empty batch" }
+    }
+    si c ≡ 0 {
+        iace finge ElementaMismatch { causa = "empty class axis" }
+    }
+    fixum lista<numerus> ft ← target.figura()
+    si ft.longitudo() ≠ 1 {
+        iace finge GradusMismatch { causa = "cross_entropy target must be rank-1" }
+    }
+    si (ft.accipe(0) vel 1) ≠ n {
+        iace finge FormaMismatch { causa = "target length does not match logits rows" }
+    }
+    fixum numerus total ← _quantitas_valid(fl)
+    fixum numerus rows ← total / c
+    itera ex logits.datos fixum v {
+        si non (dtype.finita(v)) {
+            iace finge NonFinita { causa = "non-finite logits" }
+        }
+    }
+    varia f32 acc ← (0.0 ∷ f32)
+    varia numerus row ← 0
+    dum row < rows {
+        fixum f32 lbl ← target.datos.accipe(row) vel (0.0 ∷ f32)
+        si non (dtype.finita(lbl)) {
+            iace finge NonFinita { causa = "non-finite target" }
+        }
+        fixum numerus k ← lbl.trunca()
+        si non ((k ↦ f32) ≡ lbl) {
+            iace finge Incompatibilis { causa = "target must be integer class indices" }
+        }
+        si k < 0 aut k ≥ c {
+            iace finge Incompatibilis { causa = "target class out of range" }
+        }
+        varia f32 max ← logits.datos.accipe(row * c) vel (0.0 ∷ f32)
+        varia numerus j ← 1
+        dum j < c {
+            fixum f32 z ← logits.datos.accipe(row * c + j) vel (0.0 ∷ f32)
+            si z > max {
+                max ← z
+            }
+            j ← j + 1
+        }
+        varia f32 s ← (0.0 ∷ f32)
+        varia numerus jj ← 0
+        dum jj < c {
+            fixum f32 z ← logits.datos.accipe(row * c + jj) vel (0.0 ∷ f32)
+            s ← s + _exponens(z - max)
+            jj ← jj + 1
+        }
+        fixum f32 lse ← max + _logarithmus(s)
+        fixum f32 zk ← logits.datos.accipe(row * c + k) vel (0.0 ∷ f32)
+        acc ← acc + (lse - zk)
+        row ← row + 1
+    }
+    redde acc / (rows ↦ f32)
+}
+
 # -------------------------------------------------------------------------
 # mse_2x2 — mean((prediction − target)²) (2×2 f32, linear-regression shape)
 # -------------------------------------------------------------------------
