@@ -264,7 +264,7 @@ own paths/configuration and hosts own physical upload.
 
 ### PML3 — Reusable forward models and architecture rows
 
-**Status**: planned — after PML1; may overlap late PML2 after parameter schema
+**Status**: delivered — PML3 U1–U5 delivered and admitted (9822cfa, 5260049, 7bf9acc, 359c5f0, 92df3ff); gate MET — forward functions composable + autograd-independent + oracle-matching; U4 partial per CTO Q2 (runtime identity deferred to a runtime-evidence gate — residual, owner auditor/faber test path); support rows populated (2 architecture rows); PML4 next — PML3 must not require PML4, the phase intent held
 **Owner**: Gradus.
 **Source**: `src/nn.fab`, `src/attention.fab`, `src/transformer.fab`, accepted
 GPU-training proofs, and the PML1 parameter contract.
