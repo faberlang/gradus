@@ -18,7 +18,7 @@ Gradus owns model bytes and semantic admission: one Safetensors row and one sele
 ### PML2-U1 — Admitted-model capsule implementation (C8)
 - **done_when**: the typed admitted-model capsule from PML0-U14 exists as a gradus type (validated bytes + cryptographic identity + tokenizer identity + quantization + bounds + architecture facts); raw GGUF/Safetensors bytes and paths are never trust anchors — only the capsule carries identity across Gradus ↔ faber-runtime/hosts; schema version-stamped.
 - **write_scope**: `gradus/src/model/capsule.fab`, tests. **est_work_tokens**: 12k–24k. **tool_latency**: low.
-- **dependencies**: PML1-U2 (dtype), PML1-U7 (serialization), PML0-U14.
+- **dependencies**: none — leaf by design (capsule imports nothing; ceilings mirrored as constants; PML0-U14 contract only).
 - **parallel_children_considered**: none — capsule is the admission root.
 
 ### PML2-U2 — Safetensors row
