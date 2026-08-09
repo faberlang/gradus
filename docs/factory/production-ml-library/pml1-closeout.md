@@ -37,6 +37,16 @@ PML1 shape representation, confirmed at phase close.
   pinned-row ceiling. The shape system admits them; PML2 support-matrix rows
   must carry their own per-row dimension ceilings rather than re-applying
   the GI1 65536 cap globally.
+- **Serialize mirror aligned (phase-audit residual, CLOSED)**: the PML1
+  phase audit found `gradus:serialize` still rejecting dims > 65536 at
+  `src/serialize.fab` (`_quantitas` + the four shape-wire encode/decode
+  ceiling checks), while `shape.quantitas` admits them — a mirror
+  divergence that made 128k–152k-vocab shapes legal but not
+  wire-round-trippable. The per-dim 65536 was a policy mirror of the GI1
+  capsule ceiling, not a wire-format limit (dims encode as i64be), so the
+  serialization checks were aligned to `shape.quantitas`: no per-dimension
+  cap, element ceiling 1_000_000_000 and negative-dim rejection retained.
+  Wire schema unchanged (serialize-schema-1.0.0; no version bump).
 
 ## R1 record 2 — Float-encoding drift flag (NGAB1 packet-fact recheck)
 
