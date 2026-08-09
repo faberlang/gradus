@@ -5,6 +5,10 @@ admission-migration mechanics decision, no-dual-authority by code location,
 owner + fallback).
 **Status**: decided 2026-08-08 — **migrate into Gradus** (recorded default in
 Vivi need `f3309d29`; proceeds until overridden by operator).
+**Confirmed by operator 2026-08-09**: the default is the normal path — porting
+the proven Rust admission trio with the Rust implementation as the reference
+oracle needs no operator decision. The need is closed (`f3309d29` done);
+the recorded default stands as decided.
 **Decision owner**: **operator** — the binding decision owner per
 `pml0-delivery.md` ("Decision owner: operator"; recorded via Vivi need To
 `operator@`, default proceeds until overridden).
