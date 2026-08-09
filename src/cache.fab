@@ -1,0 +1,537 @@
+# KV-cache values and mutation rules — PML5-U2 (production inference
+# computation layer; the campaign never-split unit).
+#
+# Public import: importa ex "gradus:cache" privata cache
+# Depends on: gradus:dtype (tags/finita), gradus:tensor (value carrier).
+#
+# Architectural rule: gradus owns computation and logical state — NOT
+# scheduling, batching, HTTP, or device handles (the product repo / NGAB
+# own device residency). This module holds no device handle and makes no
+# performance claims.
+#
+# =========================================================================
+# The KV-cache contract (pml5-delivery.md PML5-U2)
+# =========================================================================
+#
+# --- The typed logical value ---------------------------------------------
+# KVCache is the per-session key/value state the decode serves: one K/V
+# pair per layer of the forward row (the gradus row is a single
+# transformer block — stratorum = 1), each an [positions, dimensio] f32
+# staged tensor, plus the exact token history (historia) and the
+# identity fields (model / model version / execution config / tokenizer
+# identity). No device handle, no physical residency.
+#
+# --- Declared mutation rules ---------------------------------------------
+#   * Append per position (appende): extends the K/V by exactly ONE
+#     position and the history by one token; strictly sequential — the
+#     appended position is always the current history length (no gaps,
+#     no duplicates, no reordering). Deterministic and pure.
+#   * Generation tracking: versio is the cache's generation — the
+#     mutation counter, starts at 1, bumps by 1 on every successful
+#     append. Identity fields (model/version/config/tokenizer/stratorum/
+#     dimensio) are stable across appends.
+#   * Reset (redintegra): a fresh cache — the same identity fields, an
+#     empty history and empty K/V, versio 1.
+#
+# --- Cache identity key (MD-A9 precedent) --------------------------------
+# The cache's identity (IdentitasCache) is a typed record over the MD-A9
+# key fields gradus owns: model, model version, execution configuration,
+# tokenizer identity, exact token prefix/history, positions/RoPE facts,
+# layer count, dtype, and layout. A versioned wire form round-trips the
+# key exactly; identity equality is field-wise (the product repo / NGAB
+# consume the exact key — never a second authority). The empty-prefix
+# wire segment uses the documented sentinel "-".
+#
+# --- Evidence honesty (CTO Q2, hard) -------------------------------------
+# This surface is the STRUCTURAL proof: the mutation rules and the
+# identity-key facts are compile-validated and proven by the co-located
+# proba. The append/readback arithmetic is exact concatenation (no
+# rounding — pins are exact); the identity-key facts are exact textus/
+# numerus pins. Executed VALUE identity is env-blocked tree-wide today
+# (FMIR stepper / library-import gap — the PML4 closeout recorded both
+# blockers; neither is fixed here). PML5-U2 is PARTIAL: value-identity is
+# deferred to the auditor-owned runtime-evidence gate.
+importa ex "gradus:dtype" privata dtype
+importa ex "gradus:tensor" privata tensor
+
+# -------------------------------------------------------------------------
+# CacheError — typed error vocabulary of the KV-cache surface.
+# Every variant carries a textus causa (render via causa).
+# -------------------------------------------------------------------------
+
+discretio CacheError {
+    NomenInane { textus causa },
+    IdExtra { textus causa },
+    FormaMismatch { textus causa },
+    TypoMismatch { textus causa },
+    DimensioInvalida { textus causa },
+    ElementaMismatch { textus causa },
+    VersioIgnota { textus causa },
+    WireMala { textus causa }
+}
+
+functio causa(CacheError e) → textus {
+    discerne e {
+        casu NomenInane fixum causa { redde causa }
+        casu IdExtra fixum causa { redde causa }
+        casu FormaMismatch fixum causa { redde causa }
+        casu TypoMismatch fixum causa { redde causa }
+        casu DimensioInvalida fixum causa { redde causa }
+        casu ElementaMismatch fixum causa { redde causa }
+        casu VersioIgnota fixum causa { redde causa }
+        casu WireMala fixum causa { redde causa }
+    }
+}
+
+# The cache's schema version (the identity wire form).
+fixum textus schema_versio ← "1.0.0"
+
+# The canonical layout tag of the admitted row (the F32 staged carrier).
+fixum textus ORDINATIO_STAGED ← "staged"
+
+# -------------------------------------------------------------------------
+# Private helpers.
+# -------------------------------------------------------------------------
+
+# Staged-tensor construction (the never-firing shape check, re-mapped).
+@ privata
+functio _tense(lista<f32> datos, lista<numerus> forma) → tensor.Tensor ⇥ CacheError {
+    fac {
+        redde tensor.structa(datos, forma)
+    }
+    cape err {
+        iace finge ElementaMismatch { causa = tensor.causa(err) }
+    }
+    iace finge ElementaMismatch { causa = "unreachable" }
+}
+
+# List element access (the never-firing bounds check, re-mapped to the
+# uninitialized fallback — callers validate lengths first).
+@ privata
+functio _accipe(lista<f32> datos, numerus i) → f32 {
+    fac {
+        redde datos.accipe(i)
+    }
+    cape err {
+        redde (0.0 - 999.0) ∷ f32
+    }
+    redde (0.0 - 999.0) ∷ f32
+}
+
+# "/" and ";" are reserved in the identity wire fields (the U3 wire-safety
+# rule).
+@ privata
+functio _habeat_solidum(textus s) → bivalens {
+    varia numerus i ← 0
+    dum i < s.longitudo() {
+        si s.accipe(i) ≡ "/" aut s.accipe(i) ≡ ";" ergo redde verum
+        i ← i + 1
+    }
+    redde falsum
+}
+
+@ privata
+functio _digitum(textus c) → bivalens {
+    redde c ≡ "0" aut c ≡ "1" aut c ≡ "2" aut c ≡ "3" aut c ≡ "4" aut c ≡ "5" aut c ≡ "6" aut c ≡ "7" aut c ≡ "8" aut c ≡ "9"
+}
+
+@ privata
+functio _numerica(textus s) → bivalens {
+    si s.longitudo() ≡ 0 ergo redde falsum
+    si s.longitudo() > 18 ergo redde falsum
+    varia numerus i ← 0
+    dum i < s.longitudo() {
+        si non (_digitum(s.accipe(i))) ergo redde falsum
+        i ← i + 1
+    }
+    redde verum
+}
+
+# Tensor field-wise equality (figura + flat data).
+@ privata
+functio _tensor_aequus(tensor.Tensor a, tensor.Tensor b) → bivalens {
+    si non (a.figura() ≡ b.figura()) ergo redde falsum
+    si non (a.datos ≡ b.datos) ergo redde falsum
+    redde verum
+}
+
+# -------------------------------------------------------------------------
+# KVCache — the typed logical value.
+# -------------------------------------------------------------------------
+
+genus KVCache {
+    textus model
+    textus versio_modelis
+    textus configuratio
+    textus tokenizator
+    lista<numerus> historia
+    numerus stratorum
+    textus typo
+    textus ordinatio
+    tensor.Tensor clavis
+    tensor.Tensor valor
+    numerus versio
+    numerus dimensio
+
+    # Model name (identity).
+    functio model() → textus {
+        redde ego.model
+    }
+
+    # Model version (identity).
+    functio versio_modelis() → textus {
+        redde ego.versio_modelis
+    }
+
+    # Execution configuration tag (identity; carries the RoPE/scale facts).
+    functio configuratio() → textus {
+        redde ego.configuratio
+    }
+
+    # Tokenizer identity (identity).
+    functio tokenizator() → textus {
+        redde ego.tokenizator
+    }
+
+    # The exact token history (prefix) appended so far.
+    functio historia() → lista<numerus> {
+        redde ego.historia
+    }
+
+    # Layer count of the forward row (the identity's layer field).
+    functio stratorum() → numerus {
+        redde ego.stratorum
+    }
+
+    # Element dtype nomen (identity; "f32" — the admitted row).
+    functio typo() → textus {
+        redde ego.typo
+    }
+
+    # Layout tag (identity; "staged").
+    functio ordinatio() → textus {
+        redde ego.ordinatio
+    }
+
+    # The cached K tensor [positions, dimensio].
+    functio clavis() → tensor.Tensor {
+        redde ego.clavis
+    }
+
+    # The cached V tensor [positions, dimensio].
+    functio valor() → tensor.Tensor {
+        redde ego.valor
+    }
+
+    # Generation (mutation counter: starts 1, bumps per append).
+    functio versio() → numerus {
+        redde ego.versio
+    }
+
+    # The cached feature width.
+    functio dimensio() → numerus {
+        redde ego.dimensio
+    }
+
+    # Cached position count (= the history length).
+    functio longitudo() → numerus {
+        redde ego.historia.longitudo()
+    }
+}
+
+# Field-wise cache equality — the determinism/round-trip predicate.
+functio cache_aequus(KVCache a, KVCache b) → bivalens {
+    si a.model() ≠ b.model() ergo redde falsum
+    si a.versio_modelis() ≠ b.versio_modelis() ergo redde falsum
+    si a.configuratio() ≠ b.configuratio() ergo redde falsum
+    si a.tokenizator() ≠ b.tokenizator() ergo redde falsum
+    si non (a.historia() ≡ b.historia()) ergo redde falsum
+    si a.stratorum() ≠ b.stratorum() ergo redde falsum
+    si a.typo() ≠ b.typo() ergo redde falsum
+    si a.ordinatio() ≠ b.ordinatio() ergo redde falsum
+    si non (_tensor_aequus(a.clavis(), b.clavis())) ergo redde falsum
+    si non (_tensor_aequus(a.valor(), b.valor())) ergo redde falsum
+    si a.versio() ≠ b.versio() ergo redde falsum
+    si a.dimensio() ≠ b.dimensio() ergo redde falsum
+    redde verum
+}
+
+# -------------------------------------------------------------------------
+# cache_vacua — a fresh cache: the identity fields, an empty history, an
+# empty K/V [0, dimensio], versio 1. Identity fields are non-empty and
+# wire-safe (fail closed); the stratorum/dimensio are positive.
+# -------------------------------------------------------------------------
+
+functio cache_vacua(textus model, textus versio_modelis, textus configuratio, textus tokenizator, numerus stratorum, numerus dimensio) → KVCache ⇥ CacheError {
+    si model.longitudo() ≡ 0 {
+        iace finge NomenInane { causa = "empty model name" }
+    }
+    si versio_modelis.longitudo() ≡ 0 {
+        iace finge NomenInane { causa = "empty model version" }
+    }
+    si configuratio.longitudo() ≡ 0 {
+        iace finge NomenInane { causa = "empty execution config" }
+    }
+    si tokenizator.longitudo() ≡ 0 {
+        iace finge NomenInane { causa = "empty tokenizer identity" }
+    }
+    si _habeat_solidum(model) aut _habeat_solidum(versio_modelis) aut _habeat_solidum(configuratio) aut _habeat_solidum(tokenizator) {
+        iace finge NomenInane { causa = "reserved wire character in identity" }
+    }
+    si stratorum < 1 {
+        iace finge DimensioInvalida { causa = "layer count must be at least one" }
+    }
+    si dimensio < 1 {
+        iace finge DimensioInvalida { causa = "embedding dimension must be at least one" }
+    }
+    fixum tensor.Tensor clavis ← _tense([], [0, dimensio])
+    fixum tensor.Tensor valor ← _tense([], [0, dimensio])
+    redde KVCache {
+        model = model,
+        versio_modelis = versio_modelis,
+        configuratio = configuratio,
+        tokenizator = tokenizator,
+        historia = vacua,
+        stratorum = stratorum,
+        typo = "f32",
+        ordinatio = ORDINATIO_STAGED,
+        clavis = clavis,
+        valor = valor,
+        versio = 1,
+        dimensio = dimensio
+    }
+}
+
+# -------------------------------------------------------------------------
+# appende — the ONE mutation: extend the cache by exactly one position.
+# The token joins the exact history; the [1, dimensio] f32 K/V extends
+# each cached tensor; the generation bumps by 1. Strictly sequential —
+# the appended position is always the current history length (no gaps,
+# no duplicates). Deterministic and pure.
+# -------------------------------------------------------------------------
+
+functio appende(KVCache c, numerus token_id, tensor.Tensor clavis, tensor.Tensor valor) → KVCache ⇥ CacheError {
+    si token_id < 0 {
+        iace finge IdExtra { causa = "token id must be non-negative" }
+    }
+    si non (clavis.figura() ≡ [1, c.dimensio()]) {
+        iace finge FormaMismatch { causa = "K must be [1, dim]" }
+    }
+    si non (valor.figura() ≡ [1, c.dimensio()]) {
+        iace finge FormaMismatch { causa = "V must be [1, dim]" }
+    }
+    si dtype.nomen(clavis.typus()) ≠ "f32" {
+        iace finge TypoMismatch { causa = "unsupported dtype for cache" }
+    }
+    si dtype.nomen(valor.typus()) ≠ "f32" {
+        iace finge TypoMismatch { causa = "unsupported dtype for cache" }
+    }
+    varia lista<numerus> novum_historia ← c.historia()
+    novum_historia.appende(token_id)
+    varia lista<f32> nova_clavis ← vacua
+    itera ex c.clavis().datos fixum v {
+        nova_clavis.appende(v)
+    }
+    itera ex clavis.datos fixum v {
+        nova_clavis.appende(v)
+    }
+    varia lista<f32> nova_valor ← vacua
+    itera ex c.valor().datos fixum v {
+        nova_valor.appende(v)
+    }
+    itera ex valor.datos fixum v {
+        nova_valor.appende(v)
+    }
+    fixum numerus novus ← c.longitudo() + 1
+    redde KVCache {
+        model = c.model(),
+        versio_modelis = c.versio_modelis(),
+        configuratio = c.configuratio(),
+        tokenizator = c.tokenizator(),
+        historia = novum_historia,
+        stratorum = c.stratorum(),
+        typo = c.typo(),
+        ordinatio = c.ordinatio(),
+        clavis = _tense(nova_clavis, [novus, c.dimensio()]),
+        valor = _tense(nova_valor, [novus, c.dimensio()]),
+        versio = c.versio() + 1,
+        dimensio = c.dimensio()
+    }
+}
+
+# -------------------------------------------------------------------------
+# redintegra — the reset rule: a fresh cache with the same identity
+# fields, an empty history and empty K/V, versio 1 (fresh state).
+# -------------------------------------------------------------------------
+
+functio redintegra(KVCache c) → KVCache ⇥ CacheError {
+    fixum tensor.Tensor clavis ← _tense([], [0, c.dimensio()])
+    fixum tensor.Tensor valor ← _tense([], [0, c.dimensio()])
+    redde KVCache {
+        model = c.model(),
+        versio_modelis = c.versio_modelis(),
+        configuratio = c.configuratio(),
+        tokenizator = c.tokenizator(),
+        historia = vacua,
+        stratorum = c.stratorum(),
+        typo = c.typo(),
+        ordinatio = c.ordinatio(),
+        clavis = clavis,
+        valor = valor,
+        versio = 1,
+        dimensio = c.dimensio()
+    }
+}
+
+# -------------------------------------------------------------------------
+# IdentitasCache — the typed cache identity key (MD-A9 precedent). The
+# fields gradus owns: model, model version, execution configuration,
+# tokenizer identity, exact token prefix, positions/RoPE facts, layer
+# count, dtype, layout. Field-wise equality; a versioned wire round-trip.
+# -------------------------------------------------------------------------
+
+genus IdentitasCache {
+    textus model
+    textus versio_modelis
+    textus configuratio
+    textus tokenizator
+    textus historia
+    textus positio
+    numerus stratorum
+    textus typo
+    textus ordinatio
+
+    functio model() → textus { redde ego.model }
+    functio versio_modelis() → textus { redde ego.versio_modelis }
+    functio configuratio() → textus { redde ego.configuratio }
+    functio tokenizator() → textus { redde ego.tokenizator }
+    functio historia() → textus { redde ego.historia }
+    functio positio() → textus { redde ego.positio }
+    functio stratorum() → numerus { redde ego.stratorum }
+    functio typo() → textus { redde ego.typo }
+    functio ordinatio() → textus { redde ego.ordinatio }
+}
+
+# Field-wise identity equality — the key-reuse predicate.
+functio identitas_cache_aequus(IdentitasCache a, IdentitasCache b) → bivalens {
+    si a.model() ≠ b.model() ergo redde falsum
+    si a.versio_modelis() ≠ b.versio_modelis() ergo redde falsum
+    si a.configuratio() ≠ b.configuratio() ergo redde falsum
+    si a.tokenizator() ≠ b.tokenizator() ergo redde falsum
+    si a.historia() ≠ b.historia() ergo redde falsum
+    si a.positio() ≠ b.positio() ergo redde falsum
+    si a.stratorum() ≠ b.stratorum() ergo redde falsum
+    si a.typo() ≠ b.typo() ergo redde falsum
+    si a.ordinatio() ≠ b.ordinatio() ergo redde falsum
+    redde verum
+}
+
+# Derive the identity key from a cache state: the prefix is the
+# comma-joined token history; the position span is "0..<count>".
+functio identitas_cache(KVCache c) → IdentitasCache {
+    varia textus historia ← ""
+    itera ab 0‥c.historia().longitudo() fixum i {
+        si i > 0 {
+            historia ← historia + ","
+        }
+        historia ← historia + ((c.historia().accipe(i) vel 0) ↦ textus)
+    }
+    redde IdentitasCache {
+        model = c.model(),
+        versio_modelis = c.versio_modelis(),
+        configuratio = c.configuratio(),
+        tokenizator = c.tokenizator(),
+        historia = historia,
+        positio = "0.." + (c.longitudo() ↦ textus),
+        stratorum = c.stratorum(),
+        typo = c.typo(),
+        ordinatio = c.ordinatio()
+    }
+}
+
+# -------------------------------------------------------------------------
+# Identity wire — versioned, exact round-trip. The empty-prefix segment
+# uses the documented sentinel "-" (divide/split behavior must not depend
+# on empty segments).
+# -------------------------------------------------------------------------
+
+functio serializa_identitas(IdentitasCache i) → textus {
+    varia textus historia ← i.historia()
+    si historia.longitudo() ≡ 0 {
+        historia ← "-"
+    }
+    redde "cache/identity/" + schema_versio + "/" + i.model() + "/" + i.versio_modelis() + "/" + i.configuratio() + "/" + i.tokenizator() + "/" + historia + "/" + i.positio() + "/" + (i.stratorum() ↦ textus) + "/" + i.typo() + "/" + i.ordinatio()
+}
+
+functio deserializa_identitas(textus wire) → IdentitasCache ⇥ CacheError {
+    fixum lista<textus> partes ← wire.divide("/")
+    si partes.longitudo() ≠ 12 {
+        iace finge WireMala { causa = "malformed cache identity wire" }
+    }
+    si partes.accipe(0) vel "" ≠ "cache" {
+        iace finge WireMala { causa = "unknown cache marker" }
+    }
+    si partes.accipe(1) vel "" ≠ "identity" {
+        iace finge WireMala { causa = "unknown cache marker" }
+    }
+    si partes.accipe(2) vel "" ≠ schema_versio {
+        iace finge VersioIgnota { causa = "unknown cache schema version" }
+    }
+    fixum textus model ← partes.accipe(3) vel ""
+    fixum textus versio_modelis ← partes.accipe(4) vel ""
+    fixum textus configuratio ← partes.accipe(5) vel ""
+    fixum textus tokenizator ← partes.accipe(6) vel ""
+    varia textus historia ← partes.accipe(7) vel ""
+    fixum textus positio ← partes.accipe(8) vel ""
+    fixum textus stratorum_textus ← partes.accipe(9) vel ""
+    fixum textus typo ← partes.accipe(10) vel ""
+    fixum textus ordinatio ← partes.accipe(11) vel ""
+    si model.longitudo() ≡ 0 {
+        iace finge WireMala { causa = "empty model name in cache identity" }
+    }
+    si versio_modelis.longitudo() ≡ 0 {
+        iace finge WireMala { causa = "empty model version in cache identity" }
+    }
+    si configuratio.longitudo() ≡ 0 {
+        iace finge WireMala { causa = "empty execution config in cache identity" }
+    }
+    si tokenizator.longitudo() ≡ 0 {
+        iace finge WireMala { causa = "empty tokenizer identity in cache identity" }
+    }
+    si historia ≡ "-" {
+        historia ← ""
+    }
+    si positio.longitudo() ≡ 0 {
+        iace finge WireMala { causa = "malformed position span in cache identity" }
+    }
+    si non (_numerica(stratorum_textus)) {
+        iace finge WireMala { causa = "malformed layer count in cache identity" }
+    }
+    varia numerus stratorum ← 0
+    fac {
+        stratorum ← stratorum_textus ↦ numerus
+    }
+    cape err {
+        iace finge WireMala { causa = "malformed layer count in cache identity" }
+    }
+    si stratorum < 1 {
+        iace finge WireMala { causa = "invalid layer count in cache identity" }
+    }
+    si typo.longitudo() ≡ 0 {
+        iace finge WireMala { causa = "empty dtype in cache identity" }
+    }
+    si ordinatio.longitudo() ≡ 0 {
+        iace finge WireMala { causa = "empty layout in cache identity" }
+    }
+    redde IdentitasCache {
+        model = model,
+        versio_modelis = versio_modelis,
+        configuratio = configuratio,
+        tokenizator = tokenizator,
+        historia = historia,
+        positio = positio,
+        stratorum = stratorum,
+        typo = typo,
+        ordinatio = ordinatio
+    }
+}
