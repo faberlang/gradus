@@ -48,6 +48,7 @@
 # fixed-shape scope (non-_2x2/_4x4/_2x8 names).
 
 importa ex "gradus:dtype" privata dtype
+importa ex "gradus:tensor" privata tensor
 
 # -------------------------------------------------------------------------
 # train_step_2x2 — SGD update of weight + bias (2×2 f32, linear regression)
@@ -280,7 +281,13 @@ discretio TrainError {
     SchedulaInvalida { textus causa },
     ModusIgnotus { textus causa },
     ExcutioInvalida { textus causa },
-    PassusNegativus { textus causa }
+    PassusNegativus { textus causa },
+    SemenInvalida { textus causa },
+    ValorMala { textus causa },
+    PositioInvalida { textus causa },
+    StatumInane { textus causa },
+    VersioIgnota { textus causa },
+    WireMala { textus causa }
 }
 
 functio causa(TrainError e) → textus {
@@ -289,6 +296,12 @@ functio causa(TrainError e) → textus {
         casu ModusIgnotus fixum causa { redde causa }
         casu ExcutioInvalida fixum causa { redde causa }
         casu PassusNegativus fixum causa { redde causa }
+        casu SemenInvalida fixum causa { redde causa }
+        casu ValorMala fixum causa { redde causa }
+        casu PositioInvalida fixum causa { redde causa }
+        casu StatumInane fixum causa { redde causa }
+        casu VersioIgnota fixum causa { redde causa }
+        casu WireMala fixum causa { redde causa }
     }
 }
 
@@ -477,4 +490,377 @@ functio dropout_pars(Modus m, f32 rate) → f32 ⇥ TrainError {
     }
     si est_aestimatio(m) ergo redde (0.0 ∷ f32)
     redde rate
+}
+
+# =========================================================================
+# PML4-U5 — Seeds (RNG), checkpoint resume, metrics (pml4-delivery.md U5)
+# =========================================================================
+#
+# --- Contract ------------------------------------------------------------
+# Three pieces close the reproducibility contract:
+#
+#   1. Semen — the seed/RNG state (this unit owns the machinery U4's
+#      dropout gate composes with). A xorshift64 generator (shifts + XOR
+#      only, no multiply — no overflow concerns) over a nonzero i64
+#      state; deterministic: the same seed produces the same sequence.
+#      proximus() draws the next 64-bit value and advances the state;
+#      proximus_f32() maps a draw to [0, 1) (sign-masked, top 52 bits,
+#      uniform over the masked space — the f32 [0,1) contract). excutio()
+#      is the dropout-mask composition: it takes the effective rate from
+#      dropout_pars (U4) — eval mode is identity and the RNG is left
+#      untouched — and in train mode applies a per-element Bernoulli mask
+#      scaled by 1/(1−rate) (inverted dropout, so the eval identity
+#      composes exactly). Deterministic given (tensor, seed, mode, rate).
+#
+#   2. Tabula — the checkpoint: epoch + step + RNG state + the U3
+#      optimizer-state wire (carried VERBATIM — the envelope stays
+#      autograd-free; the state wire is validated by its own schema,
+#      optimize.deserializa, at resume). Versioned wire round-trip
+#      ("train/checkpoint/1.0.0/<epoch>/<step>/<rng_state>/<state_wire>");
+#      interrupted-resume failure is EXPLICIT: a truncated/malformed
+#      checkpoint wire, an unknown schema, an invalid epoch/step, a zero
+#      RNG state, or a missing state wire all fail closed at
+#      deserialization; a corrupt embedded state wire fails closed at
+#      optimize.deserializa (resume).
+#
+#   3. Metrics — see gradus:metrics (accuratezza + the per-step Metricum
+#      record); defined values with a deterministic contract.
+#
+# --- Shared with the GPU-training lane's accepted facts -----------------
+#   * checkpoint resume (state + RNG + epoch/step) versioned per the U3
+#     wire precedent (slot wire, lossless float form, '/' and ';'
+#     reserved); same fail-closed posture (capsule rule).
+#   * dropout mask semantics: per-element Bernoulli(1−rate), scaled by
+#     1/(1−rate) in train (inverted dropout) — the standard training
+#     policy the U4 dropout_pars gate controls.
+#
+# --- Evidence honesty (CTO Q2, hard) ------------------------------------
+# This surface is the STRUCTURAL proof: the generator recurrence, the
+# mask policy, and the checkpoint round-trip are compile-validated and
+# proven by the co-located proba (f64 oracle pins for the xorshift
+# recurrence, the [0,1) draws, and a concrete dropout-mask output).
+# Executed VALUE identity is env-blocked tree-wide today (FMIR stepper /
+# library-import gap — recorded residual). PML4-U5 is PARTIAL: numeric
+# identity is deferred to a runtime-evidence gate (auditor-owned faber
+# test path; oracle pins recorded in train.proba).
+
+# Schema version of this module's wire forms (rng, checkpoint).
+fixum textus schema_versio ← "1.0.0"
+
+# -------------------------------------------------------------------------
+# Semen — the deterministic RNG state. A xorshift64 state (nonzero i64);
+# the same seed reproduces the same sequence (reproducibility).
+# -------------------------------------------------------------------------
+
+genus Semen {
+    numerus status
+
+    # The 64-bit generator state (nonzero — xorshift64 degenerates at 0).
+    functio status() → numerus {
+        redde ego.status
+    }
+}
+
+# Seed the generator. Zero is rejected fail-closed (xorshift64 maps 0 → 0).
+functio structa_semen(numerus semen) → Semen ⇥ TrainError {
+    si semen ≡ 0 {
+        iace finge SemenInvalida { causa = "seed must be non-zero" }
+    }
+    redde Semen { status = semen }
+}
+
+# One RNG draw: the next 64-bit value + the advanced state.
+genus Fructus {
+    numerus valor
+    Semen semen
+
+    # The drawn value.
+    functio valor() → numerus {
+        redde ego.valor
+    }
+
+    # The advanced generator state.
+    functio semen() → Semen {
+        redde ego.semen
+    }
+}
+
+# xorshift64 step: x ^= x<<13; x ^= x>>7; x ^= x<<17. Shifts + XOR only —
+# no multiply, no overflow concerns. Bitwise on the i64 carrier.
+functio proximus(Semen s) → Fructus {
+    varia numerus x ← s.status()
+    x ← x ⊻ (x ⇐ 13)
+    x ← x ⊻ (x ⇒ 7)
+    x ← x ⊻ (x ⇐ 17)
+    redde Fructus { valor = x, semen = Semen { status = x } }
+}
+
+# Sign-bit mask: the [0,1) draw uses only the low 63 bits (sign-agnostic).
+fixum numerus MASK_63 ← 9223372036854775807
+
+# 2^52 as f32 (exact power of two) — the draw denominator.
+fixum f32 DUO_52 ← (4503599627370496.0 ∷ f32)
+
+# One f32 draw in [0, 1): the top 52 bits of the sign-masked state over
+# 2^52. Uniform over the masked space; deterministic (same seed → same
+# draws). f32 rounding is ~1e-7 — the proba pins compare within 1e-6.
+genus FructusF32 {
+    f32 valor
+    Semen semen
+
+    # The drawn value in [0, 1).
+    functio valor() → f32 {
+        redde ego.valor
+    }
+
+    # The advanced generator state.
+    functio semen() → Semen {
+        redde ego.semen
+    }
+}
+
+functio proximus_f32(Semen s) → FructusF32 {
+    fixum Fructus f ← proximus(s)
+    fixum f32 v ← (((f.valor() ∧ MASK_63) ⇒ 11) ↦ f32) / DUO_52
+    redde FructusF32 { valor = v, semen = f.semen() }
+}
+
+# -------------------------------------------------------------------------
+# excutio — the dropout-mask composition (the U5 machinery the U4
+# dropout_pars gate controls). Eval mode (or rate 0) is identity and the
+# RNG is untouched — the standard evaluation policy, deterministic. Train
+# mode applies a per-element Bernoulli(1−rate) mask scaled by 1/(1−rate)
+# (inverted dropout): x_i ← x_i·m_i/(1−rate), m_i = 1 if r_i ≥ rate.
+# The mask is drawn from the explicit Semen state, which advances; the
+# same (tensor, seed, mode, rate) reproduces the same output.
+# -------------------------------------------------------------------------
+
+genus Excutio {
+    tensor.Tensor valor
+    Semen semen
+
+    # The masked tensor.
+    functio valor() → tensor.Tensor {
+        redde ego.valor
+    }
+
+    # The advanced RNG state.
+    functio semen() → Semen {
+        redde ego.semen
+    }
+}
+
+functio excutio(tensor.Tensor x, Semen s, Modus m, f32 rate) → Excutio ⇥ TrainError {
+    fixum f32 par ← dropout_pars(m, rate)
+    si par ≡ (0.0 ∷ f32) {
+        redde Excutio { valor = x, semen = s }
+    }
+    fixum f32 scala ← 1.0 / (1.0 - par)
+    fixum lista<f32> datos ← x.datos
+    varia lista<f32> novus ← vacua
+    varia Semen s2 ← s
+    itera ex datos fixum v {
+        fixum FructusF32 f ← proximus_f32(s2)
+        s2 ← f.semen()
+        si f.valor() ≥ par {
+            novus.appende(v * scala)
+        }
+        secus {
+            novus.appende((0.0 ∷ f32))
+        }
+    }
+    varia tensor.Tensor renovatus
+    fac {
+        renovatus ← tensor.structa(novus, x.figura())
+    }
+    cape err {
+        iace finge ValorMala { causa = tensor.causa(err) }
+    }
+    redde Excutio { valor = renovatus, semen = s2 }
+}
+
+# -------------------------------------------------------------------------
+# RNG wire — versioned, exact round-trip.
+# -------------------------------------------------------------------------
+
+functio serializa_semen(Semen s) → textus {
+    redde "train/rng/" + schema_versio + "/" + (s.status() ↦ textus)
+}
+
+functio deserializa_semen(textus wire) → Semen ⇥ TrainError {
+    fixum lista<textus> partes ← wire.divide("/")
+    si partes.longitudo() ≠ 4 {
+        iace finge WireMala { causa = "malformed rng wire" }
+    }
+    si partes.accipe(0) vel "" ≠ "train" {
+        iace finge WireMala { causa = "unknown rng marker" }
+    }
+    si partes.accipe(1) vel "" ≠ "rng" {
+        iace finge WireMala { causa = "unknown rng marker" }
+    }
+    si partes.accipe(2) vel "" ≠ schema_versio {
+        iace finge VersioIgnota { causa = "unknown rng schema version" }
+    }
+    fixum textus status_textus ← partes.accipe(3) vel ""
+    si status_textus.longitudo() ≡ 0 {
+        iace finge WireMala { causa = "malformed rng state" }
+    }
+    varia numerus status ← 0
+    fac {
+        status ← status_textus ↦ numerus
+    }
+    cape err {
+        iace finge WireMala { causa = "malformed rng state" }
+    }
+    redde structa_semen(status)
+}
+
+# -------------------------------------------------------------------------
+# Tabula — the checkpoint: epoch + step + RNG state + the optimizer-state
+# wire (U3, carried verbatim). The envelope is autograd-free; the state
+# wire validates against ITS OWN schema at resume (optimize.deserializa).
+# -------------------------------------------------------------------------
+
+genus Tabula {
+    numerus aetas
+    numerus passus
+    Semen rng
+    textus statum_wire
+
+    # Epoch.
+    functio aetas() → numerus {
+        redde ego.aetas
+    }
+
+    # Step within the epoch.
+    functio passus() → numerus {
+        redde ego.passus
+    }
+
+    # The RNG state (deterministic continuation after resume).
+    functio rng() → Semen {
+        redde ego.rng
+    }
+
+    # The embedded U3 optimizer-state wire (verbatim).
+    functio statum_wire() → textus {
+        redde ego.statum_wire
+    }
+}
+
+# Build a checkpoint. Epoch/step are non-negative; the state wire is
+# non-empty (fail closed). The RNG is already a validated Semen.
+functio structa_tabula(numerus aetas, numerus passus, Semen rng, textus statum_wire) → Tabula ⇥ TrainError {
+    si aetas < 0 {
+        iace finge PositioInvalida { causa = "epoch must be non-negative" }
+    }
+    si passus < 0 {
+        iace finge PositioInvalida { causa = "step must be non-negative" }
+    }
+    si statum_wire.longitudo() ≡ 0 {
+        iace finge StatumInane { causa = "checkpoint state wire is empty" }
+    }
+    redde Tabula { aetas = aetas, passus = passus, rng = rng, statum_wire = statum_wire }
+}
+
+# Field-wise checkpoint equality — the round-trip predicate.
+functio tabula_aequus(Tabula a, Tabula b) → bivalens {
+    si a.aetas() ≠ b.aetas() ergo redde falsum
+    si a.passus() ≠ b.passus() ergo redde falsum
+    si a.rng().status() ≠ b.rng().status() ergo redde falsum
+    si a.statum_wire() ≠ b.statum_wire() ergo redde falsum
+    redde verum
+}
+
+# -------------------------------------------------------------------------
+# Checkpoint wire — versioned, exact round-trip. The fixed prefix carries
+# marker/schema/epoch/step/rng-state; the embedded optimizer-state wire is
+# the '/' tail (joined verbatim from the trailing segments).
+# -------------------------------------------------------------------------
+
+functio serializa_tabula(Tabula c) → textus {
+    varia textus out ← "train/checkpoint/" + schema_versio + "/" + (c.aetas() ↦ textus) + "/" + (c.passus() ↦ textus) + "/" + (c.rng().status() ↦ textus) + "/" + c.statum_wire()
+    redde out
+}
+
+# All-digits predicate for wire integer fields (epoch, step).
+@ privata
+functio _digitum(textus c) → bivalens {
+    redde c ≡ "0" aut c ≡ "1" aut c ≡ "2" aut c ≡ "3" aut c ≡ "4" aut c ≡ "5" aut c ≡ "6" aut c ≡ "7" aut c ≡ "8" aut c ≡ "9"
+}
+
+@ privata
+functio _numerica(textus s) → bivalens {
+    si s.longitudo() ≡ 0 ergo redde falsum
+    si s.longitudo() > 18 ergo redde falsum
+    varia numerus i ← 0
+    dum i < s.longitudo() {
+        si non (_digitum(s.accipe(i))) ergo redde falsum
+        i ← i + 1
+    }
+    redde verum
+}
+
+functio deserializa_tabula(textus wire) → Tabula ⇥ TrainError {
+    fixum lista<textus> partes ← wire.divide("/")
+    si partes.longitudo() < 7 {
+        iace finge WireMala { causa = "malformed checkpoint wire" }
+    }
+    si partes.accipe(0) vel "" ≠ "train" {
+        iace finge WireMala { causa = "unknown checkpoint marker" }
+    }
+    si partes.accipe(1) vel "" ≠ "checkpoint" {
+        iace finge WireMala { causa = "unknown checkpoint marker" }
+    }
+    si partes.accipe(2) vel "" ≠ schema_versio {
+        iace finge VersioIgnota { causa = "unknown checkpoint schema version" }
+    }
+    fixum textus aetas_textus ← partes.accipe(3) vel ""
+    fixum textus passus_textus ← partes.accipe(4) vel ""
+    si non (_numerica(aetas_textus)) {
+        iace finge WireMala { causa = "malformed epoch in checkpoint wire" }
+    }
+    si non (_numerica(passus_textus)) {
+        iace finge WireMala { causa = "malformed step in checkpoint wire" }
+    }
+    varia numerus aetas ← 0
+    varia numerus passus ← 0
+    fac {
+        aetas ← aetas_textus ↦ numerus
+    }
+    cape err {
+        iace finge WireMala { causa = "malformed epoch in checkpoint wire" }
+    }
+    fac {
+        passus ← passus_textus ↦ numerus
+    }
+    cape err {
+        iace finge WireMala { causa = "malformed step in checkpoint wire" }
+    }
+    fixum textus status_textus ← partes.accipe(5) vel ""
+    si status_textus.longitudo() ≡ 0 {
+        iace finge WireMala { causa = "malformed rng state in checkpoint wire" }
+    }
+    varia numerus status ← 0
+    fac {
+        status ← status_textus ↦ numerus
+    }
+    cape err {
+        iace finge WireMala { causa = "malformed rng state in checkpoint wire" }
+    }
+    fixum Semen rng ← structa_semen(status)
+    # The embedded optimizer-state wire is the '/' tail, joined verbatim.
+    varia textus statum_wire ← ""
+    varia numerus i ← 6
+    dum i < partes.longitudo() {
+        si i > 6 {
+            statum_wire ← statum_wire + "/"
+        }
+        statum_wire ← statum_wire + (partes.accipe(i) vel "")
+        i ← i + 1
+    }
+    si statum_wire.longitudo() ≡ 0 {
+        iace finge StatumInane { causa = "checkpoint state wire is empty" }
+    }
+    redde Tabula { aetas = aetas, passus = passus, rng = rng, statum_wire = statum_wire }
 }
