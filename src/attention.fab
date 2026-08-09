@@ -18,17 +18,22 @@
 # component. This module must not import from gradus:transformer.
 # No module owns a backend or device handle.
 #
-# KNOWN TOOLCHAIN CONSTRAINT: every public function in this module is
-# self-contained (tensor ops only, no calls to other Gradus functions) — the
-# FMIR stepper cannot resolve calls FROM a library function TO another
-# library function. The transformer block inlines the same math for the same
-# reason (the S4-A train_step_4x4 precedent).
+# TOOLCHAIN NOTE: the legacy fixed-shape function below is self-contained
+# (typed-tensor ops only). The PML3-U2 production surface (bottom of this
+# module) instead composes the gradus:math / gradus:tensor families over the
+# staged carrier — the same posture as the nn.fab production surface (see
+# nn.fab "Compiler-boundary notes"). The transformer block inlines the same
+# math for the same stepper reason (the S4-A train_step_4x4 precedent).
 #
 # PML0-U3 ledger disposition (pml0-proof-api-ledger.md, gradus 33df687) —
 # executed at PML1-U6: scaled_dot_product_2x8 is ADMITTED as caller-backed
 # public API (grep-verified live callers in package code):
 #   row 12 — bert-tiny-fragment train.fab:366 (+oracle capture.fab:398);
 #            bert-gradus-probe train.fab:364
+
+importa ex "gradus:dtype" privata dtype
+importa ex "gradus:math" privata math
+importa ex "gradus:tensor" privata tensor
 
 # -------------------------------------------------------------------------
 # scaled_dot_product_2x8 — single-head attention for B=2, D=8, H=1
@@ -49,4 +54,471 @@ functio scaled_dot_product_2x8(
     fixum tensor<f32, [2,2]> attn    ← scaled.activatio_softmax()
     fixum tensor<f32, [2,8]> context ← attn.matmul(vb)
     redde context
+}
+
+# =========================================================================
+# PML3-U2 — production surface (shape-generic, forward-only, typed errors)
+# =========================================================================
+#
+# --- Contract (pml3-delivery.md PML3-U2) ---------------------------------
+# Scaled dot-product attention with causal masking and RoPE integration for
+# the admitted rows is forward-only, composable, oracle-checked (CPU
+# reference vs the GI2/GI3 pinned contracts); attention semantics shared by
+# training and inference. The F32 row is the admitted row (any other staged
+# tag fails closed).
+#
+# --- Formulas (matching the accepted proofs and the GI3 frozen recipes) ---
+#   scaled_dot_product(q,k,v,scale)   = softmax((q·kᵀ)·scale)·v — the
+#       accepted scaled_dot_product_2x8 arithmetic (capture.fab: scores =
+#       qb@kt, scaled = scores·dk_scale, softmax, attn@v); q/k/v are the
+#       single-head [T,D] projections.
+#   scaled_dot_product_causal(...)    = same with the GI3 CausalMaskedSoftmax
+#       recipe semantics: row i attends to columns j ≤ i (j > i masked,
+#       diagonal included) — masked stable row softmax, no mask-tensor input
+#       (causal structure is the recipe's semantics, gi3-contract.md §1.1).
+#   rotary_position_embedding(x,pos,dim) = the GI3 Rope recipe on the LAST
+#       axis: llama-arch NORM consecutive-pair rotation (2k, 2k+1) with
+#       theta = pos · freq_base^(-2k/dim), freq_base frozen at 100000
+#       (gi3-contract.md §1 frozen recipe; radix-mir-stepper tensor_rope).
+#       Elements beyond dim are untouched.
+#   scaled_dot_product_causal_rope(...) = the RoPE-integrated composite for
+#       the admitted rows: q and k are rotated at their positions first,
+#       then causal attention runs — THE function shared by training and
+#       inference (U3 consumes it; PML4 training / PML5 inference both call
+#       this forward, no gradient path).
+#
+# --- Autograd independence (PML3 thesis, forward-without-autograd) --------
+# This module imports NO autograd surface (no gradus:gradient, no @ radix
+# backward, no companion ABI). Attention is a pure value function over the
+# staged carrier; the co-located proba exercises the whole surface with no
+# autograd import at all.
+#
+# --- Compiler-boundary notes ---------------------------------------------
+#   * Shape generics are not available in library context (SEM014 — the
+#     nn.fab posture); the staged carrier carries runtime shapes, so the
+#     attention surface is shape-generic at runtime and R3-compliant (no
+#     one-row/one-shape narrowing in the public API).
+#   * The CPU reference evaluates rope/softmax in f64 (FMIR stepper); this
+#     surface is f32 self-hosted (exp via potentia; sin/cos via range
+#     reduction + Taylor series — the mathesis.fab precedent). Row tests
+#     compare with a documented tolerance, not bit equality.
+#   * The legacy scaled_dot_product_2x8 stays caller-backed admitted API
+#     (PML0-U3 ledger row 12); the production surface re-admits none of the
+#     retired transformer helpers.
+
+# -------------------------------------------------------------------------
+# AttentionError — typed error vocabulary of the attention surface. Every
+# variant carries a textus causa (render via causa), mirroring the tensor/
+# shape/dtype/math/nn error contract.
+# -------------------------------------------------------------------------
+
+discretio AttentionError {
+    DimensioNegativa { textus causa },
+    DimensioSupraLimitem { textus causa },
+    ProductumSupraLimitem { textus causa },
+    GradusMismatch { textus causa },
+    FormaMismatch { textus causa },
+    Incompatibilis { textus causa },
+    TypoMismatch { textus causa },
+    ElementaMismatch { textus causa },
+    PositioInvalida { textus causa },
+    DimensioInvalida { textus causa }
+}
+
+functio causa(AttentionError e) → textus {
+    discerne e {
+        casu DimensioNegativa fixum causa { redde causa }
+        casu DimensioSupraLimitem fixum causa { redde causa }
+        casu ProductumSupraLimitem fixum causa { redde causa }
+        casu GradusMismatch fixum causa { redde causa }
+        casu FormaMismatch fixum causa { redde causa }
+        casu Incompatibilis fixum causa { redde causa }
+        casu TypoMismatch fixum causa { redde causa }
+        casu ElementaMismatch fixum causa { redde causa }
+        casu PositioInvalida fixum causa { redde causa }
+        casu DimensioInvalida fixum causa { redde causa }
+    }
+}
+
+# -------------------------------------------------------------------------
+# Private helpers.
+# -------------------------------------------------------------------------
+
+# RoPE frequency base — frozen at 100000 (the GI3 Rope recipe v1 constant;
+# the radix-mir-stepper tensor_rope FREQ_BASE).
+fixum f32 ROPE_FREQ_BASE ← (100000.0 ∷ f32)
+
+# 2π and π for angle reduction (the mathesis.fab precedent).
+fixum f32 TAU ← (6.283185307179586 ∷ f32)
+fixum f32 SEMITAU ← (3.141592653589793 ∷ f32)
+
+# F32-only gate — the admitted row is the F32 row; a differently tagged
+# staged carrier fails closed (mirror of nn.fab _typo_f32).
+@ privata
+functio _typo_f32(tensor.Tensor t) → bivalens ⇥ AttentionError {
+    si dtype.nomen(t.typus()) ≠ "f32" {
+        iace finge TypoMismatch { causa = "unsupported dtype for attention primitive" }
+    }
+    redde verum
+}
+
+# Pairwise dtype parity + F32 gate.
+@ privata
+functio _typo_par(tensor.Tensor a, tensor.Tensor b) → bivalens ⇥ AttentionError {
+    fixum textus ta ← dtype.nomen(a.typus())
+    fixum textus tb ← dtype.nomen(b.typus())
+    si ta ≠ tb {
+        iace finge TypoMismatch { causa = "dtype mismatch" }
+    }
+    si ta ≠ "f32" {
+        iace finge TypoMismatch { causa = "unsupported dtype for attention primitive" }
+    }
+    redde verum
+}
+
+# Three-way dtype parity + F32 gate for the q/k/v triple.
+@ privata
+functio _typo_tres(tensor.Tensor a, tensor.Tensor b, tensor.Tensor c) → bivalens ⇥ AttentionError {
+    fixum bivalens _ ← _typo_par(a, b)
+    redde _typo_par(a, c)
+}
+
+# e^x via the exponentiation intrinsic (base e > 0, so the non-positive
+# base guard never fires; potentia lowers to exp(x·ln(e)) ≈ exp(x)) — the
+# nn.fab _exponens precedent.
+@ privata
+functio _exponens(f32 x) → f32 {
+    redde (2.718281828459045 ∷ f32).potentia(x)
+}
+
+# Angle reduction to the principal range [-π, π] for stable Taylor
+# evaluation (the mathesis.fab _reduce_angle precedent).
+@ privata
+functio _reduce_angulus(f32 x) → f32 {
+    fixum f32 shifted ← x + SEMITAU
+    fixum numerus k ← (shifted / TAU).pavimentum()
+    redde x - TAU * (k ↦ f32)
+}
+
+# sin via Taylor series on the reduced angle (fixed 12-iteration count —
+# accurate to f32 precision over the reduced range, mathesis.fab precedent).
+@ privata
+functio _sinus(f32 x) → f32 {
+    fixum f32 a ← _reduce_angulus(x)
+    varia f32 term ← a
+    varia f32 sum ← a
+    fixum f32 x2 ← a * a
+    varia numerus n ← 1
+    dum n < 12 {
+        term ← (term * (0.0 - x2)) / (((2 * n) ↦ f32) * ((2 * n + 1) ↦ f32))
+        sum ← sum + term
+        n ← n + 1
+    }
+    redde sum
+}
+
+# cos via Taylor series on the reduced angle.
+@ privata
+functio _cosinus(f32 x) → f32 {
+    fixum f32 a ← _reduce_angulus(x)
+    varia f32 term ← 1.0
+    varia f32 sum ← 1.0
+    fixum f32 x2 ← a * a
+    varia numerus n ← 1
+    dum n < 12 {
+        term ← (term * (0.0 - x2)) / (((2 * n - 1) ↦ f32) * ((2 * n) ↦ f32))
+        sum ← sum + term
+        n ← n + 1
+    }
+    redde sum
+}
+
+# Rank-2 transpose [rows, cols] → [cols, rows] (math has no transpose; the
+# score product needs kᵀ). Infallible — callers validate shape first.
+@ privata
+functio _transpone(tensor.Tensor t) → tensor.Tensor {
+    fixum lista<numerus> f ← t.figura()
+    fixum numerus rows ← f.accipe(0) vel 1
+    fixum numerus cols ← f.accipe(1) vel 1
+    fixum lista<numerus> trans ← [cols, rows]
+    varia lista<f32> out ← vacua
+    varia numerus j ← 0
+    dum j < cols {
+        varia numerus i ← 0
+        dum i < rows {
+            out.appende(t.datos.accipe(i * cols + j) vel (0.0 ∷ f32))
+            i ← i + 1
+        }
+        j ← j + 1
+    }
+    redde tensor.Tensor { dtype = t.typus(), forma = trans, datos = out }
+}
+
+# Filled-tensor construction through the attention error vocabulary
+# (tensor.impleta → AttentionError, causa text preserved).
+@ privata
+functio _impleta(lista<numerus> f, f32 valor) → tensor.Tensor ⇥ AttentionError {
+    fac {
+        redde tensor.impleta(f, valor)
+    }
+    cape err {
+        fixum textus c ← tensor.causa(err)
+        si c ≡ "negative dimension" {
+            iace finge DimensioNegativa { causa = c }
+        }
+        si c ≡ "dimension above ceiling" {
+            iace finge DimensioSupraLimitem { causa = c }
+        }
+        si c ≡ "element count above ceiling" {
+            iace finge ProductumSupraLimitem { causa = c }
+        }
+        iace finge FormaMismatch { causa = c }
+    }
+}
+
+# Row softmax over the LAST axis of a rank-2 tensor, numerically stable via
+# max subtraction (the stepper tensor_softmax identity). With causalis =
+# verum it is the GI3 masked stable row softmax: row i keeps columns
+# j ≤ i (diagonal included) and outputs zeros past the prefix.
+@ privata
+functio _softmax(tensor.Tensor x, bivalens causalis) → tensor.Tensor {
+    fixum lista<numerus> f ← x.figura()
+    fixum numerus rows ← f.accipe(0) vel 1
+    fixum numerus cols ← f.accipe(1) vel 1
+    varia lista<f32> out ← vacua
+    varia numerus i ← 0
+    dum i < rows {
+        varia numerus finis ← cols
+        si causalis {
+            finis ← i + 1
+        }
+        # Row max over the valid prefix.
+        varia f32 maximus ← x.datos.accipe(i * cols) vel (0.0 ∷ f32)
+        varia numerus j ← 0
+        dum j < finis {
+            fixum f32 v ← x.datos.accipe(i * cols + j) vel (0.0 ∷ f32)
+            si v > maximus {
+                maximus ← v
+            }
+            j ← j + 1
+        }
+        # exp(x − max) over the valid prefix and the normalizer sum. At least
+        # one element equals max, so the sum is ≥ 1 — no division by zero.
+        varia lista<f32> exps ← vacua
+        varia f32 total ← (0.0 ∷ f32)
+        varia numerus j2 ← 0
+        dum j2 < finis {
+            fixum f32 v ← x.datos.accipe(i * cols + j2) vel (0.0 ∷ f32)
+            fixum f32 e ← _exponens(v - maximus)
+            exps.appende(e)
+            total ← total + e
+            j2 ← j2 + 1
+        }
+        itera ex exps fixum e {
+            out.appende(e / total)
+        }
+        varia numerus j3 ← finis
+        dum j3 < cols {
+            out.appende((0.0 ∷ f32))
+            j3 ← j3 + 1
+        }
+        i ← i + 1
+    }
+    redde tensor.Tensor { dtype = x.typus(), forma = f, datos = out }
+}
+
+# RoPE rotation over the LAST axis of a rank-2 tensor: the llama-arch NORM
+# consecutive-pair rotation (2k, 2k+1) for k < dim/2 with
+# theta = pos · freq_base^(-2k/dim); elements beyond dim are untouched.
+# Infallible — callers validate shape/positions/dim first.
+@ privata
+functio _rope(tensor.Tensor x, lista<numerus> positions, numerus dim) → tensor.Tensor {
+    fixum lista<numerus> f ← x.figura()
+    fixum numerus t ← f.accipe(0) vel 1
+    fixum numerus d ← f.accipe(1) vel 1
+    fixum f32 dim_f ← (dim ↦ f32)
+    varia lista<f32> out ← vacua
+    varia numerus row ← 0
+    dum row < t {
+        fixum numerus pos ← positions.accipe(row) vel 0
+        fixum f32 pos_f ← (pos ↦ f32)
+        fixum numerus base ← row * d
+        varia numerus col ← 0
+        dum col < d {
+            si col < dim {
+                fixum numerus k ← col / 2
+                fixum f32 kf ← (k ↦ f32)
+                fixum f32 theta ← pos_f * ROPE_FREQ_BASE.potentia((0.0 - 2.0 * kf) / dim_f)
+                fixum f32 c ← _cosinus(theta)
+                fixum f32 s ← _sinus(theta)
+                fixum f32 x0 ← x.datos.accipe(base + col) vel (0.0 ∷ f32)
+                fixum f32 x1 ← x.datos.accipe(base + col + 1) vel (0.0 ∷ f32)
+                out.appende(x0 * c - x1 * s)
+                out.appende(x0 * s + x1 * c)
+                col ← col + 2
+            }
+            secus {
+                out.appende(x.datos.accipe(base + col) vel (0.0 ∷ f32))
+                col ← col + 1
+            }
+        }
+        row ← row + 1
+    }
+    redde tensor.Tensor { dtype = x.typus(), forma = f, datos = out }
+}
+
+# Shared q/k/v validation: dtype parity + F32 gate, rank-2, shared [T,D]
+# shape, non-empty. Returns the shared shape.
+@ privata
+functio _valida_triplum(tensor.Tensor q, tensor.Tensor k, tensor.Tensor v) → lista<numerus> ⇥ AttentionError {
+    fixum bivalens _ ← _typo_tres(q, k, v)
+    fixum lista<numerus> fq ← q.figura()
+    fixum lista<numerus> fk ← k.figura()
+    fixum lista<numerus> fv ← v.figura()
+    si fq.longitudo() ≠ 2 {
+        iace finge GradusMismatch { causa = "attention requires rank-2 tensors" }
+    }
+    si fk.longitudo() ≠ 2 aut fv.longitudo() ≠ 2 {
+        iace finge GradusMismatch { causa = "attention requires rank-2 tensors" }
+    }
+    fixum numerus t ← fq.accipe(0) vel 1
+    fixum numerus d ← fq.accipe(1) vel 1
+    si (fk.accipe(0) vel 1) ≠ t aut (fk.accipe(1) vel 1) ≠ d {
+        iace finge FormaMismatch { causa = "query, key, value must share shape" }
+    }
+    si (fv.accipe(0) vel 1) ≠ t aut (fv.accipe(1) vel 1) ≠ d {
+        iace finge FormaMismatch { causa = "query, key, value must share shape" }
+    }
+    si t ≡ 0 aut d ≡ 0 {
+        iace finge ElementaMismatch { causa = "empty attention input" }
+    }
+    redde fq
+}
+
+# Shared rope/positions/dim validation for a rank-2 staged tensor: dtype
+# gate, rank-2, non-empty, positions length == row count, positions
+# non-negative, dim even and within [2, last-extent]. Returns the shape.
+@ privata
+functio _valida_rope(tensor.Tensor x, lista<numerus> positions, numerus dim) → lista<numerus> ⇥ AttentionError {
+    fixum bivalens _ ← _typo_f32(x)
+    fixum lista<numerus> f ← x.figura()
+    si f.longitudo() ≠ 2 {
+        iace finge GradusMismatch { causa = "rope requires rank-2 tensor" }
+    }
+    fixum numerus t ← f.accipe(0) vel 1
+    fixum numerus d ← f.accipe(1) vel 1
+    si t ≡ 0 aut d ≡ 0 {
+        iace finge ElementaMismatch { causa = "empty rope input" }
+    }
+    si positions.longitudo() ≠ t {
+        iace finge FormaMismatch { causa = "positions must match the token count" }
+    }
+    si dim < 2 {
+        iace finge DimensioInvalida { causa = "rope dim must be at least 2" }
+    }
+    si dim % 2 ≠ 0 {
+        iace finge DimensioInvalida { causa = "rope dim must be even" }
+    }
+    si dim > d {
+        iace finge DimensioInvalida { causa = "rope dim exceeds head width" }
+    }
+    itera ex positions fixum p {
+        si p < 0 {
+            iace finge PositioInvalida { causa = "negative position" }
+        }
+    }
+    redde f
+}
+
+# The attention computation core: scores = (q·kᵀ)·scale, row softmax (with
+# or without the causal prefix), context = attn·v. Math failures are mapped
+# into AttentionError preserving the causa text (the nn.fab linear pattern).
+@ privata
+functio _attention_core(tensor.Tensor q, tensor.Tensor k, tensor.Tensor v, f32 scale, bivalens causalis) → tensor.Tensor ⇥ AttentionError {
+    fixum lista<numerus> fq ← q.figura()
+    fixum numerus t ← fq.accipe(0) vel 1
+    fixum tensor.Tensor kt ← _transpone(k)
+    fixum tensor.Tensor scale_t ← _impleta([t, t], scale)
+    fac {
+        fixum tensor.Tensor scores ← math.matmul(q, kt)
+        fixum tensor.Tensor scaled ← math.mul(scores, scale_t)
+        fixum tensor.Tensor attn ← _softmax(scaled, causalis)
+        fixum tensor.Tensor context ← math.matmul(attn, v)
+        redde context
+    }
+    cape err {
+        fixum textus c ← math.causa(err)
+        si c ≡ "matmul requires rank-2 operands" {
+            iace finge GradusMismatch { causa = c }
+        }
+        si c ≡ "inner dimensions mismatch" {
+            iace finge Incompatibilis { causa = c }
+        }
+        si c ≡ "dtype mismatch" {
+            iace finge TypoMismatch { causa = c }
+        }
+        si c ≡ "element count above ceiling" {
+            iace finge ProductumSupraLimitem { causa = c }
+        }
+        si c ≡ "dimension above ceiling" {
+            iace finge DimensioSupraLimitem { causa = c }
+        }
+        si c ≡ "negative dimension" {
+            iace finge DimensioNegativa { causa = c }
+        }
+        si c ≡ "shapes not broadcastable" {
+            iace finge FormaMismatch { causa = c }
+        }
+        iace finge FormaMismatch { causa = c }
+    }
+}
+
+# -------------------------------------------------------------------------
+# Family: rotary_position_embedding — the GI3 Rope recipe over the staged
+# carrier. x [T,D]; positions is one non-negative integer per row; dim is
+# the (even) rotation width over the last axis.
+# -------------------------------------------------------------------------
+
+functio rotary_position_embedding(tensor.Tensor x, lista<numerus> positions, numerus dim) → tensor.Tensor ⇥ AttentionError {
+    fixum lista<numerus> _ ← _valida_rope(x, positions, dim)
+    redde _rope(x, positions, dim)
+}
+
+# -------------------------------------------------------------------------
+# Family: scaled_dot_product — single-head scaled dot-product attention.
+#   scores = (q·kᵀ)·scale, row softmax over the last axis, context = attn·v.
+# q/k/v are the [T,D] projections; scale is the dk scaling factor (the
+# caller passes 1/sqrt(dk), matching the accepted dk_scale contract).
+# -------------------------------------------------------------------------
+
+functio scaled_dot_product(tensor.Tensor q, tensor.Tensor k, tensor.Tensor v, f32 scale) → tensor.Tensor ⇥ AttentionError {
+    fixum lista<numerus> _ ← _valida_triplum(q, k, v)
+    redde _attention_core(q, k, v, scale, falsum)
+}
+
+# -------------------------------------------------------------------------
+# Family: scaled_dot_product_causal — the same attention with the GI3
+# CausalMaskedSoftmax recipe semantics: row i attends to columns j ≤ i
+# (diagonal included; future positions masked out before softmax). This is
+# the causal scoring used identically by training and inference.
+# -------------------------------------------------------------------------
+
+functio scaled_dot_product_causal(tensor.Tensor q, tensor.Tensor k, tensor.Tensor v, f32 scale) → tensor.Tensor ⇥ AttentionError {
+    fixum lista<numerus> _ ← _valida_triplum(q, k, v)
+    redde _attention_core(q, k, v, scale, verum)
+}
+
+# -------------------------------------------------------------------------
+# Family: scaled_dot_product_causal_rope — the RoPE-integrated composite for
+# the admitted rows. q and k are rotated at their positions first
+# (rotary_position_embedding), then causal attention runs. Training and
+# inference share this exact forward composition.
+# -------------------------------------------------------------------------
+
+functio scaled_dot_product_causal_rope(tensor.Tensor q, tensor.Tensor k, tensor.Tensor v, f32 scale, lista<numerus> positions, numerus dim) → tensor.Tensor ⇥ AttentionError {
+    fixum lista<numerus> _ ← _valida_triplum(q, k, v)
+    fixum lista<numerus> _ ← _valida_rope(q, positions, dim)
+    fixum tensor.Tensor qr ← _rope(q, positions, dim)
+    fixum tensor.Tensor kr ← _rope(k, positions, dim)
+    redde _attention_core(qr, kr, v, scale, verum)
 }
