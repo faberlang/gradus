@@ -1,0 +1,470 @@
+# Decode loop semantics — PML5-U1 (production inference computation layer).
+#
+# Public import: importa ex "gradus:decode" privata decode
+# Depends on: gradus:dtype (finita), gradus:tensor (value carrier),
+# gradus:nn (linear — the output projection), gradus:transformer
+# (transformer_block — the SHARED forward row).
+#
+# Architectural rule: gradus owns computation and logical state — NOT
+# scheduling, batching, HTTP, or device handles (the product repo / NGAB
+# own those). This module holds no backend or device handle and makes no
+# performance claims (NGAB owns executable evidence).
+#
+# =========================================================================
+# The decode contract (pml5-delivery.md PML5-U1)
+# =========================================================================
+#
+# --- One-token decode over the forward row -------------------------------
+# decodere_datum(token_id, positio, decodere) is the explicit public
+# one-token decode op: token id + position in → full-vocabulary logits
+# out. The forward row is the PML3 shared transformer block
+# (transformer.transformer_block, attention mode 2 — causal + RoPE, the
+# selected inference row) over the F32 staged carrier; the decode composes
+# embedding gather → block → output projection.
+#
+# --- Prefill and decode share the same forward functions -----------------
+# praefundere(tokens, decodere) runs the multi-token (teacher-forced)
+# path over the SAME forward functions: the same embedding gather, the
+# same transformer_block, the same output projection. The single-token
+# prefill IS the decode at position 0 (probed); the first prefill
+# position equals the single-token decode at position 0 (probed). The
+# decode's single-token causal self-score is position-invariant under RoPE
+# (the rotation of q and k by the same angles cancels in the dot product)
+# — the position enters through the multi-token causal path (and the
+# KV-cache of U2).
+#
+# --- Reset / context-limit behavior (explicit) ---------------------------
+# The Decodere declares its context length (contextus); the decode op and
+# the prefill op fail closed on positions at or beyond it (reject policy —
+# no silent truncation; U5 owns the full session policy). The session
+# (Sessio) is an explicit position counter with advance (progredere —
+# rejects at the limit) and reset (redintegra — back to position 0);
+# no hidden position state.
+#
+# --- Oracle-matching logits (GI2 contract, read-only inputs) -------------
+# The logits are pinned per the GI2 numeric-contract discipline (read
+# only: gi0-numeric-contract.md — full-vocab raw logits, finite gate,
+# top-1 exactness over the non-EOG set, first-divergence rule) applied to
+# the gradus forward row: the decode.proba pins f64 evaluations of the
+# documented forward arithmetic (the same arithmetic the transformer/
+# attention/nn probas pin) with the documented 5e-4 tolerance. The GI2
+# oracle itself (dequant + the 32-layer decoder in faber-runtime) is a
+# read-only input to this phase, never reimplemented here.
+#
+# --- Evidence honesty (CTO Q2, hard) -------------------------------------
+# This surface is the STRUCTURAL proof: the decode op, the prefill/decode
+# sharing, and the reset/limit behavior are compile-validated and proven
+# by the co-located proba (f64 oracle pins). Executed VALUE identity
+# (the logits computed at runtime) is env-blocked tree-wide today (FMIR
+# stepper / library-import gap — the PML4 closeout recorded both blockers;
+# neither is fixed here). PML5-U1 is PARTIAL: logit-value identity is
+# deferred to the auditor-owned runtime-evidence gate.
+importa ex "gradus:dtype" privata dtype
+importa ex "gradus:tensor" privata tensor
+importa ex "gradus:nn" privata nn
+importa ex "gradus:transformer" privata transformer
+
+# -------------------------------------------------------------------------
+# DecodeError — typed error vocabulary of the decode surface.
+# Every variant carries a textus causa (render via causa).
+# -------------------------------------------------------------------------
+
+discretio DecodeError {
+    IdExtra { textus causa },
+    PositioInvalida { textus causa },
+    Terminus { textus causa },
+    DecodereInvalida { textus causa },
+    FormaMismatch { textus causa },
+    TypoMismatch { textus causa },
+    ElementaMismatch { textus causa },
+    Incompatibilis { textus causa },
+    DimensioInvalida { textus causa }
+}
+
+functio causa(DecodeError e) → textus {
+    discerne e {
+        casu IdExtra fixum causa { redde causa }
+        casu PositioInvalida fixum causa { redde causa }
+        casu Terminus fixum causa { redde causa }
+        casu DecodereInvalida fixum causa { redde causa }
+        casu FormaMismatch fixum causa { redde causa }
+        casu TypoMismatch fixum causa { redde causa }
+        casu ElementaMismatch fixum causa { redde causa }
+        casu Incompatibilis fixum causa { redde causa }
+        casu DimensioInvalida fixum causa { redde causa }
+    }
+}
+
+# The attention mode of the shared forward row: 2 = causal + RoPE (the
+# selected inference row, transformer.fab mode contract).
+fixum numerus MODUS_INFERENTIA ← 2
+
+# -------------------------------------------------------------------------
+# Pondera — the transformer block's weights (the shared forward row's
+# parameters). Mirrors the transformer_block argument order.
+# -------------------------------------------------------------------------
+
+genus Pondera {
+    tensor.Tensor ln1_s
+    tensor.Tensor ln1_o
+    tensor.Tensor wq
+    tensor.Tensor bq
+    tensor.Tensor wk
+    tensor.Tensor bk
+    tensor.Tensor wv
+    tensor.Tensor bv
+    tensor.Tensor wo
+    tensor.Tensor bo
+    tensor.Tensor ln2_s
+    tensor.Tensor ln2_o
+    tensor.Tensor wf1
+    tensor.Tensor bf1
+    tensor.Tensor wf2
+    tensor.Tensor bf2
+    tensor.Tensor ln3_s
+    tensor.Tensor ln3_o
+
+    functio ln1_s() → tensor.Tensor { redde ego.ln1_s }
+    functio ln1_o() → tensor.Tensor { redde ego.ln1_o }
+    functio wq() → tensor.Tensor { redde ego.wq }
+    functio bq() → tensor.Tensor { redde ego.bq }
+    functio wk() → tensor.Tensor { redde ego.wk }
+    functio bk() → tensor.Tensor { redde ego.bk }
+    functio wv() → tensor.Tensor { redde ego.wv }
+    functio bv() → tensor.Tensor { redde ego.bv }
+    functio wo() → tensor.Tensor { redde ego.wo }
+    functio bo() → tensor.Tensor { redde ego.bo }
+    functio ln2_s() → tensor.Tensor { redde ego.ln2_s }
+    functio ln2_o() → tensor.Tensor { redde ego.ln2_o }
+    functio wf1() → tensor.Tensor { redde ego.wf1 }
+    functio bf1() → tensor.Tensor { redde ego.bf1 }
+    functio wf2() → tensor.Tensor { redde ego.wf2 }
+    functio bf2() → tensor.Tensor { redde ego.bf2 }
+    functio ln3_s() → tensor.Tensor { redde ego.ln3_s }
+    functio ln3_o() → tensor.Tensor { redde ego.ln3_o }
+}
+
+# Build the block weights (the block's own fail-closed validation runs at
+# call time; the decode-level invariants are the Decodere constructor's).
+functio structa_pondera(
+    tensor.Tensor ln1_s, tensor.Tensor ln1_o,
+    tensor.Tensor wq, tensor.Tensor bq,
+    tensor.Tensor wk, tensor.Tensor bk,
+    tensor.Tensor wv, tensor.Tensor bv,
+    tensor.Tensor wo, tensor.Tensor bo,
+    tensor.Tensor ln2_s, tensor.Tensor ln2_o,
+    tensor.Tensor wf1, tensor.Tensor bf1,
+    tensor.Tensor wf2, tensor.Tensor bf2,
+    tensor.Tensor ln3_s, tensor.Tensor ln3_o
+) → Pondera {
+    redde Pondera {
+        ln1_s = ln1_s, ln1_o = ln1_o,
+        wq = wq, bq = bq, wk = wk, bk = bk, wv = wv, bv = bv,
+        wo = wo, bo = bo,
+        ln2_s = ln2_s, ln2_o = ln2_o,
+        wf1 = wf1, bf1 = bf1, wf2 = wf2, bf2 = bf2,
+        ln3_s = ln3_s, ln3_o = ln3_o
+    }
+}
+
+# -------------------------------------------------------------------------
+# Decodere — the model handle: the embedding table + the block weights +
+# the output projection + the decode configuration. Gradus owns this
+# logical state; no device handle. The forward row's weight-shape
+# validation is the transformer_block's fail-closed contract (call time);
+# this constructor validates the decode-level invariants.
+# -------------------------------------------------------------------------
+
+genus Decodere {
+    tensor.Tensor mensa
+    Pondera pondera
+    tensor.Tensor projectio
+    tensor.Tensor projectio_bias
+    f32 scala
+    numerus vocabulum
+    numerus contextus
+    numerus dimensio
+
+    # The embedding table [vocabulum, dimensio].
+    functio mensa() → tensor.Tensor {
+        redde ego.mensa
+    }
+
+    # The shared forward row's block weights.
+    functio pondera() → Pondera {
+        redde ego.pondera
+    }
+
+    # The output projection [dimensio, vocabulum].
+    functio projectio() → tensor.Tensor {
+        redde ego.projectio
+    }
+
+    # The output projection bias [vocabulum].
+    functio projectio_bias() → tensor.Tensor {
+        redde ego.projectio_bias
+    }
+
+    # The attention dk scaling factor (1/sqrt(dk)).
+    functio scala() → f32 {
+        redde ego.scala
+    }
+
+    # Vocabulary size (token-id domain [0, vocabulum)).
+    functio vocabulum() → numerus {
+        redde ego.vocabulum
+    }
+
+    # Context length (the position limit; decode fails closed at it).
+    functio contextus() → numerus {
+        redde ego.contextus
+    }
+
+    # Embedding dimension (the forward row's feature width).
+    functio dimensio() → numerus {
+        redde ego.dimensio
+    }
+}
+
+functio structa_decodere(
+    tensor.Tensor mensa,
+    Pondera pondera,
+    tensor.Tensor projectio,
+    tensor.Tensor projectio_bias,
+    f32 scala,
+    numerus vocabulum,
+    numerus contextus,
+    numerus dimensio
+) → Decodere ⇥ DecodeError {
+    si vocabulum < 1 {
+        iace finge DecodereInvalida { causa = "vocabulary must be non-empty" }
+    }
+    si contextus < 1 {
+        iace finge DecodereInvalida { causa = "context length must be at least one" }
+    }
+    si dimensio < 1 {
+        iace finge DecodereInvalida { causa = "embedding dimension must be at least one" }
+    }
+    si non (dtype.finita(scala)) {
+        iace finge DecodereInvalida { causa = "invalid attention scale" }
+    }
+    si scala ≤ 0.0 {
+        iace finge DecodereInvalida { causa = "invalid attention scale" }
+    }
+    fixum lista<numerus> fm ← mensa.figura()
+    si fm.longitudo() ≠ 2 {
+        iace finge DecodereInvalida { causa = "embedding must be rank-2" }
+    }
+    si (fm.accipe(0) vel 1) ≠ vocabulum {
+        iace finge DecodereInvalida { causa = "embedding rows must equal the vocabulary" }
+    }
+    si (fm.accipe(1) vel 1) ≠ dimensio {
+        iace finge DecodereInvalida { causa = "embedding columns must equal the dimension" }
+    }
+    fixum lista<numerus> fp ← projectio.figura()
+    si fp.longitudo() ≠ 2 {
+        iace finge DecodereInvalida { causa = "output projection must be rank-2" }
+    }
+    si (fp.accipe(0) vel 1) ≠ dimensio aut (fp.accipe(1) vel 1) ≠ vocabulum {
+        iace finge DecodereInvalida { causa = "output projection shape must be [dim, vocab]" }
+    }
+    fixum lista<numerus> fpb ← projectio_bias.figura()
+    si fpb.longitudo() ≠ 1 aut (fpb.accipe(0) vel 1) ≠ vocabulum {
+        iace finge DecodereInvalida { causa = "output projection bias must be [vocab]" }
+    }
+    redde Decodere {
+        mensa = mensa,
+        pondera = pondera,
+        projectio = projectio,
+        projectio_bias = projectio_bias,
+        scala = scala,
+        vocabulum = vocabulum,
+        contextus = contextus,
+        dimensio = dimensio
+    }
+}
+
+# -------------------------------------------------------------------------
+# Private helpers.
+# -------------------------------------------------------------------------
+
+# Staged-tensor construction (the never-firing shape check, re-mapped).
+@ privata
+functio _tense(lista<f32> datos, lista<numerus> forma) → tensor.Tensor ⇥ DecodeError {
+    fac {
+        redde tensor.structa(datos, forma)
+    }
+    cape err {
+        iace finge ElementaMismatch { causa = tensor.causa(err) }
+    }
+    iace finge ElementaMismatch { causa = "unreachable" }
+}
+
+# The embedding gather: the token's row of the embedding table, flat.
+@ privata
+functio _immersio(tensor.Tensor mensa, numerus id, numerus dim) → lista<f32> {
+    varia lista<f32> row ← vacua
+    varia numerus i ← 0
+    dum i < dim {
+        row.appende(mensa.datos.accipe(id * dim + i) vel (0.0 ∷ f32))
+        i ← i + 1
+    }
+    redde row
+}
+
+# The shared forward row: the transformer block (mode 2 — causal + RoPE)
+# over the staged carrier, positions explicit.
+@ privata
+functio _bloccum(Decodere m, tensor.Tensor x, lista<numerus> positions) → tensor.Tensor ⇥ DecodeError {
+    fixum Pondera p ← m.pondera()
+    fac {
+        redde transformer.transformer_block(
+            x,
+            p.ln1_s(), p.ln1_o(),
+            p.wq(), p.bq(),
+            p.wk(), p.bk(),
+            p.wv(), p.bv(),
+            p.wo(), p.bo(),
+            p.ln2_s(), p.ln2_o(),
+            p.wf1(), p.bf1(),
+            p.wf2(), p.bf2(),
+            p.ln3_s(), p.ln3_o(),
+            m.scala(),
+            MODUS_INFERENTIA,
+            positions,
+            m.dimensio())
+    }
+    cape err {
+        fixum textus c ← transformer.causa(err)
+        si c ≡ "inner dimensions mismatch" {
+            iace finge Incompatibilis { causa = c }
+        }
+        si c ≡ "dtype mismatch" {
+            iace finge TypoMismatch { causa = c }
+        }
+        si c ≡ "bias does not match output width" {
+            iace finge FormaMismatch { causa = c }
+        }
+        si c ≡ "unknown attention mode" {
+            iace finge DimensioInvalida { causa = c }
+        }
+        iace finge FormaMismatch { causa = c }
+    }
+}
+
+# The output projection: the block output → full-vocab logits.
+@ privata
+functio _projicere(Decodere m, tensor.Tensor h) → tensor.Tensor ⇥ DecodeError {
+    fac {
+        redde nn.linear(h, m.projectio(), m.projectio_bias())
+    }
+    cape err {
+        fixum textus c ← nn.causa(err)
+        si c ≡ "inner dimensions mismatch" {
+            iace finge Incompatibilis { causa = c }
+        }
+        si c ≡ "dtype mismatch" {
+            iace finge TypoMismatch { causa = c }
+        }
+        iace finge FormaMismatch { causa = c }
+    }
+}
+
+# -------------------------------------------------------------------------
+# decodere_datum — the ONE-token decode op: token id + position in →
+# full-vocab logits out, over the shared forward row. Fail closed on a
+# token id outside [0, vocabulum) and a position at or beyond the context
+# limit (the reject policy — no silent truncation).
+# -------------------------------------------------------------------------
+
+functio decodere_datum(numerus token_id, numerus positio, Decodere m) → tensor.Tensor ⇥ DecodeError {
+    si token_id < 0 aut token_id ≥ m.vocabulum() {
+        iace finge IdExtra { causa = "token id out of vocabulary range" }
+    }
+    si positio < 0 aut positio ≥ m.contextus() {
+        iace finge PositioInvalida { causa = "position out of context" }
+    }
+    fixum lista<f32> row ← _immersio(m.mensa(), token_id, m.dimensio())
+    fixum tensor.Tensor x ← _tense(row, [1, m.dimensio()])
+    fixum tensor.Tensor h ← _bloccum(m, x, [positio])
+    fixum tensor.Tensor logits ← _projicere(m, h)
+    # The [1, V] projection flattens to the full-vocab logits [V].
+    redde _tense(logits.datos, [m.vocabulum()])
+}
+
+# -------------------------------------------------------------------------
+# praefundere — the multi-token (teacher-forced) path: prompt token ids →
+# full-vocab logits [N, V] over the SAME forward functions as decode.
+# The prompt length must not exceed the context limit (reject policy).
+# -------------------------------------------------------------------------
+
+functio praefundere(lista<numerus> tokens, Decodere m) → tensor.Tensor ⇥ DecodeError {
+    si tokens.longitudo() ≡ 0 {
+        iace finge ElementaMismatch { causa = "empty prompt" }
+    }
+    si tokens.longitudo() > m.contextus() {
+        iace finge PositioInvalida { causa = "prompt exceeds the context limit" }
+    }
+    itera ex tokens fixum t {
+        si t < 0 aut t ≥ m.vocabulum() {
+            iace finge IdExtra { causa = "token id out of vocabulary range" }
+        }
+    }
+    varia lista<f32> flat ← vacua
+    itera ex tokens fixum t {
+        fixum lista<f32> row ← _immersio(m.mensa(), t, m.dimensio())
+        itera ex row fixum v {
+            flat.appende(v)
+        }
+    }
+    fixum tensor.Tensor x ← _tense(flat, [tokens.longitudo(), m.dimensio()])
+    varia lista<numerus> positions ← vacua
+    itera ab 0‥tokens.longitudo() fixum i {
+        positions.appende(i)
+    }
+    fixum tensor.Tensor h ← _bloccum(m, x, positions)
+    redde _projicere(m, h)
+}
+
+# -------------------------------------------------------------------------
+# Sessio — the explicit session position state. Reset and the context
+# limit are explicit public behaviors: progredere rejects at the limit,
+# redintegra resets to position 0. No hidden position state.
+# -------------------------------------------------------------------------
+
+genus Sessio {
+    numerus positio
+    numerus contextus
+
+    # The next decode position.
+    functio positio() → numerus {
+        redde ego.positio
+    }
+
+    # The session's context limit.
+    functio contextus() → numerus {
+        redde ego.contextus
+    }
+}
+
+# A fresh session at position 0 with the declared context limit.
+functio sessio_fresh(numerus contextus) → Sessio ⇥ DecodeError {
+    si contextus < 1 {
+        iace finge DecodereInvalida { causa = "context length must be at least one" }
+    }
+    redde Sessio { positio = 0, contextus = contextus }
+}
+
+# Advance the session by one position — rejects when the next position
+# would be at or beyond the context limit (the limit is reached).
+functio progredere(Sessio s) → Sessio ⇥ DecodeError {
+    si s.positio() + 1 ≥ s.contextus() {
+        iace finge Terminus { causa = "context limit reached" }
+    }
+    redde Sessio { positio = s.positio() + 1, contextus = s.contextus() }
+}
+
+# Reset the session to position 0 (fresh state).
+functio redintegra(Sessio s) → Sessio {
+    redde Sessio { positio = 0, contextus = s.contextus() }
+}
