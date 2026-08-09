@@ -1,0 +1,516 @@
+# Sampling — deterministic token sampling (PML5-U3, production inference
+# computation layer).
+#
+# Public import: importa ex "gradus:sampling" privata sampling
+# Depends on: gradus:dtype (finita — the logits/config finite gate),
+# gradus:train (Semen — the explicit RNG state seam).
+#
+# Architectural rule: gradus owns computation and logical state — NOT
+# scheduling, batching, HTTP, or device handles (the product repo / NGAB
+# own those). This module holds no device handle, no hidden state, and
+# makes no performance claims.
+#
+# =========================================================================
+# The sampling contract (pml5-delivery.md PML5-U3)
+# =========================================================================
+#
+# --- Pure function --------------------------------------------------------
+# Sampling is a PURE function of logits + config + RNG state:
+#
+#   maxima(logits) -> token id                       (greedy, exact)
+#   sors(logits, Configura, historia, Semen) -> Sortitio
+#
+# No hidden state: the RNG state (Semen) is an explicit argument and is
+# returned advanced in the outcome; equal inputs produce equal outcomes.
+# The seed enters through train.structa_semen (the xorshift64 seam); the
+# same seed reproduces the same token choices.
+#
+# --- The pinned pipeline order (deterministic, oracle-pinned) -------------
+# sors applies, in this exact order:
+#   1. repetition penalty (poena_repetitionis) over the history tokens:
+#        logits[t] > 0  -> logits[t] / poena
+#        logits[t] <= 0 -> logits[t] * poena        (the llama.cpp rule)
+#   2. temperature scaling: logits[i] / temperatura
+#   3. top-k: keep the k largest logits (first-index ties; k <= 0 = off)
+#   4. stabilized softmax (max-subtracted exp, base-e)
+#   5. top-p (nucleus): the smallest descending-probability set whose
+#        cumulative mass reaches top_p; renormalized (<=0 or >=1 = off)
+#   6. min-p: keep probs >= min_p * max_prob; renormalized (<=0 = off)
+#   7. draw u in [0,1) from Semen (train.proximus_f32) and walk the
+#        cumulative distribution: first index with cum >= u.
+# temperatura <= 0 is the GREEDY path: sors returns the argmax token and
+# the UNCHANGED Semen (no draw). The order and tie-breaks are part of the
+# oracle contract (first-index ties throughout).
+#
+# --- Fail-closed gates ------------------------------------------------------
+# Logits must be non-empty and finite (GI2 finite-gate discipline); the
+# history tokens must lie in [0, logits.longitudo()); Configura knobs are
+# validated by structa_configura. Invalid input throws (typed error), never
+# silently truncates.
+#
+# --- Evidence honesty (CTO Q2, hard) --------------------------------------
+# This surface is the STRUCTURAL proof: the pure-function shape, the greedy
+# exactness, the deterministic pipeline, and the f64 oracle pins (the
+# sampling.proba pins evaluate the documented arithmetic). Executed token
+# value-identity is env-blocked tree-wide today (FMIR stepper /
+# library-import gap — the PML4 closeout recorded both blockers; neither is
+# fixed here). PML5-U3 is PARTIAL and token value-identity is deferred to
+# the auditor-owned runtime-evidence gate.
+importa ex "gradus:dtype" privata dtype
+importa ex "gradus:train" privata train
+
+# -------------------------------------------------------------------------
+# SamplingError — typed error vocabulary of the sampling surface.
+# Every variant carries a textus causa (render via causa).
+# -------------------------------------------------------------------------
+
+discretio SamplingError {
+    LogitsInvalida { textus causa },
+    ConfiguraInvalida { textus causa },
+    HistoriaInvalida { textus causa }
+}
+
+functio causa(SamplingError e) → textus {
+    discerne e {
+        casu LogitsInvalida fixum causa { redde causa }
+        casu ConfiguraInvalida fixum causa { redde causa }
+        casu HistoriaInvalida fixum causa { redde causa }
+    }
+}
+
+# -------------------------------------------------------------------------
+# Configura — the sampling knobs. The validated constructor is
+# structa_configura; the genus itself is the plain carrier.
+# -------------------------------------------------------------------------
+
+genus Configura {
+    f32 temperatura
+    numerus top_k
+    f32 top_p
+    f32 min_p
+    f32 poena_repetitionis
+
+    # Temperature scaling; <= 0 selects the greedy path.
+    functio temperatura() → f32 {
+        redde ego.temperatura
+    }
+
+    # Top-k filter width; 0 disables the filter.
+    functio top_k() → numerus {
+        redde ego.top_k
+    }
+
+    # Top-p (nucleus) threshold; <= 0 or >= 1 disables the filter.
+    functio top_p() → f32 {
+        redde ego.top_p
+    }
+
+    # Min-p threshold; <= 0 disables the filter.
+    functio min_p() → f32 {
+        redde ego.min_p
+    }
+
+    # Repetition penalty; 1.0 = no penalty.
+    functio poena_repetitionis() → f32 {
+        redde ego.poena_repetitionis
+    }
+}
+
+# The validated Configura constructor. Temperatura may be 0 (the greedy
+# flag); top_k non-negative; top_p / min_p within [0, 1]; the repetition
+# penalty at least 1.0.
+functio structa_configura(
+    f32 temperatura,
+    numerus top_k,
+    f32 top_p,
+    f32 min_p,
+    f32 poena_repetitionis
+) → Configura ⇥ SamplingError {
+    si temperatura < 0.0 {
+        iace finge ConfiguraInvalida { causa = "temperature must be non-negative" }
+    }
+    si top_k < 0 {
+        iace finge ConfiguraInvalida { causa = "top-k must be non-negative" }
+    }
+    si non (dtype.finita(top_p)) aut top_p < 0.0 aut top_p > 1.0 {
+        iace finge ConfiguraInvalida { causa = "top-p must be within [0, 1]" }
+    }
+    si non (dtype.finita(min_p)) aut min_p < 0.0 aut min_p > 1.0 {
+        iace finge ConfiguraInvalida { causa = "min-p must be within [0, 1]" }
+    }
+    si non (dtype.finita(poena_repetitionis)) aut poena_repetitionis < 1.0 {
+        iace finge ConfiguraInvalida { causa = "repetition penalty must be at least 1" }
+    }
+    redde Configura {
+        temperatura = temperatura,
+        top_k = top_k,
+        top_p = top_p,
+        min_p = min_p,
+        poena_repetitionis = poena_repetitionis
+    }
+}
+
+# -------------------------------------------------------------------------
+# Sortitio — a sample outcome: the chosen token id + the advanced RNG state.
+# -------------------------------------------------------------------------
+
+genus Sortitio {
+    numerus token_id
+    train.Semen semen
+
+    # The chosen token id (the draw outcome).
+    functio token_id() → numerus {
+        redde ego.token_id
+    }
+
+    # The advanced generator state (the explicit RNG continuation).
+    functio semen() → train.Semen {
+        redde ego.semen
+    }
+}
+
+# -------------------------------------------------------------------------
+# maxima — the GREEDY path: the index of the largest logit (first-index
+# tie-break). Exact, pure, no RNG. Rejects empty or non-finite logits.
+# -------------------------------------------------------------------------
+
+functio maxima(lista<f32> logits) → numerus ⇥ SamplingError {
+    si logits.longitudo() ≡ 0 {
+        iace finge LogitsInvalida { causa = "logits must be non-empty" }
+    }
+    si non (_finita(logits)) {
+        iace finge LogitsInvalida { causa = "logits must be finite" }
+    }
+    redde _index_max(logits)
+}
+
+# -------------------------------------------------------------------------
+# distributio — the PURE post-filter distribution: logits + config +
+# history in, the filtered probability vector out (steps 1–6 of the pinned
+# pipeline; no RNG). sors consumes it and adds the draw. Exposed so the
+# oracle pins can compare the per-knob distributions.
+# -------------------------------------------------------------------------
+
+functio distributio(lista<f32> logits, Configura c, lista<numerus> historia) → lista<f32> ⇥ SamplingError {
+    si logits.longitudo() ≡ 0 {
+        iace finge LogitsInvalida { causa = "logits must be non-empty" }
+    }
+    si non (_finita(logits)) {
+        iace finge LogitsInvalida { causa = "logits must be finite" }
+    }
+    itera ex historia fixum t {
+        si t < 0 aut t ≥ logits.longitudo() {
+            iace finge HistoriaInvalida { causa = "history token out of vocabulary range" }
+        }
+    }
+    si c.temperatura() ≤ 0.0 {
+        varia lista<f32> degenerate ← vacua
+        itera ab 0‥logits.longitudo() fixum i {
+            degenerate.appende(0.0)
+        }
+        degenerate ← _siste_f32(degenerate, _index_max(logits), 1.0)
+        redde degenerate
+    }
+    fixum lista<f32> penalized ← _poena_repetitionis(logits, historia, c.poena_repetitionis())
+    fixum lista<f32> scaled ← _scala_temperatura(penalized, c.temperatura())
+    fixum lista<f32> k_limited ← _top_k(scaled, c.top_k())
+    fixum lista<f32> probs ← _softmax(k_limited)
+    fixum lista<f32> p_limited ← _top_p(probs, c.top_p())
+    redde _min_p(p_limited, c.min_p())
+}
+
+# -------------------------------------------------------------------------
+# sors — the STOCHASTIC path: pure function of logits + config + history +
+# RNG state. temperatura <= 0 selects the greedy path (argmax, semen
+# unchanged). Otherwise distributio runs and the outcome carries the
+# advanced Semen.
+# -------------------------------------------------------------------------
+
+functio sors(lista<f32> logits, Configura c, lista<numerus> historia, train.Semen semen) → Sortitio ⇥ SamplingError {
+    si logits.longitudo() ≡ 0 {
+        iace finge LogitsInvalida { causa = "logits must be non-empty" }
+    }
+    si non (_finita(logits)) {
+        iace finge LogitsInvalida { causa = "logits must be finite" }
+    }
+    itera ex historia fixum t {
+        si t < 0 aut t ≥ logits.longitudo() {
+            iace finge HistoriaInvalida { causa = "history token out of vocabulary range" }
+        }
+    }
+    si c.temperatura() ≤ 0.0 {
+        fixum numerus token ← maxima(logits)
+        redde Sortitio { token_id = token, semen = semen }
+    }
+    fixum lista<f32> probs ← distributio(logits, c, historia)
+    redde _distributio(probs, semen)
+}
+
+# -------------------------------------------------------------------------
+# Private helpers (the deterministic pipeline).
+# -------------------------------------------------------------------------
+
+# e^x via the base-e exponentiation with a sign split: potentia is only
+# ever called with a non-negative exponent (1/e^{−x} for x < 0), matching
+# the accepted loss.fab precedent — no negative-power runtime claim.
+fixum f32 E ← (2.718281828459045 ∷ f32)
+
+@ privata
+functio _exponens(f32 x) → f32 {
+    si x ≥ 0.0 {
+        redde E.potentia(x)
+    }
+    redde 1.0 / E.potentia(0.0 - x)
+}
+
+# The index of the largest value (first-index tie-break). Non-empty input.
+@ privata
+functio _index_max(lista<f32> xs) → numerus {
+    varia numerus best ← 0
+    varia f32 best_val ← xs.accipe(0) vel (0.0 ∷ f32)
+    itera ab 1‥xs.longitudo() fixum i {
+        fixum f32 v ← xs.accipe(i) vel (0.0 ∷ f32)
+        si v > best_val {
+            best_val ← v
+            best ← i
+        }
+    }
+    redde best
+}
+
+# The index of the largest value among positions not yet kept (the
+# incremental top-k / top-p selection; first-index ties).
+@ privata
+functio _index_max_pars(lista<f32> xs, lista<bivalens> keep) → numerus {
+    varia numerus best ← 0
+    varia bivalens init ← falsum
+    varia f32 best_val ← 0.0
+    itera ab 0‥xs.longitudo() fixum i {
+        si non (keep.accipe(i) vel falsum) {
+            fixum f32 v ← xs.accipe(i) vel (0.0 ∷ f32)
+            si (non init) aut (v > best_val) {
+                best ← i
+                best_val ← v
+                init ← verum
+            }
+        }
+    }
+    redde best
+}
+
+# Every element is finite (the GI2 finite gate).
+@ privata
+functio _finita(lista<f32> xs) → bivalens {
+    itera ex xs fixum v {
+        si non (dtype.finita(v)) {
+            redde falsum
+        }
+    }
+    redde verum
+}
+
+# A false mask of length n.
+@ privata
+functio _masks_falsa(numerus n) → lista<bivalens> {
+    varia lista<bivalens> m ← vacua
+    itera ab 0‥n fixum _ {
+        m.appende(falsum)
+    }
+    redde m
+}
+
+# The mask with position i replaced by v (pure rebuild).
+@ privata
+functio _siste_bivalens(lista<bivalens> xs, numerus i, bivalens v) → lista<bivalens> {
+    varia lista<bivalens> out ← vacua
+    itera ab 0‥xs.longitudo() fixum j {
+        si j ≡ i {
+            out.appende(v)
+        }
+        secus {
+            out.appende(xs.accipe(j) vel falsum)
+        }
+    }
+    redde out
+}
+
+# The list with position i replaced by v (pure rebuild).
+@ privata
+functio _siste_f32(lista<f32> xs, numerus i, f32 v) → lista<f32> {
+    varia lista<f32> out ← vacua
+    itera ab 0‥xs.longitudo() fixum j {
+        si j ≡ i {
+            out.appende(v)
+        }
+        secus {
+            out.appende(xs.accipe(j) vel (0.0 ∷ f32))
+        }
+    }
+    redde out
+}
+
+# Step 1 — repetition penalty over the history tokens (llama.cpp rule:
+# positive logits divide by poena, non-positive multiply by poena).
+@ privata
+functio _poena_repetitionis(lista<f32> logits, lista<numerus> historia, f32 poena) → lista<f32> {
+    fixum numerus n ← logits.longitudo()
+    varia lista<f32> out ← vacua
+    itera ab 0‥n fixum i {
+        fixum f32 v ← logits.accipe(i) vel (0.0 ∷ f32)
+        varia f32 w ← v
+        itera ex historia fixum t {
+            si t ≡ i {
+                si w > 0.0 {
+                    w ← w / poena
+                }
+                secus {
+                    w ← w * poena
+                }
+            }
+        }
+        out.appende(w)
+    }
+    redde out
+}
+
+# Step 2 — temperature scaling (pure per-element division).
+@ privata
+functio _scala_temperatura(lista<f32> logits, f32 temperatura) → lista<f32> {
+    varia lista<f32> out ← vacua
+    itera ex logits fixum v {
+        out.appende(v / temperatura)
+    }
+    redde out
+}
+
+# Step 3 — top-k: keep the k largest logits (first-index ties, k <= 0 off).
+@ privata
+functio _top_k(lista<f32> xs, numerus k) → lista<f32> {
+    si k ≤ 0 {
+        redde xs
+    }
+    fixum numerus n ← xs.longitudo()
+    varia lista<bivalens> keep ← _masks_falsa(n)
+    varia numerus count ← 0
+    dum count < k et count < n {
+        fixum numerus best ← _index_max_pars(xs, keep)
+        keep ← _siste_bivalens(keep, best, verum)
+        count ← count + 1
+    }
+    varia lista<f32> out ← vacua
+    itera ab 0‥n fixum i {
+        si keep.accipe(i) vel falsum {
+            out.appende(xs.accipe(i) vel (0.0 ∷ f32))
+        }
+        secus {
+            out.appende(0.0)
+        }
+    }
+    redde out
+}
+
+# Step 4 — stabilized softmax (max-subtracted, base-e).
+@ privata
+functio _softmax(lista<f32> xs) → lista<f32> {
+    fixum numerus n ← xs.longitudo()
+    fixum f32 m ← xs.accipe(_index_max(xs)) vel (0.0 ∷ f32)
+    varia lista<f32> es ← vacua
+    varia f32 sum ← 0.0
+    itera ab 0‥n fixum i {
+        fixum f32 e ← _exponens((xs.accipe(i) vel (0.0 ∷ f32)) - m)
+        es.appende(e)
+        sum ← sum + e
+    }
+    varia lista<f32> out ← vacua
+    itera ab 0‥n fixum i {
+        out.appende((es.accipe(i) vel (0.0 ∷ f32)) / sum)
+    }
+    redde out
+}
+
+# Renormalize the kept probabilities (kept positions keep prob/sum, others 0).
+@ privata
+functio _renorma_maske(lista<f32> ps, lista<bivalens> keep) → lista<f32> {
+    fixum numerus n ← ps.longitudo()
+    varia f32 sum ← 0.0
+    itera ab 0‥n fixum i {
+        si keep.accipe(i) vel falsum {
+            sum ← sum + (ps.accipe(i) vel (0.0 ∷ f32))
+        }
+    }
+    varia lista<f32> out ← vacua
+    itera ab 0‥n fixum i {
+        si keep.accipe(i) vel falsum {
+            out.appende((ps.accipe(i) vel (0.0 ∷ f32)) / sum)
+        }
+        secus {
+            out.appende(0.0)
+        }
+    }
+    redde out
+}
+
+# Step 5 — top-p (nucleus): the smallest descending-probability set whose
+# cumulative mass reaches p, renormalized (p <= 0 or p >= 1 off). When all
+# positive mass is kept and the cumulative is still below p, the kept set
+# stops growing (equivalent to keeping everything nonzero).
+@ privata
+functio _top_p(lista<f32> ps, f32 p) → lista<f32> {
+    si p ≤ 0.0 aut p ≥ 1.0 {
+        redde ps
+    }
+    fixum numerus n ← ps.longitudo()
+    varia lista<bivalens> keep ← _masks_falsa(n)
+    varia f32 cum ← 0.0
+    varia bivalens progress ← verum
+    dum cum < p et progress {
+        fixum numerus best ← _index_max_pars(ps, keep)
+        fixum f32 v ← ps.accipe(best) vel (0.0 ∷ f32)
+        si v > 0.0 {
+            keep ← _siste_bivalens(keep, best, verum)
+            cum ← cum + v
+        }
+        secus {
+            progress ← falsum
+        }
+    }
+    redde _renorma_maske(ps, keep)
+}
+
+# Step 6 — min-p: keep probs >= min_p * max_prob, renormalized (p <= 0 off).
+@ privata
+functio _min_p(lista<f32> ps, f32 p) → lista<f32> {
+    si p ≤ 0.0 {
+        redde ps
+    }
+    fixum numerus n ← ps.longitudo()
+    fixum f32 mx ← ps.accipe(_index_max(ps)) vel (0.0 ∷ f32)
+    fixum f32 threshold ← mx * p
+    varia lista<bivalens> keep ← vacua
+    itera ab 0‥n fixum i {
+        si (ps.accipe(i) vel (0.0 ∷ f32)) ≥ threshold {
+            keep.appende(verum)
+        }
+        secus {
+            keep.appende(falsum)
+        }
+    }
+    redde _renorma_maske(ps, keep)
+}
+
+# Step 7 — the draw: u in [0,1) from the explicit Semen state (advanced),
+# then the cumulative walk: the first index with cum >= u (the fallback for
+# the f32 rounding edge where cum never reaches u is the last index).
+@ privata
+functio _distributio(lista<f32> probs, train.Semen semen) → Sortitio {
+    fixum train.FructusF32 u_f ← train.proximus_f32(semen)
+    fixum f32 u ← u_f.valor()
+    varia f32 cum ← 0.0
+    itera ab 0‥probs.longitudo() fixum i {
+        cum ← cum + (probs.accipe(i) vel (0.0 ∷ f32))
+        si u < cum {
+            redde Sortitio { token_id = i, semen = u_f.semen() }
+        }
+    }
+    redde Sortitio { token_id = probs.longitudo() - 1, semen = u_f.semen() }
+}
