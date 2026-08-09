@@ -17,14 +17,23 @@ scale 1/√4, RoPE dim 4 — the oracle-pinned model), prompt `[0]`, config
 
 | Run | Config | Expected tokens (f64 oracle) |
 | --- | --- | --- |
-| Greedy | temperatura 0 (the U3 greedy path, exact argmax) | `[0, 0]` |
+| Greedy | temperatura 0 (the U3 greedy path, exact argmax) | `[0]` |
 | Seeded stochastic | temperatura 1.0, neutral knobs, seed `8742514861359412281` | `[1, 1]` |
 
+The greedy run emits **`[0]`** — not `[0, 0]` — because of the **EOG-stop
+policy** (the CTO9-4 correctness fix, binding generation to the admitted
+tokenizer identity): the first drawn token `0` is an admitted EOG token
+(EOG set `{0, 2}` — `tokenizer.fab`, `tokenizator.est_eog`), so
+generation terminates after it. `maxima_verborum` is a **ceiling**, not a
+promise to emit exactly that many tokens. The seeded run draws `[1, 1]`
+(no EOG token), so it runs to the cursor ceiling.
+
 Both runs are bounded by the generation cursor (`verbum_licet` — the U5
-reject policy: exactly `maxima_verborum` tokens, never truncated). The
-stochastic run threads the running history into `sors` and advances the
-explicit `Semen` per step; the cooperative cancellation checkpoint is
-observed before every step (honored: a cancelled flag stops the run).
+reject policy: never more than `maxima_verborum`, never truncated) AND
+the EOG-stop policy (terminate at the first EOG token). The stochastic
+run threads the running history into `sors` and advances the explicit
+`Semen` per step; the cooperative cancellation checkpoint is observed
+before every step (honored: a cancelled flag stops the run).
 
 ## What the run composes (the U6 residual from PML5-U5)
 
@@ -33,7 +42,7 @@ observed before every step (honored: a cancelled flag stops the run).
 | Token decode | `decode.decodere_datum(prev, positio, m)` — one-token decode over the shared forward row (embedding gather → transformer block → output projection) |
 | Greedy selection | `sampling.maxima` — the exact argmax path (temperatura 0) |
 | Seeded draw | `sampling.sors` — the deterministic pipeline (rep-penalty → temperature → top-k → softmax → top-p → min-p) + one `train.proximus_f32` draw per step, walking the cumulative distribution (first-index rule) |
-| Bounded loop | `generation.cursor_fresh` / `verbum_licet` / `cursor_progredere` — the cursor limits (reject, never truncate) drive the loop |
+| Bounded loop | `generation.cursor_fresh` / `verbum_licet` / `cursor_progredere` — the cursor limits (reject, never truncate) + the EOG-stop policy (`tokenizator.est_eog` — terminate at the first EOG token `0`/`2`) drive the loop |
 | Cancellation | `decode.observa_cancellationem` per step — the cooperative checkpoint (fail closed) |
 | Determinism | pure composition: same model + config + seed → same tokens; the advanced `Semen` is carried explicitly |
 
@@ -52,7 +61,7 @@ bucket — no near-boundary draw):
 | Step | Logits (f64) | Softmax (temp 1) | Draw u | Chosen token | Boundary margins |
 | --- | --- | --- | --- | --- | --- |
 | Greedy 1 | `[1.0800156280811244, 0.5934879833437627, -2.5475127865679967]` | — | — | `0` | argmax gap 0.4865 |
-| Greedy 2 | identical (single-token RoPE invariance) | — | — | `0` | argmax gap 0.4865 |
+| Greedy 2 | — not reached — the first drawn token `0` is an admitted EOG token (`{0, 2}`), so EOG-stop terminates the run at `[0]`; the would-be step is the identical RoPE-invariant row (the U1 pin) | — | — | — | — |
 | Stoch 1 | `[1.0800156280811244, 0.5934879833437627, -2.5475127865679967]` | `[0.60926, 0.37455, 0.01620]` | `0.77714` | `1` | 0.168 / 0.207 from the bucket edges |
 | Stoch 2 | `[-0.31137982360561633, 1.1948983869194876, 0.90882901706536]` | `[0.11239, 0.50686, 0.38076]` | `0.33934` | `1` | 0.227 / 0.280 from the bucket edges |
 
@@ -88,9 +97,13 @@ never the claim. The rule is probe-pinned in `decode.proba`.
 - The stochastic run carries the advanced `Semen` explicitly per step
   (no hidden state); the cursor resets via `cursor_redintegra` to the
   fresh state (position 0, count 0, context preserved).
-- The U5 replay pins (`replica` plain `[1, 1]`, penalized `[1, 2, 1]`)
-  hold — this workload re-derives the same draws through the full
-  decode→sampling→cursor composition.
+- The U5 replay pins hold: the seeded run re-derives the plain `[1, 1]`
+  replay pin through the full decode→sampling→cursor composition. The
+  penalized `[1, 2, 1]` replay pin stays a U5 sampling-side pin
+  (`decode.replica` over a fixed logits stream — it is not a generation
+  loop and not re-derived by this workload, which runs neutral knobs);
+  EOG-stop is a generation-loop policy, so a sampling replay that draws
+  the EOG token `2` is out of that scope.
 
 ## Execution record (honest — CTO Q2)
 

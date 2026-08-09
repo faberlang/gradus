@@ -18,8 +18,16 @@ enforced; README regen + audit 0) is satisfied at the **structural
 (compile-level) tier**: decode, KV-cache, sampling, generation
 configuration, and reset/limits/cancellation compose over the shared
 forward functions (PML3), and the bounded generation run's expected token
-sequences are pinned (greedy `[0, 0]` + seeded `[1, 1]`, f64 evaluations,
+sequences are pinned (greedy `[0]` + seeded `[1, 1]`, f64 evaluations,
 first-token-divergence rule, reset/replay determinism).
+
+> **Correction (2026-08-09, CTO9-4)**: the greedy pin is `[0]`, not
+> `[0, 0]`. Under the admitted tokenizer identity (EOG set `{0, 2}` —
+> tokenizer.fab), the greedy run's first drawn token `0` is an EOG token,
+> so the EOG-stop policy terminates generation at `[0]`; `maxima_verborum`
+> is a ceiling, not a promise to emit exactly that many tokens. The
+> oracle, pins, and docs were reconciled to the admitted contract
+> (hand-2, task 4e2dcb05).
 
 Per **CTO8-1**, the phase gate does **NOT** close as "MET structural" by
 default: **oracle-matching tokens (executed)** is a **named gate clause**
@@ -35,14 +43,14 @@ Clause section). No executed-token claims exist anywhere.
 | U3 — Deterministic sampling | b1b01f1 | `src/sampling.fab` `Configura` validation + `maxima` (greedy exact) / `sors` (rep-penalty → temperature → top-k → softmax → top-p → min-p, pure logits+config+RNG); pinned per-knob oracle | structural |
 | U4 — Generation-config contract | 56e70f0 | `src/generation.fab` nine-field contract (values/defaults/validation), deterministic mapping (Configura + Semen), explicit reject rows, single-authority statement (NGAB5 adapts); exact mapping + wire pins | structural |
 | U5 — Reset, limits, cancellation, determinism | 8cf798a | `decode`/`generation` reset + context-limit reject policy, cooperative cancellation observation, deterministic replay; proba'd | structural |
-| U6 — Oracle-matching token proof | 1a6abd0 | `exempla/token-generation` bounded run (decode → sampling → cursor; greedy + one seeded stochastic config) on the tiny pinned decoder; expected sequences `[0, 0]` / `[1, 1]` pinned (f64), first-token-divergence rule, reset/replay determinism | structural |
+| U6 — Oracle-matching token proof | 1a6abd0 | `exempla/token-generation` bounded run (decode → sampling → cursor; greedy + one seeded stochastic config) on the tiny pinned decoder; expected sequences `[0]` / `[1, 1]` pinned (f64), first-token-divergence rule, reset/replay determinism | structural |
 
 ## Phase-gate checklist
 
 | Gate clause | Evidence | Verdict |
 | --- | --- | --- |
 | U1–U6 done | All six units landed + admitted (commits above) | **MET** |
-| Oracle-matching tokens for the admitted model | Bounded generation run (greedy `[0, 0]` + seeded `[1, 1]`) with f64-evaluated token pins, first-token-divergence comparison policy, reset/replay determinism probed — **at the compile level** (the U6 exemplum + pins) | **MET (structural)** |
+| Oracle-matching tokens for the admitted model | Bounded generation run (greedy `[0]` + seeded `[1, 1]`) with f64-evaluated token pins, first-token-divergence comparison policy, reset/replay determinism probed — **at the compile level** (the U6 exemplum + pins) | **MET (structural)** |
 | Oracle-matching tokens (EXECUTED) | Env-blocked on the sole remaining blocker (FMIR library-call gap — the PML4 closeout's other blocker, TARGETLANE001, no longer applies to the token run's lane posture) | **NAMED OPEN CLAUSE (CTO8-1)** — see below |
 | Reject rows enforced | `generation.proba` reject-row matrix (unsupported llama.cpp-style controls pinned row by row); config wire rejects extra fields | **MET** |
 | README regen + audit 0 findings | `generate-factory-readme.py` regenerated + `--check` green; goal-status audit 0 findings (see Validation) | **MET** |
@@ -72,7 +80,7 @@ ONE auditor-owned pass re-runs, under numeric-policy v1.0.0:
 
 1. the **PML4 trajectory pins + resume + seeds** (the composed loop's
    loss trajectory, checkpoint round-trip, seeded reproducibility), and
-2. the **PML5-U6 tokens** (the bounded generation run's `[0, 0]` /
+2. the **PML5-U6 tokens** (the bounded generation run's `[0]` /
    `[1, 1]` sequences + determinism).
 
 This dated record ensures the re-verification cannot be silently dropped.
