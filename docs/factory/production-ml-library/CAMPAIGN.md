@@ -278,7 +278,7 @@ semantic shortcut.
 
 ### PML4 — Production training layer
 
-**Status**: planned — after PML3
+**Status**: delivered (structural tier) — PML4 U1–U6 delivered and admitted (5f98e8b, e09c79c, 9bebda9, 4b24c81, 94d8a94, fc85de7); gate MET at the structural tier — the composed loop's bounded workload converges per the accepted oracle (trajectory pins + ratio 0.01137 < 0.1, compile-level via the reverse-AD transform; closeout pml4-closeout.md); executed convergence deferred to the auditor-owned runtime-evidence gate with the concrete blockers recorded (FMIR library-call gap; TARGETLANE001 AIR-companion-to-Rust) — recorded, not claimed; resume reproducibility + deterministic seed proba'd at composition level; PML5 next (parallel lane, after PML2+PML3 per the ordering graph)
 **Owner**: Gradus.
 **Source**: `src/gradient.fab`, `src/loss.fab`, `src/optimize.fab`,
 `src/train.fab`, GPU-training receipts, and PML1/PML3.
