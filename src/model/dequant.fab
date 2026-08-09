@@ -1,0 +1,504 @@
+# CPU dequantization of the four admitted GGML block types (PML2-U5, C3).
+#
+# Public import: importa ex "gradus:model/dequant" privata dequant
+# Depends on: nothing (leaf module — self-contained like capsule.fab).
+#
+# --- Contract ------------------------------------------------------------
+#
+# Re-expression port (Rust -> Faber) of faber-runtime/src/dequant.rs — the
+# GI2-1 CPU dequant core for the admitted SmolLM2-360M-Instruct Q4_K_M row.
+# The Rust original is the migration ORACLE (decision pml0-admission-
+# migration-decision.md §3.1/§3.2): its tests, fixtures, and pinned-row
+# facts are the acceptance target for this port, and this module mirrors
+# the dequant trio member 1:1. Supporting surfaces (QuantizedTensorLayout,
+# TensorView) stay with their GI owners per §1 — this module owns the
+# dequant MATH only: admitted GGML block bytes in, f32 logical elements
+# out, fail closed.
+#
+# CONTRACT — semantics match llama.cpp exactly (`ggml/src/ggml-quants.c`,
+# commit `a957b7747` at the pinned checkout): GGML half->f32 (exact
+# IEEE-754 binary16->binary32), integer qs, per-block scale/min/dmin/kscale
+# application (`dequantize_row_q5_0`, `dequantize_row_q8_0`,
+# `dequantize_row_q4_K`, `dequantize_row_q6_K` + `get_scale_min_k4`).
+# Dequant is exact integer/half math: all arithmetic is plain IEEE-754 f32
+# in the same operation order as the C kernels, so outputs are bit-exact
+# against the independent reference
+# (`radix/docs/factory/gpu-inference-gguf/evidence/gi2-dequant-reference.py`
+# and its committed goldens `gi2-dequant-goldens.json`, cited read-only).
+#
+# FAIL CLOSED:
+#   * unknown / un-admitted GGML type id -> TypoIgnotum before any byte is
+#     touched (the closed set is {F32, Q5_0, Q8_0, Q4_K, Q6_K} — the
+#     pinned-row set; toy packed-u4 and any other id are un-admitted);
+#   * a block whose byte length is not the layout's block_bytes -> 
+#     GlomulusMala (oracle RowBytesMismatch analog);
+#   * a row whose byte length is not a whole multiple of block_bytes ->
+#     OrdoMala (oracle BlockBytesMismatch analog);
+#   * NaN halves fail closed (ValorMala): the pinned row has none, and a
+#     NaN half is malformed data — no bit pattern is smuggled into the
+#     dequant output.
+#
+# Tensor-level coverage gating (GI1-4 residual: `coverage_ok()` +
+# `per_tensor_covered`) is enforced by the admission rows (gguf.fab /
+# safetensors.fab) at capsule construction, not re-derived here — this
+# module consumes already-validated byte payloads.
+#
+# --- Compiler boundary notes ----------------------------------------------
+#
+#   * The language surface has no `f32::from_bits` — binary16->binary32 and
+#     binary32-from-4-bytes are computed as exact IEEE values via integer
+#     field extraction + power-of-two scaling (same seam as the safetensors
+#     f32 decode), which is exact for the finite f32 set.
+#   * Proba proof is compile-level until the FMIR stepper / faber test path
+#     covers library probas (recorded capsule.fab residual); adfirma
+#     assertions run under the auditor-owned `faber test` harness.
+#   * Public signatures stay on primitives plus this module's own DequantError
+#     so the proba file-interface keeps every export (WARN014 — same seam as
+#     capsule.fab U1).
+#
+# --- Seams ---------------------------------------------------------------
+#   * oracle + goldens: faber-runtime/src/dequant.rs, gi2-dequant-goldens.json
+#     (read-only; bit-exact comparison is the auditor-owned test path).
+#   * tensor-level coverage gate: gguf.fab / safetensors.fab admission.
+#   * tokenizer probe parity (P1–P11, workload id lists) — gradus:tokenizer.
+#   * negative-matrix conformance suite across U2/U3/U4 — PML2-U6.
+
+# -------------------------------------------------------------------------
+# Pinned constants. GGML type ids and block layouts mirror gguf.fab /
+# capsule.fab and the pinned toolchain (ggml.h @ a957b7747).
+# -------------------------------------------------------------------------
+
+fixum numerus GGML_F32 ← 0
+fixum numerus GGML_Q5_0 ← 6
+fixum numerus GGML_Q8_0 ← 8
+fixum numerus GGML_Q4_K ← 12
+fixum numerus GGML_Q6_K ← 14
+
+fixum numerus F32_ELEMENTA ← 1
+fixum numerus F32_OCTETI ← 4
+fixum numerus Q5_0_ELEMENTA ← 32
+fixum numerus Q5_0_OCTETI ← 22
+fixum numerus Q8_0_ELEMENTA ← 32
+fixum numerus Q8_0_OCTETI ← 34
+fixum numerus Q4_K_ELEMENTA ← 256
+fixum numerus Q4_K_OCTETI ← 144
+fixum numerus Q6_K_ELEMENTA ← 256
+fixum numerus Q6_K_OCTETI ← 210
+
+# -------------------------------------------------------------------------
+# DequantError — typed fail-closed diagnostics of the dequant boundary.
+# Variant -> class:
+#   TypoIgnotum   — un-admitted / unknown GGML type id.
+#   GlomulusMala  — block byte length != the layout's block_bytes.
+#   OrdoMala      — row byte length not a multiple of block_bytes.
+#   ValorMala     — malformed value (NaN half) fails closed.
+# -------------------------------------------------------------------------
+
+discretio DequantError {
+    TypoIgnotum { textus causa },
+    GlomulusMala { textus causa },
+    OrdoMala { textus causa },
+    ValorMala { textus causa }
+}
+
+functio causa(DequantError e) → textus {
+    discerne e {
+        casu TypoIgnotum fixum causa { redde causa }
+        casu GlomulusMala fixum causa { redde causa }
+        casu OrdoMala fixum causa { redde causa }
+        casu ValorMala fixum causa { redde causa }
+    }
+}
+
+# -------------------------------------------------------------------------
+# Private byte readers (bounds-checked on read; the admission rows have
+# already validated the enclosing payload).
+# -------------------------------------------------------------------------
+
+@ privata
+functio _byte(lista<numerus<u8>> b, numerus off) → numerus {
+    redde (b.accipe(off) vel (0 ∷ numerus<u8>)) ↦ numerus
+}
+
+@ privata
+functio _le_u16(lista<numerus<u8>> b, numerus off) → numerus {
+    redde _byte(b, off) ∨ (_byte(b, off + 1) ⇐ 8)
+}
+
+@ privata
+functio _le_u32(lista<numerus<u8>> b, numerus off) → numerus {
+    redde _byte(b, off) ∨ (_byte(b, off + 1) ⇐ 8) ∨ (_byte(b, off + 2) ⇐ 16) ∨ (_byte(b, off + 3) ⇐ 24)
+}
+
+# Unsigned byte -> signed i8 value.
+@ privata
+functio _i8(numerus v) → numerus {
+    si v ≥ 128 ergo redde v - 256
+    redde v
+}
+
+# Compute 2^n via repeated multiplication/division. n range: [-127, 128]
+# — matches the IEEE-754 exponent spans this module needs.
+@ privata
+functio _potentia_duorum(numerus n) → fractus {
+    varia fractus result ← 1.0
+    si n ≥ 0 {
+        varia numerus i ← 0
+        dum i < n {
+            result ← result * 2.0
+            i ← i + 1
+        }
+    } secus {
+        varia numerus i ← n
+        dum i < 0 {
+            result ← result / 2.0
+            i ← i + 1
+        }
+    }
+    redde result
+}
+
+# -------------------------------------------------------------------------
+# GGML half (binary16) -> exact f32 VALUE (no bit reinterpretation — value
+# arithmetic, exact for every finite half). Fail closed on NaN halves.
+# -------------------------------------------------------------------------
+
+@ privata
+functio _dimidium(lista<numerus<u8>> b, numerus off) → f32 ⇥ DequantError {
+    fixum numerus bits ← _le_u16(b, off)
+    fixum numerus sign ← (bits ⇒ 15) % 2
+    fixum numerus exp ← (bits ⇒ 10) % 32
+    fixum numerus frac ← bits % 1024
+
+    varia fractus sign_factor ← 1.0
+    si sign ≠ 0 {
+        sign_factor ← -1.0
+    }
+
+    si exp ≡ 0 {
+        si frac ≡ 0 {
+            # ±0 (subnormal zero)
+            redde (sign_factor * 0.0) ↦ f32
+        }
+        # Subnormal: ±frac × 2^-24
+        fixum fractus power ← _potentia_duorum(-24)
+        redde (sign_factor * power * (frac ↦ fractus)) ↦ f32
+    }
+
+    si exp ≡ 31 {
+        si frac ≡ 0 {
+            # ±inf via f64 overflow -> f32 narrowing (same seam as the
+            # safetensors f32 decode).
+            fixum fractus power ← _potentia_duorum(128)
+            redde (sign_factor * power * 2.0) ↦ f32
+        }
+        iace finge ValorMala { causa = "NaN half in dequant block" }
+    }
+
+    # Normal: ±2^(e-15) × (1 + frac/1024)
+    fixum fractus power ← _potentia_duorum(exp - 15)
+    fixum fractus frac_ratio ← (frac ↦ fractus) / 1024.0
+    redde (sign_factor * power * (1.0 + frac_ratio)) ↦ f32
+}
+
+# 4 little-endian bytes -> exact f32 VALUE (IEEE-754 binary32 decode, the
+# same seam as the safetensors `_f32le_quattuor`; NaN fails closed).
+@ privata
+functio _f32le(lista<numerus<u8>> b, numerus off) → f32 ⇥ DequantError {
+    fixum numerus b0 ← _byte(b, off)
+    fixum numerus b1 ← _byte(b, off + 1)
+    fixum numerus b2 ← _byte(b, off + 2)
+    fixum numerus b3 ← _byte(b, off + 3)
+
+    fixum numerus raw ← (b3 * 16777216) + (b2 * 65536) + (b1 * 256) + b0
+
+    fixum numerus sign ← (raw ⇒ 31) % 2
+    fixum numerus exp ← (raw ⇒ 23) % 256
+    fixum numerus frac ← raw % 8388608
+
+    varia fractus sign_factor ← 1.0
+    si sign ≠ 0 {
+        sign_factor ← -1.0
+    }
+    fixum fractus frac_ratio ← (frac ↦ fractus) / 8388608.0
+
+    si exp ≡ 0 {
+        si frac ≡ 0 {
+            redde (sign_factor * 0.0) ↦ f32
+        }
+        fixum fractus power ← _potentia_duorum(-126)
+        redde (sign_factor * power * frac_ratio) ↦ f32
+    }
+
+    si exp ≡ 255 {
+        si frac ≡ 0 {
+            fixum fractus power ← _potentia_duorum(128)
+            redde (sign_factor * power * 2.0) ↦ f32
+        }
+        iace finge ValorMala { causa = "NaN f32 value in dequant block" }
+    }
+
+    fixum fractus power ← _potentia_duorum(exp - 127)
+    redde (sign_factor * power * (1.0 + frac_ratio)) ↦ f32
+}
+
+# -------------------------------------------------------------------------
+# Block kernels — mirror dequant.rs / llama.cpp exactly (same operation
+# order; all arithmetic in f32).
+# -------------------------------------------------------------------------
+
+# `block_q8_0`: d (half) + qs[32] int8 -> y[j] = qs[j] * d.
+@ privata
+functio _dequant_q8_0(lista<numerus<u8>> b) → lista<f32> ⇥ DequantError {
+    fixum f32 d ← _dimidium(b, 0)
+    varia lista<f32> y ← vacua
+    varia numerus j ← 0
+    dum j < 32 {
+        y.appende((_i8(_byte(b, 2 + j)) ↦ f32) * d)
+        j ← j + 1
+    }
+    redde y
+}
+
+# `block_q5_0`: d (half) + qh[4] bitmask + qs[16] nibbles. Output order
+# matches llama.cpp: y[0..16] from the low nibbles, y[16..32] from the
+# high nibbles (two 16-elem runs, appended in that order).
+@ privata
+functio _dequant_q5_0(lista<numerus<u8>> b) → lista<f32> ⇥ DequantError {
+    fixum f32 d ← _dimidium(b, 0)
+    fixum numerus qh ← _le_u32(b, 2)
+    varia lista<f32> low ← vacua
+    varia lista<f32> high ← vacua
+    varia numerus j ← 0
+    dum j < 16 {
+        # xh_0 = ((qh >> j) << 4) & 0x10 ; xh_1 = (qh >> (j+12)) & 0x10
+        fixum numerus xh_0 ← ((qh ⇒ j) % 2) * 16
+        fixum numerus xh_1 ← ((qh ⇒ (j + 16)) % 2) * 16
+        fixum numerus qs ← _byte(b, 6 + j)
+        fixum numerus x0 ← ((qs % 16) ∨ xh_0) - 16
+        fixum numerus x1 ← (((qs ⇒ 4) % 16) ∨ xh_1) - 16
+        low.appende((x0 ↦ f32) * d)
+        high.appende((x1 ↦ f32) * d)
+        j ← j + 1
+    }
+    varia lista<f32> y ← vacua
+    itera ex low fixum v {
+        y.appende(v)
+    }
+    itera ex high fixum v {
+        y.appende(v)
+    }
+    redde y
+}
+
+# `get_scale_min_k4` (llama.cpp ggml-quants.c): 6-bit scale + 6-bit min
+# from scales[K_SCALE_SIZE = 12]. The scales array lives at block offset 4
+# (the caller's `b`); indexes are relative to that array. Returns (sc, m).
+@ privata
+genus ScalaMinima {
+    numerus sc
+    numerus m
+}
+
+@ privata
+functio _scala_minima_k4(numerus index, lista<numerus<u8>> b) → ScalaMinima {
+    si index < 4 {
+        redde ScalaMinima {
+            sc = _byte(b, 4 + index) % 64,
+            m = _byte(b, 8 + index) % 64
+        }
+    }
+    fixum numerus sc ← ((_byte(b, 8 + index) % 16) ∨ (((_byte(b, index) ⇒ 6) % 2) * 16))
+    fixum numerus m ← (((_byte(b, 8 + index) ⇒ 4) % 16) ∨ (((_byte(b, 4 + index) ⇒ 6) % 2) * 16))
+    redde ScalaMinima { sc = sc, m = m }
+}
+
+# `block_q4_K`: d, dmin (halves), scales[12], qs[128]. Per 64-element
+# sub-block pair: d1 = d·sc(is), m1 = dmin·m(is), d2 = d·sc(is+1),
+# m2 = dmin·m(is+1); y = d1·(qs&0xF) − m1 for 32 elements, then
+# y = d2·(qs>>4) − m2 for 32. Output per chunk is one 64-elem run:
+# first the 32 low-nibble values, then the 32 high-nibble values.
+@ privata
+functio _dequant_q4_k(lista<numerus<u8>> b) → lista<f32> ⇥ DequantError {
+    fixum f32 d ← _dimidium(b, 0)
+    fixum f32 dmin ← _dimidium(b, 2)
+    varia lista<f32> y ← vacua
+    varia numerus is ← 0
+    varia numerus qoff ← 0
+    varia numerus chunk ← 0
+    dum chunk < 4 {
+        fixum ScalaMinima sm0 ← _scala_minima_k4(is, b)
+        fixum f32 d1 ← d * (sm0.sc ↦ f32)
+        fixum f32 m1 ← dmin * (sm0.m ↦ f32)
+        fixum ScalaMinima sm1 ← _scala_minima_k4(is + 1, b)
+        fixum f32 d2 ← d * (sm1.sc ↦ f32)
+        fixum f32 m2 ← dmin * (sm1.m ↦ f32)
+        varia lista<f32> low ← vacua
+        varia lista<f32> high ← vacua
+        varia numerus l ← 0
+        dum l < 32 {
+            fixum numerus qs ← _byte(b, 16 + qoff + l)
+            low.appende(d1 * ((qs % 16) ↦ f32) - m1)
+            high.appende(d2 * (((qs ⇒ 4) % 16) ↦ f32) - m2)
+            l ← l + 1
+        }
+        itera ex low fixum v {
+            y.appende(v)
+        }
+        itera ex high fixum v {
+            y.appende(v)
+        }
+        qoff ← qoff + 32
+        is ← is + 2
+        chunk ← chunk + 1
+    }
+    redde y
+}
+
+# `block_q6_K`: ql[128] low nibbles, qh[64] high bits, scales[16] int8,
+# d (half) at byte offset 208. Output order matches llama.cpp: within
+# each 128-element group the four quants are written at strides 0/32/64/96
+# over l — one 32-elem run per stride, appended in stride order.
+@ privata
+functio _dequant_q6_k(lista<numerus<u8>> b) → lista<f32> ⇥ DequantError {
+    fixum f32 d ← _dimidium(b, 208)
+    varia lista<f32> y ← vacua
+    varia numerus n ← 0
+    dum n < 2 {
+        fixum numerus sc_base ← n * 8
+        fixum numerus ql_off ← n * 64
+        fixum numerus qh_off ← n * 32
+        varia lista<f32> q1s ← vacua
+        varia lista<f32> q2s ← vacua
+        varia lista<f32> q3s ← vacua
+        varia lista<f32> q4s ← vacua
+        varia numerus l ← 0
+        dum l < 32 {
+            fixum numerus is ← l / 16
+            fixum numerus ql_lo ← _byte(b, ql_off + l)
+            fixum numerus ql_hi ← _byte(b, ql_off + l + 32)
+            fixum numerus qh ← _byte(b, 128 + qh_off + l)
+            # q1..q4: low/high nibbles + 2-bit high groups, then -32.
+            fixum numerus q1 ← ((ql_lo % 16) ∨ ((qh % 4) * 16)) - 32
+            fixum numerus q2 ← ((ql_hi % 16) ∨ (((qh ⇒ 2) % 4) * 16)) - 32
+            fixum numerus q3 ← (((ql_lo ⇒ 4) % 16) ∨ (((qh ⇒ 4) % 4) * 16)) - 32
+            fixum numerus q4 ← (((ql_hi ⇒ 4) % 16) ∨ (((qh ⇒ 6) % 4) * 16)) - 32
+            fixum f32 sc0 ← (_i8(_byte(b, 192 + sc_base + is + 0)) ↦ f32)
+            fixum f32 sc2 ← (_i8(_byte(b, 192 + sc_base + is + 2)) ↦ f32)
+            fixum f32 sc4 ← (_i8(_byte(b, 192 + sc_base + is + 4)) ↦ f32)
+            fixum f32 sc6 ← (_i8(_byte(b, 192 + sc_base + is + 6)) ↦ f32)
+            # Same left-associative f32 multiplication order as the C
+            # kernels ((d * sc) * q), so outputs are bit-exact.
+            q1s.appende(d * sc0 * (q1 ↦ f32))
+            q2s.appende(d * sc2 * (q2 ↦ f32))
+            q3s.appende(d * sc4 * (q3 ↦ f32))
+            q4s.appende(d * sc6 * (q4 ↦ f32))
+            l ← l + 1
+        }
+        itera ex q1s fixum v {
+            y.appende(v)
+        }
+        itera ex q2s fixum v {
+            y.appende(v)
+        }
+        itera ex q3s fixum v {
+            y.appende(v)
+        }
+        itera ex q4s fixum v {
+            y.appende(v)
+        }
+        n ← n + 1
+    }
+    redde y
+}
+
+# F32 scalar block: bit-exact passthrough of the 4 little-endian bytes.
+@ privata
+functio _dequant_f32(lista<numerus<u8>> b) → lista<f32> ⇥ DequantError {
+    varia lista<f32> y ← vacua
+    y.appende(_f32le(b, 0))
+    redde y
+}
+
+# -------------------------------------------------------------------------
+# Layout facts (block elements / block bytes per admitted type; 0 for
+# un-admitted types). Public so the row entry point and the admission
+# consumers can compute block counts without re-deriving the table.
+# -------------------------------------------------------------------------
+
+functio elementa_glomoris(numerus typo) → numerus {
+    si typo ≡ GGML_F32 ergo redde F32_ELEMENTA
+    si typo ≡ GGML_Q5_0 ergo redde Q5_0_ELEMENTA
+    si typo ≡ GGML_Q8_0 ergo redde Q8_0_ELEMENTA
+    si typo ≡ GGML_Q4_K ergo redde Q4_K_ELEMENTA
+    si typo ≡ GGML_Q6_K ergo redde Q6_K_ELEMENTA
+    redde 0
+}
+
+functio octeti_glomoris(numerus typo) → numerus {
+    si typo ≡ GGML_F32 ergo redde F32_OCTETI
+    si typo ≡ GGML_Q5_0 ergo redde Q5_0_OCTETI
+    si typo ≡ GGML_Q8_0 ergo redde Q8_0_OCTETI
+    si typo ≡ GGML_Q4_K ergo redde Q4_K_OCTETI
+    si typo ≡ GGML_Q6_K ergo redde Q6_K_OCTETI
+    redde 0
+}
+
+# -------------------------------------------------------------------------
+# dequantizas_glomulus — dequantize ONE admitted GGML block to its f32
+# logical elements. Fail closed on un-admitted type (before any byte is
+# touched) and on block byte-length mismatch.
+# -------------------------------------------------------------------------
+
+functio dequantizas_glomulus(numerus typo, lista<numerus<u8>> blocci) → lista<f32> ⇥ DequantError {
+    fixum numerus elementa ← elementa_glomoris(typo)
+    si elementa ≡ 0 {
+        iace finge TypoIgnotum { causa = "un-admitted GGML type id: " + (typo ↦ textus) }
+    }
+    fixum numerus blocci_octeti ← octeti_glomoris(typo)
+    si blocci.longitudo() ≠ blocci_octeti {
+        iace finge GlomulusMala { causa = "block byte length mismatch" }
+    }
+
+    si typo ≡ GGML_F32 ergo redde _dequant_f32(blocci)
+    si typo ≡ GGML_Q5_0 ergo redde _dequant_q5_0(blocci)
+    si typo ≡ GGML_Q8_0 ergo redde _dequant_q8_0(blocci)
+    si typo ≡ GGML_Q4_K ergo redde _dequant_q4_k(blocci)
+    si typo ≡ GGML_Q6_K ergo redde _dequant_q6_k(blocci)
+    iace finge TypoIgnotum { causa = "unreachable" }
+}
+
+# -------------------------------------------------------------------------
+# dequantizas_ordo — dequantize a packed row (blocks × block_bytes, the
+# GGUF data-region payload of one admitted tensor) to its f32 logical
+# elements, in GGUF block order. Fail closed on un-admitted type and on a
+# row byte length that is not a whole multiple of block_bytes.
+# -------------------------------------------------------------------------
+
+functio dequantizas_ordo(numerus typo, lista<numerus<u8>> octeti) → lista<f32> ⇥ DequantError {
+    fixum numerus elementa ← elementa_glomoris(typo)
+    si elementa ≡ 0 {
+        iace finge TypoIgnotum { causa = "un-admitted GGML type id: " + (typo ↦ textus) }
+    }
+    fixum numerus blocci_octeti ← octeti_glomoris(typo)
+    si octeti.longitudo() % blocci_octeti ≠ 0 {
+        iace finge OrdoMala { causa = "row byte length not a multiple of block_bytes" }
+    }
+
+    varia lista<f32> y ← vacua
+    varia numerus off ← 0
+    dum off < octeti.longitudo() {
+        varia lista<numerus<u8>> blocci ← vacua
+        varia numerus i ← 0
+        dum i < blocci_octeti {
+            blocci.appende(octeti.accipe(off + i) vel (0 ∷ numerus<u8>))
+            i ← i + 1
+        }
+        fixum lista<f32> g ← dequantizas_glomulus(typo, blocci)
+        itera ex g fixum v {
+            y.appende(v)
+        }
+        off ← off + blocci_octeti
+    }
+    redde y
+}
