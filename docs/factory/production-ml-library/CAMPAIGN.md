@@ -1,6 +1,6 @@
 # Campaign: Production ML Library
 
-**Status**: planned pre-implementation — ready for delivery; PML0 boundary and baseline is selected
+**Status**: active — PML executed tier in progress: LIB-MIR landed (43c0102ba), PML4 executed-lane committed (04ba15f), lane test on last masked layers (rounding fixed; Absolute/Signum arm pending); PML5 executed tier queued
 **Created**: 2026-08-08
 **Mode**: routing artifact — draft/maintain; does not implement code directly
 **Control-plane repo**: `/Users/ianzepp/work/faberlang/gradus`

@@ -19,21 +19,21 @@ in [`docs/archived/`](../archived/README.md).
 ## Summary
 
 - goals scanned: 2
-- active: 0
-- planned: 1
+- active: 1
+- planned: 0
 - done: 1
 - unknown: 0
 - archived (moved to `docs/archived/`): 0
 
 ## Open and in progress
 
-_none_
+| Goal | Status | Done | goal | campaign | delivery | ledger | council | evidence | other |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| [production-ml-library](production-ml-library/CAMPAIGN.md) | active | — | 0 | 1 | 8 | 1 | 0 | 0 | 20 |
 
 ## Planned
 
-| Goal | Status | Done | goal | campaign | delivery | ledger | council | evidence | other |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| [production-ml-library](production-ml-library/CAMPAIGN.md) | planned | — | 0 | 1 | 8 | 1 | 0 | 0 | 20 |
+_none_
 
 ## Archived
 
