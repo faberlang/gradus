@@ -110,4 +110,4 @@ the pins under numeric-policy v1.0.0 (gradient row 1e-4; loss row).
 | --- | --- | --- | --- |
 | 1 | Runtime-evidence gate for PML4 executed convergence (loss trajectory + resume trajectory + seeded runs vs the pins under numeric-policy v1.0.0). Blocked by the named compiler-lane inputs (FMIR library-call resolution OR AIR-companion Rust lowering) — the two blockers above are the gate's prerequisites | Auditor (faber test path) + radix lane (named inputs) | pending — gate |
 | 2 | PML5 (production inference computation layer) is the next Gradus phase per the ordering graph; PML4's composed loop is its aggregate training reference | Mind routes at PML5 lowering | pending — PML5 |
-| 3 | PML6-U3 aggregates every admitted row into `pml0-support-matrix.md` — the PML4 structural-tier rows join that full-matrix aggregation | PML6 delivery owner | pending — PML6 stage |
+| 3 | PML6-U3 aggregates every admitted row into `pml0-support-matrix.md` — the PML4 structural-tier rows join that full-matrix aggregation | PML6 delivery owner | **closed** — U3 `43d75ce` (full-matrix aggregation; see `pml6-closeout.md`) |

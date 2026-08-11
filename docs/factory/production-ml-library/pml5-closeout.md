@@ -140,5 +140,5 @@ semantic mapping is cross-checked against when it opens.
 | --- | --- | --- | --- |
 | 1 | PML5 executed-oracle clause (CTO8-1): oracle-matching tokens (executed) — open until hand-1's FMIR lands AND `exempla_script_e2e` is green for library-importing packages; then one auditor pass re-runs PML4 pins + PML5 tokens (CTO8-3) | Auditor (executed-tier gate) + hand-1 (FMIR lever) | open — trigger dated 2026-08-09 |
 | 2 | NGAB5 feed: the aggregate is the semantic contract NGAB5 adapts; the executed tier gates the feed (cross-check the executed-oracle clause when it opens) | NGAB5 delivery owner | pending — NGAB5 |
-| 3 | PML6 (package contract) is the next Gradus phase per the ordering graph — planning is Mind's | Mind routes at PML6 planning | pending — PML6 |
-| 4 | PML6-U3 aggregates every admitted row into `pml0-support-matrix.md` (the PML4/PML5 structural rows join the full-matrix aggregation) | PML6 delivery owner | pending — PML6 stage |
+| 3 | PML6 (package contract) is the next Gradus phase per the ordering graph — planning is Mind's | Mind routes at PML6 planning | **closed** — PML6 delivered structural (`pml6-closeout.md`, 2026-08-11) |
+| 4 | PML6-U3 aggregates every admitted row into `pml0-support-matrix.md` (the PML4/PML5 structural rows join the full-matrix aggregation) | PML6 delivery owner | **closed** — U3 `43d75ce` (full-matrix aggregation) |
