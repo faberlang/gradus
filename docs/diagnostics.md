@@ -448,4 +448,3 @@ Discipline: for each `ErrorType.Variant` row, `Variant` appears inside `discreti
 - Support matrix: [`docs/factory/production-ml-library/pml0-support-matrix.md`](factory/production-ml-library/pml0-support-matrix.md)
 - Compatibility policy: [`docs/compatibility-policy.md`](compatibility-policy.md) (PML6-U3, when present)
 - Exempla: `exempla/*/README.md`
-
