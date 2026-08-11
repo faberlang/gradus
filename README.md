@@ -41,21 +41,25 @@ broadcast is limited). A linear+MSE training loop matches finite differences,
 and an MLP exemplum landed. Gradus's job is to wrap that capability into a
 clean, self-contained user library.
 
-### Seam status (rebaselined 2026-08-03)
+### Seam status (PML6-U2 — structural tier)
 
-The gradient seam (`exempla/gradient-seam`) **compiles and executes end to end
-through `faber run -t fmir` with the current release faber toolchain**
-(v1.4.0, includes faber `180bcef`): forward loss via `gradient.simple_loss`,
-companion backward `gradient.loss_backward` across the `importa` boundary
-(SEM004), and the per-element FD comparison all run; the companion gradient
-matches finite differences to ~1e-11. The two U1 compiler blockers this seam
-depends on — SEM004 and LIB-MIR — are resolved on that toolchain. The seam
-fixture header's "faber run -t fmir fails (LIB-MIR gate)" claim is stale.
+The gradient seam consumers live under `exempla/`:
 
-Caveat: `./scripta/check-compile` resolves `faber` from PATH and currently
-fails on the seam consumer (SEM004) when the on-PATH binary is the stale
-2026-08-01 debug build — refresh the toolchain before trusting that gate.
-Full evidence: `radix/docs/factory/gpu-training-lowering/gradus-seam-rebaseline.md`.
+| Exemplum | Role | Tier (PML6) |
+| --- | --- | --- |
+| `exempla/gradient-seam` | Library import of `gradus:gradient` + FD check (SEM004 companion across `importa`) | **Structural** — `faber check`; oracle pins in the exemplum README |
+| `exempla/gradient-seam-nolib` | Self-contained `@ radix backward` + FD (no library import) | **Structural** — `faber check`; same arithmetic oracle |
+
+Pinned oracle (f64 arithmetic of the documented loss): forward loss `2.25`,
+companion `grad_w = [0.25, 0.5, 0.75, 1.0]`, FD diffs ~`1e-11`. See each
+exemplum README for inputs and the honest execution record.
+
+**No executed seam run is claimed at the campaign gate.** Exempla e2e and
+proba execution remain on the FMIR lever (CTO8-1 named pre-release item).
+Historical toolchain rebaseline (S0-D, not a standing executed claim):
+`radix/docs/factory/gpu-training-lowering/gradus-seam-rebaseline.md`.
+Use a current release `faber` binary for `./scripta/check-compile` (set
+`FABER_BIN` if PATH points at a stale build).
 
 ## Design principles
 

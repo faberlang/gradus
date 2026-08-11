@@ -6,6 +6,10 @@ a 4×4 two-layer MLP (linear → GELU → linear → MSE), 100 steps, lr 0.1 —
 the accepted MLP training-proof shape (`examples/training/mlp`, the pinned
 CPU/FMIR oracle).
 
+**Tier**: structural (PML6). Oracle pins below match `src/train.proba`
+(PML4-U6). **No executed convergence is claimed** while the FMIR lever
+(CTO8-1) is open.
+
 ## What the loop composes (the U6 residual from PML4-U5)
 
 | Step | Surface |
@@ -19,6 +23,11 @@ CPU/FMIR oracle).
 
 ## Convergence target (accepted oracle, f64 evaluations)
 
+Pinned in `src/train.proba` (PML4-U6). The proba asserts the gate
+`final/initial < 0.1` and the trajectory points below (step 25 is part of
+the documented target series; the proba binds l0/l10/l50/l75/l99 for the
+ratio checks):
+
 | Step | Loss |
 | --- | --- |
 | 0 | 1.576448169383708 |
@@ -29,9 +38,8 @@ CPU/FMIR oracle).
 | 99 | 0.017928625511508454 |
 
 Convergence ratio `final/initial = 0.01137 < 0.1` (the accepted gate).
-Pins recorded in `src/train.proba` (U6 section).
 
-## Execution record (honest — CTO Q2)
+## Execution record (honest — CTO Q2 / CTO8-1)
 
 This library-backed composition is **compile-validated** by
 `faber check` on the package (the reverse-AD transform runs; every U1–U5
@@ -41,7 +49,8 @@ env-blocked on both available lanes today**:
 1. **FMIR stepper** — the recorded library-import gap: `faber test` on a
    library-importing surface fails with `unsupported MIR lowering: method
    call before runtime/provider MIR lowering` (library-to-library calls
-   do not resolve in the stepper).
+   do not resolve in the stepper). Campaign name for the open gate:
+   **FMIR lever / CTO8-1**.
 2. **Rust emit lane** — `faber emit -t rust` on the training path fails
    with `TARGETLANE001: lane_requires_mir_backed_target`: the AIR-lane
    reverse-AD companion (`@ radix lane "air"` + `@ radix backward`) does
@@ -58,3 +67,9 @@ To run the gate once the lanes open: `faber run -t fmir .` (FMIR lane) or
 emit-to-Rust + scratch-crate `cargo run` (Tela double-build pattern) and
 compare the `loss_trace` against the pins above under numeric-policy
 v1.0.0.
+
+## Related
+
+- Seam consumers: `exempla/gradient-seam/`, `exempla/gradient-seam-nolib/`
+- Token generation: `exempla/token-generation/`
+- Diagnostics: `docs/diagnostics.md`

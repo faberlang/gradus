@@ -9,16 +9,20 @@ token sequences are pinned against the documented arithmetic, with the
 GI0–GI2 oracle linkage recorded and the first-token-divergence rule
 enforced.
 
+**Tier**: structural (PML6). Token pins below match `src/decode.proba`
+(PML5-U6). **No executed token is claimed** while the FMIR lever
+(CTO8-1) is open.
+
 ## The pinned workload (gradus scale)
 
 The tiny pinned decoder of `decode.proba` (V=3, D=4, F=4, context 3,
 scale 1/√4, RoPE dim 4 — the oracle-pinned model), prompt `[0]`, config
 `contextus 3, prompt batch 1, max generated tokens 2`:
 
-| Run | Config | Expected tokens (f64 oracle) |
-| --- | --- | --- |
-| Greedy | temperatura 0 (the U3 greedy path, exact argmax) | `[0]` |
-| Seeded stochastic | temperatura 1.0, neutral knobs, seed `8742514861359412281` | `[1, 1]` |
+| Run | Config | Expected tokens (f64 oracle) | Proba pin |
+| --- | --- | --- | --- |
+| Greedy | temperatura 0 (the U3 greedy path, exact argmax) | `[0]` | EOG-stop: first drawn `0` is admitted EOG |
+| Seeded stochastic | temperatura 1.0, neutral knobs, seed `8742514861359412281` | `[1, 1]` | no EOG token — runs to cursor ceiling |
 
 The greedy run emits **`[0]`** — not `[0, 0]` — because of the **EOG-stop
 policy** (the CTO9-4 correctness fix, binding generation to the admitted
@@ -27,6 +31,9 @@ tokenizer identity): the first drawn token `0` is an admitted EOG token
 generation terminates after it. `maxima_verborum` is a **ceiling**, not a
 promise to emit exactly that many tokens. The seeded run draws `[1, 1]`
 (no EOG token), so it runs to the cursor ceiling.
+
+Identity failure for a non-pinned EOG set is `TokenizerError.EogMala`
+(see `docs/diagnostics.md`) — not a value error.
 
 Both runs are bounded by the generation cursor (`verbum_licet` — the U5
 reject policy: never more than `maxima_verborum`, never truncated) AND
@@ -105,23 +112,29 @@ never the claim. The rule is probe-pinned in `decode.proba`.
   EOG-stop is a generation-loop policy, so a sampling replay that draws
   the EOG token `2` is out of that scope.
 
-## Execution record (honest — CTO Q2)
+## Execution record (honest — CTO Q2 / CTO8-1)
 
 This workload is **compile-validated** by `faber check` on the package
 (every U1–U5 call and the aggregate composition type-check), and its
-expected token sequences are pinned by the co-located proba. **Executed
-token generation is env-blocked today**: the FMIR execution lane does not
-build — `faber run --target fmir` fails with `invalid MIR: named
-aggregate is missing required field` / `fmir image build failed` on the
-existing PML4 exempla (the recorded FMIR stepper / library-import gap;
-hand-1's e2e-hardening successor slice is in flight). PML5-U6 is
-therefore **PARTIAL** per the standing bar: the proof is structural
-(composition + f64 oracle pins) and executed value-identity (the run's
-printed tokens vs the pins, the deterministic replay byte identity) is
-deferred to the auditor-owned runtime-evidence gate. **No executed
-token is claimed.**
+expected token sequences are pinned by the co-located proba
+(`src/decode.proba` PML5-U6). **Executed token generation is
+env-blocked today** on the **FMIR lever** (CTO8-1 named pre-release
+item): the FMIR execution lane does not build — `faber run --target
+fmir` fails with `invalid MIR: named aggregate is missing required
+field` / `fmir image build failed` on the existing PML4 exempla (the
+recorded FMIR stepper / library-import gap). PML5-U6 is therefore
+**PARTIAL** per the standing bar: the proof is structural (composition +
+f64 oracle pins) and executed value-identity (the run's printed tokens
+vs the pins, the deterministic replay byte identity) is deferred to the
+auditor-owned runtime-evidence gate. **No executed token is claimed.**
 
 To run the gate once the lane opens: `faber run -t fmir .` (FMIR lane)
 and compare the printed token sequences against the pins above with the
 first-token-divergence rule — divergence, if any, is recorded at the
 first divergent token.
+
+## Related
+
+- Training composition: `exempla/training-loop-mlp/`
+- Diagnostics (`EogMala`, decode/generation errors): `docs/diagnostics.md`
+- API: `docs/api-reference.md` (`gradus:decode`, `gradus:generation`, `gradus:tokenizer`)
