@@ -1,117 +1,140 @@
-# PML0/PML1/PML2 Public Symbol Inventory — gradus
+# PML0/PML1/PML2/PML3/PML4/PML5 Public Symbol Inventory — gradus
 
-**Unit**: PML0-U2 (public symbol inventory), re-baselined at PML1 closeout
-and re-baselined for PML2 (auditor-2 fire-3 P2-3 — the model module and
-tokenizer were missing from the prior baseline)
-**Date**: 2026-08-08 (PML0) / 2026-08-09 (PML1 re-baseline; PML2 re-baseline;
-grep only, no cargo)
+**Unit**: PML0-U2 (public symbol inventory), re-baselined at PML1 closeout,
+re-baselined for PML2 (auditor-2 fire-3 P2-3 — the model module and tokenizer
+were missing from the prior baseline), and re-baselined for PML6-U1 (the
+post-PML1–5 + correctness-wave surface: the training-layer modules PML4, the
+inference modules PML5, the dequant sub-leaf, and the correctness-wave rename
+`_le4/_le8` → `_be4_lege/_be8_lege`)
+**Date**: 2026-08-08 (PML0) / 2026-08-09 (PML1/PML2 re-baselines) /
+2026-08-11 (PML6-U1 re-baseline; grep only, no cargo)
 **Source**: live `grep -c 'functio ' src/*.fab` + `src/model/*.fab` per
 module — the scan is recursive so the PML2 model module (`src/model/`,
-sub-leaves capsule/gguf/safetensors) is covered
+sub-leaves capsule/dequant/gguf/safetensors) is covered
 **Method**: `scripta/inventory-public-symbols` — grep-based; counts `functio `
-declaration lines per `src/*.fab` module (recursively, so `model/capsule`,
-`model/gguf`, `model/safetensors` appear), prints the module → functio table
-plus the all-module total, and asserts the re-baselined baseline: per-module
-counts for the seven fixed-shape proof-surface modules (post-U6: optimize 0,
-transformer 1) and for the model module's three sub-leaves, and the tracked
-total **133** (proof-surface 17 + model module 116). The live all-module
-total (printed TOTAL row) includes the foundation modules
-(dtype/math/parameter/serialize/shape/tensor) that are versioned by their own
-contract docs and schemas.
+declaration lines per `src/*.fab` module (recursively), prints the module →
+functio table plus the all-module total, and asserts the re-baselined
+baseline: per-module counts for **every live module** (25 modules: the
+PML0/PML1 foundation and proof-surface modules, the PML2 model module's four
+sub-leaves, the PML4 training-layer modules, and the PML5 inference modules)
+and the tracked total **572** (the live all-module count — every module is
+asserted, there is no untracked remainder). The script additionally runs the
+**committed coverage gate** (PML6-U1, zombie-doc): every public `functio`
+name (non-`_` prefix — `_`-prefixed names are `@ privata` module-internal
+helpers) in every module appears in `docs/api-reference.md` under that
+module's section, so no shipped public symbol is undocumented.
 **Version stamps**: PML1 closeout at gradus HEAD (PML1-U1..U7 landed,
-45a09d9..de017eb); PML2-U1..U3 landed (435ccd6, 07291d6, b392fc8) added
-`src/model/`. The tokenizer module (`src/tokenizer.fab`, PML2-U4) is **in
-flight** (hand-5, untracked at this re-baseline): its row is counted in the
-live TOTAL but is **not asserted** (informational until it lands).
+45a09d9..de017eb); PML2-U1..U4 landed (435ccd6, 07291d6, b392fc8, and the
+tokenizer module) added `src/model/` and `src/tokenizer.fab`; PML3–PML5
+landed the production nn/attention/transformer surface and the training +
+inference modules; the correctness wave (`3c295c0`, `6cc0eb5`, `2cdc498`,
+`0d50d60`) renamed the serialize big-endian readers and pinned the EOG-set
+admission semantics.
 **Consumed by**: PML0-U3 (proof-shaped API ledger) feeds the fixed-shape rows
-from the names below.
+from the names below; `docs/api-reference.md` (PML6-U1) documents every
+public symbol on this inventory.
 
 ## Captured output
 
 ```
 module           functio
-attention        1
+attention        20
+cache            37
 data             0
+decode           46
 dtype            14
-gradient         2
-gradus           0
-loss             3
-math             22
+generation       27
+gradient         13
+gradus           7
+loss             11
+math             23
+metrics          6
 model/capsule    79
+model/dequant    18
 model/gguf       14
 model/safetensors 23
-nn               6
-optimize         0
+nn               17
+optimize         26
 parameter        37
+sampling         27
 serialize        34
 shape            9
 tensor           11
-tokenizer        22
-train            4
-transformer      1
-TOTAL            282
+tokenizer        23
+train            41
+transformer      9
+TOTAL            572
 ```
 
 ## Symbol detail
 
-| Module | Count | `functio` names |
+Public symbol names per module (the coverage gate's surface; the count
+column is the module's **total** `functio` lines including `@ privata`
+helpers, matching the captured output):
+
+| Module | Count | Public `functio` names |
 | --- | --- | --- |
-| attention | 1 | `scaled_dot_product_2x8` |
+| attention | 20 | `scaled_dot_product_2x8`, `causa`, `rotary_position_embedding`, `scaled_dot_product`, `scaled_dot_product_causal`, `scaled_dot_product_causal_rope` (14 `@ privata` helpers) |
+| cache | 37 | `causa`, `cache_aequus`, `cache_vacua`, `appende`, `redintegra`, `identitas_cache_aequus`, `identitas_cache`, `serializa_identitas`, `deserializa_identitas` + KVCache/IdentitasCache genus methods (`model`, `versio_modelis`, `configuratio`, `tokenizator`, `historia`, `stratorum`, `typo`, `ordinatio`, `clavis`, `valor`, `versio`, `dimensio`, `longitudo`, `positio`) (6 `@ privata` helpers) |
 | data | 0 | — (stub) |
+| decode | 46 | `causa`, `structa_pondera`, `structa_decodere`, `decodere_datum`, `praefundere`, `sessio_fresh`, `progredere`, `redintegra`, `cancelatum_fresh`, `cancelatum_cancellata`, `observa_cancellationem`, `replica` + Pondera/Decodere/Sessio/Cancelatum genus methods (`ln1_s`, `ln1_o`, `wq`, `bq`, `wk`, `bk`, `wv`, `bv`, `wo`, `bo`, `ln2_s`, `ln2_o`, `wf1`, `bf1`, `wf2`, `bf2`, `ln3_s`, `ln3_o`, `mensa`, `pondera`, `projectio`, `projectio_bias`, `scala`, `vocabulum`, `contextus`, `dimensio`, `positio`, `cancellata`) (5 `@ privata` helpers) |
 | dtype | 14 | `f32`, `f16`, `i32`, `u8`, `causa`, `nomen`, `ex_nomine`, `amplitudo`, `serializa`, `deserializa`, `promovet`, `angusta`, `finita`, `casta` |
-| gradient | 2 | `nil`, `simple_loss` |
-| gradus | 0 | facade map only (no genera) |
-| loss | 3 | `mse_2x2`, `mse_4x4`, `mse_2x8` |
-| math | 22 | `causa`, `_forma_broadcast`, `_quantitas_valid`, `_index_broadcast`, `_index_axis`, `_coordinata`, `_planus_axis`, `_typo_par`, `structa`, `add`, `sub`, `mul`, `div`, `neg`, `abs`, `summa`, `media`, `matmul`, `_typus_ex_nomine`, `casta`, `concatenatio`, `segmentum` |
-| model/capsule | 79 | six field-group accessors (bytes `corpus`/`longitudo`/`opertum`; crypta `algorithmus`/`digestio`/`longitudo_bytes`; tokenizator `progenies`/`pre_tokenizator`/`digestio_vocabuli`/`eog`/`bos_vacua`/`spatium_vacua`; quantizatio `typo`/`elementa_glomoris`/`octeti_glomoris`/`concordatio`/`quantizatio`; limites `machina`/`kv`/`tensores`/`nomen`/`dimensio`/`elementa`/`textus` + `limes_*` mirrors; architectura `identificator`/`densitas`/`strata`/`contextus`/`schematis`/`architectura`) + `causa`, `semita`, `identia`, `identitas_aequus`, `structa`, `verifica`, `verifica_contra`, `serializa_identitas`, `deserializa_identitas`, `_parsa` + 10 `@ privata` validators (`_est_hex`, `_hex_recta`, `_eog_recta`, `_est_digitum`, `_quantizatio_admissa`, `_quantizatio_recta`, `_limes_recti`, `_tokenizator_recta`, `_architectura_recta`) |
-| model/gguf | 14 | `admit` (row → capsule, fail-closed) + `causa` + 12 `@ privata` GGUF parse helpers (`_legere_u32`, `_legere_u64`, `_legere_textus`, `_legere_string`, `_legere_bool`, `_scalar_magnitudo`, `_magnitudo_valoris`, `_clavis_admissa`, `_continet`, `_typo_admissus`, `_typo_elementa`, `_typo_octeti`) |
-| model/safetensors | 23 | `admittas` (row → capsule, fail-closed) + `causa` + 21 `@ privata` header/JSON parse helpers (`_est_digitum`, `_est_hex`, `_est_sponte`, `_hex_recta`, `_le8`, `_caput`, `_lege_string`, `_lege_number`, `_scander`, `_typo`, `_valor`, `_parsa_integrum`, `_parsa_numerorum`, `_parsa_meta`, `_parsa_tensoris`, `_perambulare`, `_meta_quaero`, `_meta_exige`, `_inveni_nomen`, `_quantitas`, `_formae_aequae`) |
-| nn | 6 | `linear_2x2`, `linear_4x4`, `gelu_4x4`, `linear_2x8`, `layernorm_2x8`, `gelu_2x8` |
-| optimize | 0 | — (empty facade post-U6; sgd_step_* retired) |
-| parameter | 37 | `statio_nomen`, `causa`, genus methods (`nomen`, `nomen_typi`, `figura`, `versio`, `possessor`, `identia`, `statio`, `quantitas`, `valor`, `numerus`, `contineo`, `inveni`, `trainabiles`, `gelidae`, `ordo`) + `identitas_aequus`, `_gelida`, `est_trainabilis`, `est_gelida`, `_structum`, `structa`, `structa_gelida`, `muta`, `registrum_vacuum`, `adscisco`, `_digitum`, `_numerica`, `_habeat_solidum`, `serializa`, `deserializa` |
-| serialize | 34 | `causa`, `Tensum`/`ParametrumWire` methods (`typo`, `figura`, `datos`, `nomen`, `possessor`, `versio`, `statium`) + `_octeti_lista`, `_textus_bytes`, `_be4`, `_be8`, `_be4_lege`, `_be8_lege`, `_caput`, `_legere_textus`, `_quantitas`, `_gradus`, `_iunge_datos`, `_divido_datos`, `_tag_a`, `_nomen_a_tag`, `_habeat_solidum`, `serializa_dtype`, `serializa_shape`, `serializa_tensor`, `serializa_parametrum`, `deserializa_dtype`, `deserializa_shape`, `deserializa_tensor`, `deserializa_parametrum` |
-| shape | 9 | `causa`, `valet`, `gradus`, `_productus`, `quantitas`, `_dimensio`, `broadcastum`, `reformanda`, `expansio` |
-| tensor | 11 | genus methods (`figura`, `gradus`, `quantitas`, `typus`, `valet`, `accipe`) + `causa`, `_quantitas_forma`, `structa`, `structa_typo`, `impleta` |
-| tokenizer | 22 | identity accessors (`schematis`, `progenies`, `pre_tokenizator`, `digestio_vocabuli`, `eog`, `bos_vacua`, `spatium_vacua`) + probe/verify surface (`proba_aequa`, `proba_ida`, `verifica_proba`, `pinnata_proba`, `structa`, `verifica`, `clavis_tokenizatoris`, `serializa_identitas`, `deserializa_identitas`) + `causa` + 5 `@ privata` helpers (`_est_hex`, `_hex_recta`, `_est_digitum`, `_eog_recta`, `_id_in_ambitu`) — **in flight** (hand-5); count informational |
-| train | 4 | `train_step_2x2`, `train_step_4x4`, `train_step_bert_linear`, `train_step_bert_layernorm` |
-| transformer | 1 | `bert_tiny_block_2x8` |
+| generation | 27 | `causa`, `generatio_aequus`, `structa_generatio`, `generatio_defecta`, `imperia_subsidia`, `imperium_admissum`, `configura`, `semen`, `serializa_generatio`, `deserializa_generatio`, `cursor_fresh`, `verbum_licet`, `cursor_progredere`, `cursor_redintegra` + GeneratioConfigura/GenereCursor genus methods (`contextus`, `magna_promptus`, `maxima_verborum`, `semen`, `temperatura`, `top_k`, `top_p`, `min_p`, `poena_repetitionis`, `sessio`, `prolata`) (2 `@ privata` helpers) |
+| gradient | 13 | `causa`, `structa`, `structa_gradientes`, `obsoletus`, `nil`, `simple_loss`, `gradientes_simple_loss` + Gradiente/Gradientes genus methods (`possessor`, `nomen`, `versio`, `valor`, `numerus`, `inveni`) |
+| gradus | 7 | `causa`, `forward_mlp`, `nil`, `forward_mlp_loss` (3 `@ privata` helpers) |
+| loss | 11 | `causa`, `mse`, `cross_entropy`, `mse_2x2`, `mse_4x4`, `mse_2x8` (5 `@ privata` helpers) |
+| math | 23 | `causa`, `structa`, `add`, `sub`, `mul`, `div`, `neg`, `abs`, `signum`, `summa`, `media`, `matmul`, `casta`, `concatenatio`, `segmentum` (8 `@ privata` helpers) |
+| metrics | 6 | `causa`, `accuratezza`, `metricum`, `metrica_aequus` + Metricum genus methods (`damnum`, `accuratezza`) |
+| model/capsule | 79 | `causa`, `identitas_aequus`, `structa`, `verifica`, `verifica_contra`, `serializa_identitas`, `deserializa_identitas` + the six field-group genus methods (BytesValida: `corpus`, `longitudo`, `opertum`; IdentitasCrypto: `algorithmus`, `digestio`; IdentitasTokenizer: `progenies`, `pre_tokenizator`, `digestio_vocabuli`, `eog`, `bos_vacua`, `spatium_vacua`; Quantizatio: `typo`, `elementa_glomoris`, `octeti_glomoris`, `concordatio`; Limites: `machina`, `kv`, `tensores`, `nomen`, `dimensio`, `elementa`, `textus`; Architectura: `identificator`, `densitas`, `strata`, `contextus`; Identitas: `schematis`, `algorithmus`, `digestio`, `longitudo_bytes`, `quantizatio`, `architectura`, `strata`; Capsula: `schematis`, `corpus`, `longitudo`, `opertum`, `algorithmus`, `digestio`, `progenies`, `pre_tokenizator`, `digestio_vocabuli`, `eog`, `bos_vacua`, `spatium_vacua`, `quantizatio`, `elementa_glomoris`, `octeti_glomoris`, `concordatio`, `limes_machinae`, `limes_kv`, `limes_tensorum`, `limes_nominis`, `limes_dimensionis`, `limes_elementorum`, `limes_textus`, `identificator`, `densitas`, `strata`, `contextus`, `semita`, `identia`) (10 `@ privata` validators) |
+| model/dequant | 18 | `causa`, `elementa_glomoris`, `octeti_glomoris`, `dequantizas_glomulus`, `dequantizas_ordo` (13 `@ privata` helpers) |
+| model/gguf | 14 | `admit` (row → capsule, fail-closed) + `causa` + 12 `@ privata` GGUF parse helpers |
+| model/safetensors | 23 | `admittas` (row → capsule, fail-closed) + `causa` + 21 `@ privata` header/JSON parse helpers |
+| nn | 17 | `linear_2x2`, `linear_4x4`, `gelu_4x4`, `linear_2x8`, `layernorm_2x8`, `gelu_2x8`, `causa`, `linear`, `gelu`, `layernorm` (7 `@ privata` helpers) |
+| optimize | 26 | `causa`, `statum_aequus`, `structa`, `sgd_aequus`, `sgd_vacuum`, `adscisco`, `passus`, `serializa_statum`, `deserializa_statum`, `serializa`, `deserializa` + SgdStatum/Sgd/Passus genus methods (`possessor`, `nomen`, `versio`, `generatio`, `passus`, `lentus`, `numerus`, `contineo`, `inveni`, `novus`, `statum`) (4 `@ privata` helpers) |
+| parameter | 37 | `statio_nomen`, `causa`, `identitas_aequus`, `est_trainabilis`, `est_gelida`, `structa`, `structa_gelida`, `muta`, `registrum_vacuum`, `adscisco`, `serializa`, `deserializa` + Identitas/Parametrum/Registrum genus methods (`nomen`, `nomen_typi`, `figura`, `versio`, `possessor`, `identia`, `statio`, `quantitas`, `valor`, `numerus`, `contineo`, `inveni`, `trainabiles`, `gelidae`, `ordo`) (5 `@ privata` helpers) |
+| sampling | 27 | `causa`, `structa_configura`, `maxima`, `distributio`, `sors` + Configura/Sortitio genus methods (`temperatura`, `top_k`, `top_p`, `min_p`, `poena_repetitionis`, `token_id`, `semen`) (15 `@ privata` helpers) |
+| serialize | 34 | `causa`, `serializa_dtype`, `serializa_shape`, `serializa_tensor`, `serializa_parametrum`, `deserializa_dtype`, `deserializa_shape`, `deserializa_tensor`, `deserializa_parametrum` + Tensum/ParametrumWire genus methods (`typo`, `figura`, `datos`, `nomen`, `possessor`, `versio`, `statium`) (15 `@ privata` helpers, incl. the renamed `_be4_lege` / `_be8_lege` big-endian readers — correctness wave `3c295c0`) |
+| shape | 9 | `causa`, `valet`, `gradus`, `quantitas`, `broadcastum`, `reformanda`, `expansio` (2 `@ privata` helpers) |
+| tensor | 11 | `causa`, `structa`, `structa_typo`, `impleta` + Tensor genus methods (`figura`, `gradus`, `quantitas`, `typus`, `valet`, `accipe`) (1 `@ privata` helper) |
+| tokenizer | 23 | `est_eog`, `causa`, `proba_aequa`, `proba_ida`, `verifica_proba`, `pinnata_proba`, `structa`, `verifica`, `clavis_tokenizatoris`, `serializa_identitas`, `deserializa_identitas` + IdentitasTokenizator genus methods (`schematis`, `progenies`, `pre_tokenizator`, `digestio_vocabuli`, `eog`, `bos_vacua`, `spatium_vacua`) (5 `@ privata` helpers) |
+| train | 41 | `train_step_2x2`, `train_step_4x4`, `train_step_bert_linear`, `train_step_bert_layernorm`, `causa`, `structa_schedula`, `lentus_schedulata`, `modus_nomen`, `est_disciplina`, `est_aestimatio`, `modus`, `dropout_pars`, `structa_semen`, `proximus`, `proximus_f32`, `excutio`, `serializa_semen`, `deserializa_semen`, `structa_tabula`, `tabula_aequus`, `serializa_tabula`, `deserializa_tabula` + Schedula/Semen/Fructus/FructusF32/Excutio/Tabula genus methods (`lentus_vertex`, `incalesco`, `passus_total`, `lentus_finis`, `status`, `valor`, `semen`, `aetas`, `passus`, `rng`, `statum_wire`) (4 `@ privata` helpers) |
+| transformer | 9 | `bert_tiny_block_2x8`, `causa`, `transformer_block` (6 `@ privata` helpers) |
 
 ## Assertions (hold)
 
-- Per-module counts for the seven fixed-shape proof-surface modules match the
-  post-U6 live tree: attention 1, gradient 2, loss 3, nn 6, **optimize 0**,
-  train 4, **transformer 1**.
-- The PML2 model module (`src/model/`) is counted: model/capsule 79,
-  model/gguf 14, model/safetensors 23.
-- The tracked total (the seven per-module-asserted modules + the model module
-  sub-leaves) == **133**.
-- The live all-module total (printed TOTAL row) == **282** — informational;
-  foundation modules (dtype, math, parameter, serialize, shape, tensor) are
-  versioned by their own contract docs (`dtype-schema-1.0.0`,
-  `parameter-identity-schema-1.0.0`, `serialize-schema-1.0.0`, shape rules,
-  math families) and the module-DAG re-snapshot. The tokenizer row (22) is
-  **not asserted** — PML2-U4 is in flight (hand-5); it is counted in the live
-  TOTAL only.
-- Zero-count modules (data stub, gradus facade) and the empty optimize facade
-  are covered by the live table.
+- Per-module counts for **all 25 live modules** match the live tree exactly
+  (captured output above): foundation and proof-surface modules
+  (attention 20, data 0, dtype 14, gradient 13, gradus 7, loss 11, math 23,
+  nn 17, optimize 26, parameter 37, serialize 34, shape 9, tensor 11,
+  transformer 9), the PML4 training-layer modules (metrics 6, train 41), the
+  PML5 inference modules (cache 37, decode 46, generation 27, sampling 27),
+  and the PML2 model module (`model/capsule` 79, `model/dequant` 18,
+  `model/gguf` 14, `model/safetensors` 23) + tokenizer 23.
+- The tracked total == the live all-module total == **572**; every module is
+  asserted (no untracked remainder).
+- The **coverage gate** holds: every public symbol name above appears in
+  `docs/api-reference.md` under its module's `## gradus:<module>` section —
+  no shipped public symbol is undocumented (zombie-doc gate, PML6-U1).
+- Zero-count modules (data stub) and the facade module (gradus — public
+  convenience functions, no genera) are covered by the live table.
+- Private `_`-prefixed helpers are excluded from the public surface; the two
+  renamed serialize readers (`_be4_lege`, `_be8_lege`) are additionally
+  documented in the API reference per the correctness-wave reconciliation.
 
 ## Validation
 
 ```bash
 cd /Users/ianzepp/work/faberlang/gradus
-./scripta/inventory-public-symbols            # exit 0; per-module + tracked total 133 hold
+./scripta/inventory-public-symbols            # exit 0; per-module counts + total 572 + coverage gate
 diff <(./scripta/inventory-public-symbols) \
   <(awk 'BEGIN{n=0} /^```$/{n++; next} n==1{print} n>1{exit}' \
      docs/factory/production-ml-library/pml0-symbol-inventory.md)  # clean
-grep -c 'functio ' src/{attention,gradient,loss,nn,optimize,train,transformer}.fab \
-  | awk -F: '{s+=$2} END {print s}'   # 17 (tracked proof-surface total)
-grep -c 'functio ' src/model/{capsule,gguf,safetensors}.fab \
-  | awk -F: '{s+=$2} END {print s}'   # 116 (model module)
-grep -c 'functio ' src/*.fab src/model/*.fab | awk -F: '{s+=$2} END {print s}'   # 282 (live all-module)
+grep -c 'functio ' src/*.fab src/model/*.fab | awk -F: '{s+=$2} END {print s}'   # 572 (live all-module)
 git diff --check
 ```
 
-Outcome: `./scripta/inventory-public-symbols` exits 0 (per-module baseline and
-tracked total 133 hold); a fresh run diffs clean against the captured output
-above; the tracked proof-surface total == 17, the model module == 116, and the
-live all-module total == 282 match live grep; `git diff --check` clean.
+Outcome: `./scripta/inventory-public-symbols` exits 0 (per-module baseline
+and tracked total 572 hold; every public symbol is documented in
+`docs/api-reference.md`); a fresh run diffs clean against the captured output
+above; the live all-module total == 572 matches live grep; `git diff --check`
+clean.
