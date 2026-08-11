@@ -1,7 +1,7 @@
 # Delivery: PML6 — Production quality, performance, and release contract
 
 **Goal**: `docs/factory/production-ml-library/CAMPAIGN.md` (PML6 gate, lines 311–319)
-**Status**: scoped 2026-08-09 — entry gate MET; batch-by-default; full P3 confirmation at gate by planner; Mind owns admission
+**Status**: delivered (structural tier) 2026-08-11 — SG1/SG2/SG3 MET; phase gate MET at structural tier; U1–U5 tips 1f4f0d2 / 649b2f6 / 43d75ce / 5a5f295 / 9a2ed8b (main 0fbc97c); closeout `pml6-closeout.md`; CTO8-1 named pre-release item does NOT gate PML6; no version bump
 **Repo**: gradus (`docs/`, `README.md`, `AGENTS.md` doc refs, `faber.toml` / `cista.toml` metadata, `scripta/inventory-public-symbols`, benchmark/regression docs)
 **Predecessors**: accepted PML1–PML5 contracts, deliveries, and closeouts; PML0 support-matrix baseline (`pml0-support-matrix.md`, PML0-U5) and claim register (`pml0-claim-register.md`, PML0-U12); the landed gradus correctness wave (this session: `3c295c0`, `6cc0eb5`, `2cdc498`, `0d50d60`)
 **Supersedes**: the 2026-08-08 `pml6-delivery.md` draft (predates PML4/PML5 landing and the correctness wave — re-lowered at gate MET)

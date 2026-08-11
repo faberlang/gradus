@@ -310,7 +310,7 @@ continuous batching, HTTP, or physical residency.
 
 ### PML6 — Production quality, performance, and release contract
 
-**Status**: planned — may begin after PML1; closes after PML4 and PML5
+**Status**: delivered (structural tier) — PML6 U1–U5 delivered and admitted (U1 1f4f0d2, U2 649b2f6/29fb2fb, U3 43d75ce, U4 5a5f295, U5 9a2ed8b; main tip 0fbc97c); SG1/SG2/SG3 MET; phase gate MET at the structural tier — ten gate items committed and agree with live behavior (api-reference, diagnostics, exempla READMEs, full support-matrix aggregation, compatibility-policy v1.0.0, benchmark-method, numeric-tolerances, regression-corpus, package metadata @ 0.1.0 no bump, release-checklist); CTO8-1 remains a **named pre-release item** on the release checklist (does NOT gate PML6; open until FMIR lever + exempla_script_e2e green for library-importing packages; CTO8-3 auditor re-verification when lever opens); no executed claims beyond structural; no performance claim precedes correctness; closeout pml6-closeout.md; PML7 next (capstones + clean-install receipts)
 **Owner**: Gradus.
 **Source**: accepted PML contracts and receipts, package metadata, and the PML0
 support-matrix baseline.
