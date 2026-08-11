@@ -1,0 +1,247 @@
+# Gradus Regression Corpus
+
+**Version**: `gradus-regression-corpus v1.0.0` (2026-08-11, PML6-U4)
+**Repo**: gradus. **Tier**: structural inventory.
+**Delivery**: `docs/factory/production-ml-library/pml6-delivery.md` §PML6-U4.
+**Support rows**: `docs/factory/production-ml-library/pml0-support-matrix.md`
+(six admitted rows). **Tolerances**: `docs/numeric-tolerances.md`.
+**Benchmark method**: `docs/benchmark-method.md`.
+
+This document inventories the **admitted fixtures and proba pins** that
+form the Gradus regression corpus. The corpus **is** the co-located
+`src/**/*.proba` surface plus the committed fixtures under `fixtures/`
+and the fire-9 structural consumers — not a separate harness.
+
+**Structural green** means: `./scripta/check-source` and
+`./scripta/check-compile` exit 0, and the pin greps in §5 resolve.
+**No executed proba run is claimed here.** Executed regression is
+auditor-owned at the FMIR-lever gate (CTO8-1 / CTO8-3); one pass at
+closeout, never a dev-loop suite.
+
+---
+
+## 1. What counts as the corpus
+
+| Layer | Path | Role |
+| --- | --- | --- |
+| Co-located package tests | `src/*.proba`, `src/model/*.proba` | Compile-level contract + oracle pins per module |
+| Model / tokenizer fixtures | `fixtures/safetensors/`, `fixtures/gguf/`, `fixtures/tokenizer/` | Legal fixtures + row-oracle docs for admitted format rows |
+| Exempla consumers | `exempla/gradient-seam`, `exempla/gradient-seam-nolib`, `exempla/training-loop-mlp`, `exempla/token-generation` | Public-surface consumers (fire-9 enumeration) |
+| Admission conformance | `tests/admission_conformance.fab` | Capsule admission composition check |
+
+Nested package dirs follow the Agents rule (≥2 modules); model package
+tests live under `src/model/`.
+
+---
+
+## 2. Proba inventory (structural)
+
+Live co-located suites (24 files):
+
+| Suite | Module / surface | Pin class (summary) |
+| --- | --- | --- |
+| `src/dtype.proba` | `gradus:dtype` | Tag / cast / promote exact + typed errors |
+| `src/shape.proba` | `gradus:shape` | Broadcast / reshape / product fail-closed |
+| `src/tensor.proba` | `gradus:tensor` | Construction, index, rank errors |
+| `src/math.proba` | `gradus:math` | Tensor-aware math foundation |
+| `src/serialize.proba` | `gradus:serialize` | Wire round-trip; `_be4_lege` / `_be8_lege` readers |
+| `src/parameter.proba` | `gradus:parameter` | Identity + version schema |
+| `src/nn.proba` | `gradus:nn` | GELU / layernorm / linear — f64 pins @ **5e-4** |
+| `src/attention.proba` | `gradus:attention` | SDPA / RoPE — f64 pins @ **5e-4** |
+| `src/transformer.proba` | `gradus:transformer` | Block + LN3 / IN_LN3 pins @ **5e-4** |
+| `src/loss.proba` | `gradus:loss` | MSE / CE scalars @ **5e-4** |
+| `src/gradient.proba` | `gradus:gradient` | Companion-call contract; oracle pins for runtime gate |
+| `src/optimize.proba` | `gradus:optimize` | SGD step pins @ **1e-4** absolute |
+| `src/train.proba` | `gradus:train` | Schedules @ **5e-4**; seeds; checkpoint; U6 trajectory |
+| `src/metrics.proba` | `gradus:metrics` | Accuracy / metric record |
+| `src/tokenizer.proba` | `gradus:tokenizer` | Identity + **`est_eog` {0,2}** + EOG admission rejects |
+| `src/decode.proba` | `gradus:decode` | Logits @ **5e-4**; **tokens `[0]` / `[1,1]`**; reset/replay; first-token-divergence |
+| `src/cache.proba` | `gradus:cache` | KV identity + `redintegra` |
+| `src/sampling.proba` | `gradus:sampling` | Softmax / filters @ **5e-4** |
+| `src/generation.proba` | `gradus:generation` | Config + cursor limits + `cursor_redintegra` |
+| `src/gradus.proba` | facade composition | MLP / GELU composition @ **5e-4** |
+| `src/model/capsule.proba` | capsule admission | Schema + **EOG rejection** + quant / bounds |
+| `src/model/safetensors.proba` | Safetensors row | Fixture bytes + digest + tokenizer mismatch |
+| `src/model/gguf.proba` | GGUF row | Builder + digest + row facts |
+| `src/model/dequant.proba` | CPU dequant | Block layout pins |
+
+Every suite header states **EVIDENCE HONESTY (CTO Q2)**: structural /
+compile-level proof; executed value-identity deferred.
+
+---
+
+## 3. Fixture inventory (admitted rows)
+
+| Fixture / oracle | SHA-256 (where pinned) | Support-matrix row |
+| --- | --- | --- |
+| `fixtures/safetensors/smollm2-360m-scaled-row.safetensors` | `424442296e97c261de42fd496cc6cdb4496f3f632835479de96a7ed76c5f75d8` | Row 1 — Safetensors admission |
+| `fixtures/safetensors/safetensors-row-oracle.md` | (doc) | Row 1 oracle |
+| `fixtures/gguf/smollm2-360m-scaled-row.gguf` | `d89c9ef917158bfb5600f417020479499c6c042f728e9a29c8457a6b1a8f0974` | Row 2 — GGUF admission; also feeds Row 4 |
+| `fixtures/gguf/gguf-row-oracle.md` | (doc) | Row 2 oracle |
+| `fixtures/tokenizer/tokenizer-identity-oracle.md` | (doc; P1–P11 id lists) | Tokenizer identity for rows 1–2, 4, 6 |
+
+Generator helpers (`fixtures/*/gen_fixture.{fab,py}`) rebuild synthetic
+fixtures; they are not themselves admission evidence.
+
+Architecture / training / inference rows (matrix rows 3–6) use
+**synthetic fragment data + proba pins** rather than model-file fixtures
+(see each row's `legal fixture ref` in the support matrix).
+
+---
+
+## 4. Named pins (must not silently drift)
+
+These pins are the load-bearing regression contracts called out by
+PML6-U4 / the correctness wave. Loss of any pin is a corpus defect.
+
+### 4.1 EOG-stop greedy tokens `[0]`
+
+| Field | Value |
+| --- | --- |
+| **Pin** | Greedy bounded generation emits **`[0]`** (length 1), not `[0,0]` |
+| **Why** | First drawn token `0` is an admitted EOG token; EOG-stop terminates (`0d50d60`) |
+| **EOG set** | `{0, 2}` via `tokenizator.est_eog` |
+| **Ceiling** | `maxima_verborum` is a ceiling, never a promise of exact length |
+| **Live** | `src/decode.proba` — `"the greedy bounded run (temp 0) draws the f64-oracle tokens [0] ..."` |
+| **Consumer doc** | `exempla/token-generation/README.md` |
+
+### 4.2 Seeded stochastic tokens `[1, 1]`
+
+| Field | Value |
+| --- | --- |
+| **Pin** | Seeded run emits **`[1, 1]`** (length 2) |
+| **Seed** | `8742514861359412281` |
+| **Config** | `temperatura 1.0`, neutral top-k / top-p / min-p / penalty; `maxima_verborum 2` |
+| **Why** | No EOG token in the draw — runs to the cursor ceiling |
+| **Live** | `src/decode.proba` — `"the seeded stochastic bounded run ... draws the f64-oracle tokens [1, 1]"` |
+| **Consumer doc** | `exempla/token-generation/README.md` |
+
+### 4.3 Capsule EOG-rejection pin
+
+| Field | Value |
+| --- | --- |
+| **Pin** | Well-formed-but-**different** EOG set **`1,5`** fails closed at capsule admission |
+| **Pinned set** | `"0,2"` (`F_EOG`) |
+| **Message class** | `invalid tokenizer identity` (identity, not a value error) |
+| **Why** | A different EOG set is a different tokenizer (`2cdc498`; contract §3.3) |
+| **Live** | `src/model/capsule.proba` — `"rejects a well-formed-but-different EOG set (pinned EOG is {0, 2})"` |
+| **Sibling** | `src/tokenizer.proba` rejects `"1,5"` / non-sorted / empty EOG; `est_eog` admits only `{0,2}` |
+
+### 4.4 Reset / replay determinism
+
+| Field | Value |
+| --- | --- |
+| **Pin** | Same seed + input → same tokens (two independent runs; `prima_divergentia` = no divergence) |
+| **Reset** | `decode.redintegra` / `generation.cursor_redintegra` restore fresh position/context rules |
+| **Live** | `src/decode.proba` — `"reset/replay determinism: same seed + input → same tokens"`; PML5-U5 session reset block; `src/generation.proba` cursor reset; `src/cache.proba` cache `redintegra` |
+| **Rule** | First-token-divergence comparison only — never text similarity (`src/decode.proba` first-token-divergence probandum) |
+
+### 4.5 Supporting numeric / training pins (corpus, not retuned)
+
+| Pin family | Where | Band / rule |
+| --- | --- | --- |
+| Forward / logits / sampling | nn / attention / transformer / decode / sampling / loss / gradus | **5e-4** absolute |
+| SGD step | `src/optimize.proba` | **1e-4** absolute |
+| Train trajectory / schedules | `src/train.proba` (PML4-U6) | **5e-4** + exact resume/seed contracts |
+| Gradient companion contract | `src/gradient.proba` + `src/gradient.fab` comments | runtime gate uses policy **1e-4 / 1e-4** |
+| Wire / identity / integer | serialize / parameter / dtype / tokenizer lists | exact |
+
+Tolerance policy detail: `docs/numeric-tolerances.md`.
+
+---
+
+## 5. Structural validation
+
+### 5.1 Always-on gates
+
+```bash
+cd /path/to/faberlang/gradus
+./scripta/check-source
+./scripta/check-compile
+```
+
+`check-compile` runs `faber check` on:
+
+- the gradus library root (includes co-located `.proba` typecheck),
+- `exempla/gradient-seam`,
+- `exempla/training-loop-mlp`,
+- `exempla/token-generation`.
+
+### 5.2 Pin-consistency greps (U4)
+
+```bash
+cd /path/to/faberlang/gradus
+
+# Named token pins still in decode + consumer README
+rg -n 'draws the f64-oracle tokens \[0\]|draws the f64-oracle tokens \[1, 1\]' \
+  src/decode.proba
+rg -n '`\[0\]`|`\[1, 1\]`|8742514861359412281' exempla/token-generation/README.md
+
+# Capsule EOG rejection
+rg -n 'rejects a well-formed-but-different EOG set \(pinned EOG is \{0, 2\}\)' \
+  src/model/capsule.proba
+rg -n '1,5' src/model/capsule.proba src/tokenizer.proba
+
+# Reset / replay + first-token-divergence
+rg -n 'reset/replay determinism|prima_divergentia|first-token-divergence' \
+  src/decode.proba
+
+# est_eog binding
+rg -n 'est_eog' src/tokenizer.proba src/tokenizer.fab
+
+# Fixture files present
+test -f fixtures/safetensors/smollm2-360m-scaled-row.safetensors
+test -f fixtures/gguf/smollm2-360m-scaled-row.gguf
+test -f fixtures/tokenizer/tokenizer-identity-oracle.md
+
+# Proba count stays the admitted co-located surface
+find src -name '*.proba' | wc -l   # expect 24 at this corpus version
+```
+
+### 5.3 Executed pass (auditor-owned; not claimed by this unit)
+
+When the FMIR lever opens:
+
+1. Auditor runs the cargo-backed `faber test` path over the corpus.
+2. Token pins `[0]` and `[1, 1]`, SGD / loss / forward bands, and
+   reset/replay are checked as **executed** value-identity under
+   `docs/numeric-tolerances.md`.
+3. Receipt cites `numeric-policy v1.0.0` where device/FD comparisons
+   apply.
+4. A single closeout pass is enough; no Hand dev-loop suite is added.
+
+Until then, §5.1–§5.2 are the only green criteria for this document.
+
+---
+
+## 6. Mapping to support-matrix rows
+
+| Matrix row | Corpus evidence (structural) |
+| --- | --- |
+| 1 Safetensors | `fixtures/safetensors/*`, `src/model/safetensors.proba`, `src/model/capsule.proba` |
+| 2 GGUF | `fixtures/gguf/*`, `src/model/gguf.proba`, `src/model/capsule.proba`, `src/model/dequant.proba` |
+| 3 BERT-tiny training arch | `src/nn.proba`, `src/attention.proba`, `src/transformer.proba`, `src/gradus.proba` |
+| 4 SmolLM2-360M scaled inference arch | `src/attention.proba`, `src/transformer.proba` + GGUF fixture facts |
+| 5 PML4 training layer | `src/loss.proba`, `src/gradient.proba`, `src/optimize.proba`, `src/train.proba`, `src/metrics.proba`, `exempla/training-loop-mlp` |
+| 6 PML5 inference layer | `src/decode.proba`, `src/cache.proba`, `src/sampling.proba`, `src/generation.proba`, `src/tokenizer.proba`, `exempla/token-generation` |
+
+Reject-log rows (R3/R4/R5/R9/R10/R11 and "no executed-identity upgrade")
+remain in the support matrix; this corpus does not re-admit them.
+
+---
+
+## 7. Non-goals
+
+- No new proba pins in PML6-U4 (inventory only).
+- No executed claims; no GPU performance claims.
+- No silent pin rewrite to match a device observation.
+- No replacement of the support matrix or claim register.
+
+---
+
+## 8. Versioning
+
+`gradus-regression-corpus v1.0.0`. Adding a suite, fixture, or named pin
+bumps this version. Removing or retargeting a named pin (§4) is a
+**major** event and must update the support matrix / compatibility
+policy in the same change set.
