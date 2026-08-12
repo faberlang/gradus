@@ -246,8 +246,8 @@ loss/optimize/nn/attention/transformer. Parameter identity enters as plain
 
 `genus Gradiente` (per-parameter gradient bundle slot) — methods
 `possessor()`, `nomen()`, `versio()` (generation — the parameter versio at
-gradient computation), `valor()`; plus `functio structa(textus possessor,
-textus nomen, numerus versio, tensor.Tensor valor) → Gradiente ⇥
+gradient computation), `valor()`; plus `functio structa(textus nomen,
+textus possessor, numerus versio, tensor.Tensor valor) → Gradiente ⇥
 GradienteError`.
 
 `genus Gradientes` — methods `numerus()`, `inveni(possessor, nomen)` (fail
@@ -261,7 +261,7 @@ gradientes) → Gradientes`.
 - `functio simple_loss(tensor<f32, [2,2]> x, tensor<f32, [2,2]> w) → f32` —
   the annotated forward (linear regression 2×2 seam).
 - `functio gradientes_simple_loss(tensor<f32, [2,2]> x, tensor<f32, [2,2]>
-  w, f32 upstream, textus possessor, textus nomen, numerus versio) →
+  w, f32 upstream, textus nomen, textus possessor, numerus versio) →
   Gradientes ⇥ GradienteError` — the ONE public companion-call entry: runs
   the compiler-generated backward and pairs every gradient with its
   parameter identity + generation.
@@ -301,7 +301,7 @@ step), `passus()` (applied step count), `lentus()` (learning rate); plus:
 
 - `functio statum_aequus(SgdStatum a, SgdStatum b) → bivalens` — field-wise
   equality.
-- `functio structa(textus possessor, textus nomen, numerus generatio, f32
+- `functio structa(textus nomen, textus possessor, numerus generatio, f32
   lentus) → SgdStatum ⇥ OptimizeError` — validated slot constructor.
 
 `genus Sgd` (optimizer state) — methods `numerus()`, `contineo(possessor,
