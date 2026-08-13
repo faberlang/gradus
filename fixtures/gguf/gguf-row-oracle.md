@@ -4,8 +4,10 @@
 **Date**: 2026-08-09. **Owner**: hand-4 (implement), mind@ (admission).
 
 This document pins the LEGAL fixture + oracle for the one admitted GGUF
-row. The module `gradus:model/gguf` admits EXACTLY this row into a
-`capsula.Capsula` (capsule-schema-1.0.0, PML2-U1 `435ccd6`).
+row. The module `gradus:model/gguf` admits EXACTLY this row into the
+schema-2 `capsula.Capsula` (capsule-schema-2.0.0, A1C-M1): a pathless
+content identity plus the per-format GGUF manifest, per the GGUF-A1c
+clean break.
 
 ## Row identity (pinned facts)
 
@@ -66,33 +68,35 @@ residual), so the data section tiles exactly with no per-tensor padding.
 | Data region | 2912 bytes (bytes 1024..3936), offset base = data-section start |
 | Data pattern | byte k = `(k*13 + 7) mod 256` (deterministic; data content is not semantically inspected) |
 
-The proba reconstructs the same byte sequence in code (its `aedifica`
-builder) and carries the digest as the capsule's identity; the digest
-VALUE is host-computed per the capsule boundary (capsule.fab header — the
-language surface has no digest primitive) and re-verifiable via
-`capsula.verifica_contra`.
+The conformance suite and `gguf.proba` reconstruct the same byte sequence
+in code (the `aedifica` builder) and admit it into the schema-2 capsule,
+whose pathless content identity carries the digest; the digest VALUE is
+host-computed per the capsule boundary (capsule.fab header — the language
+surface has no digest primitive) and re-verifiable via
+`capsula.verifica_contra` (capsule-schema-2.0.0).
 
-## Row ceilings (the capsule's Limites)
+## Row ceilings (admit-time caller limits)
 
-| Ceiling | Value | Capsule hard limit |
+| Ceiling | Value | Caller ceiling |
 | --- | --- | --- |
-| File size (machina) | 3936 | — (data region ≤ file size) |
+| File size (artifact bytes) | 3936 | — (data region ≤ file size) |
 | Metadata KV count | 18 | ≤ 4096 (row ceiling) |
 | Tensor count | 3 | ≤ 65536 (row ceiling) |
 | Tensor-name length | ≤ 128 | ≤ 128 |
 | Per-dimension size | ≤ 65536 | ≤ 65536 |
 | Total elements | 4624 | ≤ 1e9 |
-| Per-string bytes | ≤ 4096 | ≤ 4096 |
+| Per-string bytes | ≤ 4096 | ≤ 1 MiB (authority text limit) |
 
 Per-type tensor counts (exact row pin): F32 1 / Q4_K 1 / Q5_0 0 / Q6_K 0 /
 Q8_0 1.
 
 ## Fail-closed matrix (per PML2-U3 done_when)
 
-`gradus/src/model/gguf.proba` proves, at compile level: the happy row
-admits → capsule with the pinned identity; and each negative fails closed
-with the module's typed error before any allocation sized by a parsed
-count, across the full dimension set:
+`gradus/src/model/gguf.proba` and `tests/admission_conformance.fab` prove,
+at compile level: the happy row admits → schema-2 capsule with the pinned
+identity; and each negative fails closed with the module's typed error
+before any allocation sized by a parsed count, across the full dimension
+set:
 
 - **format**: bad magic (FormatMala), truncated header (WireMala).
 - **version**: unsupported GGUF version (VersioIgnota), u64 field above
