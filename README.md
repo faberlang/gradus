@@ -37,8 +37,10 @@ auditor-owned gate, never claimed here.
 GGUF-A1a's library proof is deliberately bounded: metadata and tensor
 directories are capped at 4,096 entries and the retained prefix at 64 MiB,
 which admits the inventoried local maximum of 753 tensors. The package-MIR
-exemplar executes 23 named bounded-parser cases with 23 PASS / 0 FAIL through
-the hand-2 Radix binary. It uses deterministic in-source corpora only; this
+exemplar executes 31 named bounded-parser cases with 31 PASS / 0 FAIL through
+the hand-2 Radix binary. It covers all thirteen metadata wire kinds, exact
+wire-byte preservation, nested arrays, and the typed BOOL `numerum` rejection.
+It uses deterministic in-source corpora only; this
 README makes no committed-fixture, real-file, tensor-payload, or inference
 claim. The exact receipt is recorded in `exempla/gguf-manifest/README.md`.
 

@@ -86,8 +86,8 @@ values and tensor descriptors. It does not admit an architecture, read tensor
 payloads, or claim inference execution. Metadata and tensor directories are
 bounded at 4,096 entries, and the retained prefix is bounded at 64 MiB; those
 ceilings bound duplicate/overlap work while admitting the inventoried local
-maximum of 753 tensors. The package-MIR exemplar executes 23 bounded
-synthetic cases with 23 PASS / 0 FAIL; its exact hand-2 receipt is recorded in
+maximum of 753 tensors. The package-MIR exemplar executes 31 bounded
+synthetic cases with 31 PASS / 0 FAIL; its exact hand-2 receipt is recorded in
 `exempla/gguf-manifest/README.md`. No committed fixture, real-file, payload,
 or inference parse is claimed.
 

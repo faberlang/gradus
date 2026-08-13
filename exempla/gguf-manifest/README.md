@@ -16,7 +16,7 @@ The package runs through package MIR with the hand-2 lane Radix binary. The
 receipt below is the only executable claim for A1a. Co-located
 `src/model/*.proba` files remain structural/typecheck evidence; focused
 `faber test` attempts remain blocked by the imported-library provider seam
-(artifact `sym#20`, manifest `sym#113`).
+(artifact `sym#20`, manifest `sym#140`).
 
 ## Receipt
 
@@ -29,10 +29,13 @@ env FABER_LIBRARY_HOME=/Users/ianzepp/work/faberlang/worktrees/hand-1 \
   run --target fmir exempla/gguf-manifest
 ```
 
-Observed result (2026-08-12): exit `0`; 23 PASS lines and 0 FAIL lines. The
-package executes only deterministic bounded in-source corpora. It does not
-parse the committed binary fixtures, read a real file or tensor payload, or
-claim model inference.
+Observed result (2026-08-12): exit `0`; 31 PASS lines and 0 FAIL lines. The
+package executes only deterministic bounded in-source corpora. It checks all
+thirteen metadata wire kinds, exact representative `valor_wire` bytes
+(including a nested array), signed integer access, the typed BOOL `numerum`
+rejection, default/custom data starts, descriptor ranges, and legal table-end
+boundaries. It does not parse the committed binary fixtures, read a real file
+or tensor payload, or claim model inference.
 
 ```text
 llama-default-and-unknown-metadata: PASS observed=llama/32/4/0
@@ -58,6 +61,14 @@ checked-offset-overflow: PASS observed=checked offset addition overflow
 known-range-overlap: PASS observed=known GGML tensor ranges overlap
 extra-data-region-byte: PASS observed=bounded GGUF corpus contains bytes from the data region
 identity-mismatch: PASS observed=content identity does not match the supplied artifact length
+metadata-13-wire-kinds: PASS observed=13-kinds/bytes
+nested-array-preservation: PASS observed=26-bytes
+bool-and-float-numerum-rejects: PASS observed=bool-preserved/numerum-rejected
+descriptor-offset-elements-known-length: PASS observed=288/160/8/16
+custom-alignment-data-offset: PASS observed=384/192/4/16
+reordered-gapped-ranges: PASS observed=128/160/4/16
+corpus-table-end-accepted: PASS observed=96/96
+corpus-padding-end-accepted: PASS observed=96/96
 ```
 
 The source-level command `faber check exempla/gguf-manifest` is green, and

@@ -266,8 +266,10 @@ and first divergence.
 - changed-source checks and package-aware semantic analysis pass;
 - `exempla/gguf-manifest` runs through package MIR and prints observed PASS
   results for every named positive and negative case. The hand-2 receipt is
-  23 PASS / 0 FAIL with exit 0; it covers only deterministic in-source
-  bounded corpora and is not a real-file, tensor-payload, or inference claim.
+  31 PASS / 0 FAIL with exit 0; it covers all thirteen metadata wire kinds,
+  exact `valor_wire` preservation, nested arrays, descriptor ranges, and the
+  typed BOOL `numerum` rejection in deterministic in-source bounded corpora.
+  It is not a real-file, tensor-payload, or inference claim.
 
 **Commands** (from the Hand packet):
 
@@ -294,7 +296,7 @@ git diff --check -- src/model/artifact.fab src/model/artifact.proba \
 ```
 
 **Expected result**: `check-source` and `check-compile` exit 0; `faber check`
-ends in `ok: .`; the package-MIR exemplar prints 23 observed PASS lines, zero
+ends in `ok: .`; the package-MIR exemplar prints 31 observed PASS lines, zero
 FAIL lines, and exits 0; `git diff --check` is silent; all synthetic
 manifest/parser cases type-check. This is the executed A1a bounded-parser
 proof. It does not parse committed fixtures, read real files or tensor

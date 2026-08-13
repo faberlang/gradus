@@ -598,7 +598,7 @@ does not admit an architecture, read tensor payloads, or claim inference.
 The parser bounds metadata and tensor directories at 4,096 entries and the
 retained header/table corpus at 64 MiB; these ceilings bound duplicate and
 overlap checks while admitting the inventoried local rows (up to 753 tensors).
-The A1a package proof executes 23 bounded synthetic cases with 23 PASS / 0
+The A1a package proof executes 31 bounded synthetic cases with 31 PASS / 0
 FAIL through package MIR; the exact hand-2 receipt is recorded in
 `exempla/gguf-manifest/README.md`. It does not parse committed binary fixtures,
 read real files or tensor payloads, or claim inference.
@@ -621,7 +621,9 @@ octeti_per_blockum, longitudo_octetorum)` or `Ignota(typo)`.
 - `functio textum(ManifestumGguf m, textus clavis) → textus ⇥
   GgufManifestError` — typed text accessor for a string metadata value.
 - `functio numerum(ManifestumGguf m, textus clavis) → numerus ⇥
-  GgufManifestError` — typed integer accessor for a numeric metadata value.
+  GgufManifestError` — typed integer accessor for an integer metadata value;
+  `GGUF_BOOL` and floating-point values remain parseable/preserved but return a
+  typed `WireMala` error from this accessor.
 - `functio inveni_tensorem(ManifestumGguf m, textus nomen) →
   DescriptioTensorisGguf ⇥ GgufManifestError` — retrieve one tensor descriptor.
 - `functio layout(numerus typo_ggml, lista<numerus> forma) → LayoutGgml ⇥

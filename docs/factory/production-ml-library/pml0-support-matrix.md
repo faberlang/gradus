@@ -32,8 +32,10 @@ admit a model, load tensor payloads, or claim inference. The parser bounds
 metadata and tensor directories at 4,096 entries and the retained prefix at
 64 MiB, admitting the inventoried local maximum of 753 tensors. The source
 and synthetic proof are compile/typecheck evidence, and the package-MIR
-exemplar now executes 23 bounded parser cases with 23 PASS / 0 FAIL through
-the hand-2 Radix binary. This is an in-source synthetic receipt only: no
+exemplar now executes 31 bounded parser cases with 31 PASS / 0 FAIL through
+the hand-2 Radix binary. It also checks all thirteen metadata wire kinds,
+exact `valor_wire` bytes, nested arrays, descriptor ranges, and the typed
+BOOL `numerum` rejection. This is an in-source synthetic receipt only: no
 committed-fixture, real-file, tensor-payload, or inference parse is claimed
 (`exempla/gguf-manifest/README.md`). The existing Row 2 capsule admission
 remains the old one-row authority until GGUF-A1c performs the clean-break
