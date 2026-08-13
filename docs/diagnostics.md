@@ -46,9 +46,11 @@ pinned row is space-prefix-free (add_space_prefix = false)
 | `gradus:loss` | `LossError` | 9 | `src/loss.fab` |
 | `gradus:math` | `MathError` | 11 | `src/math.fab` |
 | `gradus:metrics` | `MetricError` | 7 | `src/metrics.fab` |
+| `gradus:model/artifact` | `ArtifactError` | 3 | `src/model/artifact.fab` |
 | `gradus:model/capsule` | `AdmissionError` | 9 | `src/model/capsule.fab` |
 | `gradus:model/dequant` | `DequantError` | 4 | `src/model/dequant.fab` |
 | `gradus:model/gguf` | `GgufError` | 10 | `src/model/gguf.fab` |
+| `gradus:model/gguf_manifest` | `GgufManifestError` | 10 | `src/model/gguf_manifest.fab` |
 | `gradus:model/safetensors` | `SafetensorError` | 11 | `src/model/safetensors.fab` |
 | `gradus:nn` | `NnError` | 9 | `src/nn.fab` |
 | `gradus:optimize` | `OptimizeError` | 14 | `src/optimize.fab` |
@@ -61,7 +63,40 @@ pinned row is space-prefix-free (add_space_prefix = false)
 | `gradus:train` | `TrainError` | 10 | `src/train.fab` |
 | `gradus:transformer` | `TransformerError` | 12 | `src/transformer.fab` |
 
-**Total**: 193 public error codes across 24 error types.
+**Total**: 206 public error codes across 26 error types.
+
+## `gradus:model/artifact` — `ArtifactError`
+
+Pathless content identity for bounded model artifacts. The identity carries
+only the lower-case `sha-256` algorithm, a 64-digit lower-case hexadecimal
+digest, and a positive byte length. It never carries a path, URL, reader,
+file handle, mapping, host/device object, or payload.
+
+| Code | Live messages | Resolution |
+| --- | --- | --- |
+| `ArtifactError.AlgorithmusIgnotus` | `unknown content identity algorithm: …` | Supply the admitted lower-case `sha-256` name. |
+| `ArtifactError.DigestioMala` | `content digest must be 64 lower-case hexadecimal digits` | Supply the canonical 64-digit lower-case hexadecimal digest. |
+| `ArtifactError.LongitudoMala` | `content length must be positive` | Supply the positive artifact byte length. |
+
+## `gradus:model/gguf_manifest` — `GgufManifestError`
+
+GGUF-A1a's format-general, structural GGUF v3 parser. It parses a caller-
+supplied bounded header/metadata/tensor-table corpus and retains metadata wire
+values and tensor descriptors. It does not admit an architecture, read tensor
+payloads, or claim inference execution.
+
+| Code | Class / when | Resolution |
+| --- | --- | --- |
+| `GgufManifestError.FormatMala` | GGUF magic is malformed. | Supply a GGUF file prefix beginning with `GGUF`. |
+| `GgufManifestError.VersioIgnota` | GGUF version is not v3. | Use a supported GGUF v3 artifact or a later parser unit. |
+| `GgufManifestError.Truncata` | The bounded corpus ends before a required field. | Supply the complete header, metadata, tensor table, and permitted alignment padding. |
+| `GgufManifestError.WireMala` | Value kind, UTF-8, boolean, array, or wire field is malformed. | Repair the GGUF wire encoding. |
+| `GgufManifestError.LimitesMala` | Count, rank, dimension, string, array, or checked arithmetic ceiling is exceeded. | Keep bounded counts and lengths within the documented parser ceilings. |
+| `GgufManifestError.Superfluitas` | The supplied corpus contains bytes from the tensor data region. | Stop the corpus at or before the checked data offset. |
+| `GgufManifestError.ClavisDuplicata` | A metadata key occurs more than once. | Keep metadata keys unique. |
+| `GgufManifestError.TensorDuplicatum` | A tensor name occurs more than once. | Keep tensor names unique. |
+| `GgufManifestError.OffsetMala` | A known GGML range is incomplete, overflowing, overlapping, or outside the artifact. | Correct tensor shapes, relative offsets, and artifact length. Unknown raw type IDs remain inspectable. |
+| `GgufManifestError.IdentitasMala` | The pathless content identity does not match the supplied artifact length or canonical form. | Supply a valid `artifact.IdentitasContenuti`. |
 
 ## `gradus:attention` — `AttentionError`
 

@@ -1,8 +1,9 @@
 # Gradus Regression Corpus
 
-**Version**: `gradus-regression-corpus v1.0.0` (2026-08-11, PML6-U4)
+**Version**: `gradus-regression-corpus v1.1.0` (2026-08-12, GGUF-A1a)
 **Repo**: gradus. **Tier**: structural inventory.
-**Delivery**: `docs/factory/production-ml-library/pml6-delivery.md` §PML6-U4.
+**Delivery**: `docs/factory/production-ml-library/pml6-delivery.md` §PML6-U4;
+GGUF-A1a delivery in `pml5-general-gguf-delivery.md`.
 **Support rows**: `docs/factory/production-ml-library/pml0-support-matrix.md`
 (six admitted rows). **Tolerances**: `docs/numeric-tolerances.md`.
 **Benchmark method**: `docs/benchmark-method.md`.
@@ -25,7 +26,7 @@ closeout, never a dev-loop suite.
 | Layer | Path | Role |
 | --- | --- | --- |
 | Co-located package tests | `src/*.proba`, `src/model/*.proba` | Compile-level contract + oracle pins per module |
-| Model / tokenizer fixtures | `fixtures/safetensors/`, `fixtures/gguf/`, `fixtures/tokenizer/` | Legal fixtures + row-oracle docs for admitted format rows |
+| Model / tokenizer fixtures | `fixtures/safetensors/`, `fixtures/gguf/`, `fixtures/tokenizer/` | Legal fixtures + row-oracle docs, including the three GGUF-A1a manifest fixtures |
 | Exempla consumers | `exempla/gradient-seam`, `exempla/gradient-seam-nolib`, `exempla/training-loop-mlp`, `exempla/token-generation` | Public-surface consumers (fire-9 enumeration) |
 | Admission conformance | `tests/admission_conformance.fab` | Capsule admission composition check |
 
@@ -36,7 +37,7 @@ tests live under `src/model/`.
 
 ## 2. Proba inventory (structural)
 
-Live co-located suites (24 files):
+Live co-located suites (26 files):
 
 | Suite | Module / surface | Pin class (summary) |
 | --- | --- | --- |
@@ -64,6 +65,8 @@ Live co-located suites (24 files):
 | `src/model/safetensors.proba` | Safetensors row | Fixture bytes + digest + tokenizer mismatch |
 | `src/model/gguf.proba` | GGUF row | Builder + digest + row facts |
 | `src/model/dequant.proba` | CPU dequant | Block layout pins |
+| `src/model/artifact.proba` | pathless content identity | Algorithm, digest, and positive-length validation |
+| `src/model/gguf_manifest.proba` | GGUF-A1a bounded manifest | Unknown codec inspection and structural parser surface |
 
 Every suite header states **EVIDENCE HONESTY (CTO Q2)**: structural /
 compile-level proof; executed value-identity deferred.
@@ -78,6 +81,10 @@ compile-level proof; executed value-identity deferred.
 | `fixtures/safetensors/safetensors-row-oracle.md` | (doc) | Row 1 oracle |
 | `fixtures/gguf/smollm2-360m-scaled-row.gguf` | `d89c9ef917158bfb5600f417020479499c6c042f728e9a29c8457a6b1a8f0974` | Row 2 — GGUF admission; also feeds Row 4 |
 | `fixtures/gguf/gguf-row-oracle.md` | (doc) | Row 2 oracle |
+| `fixtures/gguf/llama-manifest-v3.gguf` | `68a950bb21b44d93f52136cbfcf561796cdd8f1105edc35ddbab957a413dd38b` | GGUF-A1a default-alignment manifest fixture |
+| `fixtures/gguf/qwen2-manifest-v3.gguf` | `3eb06b43263bb7ef9caf5e7993c74c74d2f5fc2c9d931935c60dc8a802caa7df` | GGUF-A1a non-default-alignment/rank-3 fixture |
+| `fixtures/gguf/qwen35moe-manifest-v3.gguf` | `0569265f0ff43f9de50ee067af182ef21cc1242ab6fd0fa940e6a9c4b7676d48` | GGUF-A1a unknown-type/rank-3 fixture |
+| `fixtures/gguf/general-manifest-oracle.md` | (doc) | GGUF-A1a manifest fixture oracle |
 | `fixtures/tokenizer/tokenizer-identity-oracle.md` | (doc; P1–P11 id lists) | Tokenizer identity for rows 1–2, 4, 6 |
 
 Generator helpers (`fixtures/*/gen_fixture.{fab,py}`) rebuild synthetic

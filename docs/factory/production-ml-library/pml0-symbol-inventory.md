@@ -10,14 +10,14 @@ inference modules PML5, the dequant sub-leaf, and the correctness-wave rename
 2026-08-11 (PML6-U1 re-baseline; grep only, no cargo)
 **Source**: live `grep -c 'functio ' src/*.fab` + `src/model/*.fab` per
 module — the scan is recursive so the PML2 model module (`src/model/`,
-sub-leaves capsule/dequant/gguf/safetensors) is covered
+sub-leaves artifact/capsule/dequant/gguf/gguf_manifest/safetensors) is covered
 **Method**: `scripta/inventory-public-symbols` — grep-based; counts `functio `
 declaration lines per `src/*.fab` module (recursively), prints the module →
 functio table plus the all-module total, and asserts the re-baselined
-baseline: per-module counts for **every live module** (25 modules: the
-PML0/PML1 foundation and proof-surface modules, the PML2 model module's four
+baseline: per-module counts for **every live module** (27 modules: the
+PML0/PML1 foundation and proof-surface modules, the PML2 model module's six
 sub-leaves, the PML4 training-layer modules, and the PML5 inference modules)
-and the tracked total **572** (the live all-module count — every module is
+and the tracked total **612** (the live all-module count — every module is
 asserted, there is no untracked remainder). The script additionally runs the
 **committed coverage gate** (PML6-U1, zombie-doc): every public `functio`
 name (non-`_` prefix — `_`-prefixed names are `@ privata` module-internal
@@ -29,7 +29,9 @@ tokenizer module) added `src/model/` and `src/tokenizer.fab`; PML3–PML5
 landed the production nn/attention/transformer surface and the training +
 inference modules; the correctness wave (`3c295c0`, `6cc0eb5`, `2cdc498`,
 `0d50d60`) renamed the serialize big-endian readers and pinned the EOG-set
-admission semantics.
+admission semantics. GGUF-A1a adds the pathless artifact identity and
+format-general GGUF manifest/parser leaves; this inventory is a structural
+re-baseline only.
 **Consumed by**: PML0-U3 (proof-shaped API ledger) feeds the fixed-shape rows
 from the names below; `docs/api-reference.md` (PML6-U1) documents every
 public symbol on this inventory.
@@ -49,9 +51,11 @@ gradus           7
 loss             11
 math             23
 metrics          6
+model/artifact   4
 model/capsule    79
 model/dequant    18
 model/gguf       14
+model/gguf_manifest 36
 model/safetensors 23
 nn               17
 optimize         26
@@ -63,7 +67,7 @@ tensor           11
 tokenizer        23
 train            41
 transformer      9
-TOTAL            572
+TOTAL            612
 ```
 
 ## Symbol detail
@@ -85,9 +89,11 @@ helpers, matching the captured output):
 | loss | 11 | `causa`, `mse`, `cross_entropy`, `mse_2x2`, `mse_4x4`, `mse_2x8` (5 `@ privata` helpers) |
 | math | 23 | `causa`, `structa`, `add`, `sub`, `mul`, `div`, `neg`, `abs`, `signum`, `summa`, `media`, `matmul`, `casta`, `concatenatio`, `segmentum` (8 `@ privata` helpers) |
 | metrics | 6 | `causa`, `accuratezza`, `metricum`, `metrica_aequus` + Metricum genus methods (`damnum`, `accuratezza`) |
+| model/artifact | 4 | `causa`, `identitas` (2 `@ privata` validators) |
 | model/capsule | 79 | `causa`, `identitas_aequus`, `structa`, `verifica`, `verifica_contra`, `serializa_identitas`, `deserializa_identitas` + the six field-group genus methods (BytesValida: `corpus`, `longitudo`, `opertum`; IdentitasCrypto: `algorithmus`, `digestio`; IdentitasTokenizer: `progenies`, `pre_tokenizator`, `digestio_vocabuli`, `eog`, `bos_vacua`, `spatium_vacua`; Quantizatio: `typo`, `elementa_glomoris`, `octeti_glomoris`, `concordatio`; Limites: `machina`, `kv`, `tensores`, `nomen`, `dimensio`, `elementa`, `textus`; Architectura: `identificator`, `densitas`, `strata`, `contextus`; Identitas: `schematis`, `algorithmus`, `digestio`, `longitudo_bytes`, `quantizatio`, `architectura`, `strata`; Capsula: `schematis`, `corpus`, `longitudo`, `opertum`, `algorithmus`, `digestio`, `progenies`, `pre_tokenizator`, `digestio_vocabuli`, `eog`, `bos_vacua`, `spatium_vacua`, `quantizatio`, `elementa_glomoris`, `octeti_glomoris`, `concordatio`, `limes_machinae`, `limes_kv`, `limes_tensorum`, `limes_nominis`, `limes_dimensionis`, `limes_elementorum`, `limes_textus`, `identificator`, `densitas`, `strata`, `contextus`, `semita`, `identia`) (10 `@ privata` validators) |
 | model/dequant | 18 | `causa`, `elementa_glomoris`, `octeti_glomoris`, `dequantizas_glomulus`, `dequantizas_ordo` (13 `@ privata` helpers) |
 | model/gguf | 14 | `admit` (row → capsule, fail-closed) + `causa` + 12 `@ privata` GGUF parse helpers |
+| model/gguf_manifest | 36 | `causa`, `layout`, `metadatum`, `textum`, `numerum`, `tensorum`, `parse` + 29 `@ privata` bounded-wire/layout helpers |
 | model/safetensors | 23 | `admittas` (row → capsule, fail-closed) + `causa` + 21 `@ privata` header/JSON parse helpers |
 | nn | 17 | `linear_2x2`, `linear_4x4`, `gelu_4x4`, `linear_2x8`, `layernorm_2x8`, `gelu_2x8`, `causa`, `linear`, `gelu`, `layernorm` (7 `@ privata` helpers) |
 | optimize | 26 | `causa`, `statum_aequus`, `structa`, `sgd_aequus`, `sgd_vacuum`, `adscisco`, `passus`, `serializa_statum`, `deserializa_statum`, `serializa`, `deserializa` + SgdStatum/Sgd/Passus genus methods (`possessor`, `nomen`, `versio`, `generatio`, `passus`, `lentus`, `numerus`, `contineo`, `inveni`, `novus`, `statum`) (4 `@ privata` helpers) |

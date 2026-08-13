@@ -29,7 +29,7 @@ auditor-owned gate, never claimed here.
 | Attention / transformer | **Shipped (PML3)** — SDPA/RoPE + transformer block on the staged carrier, plus the fixed-shape BERT-tiny rows |
 | Training (steps, schedules, mode, RNG, checkpoint) | **Shipped (PML4)** — `Tabula` checkpoint, LR schedules, mode, seeded RNG, dropout |
 | Metrics | **Shipped (PML4)** — `accuratezza` + `Metricum` record |
-| Model admission | **Shipped (PML2)** — capsule (C8) + Safetensors + GGUF rows + CPU dequant |
+| Model admission | **Shipped (PML2/A1a)** — capsule + admitted rows, plus structural GGUF v3 manifest inspection for bounded metadata/tensor tables |
 | Tokenizer identity | **Shipped (PML2/PML5)** — pinned-row probe parity + `est_eog` stop binding |
 | Inference (decode, cache, sampling, generation) | **Shipped (PML5)** — decode/prefill, KV-cache, sampling pipeline, generation config + cursor |
 | GPU training / executed runs | Blocked on the FMIR lever (CTO8-1) — structural tier only, no executed claim |
@@ -121,7 +121,7 @@ gate.
 | Linear regression + FD gradient proof | **Shipped (S4-A)** — CPU seam proof | Gradus |
 | SGD optimizer state, loss (`mse`/`cross_entropy`), training (steps, schedules, mode, RNG, dropout, checkpoint `Tabula`) | **Shipped (PML4)** | Gradus |
 | NN primitives + attention/transformer (staged surface + fixed-shape rows) | **Shipped (PML3)** | Gradus |
-| Model admission (capsule + Safetensors + GGUF + dequant) | **Shipped (PML2)** | Gradus |
+| Model admission (capsule + Safetensors + GGUF + dequant) | **Shipped (PML2)**; format-general GGUF manifest inspection is **structural (GGUF-A1a)** and does not claim execution | Gradus |
 | Tokenizer identity + probe parity + `est_eog` | **Shipped (PML2/PML5)** | Gradus |
 | Inference: decode, KV-cache, sampling, generation config | **Shipped (PML5)** | Gradus |
 | nanoGPT on Shakespeare (CPU) | **Planned** (forcing-function demo; corpus/ not yet in-tree) | Gradus |

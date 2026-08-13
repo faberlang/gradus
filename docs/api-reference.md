@@ -504,6 +504,23 @@ Defined metric values with a deterministic contract (PML4-U5) —
 - `functio metrica_aequus(Metricum a, Metricum b) → bivalens` — field-wise
   equality.
 
+## gradus:model/artifact
+
+Pathless content identity for bounded model-format sources (GGUF-A1a). The
+identity carries algorithm, digest, and byte length only; it never owns a
+path, URL, reader, file handle, mapping, host/device object, or payload.
+
+`genus IdentitasContenuti` — fields `algorithmus`, `digestio`, and
+`longitudo`.
+
+- `functio causa(ArtifactError e) → textus` — render the typed identity error.
+- `functio identitas(textus algorithmus, textus digestio, numerus longitudo) →
+  IdentitasContenuti ⇥ ArtifactError` — validate the lower-case `sha-256`
+  algorithm, 64-digit lower-case hexadecimal digest, and positive byte length.
+
+`discretio ArtifactError` variants: `AlgorithmusIgnotus`, `DigestioMala`, and
+`LongitudoMala`; each carries `textus causa`.
+
 ## gradus:model/capsule
 
 The admitted-model capsule — the typed identity handoff (council C8,
@@ -568,6 +585,46 @@ well-formed-but-different set is a **different tokenizer** — it fails
 closed at admission (`EogMala`), it is not a value error. The pinned
 add-* flags are `falsum`; `bos_vacua` / `spatium_vacua` are the positive
 facts (verum = BOS-free / space-prefix-free), enforced with `≡`.
+
+## gradus:model/gguf_manifest
+
+Format-general GGUF v3 manifest inspection (GGUF-A1a). `CorpusGguf` accepts a
+bounded prefix containing the complete header, metadata, and tensor table,
+plus the caller-supplied total artifact length and pathless content identity.
+The parser retains metadata value kinds and exact wire payloads, raw tensor
+names/shapes/types/relative offsets, and known GGML block geometry. Unknown
+architecture metadata and raw GGML type IDs remain inspectable; this module
+does not admit an architecture, read tensor payloads, or claim inference.
+
+`genus CorpusGguf` — fields `tabula`, `longitudo_artifacti`, and
+`identitas`.
+`genus MetadatumGguf` — fields `clavis`, `typo`, and `valor_wire`.
+`discretio LayoutGgml` — `Cognita(elementa_per_blockum,
+octeti_per_blockum, longitudo_octetorum)` or `Ignota(typo)`.
+`genus DescriptioTensorisGguf` — fields `nomen`, `forma`, `typo_ggml`,
+`offset_relativum`, `elementa`, and `layout`.
+`genus ManifestumGguf` — fields `identitas`, `versio`, `concordatio`,
+`data_inceptum`, `longitudo_artifacti`, `metadata`, and `tensores`.
+
+- `functio causa(GgufManifestError e) → textus` — render the parser error.
+- `functio parse(CorpusGguf corpus) → ManifestumGguf ⇥ GgufManifestError` —
+  parse GGUF v3 header/metadata/tensor table from a bounded corpus.
+- `functio metadatum(ManifestumGguf m, textus clavis) → MetadatumGguf ⇥
+  GgufManifestError` — retrieve one preserved metadata entry.
+- `functio textum(ManifestumGguf m, textus clavis) → textus ⇥
+  GgufManifestError` — typed text accessor for a string metadata value.
+- `functio numerum(ManifestumGguf m, textus clavis) → numerus ⇥
+  GgufManifestError` — typed integer accessor for a numeric metadata value.
+- `functio tensorum(ManifestumGguf m, textus nomen) →
+  DescriptioTensorisGguf ⇥ GgufManifestError` — retrieve one tensor descriptor.
+- `functio layout(numerus typo_ggml, lista<numerus> forma) → LayoutGgml ⇥
+  GgufManifestError` — resolve known GGML block geometry or return
+  `LayoutGgml.Ignota` for an unknown raw type ID.
+
+`discretio GgufManifestError` variants: `FormatMala`, `VersioIgnota`,
+`Truncata`, `WireMala`, `LimitesMala`, `Superfluitas`, `ClavisDuplicata`,
+`TensorDuplicatum`, `OffsetMala`, and `IdentitasMala`; each carries
+`textus causa`.
 
 ## gradus:model/gguf
 

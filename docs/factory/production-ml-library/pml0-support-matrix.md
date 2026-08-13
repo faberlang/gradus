@@ -23,6 +23,15 @@ training-layer row, one PML5 inference-layer row. Every row is **structural
 tier** — the executed tier is recorded, never claimed (see §2 reject log and
 each row's structural-tier note).
 
+GGUF-A1a adds a separate **format-inspection foundation**, not an admitted
+execution row. `gradus:model/artifact` and `gradus:model/gguf_manifest` parse
+bounded GGUF v3 headers, metadata, and tensor directories for `llama`, `qwen2`,
+and `qwen35moe` synthetic fixtures. They preserve unknown architecture names
+and raw GGML type IDs as data, honor default/non-default alignment, and do not
+admit a model, load tensor payloads, or claim inference. The existing Row 2
+capsule admission remains the old one-row authority until GGUF-A1c performs
+the clean-break migration.
+
 ## 1. Admitted rows
 
 ### Row 1 — PML2 Safetensors model-file admission row
