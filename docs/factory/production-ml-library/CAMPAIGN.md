@@ -1,6 +1,6 @@
 # Campaign: Production ML Library
 
-**Status**: active — PML5-GGUF continuation; GGUF-A1a bounded parsing and GGUF-A1b guarded real-file inspection are implemented in the Hand lanes; GGUF-A1c is next
+**Status**: active — PML5-GGUF Qwen3.6 invariant; GGUF-A1a bounded parsing and GGUF-A1b guarded real-file inspection are implemented; GGUF-A1c is next
 **Created**: 2026-08-08
 **Mode**: routing artifact — draft/maintain; does not implement code directly
 **Control-plane repo**: `/Users/ianzepp/work/faberlang/gradus`
@@ -12,7 +12,7 @@ and `hosts` only through named compiler and execution dependencies
 [`gradus-ml-foundation`](../gradus-ml-foundation/GOAL.md); that goal remains
 the historical autograd and nanoGPT architecture source
 **Lowers to**: `delivery` then `factory`
-**Campaign readiness**: **READY FOR DELIVERY — PML0 SELECTED**
+**Campaign readiness**: **READY FOR DELIVERY — PML5-GGUF-A1c SELECTED**
 
 ## Summary
 
@@ -22,6 +22,35 @@ device-neutral model semantics shared by training and inference, plus clearly
 separated training-only and inference-only modules. It does not own GPU
 drivers, kernel launch, application packaging, request scheduling, HTTP
 serving, or deployment.
+
+## Non-Negotiable Inference Invariant
+
+This campaign cannot complete until a Faber package successfully runs the
+hash-pinned local `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` artifact through public
+`gradus:*` APIs and the accepted Faber/Radix/Hosts execution path.
+
+`Successfully runs` means that one normal Faber package command:
+
+1. verifies the artifact's SHA-256
+   `0b21525e972670ed59e1812e170b27c26355381f0656ecc4e25617ece7dac58b`
+   and byte length `22,663,387,424` before admission;
+2. admits the `qwen35moe` architecture and every tensor required by the
+   forward path;
+3. accepts operator-supplied Unicode text, applies the artifact tokenizer and
+   special-token policy, executes full-model prefill and autoregressive
+   decode, and detokenizes generated tokens to text;
+4. generates at least 256 new tokens for each of two distinct prompts while
+   reusing one admitted model session, with weights and model state remaining
+   resident and without per-token model reload, recompilation, or packet
+   rebuild;
+5. matches the pinned independent `llama.cpp` oracle under the campaign's
+   declared token/logit comparison policy;
+6. executes on both admitted single-device backends, Metal and CUDA; and
+7. records the exact command, source revisions, model identity, hardware,
+   backend, output, peak memory, and timing in reproducible receipts.
+
+HTTP, request scheduling, and deployment are not part of this invariant. They
+may wrap the accepted library later, but cannot substitute for it here.
 
 ## Problem
 
@@ -56,6 +85,8 @@ than a collection of demonstrations.
 8. A separate Faber application can compile those inference calls into a
    native executable with embedded GPU kernels without Gradus learning about
    device handles or backends.
+9. The non-negotiable Qwen3.6 invariant is executed and its Metal and CUDA
+   receipts are current.
 
 ```text
 application repository
@@ -76,8 +107,8 @@ application repository
   inference calls forward and decode paths without building a gradient path.
 - **Device neutral.** No CUDA, Metal, allocator, stream, command-buffer, or
   device-session value enters the public Gradus API.
-- **One admitted row first.** General model-format or architecture support is
-  earned by explicit rows, not inferred from one fixture.
+- **Named production row.** Intermediate rows establish correctness, but the
+  selected Qwen3.6 artifact is the campaign completion row.
 - **Correctness before performance.** Tokenization, logits, gradients, state
   mutation, and deterministic sampling gate speed claims.
 - **Second caller before abstraction.** Split nested module families only
@@ -209,7 +240,7 @@ for the first local single-device LLM executable.
 | Model formats | Partial support in `norma:model` | PML2 freeze ownership and migrate |
 | Forward architectures | BERT-tiny-shaped source exists | PML3 admitted reusable rows |
 | Training | Small SGD/MSE/static-step proofs | PML4 production training layer |
-| Inference | No coherent decode/cache/sampling layer | PML5 add it over shared forward semantics |
+| Inference | Structural decode/cache/sampling receipts plus GGUF inspection; no full Qwen3.6 execution | PML5-GGUF complete the Qwen3.6 invariant |
 | Quality and releases | Source/compile checks only | PML6 establish support and release gates |
 | Capstones | Training proofs; no paired capstones | PML7 qualify both modes |
 
@@ -250,7 +281,7 @@ hosts own physical storage.
 
 ### PML2 — Model, format, tokenizer, and checkpoint admission
 
-**Status**: delivered/accepted — PML2 U1–U6 delivered and admitted (435ccd6, 07291d6, b392fc8, f12deaf, d6954ab/22041e6, 02fae61); C3 trio-deletion boundary EXECUTED at the closeout re-run (faber-runtime trio git rm after the decouple 9a0295e/08d195f; transitive-closure gate PASSED — zero live references; no forwarding shims); PML3 next
+**Status**: delivered/accepted — PML2 U1–U6 delivered and admitted (435ccd6, 07291d6, b392fc8, f12deaf, d6954ab/22041e6, 02fae61); the retired runtime split was deleted after the decouple (9a0295e/08d195f), and the closeout transitive-closure gate found zero live references or forwarding shims
 **Owner**: Gradus; Norma participates only in the controlled source migration.
 **Source**: PML0/PML1, `norma/src/model.fab`, GI0-GI2 model/oracle contracts,
 and admitted legal fixtures.
@@ -264,7 +295,7 @@ own paths/configuration and hosts own physical upload.
 
 ### PML3 — Reusable forward models and architecture rows
 
-**Status**: delivered — PML3 U1–U5 delivered and admitted (9822cfa, 5260049, 7bf9acc, 359c5f0, 92df3ff); gate MET — forward functions composable + autograd-independent + oracle-matching; U4 partial per CTO Q2 (runtime identity deferred to a runtime-evidence gate — residual, owner auditor/faber test path); support rows populated (2 architecture rows); PML4 next — PML3 must not require PML4, the phase intent held
+**Status**: active — PML3 U1–U5 historical dense/structural receipts landed (9822cfa, 5260049, 7bf9acc, 359c5f0, 92df3ff); the stage remains incomplete until the selected `qwen35moe` forward architecture executes through the PML5-GGUF invariant
 **Owner**: Gradus.
 **Source**: `src/nn.fab`, `src/attention.fab`, `src/transformer.fab`, accepted
 GPU-training proofs, and the PML1 parameter contract.
@@ -278,7 +309,7 @@ semantic shortcut.
 
 ### PML4 — Production training layer
 
-**Status**: delivered (structural tier) — PML4 U1–U6 delivered and admitted (5f98e8b, e09c79c, 9bebda9, 4b24c81, 94d8a94, fc85de7); gate MET at the structural tier — the composed loop's bounded workload converges per the accepted oracle (trajectory pins + ratio 0.01137 < 0.1, compile-level via the reverse-AD transform; closeout pml4-closeout.md); executed convergence deferred to the auditor-owned runtime-evidence gate with the concrete blockers recorded (FMIR library-call gap; TARGETLANE001 AIR-companion-to-Rust) — recorded, not claimed; resume reproducibility + deterministic seed proba'd at composition level; PML5 next (parallel lane, after PML2+PML3 per the ordering graph)
+**Status**: active — PML4 U1–U6 structural receipts landed (5f98e8b, e09c79c, 9bebda9, 4b24c81, 94d8a94, fc85de7); executed convergence remains an incomplete campaign item and cannot be treated as delivered
 **Owner**: Gradus.
 **Source**: `src/gradient.fab`, `src/loss.fab`, `src/optimize.fab`,
 `src/train.fab`, GPU-training receipts, and PML1/PML3.
@@ -290,7 +321,7 @@ compose publicly; a bounded workload converges and resumes reproducibly.
 
 ### PML5 — Production inference computation layer
 
-**Status**: delivered (structural tier) — PML5 U1–U6 delivered and admitted (bdefb5a, 3b2fc9b, b1b01f1, 56e70f0, 8cf798a, 1a6abd0); gate MET at the structural tier — decode/KV-cache/sampling/generation-config/reset compose over the shared forward row with the aggregate token pins (greedy [0] + seeded [1,1] — the greedy run terminates at its first token 0, an admitted EOG token {0,2}, per the EOG-stop policy; first-token-divergence rule, reset/replay determinism; closeout pml5-closeout.md); NAMED EXECUTED-GATE CLAUSE (CTO8-1) — oracle-matching tokens (executed) stays OPEN, dated trigger 2026-08-09: hand-1's FMIR e2e-hardening lands AND exempla_script_e2e green for library-importing packages (the FMIR gap is the sole remaining blocker; owner auditor); CTO8-3 dated re-verification + post-lever sequencing recorded in the closeout (U6 → PML4 → SCRIPT → PML3/0); NGAB5 feeds on this phase's semantic contract (executed tier gates the feed); PML6 next (planning)
+**Status**: active — PML5 U1–U6 structural receipts landed (bdefb5a, 3b2fc9b, b1b01f1, 56e70f0, 8cf798a, 1a6abd0), and GGUF-A1a/A1b inspect the real corpus; PML5 remains incomplete until the Qwen3.6 invariant executes end to end
 **Owner**: Gradus.
 **Source**: PML2/PML3, GI0-GI3 oracle and decoder contracts, and independent
 token/logit fixtures.
@@ -308,17 +339,16 @@ continuous batching, HTTP, or physical residency.
 **Batch posture**: split on cache mutation, sampling, and numerical oracles.
 **Lowers to**: `delivery` then `factory`.
 
-**General-inference continuation**:
+**Mandatory Qwen3.6 continuation**:
 [`pml5-general-gguf-delivery.md`](pml5-general-gguf-delivery.md) corrects the
 one-row/one-block boundary through format-general GGUF artifacts, real
-tokenization, packed storage, complete dense Llama/Qwen models, integrated KV
-decode, and explicit native-quantized capability rows. It does not reopen the
-historical structural receipts or imply executable support for every GGUF
-architecture.
+tokenization, packed storage, complete dense reference models, `qwen35moe`
+MoE/SSM semantics, integrated KV/recurrent decode, native quantized execution,
+and the exact Qwen3.6 capstone. Every unit in that delivery is mandatory.
 
 ### PML6 — Production quality, performance, and release contract
 
-**Status**: delivered (structural tier) — PML6 U1–U5 delivered and admitted (U1 1f4f0d2, U2 649b2f6/29fb2fb, U3 43d75ce, U4 5a5f295, U5 9a2ed8b; main tip 0fbc97c); SG1/SG2/SG3 MET; phase gate MET at the structural tier — ten gate items committed and agree with live behavior (api-reference, diagnostics, exempla READMEs, full support-matrix aggregation, compatibility-policy v1.0.0, benchmark-method, numeric-tolerances, regression-corpus, package metadata @ 0.1.0 no bump, release-checklist); CTO8-1 remains a **named pre-release item** on the release checklist (does NOT gate PML6; open until FMIR lever + exempla_script_e2e green for library-importing packages; CTO8-3 auditor re-verification when lever opens); no executed claims beyond structural; no performance claim precedes correctness; closeout pml6-closeout.md; PML7 next (capstones + clean-install receipts)
+**Status**: active — PML6 U1–U5 structural quality artifacts landed (1f4f0d2, 649b2f6/29fb2fb, 43d75ce, 5a5f295, 9a2ed8b); the stage remains incomplete until those artifacts and support claims include the executed Qwen3.6 receipts
 **Owner**: Gradus.
 **Source**: accepted PML contracts and receipts, package metadata, and the PML0
 support-matrix baseline.
@@ -334,10 +364,11 @@ release checklist agree with live behavior.
 **Owner**: Gradus for library acceptance; examples for capstones; Faber/hosts
 for NGAB cross-backend receipts.
 **Source**: accepted PML1-PML6 and NGAB5/NGAB7 receipts.
-**Gate**: one training app and one inference app consume only public Gradus;
-CPU/reference results pass; inference also passes through the sibling native
-GPU executable campaign on every admitted backend; clean-install receipts pin
-package and toolchain versions.
+**Gate**: one training app and
+`exempla/qwen36-35b-inference` consume only public Gradus; CPU/reference
+results pass; the inference capstone satisfies the non-negotiable Qwen3.6
+invariant on Metal and CUDA; clean-install receipts pin package and toolchain
+versions.
 **Batch posture**: split only by capstone and backend receipt.
 **Lowers to**: `delivery` then `factory`.
 
@@ -347,21 +378,24 @@ package and toolchain versions.
    generalizes it.
 2. PML1 is the common prerequisite for PML2-PML5.
 3. PML3 forward functions must not require PML4 training machinery.
-4. PML5 cannot claim physical residency or GPU performance without the
-   sibling executable campaign.
+4. PML5 cannot complete until the sibling executable campaign supplies the
+   physical-residency, Metal, and CUDA receipts required by the Qwen3.6
+   invariant.
 5. Model-format code moves from Norma only after PML2 names the destination
    API and proves accepted and rejected fixture equivalence.
 6. Compiler limitations become sibling-campaign needs, not Gradus workarounds.
-7. Existing GPU-inference clauses assigning model runtime to `faber-runtime`
-   are stale under this ownership decision and require re-lowering.
+7. Model execution ownership is fixed: Gradus owns semantics, Radix owns
+   lowering, Faber owns package/run composition, and Hosts owns physical
+   execution. The retired runtime split is not a dependency.
 
 ## First Useful Milestones
 
 1. **Library contract**: PML0 publishes the module and support map.
 2. **Portable evaluation**: PML1-PML3 load one model and match a CPU oracle.
-3. **Useful ML library**: PML4-PML5 expose stable training and generation.
+3. **Useful ML library**: PML4-PML5 expose stable training and full Qwen3.6
+   generation.
 4. **Product-ready dependency**: PML6-PML7 provide versioned packages and
-   paired clean-install capstone receipts.
+   paired clean-install capstone receipts, including the Qwen3.6 invariant.
 
 ## Acceptance Criteria
 
@@ -371,6 +405,10 @@ package and toolchain versions.
 - [ ] PML0 is ready to lower into a delivery spec.
 - [ ] Proof work is consumed without being promoted to production evidence.
 - [ ] Release/version review occurs at PML6 and PML7.
+- [ ] The exact Qwen3.6 invariant is executed on Metal and CUDA through one
+      public-Gradus Faber capstone.
+- [ ] Every PML stage with an open executed gate remains active until that gate
+      is satisfied.
 - [ ] No stage authorizes deployment, model acquisition, paid GPU use, or
       production mutation.
 
@@ -391,12 +429,13 @@ Implementation stages use `./scripta/check-source` and
 `./scripta/check-compile`; cross-backend, performance, and release commands
 must be named by their delivery specs.
 
-## Open Questions
+## Settled Decisions
 
-- Which first GGUF architecture and quantization become the PML2 row?
-- Does the first production tensor API use generic shapes, generated admitted
-  shapes, or a staged mix? PML0 answers from live compiler evidence.
-- Which application repository supplies the PML7 inference capstone?
+- The production inference row is the hash-pinned local
+  `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` artifact.
+- The public inference capstone is `exempla/qwen36-35b-inference`.
+- The exact tensor-shape representation may be lowered by its owning delivery
+  unit, but it may not change the invariant or remove any required model row.
 
 ## Stop Conditions
 

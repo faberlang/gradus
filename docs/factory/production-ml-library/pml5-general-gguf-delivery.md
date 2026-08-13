@@ -1,8 +1,8 @@
-# Delivery: PML5-GGUF — General GGUF Inference Continuation
+# Delivery: PML5-GGUF — Qwen3.6 35B End-to-End Inference
 
-**Status**: active — GGUF-A1a and GGUF-A1b implemented in the Hand lanes; GGUF-A1c is next after merge-lane integration
-**Campaign**: [`CAMPAIGN.md`](CAMPAIGN.md), continuation after structural PML5
-**Umbrella**: Radix `gpu-production-readiness` units ML-01 through ML-07
+**Status**: active — GGUF-A1a and GGUF-A1b implemented; GGUF-A1c is the next mandatory unit
+**Campaign**: [`CAMPAIGN.md`](CAMPAIGN.md), mandatory completion of PML5
+**Umbrella**: Radix `gpu-production-readiness` Qwen3.6 invariant
 **Repo**: `gradus`
 **Integration stop**: `factory/merge` only; this delivery does not fast-forward
 any main branch
@@ -15,9 +15,26 @@ assuming its architecture is executable. Separately admitted architecture,
 tokenizer, storage, and execution rows fail closed until they have direct
 reference evidence.
 
-“General GGUF” means format-general inspection plus an extensible, explicit
-execution matrix. It does not mean that every architecture or quantization
-published on Hugging Face is immediately executable.
+The completion row is the exact local
+`Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` artifact. Format-general inspection is a
+foundation, not the delivery result.
+
+## Delivery Invariant
+
+This delivery is complete only when `exempla/qwen36-35b-inference`, using
+public `gradus:*` imports, runs the artifact with byte length `22,663,387,424`
+and SHA-256
+`0b21525e972670ed59e1812e170b27c26355381f0656ecc4e25617ece7dac58b`.
+
+One normal Faber package command must verify and admit the artifact, encode an
+operator-supplied Unicode prompt, execute the complete `qwen35moe` graph,
+generate at least 256 new tokens, decode them to text, and repeat for a second
+prompt through the same admitted model session. The run must keep weights and
+model state resident, avoid per-token reload/recompile/rebuild, match the
+pinned `llama.cpp` comparison policy, and produce current Metal and CUDA
+receipts with exact source, model, hardware, output, memory, and timing facts.
+
+No earlier unit or partial proof satisfies this invariant.
 
 ## Why This Continuation Exists
 
@@ -40,14 +57,12 @@ artifacts up to 35 GB.
 
 The corpus is operator-local evidence and is never committed into Gradus.
 
-| Artifact | Architecture | Tensor count | Initial disposition |
+| Artifact | Architecture | Tensor count | Mandatory role |
 | --- | --- | ---: | --- |
-| `SmolLM2-360M-Instruct-Q4_K_M.gguf` | `llama` | 290 | format + first dense reference row |
-| `Qwen2.5-0.5B-Instruct-Q4_K_M.gguf` | `qwen2` | 290 | format + first useful Qwen row |
-| `Qwen2.5-1.5B-Instruct-Q4_K_M.gguf` | `qwen2` | 338 | format now; execution after 0.5B |
-| `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` | `qwen35moe` | 753 | format now; hybrid MoE/SSM execution separate |
-| `heretic-UD-Q6_K.gguf` | `qwen35moe` | 733 | format now; hybrid MoE/SSM execution separate |
-| `ornith-1.0-35b-Q8_0.gguf` | `qwen35moe` | 733 | format now; hybrid MoE/SSM execution separate |
+| `SmolLM2-360M-Instruct-Q4_K_M.gguf` | `llama` | 290 | dense reference rung |
+| `Qwen2.5-0.5B-Instruct-Q4_K_M.gguf` | `qwen2` | 290 | dense Qwen reference rung |
+| `Qwen2.5-1.5B-Instruct-Q4_K_M.gguf` | `qwen2` | 338 | scale-independent dense adapter proof |
+| `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` | `qwen35moe` | 753 | campaign completion row |
 
 The corpus proves why a filename or `general.file_type` cannot stand in for a
 per-tensor storage manifest. The files contain mixed F32 and quantized tensors;
@@ -102,11 +117,13 @@ remain inspectable; unsupported execution fails at the admission boundary.
 | GGUF v3 metadata and tensor-directory parsing | GGUF writers or converters |
 | Configurable alignment and padded tensor spans | Filesystem, mmap, HTTP, Hub downloads |
 | Per-tensor raw storage descriptors | Device allocation and kernel launch |
-| Real tokenizer encode/decode for admitted rows | Universal chat-template language |
-| Dense Llama/SmolLM and Qwen2 reference models | `qwen35moe` execution in the dense unit |
-| Full-layer prefill, decode, and KV semantics | Serving, scheduling, continuous batching |
-| CPU/reference logits and token receipts | Unqualified “all GGUF models work” claims |
-| Packed/native quantization capability contract | Silent full-model F32 expansion as GPU support |
+| Real tokenizer encode/decode for all mandatory rows | Universal chat-template language |
+| Dense reference models and full `qwen35moe` admission | Other model architectures |
+| Rank-3 expert tensors, MoE routing, and expert dispatch | Serving, scheduling, continuous batching |
+| Hybrid SSM/attention state, prefill, and decode | HTTP and deployment |
+| CPU/reference logits and deterministic token receipts | Unqualified “all GGUF models work” claims |
+| Native quantized Metal and CUDA execution | Silent full-model F32 expansion as GPU support |
+| Persistent Faber capstone for the selected Qwen3.6 artifact | Other local 35B variants |
 
 ## Unit Graph
 
@@ -122,13 +139,36 @@ GGUF-A0 inventory
                                 -> GGUF-A6 real dense rows
                                      -> GGUF-A7 native quantized execution contract
 
-GGUF-A1a -> GGUF-M1 qwen35moe architecture delivery (separate continuation)
+GGUF-A2 + GGUF-A3
+  -> GGUF-M1 qwen35moe admission and tensor map
+       -> GGUF-M2 MoE router and expert execution
+       -> GGUF-M3 hybrid SSM/attention state
+            -> GGUF-M4 full-model reference inference
+
+GGUF-A7 + GGUF-M4
+  -> GGUF-M5 persistent Metal and CUDA execution
+       -> GGUF-M6 Faber Qwen3.6 capstone and closeout
 ```
 
 ML-01, the imported-library execution seam, is an acceptance dependency for
 broader executed claims. GGUF-A1a now has a bounded synthetic package-MIR
 receipt through the hand-2 Radix binary; full real-file, tensor-payload, and
 inference execution remains a Radix/Faber gate.
+
+## Unit Admission And Progress Ratchet
+
+Every unimplemented unit below must be lowered into a task body that names its
+exact write scope, predecessor receipt, first failing oracle, closeout command,
+expected observed result, work-token estimate basis, and stop condition. A raw
+unit heading is not a Hand assignment. The delivery audit must admit the task
+body before implementation.
+
+Each completed unit must add one new executed proof at its declared boundary.
+If execution diverges, the receipt records the first divergent tokenizer id,
+tensor, layer, state update, logit, or token. Documentation, compilation, and
+structural artifacts may support a unit but cannot replace its executed proof.
+A compiler or host blocker is routed to its owning repository with that exact
+divergence; all unaffected units continue.
 
 ### GGUF-A0 — Inventory And Capability Rows
 
@@ -345,20 +385,39 @@ Explicit write scope includes `src/model/capsule.fab`, capsule probas,
 fixture contracts, and API/support documentation. Migrate all constructor
 callers in one unit; add no forwarding shim and leave no dual GGUF authority.
 
+**Done when**: schema 1 has no live constructor or parser caller; schema 2
+identity/manifest values are the only authority; source, compile, and migrated
+format probas pass.
+
 ### GGUF-A2 — Tokenizer Runtime
 
 Load vocab, token types, merges, pre-tokenizer identity, special-token policy,
-encode/decode, EOG behavior, and an explicitly supported chat-template subset
-from the parsed artifact. SmolLM and Qwen2 arbitrary-Unicode probes must match
-the pinned `llama.cpp`/Hugging Face token IDs and decoded text exactly.
+encode/decode, EOG behavior, and the selected chat-template behavior from the
+parsed artifact. The three dense rungs and selected Qwen3.6 artifact must match
+the pinned `llama.cpp` token ids and decoded text for two Unicode probes.
+
+**Primary scope**: `src/tokenizer.fab`, `src/tokenizer.proba`, manifest metadata
+accessors, and the tokenizer phase of `exempla/qwen36-35b-inference`.
+
+**Done when**: the real Qwen3.6 tokenizer consumes metadata from the artifact;
+no hard-coded prompt or token-id fallback exists in the capstone path; encode
+and decode match the independent oracle.
 
 ### GGUF-A3 — Packed Storage And Reference Materialization
 
 Separate logical dtype from physical storage. Bind one `TensorDescriptor` and
 validated `TensorPayload` at a time to dense or packed tensor views. Connect
-the existing CPU codecs and add only the layouts required by the selected
-dense rows. Mixed per-tensor storage remains explicit. Whole-model conversion
-to F32 is not an admitted native-execution path.
+the existing CPU codecs and implement every physical layout used by the four
+mandatory artifacts. Mixed per-tensor storage and rank-3 expert tensors remain
+explicit. Whole-model conversion to F32 is not an admitted execution path.
+
+**Primary scope**: `src/model/gguf_manifest.fab`, `src/model/dequant.fab`,
+their probas, packed tensor-view modules introduced by this unit, and the
+materialization phase of the capstone.
+
+**Done when**: every tensor required by the Qwen3.6 forward graph has a checked
+range, shape, storage layout, and bounded materialization path; selected
+tensor slices match the independent oracle.
 
 ### GGUF-A4 — Dense Llama/Qwen Full Model
 
@@ -368,6 +427,10 @@ ordered layer stack. Assemble weights by explicit architecture adapters and
 canonical tensor names. A full SmolLM2 and Qwen2.5-0.5B prefill logit row must
 match an independent CPU oracle at the first-divergence boundary.
 
+**Done when**: both dense rows execute complete layer stacks and publish
+first-divergence receipts. This mandatory rung establishes the reusable
+forward operations consumed by `qwen35moe`; it does not close the delivery.
+
 ### GGUF-A5 — Real Prefill, Decode, And KV State
 
 Replace the one-block cache proof with per-layer, per-KV-head state integrated
@@ -375,12 +438,18 @@ into attention. Prefill and incremental decode must agree on logits. Reset,
 context rejection, cancellation, replay, and session identity are executed,
 not only structurally compiled.
 
+**Done when**: full dense prefill and incremental decode produce equivalent
+logits at the declared boundary, and two prompts prove reset/reuse semantics.
+
 ### GGUF-A6 — Multiple Dense Acceptance Rows
 
 The actual local SmolLM2 and Qwen2.5-0.5B files pass manifest, tokenizer,
 materialization, full-model, prefill/decode, and deterministic token receipts.
 Qwen2.5-1.5B follows only after the same adapter proves it without special-case
 constants. Unsupported families retain exact typed diagnostics.
+
+**Done when**: all three dense files produce deterministic text receipts from
+real prompts through the same public library surface.
 
 ### GGUF-A7 — Native Quantized Execution Contract
 
@@ -390,15 +459,80 @@ Q4_K_M path proves it does not expand the whole model to F32 and records
 correctness, memory, timing, backend identity, and fail-closed capability
 evidence. This unit is a cross-repo dependency, not an Inferentia task.
 
-### GGUF-M1 — Hybrid Qwen35MoE/SSM Row
+**Done when**: the dense reference rows execute through native packed kernels
+on Metal and CUDA without whole-model expansion, establishing the kernel and
+residency substrate required by GGUF-M5.
 
-Lower separately after GGUF-A1a. The local `qwen35moe` files require MoE router
-and expert dispatch plus hybrid SSM/attention semantics. Format parsing is part
-of GGUF-A1a; execution is not hidden inside the dense Qwen adapter.
+### GGUF-M1 — Qwen35MoE Admission And Tensor Map
 
-## Gates Before Inferentia
+Read all required `qwen35moe` metadata, freeze the architecture configuration,
+map canonical tensor names, validate layer/expert/state dimensions, and admit
+every selected-artifact tensor required by execution. Unknown or missing
+required facts fail at admission.
 
-Inferentia remains paused until all of these are current evidence:
+**Primary scope**: new `src/model/qwen35moe.fab` and proba, architecture-facing
+manifest accessors, API/support documentation, and the admission phase of the
+capstone.
+
+**Done when**: the exact Qwen3.6 artifact admits with 753 tensors and a complete
+typed execution configuration; mutated metadata, names, shapes, and storage
+layouts fail with typed first-divergence diagnostics.
+
+### GGUF-M2 — MoE Router And Expert Execution
+
+Implement router logits, the artifact's declared expert selection and weight
+normalization, rank-3 expert projection access, expert dispatch, accumulation,
+and deterministic tie behavior.
+
+**Done when**: selected layers match independent router choices, expert
+weights, intermediate values, and outputs for pinned hidden-state probes.
+
+### GGUF-M3 — Hybrid SSM And Attention State
+
+Implement the architecture's declared SSM and attention layer schedule,
+convolution/recurrent state, attention KV state, position handling, reset,
+replay, and incremental updates without conflating the two state families.
+
+**Done when**: per-layer prefill and one-token decode state and outputs match
+the independent oracle at the first-divergence boundary; reset and replay are
+deterministic.
+
+### GGUF-M4 — Full-Model Qwen3.6 Reference Inference
+
+Compose embeddings, all hybrid layers, normalization, output projection,
+tokenizer, sampling, and logical model state into the public Gradus generation
+surface.
+
+**Done when**: the exact artifact accepts two arbitrary prompts and produces
+matching reference logits/tokens and decoded text for a bounded CPU/reference
+run. Any resource-limited reference mode must still execute every layer and
+must not substitute a reduced model.
+
+### GGUF-M5 — Persistent Native Metal And CUDA Execution
+
+Lower every operation required by GGUF-M4 to packed native kernels, bind the
+model through prepared host sessions, and retain weights plus KV/SSM state
+across decode steps and sequential prompts.
+
+**Done when**: Metal and CUDA each generate at least 256 new tokens for both
+prompts without per-token reload, recompilation, packet rebuild, or full host
+round-trip; receipts record correctness, peak memory, timing, backend,
+hardware, and lifecycle cleanup.
+
+### GGUF-M6 — Faber Qwen3.6 Capstone And Closeout
+
+Create `exempla/qwen36-35b-inference` as the public-library consumer. The
+application owns the path and I/O, Gradus owns the model semantics, Radix owns
+lowering, and Hosts owns physical execution.
+
+**Done when**: one documented Faber package command satisfies every clause of
+the Delivery Invariant on Metal and CUDA; the receipt is reproducible from a
+clean packet and the support matrix, API docs, regression inventory, and
+campaign status all describe the observed result exactly.
+
+## Campaign Closeout Gates
+
+Every item below is mandatory:
 
 1. bounded package-aware Gradus execution through the imported-library seam;
 2. generic inspection of an actual downloaded GGUF;
@@ -406,19 +540,18 @@ Inferentia remains paused until all of these are current evidence:
 4. mixed packed storage bound to tensor descriptors;
 5. full-model CPU/reference logits;
 6. persistent per-layer KV prefill/decode;
-7. at least SmolLM2 and one Qwen dense executed row;
-8. one persistent native GPU row with honest memory and correctness receipts.
-
-Once those gates pass, the server work is intentionally thin: model selection,
-request/config mapping, streaming, lifecycle, and operations around the Gradus
-library and accepted execution host.
+7. all three dense reference rows execute through the shared public surface;
+8. `qwen35moe` admission, MoE, SSM/attention, and full-model reference receipts;
+9. persistent native Qwen3.6 execution on Metal and CUDA; and
+10. the Faber capstone satisfies the Delivery Invariant.
 
 ## Lane And Merge Procedure
 
-Implementation uses `/Users/ianzepp/work/faberlang/worktrees/hand-1/gradus` on
-`factory/hand-1`. Each unit commits exact paths and stops at its done oracle.
+The Mind assigns a fresh role packet for each admitted unit. Each unit commits
+exact paths and stops at its done oracle.
 Integration uses `/Users/ianzepp/work/faberlang/worktrees/merge/gradus` on
-`factory/merge`. This session may merge into `factory/merge`; it must not
-fast-forward Gradus, Radix, Faber, or Hosts main.
+`factory/merge`; main updates follow the workspace merge-lane rules.
 
-No Tugboat or Vivi records are part of this delivery's execution process.
+Current Tugboat and Vivi law governs execution. Every dispatched unit requires
+an admitted delivery lineage, a Vivi task, and a live role process; filed work
+without a spawned process is not in flight.
