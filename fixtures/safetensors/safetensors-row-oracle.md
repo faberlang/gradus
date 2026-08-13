@@ -5,7 +5,9 @@
 
 This document pins the LEGAL fixture + oracle for the one admitted
 Safetensors row. The module `gradus:model/safetensors` admits EXACTLY this
-row into a `capsula.Capsula` (capsule-schema-1.0.0, PML2-U1 `435ccd6`).
+row into the schema-2 `capsula.Capsula` (capsule-schema-2.0.0, A1C-M1): a
+pathless content identity plus the per-format Safetensors manifest, per
+the GGUF-A1c clean break.
 
 ## Row identity (pinned facts)
 
@@ -27,7 +29,7 @@ boundary — local synthetic fixture only).
 | EOG set | `{0,2}` | gi0-model-contract §4 (eos 2, unk 0) |
 | BOS-free / space-prefix-free | true / true | gi0-model-contract §4 (`add_bos_token=false`, `add_space_prefix=false`) |
 | Vocab digest claim | 64-hex fixture value (form-valid) | pinned metadata; vocab-only digest execution is PML2-U4 |
-| Dtype set | `F32` only | one-row mapping to the capsule `f32` quantization row (1/4) |
+| Dtype set | `F32` only | pinned F32 structural row (D4) |
 | Row format | `safetensors` / version `1.0.0` | fixture metadata `format.name` / `format.version` |
 
 ## Tensor table (pinned, exactly 5)
@@ -55,28 +57,31 @@ exactly (no gaps, no overlaps). Every byte length is a multiple of 8.
 | Data region | 672 bytes (bytes 840..1512), offset base = header_size |
 | Data pattern | byte i = `(i*13 + 7) mod 256` (deterministic; data content is not semantically inspected) |
 
-The proba embeds the same byte sequence (reconstructed from the same JSON
-string + pattern) and verifies the capsule's digest against this oracle via
-`verifica_contra`. The digest VALUE is host-computed per the capsule
-boundary (capsule.fab header); the language surface has no digest primitive.
+The conformance suite and `safetensors.proba` embed the same byte
+sequence (reconstructed from the same JSON string + pattern) and verify
+the schema-2 capsule's digest against this oracle via
+`verifica_contra` (capsule-schema-2.0.0). The digest VALUE is
+host-computed per the capsule boundary (capsule.fab header); the language
+surface has no digest primitive.
 
-## Row ceilings (the capsule's Limites)
+## Row ceilings (admit-time caller limits)
 
-| Ceiling | Value | Capsule hard limit |
+| Ceiling | Value | Caller ceiling |
 | --- | --- | --- |
-| File size (machina) | 1512 | — (data region ≤ file size) |
+| File size (artifact bytes) | 1512 | — (data region ≤ file size) |
 | Metadata KV count | 12 | ≤ 64 (row ceiling) |
 | Tensor count | 5 | ≤ 16 (row ceiling) |
 | Tensor-name length | ≤ 128 | ≤ 128 |
 | Per-dimension size | ≤ 65536 | ≤ 65536 |
 | Total elements | 168 | ≤ 1e9 |
-| Per-string bytes | ≤ 4096 | ≤ 4096 |
+| Per-string bytes | ≤ 4096 | ≤ 1 MiB (header cap) |
 
 ## Fail-closed matrix (per PML2-U2 done_when)
 
-`gradus/src/model/safetensors.proba` proves, at compile level: the happy
-row admits → capsule with the pinned identity; and each negative mutates
-the pinned row and fails closed with the module's typed error before any
+`gradus/src/model/safetensors.proba` and `tests/admission_conformance.fab`
+prove, at compile level: the happy row admits → schema-2 capsule with the
+pinned identity; and each negative mutates the pinned row and fails closed
+with the module's typed error before any
 allocation sized by a parsed count — truncated prefix / truncated header /
 truncated data region, non-JSON header, non-object header, format-name
 mismatch, row-version mismatch, arch mismatch (metadata + extra tensor),
