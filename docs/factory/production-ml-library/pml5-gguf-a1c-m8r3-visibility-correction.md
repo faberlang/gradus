@@ -182,7 +182,7 @@ these annotations.)
 | --- | --- |
 | 293 | `functio causa(TrainError e) → textus {` |
 | 319 | `genus Schedula {` |
-| 346 | `functio structa_schedula(textus nomen, numerus aetas, lista<f32> rates) → Schedula ⇥ TrainError {` |
+| 346 | `functio structa_schedula(f32 lentus_vertex, numerus incalesco, numerus passus_total, f32 lentus_finis) → Schedula ⇥ TrainError {` |
 | 386 | `functio lentus_schedulata(Schedula s, numerus passus) → f32 ⇥ TrainError {` |
 | 539 | `genus Semen {` |
 | 549 | `functio structa_semen(numerus semen) → Semen ⇥ TrainError {` |
