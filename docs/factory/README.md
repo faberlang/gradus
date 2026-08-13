@@ -18,12 +18,12 @@ in [`docs/archived/`](../archived/README.md).
 
 ## Summary
 
-- goals scanned: 2
+- goals scanned: 1
 - active: 1
 - planned: 0
-- done: 1
+- done: 0
 - unknown: 0
-- archived (moved to `docs/archived/`): 0
+- archived (moved to `docs/archived/`): 1
 
 ## Open and in progress
 
@@ -37,9 +37,7 @@ _none_
 
 ## Archived
 
-| Goal | Status | Done | goal | campaign | delivery | ledger | council | evidence | other |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| [gradus-ml-foundation](gradus-ml-foundation/GOAL.md) | done | 100% | 1 | 0 | 0 | 0 | 0 | 0 | 6 |
+_none_
 
 ## Unknown
 
