@@ -157,6 +157,10 @@ tensor counts, offsets, and type distributions.
   `docs/diagnostics.md`, `docs/regression-corpus.md`,
   `docs/factory/production-ml-library/pml0-symbol-inventory.md`, and
   `docs/factory/production-ml-library/pml0-support-matrix.md`
+- `exempla/gguf-manifest/faber.toml`,
+  `exempla/gguf-manifest/src/main.fab`,
+  `exempla/gguf-manifest/README.md`, and `scripta/check-compile` for the
+  bounded package-MIR proof and its receipt
 
 **Frozen public surface**:
 
@@ -184,7 +188,7 @@ tensor counts, offsets, and type distributions.
   GgufManifestError`, `metadatum(ManifestumGguf, textus) -> MetadatumGguf ⇥
   GgufManifestError`, `textum(ManifestumGguf, textus) -> textus ⇥
   GgufManifestError`, `numerum(ManifestumGguf, textus) -> numerus ⇥
-  GgufManifestError`, `tensor(ManifestumGguf, textus) ->
+  GgufManifestError`, `inveni_tensorem(ManifestumGguf, textus) ->
   DescriptioTensorisGguf ⇥ GgufManifestError`, and
   `layout(numerus typo_ggml, lista<numerus> forma) -> LayoutGgml ⇥
   GgufManifestError`.
@@ -201,6 +205,11 @@ tensor counts, offsets, and type distributions.
   `gradus:model/gguf_manifest`; GGUF-A1c deletes the dual format parser while
   migrating callers. A1a adds no forwarding import or compatibility facade.
 
+**API spelling amendment (2026-08-12, head-cxo).** The frozen tensor accessor
+is `inveni_tensorem(ManifestumGguf, textus)`. The earlier provisional spelling
+`tensor` is retired because it is reserved in current Radix; `tensorum` is not
+the public spelling. This is a clean break with no compatibility alias.
+
 **Required behavior**:
 
 1. Parse GGUF v3 from an explicitly supplied bounded corpus containing the
@@ -208,7 +217,8 @@ tensor counts, offsets, and type distributions.
    length and content identity. The parser never accepts or retains the data
    region. A typed truncation result tells a source adapter that its corpus did
    not contain the complete table. `general.alignment`, when present, must be
-   a valid positive power-of-two UINT32 value. When absent, parsing uses the
+   use the GGUF_UINT32 wire kind and be a valid positive power-of-two value. A
+   different present wire kind is a typed wire error. When absent, parsing uses the
    GGUF default alignment of 32. The table end is rounded up with checked
    arithmetic to obtain `data_inceptum`; a corpus may end at the table or
    within its padding but must not contain a byte from the data region.
@@ -219,11 +229,17 @@ tensor counts, offsets, and type distributions.
    type, and relative offset. A separate layout resolution step produces an
    exact stored byte length only when that GGML layout is known; the parser
    then derives its checked absolute range from `data_inceptum` and
-   `offset_relativum`. Unknown layouts remain inspectable but are not
-   materializable.
+   `offset_relativum`; every relative offset, including an unknown raw type,
+   must satisfy `data_inceptum + offset_relativum <= total`. Unknown layouts
+   remain inspectable but are not materializable.
 4. Honor legal `general.alignment`; validate power-of-two alignment,
    non-overlapping known ranges irrespective of tensor-table order, overflow,
-   truncation, duplicate names, and file bounds.
+   truncation, duplicate names, and file bounds. Reject rank zero. For known
+   quantized layouts, block divisibility is checked against the first GGML
+   dimension, not only the total element product. Bound metadata and tensor
+   directories at 4,096 entries and the retained corpus prefix at 64 MiB;
+   these conservative ceilings bound the duplicate/overlap scans while
+   admitting all six inventoried local models (maximum 753 tensors).
 5. Parse rank-3 expert tensors and unknown raw storage identifiers as
    inspectable descriptors. Do not claim a decoder or kernel for them.
 6. Separate `parse` from `admit`: A1a adds no admission or execution entry
@@ -247,7 +263,12 @@ and first divergence.
   a non-default legal alignment and proves the resulting padded data offset;
 - malformed/truncated/overflowing/overlapping fixtures fail with typed errors;
 - unsupported architecture and codec states are distinct from malformed GGUF;
-- changed-source checks and package-aware semantic analysis pass.
+- changed-source checks and package-aware semantic analysis pass;
+- `exempla/gguf-manifest` runs through package MIR and prints observed PASS
+  results for every named positive and negative case. If the lane compiler
+  blocks that run, record the exact command, output, and exit status in the
+  exemplar README and leave A1a incomplete; source typechecking alone is not
+  an executable parser claim.
 
 **Commands** (from the Hand packet):
 
@@ -260,19 +281,29 @@ env FABER_LIBRARY_HOME=/Users/ianzepp/work/faberlang/worktrees/hand-1 \
 env FABER_LIBRARY_HOME=/Users/ianzepp/work/faberlang/worktrees/hand-1 \
   /Users/ianzepp/work/faberlang/worktrees/hand-1/radix/target/debug/faber \
   check --diagnostics .
+env FABER_LIBRARY_HOME=/Users/ianzepp/work/faberlang/worktrees/hand-1 \
+  /Users/ianzepp/work/faberlang/worktrees/hand-1/radix/target/debug/faber \
+  run --target fmir exempla/gguf-manifest
 git diff --check -- src/model/artifact.fab src/model/artifact.proba \
   src/model/gguf_manifest.fab src/model/gguf_manifest.proba fixtures/gguf \
   README.md docs/module-map.md docs/api-reference.md docs/diagnostics.md \
   docs/regression-corpus.md \
   docs/factory/production-ml-library/pml0-symbol-inventory.md \
-  docs/factory/production-ml-library/pml0-support-matrix.md
+  docs/factory/production-ml-library/pml0-support-matrix.md \
+  exempla/gguf-manifest/faber.toml exempla/gguf-manifest/src/main.fab \
+  exempla/gguf-manifest/README.md scripta/check-compile
 ```
 
 **Expected result**: `check-source` and `check-compile` exit 0; `faber check`
-ends in `ok: .`; `git diff --check` is silent; all synthetic
-manifest/parser cases type-check. A pre-existing failure in either required
-Gradus gate blocks closeout and must be repaired or routed as its own unit; it
-may not be hidden by substituting the direct `faber check` command.
+ends in `ok: .`; the package-MIR exemplar prints one observed PASS line per
+case and exits 0; `git diff --check` is silent; all synthetic manifest/parser
+cases type-check. A pre-existing failure in either required gate blocks
+closeout and must be repaired or routed as its own unit; it may not be hidden
+by substituting the direct `faber check` command. In this repair's current
+lane, the package-MIR command exits 1 with 23 repeated `conversion source type
+mismatch` diagnostics followed by `fmir image execution failed`, before any
+entrypoint output. That exact receipt is a blocker recorded in the exemplar
+README, so A1a is structurally repaired but not executable-complete.
 
 `docs/regression-corpus.md` must inventory both new `.proba` suites and all
 three generated fixtures, update its suite/fixture totals, and bump its

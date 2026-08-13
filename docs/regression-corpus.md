@@ -11,7 +11,7 @@ GGUF-A1a delivery in `pml5-general-gguf-delivery.md`.
 This document inventories the **admitted fixtures and proba pins** that
 form the Gradus regression corpus. The corpus **is** the co-located
 `src/**/*.proba` surface plus the committed fixtures under `fixtures/`
-and the fire-9 structural consumers — not a separate harness.
+and the named structural consumers — not a separate harness.
 
 **Structural green** means: `./scripta/check-source` and
 `./scripta/check-compile` exit 0, and the pin greps in §5 resolve.
@@ -27,7 +27,7 @@ closeout, never a dev-loop suite.
 | --- | --- | --- |
 | Co-located package tests | `src/*.proba`, `src/model/*.proba` | Compile-level contract + oracle pins per module |
 | Model / tokenizer fixtures | `fixtures/safetensors/`, `fixtures/gguf/`, `fixtures/tokenizer/` | Legal fixtures + row-oracle docs, including the three GGUF-A1a manifest fixtures |
-| Exempla consumers | `exempla/gradient-seam`, `exempla/gradient-seam-nolib`, `exempla/training-loop-mlp`, `exempla/token-generation` | Public-surface consumers (fire-9 enumeration) |
+| Exempla consumers | `exempla/gradient-seam`, `exempla/gradient-seam-nolib`, `exempla/training-loop-mlp`, `exempla/token-generation`, `exempla/gguf-manifest` | Public-surface consumers plus the bounded GGUF parser package proof |
 | Admission conformance | `tests/admission_conformance.fab` | Capsule admission composition check |
 
 Nested package dirs follow the Agents rule (≥2 modules); model package
@@ -82,7 +82,7 @@ compile-level proof; executed value-identity deferred.
 | `fixtures/gguf/smollm2-360m-scaled-row.gguf` | `d89c9ef917158bfb5600f417020479499c6c042f728e9a29c8457a6b1a8f0974` | Row 2 — GGUF admission; also feeds Row 4 |
 | `fixtures/gguf/gguf-row-oracle.md` | (doc) | Row 2 oracle |
 | `fixtures/gguf/llama-manifest-v3.gguf` | `68a950bb21b44d93f52136cbfcf561796cdd8f1105edc35ddbab957a413dd38b` | GGUF-A1a default-alignment manifest fixture |
-| `fixtures/gguf/qwen2-manifest-v3.gguf` | `3eb06b43263bb7ef9caf5e7993c74c74d2f5fc2c9d931935c60dc8a802caa7df` | GGUF-A1a non-default-alignment/rank-3 fixture |
+| `fixtures/gguf/qwen2-manifest-v3.gguf` | `8c8fc4952a283bde5c21b8bad88f09ca2061649f536477ca40946ceeea404822` | GGUF-A1a non-default-alignment/rank-3 fixture |
 | `fixtures/gguf/qwen35moe-manifest-v3.gguf` | `0569265f0ff43f9de50ee067af182ef21cc1242ab6fd0fa940e6a9c4b7676d48` | GGUF-A1a unknown-type/rank-3 fixture |
 | `fixtures/gguf/general-manifest-oracle.md` | (doc) | GGUF-A1a manifest fixture oracle |
 | `fixtures/tokenizer/tokenizer-identity-oracle.md` | (doc; P1–P11 id lists) | Tokenizer identity for rows 1–2, 4, 6 |
@@ -172,7 +172,14 @@ cd /path/to/faberlang/gradus
 - the gradus library root (includes co-located `.proba` typecheck),
 - `exempla/gradient-seam`,
 - `exempla/training-loop-mlp`,
-- `exempla/token-generation`.
+- `exempla/token-generation`,
+- `exempla/gguf-manifest`.
+
+The GGUF package proof is intended to run through package MIR. Its current
+receipt is a truthful blocker: the lane binary exits 1 during FMIR image
+execution with 23 `conversion source type mismatch` diagnostics before the
+program entrypoint prints a case. The source-level package check remains
+green; no executable parser result or committed-fixture parse is claimed.
 
 ### 5.2 Pin-consistency greps (U4)
 
@@ -202,7 +209,7 @@ test -f fixtures/gguf/smollm2-360m-scaled-row.gguf
 test -f fixtures/tokenizer/tokenizer-identity-oracle.md
 
 # Proba count stays the admitted co-located surface
-find src -name '*.proba' | wc -l   # expect 24 at this corpus version
+find src -name '*.proba' | wc -l   # expect 26 at this corpus version
 ```
 
 ### 5.3 Executed pass (auditor-owned; not claimed by this unit)
@@ -248,7 +255,7 @@ remain in the support matrix; this corpus does not re-admit them.
 
 ## 8. Versioning
 
-`gradus-regression-corpus v1.0.0`. Adding a suite, fixture, or named pin
+`gradus-regression-corpus v1.1.0`. Adding a suite, fixture, or named pin
 bumps this version. Removing or retargeting a named pin (§4) is a
 **major** event and must update the support matrix / compatibility
 policy in the same change set.

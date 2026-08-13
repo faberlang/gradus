@@ -12,7 +12,7 @@ generated code — not a runtime tape replay.
 
 ## Status
 
-Re-baselined 2026-08-11 to the live post-PML1–5 + correctness-wave surface
+Re-baselined 2026-08-12 to the live post-PML1–5 + correctness-wave surface
 (`docs/api-reference.md`, `gradus-api-reference v1.0.0`). Every layer below
 is the **structural tier** — compile-validated and proba-pinned. Executed
 value-identity is env-blocked on the FMIR lever (CTO8-1) and is an
@@ -29,10 +29,19 @@ auditor-owned gate, never claimed here.
 | Attention / transformer | **Shipped (PML3)** — SDPA/RoPE + transformer block on the staged carrier, plus the fixed-shape BERT-tiny rows |
 | Training (steps, schedules, mode, RNG, checkpoint) | **Shipped (PML4)** — `Tabula` checkpoint, LR schedules, mode, seeded RNG, dropout |
 | Metrics | **Shipped (PML4)** — `accuratezza` + `Metricum` record |
-| Model admission | **Shipped (PML2/A1a)** — capsule + admitted rows, plus structural GGUF v3 manifest inspection for bounded metadata/tensor tables |
+| Model admission | **Shipped (PML2)** — capsule + admitted rows; GGUF-A1a adds the structural, bounded GGUF v3 manifest foundation, while package-MIR execution remains blocked by the documented conversion seam |
 | Tokenizer identity | **Shipped (PML2/PML5)** — pinned-row probe parity + `est_eog` stop binding |
 | Inference (decode, cache, sampling, generation) | **Shipped (PML5)** — decode/prefill, KV-cache, sampling pipeline, generation config + cursor |
 | GPU training / executed runs | Blocked on the FMIR lever (CTO8-1) — structural tier only, no executed claim |
+
+GGUF-A1a's library proof is deliberately bounded: metadata and tensor
+directories are capped at 4,096 entries and the retained prefix at 64 MiB,
+which admits the inventoried local maximum of 753 tensors. `faber check`
+typechecks the parser and synthetic cases. The executable package receipt is
+recorded in `exempla/gguf-manifest/README.md`; the lane FMIR run currently
+exits before the entrypoint with 23 `conversion source type mismatch`
+diagnostics, so this README makes no executed parser or binary-fixture parse
+claim.
 
 The compiler's autograd capability is shipped (campaign `mir-autograd`, closed
 at `336f359ec`): the reverse-mode AD transform covers 16 of 18 AIR tensor ops
@@ -121,7 +130,7 @@ gate.
 | Linear regression + FD gradient proof | **Shipped (S4-A)** — CPU seam proof | Gradus |
 | SGD optimizer state, loss (`mse`/`cross_entropy`), training (steps, schedules, mode, RNG, dropout, checkpoint `Tabula`) | **Shipped (PML4)** | Gradus |
 | NN primitives + attention/transformer (staged surface + fixed-shape rows) | **Shipped (PML3)** | Gradus |
-| Model admission (capsule + Safetensors + GGUF + dequant) | **Shipped (PML2)**; format-general GGUF manifest inspection is **structural (GGUF-A1a)** and does not claim execution | Gradus |
+| Model admission (capsule + Safetensors + GGUF + dequant) | **Shipped (PML2)**; format-general GGUF manifest inspection is **structural (GGUF-A1a)**, with package-MIR execution blocked by the documented conversion seam and no inference claim | Gradus |
 | Tokenizer identity + probe parity + `est_eog` | **Shipped (PML2/PML5)** | Gradus |
 | Inference: decode, KV-cache, sampling, generation config | **Shipped (PML5)** | Gradus |
 | nanoGPT on Shakespeare (CPU) | **Planned** (forcing-function demo; corpus/ not yet in-tree) | Gradus |

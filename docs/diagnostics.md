@@ -83,7 +83,12 @@ file handle, mapping, host/device object, or payload.
 GGUF-A1a's format-general, structural GGUF v3 parser. It parses a caller-
 supplied bounded header/metadata/tensor-table corpus and retains metadata wire
 values and tensor descriptors. It does not admit an architecture, read tensor
-payloads, or claim inference execution.
+payloads, or claim inference execution. Metadata and tensor directories are
+bounded at 4,096 entries, and the retained prefix is bounded at 64 MiB; those
+ceilings bound duplicate/overlap work while admitting the inventoried local
+maximum of 753 tensors. The package-MIR execution attempt is recorded as a
+blocker in `exempla/gguf-manifest/README.md`; source checks do not claim an
+executed parser result.
 
 | Code | Class / when | Resolution |
 | --- | --- | --- |

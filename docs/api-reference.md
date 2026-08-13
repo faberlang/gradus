@@ -595,6 +595,12 @@ The parser retains metadata value kinds and exact wire payloads, raw tensor
 names/shapes/types/relative offsets, and known GGML block geometry. Unknown
 architecture metadata and raw GGML type IDs remain inspectable; this module
 does not admit an architecture, read tensor payloads, or claim inference.
+The parser bounds metadata and tensor directories at 4,096 entries and the
+retained header/table corpus at 64 MiB; these ceilings bound duplicate and
+overlap checks while admitting the inventoried local rows (up to 753 tensors).
+The A1a source and synthetic builders are compile/typecheck evidence. The
+package-MIR receipt is recorded in `exempla/gguf-manifest/README.md`; no
+committed binary fixture is claimed parsed here.
 
 `genus CorpusGguf` — fields `tabula`, `longitudo_artifacti`, and
 `identitas`.
@@ -615,7 +621,7 @@ octeti_per_blockum, longitudo_octetorum)` or `Ignota(typo)`.
   GgufManifestError` — typed text accessor for a string metadata value.
 - `functio numerum(ManifestumGguf m, textus clavis) → numerus ⇥
   GgufManifestError` — typed integer accessor for a numeric metadata value.
-- `functio tensorum(ManifestumGguf m, textus nomen) →
+- `functio inveni_tensorem(ManifestumGguf m, textus nomen) →
   DescriptioTensorisGguf ⇥ GgufManifestError` — retrieve one tensor descriptor.
 - `functio layout(numerus typo_ggml, lista<numerus> forma) → LayoutGgml ⇥
   GgufManifestError` — resolve known GGML block geometry or return
@@ -933,13 +939,13 @@ same training loop through the same batch interface.
 
 ```bash
 cd /Users/ianzepp/work/faberlang/gradus
-./scripta/inventory-public-symbols   # per-module counts + total 572 + the
+./scripta/inventory-public-symbols   # per-module counts + total 612 + the
                                      # committed coverage gate: every public
                                      # symbol below is documented here
 ```
 
 The inventory script asserts every live module's `functio` count, the live
-all-module total (572), and — per module — that every public symbol name
+all-module total (612), and — per module — that every public symbol name
 listed above appears in this reference's `### gradus:<module>` section. A
 public symbol added to `src/` without a matching entry here fails the
 script (zombie-doc gate, PML6-U1). Private `_`-prefixed helpers are exempt;

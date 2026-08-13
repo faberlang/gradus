@@ -87,7 +87,10 @@ FIXTURES = (
             ("tokenizer.ggml.tokens", 9, ("<|endoftext|>", "hello", "world")),
         ),
         tensors=(
-            Tensor("blk.0.attn_q.weight", 12, (1, 1, 256), 0, 144),
+            # Q4_K blocks are defined along the first (contiguous) dimension.
+            # This rank-3 shape catches implementations that validate only the
+            # total element product: 256 total elements, first dimension 256.
+            Tensor("blk.0.attn_q.weight", 12, (256, 1, 1), 0, 144),
             Tensor("blk.0.attn_norm.weight", 0, (2, 2), 192, 16),
         ),
         data_bytes=208,

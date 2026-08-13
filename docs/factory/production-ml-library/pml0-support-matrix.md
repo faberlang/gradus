@@ -28,9 +28,15 @@ execution row. `gradus:model/artifact` and `gradus:model/gguf_manifest` parse
 bounded GGUF v3 headers, metadata, and tensor directories for `llama`, `qwen2`,
 and `qwen35moe` synthetic fixtures. They preserve unknown architecture names
 and raw GGML type IDs as data, honor default/non-default alignment, and do not
-admit a model, load tensor payloads, or claim inference. The existing Row 2
-capsule admission remains the old one-row authority until GGUF-A1c performs
-the clean-break migration.
+admit a model, load tensor payloads, or claim inference. The parser bounds
+metadata and tensor directories at 4,096 entries and the retained prefix at
+64 MiB, admitting the inventoried local maximum of 753 tensors. The source
+and synthetic proof are compile/typecheck evidence; the package-MIR receipt is
+currently blocked by 23 `conversion source type mismatch` diagnostics before
+entrypoint output, so no executed parse or committed-fixture parse is claimed
+(`exempla/gguf-manifest/README.md`). The existing Row 2 capsule admission
+remains the old one-row authority until GGUF-A1c performs the clean-break
+migration.
 
 ## 1. Admitted rows
 
