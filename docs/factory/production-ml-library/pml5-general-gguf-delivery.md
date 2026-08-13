@@ -1,6 +1,6 @@
 # Delivery: PML5-GGUF — General GGUF Inference Continuation
 
-**Status**: active — GGUF-A1 selected for implementation in `factory/hand-1`
+**Status**: active — GGUF-A1a selected for implementation in `factory/hand-1`
 **Campaign**: [`CAMPAIGN.md`](CAMPAIGN.md), continuation after structural PML5
 **Umbrella**: Radix `gpu-production-readiness` units ML-01 through ML-07
 **Repo**: `gradus`
@@ -112,15 +112,17 @@ remain inspectable; unsupported execution fails at the admission boundary.
 
 ```text
 GGUF-A0 inventory
-  -> GGUF-A1 artifact v2
-       -> GGUF-A2 tokenizer runtime
-       -> GGUF-A3 packed storage and reference materialization
-            -> GGUF-A4 dense Llama/Qwen primitives and full model
-                 -> GGUF-A5 per-layer KV prefill/decode
-                      -> GGUF-A6 real dense rows
-                           -> GGUF-A7 native quantized execution contract
+  -> GGUF-A1a manifest and bounded-corpus parser
+       -> GGUF-A1b range-source seam and real-file inspection
+            -> GGUF-A1c capsule/caller clean break
+                 -> GGUF-A2 tokenizer runtime
+                 -> GGUF-A3 packed storage and reference materialization
+                      -> GGUF-A4 dense Llama/Qwen primitives and full model
+                           -> GGUF-A5 per-layer KV prefill/decode
+                                -> GGUF-A6 real dense rows
+                                     -> GGUF-A7 native quantized execution contract
 
-GGUF-A1 -> GGUF-M1 qwen35moe architecture delivery (separate continuation)
+GGUF-A1a -> GGUF-M1 qwen35moe architecture delivery (separate continuation)
 ```
 
 ML-01, the imported-library execution seam, is an acceptance dependency for
@@ -137,26 +139,24 @@ reference/native support state. Filenames are provenance only.
 **Evidence**: an independent reader and `llama.cpp` agree on header, metadata,
 tensor counts, offsets, and type distributions.
 
-### GGUF-A1 — GGUF Artifact V2
+### GGUF-A1a — Manifest And Bounded-Corpus Parser
 
 **Selected first unit.**
 
 **Write scope**:
 
-- `src/model/gguf.fab`
-- `src/model/gguf.proba`
 - new pathless artifact/manifest module and its co-located `.proba`
-- `src/model/capsule.fab` and internal callers only as needed for the clean
-  replacement of capsule schema 1
+- new format-general GGUF parser module and its co-located `.proba`
 - `fixtures/gguf/` small synthetic wire fixtures and oracle notes
 - directly affected Gradus API/support documentation
 
 **Required behavior**:
 
-1. Parse GGUF v3 from caller-supplied content identity and an ephemeral bounded
-   range reader `(offset, length) -> octeti`. The parser requests only header,
-   metadata, and tensor-table ranges. It never requests the data region and
-   never retains the reader or the whole tensor payload.
+1. Parse GGUF v3 from an explicitly supplied bounded corpus containing the
+   complete header, metadata, and tensor table, plus caller-supplied total file
+   length and content identity. The parser never accepts or retains the data
+   region. A typed truncation result tells a source adapter that its corpus did
+   not contain the complete table.
 2. Preserve every metadata entry with its GGUF value kind. Known scalar/text
    fields have typed accessors; arrays needed by tokenizer and architecture
    units remain preserved rather than discarded.
@@ -171,16 +171,13 @@ tensor counts, offsets, and type distributions.
    inspectable descriptors. Do not claim a decoder or kernel for them.
 6. Separate `parse` from `admit`: valid unknown architectures parse, then fail
    with a typed unsupported-architecture result if execution is requested.
-7. Replace the byte-owning, path-carrying, one-global-quantization capsule
-   contract with schema 2 identity/manifest values. No compatibility façade is
-   required for internal pre-1.0 callers. Reject schema 1 at the new boundary.
-8. Add a bounded tensor-fragment operation that receives the range reader per
-   call, checks relative and absolute ranges, requires an exact-length return,
-   and never retains the source capability.
+7. Do not edit the old capsule or its GGUF/Safetensors callers in this unit.
+   The new parser is the replacement foundation, not a compatibility façade;
+   GGUF-A1c owns the clean deletion/migration boundary.
 
-**Red proof**: before implementation, add focused cases showing the existing
-row parser rejects or loses custom alignment, padded spans, rank 3, unknown
-metadata, mixed storage, and a Qwen architecture. Record the failing command
+**Red proof**: before implementation, add focused cases for custom alignment,
+padded spans, rank 3, unknown metadata, mixed storage, and a Qwen architecture
+against the not-yet-present format-general parser. Record the failing command
 and first divergence.
 
 **Green proof**:
@@ -188,8 +185,6 @@ and first divergence.
 - small synthetic `llama`, `qwen2`, and `qwen35moe` fixtures parse into the
   same artifact type;
 - malformed/truncated/overflowing/overlapping fixtures fail with typed errors;
-- a header/table-only inspection of all six local files reports the independent
-  reader's architecture and tensor counts without reading tensor payloads;
 - unsupported architecture and codec states are distinct from malformed GGUF;
 - changed-source checks and package-aware semantic analysis pass.
 
@@ -205,11 +200,33 @@ git diff --check -- src/model fixtures/gguf docs
 ```
 
 **Expected result**: `check-source` exits 0; `faber check` ends in `ok: .`;
-`git diff --check` is silent; the inventory inspection reports `llama/290`,
-`qwen2/290`, `qwen2/338`, and `qwen35moe/753/733/733`.
+`git diff --check` is silent; all synthetic manifest/parser cases type-check.
 
 **Non-goals**: tokenization, tensor payload codecs, model assembly, inference,
 GPU work, Hosts work, Inferentia, or main-branch integration.
+
+### GGUF-A1b — Range Source And Real-File Inspection
+
+Define the exact failable range-source contract only after its Faber
+function-value ABI is executable through an imported Gradus package. The
+source is passed per operation and is never retained. Add bounded table reads
+and tensor-fragment reads with checked absolute ranges and exact-length return
+checks.
+
+This unit owns the real local inventory oracle. Its receipt must name the
+source adapter and command, prove that no read intersects the tensor data
+region during inspection, and report `llama/290`, `qwen2/290`, `qwen2/338`,
+and `qwen35moe/753/733/733` against the independent reader. A package-aware
+compile-only check is insufficient for this unit.
+
+### GGUF-A1c — Capsule And Caller Clean Break
+
+Replace the byte-owning, path-carrying, one-global-quantization capsule with
+schema-2 identity/manifest values and reject schema 1 at the new boundary.
+Explicit write scope includes `src/model/capsule.fab`, capsule probas,
+`src/model/gguf.fab`, `src/model/safetensors.fab`, both format probas,
+fixture contracts, and API/support documentation. Migrate all constructor
+callers in one unit; add no forwarding shim and leave no dual GGUF authority.
 
 ### GGUF-A2 — Tokenizer Runtime
 

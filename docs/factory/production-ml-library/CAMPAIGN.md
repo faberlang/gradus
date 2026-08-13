@@ -1,6 +1,6 @@
 # Campaign: Production ML Library
 
-**Status**: active — PML5-GGUF general-inference continuation selected; structural PML2–PML6 history remains accepted at its stated tier; GGUF-A1 artifact v2 is the first implementation unit
+**Status**: active — PML5-GGUF general-inference continuation selected; structural PML2–PML6 history remains accepted at its stated tier; GGUF-A1a manifest/parser is the first implementation unit
 **Created**: 2026-08-08
 **Mode**: routing artifact — draft/maintain; does not implement code directly
 **Control-plane repo**: `/Users/ianzepp/work/faberlang/gradus`
