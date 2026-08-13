@@ -126,9 +126,9 @@ GGUF-A1a -> GGUF-M1 qwen35moe architecture delivery (separate continuation)
 ```
 
 ML-01, the imported-library execution seam, is an acceptance dependency for
-executed claims. It does not block format work. Current package-aware `faber
-check` can validate Gradus; the full imported execution receipt remains a
-Radix/Faber gate.
+broader executed claims. GGUF-A1a now has a bounded synthetic package-MIR
+receipt through the hand-2 Radix binary; full real-file, tensor-payload, and
+inference execution remains a Radix/Faber gate.
 
 ### GGUF-A0 — Inventory And Capability Rows
 
@@ -265,10 +265,9 @@ and first divergence.
 - unsupported architecture and codec states are distinct from malformed GGUF;
 - changed-source checks and package-aware semantic analysis pass;
 - `exempla/gguf-manifest` runs through package MIR and prints observed PASS
-  results for every named positive and negative case. If the lane compiler
-  blocks that run, record the exact command, output, and exit status in the
-  exemplar README and leave A1a incomplete; source typechecking alone is not
-  an executable parser claim.
+  results for every named positive and negative case. The hand-2 receipt is
+  23 PASS / 0 FAIL with exit 0; it covers only deterministic in-source
+  bounded corpora and is not a real-file, tensor-payload, or inference claim.
 
 **Commands** (from the Hand packet):
 
@@ -276,13 +275,13 @@ and first divergence.
 cd /Users/ianzepp/work/faberlang/worktrees/hand-1/gradus
 ./scripta/check-source
 env FABER_LIBRARY_HOME=/Users/ianzepp/work/faberlang/worktrees/hand-1 \
-  FABER_BIN=/Users/ianzepp/work/faberlang/worktrees/hand-1/radix/target/debug/faber \
+  FABER_BIN=/Users/ianzepp/work/faberlang/worktrees/hand-2/radix/target/debug/faber \
   ./scripta/check-compile
 env FABER_LIBRARY_HOME=/Users/ianzepp/work/faberlang/worktrees/hand-1 \
-  /Users/ianzepp/work/faberlang/worktrees/hand-1/radix/target/debug/faber \
+  /Users/ianzepp/work/faberlang/worktrees/hand-2/radix/target/debug/faber \
   check --diagnostics .
 env FABER_LIBRARY_HOME=/Users/ianzepp/work/faberlang/worktrees/hand-1 \
-  /Users/ianzepp/work/faberlang/worktrees/hand-1/radix/target/debug/faber \
+  /Users/ianzepp/work/faberlang/worktrees/hand-2/radix/target/debug/faber \
   run --target fmir exempla/gguf-manifest
 git diff --check -- src/model/artifact.fab src/model/artifact.proba \
   src/model/gguf_manifest.fab src/model/gguf_manifest.proba fixtures/gguf \
@@ -295,15 +294,11 @@ git diff --check -- src/model/artifact.fab src/model/artifact.proba \
 ```
 
 **Expected result**: `check-source` and `check-compile` exit 0; `faber check`
-ends in `ok: .`; the package-MIR exemplar prints one observed PASS line per
-case and exits 0; `git diff --check` is silent; all synthetic manifest/parser
-cases type-check. A pre-existing failure in either required gate blocks
-closeout and must be repaired or routed as its own unit; it may not be hidden
-by substituting the direct `faber check` command. In this repair's current
-lane, the package-MIR command exits 1 with 23 repeated `conversion source type
-mismatch` diagnostics followed by `fmir image execution failed`, before any
-entrypoint output. That exact receipt is a blocker recorded in the exemplar
-README, so A1a is structurally repaired but not executable-complete.
+ends in `ok: .`; the package-MIR exemplar prints 23 observed PASS lines, zero
+FAIL lines, and exits 0; `git diff --check` is silent; all synthetic
+manifest/parser cases type-check. This is the executed A1a bounded-parser
+proof. It does not parse committed fixtures, read real files or tensor
+payloads, or claim inference; focused `faber test` remains provider-blocked.
 
 `docs/regression-corpus.md` must inventory both new `.proba` suites and all
 three generated fixtures, update its suite/fixture totals, and bump its
@@ -390,7 +385,7 @@ of GGUF-A1a; execution is not hidden inside the dense Qwen adapter.
 
 Inferentia remains paused until all of these are current evidence:
 
-1. package-aware Gradus execution through the imported-library seam;
+1. bounded package-aware Gradus execution through the imported-library seam;
 2. generic inspection of an actual downloaded GGUF;
 3. real encode/decode and special-token behavior;
 4. mixed packed storage bound to tensor descriptors;

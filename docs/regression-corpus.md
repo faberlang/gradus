@@ -27,7 +27,7 @@ closeout, never a dev-loop suite.
 | --- | --- | --- |
 | Co-located package tests | `src/*.proba`, `src/model/*.proba` | Compile-level contract + oracle pins per module |
 | Model / tokenizer fixtures | `fixtures/safetensors/`, `fixtures/gguf/`, `fixtures/tokenizer/` | Legal fixtures + row-oracle docs, including the three GGUF-A1a manifest fixtures |
-| Exempla consumers | `exempla/gradient-seam`, `exempla/gradient-seam-nolib`, `exempla/training-loop-mlp`, `exempla/token-generation`, `exempla/gguf-manifest` | Public-surface consumers plus the bounded GGUF parser package proof |
+| Exempla consumers | `exempla/gradient-seam`, `exempla/gradient-seam-nolib`, `exempla/training-loop-mlp`, `exempla/token-generation`, `exempla/gguf-manifest` | Public-surface consumers plus the executed bounded GGUF parser package proof (23 PASS / 0 FAIL) |
 | Admission conformance | `tests/admission_conformance.fab` | Capsule admission composition check |
 
 Nested package dirs follow the Agents rule (≥2 modules); model package
@@ -175,11 +175,10 @@ cd /path/to/faberlang/gradus
 - `exempla/token-generation`,
 - `exempla/gguf-manifest`.
 
-The GGUF package proof is intended to run through package MIR. Its current
-receipt is a truthful blocker: the lane binary exits 1 during FMIR image
-execution with 23 `conversion source type mismatch` diagnostics before the
-program entrypoint prints a case. The source-level package check remains
-green; no executable parser result or committed-fixture parse is claimed.
+The GGUF package proof runs through package MIR with the hand-2 Radix binary.
+Its receipt exits 0 with 23 PASS lines and 0 FAIL lines across the bounded
+synthetic parser cases. The source-level package check remains green; no
+committed-fixture, real-file, tensor-payload, or inference parse is claimed.
 
 ### 5.2 Pin-consistency greps (U4)
 

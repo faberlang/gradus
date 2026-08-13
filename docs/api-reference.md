@@ -598,9 +598,10 @@ does not admit an architecture, read tensor payloads, or claim inference.
 The parser bounds metadata and tensor directories at 4,096 entries and the
 retained header/table corpus at 64 MiB; these ceilings bound duplicate and
 overlap checks while admitting the inventoried local rows (up to 753 tensors).
-The A1a source and synthetic builders are compile/typecheck evidence. The
-package-MIR receipt is recorded in `exempla/gguf-manifest/README.md`; no
-committed binary fixture is claimed parsed here.
+The A1a package proof executes 23 bounded synthetic cases with 23 PASS / 0
+FAIL through package MIR; the exact hand-2 receipt is recorded in
+`exempla/gguf-manifest/README.md`. It does not parse committed binary fixtures,
+read real files or tensor payloads, or claim inference.
 
 `genus CorpusGguf` — fields `tabula`, `longitudo_artifacti`, and
 `identitas`.

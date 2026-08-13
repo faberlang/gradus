@@ -10,8 +10,9 @@ One `.fab` file → one import path. Nested dirs for packages.
 ## Live modules (post-PML1–5 + correctness wave)
 
 The live tree has 27 modules and 612 declared functions. The GGUF-A1a parser
-surface is compile/typecheck-validated; the bounded package proof and its
-truthful package-MIR blocker are recorded in
+surface is compile/typecheck-validated and has an executed bounded package-MIR
+proof over deterministic in-source corpora; its exact receipt and boundaries
+are recorded in
 [`exempla/gguf-manifest/README.md`](../exempla/gguf-manifest/README.md).
 
 | Import | File | Role |

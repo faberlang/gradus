@@ -11,7 +11,7 @@
 - **Message** = the `textus causa` on the variant, rendered by `causa(e)`. Messages are locale-ready English. Dynamic suffixes (appended names, versions, counts) are written as a trailing `…` when the live source concatenates.
 - **Resolution** = the closed action that makes the call succeed. Gradus fails closed — no silent coercion.
 - **Reserved / mapped variants**: some variants exist for cross-module mapping or class coverage and have no direct `iace finge "…"` literal site; they still have stable codes. Mapped facades (e.g. `GradusError`, `TransformerError`) preserve the underlying causa text.
-- **Executed tier**: this map documents fail-closed identity on the compiled surface. Proba execution and exempla e2e runs remain on the FMIR lever (CTO8-1) until that gate opens — this document never claims executed runs.
+- **Executed tier**: this map documents fail-closed identity on the compiled surface. Focused `faber test` proba execution and broader inference exempla remain on the FMIR lever (CTO8-1); the separate GGUF-A1a bounded-parser package receipt is recorded in its exemplar README and is not a model or inference claim.
 
 ## EOG identity — `TokenizerError.EogMala`
 
@@ -86,9 +86,10 @@ values and tensor descriptors. It does not admit an architecture, read tensor
 payloads, or claim inference execution. Metadata and tensor directories are
 bounded at 4,096 entries, and the retained prefix is bounded at 64 MiB; those
 ceilings bound duplicate/overlap work while admitting the inventoried local
-maximum of 753 tensors. The package-MIR execution attempt is recorded as a
-blocker in `exempla/gguf-manifest/README.md`; source checks do not claim an
-executed parser result.
+maximum of 753 tensors. The package-MIR exemplar executes 23 bounded
+synthetic cases with 23 PASS / 0 FAIL; its exact hand-2 receipt is recorded in
+`exempla/gguf-manifest/README.md`. No committed fixture, real-file, payload,
+or inference parse is claimed.
 
 | Code | Class / when | Resolution |
 | --- | --- | --- |
