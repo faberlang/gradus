@@ -1,6 +1,6 @@
 # Gradus Regression Corpus
 
-**Version**: `gradus-regression-corpus v1.2.0` (2026-08-12, GGUF-A1b)
+**Version**: `gradus-regression-corpus v1.3.0` (2026-08-13, A1C-M5)
 **Repo**: gradus. **Tier**: structural inventory.
 **Delivery**: `docs/factory/production-ml-library/pml6-delivery.md` §PML6-U4;
 GGUF-A1b delivery in `pml5-general-gguf-delivery.md`.
@@ -61,7 +61,7 @@ Live co-located suites (26 files):
 | `src/sampling.proba` | `gradus:sampling` | Softmax / filters @ **5e-4** |
 | `src/generation.proba` | `gradus:generation` | Config + cursor limits + `cursor_redintegra` |
 | `src/gradus.proba` | facade composition | MLP / GELU composition @ **5e-4** |
-| `src/model/capsule.proba` | capsule admission | Schema + **EOG rejection** + quant / bounds |
+| `src/model/capsule.proba` | capsule admission (schema 2) | Schema-2 admission (identity + manifest) + **schema-1 rejection** (`SchemaVetus`) + identity wire |
 | `src/model/safetensors.proba` | Safetensors row | Fixture bytes + digest + tokenizer mismatch |
 | `src/model/gguf.proba` | GGUF row | Builder + digest + row facts |
 | `src/model/dequant.proba` | CPU dequant | Block layout pins |
@@ -123,16 +123,16 @@ PML6-U4 / the correctness wave. Loss of any pin is a corpus defect.
 | **Live** | `src/decode.proba` — `"the seeded stochastic bounded run ... draws the f64-oracle tokens [1, 1]"` |
 | **Consumer doc** | `exempla/token-generation/README.md` |
 
-### 4.3 Capsule EOG-rejection pin
+### 4.3 Capsule schema-1 rejection pin (schema-2 boundary)
 
 | Field | Value |
 | --- | --- |
-| **Pin** | Well-formed-but-**different** EOG set **`1,5`** fails closed at capsule admission |
-| **Pinned set** | `"0,2"` (`F_EOG`) |
-| **Message class** | `invalid tokenizer identity` (identity, not a value error) |
-| **Why** | A different EOG set is a different tokenizer (`2cdc498`; contract §3.3) |
-| **Live** | `src/model/capsule.proba` — `"rejects a well-formed-but-different EOG set (pinned EOG is {0, 2})"` |
-| **Sibling** | `src/tokenizer.proba` rejects `"1,5"` / non-sorted / empty EOG; `est_eog` admits only `{0,2}` |
+| **Pin** | A **schema-1** stamp fails closed at the capsule boundary — the constructor (`structa_manifestum`), `verifica`, and the identity wire form all reject it |
+| **Stamp** | `"1.0.0"` (`F_SCHEMA` is `"2.0.0"`; schema 1 is retired, A1C-M1) |
+| **Message class** | `schema 1 is retired — capsule schema is 2.0.0` (`AdmissionError.SchemaVetus`) |
+| **Why** | Schema 1 is retired at the schema-2 boundary; a schema-1 call site also fails to compile (the schema-2 constructor has no schema-1 signature) |
+| **Live** | `src/model/capsule.proba` — the `"capsule schema-1 rejection"` probandum (`structa_manifestum rejects a schema-1 stamp`, `verifica rejects a schema-1-stamped capsule`, `deserialization rejects a schema-1-stamped wire`) |
+| **Sibling** | `src/tokenizer.proba` rejects `"1,5"` / non-sorted / empty EOG; `est_eog` admits only `{0,2}` — EOG identity lives in `gradus:tokenizer`, not the schema-2 capsule |
 
 ### 4.4 Reset / replay determinism
 
@@ -192,10 +192,9 @@ rg -n 'draws the f64-oracle tokens \[0\]|draws the f64-oracle tokens \[1, 1\]' \
   src/decode.proba
 rg -n '`\[0\]`|`\[1, 1\]`|8742514861359412281' exempla/token-generation/README.md
 
-# Capsule EOG rejection
-rg -n 'rejects a well-formed-but-different EOG set \(pinned EOG is \{0, 2\}\)' \
-  src/model/capsule.proba
-rg -n '1,5' src/model/capsule.proba src/tokenizer.proba
+# Capsule schema-1 rejection (schema-2 boundary)
+rg -n 'schema 1 is retired — capsule schema is 2\.0\.0' src/model/capsule.proba
+rg -n '1,5' src/tokenizer.proba
 
 # Reset / replay + first-token-divergence
 rg -n 'reset/replay determinism|prima_divergentia|first-token-divergence' \
@@ -256,7 +255,7 @@ remain in the support matrix; this corpus does not re-admit them.
 
 ## 8. Versioning
 
-`gradus-regression-corpus v1.1.0`. Adding a suite, fixture, or named pin
+`gradus-regression-corpus v1.3.0`. Adding a suite, fixture, or named pin
 bumps this version. Removing or retargeting a named pin (§4) is a
 **major** event and must update the support matrix / compatibility
 policy in the same change set.
