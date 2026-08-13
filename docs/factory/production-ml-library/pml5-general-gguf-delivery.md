@@ -1,6 +1,6 @@
 # Delivery: PML5-GGUF — Qwen3.6 35B End-to-End Inference
 
-**Status**: active — GGUF-A1a and GGUF-A1b implemented; GGUF-A1c is the next mandatory unit
+**Status**: active — GGUF-A1a and GGUF-A1b implemented; GGUF-A1c is implemented in the transitional A1C micro-unit chain but not yet validated, audited, or integrated (aggregate M8 gate pending)
 **Campaign**: [`CAMPAIGN.md`](CAMPAIGN.md), mandatory completion of PML5
 **Umbrella**: Radix `gpu-production-readiness` Qwen3.6 invariant
 **Repo**: `gradus`
@@ -388,6 +388,15 @@ callers in one unit; add no forwarding shim and leave no dual GGUF authority.
 **Done when**: schema 1 has no live constructor or parser caller; schema 2
 identity/manifest values are the only authority; source, compile, and migrated
 format probas pass.
+
+**Implemented evidence**: the A1C clean break is implemented in the
+transitional A1C micro-unit chain (`factory/a1c-chain`, tip 888b656 — M1
+capsule schema-2 producer `1c3bc51`, M2 GGUF caller/parser migration
+`baa32c5`, M3 Safetensors caller migration `3a3d906`, M5 API/support docs
+`fb41344`, plus the visibility-correction fixes). Every micro-unit is
+non-integrable alone; the aggregate M8 package validation and the single
+atomic merge to `factory/merge` are pending, so the chain is not yet
+validated, audited, or integrated.
 
 ### GGUF-A2 — Tokenizer Runtime
 

@@ -1,6 +1,6 @@
 # Campaign: Production ML Library
 
-**Status**: active — PML5-GGUF Qwen3.6 invariant; GGUF-A1a bounded parsing and GGUF-A1b guarded real-file inspection are implemented; GGUF-A1c is next
+**Status**: active — PML5-GGUF Qwen3.6 invariant; GGUF-A1a bounded parsing and GGUF-A1b guarded real-file inspection are implemented; GGUF-A1c is implemented in the transitional A1C micro-unit chain but not yet validated, audited, or integrated (aggregate M8 merge gate pending)
 **Created**: 2026-08-08
 **Mode**: routing artifact — draft/maintain; does not implement code directly
 **Control-plane repo**: `/Users/ianzepp/work/faberlang/gradus`

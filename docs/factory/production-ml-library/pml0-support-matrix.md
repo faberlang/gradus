@@ -39,9 +39,10 @@ BOOL `numerum` rejection. A guarded source adapter separately matches six
 operator-local real files against independent offsets and counts without
 entering tensor data (`exempla/gguf-inspect/README.md`). Neither receipt is a
 tokenizer, architecture admission, model execution, or inference claim. The
-existing Row 2 capsule admission
-remains the old one-row authority until GGUF-A1c performs the clean-break
-migration.
+A1C clean-break migration is implemented in the transitional A1C micro-unit
+chain (`factory/a1c-chain`, tip 888b656) but is not yet validated, audited,
+or integrated — the aggregate M8 package validation and atomic merge are
+pending.
 
 ## 1. Admitted rows
 
@@ -57,7 +58,7 @@ migration.
 | `legal fixture ref` | `fixtures/safetensors/smollm2-360m-scaled-row.safetensors` — SHA-256 `424442296e97c261de42fd496cc6cdb4496f3f632835479de96a7ed76c5f75d8` (1512 bytes); local synthetic fixture, no acquisition or redistribution claim |
 | `oracle ref` | the PML2-U2 row-oracle (`fixtures/safetensors/safetensors-row-oracle.md`): pinned header/data facts (header_size 840, 672-byte data region, deterministic data pattern); the proba embeds the same byte sequence and verifies the capsule digest via `capsula.verifica_contra` (digest value host-computed per the capsule boundary) |
 | `evidence links` | `src/model/safetensors.fab`, `src/model/safetensors.proba`, `src/model/capsule.fab`, `src/model/capsule.proba`; `tests/admission_conformance.fab`; `fixtures/safetensors/safetensors-row-oracle.md`; committed units 435ccd6 (U1 capsule), 07291d6 (U2), f12deaf (U4 tokenizer), 02fae61 (U6 conformance) |
-| `compatibility policy` | exact admitted row: the pinned SmolLM2-360M scaled Safetensors model-file row admits into the capsule (`capsule-schema-1.0.0`). Non-goals: no other format/version; no quantization (F32 storage only); no forward-path claim (admission row — forward rows are the PML3 rows); no executed identity claim |
+| `compatibility policy` | exact admitted row: the pinned SmolLM2-360M scaled Safetensors model-file row admits into the capsule (`capsule-schema-2.0.0`). Non-goals: no other format/version; no quantization (F32 storage only); no forward-path claim (admission row — forward rows are the PML3 rows); no executed identity claim |
 | `schema version` | `gradus-support-matrix-schema v0.1.0` |
 ```
 
@@ -73,7 +74,7 @@ migration.
 | `legal fixture ref` | `fixtures/gguf/smollm2-360m-scaled-row.gguf` — SHA-256 `d89c9ef917158bfb5600f417020479499c6c042f728e9a29c8457a6b1a8f0974` (3936 bytes); local synthetic fixture, no acquisition or redistribution claim |
 | `oracle ref` | the PML2-U3 row-oracle (`fixtures/gguf/gguf-row-oracle.md`): pinned header/tensor-table/data facts (metadata KV count 18, data-section start 1024, deterministic data pattern); the proba reconstructs the same byte sequence in code (`aedifica` builder) and verifies the capsule digest via `capsula.verifica_contra` |
 | `evidence links` | `src/model/gguf.fab`, `src/model/gguf.proba`, `src/model/capsule.fab`, `src/model/capsule.proba`; `tests/admission_conformance.fab`; `fixtures/gguf/gguf-row-oracle.md`; committed units 435ccd6 (U1), b392fc8 (U3), f12deaf (U4), 02fae61 (U6) |
-| `compatibility policy` | exact admitted row: the pinned SmolLM2-360M scaled GGUF row (file v3, Q4_K_M storage / f32 compute) admits into the capsule. Non-goals: no quantized forward path (quantization is a storage property of this row, never a forward-path claim); no other file versions/types/quants; no executed identity claim |
+| `compatibility policy` | exact admitted row: the pinned SmolLM2-360M scaled GGUF row (file v3, Q4_K_M storage / f32 compute) admits into the capsule (`capsule-schema-2.0.0`). Non-goals: no quantized forward path (quantization is a storage property of this row, never a forward-path claim); no other file versions/types/quants; no executed identity claim |
 | `schema version` | `gradus-support-matrix-schema v0.1.0` |
 ```
 
