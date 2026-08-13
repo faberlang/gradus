@@ -1,9 +1,9 @@
 # Gradus Regression Corpus
 
-**Version**: `gradus-regression-corpus v1.1.0` (2026-08-12, GGUF-A1a)
+**Version**: `gradus-regression-corpus v1.2.0` (2026-08-12, GGUF-A1b)
 **Repo**: gradus. **Tier**: structural inventory.
 **Delivery**: `docs/factory/production-ml-library/pml6-delivery.md` §PML6-U4;
-GGUF-A1a delivery in `pml5-general-gguf-delivery.md`.
+GGUF-A1b delivery in `pml5-general-gguf-delivery.md`.
 **Support rows**: `docs/factory/production-ml-library/pml0-support-matrix.md`
 (six admitted rows). **Tolerances**: `docs/numeric-tolerances.md`.
 **Benchmark method**: `docs/benchmark-method.md`.
@@ -27,7 +27,7 @@ closeout, never a dev-loop suite.
 | --- | --- | --- |
 | Co-located package tests | `src/*.proba`, `src/model/*.proba` | Compile-level contract + oracle pins per module |
 | Model / tokenizer fixtures | `fixtures/safetensors/`, `fixtures/gguf/`, `fixtures/tokenizer/` | Legal fixtures + row-oracle docs, including the three GGUF-A1a manifest fixtures |
-| Exempla consumers | `exempla/gradient-seam`, `exempla/gradient-seam-nolib`, `exempla/training-loop-mlp`, `exempla/token-generation`, `exempla/gguf-manifest` | Public-surface consumers plus the executed bounded GGUF parser package proof (31 PASS / 0 FAIL) |
+| Exempla consumers | `exempla/gradient-seam`, `exempla/gradient-seam-nolib`, `exempla/training-loop-mlp`, `exempla/token-generation`, `exempla/gguf-manifest`, `exempla/gguf-inspect` | Public-surface consumers plus the executed GGUF synthetic proof (40 PASS / 0 FAIL) and guarded six-file local inspection receipt |
 | Admission conformance | `tests/admission_conformance.fab` | Capsule admission composition check |
 
 Nested package dirs follow the Agents rule (≥2 modules); model package
@@ -66,7 +66,7 @@ Live co-located suites (26 files):
 | `src/model/gguf.proba` | GGUF row | Builder + digest + row facts |
 | `src/model/dequant.proba` | CPU dequant | Block layout pins |
 | `src/model/artifact.proba` | pathless content identity | Algorithm, digest, and positive-length validation |
-| `src/model/gguf_manifest.proba` | GGUF-A1a bounded manifest | Unknown codec inspection and structural parser surface |
+| `src/model/gguf_manifest.proba` | GGUF-A1b manifest and range seam | Unknown codec inspection, exact ranges, source failure, and checked tensor fragments |
 
 Every suite header states **EVIDENCE HONESTY (CTO Q2)**: structural /
 compile-level proof; executed value-identity deferred.
@@ -167,18 +167,20 @@ cd /path/to/faberlang/gradus
 ./scripta/check-compile
 ```
 
-`check-compile` runs `faber check` on:
+`check-compile` runs package-aware `faber check` on:
 
-- the gradus library root (includes co-located `.proba` typecheck),
+- the gradus library source root,
 - `exempla/gradient-seam`,
 - `exempla/training-loop-mlp`,
 - `exempla/token-generation`,
 - `exempla/gguf-manifest`.
+- `exempla/gguf-inspect`.
 
 The GGUF package proof runs through package MIR with the hand-2 Radix binary.
-Its receipt exits 0 with 31 PASS lines and 0 FAIL lines across the bounded
-synthetic parser cases. The source-level package check remains green; no
-committed-fixture, real-file, tensor-payload, or inference parse is claimed.
+Its receipt exits 0 with 40 PASS lines and 0 FAIL lines across bounded
+synthetic parser/range cases. The separate real-file adapter inspected six
+operator-local GGUFs and fails if an inspection request enters tensor data.
+This is manifest/range evidence only, not tokenizer or inference execution.
 
 ### 5.2 Pin-consistency greps (U4)
 

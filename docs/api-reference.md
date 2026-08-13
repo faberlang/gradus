@@ -588,23 +588,24 @@ facts (verum = BOS-free / space-prefix-free), enforced with `≡`.
 
 ## gradus:model/gguf_manifest
 
-Format-general GGUF v3 manifest inspection (GGUF-A1a). `CorpusGguf` accepts a
-bounded prefix containing the complete header, metadata, and tensor table,
-plus the caller-supplied total artifact length and pathless content identity.
-The parser retains metadata value kinds and exact wire payloads, raw tensor
-names/shapes/types/relative offsets, and known GGML block geometry. Unknown
-architecture metadata and raw GGML type IDs remain inspectable; this module
-does not admit an architecture, read tensor payloads, or claim inference.
-The parser bounds metadata and tensor directories at 4,096 entries and the
-retained header/table corpus at 64 MiB; these ceilings bound duplicate and
-overlap checks while admitting the inventoried local rows (up to 753 tensors).
-The A1a package proof executes 31 bounded synthetic cases with 31 PASS / 0
-FAIL through package MIR; the exact hand-2 receipt is recorded in
-`exempla/gguf-manifest/README.md`. It does not parse committed binary fixtures,
-read real files or tensor payloads, or claim inference.
+Format-general GGUF v3 manifest inspection (GGUF-A1b). `CorpusGguf` accepts a
+bounded prefix containing the complete header, metadata, and tensor table.
+`inspice` instead advances through exact ranges supplied by a caller-owned
+function. Both routes retain metadata value kinds and exact wire payloads, raw
+tensor names/shapes/types/relative offsets, and known GGML block geometry.
+Unknown architecture metadata and raw GGML type IDs remain inspectable.
+Metadata and tensor directories are bounded at 4,096 entries; retained
+metadata values and individual reads are bounded at 64 MiB. The source
+function is operation-scoped and is never retained. The synthetic package
+proof executes 40 cases with 40 PASS / 0 FAIL. A separate guarded adapter
+matches six operator-local files against independent GGUF data offsets and
+counts without reading tensor payloads. Neither receipt admits an architecture,
+implements tokenization, or claims inference.
 
 `genus CorpusGguf` — fields `tabula`, `longitudo_artifacti`, and
 `identitas`.
+`genus LectioFontis` — fields `successus`, `bytes`, and `causa`; one explicit
+success/failure result from a caller-owned range function.
 `genus MetadatumGguf` — fields `clavis`, `typo`, and `valor_wire`.
 `discretio LayoutGgml` — `Cognita(elementa_per_blockum,
 octeti_per_blockum, longitudo_octetorum)` or `Ignota(typo)`.
@@ -616,6 +617,15 @@ octeti_per_blockum, longitudo_octetorum)` or `Ignota(typo)`.
 - `functio causa(GgufManifestError e) → textus` — render the parser error.
 - `functio parse(CorpusGguf corpus) → ManifestumGguf ⇥ GgufManifestError` —
   parse GGUF v3 header/metadata/tensor table from a bounded corpus.
+- `functio inspice((numerus, numerus) → LectioFontis fons, numerus
+  longitudo_artifacti, artifact.IdentitasContenuti identitas) →
+  ManifestumGguf ⇥ GgufManifestError` — inspect exact header, metadata, and
+  tensor-directory ranges from an operation-scoped source without retaining
+  the source or requesting tensor payload bytes.
+- `functio lege_fragmentum(ManifestumGguf m, textus nomen, numerus initium,
+  numerus longitudo, (numerus, numerus) → LectioFontis fons) → octeti ⇥
+  GgufManifestError` — read one checked relative fragment of a known-layout
+  tensor through a newly supplied source; unknown layouts fail closed.
 - `functio metadatum(ManifestumGguf m, textus clavis) → MetadatumGguf ⇥
   GgufManifestError` — retrieve one preserved metadata entry.
 - `functio textum(ManifestumGguf m, textus clavis) → textus ⇥
@@ -632,8 +642,8 @@ octeti_per_blockum, longitudo_octetorum)` or `Ignota(typo)`.
 
 `discretio GgufManifestError` variants: `FormatMala`, `VersioIgnota`,
 `Truncata`, `WireMala`, `LimitesMala`, `Superfluitas`, `ClavisDuplicata`,
-`TensorDuplicatum`, `OffsetMala`, and `IdentitasMala`; each carries
-`textus causa`.
+`TensorDuplicatum`, `OffsetMala`, `LayoutIgnota`, `IdentitasMala`, and
+`FonsMala`; each carries `textus causa`.
 
 ## gradus:model/gguf
 
@@ -942,13 +952,13 @@ same training loop through the same batch interface.
 
 ```bash
 cd /Users/ianzepp/work/faberlang/gradus
-./scripta/inventory-public-symbols   # per-module counts + total 612 + the
+./scripta/inventory-public-symbols   # per-module counts + total 618 + the
                                      # committed coverage gate: every public
                                      # symbol below is documented here
 ```
 
 The inventory script asserts every live module's `functio` count, the live
-all-module total (612), and — per module — that every public symbol name
+all-module total (618), and — per module — that every public symbol name
 listed above appears in this reference's `### gradus:<module>` section. A
 public symbol added to `src/` without a matching entry here fails the
 script (zombie-doc gate, PML6-U1). Private `_`-prefixed helpers are exempt;

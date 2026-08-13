@@ -23,21 +23,23 @@ training-layer row, one PML5 inference-layer row. Every row is **structural
 tier** — the executed tier is recorded, never claimed (see §2 reject log and
 each row's structural-tier note).
 
-GGUF-A1a adds a separate **format-inspection foundation**, not an admitted
+GGUF-A1b extends the separate **format-inspection foundation**; it is not an admitted
 execution row. `gradus:model/artifact` and `gradus:model/gguf_manifest` parse
 bounded GGUF v3 headers, metadata, and tensor directories for `llama`, `qwen2`,
-and `qwen35moe` synthetic fixtures. They preserve unknown architecture names
+and `qwen35moe` inputs. They preserve unknown architecture names
 and raw GGML type IDs as data, honor default/non-default alignment, and do not
 admit a model, load tensor payloads, or claim inference. The parser bounds
 metadata and tensor directories at 4,096 entries and the retained prefix at
 64 MiB, admitting the inventoried local maximum of 753 tensors. The source
 and synthetic proof are compile/typecheck evidence, and the package-MIR
-exemplar now executes 31 bounded parser cases with 31 PASS / 0 FAIL through
+exemplar executes 40 bounded parser/range cases with 40 PASS / 0 FAIL through
 the hand-2 Radix binary. It also checks all thirteen metadata wire kinds,
 exact `valor_wire` bytes, nested arrays, descriptor ranges, and the typed
-BOOL `numerum` rejection. This is an in-source synthetic receipt only: no
-committed-fixture, real-file, tensor-payload, or inference parse is claimed
-(`exempla/gguf-manifest/README.md`). The existing Row 2 capsule admission
+BOOL `numerum` rejection. A guarded source adapter separately matches six
+operator-local real files against independent offsets and counts without
+entering tensor data (`exempla/gguf-inspect/README.md`). Neither receipt is a
+tokenizer, architecture admission, model execution, or inference claim. The
+existing Row 2 capsule admission
 remains the old one-row authority until GGUF-A1c performs the clean-break
 migration.
 

@@ -9,11 +9,11 @@ One `.fab` file → one import path. Nested dirs for packages.
 
 ## Live modules (post-PML1–5 + correctness wave)
 
-The live tree has 27 modules and 612 declared functions. The GGUF-A1a parser
-surface is compile/typecheck-validated and has an executed bounded package-MIR
-proof over deterministic in-source corpora; its exact receipt and boundaries
-are recorded in
-[`exempla/gguf-manifest/README.md`](../exempla/gguf-manifest/README.md).
+The live tree has 27 modules and 618 declared functions. The GGUF-A1b surface
+has an executed 40-case synthetic package-MIR proof and guarded real-file
+inspection receipts for six operator-local GGUFs. Exact evidence and boundaries
+are recorded in [`exempla/gguf-manifest/README.md`](../exempla/gguf-manifest/README.md)
+and [`exempla/gguf-inspect/README.md`](../exempla/gguf-inspect/README.md).
 
 | Import | File | Role |
 | --- | --- | --- |
@@ -34,7 +34,7 @@ are recorded in
 | `gradus:data` | `src/data.fab` | Stub — batching/shuffling/tokenization declared future |
 | `gradus:model/artifact` | `src/model/artifact.fab` | Pathless content identity for bounded model artifacts (GGUF-A1a) |
 | `gradus:model/capsule` | `src/model/capsule.fab` | Admitted-model capsule — the typed identity handoff (PML2, C8) |
-| `gradus:model/gguf_manifest` | `src/model/gguf_manifest.fab` | Format-general GGUF v3 metadata/tensor manifest parser (GGUF-A1a) |
+| `gradus:model/gguf_manifest` | `src/model/gguf_manifest.fab` | Format-general GGUF v3 bounded-corpus parser plus pathless range inspection and checked tensor fragments (GGUF-A1b) |
 | `gradus:model/gguf` | `src/model/gguf.fab` | GGUF row admission → capsule (PML2) |
 | `gradus:model/safetensors` | `src/model/safetensors.fab` | Safetensors row admission → capsule (PML2) |
 | `gradus:model/dequant` | `src/model/dequant.fab` | CPU dequant of the admitted GGML block types (PML2) |

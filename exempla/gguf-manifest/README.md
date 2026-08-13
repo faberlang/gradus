@@ -1,11 +1,11 @@
-# GGUF-A1a executable parser proof
+# GGUF-A1a/A1b executable synthetic proof
 
 This package is the executable bounded-corpus proof for the Gradus
 `gradus:model/gguf_manifest` foundation. Its source builds synthetic GGUF v3
-header/metadata/tensor-table prefixes in memory, calls `parse`, accesses
-returned manifest/tensor fields, and prints a PASS/FAIL line with the observed
-result for each named case. It performs no filesystem read, download, mmap,
-host-reader call, or model-payload allocation.
+header/metadata/tensor-table prefixes in memory, calls `parse`, `inspice`, and
+`lege_fragmentum`, and prints a PASS/FAIL line with the observed result for
+each named case. It performs no filesystem read, download, mmap, or
+model-payload allocation.
 
 The committed files under `fixtures/gguf/` are deterministic generator/oracle
 artifacts. This package does not claim to have parsed those binary files.
@@ -13,7 +13,7 @@ artifacts. This package does not claim to have parsed those binary files.
 ## Evidence boundary
 
 The package runs through package MIR with the hand-2 lane Radix binary. The
-receipt below is the only executable claim for A1a. Co-located
+receipt below is the executable synthetic claim for A1a/A1b. Co-located
 `src/model/*.proba` files remain structural/typecheck evidence; focused
 `faber test` attempts remain blocked by the imported-library provider seam
 (artifact `sym#20`, manifest `sym#140`).
@@ -29,7 +29,7 @@ env FABER_LIBRARY_HOME=/Users/ianzepp/work/faberlang/worktrees/hand-1 \
   run --target fmir exempla/gguf-manifest
 ```
 
-Observed result (2026-08-12): exit `0`; 31 PASS lines and 0 FAIL lines. The
+Observed result (2026-08-12): exit `0`; 40 PASS lines and 0 FAIL lines. The
 package executes only deterministic bounded in-source corpora. It checks all
 thirteen metadata wire kinds, exact representative `valor_wire` bytes
 (including a nested array), signed integer access, the typed BOOL `numerum`
@@ -69,12 +69,22 @@ custom-alignment-data-offset: PASS observed=384/192/4/16
 reordered-gapped-ranges: PASS observed=128/160/4/16
 corpus-table-end-accepted: PASS observed=96/96
 corpus-padding-end-accepted: PASS observed=96/96
+range-source-inspection: PASS observed=llama/2/288
+range-source-failure: PASS observed=range source failed: synthetic read failed
+range-source-short-read: PASS observed=range source returned an unexpected byte length
+tensor-fragment-exact: PASS observed=exact-bytes
+tensor-fragment-negative: PASS observed=tensor fragment range is negative
+tensor-fragment-out-of-range: PASS observed=tensor fragment range exceeds the known tensor
+tensor-fragment-unknown-layout: PASS observed=tensor layout is unknown; payload fragment is unavailable
+tensor-fragment-source-failure: PASS observed=range source failed: synthetic read failed
+tensor-fragment-short-read: PASS observed=range source returned an unexpected byte length
 ```
 
 The source-level command `faber check exempla/gguf-manifest` is green, and
 `scripta/check-compile` includes that package check. This is an executed
-bounded-parser receipt, not a real-file, committed-fixture, tensor-payload, or
-inference claim. The committed binary fixtures remain generator/oracle
+synthetic parser/range receipt, not a real-file or inference claim. The
+separate guarded real-file receipt is in `../gguf-inspect/README.md`. The
+committed binary fixtures remain generator/oracle
 artifacts and are not claimed parsed.
 
 ## Separate compiled-Rust route

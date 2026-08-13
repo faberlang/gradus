@@ -1,6 +1,6 @@
 # Delivery: PML5-GGUF — General GGUF Inference Continuation
 
-**Status**: active — GGUF-A1a selected for implementation in `factory/hand-1`
+**Status**: active — GGUF-A1a and GGUF-A1b implemented in the Hand lanes; GGUF-A1c is next after merge-lane integration
 **Campaign**: [`CAMPAIGN.md`](CAMPAIGN.md), continuation after structural PML5
 **Umbrella**: Radix `gpu-production-readiness` units ML-01 through ML-07
 **Repo**: `gradus`
@@ -310,6 +310,19 @@ document version under the corpus contract. Stale totals block closeout.
 GPU work, Hosts work, Inferentia, or main-branch integration.
 
 ### GGUF-A1b — Range Source And Real-File Inspection
+
+**Implemented evidence**: `gradus:model/gguf_manifest` now exposes the
+operation-scoped `LectioFontis` callback contract, `inspice`, and
+`lege_fragmentum`. The 40-case synthetic package proof covers source failures,
+short reads, exact tensor fragments, range rejection, and unknown layouts. The
+guarded `exempla/gguf-inspect` adapter matched the six local rows as
+`llama/290`, `qwen2/290`, `qwen2/338`, and
+`qwen35moe/753/733/733`; every computed data offset matched the independent
+GGUF reader. The adapter reads exactly the independently bounded header/table
+prefix once, then serves exact subranges through a captured operation-scoped
+callback. Any inspection request that intersects tensor data fails against the
+prefix bound. Exact commands, content identities, sizes, offsets, and observed
+output are in `exempla/gguf-inspect/README.md`.
 
 Define the exact failable range-source contract only after its Faber
 function-value ABI is executable through an imported Gradus package. The
