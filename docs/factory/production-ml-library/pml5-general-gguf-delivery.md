@@ -154,15 +154,16 @@ tensor counts, offsets, and type distributions.
   `llama-manifest-v3.gguf`, `qwen2-manifest-v3.gguf`, and
   `qwen35moe-manifest-v3.gguf`
 - `README.md`, `docs/module-map.md`, `docs/api-reference.md`,
-  `docs/diagnostics.md`,
+  `docs/diagnostics.md`, `docs/regression-corpus.md`,
   `docs/factory/production-ml-library/pml0-symbol-inventory.md`, and
   `docs/factory/production-ml-library/pml0-support-matrix.md`
 
 **Frozen public surface**:
 
-- `gradus:model/artifact` exports `IdentitasContenuti { algorithmus,
-  digestio, longitudo }`, `ArtifactError { AlgorithmusIgnotus,
-  DigestioMala, LongitudoMala }`, `causa(ArtifactError)`, and
+- `gradus:model/artifact` exports `IdentitasContenuti { textus algorithmus,
+  textus digestio, numerus longitudo }`, `ArtifactError { AlgorithmusIgnotus
+  { textus causa }, DigestioMala { textus causa }, LongitudoMala { textus
+  causa } }`, `causa(ArtifactError)`, and
   `identitas(textus algorithmus, textus digestio, numerus longitudo) ->
   IdentitasContenuti ⇥ ArtifactError`. The first row accepts only the
   lower-case `sha-256` name, a 64-digit lower-case hexadecimal digest, and a
@@ -171,11 +172,14 @@ tensor counts, offsets, and type distributions.
 - `gradus:model/gguf_manifest` exports `CorpusGguf { octeti tabula, numerus
   longitudo_artifacti, artifact.IdentitasContenuti identitas }`,
   `MetadatumGguf { textus clavis, numerus typo, octeti valor_wire }`,
-  `LayoutGgml { Cognita { elementa_per_blockum, octeti_per_blockum,
-  longitudo_octetorum }, Ignota { typo } }`, `DescriptioTensorisGguf {
-  nomen, forma, typo_ggml, offset_relativum, elementa, layout }`, and
-  `ManifestumGguf { identitas, versio, concordatio, data_inceptum,
-  longitudo_artifacti, metadata, tensores }`.
+  `LayoutGgml { Cognita { numerus elementa_per_blockum, numerus
+  octeti_per_blockum, numerus longitudo_octetorum }, Ignota { numerus typo }
+  }`, `DescriptioTensorisGguf { textus nomen, lista<numerus> forma, numerus
+  typo_ggml, numerus offset_relativum, numerus elementa, LayoutGgml layout }`,
+  and `ManifestumGguf { artifact.IdentitasContenuti identitas, numerus
+  versio, numerus concordatio, numerus data_inceptum, numerus
+  longitudo_artifacti, lista<MetadatumGguf> metadata,
+  lista<DescriptioTensorisGguf> tensores }`.
 - Its operations are `parse(CorpusGguf) -> ManifestumGguf ⇥
   GgufManifestError`, `metadatum(ManifestumGguf, textus) -> MetadatumGguf ⇥
   GgufManifestError`, `textum(ManifestumGguf, textus) -> textus ⇥
@@ -259,6 +263,7 @@ env FABER_LIBRARY_HOME=/Users/ianzepp/work/faberlang/worktrees/hand-1 \
 git diff --check -- src/model/artifact.fab src/model/artifact.proba \
   src/model/gguf_manifest.fab src/model/gguf_manifest.proba fixtures/gguf \
   README.md docs/module-map.md docs/api-reference.md docs/diagnostics.md \
+  docs/regression-corpus.md \
   docs/factory/production-ml-library/pml0-symbol-inventory.md \
   docs/factory/production-ml-library/pml0-support-matrix.md
 ```
@@ -268,6 +273,10 @@ ends in `ok: .`; `git diff --check` is silent; all synthetic
 manifest/parser cases type-check. A pre-existing failure in either required
 Gradus gate blocks closeout and must be repaired or routed as its own unit; it
 may not be hidden by substituting the direct `faber check` command.
+
+`docs/regression-corpus.md` must inventory both new `.proba` suites and all
+three generated fixtures, update its suite/fixture totals, and bump its
+document version under the corpus contract. Stale totals block closeout.
 
 **Non-goals**: tokenization, tensor payload codecs, model assembly, inference,
 GPU work, Hosts work, Inferentia, or main-branch integration.
@@ -344,7 +353,7 @@ evidence. This unit is a cross-repo dependency, not an Inferentia task.
 
 Lower separately after GGUF-A1a. The local `qwen35moe` files require MoE router
 and expert dispatch plus hybrid SSM/attention semantics. Format parsing is part
-of A1; execution is not hidden inside the dense Qwen adapter.
+of GGUF-A1a; execution is not hidden inside the dense Qwen adapter.
 
 ## Gates Before Inferentia
 
