@@ -145,10 +145,57 @@ tensor counts, offsets, and type distributions.
 
 **Write scope**:
 
-- new pathless artifact/manifest module and its co-located `.proba`
-- new format-general GGUF parser module and its co-located `.proba`
-- `fixtures/gguf/` small synthetic wire fixtures and oracle notes
-- directly affected Gradus API/support documentation
+- `src/model/artifact.fab` and `src/model/artifact.proba`, public import
+  `gradus:model/artifact`
+- `src/model/gguf_manifest.fab` and `src/model/gguf_manifest.proba`, public
+  import `gradus:model/gguf_manifest`
+- `fixtures/gguf/gen_manifest_fixtures.py`,
+  `fixtures/gguf/general-manifest-oracle.md`, and generated small fixtures
+  `llama-manifest-v3.gguf`, `qwen2-manifest-v3.gguf`, and
+  `qwen35moe-manifest-v3.gguf`
+- `README.md`, `docs/module-map.md`, `docs/api-reference.md`,
+  `docs/diagnostics.md`,
+  `docs/factory/production-ml-library/pml0-symbol-inventory.md`, and
+  `docs/factory/production-ml-library/pml0-support-matrix.md`
+
+**Frozen public surface**:
+
+- `gradus:model/artifact` exports `IdentitasContenuti { algorithmus,
+  digestio, longitudo }`, `ArtifactError { AlgorithmusIgnotus,
+  DigestioMala, LongitudoMala }`, `causa(ArtifactError)`, and
+  `identitas(textus algorithmus, textus digestio, numerus longitudo) ->
+  IdentitasContenuti ⇥ ArtifactError`. The first row accepts only the
+  lower-case `sha-256` name, a 64-digit lower-case hexadecimal digest, and a
+  positive length. It contains no path, URL, reader, file handle, host/device
+  object, or payload.
+- `gradus:model/gguf_manifest` exports `CorpusGguf { octeti tabula, numerus
+  longitudo_artifacti, artifact.IdentitasContenuti identitas }`,
+  `MetadatumGguf { textus clavis, numerus typo, octeti valor_wire }`,
+  `LayoutGgml { Cognita { elementa_per_blockum, octeti_per_blockum,
+  longitudo_octetorum }, Ignota { typo } }`, `DescriptioTensorisGguf {
+  nomen, forma, typo_ggml, offset_relativum, elementa, layout }`, and
+  `ManifestumGguf { identitas, versio, concordatio, data_inceptum,
+  longitudo_artifacti, metadata, tensores }`.
+- Its operations are `parse(CorpusGguf) -> ManifestumGguf ⇥
+  GgufManifestError`, `metadatum(ManifestumGguf, textus) -> MetadatumGguf ⇥
+  GgufManifestError`, `textum(ManifestumGguf, textus) -> textus ⇥
+  GgufManifestError`, `numerum(ManifestumGguf, textus) -> numerus ⇥
+  GgufManifestError`, `tensor(ManifestumGguf, textus) ->
+  DescriptioTensorisGguf ⇥ GgufManifestError`, and
+  `layout(numerus typo_ggml, lista<numerus> forma) -> LayoutGgml ⇥
+  GgufManifestError`.
+- `GgufManifestError` is the only parser error surface. Its frozen variants
+  are `FormatMala`, `VersioIgnota`, `Truncata`, `WireMala`, `LimitesMala`,
+  `Superfluitas`, `ClavisDuplicata`, `TensorDuplicatum`, `OffsetMala`, and
+  `IdentitasMala`, each carrying `textus causa`; `causa(GgufManifestError)`
+  renders it. Unknown architecture names and raw GGML type ids are data, not
+  parser errors. `LayoutGgml.Ignota` is the explicit unresolved codec state;
+  an architecture adapter introduced after this unit owns typed unsupported
+  execution.
+- `gradus:model/gguf` remains the old one-row capsule authority through
+  GGUF-A1b. The new authority is only format parsing and is named
+  `gradus:model/gguf_manifest`; GGUF-A1c deletes the dual format parser while
+  migrating callers. A1a adds no forwarding import or compatibility facade.
 
 **Required behavior**:
 
@@ -156,21 +203,29 @@ tensor counts, offsets, and type distributions.
    complete header, metadata, and tensor table, plus caller-supplied total file
    length and content identity. The parser never accepts or retains the data
    region. A typed truncation result tells a source adapter that its corpus did
-   not contain the complete table.
+   not contain the complete table. `general.alignment`, when present, must be
+   a valid positive power-of-two UINT32 value. When absent, parsing uses the
+   GGUF default alignment of 32. The table end is rounded up with checked
+   arithmetic to obtain `data_inceptum`; a corpus may end at the table or
+   within its padding but must not contain a byte from the data region.
 2. Preserve every metadata entry with its GGUF value kind. Known scalar/text
    fields have typed accessors; arrays needed by tokenizer and architecture
    units remain preserved rather than discarded.
 3. Preserve every raw tensor name, shape, rank, logical element count, raw GGML
    type, and relative offset. A separate layout resolution step produces an
-   absolute byte range and padded span only when that GGML layout is known;
-   unknown layouts remain inspectable but are not materializable.
-4. Honor legal `general.alignment`; validate power-of-two alignment, monotonic
-   non-overlapping ranges, overflow, truncation, duplicate names, and file
-   bounds.
+   exact stored byte length only when that GGML layout is known; the parser
+   then derives its checked absolute range from `data_inceptum` and
+   `offset_relativum`. Unknown layouts remain inspectable but are not
+   materializable.
+4. Honor legal `general.alignment`; validate power-of-two alignment,
+   non-overlapping known ranges irrespective of tensor-table order, overflow,
+   truncation, duplicate names, and file bounds.
 5. Parse rank-3 expert tensors and unknown raw storage identifiers as
    inspectable descriptors. Do not claim a decoder or kernel for them.
-6. Separate `parse` from `admit`: valid unknown architectures parse, then fail
-   with a typed unsupported-architecture result if execution is requested.
+6. Separate `parse` from `admit`: A1a adds no admission or execution entry
+   point. Valid unknown architecture names parse as metadata. A later
+   architecture adapter must return a typed unsupported-architecture result
+   when admission or execution is requested.
 7. Do not edit the old capsule or its GGUF/Safetensors callers in this unit.
    The new parser is the replacement foundation, not a compatibility façade;
    GGUF-A1c owns the clean deletion/migration boundary.
@@ -184,6 +239,8 @@ and first divergence.
 
 - small synthetic `llama`, `qwen2`, and `qwen35moe` fixtures parse into the
   same artifact type;
+- one fixture omits `general.alignment` and resolves to 32; another supplies
+  a non-default legal alignment and proves the resulting padded data offset;
 - malformed/truncated/overflowing/overlapping fixtures fail with typed errors;
 - unsupported architecture and codec states are distinct from malformed GGUF;
 - changed-source checks and package-aware semantic analysis pass.
@@ -195,12 +252,22 @@ cd /Users/ianzepp/work/faberlang/worktrees/hand-1/gradus
 ./scripta/check-source
 env FABER_LIBRARY_HOME=/Users/ianzepp/work/faberlang/worktrees/hand-1 \
   FABER_BIN=/Users/ianzepp/work/faberlang/worktrees/hand-1/radix/target/debug/faber \
-  "$FABER_BIN" check --diagnostics .
-git diff --check -- src/model fixtures/gguf docs
+  ./scripta/check-compile
+env FABER_LIBRARY_HOME=/Users/ianzepp/work/faberlang/worktrees/hand-1 \
+  /Users/ianzepp/work/faberlang/worktrees/hand-1/radix/target/debug/faber \
+  check --diagnostics .
+git diff --check -- src/model/artifact.fab src/model/artifact.proba \
+  src/model/gguf_manifest.fab src/model/gguf_manifest.proba fixtures/gguf \
+  README.md docs/module-map.md docs/api-reference.md docs/diagnostics.md \
+  docs/factory/production-ml-library/pml0-symbol-inventory.md \
+  docs/factory/production-ml-library/pml0-support-matrix.md
 ```
 
-**Expected result**: `check-source` exits 0; `faber check` ends in `ok: .`;
-`git diff --check` is silent; all synthetic manifest/parser cases type-check.
+**Expected result**: `check-source` and `check-compile` exit 0; `faber check`
+ends in `ok: .`; `git diff --check` is silent; all synthetic
+manifest/parser cases type-check. A pre-existing failure in either required
+Gradus gate blocks closeout and must be repaired or routed as its own unit; it
+may not be hidden by substituting the direct `faber check` command.
 
 **Non-goals**: tokenization, tensor payload codecs, model assembly, inference,
 GPU work, Hosts work, Inferentia, or main-branch integration.
@@ -275,7 +342,7 @@ evidence. This unit is a cross-repo dependency, not an Inferentia task.
 
 ### GGUF-M1 — Hybrid Qwen35MoE/SSM Row
 
-Lower separately after GGUF-A1. The local `qwen35moe` files require MoE router
+Lower separately after GGUF-A1a. The local `qwen35moe` files require MoE router
 and expert dispatch plus hybrid SSM/attention semantics. Format parsing is part
 of A1; execution is not hidden inside the dense Qwen adapter.
 
