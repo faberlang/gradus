@@ -1,6 +1,6 @@
 # Campaign: Production ML Library
 
-**Status**: active — PML executed tier in progress: LIB-MIR landed (43c0102ba), PML4 executed-lane committed (04ba15f), lane test on last masked layers (rounding fixed; Absolute/Signum arm landed — math.signum surface + proba pins); PML5 executed tier queued
+**Status**: active — PML5-GGUF continuation; GGUF-A1a bounded parsing and GGUF-A1b guarded real-file inspection are implemented in the Hand lanes; GGUF-A1c is next
 **Created**: 2026-08-08
 **Mode**: routing artifact — draft/maintain; does not implement code directly
 **Control-plane repo**: `/Users/ianzepp/work/faberlang/gradus`
@@ -307,6 +307,14 @@ reject rows rather than silently ignored options.
 continuous batching, HTTP, or physical residency.
 **Batch posture**: split on cache mutation, sampling, and numerical oracles.
 **Lowers to**: `delivery` then `factory`.
+
+**General-inference continuation**:
+[`pml5-general-gguf-delivery.md`](pml5-general-gguf-delivery.md) corrects the
+one-row/one-block boundary through format-general GGUF artifacts, real
+tokenization, packed storage, complete dense Llama/Qwen models, integrated KV
+decode, and explicit native-quantized capability rows. It does not reopen the
+historical structural receipts or imply executable support for every GGUF
+architecture.
 
 ### PML6 — Production quality, performance, and release contract
 

@@ -1,8 +1,9 @@
 # Gradus Regression Corpus
 
-**Version**: `gradus-regression-corpus v1.0.0` (2026-08-11, PML6-U4)
+**Version**: `gradus-regression-corpus v1.2.0` (2026-08-12, GGUF-A1b)
 **Repo**: gradus. **Tier**: structural inventory.
-**Delivery**: `docs/factory/production-ml-library/pml6-delivery.md` §PML6-U4.
+**Delivery**: `docs/factory/production-ml-library/pml6-delivery.md` §PML6-U4;
+GGUF-A1b delivery in `pml5-general-gguf-delivery.md`.
 **Support rows**: `docs/factory/production-ml-library/pml0-support-matrix.md`
 (six admitted rows). **Tolerances**: `docs/numeric-tolerances.md`.
 **Benchmark method**: `docs/benchmark-method.md`.
@@ -10,7 +11,7 @@
 This document inventories the **admitted fixtures and proba pins** that
 form the Gradus regression corpus. The corpus **is** the co-located
 `src/**/*.proba` surface plus the committed fixtures under `fixtures/`
-and the fire-9 structural consumers — not a separate harness.
+and the named structural consumers — not a separate harness.
 
 **Structural green** means: `./scripta/check-source` and
 `./scripta/check-compile` exit 0, and the pin greps in §5 resolve.
@@ -25,8 +26,8 @@ closeout, never a dev-loop suite.
 | Layer | Path | Role |
 | --- | --- | --- |
 | Co-located package tests | `src/*.proba`, `src/model/*.proba` | Compile-level contract + oracle pins per module |
-| Model / tokenizer fixtures | `fixtures/safetensors/`, `fixtures/gguf/`, `fixtures/tokenizer/` | Legal fixtures + row-oracle docs for admitted format rows |
-| Exempla consumers | `exempla/gradient-seam`, `exempla/gradient-seam-nolib`, `exempla/training-loop-mlp`, `exempla/token-generation` | Public-surface consumers (fire-9 enumeration) |
+| Model / tokenizer fixtures | `fixtures/safetensors/`, `fixtures/gguf/`, `fixtures/tokenizer/` | Legal fixtures + row-oracle docs, including the three GGUF-A1a manifest fixtures |
+| Exempla consumers | `exempla/gradient-seam`, `exempla/gradient-seam-nolib`, `exempla/training-loop-mlp`, `exempla/token-generation`, `exempla/gguf-manifest`, `exempla/gguf-inspect` | Public-surface consumers plus the executed GGUF synthetic proof (40 PASS / 0 FAIL) and guarded six-file local inspection receipt |
 | Admission conformance | `tests/admission_conformance.fab` | Capsule admission composition check |
 
 Nested package dirs follow the Agents rule (≥2 modules); model package
@@ -36,7 +37,7 @@ tests live under `src/model/`.
 
 ## 2. Proba inventory (structural)
 
-Live co-located suites (24 files):
+Live co-located suites (26 files):
 
 | Suite | Module / surface | Pin class (summary) |
 | --- | --- | --- |
@@ -64,6 +65,8 @@ Live co-located suites (24 files):
 | `src/model/safetensors.proba` | Safetensors row | Fixture bytes + digest + tokenizer mismatch |
 | `src/model/gguf.proba` | GGUF row | Builder + digest + row facts |
 | `src/model/dequant.proba` | CPU dequant | Block layout pins |
+| `src/model/artifact.proba` | pathless content identity | Algorithm, digest, and positive-length validation |
+| `src/model/gguf_manifest.proba` | GGUF-A1b manifest and range seam | Unknown codec inspection, exact ranges, source failure, and checked tensor fragments |
 
 Every suite header states **EVIDENCE HONESTY (CTO Q2)**: structural /
 compile-level proof; executed value-identity deferred.
@@ -78,6 +81,10 @@ compile-level proof; executed value-identity deferred.
 | `fixtures/safetensors/safetensors-row-oracle.md` | (doc) | Row 1 oracle |
 | `fixtures/gguf/smollm2-360m-scaled-row.gguf` | `d89c9ef917158bfb5600f417020479499c6c042f728e9a29c8457a6b1a8f0974` | Row 2 — GGUF admission; also feeds Row 4 |
 | `fixtures/gguf/gguf-row-oracle.md` | (doc) | Row 2 oracle |
+| `fixtures/gguf/llama-manifest-v3.gguf` | `68a950bb21b44d93f52136cbfcf561796cdd8f1105edc35ddbab957a413dd38b` | GGUF-A1a default-alignment manifest fixture |
+| `fixtures/gguf/qwen2-manifest-v3.gguf` | `8c8fc4952a283bde5c21b8bad88f09ca2061649f536477ca40946ceeea404822` | GGUF-A1a non-default-alignment/rank-3 fixture |
+| `fixtures/gguf/qwen35moe-manifest-v3.gguf` | `0569265f0ff43f9de50ee067af182ef21cc1242ab6fd0fa940e6a9c4b7676d48` | GGUF-A1a unknown-type/rank-3 fixture |
+| `fixtures/gguf/general-manifest-oracle.md` | (doc) | GGUF-A1a manifest fixture oracle |
 | `fixtures/tokenizer/tokenizer-identity-oracle.md` | (doc; P1–P11 id lists) | Tokenizer identity for rows 1–2, 4, 6 |
 
 Generator helpers (`fixtures/*/gen_fixture.{fab,py}`) rebuild synthetic
@@ -160,12 +167,20 @@ cd /path/to/faberlang/gradus
 ./scripta/check-compile
 ```
 
-`check-compile` runs `faber check` on:
+`check-compile` runs package-aware `faber check` on:
 
-- the gradus library root (includes co-located `.proba` typecheck),
+- the gradus library source root,
 - `exempla/gradient-seam`,
 - `exempla/training-loop-mlp`,
-- `exempla/token-generation`.
+- `exempla/token-generation`,
+- `exempla/gguf-manifest`.
+- `exempla/gguf-inspect`.
+
+The GGUF package proof runs through package MIR with the hand-2 Radix binary.
+Its receipt exits 0 with 40 PASS lines and 0 FAIL lines across bounded
+synthetic parser/range cases. The separate real-file adapter inspected six
+operator-local GGUFs and fails if an inspection request enters tensor data.
+This is manifest/range evidence only, not tokenizer or inference execution.
 
 ### 5.2 Pin-consistency greps (U4)
 
@@ -195,7 +210,7 @@ test -f fixtures/gguf/smollm2-360m-scaled-row.gguf
 test -f fixtures/tokenizer/tokenizer-identity-oracle.md
 
 # Proba count stays the admitted co-located surface
-find src -name '*.proba' | wc -l   # expect 24 at this corpus version
+find src -name '*.proba' | wc -l   # expect 26 at this corpus version
 ```
 
 ### 5.3 Executed pass (auditor-owned; not claimed by this unit)
@@ -241,7 +256,7 @@ remain in the support matrix; this corpus does not re-admit them.
 
 ## 8. Versioning
 
-`gradus-regression-corpus v1.0.0`. Adding a suite, fixture, or named pin
+`gradus-regression-corpus v1.1.0`. Adding a suite, fixture, or named pin
 bumps this version. Removing or retargeting a named pin (§4) is a
 **major** event and must update the support matrix / compatibility
 policy in the same change set.

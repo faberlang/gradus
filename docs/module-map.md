@@ -9,6 +9,12 @@ One `.fab` file → one import path. Nested dirs for packages.
 
 ## Live modules (post-PML1–5 + correctness wave)
 
+The live tree has 27 modules and 618 declared functions. The GGUF-A1b surface
+has an executed 40-case synthetic package-MIR proof and guarded real-file
+inspection receipts for six operator-local GGUFs. Exact evidence and boundaries
+are recorded in [`exempla/gguf-manifest/README.md`](../exempla/gguf-manifest/README.md)
+and [`exempla/gguf-inspect/README.md`](../exempla/gguf-inspect/README.md).
+
 | Import | File | Role |
 | --- | --- | --- |
 | `gradus:dtype` | `src/dtype.fab` | Versioned dtype tag + cast/round/serialize (`dtype-schema-1.0.0`) |
@@ -26,7 +32,9 @@ One `.fab` file → one import path. Nested dirs for packages.
 | `gradus:train` | `src/train.fab` | Train steps, schedules, mode, RNG, dropout, checkpoint `Tabula` (PML4) |
 | `gradus:metrics` | `src/metrics.fab` | Defined metrics: `accuratezza`, `Metricum` (PML4) |
 | `gradus:data` | `src/data.fab` | Stub — batching/shuffling/tokenization declared future |
+| `gradus:model/artifact` | `src/model/artifact.fab` | Pathless content identity for bounded model artifacts (GGUF-A1a) |
 | `gradus:model/capsule` | `src/model/capsule.fab` | Admitted-model capsule — the typed identity handoff (PML2, C8) |
+| `gradus:model/gguf_manifest` | `src/model/gguf_manifest.fab` | Format-general GGUF v3 bounded-corpus parser plus pathless range inspection and checked tensor fragments (GGUF-A1b) |
 | `gradus:model/gguf` | `src/model/gguf.fab` | GGUF row admission → capsule (PML2) |
 | `gradus:model/safetensors` | `src/model/safetensors.fab` | Safetensors row admission → capsule (PML2) |
 | `gradus:model/dequant` | `src/model/dequant.fab` | CPU dequant of the admitted GGML block types (PML2) |
@@ -47,7 +55,8 @@ L4  Optimization        gradus:optimize
 L5  NN primitives       gradus:nn
 L6  Architecture blocks gradus:attention, gradus:transformer
 L7  Training            gradus:train, gradus:metrics, gradus:data
-PML2 Model admission    gradus:model/capsule, gradus:model/gguf,
+PML2 Model admission    gradus:model/artifact, gradus:model/capsule,
+                        gradus:model/gguf_manifest, gradus:model/gguf,
                         gradus:model/safetensors, gradus:model/dequant
 PML2 Tokenizer identity gradus:tokenizer
 PML5 Inference          gradus:decode, gradus:cache, gradus:sampling,

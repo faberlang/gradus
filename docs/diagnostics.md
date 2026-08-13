@@ -11,7 +11,7 @@
 - **Message** = the `textus causa` on the variant, rendered by `causa(e)`. Messages are locale-ready English. Dynamic suffixes (appended names, versions, counts) are written as a trailing `…` when the live source concatenates.
 - **Resolution** = the closed action that makes the call succeed. Gradus fails closed — no silent coercion.
 - **Reserved / mapped variants**: some variants exist for cross-module mapping or class coverage and have no direct `iace finge "…"` literal site; they still have stable codes. Mapped facades (e.g. `GradusError`, `TransformerError`) preserve the underlying causa text.
-- **Executed tier**: this map documents fail-closed identity on the compiled surface. Proba execution and exempla e2e runs remain on the FMIR lever (CTO8-1) until that gate opens — this document never claims executed runs.
+- **Executed tier**: this map documents fail-closed identity on the compiled surface. Focused `faber test` proba execution and broader inference exempla remain on the FMIR lever (CTO8-1); the separate GGUF-A1b synthetic and real-file inspection receipts are recorded in their exemplar READMEs and are not model-execution or inference claims.
 
 ## EOG identity — `TokenizerError.EogMala`
 
@@ -46,9 +46,11 @@ pinned row is space-prefix-free (add_space_prefix = false)
 | `gradus:loss` | `LossError` | 9 | `src/loss.fab` |
 | `gradus:math` | `MathError` | 11 | `src/math.fab` |
 | `gradus:metrics` | `MetricError` | 7 | `src/metrics.fab` |
+| `gradus:model/artifact` | `ArtifactError` | 3 | `src/model/artifact.fab` |
 | `gradus:model/capsule` | `AdmissionError` | 9 | `src/model/capsule.fab` |
 | `gradus:model/dequant` | `DequantError` | 4 | `src/model/dequant.fab` |
 | `gradus:model/gguf` | `GgufError` | 10 | `src/model/gguf.fab` |
+| `gradus:model/gguf_manifest` | `GgufManifestError` | 12 | `src/model/gguf_manifest.fab` |
 | `gradus:model/safetensors` | `SafetensorError` | 11 | `src/model/safetensors.fab` |
 | `gradus:nn` | `NnError` | 9 | `src/nn.fab` |
 | `gradus:optimize` | `OptimizeError` | 14 | `src/optimize.fab` |
@@ -61,7 +63,48 @@ pinned row is space-prefix-free (add_space_prefix = false)
 | `gradus:train` | `TrainError` | 10 | `src/train.fab` |
 | `gradus:transformer` | `TransformerError` | 12 | `src/transformer.fab` |
 
-**Total**: 193 public error codes across 24 error types.
+**Total**: 208 public error codes across 26 error types.
+
+## `gradus:model/artifact` — `ArtifactError`
+
+Pathless content identity for bounded model artifacts. The identity carries
+only the lower-case `sha-256` algorithm, a 64-digit lower-case hexadecimal
+digest, and a positive byte length. It never carries a path, URL, reader,
+file handle, mapping, host/device object, or payload.
+
+| Code | Live messages | Resolution |
+| --- | --- | --- |
+| `ArtifactError.AlgorithmusIgnotus` | `unknown content identity algorithm: …` | Supply the admitted lower-case `sha-256` name. |
+| `ArtifactError.DigestioMala` | `content digest must be 64 lower-case hexadecimal digits` | Supply the canonical 64-digit lower-case hexadecimal digest. |
+| `ArtifactError.LongitudoMala` | `content length must be positive` | Supply the positive artifact byte length. |
+
+## `gradus:model/gguf_manifest` — `GgufManifestError`
+
+GGUF-A1b's format-general, structural GGUF v3 parser. It accepts either a
+caller-supplied bounded table corpus or an operation-scoped exact-range
+function, and retains metadata wire values plus tensor descriptors. It does
+not admit an architecture or claim inference execution. Metadata and tensor
+directories are bounded at 4,096 entries, and retained metadata values and
+individual reads are bounded at 64 MiB. The package-MIR exemplar executes 40
+synthetic cases with 40 PASS / 0 FAIL. A guarded source adapter also inspected
+six operator-local real files, matched independent offsets/counts, and rejected
+any attempted read into tensor data. Exact receipts are in
+`exempla/gguf-manifest/README.md` and `exempla/gguf-inspect/README.md`.
+
+| Code | Class / when | Resolution |
+| --- | --- | --- |
+| `GgufManifestError.FormatMala` | GGUF magic is malformed. | Supply a GGUF file prefix beginning with `GGUF`. |
+| `GgufManifestError.VersioIgnota` | GGUF version is not v3. | Use a supported GGUF v3 artifact or a later parser unit. |
+| `GgufManifestError.Truncata` | The bounded corpus ends before a required field. | Supply the complete header, metadata, tensor table, and permitted alignment padding. |
+| `GgufManifestError.WireMala` | Value kind, UTF-8, boolean, array, or wire field is malformed. | Repair the GGUF wire encoding. |
+| `GgufManifestError.LimitesMala` | Count, rank, dimension, string, array, or checked arithmetic ceiling is exceeded. | Keep bounded counts and lengths within the documented parser ceilings. |
+| `GgufManifestError.Superfluitas` | The supplied corpus contains bytes from the tensor data region. | Stop the corpus at or before the checked data offset. |
+| `GgufManifestError.ClavisDuplicata` | A metadata key occurs more than once. | Keep metadata keys unique. |
+| `GgufManifestError.TensorDuplicatum` | A tensor name occurs more than once. | Keep tensor names unique. |
+| `GgufManifestError.OffsetMala` | A known GGML range is incomplete, overflowing, overlapping, or outside the artifact. | Correct tensor shapes, relative offsets, and artifact length. Unknown raw type IDs remain inspectable. |
+| `GgufManifestError.LayoutIgnota` | A tensor fragment was requested for an unknown raw GGML layout. | Add and verify that layout before requesting payload bytes. |
+| `GgufManifestError.IdentitasMala` | The pathless content identity does not match the supplied artifact length or canonical form. | Supply a valid `artifact.IdentitasContenuti`. |
+| `GgufManifestError.FonsMala` | A range source failed or returned a byte count different from the exact requested range. | Repair the caller-owned source adapter and return exactly the requested bytes. |
 
 ## `gradus:attention` — `AttentionError`
 
