@@ -1,0 +1,290 @@
+# Delivery: PML5-GGUF — General GGUF Inference Continuation
+
+**Status**: active — GGUF-A1 selected for implementation in `factory/hand-1`
+**Campaign**: [`CAMPAIGN.md`](CAMPAIGN.md), continuation after structural PML5
+**Umbrella**: Radix `gpu-production-readiness` units ML-01 through ML-07
+**Repo**: `gradus`
+**Integration stop**: `factory/merge` only; this delivery does not fast-forward
+any main branch
+
+## Outcome
+
+Turn the structural PML2/PML3/PML5 proofs into a real, device-neutral GGUF
+inference library. A valid GGUF v3 file is parsed into a format manifest without
+assuming its architecture is executable. Separately admitted architecture,
+tokenizer, storage, and execution rows fail closed until they have direct
+reference evidence.
+
+“General GGUF” means format-general inspection plus an extensible, explicit
+execution matrix. It does not mean that every architecture or quantization
+published on Hugging Face is immediately executable.
+
+## Why This Continuation Exists
+
+The historical phases remain true at their stated structural scope:
+
+- PML2 admits one scaled SmolLM2-shaped GGUF fixture with caller-supplied exact
+  counts. It discards metadata values and tensor descriptors after validation.
+- PML3 executes a fixed B=2, D=8 transformer fragment, not a complete Llama or
+  Qwen model.
+- PML5 composes one block, logical cache values, sampling, and bounded token
+  pins. It has no current full-model executed-token receipt.
+
+The live loader also fixes alignment at 32, assumes unpadded contiguous tensor
+payloads, rejects unknown metadata keys, accepts only ranks 1 and 2, stores the
+whole file in a `lista<u8>` capsule, and labels a mixed-storage artifact with
+one global quantization row. Those invariants do not fit real GGUF files or
+artifacts up to 35 GB.
+
+## Grounded Local Acceptance Corpus
+
+The corpus is operator-local evidence and is never committed into Gradus.
+
+| Artifact | Architecture | Tensor count | Initial disposition |
+| --- | --- | ---: | --- |
+| `SmolLM2-360M-Instruct-Q4_K_M.gguf` | `llama` | 290 | format + first dense reference row |
+| `Qwen2.5-0.5B-Instruct-Q4_K_M.gguf` | `qwen2` | 290 | format + first useful Qwen row |
+| `Qwen2.5-1.5B-Instruct-Q4_K_M.gguf` | `qwen2` | 338 | format now; execution after 0.5B |
+| `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` | `qwen35moe` | 753 | format now; hybrid MoE/SSM execution separate |
+| `heretic-UD-Q6_K.gguf` | `qwen35moe` | 733 | format now; hybrid MoE/SSM execution separate |
+| `ornith-1.0-35b-Q8_0.gguf` | `qwen35moe` | 733 | format now; hybrid MoE/SSM execution separate |
+
+The corpus proves why a filename or `general.file_type` cannot stand in for a
+per-tensor storage manifest. The files contain mixed F32 and quantized tensors;
+the hybrid rows also include rank-3 expert tensors and may include BF16 or
+Q5_K storage.
+
+## Ownership And Clean Boundary
+
+| Concern | Owner | Contract |
+| --- | --- | --- |
+| GGUF wire parsing, metadata, tensor directory, normalized model semantics | Gradus | pathless immutable descriptors |
+| Tokenizer behavior, model graph, logical KV state, sampling | Gradus | device-neutral values and operations |
+| Lowering, fusion, generated kernels, `DeviceProgram` | Radix | consumes admitted semantic operations |
+| File mapping, range reads, allocation, residency, upload, launch | Hosts/application | resolves bounded ranges against content identity |
+| CLI, HTTP, scheduling, streaming, deployment | Inferentia or later product | wraps accepted Gradus and execution APIs |
+
+The clean-break artifact boundary is:
+
+```text
+ParsedArtifact
+  ContentIdentity { algorithm, digest, byte_length }
+  GgufManifest { version, alignment, data_offset, metadata, tensors }
+
+TensorDescriptor
+  name
+  shape
+  element_count
+  raw_ggml_type
+  known block geometry when available
+  ByteRange { start, length }
+
+AdmittedModel
+  ParsedArtifact identity
+  supported ArchitectureSpec
+  supported TokenizerSpec
+  explicit execution capabilities
+
+TensorPayload
+  one validated ByteRange
+  bounded bytes for that range
+```
+
+No Gradus semantic value owns a path, URL, file descriptor, memory mapping,
+device handle, or whole-model byte list. Byte ranges are absolute offsets into
+the content identity. Unknown metadata and unknown raw GGML type identifiers
+remain inspectable; unsupported execution fails at the admission boundary.
+
+## Scope Matrix
+
+| In scope | Out of scope |
+| --- | --- |
+| GGUF v3 metadata and tensor-directory parsing | GGUF writers or converters |
+| Configurable alignment and padded tensor spans | Filesystem, mmap, HTTP, Hub downloads |
+| Per-tensor raw storage descriptors | Device allocation and kernel launch |
+| Real tokenizer encode/decode for admitted rows | Universal chat-template language |
+| Dense Llama/SmolLM and Qwen2 reference models | `qwen35moe` execution in the dense unit |
+| Full-layer prefill, decode, and KV semantics | Serving, scheduling, continuous batching |
+| CPU/reference logits and token receipts | Unqualified “all GGUF models work” claims |
+| Packed/native quantization capability contract | Silent full-model F32 expansion as GPU support |
+
+## Unit Graph
+
+```text
+GGUF-A0 inventory
+  -> GGUF-A1 artifact v2
+       -> GGUF-A2 tokenizer runtime
+       -> GGUF-A3 packed storage and reference materialization
+            -> GGUF-A4 dense Llama/Qwen primitives and full model
+                 -> GGUF-A5 per-layer KV prefill/decode
+                      -> GGUF-A6 real dense rows
+                           -> GGUF-A7 native quantized execution contract
+
+GGUF-A1 -> GGUF-M1 qwen35moe architecture delivery (separate continuation)
+```
+
+ML-01, the imported-library execution seam, is an acceptance dependency for
+executed claims. It does not block format work. Current package-aware `faber
+check` can validate Gradus; the full imported execution receipt remains a
+Radix/Faber gate.
+
+### GGUF-A0 — Inventory And Capability Rows
+
+**Done when**: every local file is recorded by content identity, architecture,
+format version, tokenizer identity, shape features, tensor storage types, and
+reference/native support state. Filenames are provenance only.
+
+**Evidence**: an independent reader and `llama.cpp` agree on header, metadata,
+tensor counts, offsets, and type distributions.
+
+### GGUF-A1 — GGUF Artifact V2
+
+**Selected first unit.**
+
+**Write scope**:
+
+- `src/model/gguf.fab`
+- `src/model/gguf.proba`
+- new pathless artifact/manifest module and its co-located `.proba`
+- `src/model/capsule.fab` and internal callers only as needed for the clean
+  replacement of capsule schema 1
+- `fixtures/gguf/` small synthetic wire fixtures and oracle notes
+- directly affected Gradus API/support documentation
+
+**Required behavior**:
+
+1. Parse GGUF v3 from caller-supplied content identity and an ephemeral bounded
+   range reader `(offset, length) -> octeti`. The parser requests only header,
+   metadata, and tensor-table ranges. It never requests the data region and
+   never retains the reader or the whole tensor payload.
+2. Preserve every metadata entry with its GGUF value kind. Known scalar/text
+   fields have typed accessors; arrays needed by tokenizer and architecture
+   units remain preserved rather than discarded.
+3. Preserve every raw tensor name, shape, rank, logical element count, raw GGML
+   type, and relative offset. A separate layout resolution step produces an
+   absolute byte range and padded span only when that GGML layout is known;
+   unknown layouts remain inspectable but are not materializable.
+4. Honor legal `general.alignment`; validate power-of-two alignment, monotonic
+   non-overlapping ranges, overflow, truncation, duplicate names, and file
+   bounds.
+5. Parse rank-3 expert tensors and unknown raw storage identifiers as
+   inspectable descriptors. Do not claim a decoder or kernel for them.
+6. Separate `parse` from `admit`: valid unknown architectures parse, then fail
+   with a typed unsupported-architecture result if execution is requested.
+7. Replace the byte-owning, path-carrying, one-global-quantization capsule
+   contract with schema 2 identity/manifest values. No compatibility façade is
+   required for internal pre-1.0 callers. Reject schema 1 at the new boundary.
+8. Add a bounded tensor-fragment operation that receives the range reader per
+   call, checks relative and absolute ranges, requires an exact-length return,
+   and never retains the source capability.
+
+**Red proof**: before implementation, add focused cases showing the existing
+row parser rejects or loses custom alignment, padded spans, rank 3, unknown
+metadata, mixed storage, and a Qwen architecture. Record the failing command
+and first divergence.
+
+**Green proof**:
+
+- small synthetic `llama`, `qwen2`, and `qwen35moe` fixtures parse into the
+  same artifact type;
+- malformed/truncated/overflowing/overlapping fixtures fail with typed errors;
+- a header/table-only inspection of all six local files reports the independent
+  reader's architecture and tensor counts without reading tensor payloads;
+- unsupported architecture and codec states are distinct from malformed GGUF;
+- changed-source checks and package-aware semantic analysis pass.
+
+**Commands** (from the Hand packet):
+
+```bash
+cd /Users/ianzepp/work/faberlang/worktrees/hand-1/gradus
+./scripta/check-source
+env FABER_LIBRARY_HOME=/Users/ianzepp/work/faberlang/worktrees/hand-1 \
+  FABER_BIN=/Users/ianzepp/work/faberlang/worktrees/hand-1/radix/target/debug/faber \
+  "$FABER_BIN" check --diagnostics .
+git diff --check -- src/model fixtures/gguf docs
+```
+
+**Expected result**: `check-source` exits 0; `faber check` ends in `ok: .`;
+`git diff --check` is silent; the inventory inspection reports `llama/290`,
+`qwen2/290`, `qwen2/338`, and `qwen35moe/753/733/733`.
+
+**Non-goals**: tokenization, tensor payload codecs, model assembly, inference,
+GPU work, Hosts work, Inferentia, or main-branch integration.
+
+### GGUF-A2 — Tokenizer Runtime
+
+Load vocab, token types, merges, pre-tokenizer identity, special-token policy,
+encode/decode, EOG behavior, and an explicitly supported chat-template subset
+from the parsed artifact. SmolLM and Qwen2 arbitrary-Unicode probes must match
+the pinned `llama.cpp`/Hugging Face token IDs and decoded text exactly.
+
+### GGUF-A3 — Packed Storage And Reference Materialization
+
+Separate logical dtype from physical storage. Bind one `TensorDescriptor` and
+validated `TensorPayload` at a time to dense or packed tensor views. Connect
+the existing CPU codecs and add only the layouts required by the selected
+dense rows. Mixed per-tensor storage remains explicit. Whole-model conversion
+to F32 is not an admitted native-execution path.
+
+### GGUF-A4 — Dense Llama/Qwen Full Model
+
+Implement RMSNorm, SiLU/SwiGLU, configurable RoPE, multi-head attention, GQA,
+tied/untied embeddings, final normalization, output projection, and a complete
+ordered layer stack. Assemble weights by explicit architecture adapters and
+canonical tensor names. A full SmolLM2 and Qwen2.5-0.5B prefill logit row must
+match an independent CPU oracle at the first-divergence boundary.
+
+### GGUF-A5 — Real Prefill, Decode, And KV State
+
+Replace the one-block cache proof with per-layer, per-KV-head state integrated
+into attention. Prefill and incremental decode must agree on logits. Reset,
+context rejection, cancellation, replay, and session identity are executed,
+not only structurally compiled.
+
+### GGUF-A6 — Multiple Dense Acceptance Rows
+
+The actual local SmolLM2 and Qwen2.5-0.5B files pass manifest, tokenizer,
+materialization, full-model, prefill/decode, and deterministic token receipts.
+Qwen2.5-1.5B follows only after the same adapter proves it without special-case
+constants. Unsupported families retain exact typed diagnostics.
+
+### GGUF-A7 — Native Quantized Execution Contract
+
+Gradus supplies packed layout and semantic operation requirements. Radix owns
+lowering/kernels; Hosts owns physical storage and execution. A qualified
+Q4_K_M path proves it does not expand the whole model to F32 and records
+correctness, memory, timing, backend identity, and fail-closed capability
+evidence. This unit is a cross-repo dependency, not an Inferentia task.
+
+### GGUF-M1 — Hybrid Qwen35MoE/SSM Row
+
+Lower separately after GGUF-A1. The local `qwen35moe` files require MoE router
+and expert dispatch plus hybrid SSM/attention semantics. Format parsing is part
+of A1; execution is not hidden inside the dense Qwen adapter.
+
+## Gates Before Inferentia
+
+Inferentia remains paused until all of these are current evidence:
+
+1. package-aware Gradus execution through the imported-library seam;
+2. generic inspection of an actual downloaded GGUF;
+3. real encode/decode and special-token behavior;
+4. mixed packed storage bound to tensor descriptors;
+5. full-model CPU/reference logits;
+6. persistent per-layer KV prefill/decode;
+7. at least SmolLM2 and one Qwen dense executed row;
+8. one persistent native GPU row with honest memory and correctness receipts.
+
+Once those gates pass, the server work is intentionally thin: model selection,
+request/config mapping, streaming, lifecycle, and operations around the Gradus
+library and accepted execution host.
+
+## Lane And Merge Procedure
+
+Implementation uses `/Users/ianzepp/work/faberlang/worktrees/hand-1/gradus` on
+`factory/hand-1`. Each unit commits exact paths and stops at its done oracle.
+Integration uses `/Users/ianzepp/work/faberlang/worktrees/merge/gradus` on
+`factory/merge`. This session may merge into `factory/merge`; it must not
+fast-forward Gradus, Radix, Faber, or Hosts main.
+
+No Tugboat or Vivi records are part of this delivery's execution process.
