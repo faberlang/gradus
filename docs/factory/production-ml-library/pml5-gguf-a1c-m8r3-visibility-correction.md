@@ -2,6 +2,11 @@
 
 **Planner**: planner-40. **Assignment**: task `6e4092f0` (Mind, 2026-08-13T21:49:15+00:00) —
 "lower A1C M8R3 math visibility correction".
+**Correction revision**: task `7dec37a5` (Mind, 2026-08-13T22:43:16+00:00) — "correct
+visibility closure authority and over-exposure" per audit task `03b94fb2` / report
+`b4adc3a4` (verdict residual/admitted; F1 = §3 authority overstatement, 11/96 symbols
+without cross-module reference). This revision removes the 11 uncited symbols
+(§3/§3a): the closure is now **85 `@ publica` lines across 15 gradus modules**.
 **Failure receipt**: merge task `c3ed38a6`; refusal report `88009081`; candidate `93b33d0`
 (`93b33d05f385aebd55f76a9d939a6a47e8c90bd8`, `factory/a1c-chain`); baseline/main `61aac27`
 (`61aac27d1b3c1c66882480ccea3b6d57f3a369fe`).
@@ -26,7 +31,9 @@ unit M8.
   the A1C M8 aggregate gate through CLOSE-01).
 - **Evaluator mode**: goal-check + delivery lowering of the M8R3 correction per task
   `6e4092f0` (reproduce the usage-driven closure; re-lower into one-logical-change units
-  by declaration module; add one aggregate candidate-refresh + M8R4 gate owned by merge).
+  by declaration module; add one aggregate candidate-refresh + M8R4 gate owned by merge);
+  revised per correction task `7dec37a5` (remove the 11 symbols audit F1 proved uncited
+  and correct the §3 authority claim — §3/§3a).
 - **Intended consumer**: delivery (Mind dispatches the visibility Hands, then re-runs
   A1C-M8R4 via merge).
 - **Verdict**: **READY**.
@@ -40,8 +47,9 @@ unit M8.
   which checks the *whole package plus all exempla*; the compiler stops at the first
   failing module wave, so the 21 reported SEM006 are only the first wave of a cascade.
   This delivery reproduces the **complete** normalized failure set under the authority
-  setup, proves the exact annotation closure that makes `check-compile` green (96 `@
-  publica` lines across 15 gradus modules, verified on a scratch copy of the candidate),
+  setup, proves the exact annotation closure that makes `check-compile` green (85 `@
+  publica` lines across 15 gradus modules — after audit F1 removal of 11 uncited
+  symbols, §3a — verified on a scratch copy of the candidate),
   and sizes one Hand unit per declaration module (the planner-38 VIS-S/D/T pattern).
   One cross-repo residual remains: the `gguf-inspect` exempla (part of `check-compile`)
   imports `norma:processus`/`norma:solum`, whose consumed symbols are also
@@ -99,18 +107,35 @@ cross-module-consumed non-underscore symbols (§3) and re-ran the full gate:
 - `./scripta/check-source`: exit 0.
 
 The closure therefore makes the gradus-side of the M8 gate green; the sole remaining
-gate failure is the `norma:*` dependency inside the `gguf-inspect` exempla (§10).
+gate failure is the `norma:*` dependency inside the `gguf-inspect` exempla (§10). The
+corrected closure is **85 `@ publica` lines across 15 modules** — the 96-line draft
+minus the 11 symbols audit F1 proved uncited (§3a). Variant re-runs with only the 85
+(corrected set) are gate-identical to the full-96 run (library + four gradus exempla
+exit 0, zero SEM006; `gguf-inspect` = the same 3 `norma:*` only).
 
-## 3. Usage-driven declaration set — 96 `@ publica` annotations across 15 gradus modules
+## 3. Usage-driven declaration set — 85 `@ publica` annotations across 15 gradus modules
 
-Verified statically on candidate `93b33d0` (baseline public set subtracted): every symbol
-below is consumed cross-module by a gradus library or exempla file, carries **no**
-`@ publica` on the baseline/candidate, and is **not** `_`-prefixed (all `_`-helpers stay
-private). `@ publica` is inserted as a one-line annotation immediately above the
-top-level declaration (column 0), per the VIS-04/VIS-05/VIS-S/D/T convention. Line
-numbers are from candidate `93b33d0` (all non-model files identical to `61aac27`;
-`model/gguf_manifest.fab` differs only by the A1C-chain publica already landed — the 6
-annotations below are the ones still missing).
+Verified on candidate `93b33d0` (baseline public set subtracted) against the audit
+finding F1 (report `b4adc3a4`): the corrected set contains **only symbols with exact
+cross-module consumption authority**. Of the original 96-symbol draft, **11 symbols are
+removed** because the audit proved they have no cross-module reference and targeted
+compiler simulation (§3a) proved they are not compiler-transitive required either:
+
+- **6 gratuitous standalone functions** (removed, no consumer, no transitive
+  justification): `optimize.statum_aequus`, `optimize.sgd_aequus`,
+  `optimize.serializa_statum`, `optimize.deserializa_statum`, `metrics.accuratezza`,
+  `metrics.causa`.
+- **5 error-type / formatter symbols** (removed — not compiler-transitive required):
+  `decode.DecodeError`, `generation.GeneratioError`, `gradus.GradusError`,
+  `transformer.TransformerError`, `gradus.causa`.
+
+Every remaining symbol below is consumed cross-module by a gradus library or exempla
+file, carries **no** `@ publica` on the baseline/candidate, and is **not** `_`-prefixed
+(all `_`-helpers stay private). `@ publica` is inserted as a one-line annotation
+immediately above the top-level declaration (column 0), per the VIS-04/VIS-05/VIS-S/D/T
+convention. Line numbers are from candidate `93b33d0` (all non-model files identical to
+`61aac27`; `model/gguf_manifest.fab` differs only by the A1C-chain publica already
+landed — the 6 annotations below are the ones still missing).
 
 ### V-MATH — `src/math.fab` (4)
 
@@ -209,11 +234,10 @@ Consumer: transformer.fab.
 
 Consumers: decode.fab, generation.fab, exempla/token-generation.
 
-### V-DEC — `src/decode.fab` (13)
+### V-DEC — `src/decode.fab` (12)
 
 | Line | Declaration |
 | --- | --- |
-| 103 | `discretio DecodeError {` |
 | 117 | `functio causa(DecodeError e) → textus {` |
 | 142 | `genus Pondera {` |
 | 184 | `functio structa_pondera(` |
@@ -229,11 +253,10 @@ Consumers: decode.fab, generation.fab, exempla/token-generation.
 
 Consumers: generation.fab, exempla/token-generation.
 
-### V-GEN — `src/generation.fab` (9)
+### V-GEN — `src/generation.fab` (8)
 
 | Line | Declaration |
 | --- | --- |
-| 88 | `discretio GeneratioError {` |
 | 117 | `genus GeneratioConfigura {` |
 | 193 | `functio structa_generatio(` |
 | 284 | `functio configura(GeneratioConfigura g) → sampling.Configura ⇥ GeneratioError {` |
@@ -245,32 +268,26 @@ Consumers: generation.fab, exempla/token-generation.
 
 Consumer: exempla/token-generation.
 
-### V-OPT — `src/optimize.fab` (13)
+### V-OPT — `src/optimize.fab` (9)
 
 | Line | Declaration |
 | --- | --- |
 | 189 | `genus SgdStatum {` |
-| 230 | `functio statum_aequus(SgdStatum a, SgdStatum b) → bivalens {` |
 | 258 | `functio structa(textus nomen, textus possessor, numerus generatio, f32 lentus) → SgdStatum ⇥ OptimizeError {` |
 | 267 | `genus Sgd {` |
-| 294 | `functio sgd_aequus(Sgd a, Sgd b) → bivalens {` |
 | 309 | `functio sgd_vacuum() → Sgd {` |
 | 314 | `functio adscisco(Sgd o, SgdStatum s) → Sgd ⇥ OptimizeError {` |
 | 328 | `genus Passus {` |
 | 350 | `functio passus(SgdStatum s, parametrum.Parametrum p, gradient.Gradiente g) → Passus ⇥ OptimizeError {` |
-| 398 | `functio serializa_statum(SgdStatum s) → textus {` |
-| 403 | `functio deserializa_statum(textus wire) → SgdStatum ⇥ OptimizeError {` |
 | 465 | `functio serializa(Sgd o) → textus {` |
 | 473 | `functio deserializa(textus wire) → Sgd ⇥ OptimizeError {` |
 
 Consumer: exempla/training-loop-mlp.
 
-### V-GRADUS — `src/gradus.fab` (5)
+### V-GRADUS — `src/gradus.fab` (3)
 
 | Line | Declaration |
 | --- | --- |
-| 89 | `discretio GradusError {` |
-| 100 | `functio causa(GradusError e) → textus {` |
 | 174 | `functio forward_mlp(` |
 | 186 | `functio nil() → vacuum {` |
 | 205 | `functio forward_mlp_loss(` |
@@ -279,12 +296,10 @@ Consumer: exempla/training-loop-mlp. (`forward_mlp_loss_backward` is compiler-ge
 from the annotated `forward_mlp_loss`; verified green in the exempla with only these
 annotations.)
 
-### V-METRICS — `src/metrics.fab` (4)
+### V-METRICS — `src/metrics.fab` (2)
 
 | Line | Declaration |
 | --- | --- |
-| 64 | `functio causa(MetricError e) → textus {` |
-| 85 | `functio accuratezza(tensor.Tensor prediction, tensor.Tensor target) → f32 ⇥ MetricError {` |
 | 155 | `genus Metricum {` |
 | 172 | `functio metricum(` |
 
@@ -298,11 +313,10 @@ Consumer: exempla/training-loop-mlp.
 
 Consumer: exempla/token-generation.
 
-### V-TRANS — `src/transformer.fab` (3)
+### V-TRANS — `src/transformer.fab` (2)
 
 | Line | Declaration |
 | --- | --- |
-| 164 | `discretio TransformerError {` |
 | 179 | `functio causa(TransformerError e) → textus {` |
 | 334 | `functio transformer_block(` |
 
@@ -324,21 +338,77 @@ Consumers: exempla/gguf-manifest, exempla/gguf-inspect. (The A1C chain already l
 `causa`, `metadatum`, `textum`, `numerum`, `inspice` — those stay; these six are the
 remaining consumers' symbols.)
 
+### 3a. Targeted compiler evidence — why the 11 disputed symbols are removed
+
+Audit F1 (report `b4adc3a4`) flagged 11 of the 96 drafted symbols as lacking any
+cross-module reference: 6 standalone functions ("likely gratuitous") and 5 error
+types/formatters ("possibly compiler-transitive, unverifiable statically"). The five
+compiler-transitive candidates are settled here by targeted scratch compilation on the
+candidate `93b33d0` tree (authority setup §2; faber 1.6.0 from radix `b6d6e17c8`). No
+product tree was edited and no lane gate was run — only scratch copies were annotated and
+`faber check` invoked on the library and each gradus exemplum.
+
+**Scratch variants (annotation set only; source otherwise byte-identical to the
+candidate):**
+
+| Variant | Set | Library + 4 gradus exempla | `gguf-inspect` |
+| --- | --- | --- | --- |
+| A `all` | original 96 | exit 0, zero SEM006 | exit 1, the 3 known `norma:*` SEM006 only |
+| B `no_standalone` | 90 (drop the 6 standalone functions) | exit 0, zero SEM006 | exit 1, same 3 `norma:*` only |
+| C `no_errortypes` | 91 (drop the 5 error-type symbols) | exit 0, zero SEM006 | exit 1, same 3 `norma:*` only |
+| D `no_disputed` | 85 (drop all 11) | exit 0, zero SEM006 | exit 1, same 3 `norma:*` only |
+
+**Finding.** The compiler requires **none** of the 11 disputed symbols. Variants B–D are
+gate-identical to A: zero SEM006 on the gradus library and all four non-norma gradus
+exempla, and the `gguf-inspect` exemplum fails only on the same three cross-repo
+`norma:*` symbols (Q1). The 5 error types are therefore **not** compiler-transitive
+required — Faber's cross-module error flow (returned via `⇥`, caught via `capta`/
+propagation) never names them across modules in the compiled consumers. The 6 standalone
+functions have no call site in the gate surface (`metricae.accuratezza`'s only bare-name
+hits in library/exempla code are the `Metricum` genus method of the same name and a local
+parameter in `metricum`, not calls to the free function; `optimize.serializa_statum`/
+`deserializa_statum` are never invoked by `serializa`/`deserializa` at compile-reachable
+sites in library or exempla code), so their exposure is the exact accidental public-API
+expansion audit F1 targeted. Per task `7dec37a5` instructions 2–3, all 11 are **removed**
+from the implementation units. No explicit API-policy authority (e.g.
+`docs/api-shape-policy.md`) names any of them as required public surface.
+
+**Proba nuance (audit F1 scan limit, recorded for re-audit).** F1's "0 cross-module
+refs" claim was computed over `.fab` files only; the co-located `.proba` test files do
+refer to some of these symbols (`optimize.proba` calls `serializa_statum`/
+`deserializa_statum`/`statum_aequus`/`sgd_aequus`; `metrics.proba` calls
+`metricae.accuratezza`/`metricae.causa`; `gradus.proba` calls `gradus.causa`). This does
+**not** change the removal decision: (1) `check-compile` — the M8 gate G runs — never
+compiles proba files (0 references in the script), and `faber test` is provider-blocked,
+so the proba surface is outside the gate authority; (2) the pristine candidate's proba
+surface is **already broken** independently of this delivery (e.g. `optimize.proba` has
+90 SEM006 on the unannotated candidate) because proba files also reference symbols outside
+the 85/96-set entirely (`gradient.Gradientes`, `math.casta`, `loss.mse`); exposing just
+these 11 would not make proba green. A separate proba-surface closure (annotating the
+full proba-referenced set) is out of scope here and recorded as a residual (§10).
+
+**Completeness cross-check.** Variant D (the corrected 85-symbol set) still makes the
+gradus-side gate green — dropping the 11 does not under-close the closure. Each of the
+85 remaining symbols is cross-module consumed by at least one gradus library file or
+gradus exemplum (verified per-module against consumers in §3).
+
 ## 4. Non-goals, preserved privacy, ripple
 
 - **Preserved `@ privata` / `_`-prefixed helpers (no blanket sweep)**: every `_`-prefixed
   function in the 15 modules stays private (e.g. `math._forma_broadcast`,
   `_quantitas_valid`, `_index_broadcast`, `_index_axis`, `_coordinata`, `_planus_axis`,
   `_typo_par`, `_typus_ex_nomine`; `train`/`nn`/`attention`/`sampling`/`decode`/
-  `generation`/`optimize`/`gguf_manifest` `_*` helpers). Only the 96 top-level names in
+  `generation`/`optimize`/`gguf_manifest` `_*` helpers). Only the 85 top-level names in
   §3 are annotated.
 - **No other files edited** by the 15 units: no `.proba`, no `docs/`, no `scripta/`, no
   `tests/`, no other repo. Each unit edits exactly its one `src/*.fab`.
 - **Zero inventory/doc ripple (verified)**: `scripta/inventory-public-symbols` counts
   `functio ` declaration lines — annotation lines change no count (total 582 on both
   baseline and the annotated scratch); its coverage gate requires every non-`_` name to
-  appear in `docs/api-reference.md`, and all 96 names are already documented (spot-verified
-  on baseline for representative names across all 15 modules). No M5/M6-style follow-up.
+  appear in `docs/api-reference.md`, and all 85 names are already documented (spot-verified
+  on baseline for representative names across all 15 modules; the 11 removed names remain
+  documented as module-private surface — documentation is not an exposure authority). No
+  M5/M6-style follow-up.
 - **No semantic change**: `@ publica` on an already cross-module-consumed declaration
   changes visibility only; module-private semantics are preserved for everything not
   annotated.
@@ -358,17 +428,17 @@ factory/merge (61aac27)
   ├─ V-NN      nn.fab          @ publica ×4
   ├─ V-ATTN    attention.fab   @ publica ×4
   ├─ V-SAMP    sampling.fab    @ publica ×7
-  ├─ V-DEC     decode.fab      @ publica ×13
-  ├─ V-GEN     generation.fab  @ publica ×9
-  ├─ V-OPT     optimize.fab    @ publica ×13
-  ├─ V-GRADUS  gradus.fab      @ publica ×5
-  ├─ V-METRICS metrics.fab     @ publica ×4
+  ├─ V-DEC     decode.fab      @ publica ×12
+  ├─ V-GEN     generation.fab  @ publica ×8
+  ├─ V-OPT     optimize.fab    @ publica ×9
+  ├─ V-GRADUS  gradus.fab      @ publica ×3
+  ├─ V-METRICS metrics.fab     @ publica ×2
   ├─ V-TOK     tokenizer.fab   @ publica ×1
-  ├─ V-TRANS   transformer.fab @ publica ×3
+  ├─ V-TRANS   transformer.fab @ publica ×2
   └─ V-GGUFM   model/gguf_manifest.fab @ publica ×6
         │  (each merges to factory/merge individually — additive annotation, cannot break)
         ▼
-factory/merge SEM006-green on the 96-symbol closure
+factory/merge SEM006-green on the 85-symbol closure
         │
         ▼
 G  candidate-refresh + A1C-M8R4 aggregate gate (merge-owned; §7)
@@ -408,7 +478,7 @@ still appear — record and route, do not fix).
 | `depends_on` | base `factory/merge` `61aac27` |
 | `parallel_with` | the other 14 units |
 | `integrable` | **yes** (additive annotation; merges to `factory/merge` alone) |
-| `risk` | negligible — behavior identical; all 96 names already documented |
+| `risk` | negligible — behavior identical; all 85 names already documented |
 
 Per-unit importer sanity targets (first consumer that emitted for that unit's symbols):
 V-MATH → `faber check src/attention.fab` and `src/nn.fab`; V-PARAM/V-GRAD →
@@ -456,7 +526,7 @@ This delivery must fail review if any child:
 - exceeds 4k `est_work_tokens` or touches more than its one primary file;
 - adds any annotation beyond the §3 declaration list, or removes/weakens any `_`-helper;
 - omits any §3 symbol for its module (the "no missing member of the diagnostic class"
-  claim is a hard criterion — the 96-symbol closure is the verified gate surface);
+  claim is a hard criterion — the 85-symbol closure is the verified gate surface);
 - runs a broad package/`check-compile`/`inventory-public-symbols` gate (only G may);
 - edits docs, `.proba`, `scripta/`, `tests/`, or another repo (each unit's forbidden
   scope);
@@ -481,6 +551,16 @@ This delivery must fail review if any child:
   SEM006 there (verified on `93b33d0`), so nothing is routed to them from this delivery.
 - **`inventory-public-symbols` baseline** (total 582): unchanged (§4) — no re-baseline
   unit needed.
+- **Co-located proba test surface** (outside the M8 gate; pre-existing broken,
+  not a regression): the `src/*.proba` package tests reference a set of symbols larger
+  than the 85-symbol closure — including several of the 11 removed here and additional
+  symbols outside the set entirely (`gradient.Gradientes`, `math.casta`, `loss.mse`,
+  …). `check-compile` never compiles proba files and `faber test` is provider-blocked,
+  so this surface is not part of gate G; the pristine candidate's proba files already
+  fail to compile independently of this delivery (e.g. `optimize.proba` shows 90 SEM006
+  on the unannotated candidate). **Default route**: a separate proba-surface closure
+  (annotating the full proba-referenced set) if/when the test surface becomes a gate;
+  not this delivery's scope, and it cannot be closed by the 11 removed symbols alone.
 
 ## 11. Open questions for Mind
 
@@ -497,7 +577,10 @@ This delivery must fail review if any child:
 
 This lowering corrects the M8R3 report's root cause (four provider modules, not math.fab
 alone; a cascade closure, not the first wave) and lowers the verified complete gradus
-closure. It does not fix the `norma:*` cross-repo dependency (that is norma's lane, Q1).
-It does not claim the A1C chain is complete: G re-runs the refused M8R4 gate; LIB-01
+closure. It also implements audit F1 (report `b4adc3a4`): the §3 authority claim is
+corrected to the exact cross-module-consumed set, and the 11 symbols without any
+cross-module or compiler-transitive justification are removed from the implementation
+units (§3a). It does not fix the `norma:*` cross-repo dependency (that is norma's lane,
+Q1). It does not claim the A1C chain is complete: G re-runs the refused M8R4 gate; LIB-01
 completion still requires the A1C M8 closeout and the campaign's full LIB/REF/MODEL/EXEC/CAP
 chain through CLOSE-01. Chain completion is not campaign completion.
