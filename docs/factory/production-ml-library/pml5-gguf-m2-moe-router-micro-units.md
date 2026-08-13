@@ -13,11 +13,14 @@ artifact, or transcript read).
 (row `MODEL-02` — "Implement MoE router and expert execution").
 **Delivery authority**: [`pml5-general-gguf-delivery.md`](pml5-general-gguf-delivery.md)
 §GGUF-M2.
-**Predecessors**: MODEL-01 (GGUF-M1 admission chain), transitively LIB-03
-(GGUF-A3 union codec set + windowed `VisumTensoris`/`materializa_slicem`
-surface) and REF-01 (GGUF-A4 dense primitives — `silu` hunk-serialization) —
-**the whole MODEL-02 chain dispatches only after the MODEL-01 aggregate gate
-(G1) lands**, which itself lands after the LIB-03 and REF-01 aggregate gates.
+**Predecessors**: MODEL-01 (GGUF-M1 admission chain) — **the whole MODEL-02
+chain dispatches only after the MODEL-01 aggregate gate (G1) lands**, which
+lands after the **LIB-02 + LIB-03** aggregate gates **only** (campaign
+dependency graph; REF-01 is a sibling of MODEL-01, not a predecessor, and
+does not gate its dispatch). MODEL-02 also consumes LIB-03's windowed
+`VisumTensoris`/`materializa_slicem` surface (codec set + windowed reads) and
+resolves A1's `silu` against the sibling REF-01 (GGUF-A4 dense primitives) by
+consume-or-add — neither is a MODEL-01/MODEL-02 dispatch gate.
 **Repo baselines**: Gradus `1462cd8` (lane tip, tree clean — verified; equals
 `factory/merge` HEAD); Radix `b6d6e17c8`; Hosts `57d659d`; Faber `1fb6cc9`.
 Oracle tool `llama-tokenize`/`llama-gguf` 10150 (`dee2a846b`) live on this
@@ -57,11 +60,14 @@ host.
   `gen_moe_*` files. Every split surface is locatable and each micro-unit has
   exactly one behavioral outcome.
 - **Blocking gaps**: none for the split itself. Dispatch serialization: the
-  first dispatchable units base on `factory/merge` **after the MODEL-01
-  aggregate gate lands** (which requires the LIB-03 and REF-01 aggregate gates
-  per the MODEL-01 chain's own dispatch serialization). This artifact is
-  lowered now so the units are implementation-ready when those receipts
-  arrive; it does not claim predecessor completion.
+  MODEL-01 aggregate gate lands after the **LIB-02 + LIB-03** aggregate gates
+  only (REF-01 is a sibling, not a MODEL-01 predecessor); **A1 is
+  independently eligible before MODEL-01** (disjoint `src/nn.fab`/`.proba`,
+  silu consume-or-add against the sibling REF-01 only), while the remaining
+  first-wave units (A2 ∥ B1) base on `factory/merge` **after the MODEL-01
+  aggregate gate lands**. This artifact is lowered now so the units are
+  implementation-ready when those receipts arrive; it does not claim
+  predecessor completion.
 
 ## 2. Interpreted scope (frozen, verbatim from the cited plan)
 
@@ -327,7 +333,7 @@ units (A2/A3 are the fixture exceptions at 2–3; C2 is the docs exception at
 child gate. G1 is the only integration-capable unit.
 
 ```text
-MODEL-01 (GGUF-M1 aggregate gate lands on factory/merge; LIB-03 + REF-01 gates landed)
+MODEL-01 (GGUF-M1 aggregate gate lands on factory/merge — after LIB-02 + LIB-03 gates only; REF-01 is a sibling; A1 silu eligible before this gate)
   ├─ A1  silu public primitive (nn.fab)           [∥ A2, B1]
   ├─ A2  probe vectors + synthetic fixtures       [∥ A1, B1]
   │    └─ A3  goldens generator + committed goldens [after A2; ∥ B2]
@@ -363,8 +369,8 @@ C1/C2 run parallel after B4. Peak live Hands: 3.
 | `done_when` | (a) public `silu` row present (or REF-01's consumed and the consumed revision recorded); (b) scalar + tensor proba pins pass; (c) no duplicate row; (d) narrow module proof green |
 | `est_work_tokens` | 3–5k. `est_basis`: pilot — one additive nn activation row |
 | `tool_latency` | low — single-file `faber check`/`faber test` |
-| `depends_on` | MODEL-01 aggregate gate landed on `factory/merge` (base); REF-01 nn-gate recheck for silu consumption |
-| `parallel_with` | A2, B1 (disjoint files) |
+| `depends_on` | silu consume-or-add resolution against sibling REF-01 (GGUF-A4 nn rows); **independently eligible BEFORE the MODEL-01 aggregate gate** — disjoint `src/nn.fab`/`.proba`, no MODEL-01 admission fact read; may dispatch in parallel with MODEL-01's own first units |
+| `parallel_with` | A2, B1 (disjoint files); MODEL-01's own first units (sibling chain) |
 | `non_integrable` | **YES — blocked.** Changes the `nn` public-symbol count (inventory + zombie-doc coverage) and the module-map row; landing alone breaks repo gates. Only G1 merges. |
 | `risk` | low-medium — the REF-01 hunk-serialization is a recheck, not a block: consume-or-add recorded at the boundary |
 | `test_owner` | A1 hand; proof run once |
@@ -572,7 +578,7 @@ C1/C2 run parallel after B4. Peak live Hands: 3.
 ## 5. Dependency and parallelism map
 
 ```text
-factory/merge (post MODEL-01 aggregate gate; LIB-03 + REF-01 gates landed)
+factory/merge (post MODEL-01 aggregate gate — after LIB-02 + LIB-03 gates only; REF-01 is a sibling; A1 eligible before this gate)
   ├─ A1  silu public primitive (nn.fab)           [∥ A2, B1]
   ├─ A2  probe vectors + synthetic fixtures       [∥ A1, B1]
   │    └─ A3  goldens generator + committed goldens [after A2; ∥ B2]
@@ -586,12 +592,14 @@ factory/merge (post MODEL-01 aggregate gate; LIB-03 + REF-01 gates landed)
                                 └─ G1  aggregate gate → factory/merge
 ```
 
-- **Maximum safe parallelism**: at the start, A1, A2, and B1 run in parallel
-  (disjoint files: `src/nn.fab`, `fixtures/gguf/`, `src/model/moe.fab`).
-  Then A3 and B2 run in parallel (disjoint files) after A2. Then the
-  B3 → B4 module leg serializes on `src/model/moe.fab` (one new surface — no
-  safe parallelism on the same file). After B4, C1 and C2 run in parallel
-  (disjoint files). Peak live Hands: 3.
+- **Maximum safe parallelism**: A1 is eligible **before** the MODEL-01 gate
+  (disjoint `src/nn.fab`, silu consume-or-add vs sibling REF-01 only) and may
+  run in parallel with MODEL-01's own first units. Once the MODEL-01 gate
+  lands, A2 and B1 run in parallel (disjoint files: `fixtures/gguf/`,
+  `src/model/moe.fab`). Then A3 and B2 run in parallel (disjoint files) after
+  A2. Then the B3 → B4 module leg serializes on `src/model/moe.fab` (one new
+  surface — no safe parallelism on the same file). After B4, C1 and C2 run in
+  parallel (disjoint files). Peak live Hands: 3.
 - **Branch protocol**: every A1–C3 unit commits on its own `factory/<lane>`
   branch, based on the branch indicated in `depends_on`. Each commit message
   is marked **`non-integrable (MODEL-02 chain)`**. B4's base is B3's branch;
@@ -624,25 +632,30 @@ atomicity**, not a single-task shape:
 ## 7. Dispatch serialization (first eligible frontier after MODEL-01)
 
 Per the assignment's authority — "report first eligible frontier after
-MODEL-01" — and the campaign dependency table (MODEL-02 depends on MODEL-01):
+MODEL-01" — and the corrected admitted MODEL-01 (c69d6a7) plus the campaign
+dependency table (MODEL-02 depends on MODEL-01; MODEL-01 depends on LIB-02 +
+LIB-03; REF-01 is a sibling of MODEL-01):
 
-1. **MODEL-01 (GGUF-M1) chain** lands its aggregate gate on `factory/merge`.
-   Per the MODEL-01 micro-unit doc's own dispatch serialization, that gate
-   lands only after the **LIB-03 (GGUF-A3)** and **REF-01 (GGUF-A4)**
-   aggregate gates, so all three surfaces (admission, windowed
-   `VisumTensoris`/codec set, nn `silu` hunk) are live before this chain
-   dispatches.
-2. **First eligible frontier after MODEL-01** = **A1 ∥ A2 ∥ B1** (three
-   parallel units on disjoint files). A1 consumes-or-adds `silu` against the
-   landed REF-01 nn rows; A2 commits the probe corpus; B1 freezes the module
-   type/error contract against the landed admission + tensor_view surfaces.
-3. Then **A3 ∥ B2** (after A2); then **B3** (after B2 + A1 + A3); then **B4**
+1. **MODEL-01 (GGUF-M1) chain** lands its aggregate gate on `factory/merge`
+   **after the LIB-02 + LIB-03 aggregate gates only** (campaign dependency
+   authority; REF-01 is a sibling, not a MODEL-01 predecessor, and never
+   gates its dispatch).
+2. **A1 is independently eligible BEFORE the MODEL-01 gate** — `silu` in
+   `src/nn.fab`/`.proba` reads no MODEL-01 admission fact; the only coupling
+   is the silu consume-or-add resolution against the **sibling REF-01** (nn
+   rows). A1 may dispatch in parallel with MODEL-01's own first units, not
+   behind its gate.
+3. **First eligible frontier after MODEL-01** = **A2 ∥ B1** (two parallel
+   units on disjoint files). A2 commits the probe corpus; B1 freezes the
+   module type/error contract against the landed admission + tensor_view
+   surfaces.
+4. Then **A3 ∥ B2** (after A2); then **B3** (after B2 + A1 + A3); then **B4**
    (after B3 + A3); then **C1 ∥ C2** (after B4); then **C3** (after C1 + C2);
    then **G1** (last).
-4. MODEL-02 units touch **no** MODEL-01/LIB-03/REF-01 surface beyond
+5. MODEL-02 units touch **no** MODEL-01/LIB-03/REF-01 surface beyond
    preservation: `qwen35moe.fab` is read-only; `tensor_view` is consumed
    through its landed surface; `silu` is consumed-or-added with a recorded
-   revision.
+   revision against the sibling REF-01.
 
 ## 8. Red oracle (review fail conditions)
 
@@ -692,13 +705,13 @@ Nothing below is narrowed, deferred, made optional, or moved outside the
 campaign by this re-split:
 
 ```text
-LIB-01 (A1C chain) → LIB-02 + LIB-03 → REF-01
-  → MODEL-01 → MODEL-02 (this chain) + MODEL-03 (SSM/attention)
-  → MODEL-04 (full-model reference inference)
-  → EXEC-01 (Faber package plan) + EXEC-02 (packed native kernels)
-  → EXEC-03 (persistent resident sessions)
-  → CAP-01 (Metal) + CAP-02 (CUDA)
-  → CLOSE-01 (reconcile + independent audit)
+LIB-01 (A1C chain) → LIB-02 + LIB-03 → REF-01 (dense reference rungs)
+                                 → MODEL-01 → MODEL-02 (this chain) + MODEL-03 (SSM/attention)
+                                      → MODEL-04 (full-model reference inference)
+                                      → EXEC-01 (Faber package plan) + EXEC-02 (packed native kernels)
+                                      → EXEC-03 (persistent resident sessions)
+                                      → CAP-01 (Metal) + CAP-02 (CUDA)
+                                      → CLOSE-01 (reconcile + independent audit)
 ```
 
 - GGUF graph: `M1 → M2 ‖ M3`; `M2 + M3 → M4` (full-model reference inference
@@ -739,6 +752,13 @@ LIB-01 (A1C chain) → LIB-02 + LIB-03 → REF-01
   risk, test_owner (§4).
 - Red oracle table checked for every child (§8).
 - `git diff --check` on this artifact: silent (run below).
+- **Frontier correction (2026-08-13, task `57c57d14`, audit `c7e9a272`)**:
+  every MODEL-01 dispatch/dependency statement now gates on the **LIB-02 +
+  LIB-03** aggregate gates only; REF-01 is a sibling chain of MODEL-01, not a
+  predecessor; **A1 (silu) is independently eligible before the MODEL-01
+  gate**, subject only to consume-or-add resolution against the sibling
+  REF-01. No implementation scope, unit, fact, successor, sizing, write
+  scope, or integrability was changed.
 - No Hand tasks were filed and no product code was touched (planning only).
 
 ## 12. Work-token estimates
@@ -776,10 +796,13 @@ law's shape; it is staged so no single Hand exceeds the law.
    how a divergence between them is adjudicated — is routed to the MODEL-02
    audit and the GGUF-M4 boundary recheck, never resolved by an implementing
    Hand.
-2. **Dispatch timing.** The whole MODEL-02 chain bases on `factory/merge`
-   after the MODEL-01 aggregate gate lands (which requires the LIB-03 and
-   REF-01 gates). A1 ∥ A2 ∥ B1 is the first eligible frontier; if MODEL-01
-   slips, MODEL-02 waits — the chain does not overlap those implementations.
+2. **Dispatch timing.** The MODEL-01 aggregate gate lands after the **LIB-02 +
+   LIB-03** aggregate gates only (REF-01 is a sibling, not a MODEL-01
+   predecessor). **A1 is independently eligible before MODEL-01** (silu
+   consume-or-add vs the sibling REF-01); A2 ∥ B1 is the first eligible
+   frontier after MODEL-01. If MODEL-01 slips, A1 may still dispatch (its
+   silu authority is a sibling recheck), while the gated units wait — the
+   chain does not overlap those implementations.
 3. **`silu` presence (A1).** REF-01's chain plans a generic SiLU row; if it
    lands before A1 dispatches, A1 narrows to consume-and-record (no duplicate
    row). The frozen `silu(tensor.Tensor x) → tensor.Tensor ⇥ NnError` spelling
@@ -805,8 +828,9 @@ not campaign completion: MODEL-02 completion yields the MoE component-level
 proof (router/expert/shared-expert execution authority for GGUF-M4/M5) and
 advances milestone Q2; the Qwen3.6 invariant requires the full
 LIB/REF/MODEL/EXEC/CAP chain through CLOSE-01, preserved verbatim (§10).
-MODEL-01, LIB-03, and REF-01 are separate mandatory predecessors owned by
-their own chains, not absorbed here (§7). The comparator authority question
+MODEL-01 (LIB-02 + LIB-03 gated) and the sibling REF-01 are separate
+mandatory chains owned by their own deliveries, not absorbed here (§7). The
+comparator authority question
 is preserved verbatim for audit, not resolved (§13.1).
 
 ---
@@ -817,7 +841,9 @@ aggregate gate G1: silu primitive (A1) → probe corpus (A2) → goldens oracle
 (A3) → type/error contract (B1) → router `eligito` (B2) → expert dispatch
 `expertum` (B3) → complete `ffn_moe` (B4) → exemplar receipt (C1) ∥ docs (C2)
 → records/inventory (C3) → atomic integration (G1). The first eligible
-frontier after MODEL-01 is A1 ∥ A2 ∥ B1. Every frozen fact — comparator
+frontier after MODEL-01 is A2 ∥ B1, with **A1 (silu) independently eligible
+before MODEL-01** subject only to consume-or-add resolution against the
+sibling REF-01. Every frozen fact — comparator
 authority question, deterministic tie rule, top-k probability selection and
 `norm_w=true` renormalization, shared-expert sigmoid gating, the exact rank-3
 mapping/storage union {F32, BF16, Q4_K, Q5_K, Q6_K, Q8_0}, the block-40 MTP
