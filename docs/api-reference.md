@@ -623,7 +623,12 @@ function is operation-scoped and is never retained. The synthetic package
 proof executes 40 cases with 40 PASS / 0 FAIL. A separate guarded adapter
 matches six operator-local files against independent GGUF data offsets and
 counts without reading tensor payloads. Neither receipt admits an architecture,
-implements tokenization, or claims inference.
+implements tokenization, or claims inference. The LIB-02-U1 typed array
+accessors (`textorum`/`numerorum`) read the tokenizer metadata block
+(`tokenizer.ggml.tokens`, `tokenizer.ggml.token_type`,
+`tokenizer.ggml.merges`) from a parsed schema-2 manifest with the exact
+target-prefix counts (248320 tokens, 247587 merges) and pinned special ids
+pinned in `src/model/gguf_manifest.proba`.
 
 `genus CorpusGguf` — fields `tabula`, `longitudo_artifacti`, and
 `identitas`.
@@ -657,6 +662,17 @@ octeti_per_blockum, longitudo_octetorum)` or `Ignota(typo)`.
   GgufManifestError` — typed integer accessor for an integer metadata value;
   `GGUF_BOOL` and floating-point values remain parseable/preserved but return a
   typed `WireMala` error from this accessor.
+- `functio textorum(ManifestumGguf m, textus clavis) → lista<textus> ⇥
+  GgufManifestError` — typed string-array accessor (LIB-02-U1); returns the
+  elements of a GGUF string array such as `tokenizer.ggml.tokens` /
+  `tokenizer.ggml.merges`. A non-array value or a non-string element kind
+  returns a typed `WireMala` error.
+- `functio numerorum(ManifestumGguf m, textus clavis) → lista<numerus> ⇥
+  GgufManifestError` — typed integer-array accessor (LIB-02-U1); returns the
+  elements of an integer array such as `tokenizer.ggml.token_type`. A
+  non-array value or a non-integer element kind returns a typed `WireMala`
+  error. Scalar tokenizer ids (`tokenizer.ggml.bos_token_id` and friends) and
+  the chat template stay on the `numerum`/`textum` surface.
 - `functio inveni_tensorem(ManifestumGguf m, textus nomen) →
   DescriptioTensorisGguf ⇥ GgufManifestError` — retrieve one tensor descriptor.
 - `functio layout(numerus typo_ggml, lista<numerus> forma) → LayoutGgml ⇥
@@ -1003,9 +1019,9 @@ script (zombie-doc gate, PML6-U1). Private `_`-prefixed helpers are exempt;
 the two renamed serialize readers are documented for the correctness-wave
 reconciliation.
 
-**Function-count total: pending A1C-M6.** The A1C capsule rewrite (M1) and
-the D3/D4 caller migrations (M2/M3) change the `model/capsule`,
-`model/gguf`, and `model/safetensors` counts and the tracked all-module
-total. The re-baselined total is asserted here only after A1C-M6 runs
-against the merged M1+M2+M3 source; until then no numeric total is
-asserted (the former 618 no longer holds and is not restated).
+**Function-count total: 585 (re-baselined).** The A1C capsule rewrite (M1)
+and the D3/D4 caller migrations (M2/M3) changed the `model/capsule`,
+`model/gguf`, and `model/safetensors` counts, and LIB-02-U1 added the
+`textorum`/`numerorum` array accessors on `model/gguf_manifest`. The
+tracked all-module total is re-baselined and asserted by the inventory
+script (585); the former 618 no longer holds and is not restated.

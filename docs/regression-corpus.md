@@ -1,6 +1,7 @@
 # Gradus Regression Corpus
 
-**Version**: `gradus-regression-corpus v1.3.0` (2026-08-13, A1C-M5)
+**Version**: `gradus-regression-corpus v1.3.0` (2026-08-13, A1C-M5;
+2026-08-14, LIB-02-U1 tokenizer metadata array pins)
 **Repo**: gradus. **Tier**: structural inventory.
 **Delivery**: `docs/factory/production-ml-library/pml6-delivery.md` §PML6-U4;
 GGUF-A1b delivery in `pml5-general-gguf-delivery.md`.
@@ -66,7 +67,7 @@ Live co-located suites (26 files):
 | `src/model/gguf.proba` | GGUF row | Builder + digest + row facts |
 | `src/model/dequant.proba` | CPU dequant | Block layout pins |
 | `src/model/artifact.proba` | pathless content identity | Algorithm, digest, and positive-length validation |
-| `src/model/gguf_manifest.proba` | GGUF-A1b manifest and range seam | Unknown codec inspection, exact ranges, source failure, and checked tensor fragments |
+| `src/model/gguf_manifest.proba` | GGUF-A1b manifest and range seam | Unknown codec inspection, exact ranges, source failure, checked tensor fragments, and LIB-02-U1 tokenizer array pins (248320 tokens / 247587 merges / special ids) |
 
 Every suite header states **EVIDENCE HONESTY (CTO Q2)**: structural /
 compile-level proof; executed value-identity deferred.
@@ -155,6 +156,16 @@ PML6-U4 / the correctness wave. Loss of any pin is a corpus defect.
 
 Tolerance policy detail: `docs/numeric-tolerances.md`.
 
+### 4.6 Manifest tokenizer metadata array pins (LIB-02-U1)
+
+| Field | Value |
+| --- | --- |
+| **Pin** | `textorum(m, "tokenizer.ggml.tokens").longitudo()` = **248320**; `textorum(m, "tokenizer.ggml.merges").longitudo()` = **247587**; `numerorum(m, "tokenizer.ggml.token_type").longitudo()` = **248320** |
+| **Special ids** | `tokenizer.ggml.bos_token_id` = **248044** (`<|endoftext|>`), `tokenizer.ggml.eos_token_id` = **248046** (`<|im_end|>`), `tokenizer.ggml.padding_token_id` = **248055** via the scalar `numerum` surface |
+| **Why** | The counts/ids are the frozen target-prefix corpus facts (Qwen3.6-35B-A3B-UD-Q4_K_M.gguf metadata block) that LIB-02-U2/U3 encode/decode must consume |
+| **Errors** | Missing keys, non-array values, and wrong element kinds produce typed `GgufManifestError` (`WireMala` / `LimitesMala`) rows; duplicate tokenizer keys fail at parse (`ClavisDuplicata`) |
+| **Live** | `src/model/gguf_manifest.proba` — `"LIB-02-U1 tokenizer metadata accessors"` probandum |
+
 ---
 
 ## 5. Structural validation
@@ -210,6 +221,12 @@ test -f fixtures/tokenizer/tokenizer-identity-oracle.md
 
 # Proba count stays the admitted co-located surface
 find src -name '*.proba' | wc -l   # expect 26 at this corpus version
+
+# LIB-02-U1 tokenizer metadata pins (counts, special ids, error rows)
+rg -n 'TOKENS_PIN|MERGES_PIN|BOS_PIN|EOS_PIN|PAD_PIN|248320|247587|248044|248046|248055' \
+  src/model/gguf_manifest.proba
+rg -n 'metadata array is not an integer array|metadata value is not a GGUF string array' \
+  src/model/gguf_manifest.fab
 ```
 
 ### 5.3 Executed pass (auditor-owned; not claimed by this unit)
