@@ -7,7 +7,8 @@
 **Repo**: `gradus`
 **Status**: READY FOR DELIVERY — implementation gated on predecessor receipts
 **Planner**: planner-25 (fresh lowering; no planner-1..19 artifacts reused)
-**Date**: 2026-08-13
+**Date**: 2026-08-13; **re-split 2026-08-14** (operator granularity directive — one
+behavior family per unit; see §Hand Unit Graph)
 **Integration stop**: `factory/merge` only; this delivery does not fast-forward any main branch
 
 ## Executed Outcome
@@ -26,6 +27,11 @@ bounded manifest of the target artifact to `gradus:model/qwen35moe`, which
 returns ADMIT with the frozen configuration and 753 admitted tensors. A
 package-MIR mutation suite proves every required failure mode with typed
 diagnostics.
+
+The outcome is delivered as a ten-entry unit graph (§Hand Unit Graph): nine
+one-behavior-family micro-units (M1–M9) plus one aggregate integration gate
+(G1). The mandatory scope is the union of the unit scopes and is not narrowed
+by the re-split.
 
 ## Goal-Check Verdict
 
@@ -195,6 +201,12 @@ Storage anomaly to preserve, not normalize: in `blk.40`,
 same tensors are f32 in every other block. The mixed-storage directory is a
 per-tensor fact; the admission must not collapse it to one global storage row.
 
+Block-40 nextn/MTP rule (frozen): `blk.40` is the sole nextn block; its 20
+tensors are **admitted** as part of the canonical map (map completeness
+requires all 753), but the main forward layer schedule is blocks 0..39. The
+admission records nextn tensors as loaded-not-main-pass and claims no
+nextn/MTP execution semantics — those belong to GGUF-M2/M3/M4.
+
 ### Storage-type distribution (753 tensors)
 
 | Storage | Count |
@@ -285,22 +297,29 @@ admission, Radix/Faber/Hosts only for facts that belong to their seam).
 
 | Dependency | Receipt | State |
 | --- | --- | --- |
-| GGUF-A1a manifest parser | `exempla/gguf-manifest` 31 PASS / 0 FAIL | implemented |
+| GGUF-A1a manifest parser | `exempla/gguf-manifest` executed synthetic receipt | implemented |
 | GGUF-A1b range seam + real-file inspection | `exempla/gguf-inspect` 6-file guarded receipt | implemented |
-| GGUF-A1c capsule/caller clean break | `pml5-general-gguf-delivery.md` §GGUF-A1c | **next mandatory — not yet landed** |
-| GGUF-A2 tokenizer runtime (LIB-02) | campaign MODEL-01 depends on LIB-02 | not yet landed |
-| GGUF-A3 packed storage (LIB-03) | campaign MODEL-01 depends on LIB-03 | not yet landed |
+| GGUF-A1c capsule/caller clean break (LIB-01) | aggregate gate M8R4 | **landed — Gradus main `2b3e41a`** |
+| GGUF-A2 tokenizer runtime (LIB-02) | [`pml5-lib02-tokenizer-delivery.md`](pml5-lib02-tokenizer-delivery.md) micro-unit chain | **in progress** — U1 typed metadata array accessors landed (`c4d0750`); aggregate gate pending |
+| GGUF-A3 packed storage (LIB-03) | [`pml5-gguf-a3-packed-storage-delivery.md`](pml5-gguf-a3-packed-storage-delivery.md) micro-unit chain | **in progress** — A3-C1 BF16/Q5_K codecs landed (`82048b5`); aggregate gate pending |
 
-Per the campaign dependency table, MODEL-01 cannot be dispatched to a Hand
-before the LIB-02 and LIB-03 predecessor receipts are accepted; the delivery
-authority's unit graph additionally orders GGUF-A1c before GGUF-A2/A3. This
-delivery artifact is lowered now so the unit is implementation-ready when the
-predecessor receipts land; it does not claim predecessor completion.
+Per the campaign dependency table (corrected frontier `c69d6a7`), the MODEL-01
+chain dispatches only after the **LIB-02 and LIB-03 aggregate gates land on
+`factory/merge`**; REF-01 (dense reference rungs) is a **sibling** of
+MODEL-01, not a predecessor, and never gates this dispatch. GGUF-A1c (LIB-01)
+is landed. This delivery artifact is lowered now so the units are
+implementation-ready when the LIB-02/LIB-03 aggregate gates land; it does not
+claim predecessor completion.
 
-## Exact Write Scope
+## Theme Write Scope (Mandatory Union — Unchanged)
 
 Only the files below. No product source outside this list, no docs outside
-the listed set.
+the listed set. Each micro-unit's exact write scope in §Hand Unit Graph is a
+subset of this union; the union is the mandatory MODEL-01 scope and the
+re-split does not narrow it. One recommended addition (M2's facts fixture,
+§Open Questions) pins the frozen facts beside the existing
+`fixtures/gguf/general-manifest-oracle.md` / `gguf-row-oracle.md` pattern and
+is flagged for Mind approval.
 
 - `src/model/qwen35moe.fab` (new) — public import `gradus:model/qwen35moe`;
   typed configuration genus, admission entry point(s), canonical tensor map,
@@ -346,65 +365,225 @@ the listed set.
 - Hardware authority for the executed receipt: the local host running the
   package-MIR exemplar through the lane-local Radix `faber` binary.
 
-## Closeout Command
+## Hand Unit Graph (re-split 2026-08-14)
 
-```bash
-cd /Users/ianzepp/work/faberlang/worktrees/<hand>/gradus
-./scripta/check-source
-env FABER_LIBRARY_HOME=/Users/ianzepp/work/faberlang/worktrees/<hand> \
-  FABER_BIN=/Users/ianzepp/work/faberlang/worktrees/<hand>/radix/target/debug/faber \
-  ./scripta/check-compile
-env FABER_LIBRARY_HOME=/Users/ianzepp/work/faberlang/worktrees/<hand> \
-  /Users/ianzepp/work/faberlang/worktrees/<hand>/radix/target/debug/faber \
-  check --diagnostics .
-env FABER_LIBRARY_HOME=/Users/ianzepp/work/faberlang/worktrees/<hand> \
-  /Users/ianzepp/work/faberlang/worktrees/<hand>/radix/target/debug/faber \
-  run --target fmir exempla/gguf-admit-qwen35moe -- \
-  /Users/ianzepp/Ai/models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf \
-  10991392 \
-  0b21525e972670ed59e1812e170b27c26355381f0656ecc4e25617ece7dac58b
-git diff --check -- src/model/qwen35moe.fab src/model/qwen35moe.proba \
-  src/model/gguf_manifest.fab src/model/gguf_manifest.proba \
-  docs/module-map.md docs/api-reference.md docs/regression-corpus.md \
-  docs/factory/production-ml-library/pml0-symbol-inventory.md \
-  docs/factory/production-ml-library/pml0-support-matrix.md \
-  exempla/gguf-admit-qwen35moe scripta/check-compile
+The former single unit (est 90k–150k work tokens — far over the operator's
+granularity bar) is re-split into **nine one-behavior-family micro-units
+(M1–M9) plus one aggregate integration gate (G1)**, per the operator
+directive 2026-08-14: one behavior family per unit, executable by a Hand in
+roughly 10–15 minutes with a focused check, commit, and close. Every unit
+carries all eight campaign-rule-2 fields: `outcome`, `exact write scope`,
+`first failing oracle`, `closeout command`, `expected observed result`,
+`est_basis`, `stop condition`, `depends_on`.
+
+The mandatory scope is preserved: the union of the unit write scopes equals
+the Theme Write Scope (plus the M2 facts fixture, a recommended addition);
+no frozen fact, tensor row, mutation family, or successor is narrowed,
+deferred, or made optional. No child runs a package/source/compile/stage/
+e2e/full closeout — `check-source` + `check-compile` are the narrowest
+working gates for a Gradus library unit, and the only package-level compile +
+fmir run in the whole chain is G1.
+
+`est_basis` per unit is `pilot` (no ledger class exists for GGUF-M1 qwen35moe
+admission; the ledger's closest classes are `diagnostics-oracle` and
+`compiler-surface-feature`). M3 seeds the architecture-admission module class
+baseline; M4–M6 inherit it. Tool latency per code unit: `faber check` through
+the lane-local Radix binary, ~2–5 min cold; no GPU or long-running work.
+
+### MODEL-01-M1 — Manifest architecture-facing typed accessors
+
+| Field | Value |
+| --- | --- |
+| `outcome` | `gradus:model/gguf_manifest` exposes the typed accessors the qwen35moe admission needs that are not already on the LIB-02 landed surface: typed array-of-uint32 read (so `qwen35moe.rope.dimension_sections` decodes to `[11, 11, 10, 0]`), bool read (for `tokenizer.ggml.add_bos_token`), and array-length read (for the tokenizer identity counts 248320 / 248320 / 247587); missing / malformed / duplicate / wrong-kind keys fail with typed `GgufManifestError` rows; **no parser behavior change**. If the landed LIB-02 surface already decodes a needed accessor, the unit narrows to the proba proof and adds no new symbol |
+| `exact write scope` | `src/model/gguf_manifest.fab`, `src/model/gguf_manifest.proba` only |
+| `first failing oracle` | the new proba cases asserting `rope.dimension_sections` → `[11, 11, 10, 0]`, `add_bos_token` → `falsum`, and the three tokenizer array lengths fail to compile/type-check (the packet baseline lacks the typed array/bool/length reads) |
+| `closeout command` | `./scripta/check-source && ./scripta/check-compile` (lane-local `FABER_BIN`/`FABER_LIBRARY_HOME`); `git diff --check -- src/model/gguf_manifest.fab src/model/gguf_manifest.proba` |
+| `expected observed result` | both gates exit 0; the new proba cases type-check; every existing manifest proba case is unchanged; `git diff --check` silent |
+| `est_basis` | `pilot` — typed-accessor verification/extension on the LIB-02 landed seam (closest ledger class `compiler-surface-feature`); 3–5k tokens |
+| `stop condition` | an accessor would require a parser/parse-behavior change → stop, report the seam violation To mind; a wire-kind coercion (e.g. BOOL read as UINT32) would be required → stop, the typed error is the behavior |
+| `depends_on` | theme dispatch frontier only (LIB-02 + LIB-03 aggregate gates; §Dispatch Serialization) — no intra-theme unit |
+| `gate` | proba decode + both gates green. **Non-integrable alone** (changes `model/gguf_manifest` symbol count and needs M8's api-reference coverage) — only G1 merges |
+
+### MODEL-01-M2 — Qwen35moe admission oracle fixture
+
+| Field | Value |
+| --- | --- |
+| `outcome` | a committed facts fixture `fixtures/gguf/qwen35moe-admission-oracle.md` pins every frozen fact verbatim from this delivery: target identity (byte length 22,663,387,424, SHA-256 `0b21525e…dac58b`, GGUF version 3, alignment 32, data offset 10,991,392, metadata 55, tensor count 753, architecture `qwen35moe`), all 30 frozen config rows (incl. `rope.dimension_sections` `[11, 11, 10, 0]` and the tokenizer identity facts), the four canonical tensor-family sets with exact shape/storage rows, the 41-block schedule (30 hybrid / 10 full-attention / 1 nextn / 3 global), the storage distribution (f32 368 / q8_0 259 / q4_K 82 / q5_K 38 / q6_K 4 / bf16 2), the blk.40 bf16 and blk.34/38/39 q6_K anomalies, the block-40 load-not-main-pass rule, rank-3 expert count 123, and the seven-family typed refusal matrix — facts only, no GGUF bytes, no execution claims |
+| `exact write scope` | `fixtures/gguf/qwen35moe-admission-oracle.md` (new) only — the one recommended addition to the Theme Write Scope (§Open Questions) |
+| `first failing oracle` | fixture absent or any frozen row missing/divergent from the tables in this delivery (grep assertions fail) |
+| `closeout command` | grep-based completeness assertions over every table row; `git diff --check -- fixtures/gguf/qwen35moe-admission-oracle.md` |
+| `expected observed result` | fixture committed and complete with every fact above; `git diff --check` silent |
+| `est_basis` | `pilot` — first qwen35moe admission facts fixture (precedent: `general-manifest-oracle.md`); 3–5k tokens |
+| `stop condition` | a frozen value cannot be confirmed against the live artifact or the independent `llama-gguf` oracle → stop, do not invent; record the divergence to the owning repo |
+| `depends_on` | theme dispatch frontier only; runs in parallel with M1 (disjoint files) |
+| `gate` | fixture completeness greps. **Non-integrable alone** (facts pinned ahead of the surface) — only G1 merges |
+
+### MODEL-01-M3 — Configuration genus + metadata freeze
+
+| Field | Value |
+| --- | --- |
+| `outcome` | the typed configuration genus in the new `gradus:model/qwen35moe` freezes all 30 frozen metadata rows (architecture, quantization, block_count 41, context_length 262144, embedding_length 2048, attention/rope/expert/SSM/nextn facts, tokenizer identity facts) read through the manifest accessors; metadata count 55 enforced; any frozen `qwen35moe.*` value changed, a required key missing, or an extra unknown key shadowing a required fact fails with a typed metadata-divergence diagnostic naming the first diverging key (mutation family 1); tokenizer facts are frozen as identity only |
+| `exact write scope` | `src/model/qwen35moe.fab`, `src/model/qwen35moe.proba` only |
+| `first failing oracle` | proba case with `qwen35moe.block_count` 41→42 (or a missing `qwen35moe.ssm.state_size` key) must yield a typed diagnostic naming that key; the cases fail today (module absent) |
+| `closeout command` | `./scripta/check-source && ./scripta/check-compile`; `git diff --check -- src/model/qwen35moe.fab src/model/qwen35moe.proba` |
+| `expected observed result` | both gates exit 0; all 30 frozen values + metadata-count 55 pins type-check; mutation family 1 fails with a typed first-divergence diagnostic |
+| `est_basis` | `pilot` — first architecture-config freeze in Faber (seeds the architecture-admission module class); 5–7k tokens |
+| `stop condition` | a required fact cannot be represented in the typed config → report the gap To mind with a default and options; do not invent a representation |
+| `depends_on` | M1 + M2 |
+| `gate` | module proof green. **Non-integrable alone** (partial module; inventory/docs gates break) — only G1 merges |
+
+### MODEL-01-M4 — Canonical 753-tensor map + block schedule
+
+| Field | Value |
+| --- | --- |
+| `outcome` | the canonical tensor map admits the four exact family sets (global 3: `output.weight`/`output_norm.weight`/`token_embd.weight`; hybrid 19×30; full-attention 16×10; nextn 20 on `blk.40`) with each tensor's exact stored shape and storage row; the 41-block schedule (indices 0..40; full-attention at index ≡ 3 mod 4; `blk.40` the sole nextn block per `nextn_predict_layers`=1); the storage distribution (f32 368 / q8_0 259 / q4_K 82 / q5_K 38 / q6_K 4 / bf16 2); the blk.40 bf16 and blk.34/38/39 q6_K anomalies preserved **per-tensor** (never collapsed to one global storage row); the block-40 nextn/MTP load-not-main-pass rule recorded (20 tensors admitted for map completeness; main-pass schedule blocks 0..39; no nextn execution claim); count invariants (753 total, metadata 55, block-family counts); mutation families 2 (name), 3 (shape), 4 (storage), 5 (count) fail with typed first-divergence diagnostics |
+| `exact write scope` | `src/model/qwen35moe.fab`, `src/model/qwen35moe.proba` only |
+| `first failing oracle` | proba case renaming a canonical tensor (e.g. `blk.0.attn_norm.weight` → `blk.0.attn_norm2.weight`), collapsing a rank-3 expert tensor to rank-2, "correcting" the blk.40 bf16 anomaly, or mutating the count 753→752 must each yield a typed first-divergence diagnostic naming the first diverging fact; the cases fail today (no map) |
+| `closeout command` | `./scripta/check-source && ./scripta/check-compile`; `git diff --check -- src/model/qwen35moe.fab src/model/qwen35moe.proba` |
+| `expected observed result` | both gates exit 0; family-set shapes/storage rows, count/schedule pins, distribution, and anomaly probas type-check; mutation families 2–5 fail typed |
+| `est_basis` | `pilot` — 753-tensor family map in Faber (architecture-admission module class seeded by M3); 5–8k tokens |
+| `stop condition` | a canonical tensor fact contradicts the live artifact → pause, re-verify against the independent oracle, and route the correction; never normalize an anomaly |
+| `depends_on` | M3 (file-serialized on the module) |
+| `gate` | module proof green. **Non-integrable alone** (partial module) — only G1 merges |
+
+### MODEL-01-M5 — Dimension / storage cross-reference validation
+
+| Field | Value |
+| --- | --- |
+| `outcome` | cross-reference validation between the frozen config and the canonical map per §Dimension And Cross-Reference Validation: `embedding_length` 2048 at its stored-dim positions per tensor family; `expert_count` 256 as rank-3 dim 2 of the three `*_exps` tensors and dim 1 of `ffn_gate_inp`; `expert_feed_forward_length` 512 at the down/gate-up positions; `ssm.state_size` 128 / `time_step_rank` 32 / `conv_kernel` 4 / `inner_size` 4096 dim matches; `head_count_kv` 2 × `key_length` 256 = 512 = dim 1 of `attn_k`/`attn_v` (norms carry 256); block-schedule consistency (10 ≡ 3 mod 4, one nextn when `nextn_predict_layers`=1); element counts = product of stored dims; every checked absolute range satisfies `data_inceptum + offset_relativum <= total` (GGUF-A1a/A1b guarantees); any cross-fact violation fails with a typed first-divergence diagnostic |
+| `exact write scope` | `src/model/qwen35moe.fab`, `src/model/qwen35moe.proba` only |
+| `first failing oracle` | proba case with a deliberate cross-fact violation (e.g. `head_count_kv`×`key_length` ≠ 512, or an `attn_qkv` embedding dim ≠ 2048) must yield the typed diagnostic; the cases fail today (no validator) |
+| `closeout command` | `./scripta/check-source && ./scripta/check-compile`; `git diff --check -- src/model/qwen35moe.fab src/model/qwen35moe.proba` |
+| `expected observed result` | both gates exit 0; all cross-reference pins type-check; violation rows fail with typed first-divergence diagnostics |
+| `est_basis` | `pilot` — cross-reference validator in Faber (architecture-admission module class); 3–5k tokens |
+| `stop condition` | a rule would require a fact outside the manifest/config (device, file ownership) → stop; that fact belongs to the Hosts/application seam |
+| `depends_on` | M4 (file-serialized) |
+| `gate` | module proof green. **Non-integrable alone** (partial module) — only G1 merges |
+
+### MODEL-01-M6 — Admission entry point + identity precondition + typed refusal matrix
+
+| Field | Value |
+| --- | --- |
+| `outcome` | the public admission entry on the new module composes identity precondition → config freeze (M3) → canonical tensor map (M4) → cross-reference validation (M5) and returns ADMIT with the frozen configuration + the 753-tensor receipt; the typed refusal matrix covers all seven mutation families — identity (family 6: byte length / SHA-256 divergence fails **before any architecture read**), metadata (1), name (2), shape (3), storage (4), count (5), and unsupported-but-inspectable (7: an unknown architecture name or raw GGML type stays inspectable as data per GGUF-A1a but cannot admit as `qwen35moe`); each failure returns a typed first-divergence diagnostic naming the first diverging fact that routes the repair to the owning repository |
+| `exact write scope` | `src/model/qwen35moe.fab`, `src/model/qwen35moe.proba` only |
+| `first failing oracle` | proba case with a wrong SHA-256 (or byte length) must fail with the identity diagnostic and never read architecture; proba case with `general.architecture = llama` must yield unsupported-but-inspectable (not a parse error); the cases fail today (no entry) |
+| `closeout command` | `./scripta/check-source && ./scripta/check-compile`; `git diff --check -- src/model/qwen35moe.fab src/model/qwen35moe.proba` |
+| `expected observed result` | both gates exit 0; the ADMIT + 753 receipt case type-checks on the exact frozen facts; all seven families fail closed with typed first-divergence diagnostics; the identity check precedes any architecture read |
+| `est_basis` | `pilot` — admission composition + refusal matrix in Faber (closest ledger class `diagnostics-oracle`); 4–6k tokens |
+| `stop condition` | admission would acquire device or file ownership → stop (Hosts/application seam); composition would weaken any mutation family → stop |
+| `depends_on` | M5 (file-serialized) |
+| `gate` | module proof green. **Non-integrable alone** (surface complete but needs M7/M8/M9/G1) — only G1 merges |
+
+### MODEL-01-M7 — Exemplar adapter (executed real-file admission receipt)
+
+| Field | Value |
+| --- | --- |
+| `outcome` | `exempla/gguf-admit-qwen35moe/` (new) — guarded application-owned adapter (GGUF-A1b range-source pattern): reads the bounded manifest prefix of the target artifact (first 10,991,392 bytes; **never a tensor-payload byte**), calls `gradus:model/qwen35moe` admission, prints ADMIT + the frozen configuration + the 753-tensor receipt (block schedule 30 hybrid / 10 full-attention / 1 nextn / 3 global; storage distribution f32 368 / q8_0 259 / q4_K 82 / q5_K 38 / q6_K 4 / bf16 2), exits 0; README records the exact command, revisions, model identity, expected vs observed rows, and the tensor-data guard proof |
+| `exact write scope` | `exempla/gguf-admit-qwen35moe/` only (`faber.toml`, `src/main.fab`, `README.md`) |
+| `first failing oracle` | the fmir run against the real artifact prints anything other than ADMIT + the exact frozen facts, or the guard would permit a tensor-region read |
+| `closeout command` | `env FABER_LIBRARY_HOME=<packet root> FABER_BIN=<packet>/radix/target/debug/faber ./scripta/check-compile`; then `faber run --target fmir exempla/gguf-admit-qwen35moe -- /Users/ianzepp/Ai/models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf 10991392 0b21525e972670ed59e1812e170b27c26355381f0656ecc4e25617ece7dac58b`; `git diff --check -- exempla/gguf-admit-qwen35moe` |
+| `expected observed result` | check-compile exit 0; the exemplar run prints ADMIT + all frozen table values + `753` + the block schedule + the storage distribution and exits 0; no tensor-payload byte is read (the adapter guard proves it) |
+| `est_basis` | `pilot` — admission exemplar phase (precedent: `exempla/gguf-inspect` guarded adapter); 4–6k tokens |
+| `stop condition` | target identity diverges on the real file → pause, route a correction to the owning repo; a short prefix read → adapter guard bug, fix the adapter not the oracle |
+| `depends_on` | M6; runs in parallel with M8 (disjoint files) |
+| `gate` | one fmir run exit 0 with the full ADMIT receipt. **Non-integrable alone** (executed proof lands with the surface it proves) — only G1 merges |
+
+### MODEL-01-M8 — API/support docs
+
+| Field | Value |
+| --- | --- |
+| `outcome` | docs describe the actual frozen surface: `docs/api-reference.md` gains a `## gradus:model/qwen35moe` section documenting every public symbol from the M3/M6 reports (+ any M1 accessor); `docs/module-map.md` gains the `gradus:model/qwen35moe` row + PML layer note; `docs/regression-corpus.md` inventories the new proba suite and the admission exemplum under the corpus contract and bumps the suite totals (current version `v1.3.0`; next bump for this delivery unless LIB-02/LIB-03 already bumped) |
+| `exact write scope` | `docs/api-reference.md`, `docs/module-map.md`, `docs/regression-corpus.md` only |
+| `first failing oracle` | the coverage snippet (mirroring `scripta/inventory-public-symbols`) reports a public qwen35moe `functio` absent from the api-reference section, or a corpus-total assertion fails |
+| `closeout command` | the coverage snippet + `git diff --check -- docs/api-reference.md docs/module-map.md docs/regression-corpus.md` |
+| `expected observed result` | every new public symbol appears in the api-reference section; the module-map row is present; the regression-corpus totals match the landed suite and exemplum |
+| `est_basis` | `pilot` — selective docs touch (precedent: PML6-U1 re-baseline `1f4f0d2`); 4–6k tokens |
+| `stop condition` | docs would describe a symbol that does not exist in the merged surface → stop, fix the doc not the code; corpus totals would require inventing counts → report the gap |
+| `depends_on` | M6 (surface frozen there); runs in parallel with M7 (disjoint files) |
+| `gate` | coverage snippet green. **Non-integrable alone** (docs ahead of the verified surface; zombie-doc coverage breaks) — only G1 merges |
+
+### MODEL-01-M9 — Records + inventory re-baseline + gate registration
+
+| Field | Value |
+| --- | --- |
+| `outcome` | `scripta/inventory-public-symbols` re-baselined to the merged surface (new `model/qwen35moe` row + any `model/gguf_manifest` count change from M1 + tracked total); `pml0-symbol-inventory.md` captured verbatim from a fresh run; `pml0-support-matrix.md` records the qwen35moe admission row (architecture + tensor-map facts; no execution claim); `scripta/check-compile` registers `exempla/gguf-admit-qwen35moe` |
+| `exact write scope` | `scripta/inventory-public-symbols`, `docs/factory/production-ml-library/pml0-symbol-inventory.md`, `docs/factory/production-ml-library/pml0-support-matrix.md`, `scripta/check-compile` only |
+| `first failing oracle` | `./scripta/inventory-public-symbols` exits non-zero (unknown module `model/qwen35moe`, stale tracked total), or `grep -c "gguf-admit-qwen35moe" scripta/check-compile` = 0 |
+| `closeout command` | `./scripta/inventory-public-symbols` (must exit 0) + the check-compile grep + `git diff --check -- <the four paths>` |
+| `expected observed result` | inventory exits 0 with re-baselined counts and total; symbol-inventory doc matches verbatim; support-matrix row present with no execution claim; check-compile registers the exemplum; `git diff --check` silent |
+| `est_basis` | `pilot` — mechanical re-baseline + registration (precedent: `34a8a7f`); 3–5k tokens |
+| `stop condition` | re-baselining would mask a symbol that should be private → stop, route to audit; a status claim would overclaim (no "audited" wording without an audit) → keep it factual |
+| `depends_on` | M7 + M8 |
+| `gate` | inventory exit 0 + registration grep. **Non-integrable alone** (records claim completion; only G1's validated merge makes that true) — only G1 merges |
+
+### MODEL-01-G1 — Aggregate package validation and atomic integration
+
+| Field | Value |
+| --- | --- |
+| `outcome` | merge the M1–M9 branch heads onto the MODEL-01 integration branch, run the full closeout validation once, and merge the integration branch into `factory/merge` as a single unit — `factory/merge` never observes a partial qwen35moe admission surface (no config without map, no map without admission, no module without its executed exemplar/docs/records) |
+| `exact write scope` | the merge itself + a commit message naming the M1–M9 heads; no product or doc edits |
+| `first failing oracle` | any closeout command fails, any closeout grep is non-empty, or the exemplar run diverges → **do not merge**; record the exact failure and stop |
+| `closeout command` | lane-relative with lane-local `FABER_BIN`: `./scripta/check-source`; `./scripta/check-compile` (package + exempla incl. the new admission exemplum); `faber check --diagnostics .` ends `ok: .`; `faber run --target fmir exempla/gguf-admit-qwen35moe -- /Users/ianzepp/Ai/models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf 10991392 0b21525e972670ed59e1812e170b27c26355381f0656ecc4e25617ece7dac58b` prints ADMIT + frozen config + `753` + block schedule (30/10/1/3) + storage distribution (f32 368 / q8_0 259 / q4_K 82 / q5_K 38 / q6_K 4 / bf16 2) and exits 0; `./scripta/inventory-public-symbols` exit 0; `git diff --check` silent |
+| `expected observed result` | all closeout commands pass on the merged tree; the integration branch lands on `factory/merge` as one atomic merge; the admission receipt records revisions, model identity, command, and expected vs observed rows |
+| `est_basis` | `pilot` — one aggregate validation pass + merge; 3–5k tokens |
+| `stop condition` | any closeout divergence → stop, record the exact failure; the gate verifies, it does not "fix" source |
+| `depends_on` | M1–M9 merged on the MODEL-01 integration branch |
+| `gate` | the aggregate closeout above — **the only integrable unit**; sole holder of the merge to `factory/merge` |
+
+## Dependency And Parallelism Map
+
+```text
+factory/merge (post LIB-02 + LIB-03 aggregate gates)
+  ├─ M1  manifest typed accessors            [∥ M2; disjoint files]
+  └─ M2  admission oracle fixture            [∥ M1]
+       └─ M3  configuration genus + freeze   [serial on src/model/qwen35moe.fab]
+            └─ M4  canonical 753-tensor map + block schedule
+                 └─ M5  dimension/storage cross-reference
+                      └─ M6  admission entry + typed refusal matrix
+                           ├─ M7  exemplar adapter (executed receipt)  [∥ M8]
+                           └─ M8  API/support docs                     [∥ M7]
+                                └─ M9  records + inventory + registration
+                                     └─ G1  aggregate gate → factory/merge
 ```
 
-## Expected Observed Result
+- **Maximum safe parallelism**: M1 ∥ M2 at the start (disjoint files); then
+  M3→M4→M5→M6 serializes on `src/model/qwen35moe.fab` (one new module surface —
+  no safe parallelism on the same file); after M6, M7 ∥ M8 (disjoint files).
+  Peak live Hands: 2.
+- **Branch protocol**: every M1–M9 unit commits on its own `factory/<lane>`
+  branch, based on the branch named in `depends_on`, with the commit message
+  marked `non-integrable (MODEL-01 chain)`. G1 merges the complete integration
+  branch to `factory/merge`.
 
-- `check-source` and `check-compile` exit 0; `faber check` ends `ok: .`;
-  `git diff --check` silent.
-- The admission exemplar prints `ADMIT` with the frozen configuration (all
-  values from the table above), `753` tensors, the block schedule
-  (30 hybrid / 10 full-attention / 1 nextn / 3 global), and the storage
-  distribution (f32 368 / q8_0 259 / q4_K 82 / q5_K 38 / q6_K 4 / bf16 2),
-  then exits 0. The receipt records the exact command, working directory,
-  artifact identity, and observed output.
-- The package-MIR mutation suite prints PASS for every named positive case
-  and every mutation family fails with a typed first-divergence diagnostic.
-- No real-file tensor payload byte is read (the adapter guard proves it).
+## Integration Gate And Lane-Owned Validation
 
-## Work-Token Estimate
+- `factory/merge` is the only integration stop. M1–M9 never merge to
+  `factory/merge`; each is non-integrable alone (repo-gate breakage, partial
+  module surface, records/docs ahead of the verified surface). G1 is the sole
+  aggregate gate and owns the one package-level compile + fmir run in the
+  chain.
+- Lane-owned validation, named once (not copied onto child units): the lint
+  lane owns stages 1–2 after integration (`check-source`, `check-compile`,
+  `check-factory-goal-status`); the test lane owns stages 3–6 and broad
+  suites; the merge lane owns `scripta/verify-main-consistent` and the
+  fast-forward of main. `scripta/inventory-public-symbols` exit 0 is the
+  release-checklist gate, satisfied by M9 + G1.
 
-- `est_work_tokens`: 90k–150k.
-- `est_basis`: `pilot` (first unit of a new class; no ledger class exists for
-  GGUF-M1 qwen35moe admission — the ledger's closest classes are
-  `diagnostics-oracle` and `compiler-surface-feature`, neither of which
-  covers a Gradus architecture-admission module; this unit seeds the class
-  baseline).
-- `tool_latency`: `check-compile`/`faber check` and the package-MIR exemplar
-  run through the lane-local Radix faber binary, ~2–5 min cold; no GPU or
-  long-running device work.
+## Dispatch Serialization (Mandatory Predecessor Frontier)
 
-## Named Split Boundary
-
-MODEL-01 is one coherent unit: admission + canonical tensor map for the exact
-target. It is not split further because the done oracle is a single executed
-admission receipt. It is also **not** widened: MoE router/expert execution
-(MODEL-02), hybrid SSM/attention state (MODEL-03), full-model reference
-inference (MODEL-04), tokenizer runtime (LIB-02), and packed storage
-materialization (LIB-03) are separate units with their own receipts.
+1. LIB-01 (GGUF-A1c) landed on Gradus main (`2b3e41a`).
+2. LIB-02 (GGUF-A2 tokenizer chain) and LIB-03 (GGUF-A3 packed storage chain)
+   must each land their aggregate gates on `factory/merge` before the MODEL-01
+   chain dispatches. REF-01 (dense reference rungs) is a **sibling** of
+   MODEL-01 (both depend on LIB-02 + LIB-03); it is not a MODEL-01
+   predecessor and never gates this dispatch.
+3. MODEL-01 M1 and M2 are the first dispatchable pair (parallel, disjoint
+   files). If LIB-02 or LIB-03 slips, MODEL-01 waits; the chain does not
+   overlap those implementations.
+4. MODEL-01 units touch no LIB-02/LIB-03 surface beyond preservation: M1
+   re-uses the landed typed-array accessors and adds only a missing
+   architecture-facing accessor; the module, fixture, and exemplum are new
+   files.
 
 ## Successors Preserved Through CLOSE-01
 
@@ -429,7 +608,7 @@ campaign: the campaign closes only when CLOSE-01 is accepted with both
 capstone receipts and every invariant clause. A completed MODEL-01 with no
 successor receipts leaves the campaign incomplete by design.
 
-## Stop Conditions
+## Theme Stop Conditions (Aggregate)
 
 - Target identity diverges (bytes, digest, architecture, counts) → pause,
   route a correction to the owning repo.
@@ -437,6 +616,30 @@ successor receipts leaves the campaign incomplete by design.
   report the gap To mind with a default and options; do not invent a
   representation.
 - The oracle (independent `llama-gguf` facts / live parse) is unavailable →
-  pause the executed proof; the proba mutation surface can proceed.
+  pause the executed proof (M7/G1); the proba surface (M1–M6) can proceed.
 - Any public Gradus API would acquire device ownership or file ownership →
   stop; that fact belongs to the Hosts/application seam.
+
+## Open Questions (for Mind)
+
+1. **M2 fixture scope addition**: `fixtures/gguf/qwen35moe-admission-oracle.md`
+   is a one-file facts-pinning addition to the delivery's exact write scope
+   (recommended; matches the sibling lane's split and the existing
+   `*oracle*.md` pattern). If declined, M3/M4/M6 probas assert the frozen
+   values as literals from this delivery's tables and no graph position
+   changes.
+2. **Status-line flips**: flipping GGUF-M1's status in
+   `pml5-general-gguf-delivery.md` §GGUF-M1 and `CAMPAIGN.md` is outside this
+   delivery's exact write scope; route to the merge lane (same atomic G1
+   commit) or a follow-up docs unit.
+3. **`docs/diagnostics.md` rows**: the typed diagnostic variants could get
+   error-table rows there; the current write scope does not list the file —
+   Mind decide whether to add it to M8.
+4. **Sibling delivery artifact**: the planner-39 lane carries
+   `pml5-gguf-m1-qwen35moe-micro-units.md` (`df3c016`, frontier-corrected
+   `c69d6a7`) for the same unit with the same M1–M9 + G1 boundaries. The merge
+   lane should reconcile the two delivery artifacts into one integrated
+   authority before dispatch.
+5. **Regression-corpus version**: current `v1.3.0`; M8 bumps under the corpus
+   contract to the next version (v1.4.0 unless LIB-02/LIB-03 already bumped)
+   and records the observed version.
