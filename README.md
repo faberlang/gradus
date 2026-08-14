@@ -25,7 +25,7 @@ auditor-owned gate, never claimed here.
 | Gradient wrapper | **Shipped (PML4)** — the ONE companion-call entry: `gradientes_simple_loss` |
 | Loss functions | **Shipped (PML4)** — shape-generic `mse`, `cross_entropy` + fixed-shape MSE rows |
 | Optimizers | **Shipped (PML4)** — SGD state contract: slots, `passus`, serialization |
-| NN primitives | **Shipped (PML3)** — shape-generic `linear`, `gelu`, `layernorm` + fixed-shape rows |
+| NN primitives | **Shipped (PML3)** — shape-generic `linear`, `gelu`, `layernorm` + fixed-shape rows; **REF-01-U1.1** adds the generic `rmsnorm` row (llama-arch last-axis norm, no centering) with an executed `exempla/dense-rmsnorm` proof (32 PASS / 0 FAIL) |
 | Attention / transformer | **Shipped (PML3)** — SDPA/RoPE + transformer block on the staged carrier, plus the fixed-shape BERT-tiny rows |
 | Training (steps, schedules, mode, RNG, checkpoint) | **Shipped (PML4)** — `Tabula` checkpoint, LR schedules, mode, seeded RNG, dropout |
 | Metrics | **Shipped (PML4)** — `accuratezza` + `Metricum` record |

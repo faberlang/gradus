@@ -17,13 +17,14 @@ row-oracle docs (`fixtures/safetensors/safetensors-row-oracle.md`,
 tokenizer-identity-oracle.md`), not duplicated.
 
 This matrix holds **admitted rows only**, per `pml0-support-matrix-schema.md`
-§2/§3 (fail-closed R1–R11; one row is the unit of support claim). Nine
+§2/§3 (fail-closed R1–R11; one row is the unit of support claim). Ten
 admitted rows: two PML2 model-file format rows (Safetensors, GGUF), two PML3
 architecture rows (one training, one selected inference), one PML4
 training-layer row, one PML5 inference-layer row, two GGUF-A3
 packed-storage materialization rows at the **output-checked slice tier**
-(rows 7–8, C3-U6), and one GGUF-A2 artifact-backed tokenizer runtime row at
-the **executed probe tier** (row 9, LIB-02-U4-1/U4-3). Every row is
+(rows 7–8, C3-U6), one GGUF-A2 artifact-backed tokenizer runtime row at
+the **executed probe tier** (row 9, LIB-02-U4-1/U4-3), and one REF-01 dense
+reference primitive row (row 10, generic RMSNorm, executed proof — REF-01-U1.1). Every row is
 **structural tier** — the executed tier is recorded, never claimed (see §2 reject log and
 each row's structural-tier note).
 
@@ -261,6 +262,20 @@ tensor data region (LIB-02-U4-1, 2026-08-14). This is the executed
 **tokenizer** phase only — it does **NOT** claim model execution, logits,
 generated tokens, or device execution; that boundary stays the **NAMED OPEN
 clause** CTO8-1 (`pml5-closeout.md`).
+
+### Row 10 — REF-01 dense reference primitive row: generic RMSNorm (REF-01-U1.1, executed proof)
+
+| Field | Value |
+| --- | --- |
+| `family` | REF-01 dense reference — shared forward primitive, `gradus:nn` |
+| `dtype` | F32 staged carrier only (the admitted row; `_typo_par` rejects non-f32) |
+| `shape` | rank ≥ 1 over the LAST axis; per-feature scale `[C]` rank-1 of the last-dim width; any shape with `C ≥ 1` (no fixed-shape constants) |
+| `formula` | `rmsnorm(x, γ, ε) = x / sqrt(mean(x²) + ε) · γ` over the LAST axis, no centering — the llama-arch norm family (llama.cpp `LLM_NORM_RMS`); ε explicit, llama-arch default `1e-5` |
+| `typed errors` | `NnError`: rank-0 reject (`rmsnorm requires rank >= 1`), non-per-channel scale (`rmsnorm scale must be per-channel`), scale width mismatch (`rmsnorm scale width mismatch`), empty axis (`empty normalization axis`), negative ε (`negative epsilon`), dtype mismatch / non-f32 (`dtype mismatch`, `unsupported dtype for nn primitive`) |
+| `oracle ref` | independent f64 evaluations of the documented formula (external Python), ε = `1e-5`, pinned in `src/nn.proba` and `exempla/dense-rmsnorm` within the documented **5e-4** absolute tolerance (the PML3 norm precedent) |
+| `evidence links` | `src/nn.fab` (`rmsnorm`), `src/nn.proba` (4 rmsnorm rows), `exempla/dense-rmsnorm/` (faber.toml, src/main.fab, README.md receipt) |
+| `executed proof` | `exempla/dense-rmsnorm` runs through package MIR (hand-2 Radix binary) — exit 0, **32 PASS / 0 FAIL** on the pinned f64 references (2026-08-14 receipt) |
+| `compatibility policy` | exact admitted combination: generic RMSNorm over the F32 staged carrier, last-axis, per-feature scale, no centering, ε parameterized — shared by the llama and qwen2 dense rows (no per-row constants). Non-goals: no model execution, logits, tokens, or device execution (CTO8-1 stays the named gate); no non-f32 dtypes; no full-model payload residency |
 
 ## 2. Reject log (recorded, never support)
 

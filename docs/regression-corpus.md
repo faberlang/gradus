@@ -29,7 +29,7 @@ closeout, never a dev-loop suite.
 | --- | --- | --- |
 | Co-located package tests | `src/*.proba`, `src/model/*.proba` | Compile-level contract + oracle pins per module |
 | Model / tokenizer fixtures | `fixtures/safetensors/`, `fixtures/gguf/`, `fixtures/tokenizer/` | Legal fixtures + row-oracle docs, including the three GGUF-A1a manifest fixtures and the GGUF-A3 union-set dequant goldens (`gguf-dequant-goldens.json` + derivation contract) |
-| Exempla consumers | `exempla/gradient-seam`, `exempla/gradient-seam-nolib`, `exempla/training-loop-mlp`, `exempla/token-generation`, `exempla/gguf-manifest`, `exempla/gguf-inspect`, `exempla/qwen36-35b-inference` | Public-surface consumers plus the executed GGUF synthetic proof (40 PASS / 0 FAIL), guarded six-file local inspection receipt, and the capstone tokenizer-phase run (LIB-02-U4-1) |
+| Exempla consumers | `exempla/gradient-seam`, `exempla/gradient-seam-nolib`, `exempla/training-loop-mlp`, `exempla/token-generation`, `exempla/gguf-manifest`, `exempla/gguf-inspect`, `exempla/qwen36-35b-inference`, `exempla/dense-rmsnorm` | Public-surface consumers plus the executed GGUF synthetic proof (40 PASS / 0 FAIL), guarded six-file local inspection receipt, the capstone tokenizer-phase run (LIB-02-U4-1), and the REF-01-U1.1 RMSNorm executed proof (32 PASS / 0 FAIL) |
 | Admission conformance | `tests/admission_conformance.fab` | Capsule admission composition check |
 
 Nested package dirs follow the Agents rule (≥2 modules); model package
@@ -49,7 +49,7 @@ Live co-located suites (28 files):
 | `src/math.proba` | `gradus:math` | Tensor-aware math foundation |
 | `src/serialize.proba` | `gradus:serialize` | Wire round-trip; `_be4_lege` / `_be8_lege` readers |
 | `src/parameter.proba` | `gradus:parameter` | Identity + version schema |
-| `src/nn.proba` | `gradus:nn` | GELU / layernorm / linear — f64 pins @ **5e-4** |
+| `src/nn.proba` | `gradus:nn` | GELU / layernorm / linear / **rmsnorm** — f64 pins @ **5e-4** (RMSNorm rows: unit scale, per-feature scale, per-row `[2,4]` normalization, sign-preserving negatives — REF-01-U1.1) |
 | `src/attention.proba` | `gradus:attention` | SDPA / RoPE — f64 pins @ **5e-4** |
 | `src/transformer.proba` | `gradus:transformer` | Block + LN3 / IN_LN3 pins @ **5e-4** |
 | `src/loss.proba` | `gradus:loss` | MSE / CE scalars @ **5e-4** |
@@ -221,6 +221,8 @@ Its receipt exits 0 with 40 PASS lines and 0 FAIL lines across bounded
 synthetic parser/range cases. The separate real-file adapter inspected six
 operator-local GGUFs and fails if an inspection request enters tensor data.
 This is manifest/range evidence only, not tokenizer or inference execution.
+The REF-01-U1.1 RMSNorm proof (`exempla/dense-rmsnorm`) runs through package
+MIR and exits 0 with 32 PASS / 0 FAIL on the pinned f64 references.
 
 ### 5.2 Pin-consistency greps (U4)
 
@@ -288,6 +290,7 @@ Until then, §5.1–§5.2 are the only green criteria for this document.
 | 4 SmolLM2-360M scaled inference arch | `src/attention.proba`, `src/transformer.proba` + GGUF fixture facts |
 | 5 PML4 training layer | `src/loss.proba`, `src/gradient.proba`, `src/optimize.proba`, `src/train.proba`, `src/metrics.proba`, `exempla/training-loop-mlp` |
 | 6 PML5 inference layer | `src/decode.proba`, `src/cache.proba`, `src/sampling.proba`, `src/generation.proba`, `src/tokenizer.proba`, `exempla/token-generation` |
+| 7 REF-01 dense reference — RMSNorm | `src/nn.proba` (rmsnorm rows), `exempla/dense-rmsnorm` (32 PASS / 0 FAIL) |
 
 Reject-log rows (R3/R4/R5/R9/R10/R11 and "no executed-identity upgrade")
 remain in the support matrix; this corpus does not re-admit them.
