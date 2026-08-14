@@ -10,15 +10,18 @@ capsule-schema-2.0.0 surface: capsule 45, gguf 10, safetensors 24; attention
 21 — the static-shape generic `scaled_dot_product_staticum` was added after
 the A1b capture and counts since), re-baselined for LIB-02-U1 (the
 tokenizer metadata array accessors `textorum`/`numerorum` and the shared
-`_numerum_scalarum` reader on `model/gguf_manifest`), and re-baselined for
+`_numerum_scalarum` reader on `model/gguf_manifest`), re-baselined for
 GGUF-A3 C3-U6 (the final GGUF-A3 inventory baseline: the
 `model/tensor_payload` + `model/tensor_view` modules, the widened
 `model/dequant` union set — BF16/Q5_K codecs — and `limes_payloadis` on
-`model/gguf_manifest`)
+`model/gguf_manifest`), and re-baselined for LIB-02-U3/U4 (the qwen35
+pre-tokenizer scanner + special/EOG/BOS/chat policy surface and the
+two-probe composition — tokenizer 37 → 74, total 611 → 648)
 **Date**: 2026-08-08 (PML0) / 2026-08-09 (PML1/PML2 re-baselines) /
 2026-08-11 (PML6-U1 re-baseline) / 2026-08-12 (GGUF-A1b range seam; grep only,
 no cargo) / 2026-08-13 (GGUF-A1c A1C-M6 re-baseline) / 2026-08-14 (LIB-02-U1)
-/ 2026-08-14 (GGUF-A3 C3-U6 final inventory baseline)
+/ 2026-08-14 (GGUF-A3 C3-U6 final inventory baseline) / 2026-08-14
+(LIB-02-U3/U4 qwen35 pre-tokenizer + policy-surface re-baseline)
 **Source**: live `grep -c 'functio ' src/*.fab` + `src/model/*.fab` per
 module — the scan is recursive so the PML2 model module (`src/model/`,
 sub-leaves artifact/capsule/dequant/gguf/gguf_manifest/safetensors/
@@ -29,7 +32,7 @@ functio table plus the all-module total, and asserts the re-baselined
 baseline: per-module counts for **every live module** (29 modules: the
 PML0/PML1 foundation and proof-surface modules, the PML2 model module's
 eight sub-leaves, the PML4 training-layer modules, and the PML5 inference
-modules) and the tracked total **611** (the live all-module count — every
+modules) and the tracked total **648** (the live all-module count — every
 module is asserted, there is no untracked remainder). The script
 additionally runs the
 **committed coverage gate** (PML6-U1, zombie-doc): every public `functio`
@@ -54,7 +57,15 @@ GGUF-A3 C2+C3 add the packed-storage surface: `model/tensor_payload` (C2-U2)
 and `model/tensor_view` (C2-U3..U5) modules, the widened `model/dequant`
 union set (BF16 + Q5_K codecs, A3-C1 `82048b5`) and `limes_payloadis`
 (A3-C2-U1) on `model/gguf_manifest`; the C3-U6 re-baseline is the final
-GGUF-A3 inventory baseline (29 modules / 611). This
+GGUF-A3 inventory baseline (29 modules / 611). LIB-02-U3/U4 add the qwen35
+pre-tokenizer surface (`categoria`/`est_littera`/`est_signum`/`est_numerus`/
+`est_spatium`/`est_novum_linea`/`est_aliud`/`categoria_nomen`/`scanna_verba`),
+the special/EOG/BOS/chat policy surface
+(`encoda_promptum`/`encoda_promptum_specialia`/`eog_artificii`/
+`est_eog_artificii`/`add_bos`/`chat_template`/`redde_turnum_user`), and the
+two-probe composition oracle (`fixtures/tokenizer/pinned-probe-oracle.md` +
+`chat-template-identity-oracle.md`); the re-baseline is the merged
+LIB-02+GGUF-A3 inventory baseline (29 modules / 648). This
 inventory remains a structural count.
 remains a structural count.
 **Consumed by**: PML0-U3 (proof-shaped API ledger) feeds the fixed-shape rows
@@ -91,10 +102,10 @@ sampling         27
 serialize        34
 shape            9
 tensor           11
-tokenizer        37
+tokenizer        74
 train            41
 transformer      9
-TOTAL            611
+TOTAL            648
 ```
 
 ## Symbol detail
@@ -131,7 +142,7 @@ helpers, matching the captured output):
 | serialize | 34 | `causa`, `serializa_dtype`, `serializa_shape`, `serializa_tensor`, `serializa_parametrum`, `deserializa_dtype`, `deserializa_shape`, `deserializa_tensor`, `deserializa_parametrum` + Tensum/ParametrumWire genus methods (`typo`, `figura`, `datos`, `nomen`, `possessor`, `versio`, `statium`) (15 `@ privata` helpers, incl. the renamed `_be4_lege` / `_be8_lege` big-endian readers — correctness wave `3c295c0`) |
 | shape | 9 | `causa`, `valet`, `gradus`, `quantitas`, `broadcastum`, `reformanda`, `expansio` (2 `@ privata` helpers) |
 | tensor | 11 | `causa`, `structa`, `structa_typo`, `impleta` + Tensor genus methods (`figura`, `gradus`, `quantitas`, `typus`, `valet`, `accipe`) (1 `@ privata` helper) |
-| tokenizer | 37 | `est_eog`, `causa`, `proba_aequa`, `proba_ida`, `verifica_proba`, `pinnata_proba`, `structa`, `verifica`, `clavis_tokenizatoris`, `serializa_identitas`, `deserializa_identitas`, `fabricare`, `encoda`, `decoda` + IdentitasTokenizator genus methods (`schematis`, `progenies`, `pre_tokenizator`, `digestio_vocabuli`, `eog`, `bos_vacua`, `spatium_vacua`) (16 `@ privata` helpers; the LIB-02-U2 artifact-backed byte-level BPE runtime adds `fabricare`/`encoda`/`decoda`) |
+| tokenizer | 74 | `est_eog`, `causa`, `proba_aequa`, `proba_ida`, `verifica_proba`, `pinnata_proba`, `structa`, `verifica`, `clavis_tokenizatoris`, `serializa_identitas`, `deserializa_identitas`, `fabricare`, `encoda`, `decoda` + IdentitasTokenizator genus methods (`schematis`, `progenies`, `pre_tokenizator`, `digestio_vocabuli`, `eog`, `bos_vacua`, `spatium_vacua`) + the LIB-02-U3/U4 qwen35 pre-tokenizer + policy surface (`categoria`, `est_littera`, `est_signum`, `est_numerus`, `est_spatium`, `est_novum_linea`, `est_aliud`, `categoria_nomen`, `scanna_verba`, `encoda_promptum`, `encoda_promptum_specialia`, `eog_artificii`, `est_eog_artificii`, `add_bos`, `chat_template`, `redde_turnum_user`) (37 `@ privata` helpers; the LIB-02-U2 artifact-backed byte-level BPE runtime adds `fabricare`/`encoda`/`decoda`; U3/U4 add the qwen35 scanner families + special/EOG/BOS/chat policy surface) |
 | train | 41 | `train_step_2x2`, `train_step_4x4`, `train_step_bert_linear`, `train_step_bert_layernorm`, `causa`, `structa_schedula`, `lentus_schedulata`, `modus_nomen`, `est_disciplina`, `est_aestimatio`, `modus`, `dropout_pars`, `structa_semen`, `proximus`, `proximus_f32`, `excutio`, `serializa_semen`, `deserializa_semen`, `structa_tabula`, `tabula_aequus`, `serializa_tabula`, `deserializa_tabula` + Schedula/Semen/Fructus/FructusF32/Excutio/Tabula genus methods (`lentus_vertex`, `incalesco`, `passus_total`, `lentus_finis`, `status`, `valor`, `semen`, `aetas`, `passus`, `rng`, `statum_wire`) (4 `@ privata` helpers) |
 | transformer | 9 | `bert_tiny_block_2x8`, `causa`, `transformer_block` (6 `@ privata` helpers) |
 
@@ -146,8 +157,8 @@ helpers, matching the captured output):
   and the PML2 model module (`model/artifact` 4, `model/capsule` 45,
   `model/dequant` 21, `model/gguf` 10, `model/gguf_manifest` 46,
   `model/safetensors` 24, `model/tensor_payload` 1, `model/tensor_view` 7) +
-  tokenizer 23.
-- The tracked total == the live all-module total == **611**; every module is
+  tokenizer 74.
+- The tracked total == the live all-module total == **648**; every module is
   asserted (no untracked remainder).
 - The **coverage gate** holds: every public symbol name above appears in
   `docs/api-reference.md` under its module's `## gradus:<module>` section —
@@ -168,16 +179,16 @@ helpers, matching the captured output):
 
 ```bash
 cd /Users/ianzepp/work/faberlang/gradus
-./scripta/inventory-public-symbols            # exit 0; per-module counts + total 611 + coverage gate
+./scripta/inventory-public-symbols            # exit 0; per-module counts + total 648 + coverage gate
 diff <(./scripta/inventory-public-symbols) \
   <(awk 'BEGIN{n=0} /^```$/{n++; next} n==1{print} n>1{exit}' \
      docs/factory/production-ml-library/pml0-symbol-inventory.md)  # clean
-grep -c 'functio ' src/*.fab src/model/*.fab | awk -F: '{s+=$2} END {print s}'   # 611 (live all-module)
+grep -c 'functio ' src/*.fab src/model/*.fab | awk -F: '{s+=$2} END {print s}'   # 648 (live all-module)
 git diff --check
 ```
 
 Outcome: `./scripta/inventory-public-symbols` exits 0 (per-module baseline
-and tracked total 611 hold; every public symbol is documented in
+and tracked total 648 hold; every public symbol is documented in
 `docs/api-reference.md`); a fresh run diffs clean against the captured output
-above; the live all-module total == 611 matches live grep; `git diff --check`
+above; the live all-module total == 648 matches live grep; `git diff --check`
 clean.
