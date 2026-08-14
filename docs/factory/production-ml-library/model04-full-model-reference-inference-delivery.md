@@ -29,7 +29,7 @@ TRUTH-01 -> LIB-01 -> {LIB-02, LIB-03} -> REF-01 -> MODEL-01
 ```
 
 **Successor chain preserved unchanged.** EXEC-01 and EXEC-02 keep their campaign
-rows and their gate on MODEL-04: EXEC-01-M4 builds the real-graph composite
+rows and their gate on MODEL-04: EXEC-01-U2 builds the real-graph composite
 plan over the GGUF-M4 public generation surface and is gated on the MODEL-04
 receipt; EXEC-02's packed native kernels consume the reference policy this
 delivery executes against. Nothing in this delivery narrows, defers,
@@ -139,7 +139,7 @@ phases, and no unit covers two families.
 | `closeout_command` | `cd /Users/ianzepp/work/faberlang/worktrees/<hand>/gradus`; `./scripta/check-source`; `env FABER_LIBRARY_HOME=/Users/ianzepp/work/faberlang/worktrees/<hand> FABER_BIN=/Users/ianzepp/work/faberlang/worktrees/<hand>/radix/target/debug/faber ./scripta/check-compile`; `git diff --check -- src/model/qwen35moe_graph.fab src/model/qwen35moe_graph.proba docs/module-map.md docs/api-reference.md docs/regression-corpus.md README.md` |
 | `expected_observed_result` | `check-source` and `check-compile` exit 0; assembly proba PASS with the declared layer schedule in order and first-divergence `none`; `git diff --check` silent. No model bytes, no execution claim beyond the structural probe. |
 | `est_work_tokens` | 3k–6k |
-| `est_basis` | Composition-row precedent at micro-unit scale: GGUF-A4 dense full-model assembly (REF-01's predecessor, same composition shape) and EXEC-01-M1 typed-shape assembly (3k–8k); one new module + proba + doc rows. |
+| `est_basis` | Composition-row precedent at micro-unit scale: GGUF-A4 dense full-model assembly (REF-01's predecessor, same composition shape) and EXEC-01-U1 typed-shape assembly (3k–8k); one new module + proba + doc rows. |
 | `tool_latency` | gradus `faber check` + compile ~1–5 min (no cargo in the gradus dev loop) |
 | `local_corpus_boundary` | No artifact bytes; identity facts (digest, byte length, tensor counts) only. |
 | `hardware/backend authority` | None — structural probe only; no machine run in this unit. |
@@ -260,12 +260,12 @@ phases, and no unit covers two families.
 | `forbidden_paths` | Product code in any repo; CAMPAIGN.md status lines (CLOSE-01 owns the campaign-wide reconciliation); any Metal/CUDA execution claim (EXEC-02/M5/CAP-01/02 own native receipts) |
 | `depends_on` | MODEL-04-M6 |
 | `done_when` | The receipt satisfies every MODEL-04 oracle clause: two prompts, every layer traversed, matching reference logits/tokens/text, no reduced-model substitution, all receipt clauses present with exact values; delivery status line updated; `git diff --check` clean. |
-| `integrable` | Yes — the receipt is evidence; EXEC-01-M4 and EXEC-02 read it as their MODEL-04 gate; CLOSE-01 reconciles it. |
+| `integrable` | Yes — the receipt is evidence; EXEC-01-U2 and EXEC-02 read it as their MODEL-04 gate; CLOSE-01 reconciles it. |
 | `first_failing_oracle` | None (closeout unit — no new failing oracle); the red state is any missing receipt clause. |
 | `closeout_command` | `cd /Users/ianzepp/work/faberlang/worktrees/<hand>/gradus`; cross-check every receipt clause against the campaign receipt list and the ORACLE comparison record; `git diff --check -- docs/factory/production-ml-library/model04-full-model-reference-inference-receipt.md docs/factory/production-ml-library/model04-full-model-reference-inference-delivery.md` |
 | `expected_observed_result` | The receipt records both prompts' full-layer traversal with matching reference logits/tokens/text and first-divergence `none` (or the routed first divergence), every receipt clause populated, no reduced-model claim; the delivery status line names the MODEL-04-G gate result; `git diff --check` silent. |
 | `est_work_tokens` | 3k–5k |
-| `est_basis` | Closeout-row precedent at micro-unit scale: EXEC-01-M5 aggregate-closeout rows (3k–5k) and the pml5-closeout receipt shape; one evidence record + status update. |
+| `est_basis` | Closeout-row precedent at micro-unit scale: EXEC-01-U3 aggregate-closeout rows (3k–5k) and the pml5-closeout receipt shape; one evidence record + status update. |
 | `tool_latency` | Low — no model run; receipt assembly + cross-check only. |
 | `local_corpus_boundary` | Derived facts only (identity, hashes, token ids, text, timing) — never model bytes. |
 | `hardware/backend authority` | burgus CPU/reference facts recorded as observed; no Metal/CUDA claim. |
