@@ -201,6 +201,7 @@ The campaign already sequences these: `TRUTH-01 → LIB-01 → LIB-02 + LIB-03 �
 | Field | Value |
 | --- | --- |
 | `outcome` | Executed full-prefill logits for the real SmolLM2-360M file through the U1.8 surface vs the pinned llama.cpp comparator (llama.cpp 10150 / `dee2a846b`, binary SHA-256 `e5c153a1…52a`) under the gi0-numeric-contract discipline; first-divergence receipt (none expected on the declared window). |
+| `execution_engine` | Compiled route — `faber run --target rust` executes the prefill (llvm-host as fallback). The MIR stepper is explicitly NOT the receipt-tier engine (structural/proba tier only). Comparison: pinned llama.cpp comparator via the radix `faber-prefill-oracle` contract (`compare_gpu_logits` / `PrefillReceipt` / `ExecutableRegime` / `admit_pinned_file`); first-divergence receipt per the gi0 contract. |
 | `write_scope` | `exempla/dense-prefill-smollm2/` (consumer + README receipt), `docs/factory/production-ml-library/pml0-support-matrix.md` (SmolLM2 dense reference execution claim at the executed tier), `docs/regression-corpus.md`, `docs/module-map.md`, `docs/api-reference.md`, `docs/diagnostics.md`, README as needed |
 | `first_failing_oracle` | The pinned comparator's full-vocab logprob surface for the pinned correctness-fixture window (positions 0..16): finite gate, top-1 exact, top-5 overlap ≥4/5, Δ=1e-5 band; the first diverging position, token ids, failing thresholds, and max band deviation are recorded (campaign rule 5). |
 | `closeout_command` | Structural gates (U1.1 shape) with `exempla/dense-prefill-smollm2` and the receipt-scope changed-path list; the run writes the receipt into the exempla README. |
@@ -214,6 +215,7 @@ The campaign already sequences these: `TRUTH-01 → LIB-01 → LIB-02 + LIB-03 �
 | Field | Value |
 | --- | --- |
 | `outcome` | Executed full-prefill logits for the real Qwen2.5-0.5B file through the SAME U1.8 surface vs the pinned llama.cpp toolset under the same comparison policy (delivery open question 1 default: reuse the pinned binary); first-divergence receipt (GQA attention exercised). |
+| `execution_engine` | Compiled route — `faber run --target rust` executes the prefill (llvm-host as fallback). The MIR stepper is explicitly NOT the receipt-tier engine (structural/proba tier only). Comparison: pinned llama.cpp comparator via the radix `faber-prefill-oracle` contract (`compare_gpu_logits` / `PrefillReceipt` / `ExecutableRegime` / `admit_pinned_file`); first-divergence receipt per the gi0 contract. |
 | `write_scope` | `exempla/dense-prefill-qwen2/` (consumer + README receipt), `docs/factory/production-ml-library/pml0-support-matrix.md` (Qwen2.5-0.5B dense reference execution claim at the executed tier), `docs/regression-corpus.md`, `docs/module-map.md`, `docs/api-reference.md`, `docs/diagnostics.md`, README as needed |
 | `first_failing_oracle` | Same policy as U1.9 on the qwen2 row. |
 | `closeout_command` | Structural gates with `exempla/dense-prefill-qwen2`; the run writes the receipt into the exempla README. |
@@ -281,6 +283,7 @@ The campaign already sequences these: `TRUTH-01 → LIB-01 → LIB-02 + LIB-03 �
 | Field | Value |
 | --- | --- |
 | `outcome` | Executed proof on the real SmolLM2 file: full dense prefill and incremental decode agree on logits at the declared boundary; two prompts prove reset/reuse; context rejection, cancellation observation, deterministic replay, and session identity are executed and recorded — one receipt per the A5 contract. |
+| `execution_engine` | Compiled route — `faber run --target rust` executes prefill and incremental decode (llvm-host as fallback). The MIR stepper is explicitly NOT the receipt-tier engine (structural/proba tier only). Comparison: pinned llama.cpp comparator via the radix `faber-prefill-oracle` contract (`compare_gpu_logits` / `PrefillReceipt` / `ExecutableRegime` / `admit_pinned_file`); first-divergence receipt per the gi0 contract. |
 | `write_scope` | `exempla/dense-session-smollm2/` (consumer + README receipt), `docs/factory/production-ml-library/pml0-support-matrix.md` (SmolLM2 KV/prefill-decode execution at the executed tier), `docs/regression-corpus.md`, `docs/module-map.md`, `docs/api-reference.md`, `docs/diagnostics.md`, README as needed |
 | `first_failing_oracle` | The U1.9 comparator policy on the decode path: prefill-vs-decode logit agreement at the declared boundary; reset/replay determinism (same seed + input → same tokens). |
 | `closeout_command` | Structural gates with `exempla/dense-session-smollm2`; the run writes the receipt into the exempla README. |
@@ -294,6 +297,7 @@ The campaign already sequences these: `TRUTH-01 → LIB-01 → LIB-02 + LIB-03 �
 | Field | Value |
 | --- | --- |
 | `outcome` | Same executed proof for the real Qwen2.5-0.5B file (GQA KV heads exercised): prefill/decode agreement at the declared boundary, two-prompt reset/reuse, and the state family (context rejection, cancellation, replay, session identity) executed and recorded. |
+| `execution_engine` | Compiled route — `faber run --target rust` executes prefill and incremental decode (llvm-host as fallback). The MIR stepper is explicitly NOT the receipt-tier engine (structural/proba tier only). Comparison: pinned llama.cpp comparator via the radix `faber-prefill-oracle` contract (`compare_gpu_logits` / `PrefillReceipt` / `ExecutableRegime` / `admit_pinned_file`); first-divergence receipt per the gi0 contract. |
 | `write_scope` | `exempla/dense-session-qwen2/` (consumer + README receipt), `docs/factory/production-ml-library/pml0-support-matrix.md` (Qwen2.5-0.5B KV/prefill-decode execution at the executed tier), `docs/regression-corpus.md`, `docs/module-map.md`, `docs/api-reference.md`, `docs/diagnostics.md`, README as needed |
 | `first_failing_oracle` | Same policy as U2.5 on the qwen2 row. |
 | `closeout_command` | Structural gates with `exempla/dense-session-qwen2`; the run writes the receipt into the exempla README. |
