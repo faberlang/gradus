@@ -17,7 +17,7 @@ row-oracle docs (`fixtures/safetensors/safetensors-row-oracle.md`,
 tokenizer-identity-oracle.md`), not duplicated.
 
 This matrix holds **admitted rows only**, per `pml0-support-matrix-schema.md`
-§2/§3 (fail-closed R1–R11; one row is the unit of support claim). Eleven
+§2/§3 (fail-closed R1–R11; one row is the unit of support claim). Twelve
 admitted rows: two PML2 model-file format rows (Safetensors, GGUF), two PML3
 architecture rows (one training, one selected inference), one PML4
 training-layer row, one PML5 inference-layer row, two GGUF-A3
@@ -25,8 +25,9 @@ packed-storage materialization rows at the **output-checked slice tier**
 (rows 7–8, C3-U6), one GGUF-A2 artifact-backed tokenizer runtime row at
 the **executed probe tier** (row 9, LIB-02-U4-1/U4-3), one REF-01 dense
 reference primitive row (row 10, generic RMSNorm, executed proof —
-REF-01-U1.1), and one qwen2 architecture-adapter row (row 11, executed
-descriptor-resolution tier — REF-01-U1.7). Every row is
+REF-01-U1.1), one qwen2 architecture-adapter row (row 11, executed
+descriptor-resolution tier — REF-01-U1.7), and one generic dense
+transformer-block row (row 12, executed proof tier — REF-01-U1.5). Every row is
 **structural tier** — the executed tier is recorded, never claimed (see §2 reject log and
 each row's structural-tier note).
 
@@ -331,6 +332,20 @@ no tensor-payload read (REF-01-U1.7, 2026-08-14). This is the executed
 **adapter** phase only — it does **NOT** claim tensor materialization, model
 execution, logits, or device execution; CTO8-1 stays the named gate.
 
+### Row 12 — generic dense transformer block, executed proof tier (REF-01-U1.5)
+
+| Field | Value |
+| --- | --- |
+| `family` | REF-01 dense reference — ordered dense transformer block, `gradus:transformer` |
+| `dtype` | F32 staged carrier only (the admitted row; the composed rows' `_typo` gates reject non-f32) |
+| `shape` | block input/output `[T, D]`; q `[T, H·D]`, k/v `[T, K·D]` with `0 < K ≤ H`, `H % K == 0`; attention output projection `[H·D, H·D]`; MLP gate/up `[D, F]`, down `[F, D]`; all runtime-derived (no fixed-shape constants) |
+| `formula` | `ln1 = rmsnorm(x, ln1_s, ε)` → GQA attention (causal + RoPE: `q/k` rotated at their positions via the configurable RoPE row, scaled causal scores, per-head KV groups, head concatenation, `[H·D, H·D]` output projection) → `r1 = x + ctx` → `ln2 = rmsnorm(r1, ln2_s, ε)` → `h = swiglu(gate, up, wd, bd)` → `r2 = ln2 + h` — composing the U1.1 (RMSNorm), U1.2 (SiLU/SwiGLU), and U1.4 (multi-head GQA) rows |
+| `typed errors` | `TransformerError`: mapped sub-call errors by documented causa text — rank (`rmsnorm requires rank >= 1`, `swiglu requires rank-2 gate and up`, `multi-head attention requires rank-2 tensors`, `linear requires rank-2 input`), shape (`query, key, value must share shape`, `output projection must be [H*D, H*D]`, `shapes not broadcastable`), dtype (`dtype mismatch`), epsilon (`negative epsilon`), position (`negative position`), rope dim (`rope dim exceeds head width`, …) |
+| `oracle ref` | independent f64 evaluation of the documented block formulas (external Python/numpy, the PML3 `transformer_block` pin precedent) for a small synthetic config — T=2, D=16, F=16, n_h=4, n_kv=2, head_dim=4, positions [0,1], rope_dim 4, consecutive-pair base 100000, ε=1e-5 — pinned within the documented **5e-4** absolute tolerance |
+| `evidence links` | `src/transformer.fab` (`dense_block`), `src/transformer.proba` (dense-block pin subset + typed error contract), `exempla/dense-block/` (faber.toml, src/main.fab, README.md receipt), `pml5-ref01-dense-reference-delivery.md` §REF-01-U1.5 |
+| `executed proof` | `exempla/dense-block` runs through package MIR (hand-7 Radix binary) — exit 0, **32 PASS / 0 FAIL** on the pinned f64 references (2026-08-14 receipt) |
+| `compatibility policy` | exact admitted combination: the ordered dense block over the F32 staged carrier — input RMSNorm → GQA attention (causal + RoPE) → residual → post-attn RMSNorm → SwiGLU MLP → residual — shared by the llama and qwen2 dense rows (no per-row constants). Non-goals: no model execution, logits, tokens, or device execution (CTO8-1 stays the named gate); no full-model stack (that is the U1.8 assembly row); no non-f32 dtypes |
+
 ## 2. Reject log (recorded, never support)
 
 | Proposed row | Reject reason (gate) |
@@ -370,12 +385,13 @@ execution, logits, or device execution; CTO8-1 stays the named gate.
 
 ```bash
 cd /Users/ianzepp/work/faberlang/gradus
-# 1. Eleven admitted rows (2 PML2 format, 2 PML3 architecture, 1 PML4
+# 1. Twelve admitted rows (2 PML2 format, 2 PML3 architecture, 1 PML4
 #    training-layer, 1 PML5 inference-layer, 2 GGUF-A3 output-checked
 #    slice materialization, 1 GGUF-A2 executed-probe tokenizer runtime,
 #    1 REF-01 dense reference primitive, 1 REF-01 qwen2 architecture
-#    adapter); the ten schema-version rows carry all 11 schema fields
-#    (row 10, the REF-01 primitive row, uses its own Field/Value set).
+#    adapter, 1 REF-01 generic dense transformer block); the ten
+#    schema-version rows carry all 11 schema fields (rows 10 and 12, the
+#    REF-01 primitive/block rows, use their own Field/Value sets).
 grep -c '^| `format`' docs/factory/production-ml-library/pml0-support-matrix.md   # 10
 grep -c '^| `schema version`' docs/factory/production-ml-library/pml0-support-matrix.md   # 10
 # 2. Committed unit commits + oracle pins cited as evidence links.

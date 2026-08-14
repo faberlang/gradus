@@ -33,7 +33,7 @@ and [`exempla/gguf-inspect/README.md`](../exempla/gguf-inspect/README.md).
 | `gradus:optimize` | `src/optimize.fab` | SGD optimizer state: slots, step, wires (PML4) |
 | `gradus:nn` | `src/nn.fab` | Primitives: `linear`, `gelu`, `layernorm`, `rmsnorm`, `silu`, `swiglu` + fixed-shape rows (PML3; RMSNorm REF-01-U1.1, SiLU/SwiGLU REF-01-U1.2) |
 | `gradus:attention` | `src/attention.fab` | SDPA + RoPE (fixed-shape row + staged surface, PML3); configurable RoPE — frequency base/scale/pair policy, consecutive-pair vs interleaved-pair (REF-01-U1.3); multi-head attention with GQA KV-head sharing, causal + RoPE, output projection (REF-01-U1.4) |
-| `gradus:transformer` | `src/transformer.fab` | Transformer block (fixed-shape row + staged surface, PML3) |
+| `gradus:transformer` | `src/transformer.fab` | Transformer block (fixed-shape row + staged surface, PML3); generic dense transformer block — input RMSNorm → GQA attention (causal + RoPE) → residual → post-attn RMSNorm → SwiGLU MLP → residual, composing the U1.1/U1.2/U1.4 rows (REF-01-U1.5) |
 | `gradus:train` | `src/train.fab` | Train steps, schedules, mode, RNG, dropout, checkpoint `Tabula` (PML4) |
 | `gradus:metrics` | `src/metrics.fab` | Defined metrics: `accuratezza`, `Metricum` (PML4) |
 | `gradus:data` | `src/data.fab` | Stub — batching/shuffling/tokenization declared future |

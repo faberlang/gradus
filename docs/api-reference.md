@@ -453,6 +453,18 @@ FFN → residual → pre-loss LN. Never imports `gradus:train`.
   lista<numerus> positions, numerus dim) → tensor.Tensor ⇥ TransformerError`
   — shape-generic transformer block over the staged carrier (mode 2 =
   causal + RoPE, the selected inference row).
+- `functio dense_block(tensor.Tensor x, tensor.Tensor ln1_s, f32 epsilon,
+  tensor.Tensor wq, tensor.Tensor bq, tensor.Tensor wk, tensor.Tensor bk,
+  tensor.Tensor wv, tensor.Tensor bv, tensor.Tensor wo, numerus num_heads,
+  numerus num_kv_heads, f32 scale, lista<numerus> positions, numerus
+  rope_dim, attention.RopeConfigura rope_configura, tensor.Tensor ln2_s,
+  tensor.Tensor wg, tensor.Tensor bg, tensor.Tensor wu, tensor.Tensor bu,
+  tensor.Tensor wd, tensor.Tensor bd) → tensor.Tensor ⇥ TransformerError`
+  — the generic dense transformer block over the staged carrier
+  (REF-01-U1.5): input RMSNorm → GQA attention (causal + RoPE, U1.4) →
+  residual → post-attn RMSNorm → SwiGLU MLP (U1.2) → residual, composing
+  the U1.1/U1.2/U1.4 rows; no fixed-shape constants (every shape derives
+  from the runtime tensors and the head counts).
 
 ## gradus:train
 

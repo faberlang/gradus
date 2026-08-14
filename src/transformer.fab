@@ -218,7 +218,7 @@ functio _mappa(textus c) → TransformerError {
     si c ≡ "element count above ceiling" {
         redde finge ProductumSupraLimitem { causa = c }
     }
-    si c ≡ "linear requires rank-2 input" aut c ≡ "linear requires rank-2 weight" aut c ≡ "layernorm requires rank >= 1" aut c ≡ "matmul requires rank-2 operands" aut c ≡ "attention requires rank-2 tensors" {
+    si c ≡ "linear requires rank-2 input" aut c ≡ "linear requires rank-2 weight" aut c ≡ "layernorm requires rank >= 1" aut c ≡ "rmsnorm requires rank >= 1" aut c ≡ "matmul requires rank-2 operands" aut c ≡ "attention requires rank-2 tensors" aut c ≡ "multi-head attention requires rank-2 tensors" aut c ≡ "swiglu requires rank-2 gate and up" {
         redde finge GradusMismatch { causa = c }
     }
     si c ≡ "inner dimensions mismatch" {
@@ -365,4 +365,128 @@ functio transformer_block(
     fixum tensor.Tensor h2 ← _linear(a1, wf2, bf2)
     fixum tensor.Tensor r2 ← _add(ln2, h2)
     redde _layernorm(r2, ln3_s, ln3_o)
+}
+
+# =========================================================================
+# REF-01-U1.5 — the generic dense transformer block (dense_block).
+# =========================================================================
+#
+# --- Contract (pml5-ref01-dense-reference-delivery.md REF-01-U1.5) --------
+# The ordered dense transformer block in gradus:transformer:
+#   ln1  = rmsnorm(x, ln1_s, ε)                 # input RMSNorm (U1.1)
+#   qb   = linear(ln1, wq, bq)                  # [T, H*D]
+#   kb   = linear(ln1, wk, bk)                  # [T, K*D]
+#   vb   = linear(ln1, wv, bv)                  # [T, K*D]
+#   ctx  = multi_head_attention(qb, kb, vb, wo, n_h, n_kv, scale,
+#                               positions, rope_dim, cfg)   # GQA (U1.4)
+#   r1   = x + ctx                              # residual 1
+#   ln2  = rmsnorm(r1, ln2_s, ε)                # post-attn RMSNorm (U1.1)
+#   h    = swiglu(linear(ln2, wg, bg), linear(ln2, wu, bu), wd, bd)  # U1.2
+#   r2   = ln2 + h                              # residual 2 -> block output
+# Composes the U1.1 (rmsnorm), U1.2 (swiglu), and U1.4
+# (multi_head_attention) rows over the staged f32 carrier; causal + RoPE
+# attention (the inference composition). No fixed-shape constants: every
+# shape derives from the runtime tensors and the head counts. The F32 row
+# is the admitted row (the composed rows' contract). The output is the
+# final residual r2 [T, D]; a final norm / output projection is model
+# assembly (REF-01-U1.8), not the block.
+#
+# --- Autograd independence (PML3 thesis, forward-without-autograd) --------
+# Same posture as transformer_block: no autograd import, no gradient path.
+#
+# --- Compiler-boundary notes ---------------------------------------------
+# Same posture as transformer_block: the staged carrier makes the block
+# shape-generic at runtime (R3); sub-call errors are mapped into
+# TransformerError by their documented causa text (the _mappa pattern).
+
+# rmsnorm wrapper — nn.rmsnorm → TransformerError.
+@ privata
+functio _rmsnorm(tensor.Tensor x, tensor.Tensor s, f32 epsilon) → tensor.Tensor ⇥ TransformerError {
+    fac {
+        redde nn.rmsnorm(x, s, epsilon)
+    }
+    cape err {
+        iace _mappa(nn.causa(err))
+    }
+}
+
+# swiglu wrapper — nn.swiglu → TransformerError.
+@ privata
+functio _swiglu(tensor.Tensor gate, tensor.Tensor up, tensor.Tensor down_w, tensor.Tensor down_b) → tensor.Tensor ⇥ TransformerError {
+    fac {
+        redde nn.swiglu(gate, up, down_w, down_b)
+    }
+    cape err {
+        iace _mappa(nn.causa(err))
+    }
+}
+
+# multi-head attention wrapper — attention.multi_head_attention →
+# TransformerError.
+@ privata
+functio _multi_attentio(
+    tensor.Tensor q, tensor.Tensor k, tensor.Tensor v, tensor.Tensor wo,
+    numerus num_heads, numerus num_kv_heads, f32 scale,
+    lista<numerus> positions, numerus rope_dim, attention.RopeConfigura cfg
+) → tensor.Tensor ⇥ TransformerError {
+    fac {
+        redde attention.multi_head_attention(q, k, v, wo, num_heads, num_kv_heads, scale, positions, rope_dim, cfg)
+    }
+    cape err {
+        iace _mappa(attention.causa(err))
+    }
+}
+
+# -------------------------------------------------------------------------
+# dense_block — the generic dense transformer block over the staged carrier.
+#
+#   x      [T,D] input
+#   ln1_s  [D]  input RMSNorm scale (no offset — the llama-arch norm family)
+#   epsilon      RMSNorm epsilon (llama default 1e-5; explicit per row)
+#   wq/bq  [D,H*D]/[H*D]  q projection
+#   wk/bk  [D,K*D]/[K*D]  k projection (K <= H, H % K == 0)
+#   wv/bv  [D,K*D]/[K*D]  v projection
+#   wo     [H*D,H*D]      attention output projection
+#   num_heads / num_kv_heads
+#   scale    dk scaling factor (1/sqrt(head_dim))
+#   positions / rope_dim / cfg  the U1.3 configurable RoPE (causal + RoPE)
+#   ln2_s  [D]  post-attn RMSNorm scale
+#   wg/bg  [D,F]/[F]  SwiGLU gate projection
+#   wu/bu  [D,F]/[F]  SwiGLU up projection
+#   wd/bd  [F,D]/[D]  SwiGLU down projection
+#
+# Returns r2 — the block output [T, D]. Shape-generic at runtime (R3).
+# -------------------------------------------------------------------------
+
+@ publica
+functio dense_block(
+    tensor.Tensor x,
+    tensor.Tensor ln1_s,
+    f32 epsilon,
+    tensor.Tensor wq, tensor.Tensor bq,
+    tensor.Tensor wk, tensor.Tensor bk,
+    tensor.Tensor wv, tensor.Tensor bv,
+    tensor.Tensor wo,
+    numerus num_heads,
+    numerus num_kv_heads,
+    f32 scale,
+    lista<numerus> positions,
+    numerus rope_dim,
+    attention.RopeConfigura cfg,
+    tensor.Tensor ln2_s,
+    tensor.Tensor wg, tensor.Tensor bg,
+    tensor.Tensor wu, tensor.Tensor bu,
+    tensor.Tensor wd, tensor.Tensor bd
+) → tensor.Tensor ⇥ TransformerError {
+    fixum tensor.Tensor ln1 ← _rmsnorm(x, ln1_s, epsilon)
+    fixum tensor.Tensor qb ← _linear(ln1, wq, bq)
+    fixum tensor.Tensor kb ← _linear(ln1, wk, bk)
+    fixum tensor.Tensor vb ← _linear(ln1, wv, bv)
+    fixum tensor.Tensor ctx ← _multi_attentio(qb, kb, vb, wo, num_heads, num_kv_heads, scale, positions, rope_dim, cfg)
+    fixum tensor.Tensor r1 ← _add(x, ctx)
+    fixum tensor.Tensor ln2 ← _rmsnorm(r1, ln2_s, epsilon)
+    fixum tensor.Tensor gate ← _linear(ln2, wg, bg)
+    fixum tensor.Tensor up ← _linear(ln2, wu, bu)
+    fixum tensor.Tensor h ← _swiglu(gate, up, wd, bd)
+    redde _add(ln2, h)
 }
