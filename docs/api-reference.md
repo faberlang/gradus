@@ -364,6 +364,10 @@ proofs.
 - `functio layernorm(tensor.Tensor x, tensor.Tensor scale, tensor.Tensor
   offset, f32 epsilon) → tensor.Tensor ⇥ NnError` — shape-generic LayerNorm
   over the last axis.
+- `functio rmsnorm(tensor.Tensor x, tensor.Tensor scale, f32 epsilon) →
+  tensor.Tensor ⇥ NnError` — shape-generic RMSNorm over the last axis, no
+  centering (`x / sqrt(mean(x²) + ε) · γ`; the llama-arch norm family,
+  REF-01-U1.1).
 
 ## gradus:attention
 
