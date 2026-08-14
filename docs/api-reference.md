@@ -414,6 +414,18 @@ transformer component — never imports `gradus:transformer`.
   tensor.Tensor v, f32 scale, lista<numerus> positions, numerus dim) →
   tensor.Tensor ⇥ AttentionError` — causal + RoPE SDPA (the inference-row
   mode 2).
+- `functio multi_head_attention(tensor.Tensor q, tensor.Tensor k,
+  tensor.Tensor v, tensor.Tensor wo, numerus num_heads, numerus
+  num_kv_heads, f32 scale, lista<numerus> positions, numerus rope_dim,
+  RopeConfigura rope_configura) → tensor.Tensor ⇥ AttentionError` —
+  multi-head attention with GQA KV-head sharing (REF-01-U1.4): per-head
+  q/k/v splits (0 < num_kv_heads ≤ num_heads, H % K == 0, query head h
+  attends through KV group g = h // (H/K)), scaled causal scores, v
+  accumulation, head concatenation, and the [H·D, H·D] output projection
+  (out = concat · woᵀ, wo in the [in, out] linear layout); q and k are
+  rotated at their positions first via the configurable RoPE row. The
+  inference composition is causal + RoPE; shape-generic (no fixed-shape
+  constants).
 
 ## gradus:transformer
 

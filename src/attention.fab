@@ -624,6 +624,163 @@ functio _attention_core(tensor.Tensor q, tensor.Tensor k, tensor.Tensor v, f32 s
     }
 }
 
+# Column slice of a rank-2 staged tensor: columns [start, start + width)
+# → [rows, width] (the per-head q/k/v split of the multi-head row).
+# Infallible — callers validate shape first (the _transpone posture).
+@ privata
+functio _caput(tensor.Tensor t, numerus start, numerus width) → tensor.Tensor {
+    fixum lista<numerus> f ← t.figura()
+    fixum numerus rows ← f.accipe(0) vel 1
+    fixum numerus full ← f.accipe(1) vel 1
+    varia lista<f32> out ← vacua
+    varia numerus i ← 0
+    dum i < rows {
+        varia numerus j ← 0
+        dum j < width {
+            out.appende(t.datos.accipe(i * full + start + j) vel (0.0 ∷ f32))
+            j ← j + 1
+        }
+        i ← i + 1
+    }
+    redde tensor.Tensor { dtype = t.typus(), forma = [rows, width], datos = out }
+}
+
+# Head concatenation along the last axis via the public math row, with the
+# attention error vocabulary (the concat failures never fire on the row's
+# validated [T, head_dim] parts; mapped for completeness).
+@ privata
+functio _concilio(lista<tensor.Tensor> partes) → tensor.Tensor ⇥ AttentionError {
+    fac {
+        redde math.concatenatio(partes, 1)
+    }
+    cape err {
+        fixum textus c ← math.causa(err)
+        si c ≡ "empty concat list" {
+            iace finge ElementaMismatch { causa = c }
+        }
+        si c ≡ "concat requires rank >= 1" aut c ≡ "axis out of range" {
+            iace finge GradusMismatch { causa = c }
+        }
+        si c ≡ "concat rank mismatch" aut c ≡ "concat dimension mismatch" {
+            iace finge FormaMismatch { causa = c }
+        }
+        si c ≡ "dtype mismatch" {
+            iace finge TypoMismatch { causa = c }
+        }
+        iace finge FormaMismatch { causa = c }
+    }
+}
+
+# matmul through the attention error vocabulary (the _attention_core mapping
+# pattern, shared by the output projection).
+@ privata
+functio _matmul_attentio(tensor.Tensor a, tensor.Tensor b) → tensor.Tensor ⇥ AttentionError {
+    fac {
+        redde math.matmul(a, b)
+    }
+    cape err {
+        fixum textus c ← math.causa(err)
+        si c ≡ "matmul requires rank-2 operands" {
+            iace finge GradusMismatch { causa = c }
+        }
+        si c ≡ "inner dimensions mismatch" {
+            iace finge Incompatibilis { causa = c }
+        }
+        si c ≡ "dtype mismatch" {
+            iace finge TypoMismatch { causa = c }
+        }
+        si c ≡ "element count above ceiling" {
+            iace finge ProductumSupraLimitem { causa = c }
+        }
+        si c ≡ "dimension above ceiling" {
+            iace finge DimensioSupraLimitem { causa = c }
+        }
+        si c ≡ "negative dimension" {
+            iace finge DimensioNegativa { causa = c }
+        }
+        si c ≡ "shapes not broadcastable" {
+            iace finge FormaMismatch { causa = c }
+        }
+        iace finge FormaMismatch { causa = c }
+    }
+}
+
+# Shared multi-head validation (REF-01-U1.4): dtype parity + F32 gate for
+# q/k/v/wo, rank-2, the head-count invariants (0 < num_kv_heads ≤
+# num_heads, num_heads % num_kv_heads == 0), the packed widths (q [T, H·D],
+# k/v [T, K·D], wo [H·D, H·D]), positions length == T, non-negative
+# positions, and the rope dim within the head width. Returns the head dim.
+@ privata
+functio _valida_multi(
+    tensor.Tensor q, tensor.Tensor k, tensor.Tensor v, tensor.Tensor wo,
+    numerus num_heads, numerus num_kv_heads,
+    lista<numerus> positions, numerus rope_dim
+) → numerus ⇥ AttentionError {
+    fixum bivalens _ ← _typo_tres(q, k, v)
+    fixum bivalens _ ← _typo_par(q, wo)
+    fixum lista<numerus> fq ← q.figura()
+    fixum lista<numerus> fk ← k.figura()
+    fixum lista<numerus> fv ← v.figura()
+    fixum lista<numerus> fw ← wo.figura()
+    si fq.longitudo() ≠ 2 aut fk.longitudo() ≠ 2 aut fv.longitudo() ≠ 2 aut fw.longitudo() ≠ 2 {
+        iace finge GradusMismatch { causa = "multi-head attention requires rank-2 tensors" }
+    }
+    si num_heads < 1 {
+        iace finge ConfiguraInvalida { causa = "num_heads must be positive" }
+    }
+    si num_kv_heads < 1 {
+        iace finge ConfiguraInvalida { causa = "num_kv_heads must be positive" }
+    }
+    si num_kv_heads > num_heads {
+        iace finge ConfiguraInvalida { causa = "num_kv_heads must not exceed num_heads" }
+    }
+    si num_heads % num_kv_heads ≠ 0 {
+        iace finge ConfiguraInvalida { causa = "num_heads must be a multiple of num_kv_heads" }
+    }
+    fixum numerus t ← fq.accipe(0) vel 1
+    fixum numerus qw ← fq.accipe(1) vel 1
+    si (fk.accipe(0) vel 1) ≠ t aut (fv.accipe(0) vel 1) ≠ t {
+        iace finge FormaMismatch { causa = "query, key, value must share the token count" }
+    }
+    si t ≡ 0 {
+        iace finge ElementaMismatch { causa = "empty attention input" }
+    }
+    si qw % num_heads ≠ 0 {
+        iace finge ConfiguraInvalida { causa = "query width must be a multiple of num_heads" }
+    }
+    fixum numerus d ← qw / num_heads
+    si d ≡ 0 {
+        iace finge ConfiguraInvalida { causa = "head dim must be positive" }
+    }
+    si (fk.accipe(1) vel 1) ≠ num_kv_heads * d {
+        iace finge FormaMismatch { causa = "key width must equal num_kv_heads * head dim" }
+    }
+    si (fv.accipe(1) vel 1) ≠ num_kv_heads * d {
+        iace finge FormaMismatch { causa = "value width must equal num_kv_heads * head dim" }
+    }
+    si (fw.accipe(0) vel 1) ≠ qw aut (fw.accipe(1) vel 1) ≠ qw {
+        iace finge FormaMismatch { causa = "output projection must be [H*D, H*D]" }
+    }
+    si positions.longitudo() ≠ t {
+        iace finge FormaMismatch { causa = "positions must match the token count" }
+    }
+    itera ex positions fixum p {
+        si p < 0 {
+            iace finge PositioInvalida { causa = "negative position" }
+        }
+    }
+    si rope_dim < 2 {
+        iace finge DimensioInvalida { causa = "rope dim must be at least 2" }
+    }
+    si rope_dim % 2 ≠ 0 {
+        iace finge DimensioInvalida { causa = "rope dim must be even" }
+    }
+    si rope_dim > d {
+        iace finge DimensioInvalida { causa = "rope dim exceeds head width" }
+    }
+    redde d
+}
+
 # -------------------------------------------------------------------------
 # Family: rotary_position_embedding — the RoPE recipe over the staged
 # carrier. x [T,D]; positions is one non-negative integer per row; dim is
@@ -688,4 +845,55 @@ functio scaled_dot_product_causal_rope(tensor.Tensor q, tensor.Tensor k, tensor.
     fixum tensor.Tensor qr ← _rope(q, positions, dim, ROPE_FREQ_BASE, (1.0 ∷ f32), falsum)
     fixum tensor.Tensor kr ← _rope(k, positions, dim, ROPE_FREQ_BASE, (1.0 ∷ f32), falsum)
     redde _attention_core(qr, kr, v, scale, verum)
+}
+
+# -------------------------------------------------------------------------
+# Family: multi_head_attention — multi-head attention with GQA KV-head
+# sharing (REF-01-U1.4). q [T, H·D] and k/v [T, K·D] are the packed
+# projections with K ≤ H and H % K == 0; each query head h attends through
+# its KV group g = h // (H/K). The composition per head: the per-head
+# splits, scaled scores, the GI3 CausalMaskedSoftmax recipe (row i attends
+# columns j ≤ i, diagonal included), v accumulation, then head
+# concatenation and the [H·D, H·D] output projection (wo in the [in, out]
+# linear layout: out = concat · woᵀ, the nn.fab linear posture). q and k
+# are rotated at their positions first via the U1.3 configurable RoPE row —
+# the inference composition is causal + RoPE. The row is shape-generic:
+# every shape derives from the runtime tensors and the head counts; no
+# fixed-shape constants. The F32 row is the admitted row.
+# -------------------------------------------------------------------------
+
+@ publica
+functio multi_head_attention(
+    tensor.Tensor q,
+    tensor.Tensor k,
+    tensor.Tensor v,
+    tensor.Tensor wo,
+    numerus num_heads,
+    numerus num_kv_heads,
+    f32 scale,
+    lista<numerus> positions,
+    numerus rope_dim,
+    RopeConfigura rope_configura
+) → tensor.Tensor ⇥ AttentionError {
+    fixum numerus d ← _valida_multi(q, k, v, wo, num_heads, num_kv_heads, positions, rope_dim)
+    fixum numerus ratio ← num_heads / num_kv_heads
+    fixum f32 base ← rope_configura.base()
+    fixum f32 rope_scale ← rope_configura.scale()
+    fixum bivalens interposita ← _interposita(rope_configura.politica())
+    varia lista<tensor.Tensor> capitas ← vacua
+    varia numerus h ← 0
+    dum h < num_heads {
+        fixum numerus g ← h / ratio
+        fixum tensor.Tensor qh ← _caput(q, h * d, d)
+        fixum tensor.Tensor kg ← _caput(k, g * d, d)
+        fixum tensor.Tensor vg ← _caput(v, g * d, d)
+        fixum tensor.Tensor qr ← _rope(qh, positions, rope_dim, base, rope_scale, interposita)
+        fixum tensor.Tensor kr ← _rope(kg, positions, rope_dim, base, rope_scale, interposita)
+        fixum tensor.Tensor ctx ← _attention_core(qr, kr, vg, scale, verum)
+        capitas.appende(ctx)
+        h ← h + 1
+    }
+    fixum tensor.Tensor concat ← _concilio(capitas)
+    fixum tensor.Tensor wot ← _transpone(wo)
+    redde _matmul_attentio(concat, wot)
 }
