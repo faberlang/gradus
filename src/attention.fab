@@ -148,7 +148,8 @@ discretio AttentionError {
     TypoMismatch { textus causa },
     ElementaMismatch { textus causa },
     PositioInvalida { textus causa },
-    DimensioInvalida { textus causa }
+    DimensioInvalida { textus causa },
+    ConfiguraInvalida { textus causa }
 }
 
 @ publica
@@ -164,6 +165,90 @@ functio causa(AttentionError e) → textus {
         casu ElementaMismatch fixum causa { redde causa }
         casu PositioInvalida fixum causa { redde causa }
         casu DimensioInvalida fixum causa { redde causa }
+        casu ConfiguraInvalida fixum causa { redde causa }
+    }
+}
+
+# -------------------------------------------------------------------------
+# RopePolitica — the RoPE pair-policy discriminator (REF-01 U1.3).
+#   Consecutiva — llama-arch NORM consecutive-pair (2k, 2k+1), the GI3
+#     frozen llama recipe.
+#   Interposita — qwen2 interleaved-pair (k, k+n/2) — the llama.cpp NEOX
+#     half-split layout (pairs offset by n_dims/2).
+# -------------------------------------------------------------------------
+
+@ publica
+discretio RopePolitica {
+    Consecutiva
+    Interposita
+}
+
+# Canonical policy factories (cross-module `finge` of an imported enum's
+# variants is not supported in library context today — the dtype.f32
+# precedent).
+@ publica
+functio politica_consecutiva() → RopePolitica {
+    redde finge Consecutiva
+}
+
+@ publica
+functio politica_interposita() → RopePolitica {
+    redde finge Interposita
+}
+
+# Canonical policy name (surface for probes and diagnostics).
+@ publica
+functio politica_nomen(RopePolitica p) → textus {
+    discerne p {
+        casu Consecutiva { redde "consecutive-pair" }
+        casu Interposita { redde "interleaved-pair" }
+    }
+}
+
+# -------------------------------------------------------------------------
+# RopeConfigura — the configurable RoPE knobs (REF-01 U1.3): frequency base
+# (theta), scale, and pair policy. The validated constructor is
+# structa_rope_configura; the genus itself is the plain carrier (the
+# sampling.Configura precedent).
+# -------------------------------------------------------------------------
+
+@ publica
+genus RopeConfigura {
+    f32 base
+    f32 scale
+    RopePolitica politica
+
+    # Frequency base (theta) of the rotation.
+    functio base() → f32 {
+        redde ego.base
+    }
+
+    # Position/frequency scale multiplier (1.0 = no scaling).
+    functio scale() → f32 {
+        redde ego.scale
+    }
+
+    # Pair policy — consecutive-pair (llama NORM) or interleaved-pair (qwen2).
+    functio politica() → RopePolitica {
+        redde ego.politica
+    }
+}
+
+# The validated RopeConfigura constructor. The frequency base and the scale
+# must be positive and finite; the policy is one of the two admitted
+# variants (Consecutiva / Interposita).
+@ publica
+functio structa_rope_configura(f32 base, f32 scale, RopePolitica politica) → RopeConfigura ⇥ AttentionError {
+    si non (dtype.finita(base)) aut non (base > 0.0) {
+        iace finge ConfiguraInvalida { causa = "rope frequency base must be positive" }
+    }
+    si non (dtype.finita(scale)) aut non (scale > 0.0) {
+        iace finge ConfiguraInvalida { causa = "rope scale must be positive" }
+    }
+    redde RopeConfigura {
+        base = base,
+        scale = scale,
+        politica = politica
     }
 }
 
@@ -354,16 +439,21 @@ functio _softmax(tensor.Tensor x, bivalens causalis) → tensor.Tensor {
     redde tensor.Tensor { dtype = x.typus(), forma = f, datos = out }
 }
 
-# RoPE rotation over the LAST axis of a rank-2 tensor: the llama-arch NORM
+# RoPE rotation over the LAST axis of a rank-2 tensor (REF-01-U1.3
+# configurable row). With interposita = falsum it is the llama-arch NORM
 # consecutive-pair rotation (2k, 2k+1) for k < dim/2 with
-# theta = pos · freq_base^(-2k/dim); elements beyond dim are untouched.
-# Infallible — callers validate shape/positions/dim first.
+# theta = pos · scale · base^(-2k/dim); with interposita = verum it is the
+# qwen2 interleaved-pair rotation (k, k+dim/2) with the same theta (the
+# llama.cpp NEOX half-split layout, pairs offset by n_dims/2). Elements
+# beyond dim are untouched. Infallible — callers validate
+# shape/positions/dim first.
 @ privata
-functio _rope(tensor.Tensor x, lista<numerus> positions, numerus dim) → tensor.Tensor {
+functio _rope(tensor.Tensor x, lista<numerus> positions, numerus dim, f32 freq_base, f32 scale, bivalens interposita) → tensor.Tensor {
     fixum lista<numerus> f ← x.figura()
     fixum numerus t ← f.accipe(0) vel 1
     fixum numerus d ← f.accipe(1) vel 1
     fixum f32 dim_f ← (dim ↦ f32)
+    fixum numerus half ← dim / 2
     varia lista<f32> out ← vacua
     varia numerus row ← 0
     dum row < t {
@@ -373,16 +463,40 @@ functio _rope(tensor.Tensor x, lista<numerus> positions, numerus dim) → tensor
         varia numerus col ← 0
         dum col < d {
             si col < dim {
-                fixum numerus k ← col / 2
-                fixum f32 kf ← (k ↦ f32)
-                fixum f32 theta ← pos_f * ROPE_FREQ_BASE.potentia((0.0 - 2.0 * kf) / dim_f)
-                fixum f32 c ← _cosinus(theta)
-                fixum f32 s ← _sinus(theta)
-                fixum f32 x0 ← x.datos.accipe(base + col) vel (0.0 ∷ f32)
-                fixum f32 x1 ← x.datos.accipe(base + col + 1) vel (0.0 ∷ f32)
-                out.appende(x0 * c - x1 * s)
-                out.appende(x0 * s + x1 * c)
-                col ← col + 2
+                si interposita {
+                    # qwen2 interleaved-pair: output column col belongs to
+                    # pair k (0..half-1) and is its first (col < half) or
+                    # second (col >= half) element.
+                    fixum numerus k ← col % half
+                    fixum f32 kf ← (k ↦ f32)
+                    fixum f32 theta ← pos_f * scale * freq_base.potentia((0.0 - 2.0 * kf) / dim_f)
+                    fixum f32 c ← _cosinus(theta)
+                    fixum f32 s ← _sinus(theta)
+                    si col < half {
+                        fixum f32 x0 ← x.datos.accipe(base + k) vel (0.0 ∷ f32)
+                        fixum f32 x1 ← x.datos.accipe(base + k + half) vel (0.0 ∷ f32)
+                        out.appende(x0 * c - x1 * s)
+                    }
+                    secus {
+                        fixum f32 x0 ← x.datos.accipe(base + k) vel (0.0 ∷ f32)
+                        fixum f32 x1 ← x.datos.accipe(base + k + half) vel (0.0 ∷ f32)
+                        out.appende(x0 * s + x1 * c)
+                    }
+                    col ← col + 1
+                }
+                secus {
+                    # llama-arch NORM consecutive-pair (2k, 2k+1).
+                    fixum numerus k ← col / 2
+                    fixum f32 kf ← (k ↦ f32)
+                    fixum f32 theta ← pos_f * scale * freq_base.potentia((0.0 - 2.0 * kf) / dim_f)
+                    fixum f32 c ← _cosinus(theta)
+                    fixum f32 s ← _sinus(theta)
+                    fixum f32 x0 ← x.datos.accipe(base + col) vel (0.0 ∷ f32)
+                    fixum f32 x1 ← x.datos.accipe(base + col + 1) vel (0.0 ∷ f32)
+                    out.appende(x0 * c - x1 * s)
+                    out.appende(x0 * s + x1 * c)
+                    col ← col + 2
+                }
             }
             secus {
                 out.appende(x.datos.accipe(base + col) vel (0.0 ∷ f32))
@@ -392,6 +506,16 @@ functio _rope(tensor.Tensor x, lista<numerus> positions, numerus dim) → tensor
         row ← row + 1
     }
     redde tensor.Tensor { dtype = x.typus(), forma = f, datos = out }
+}
+
+# Interleaved-pair flag from the typed policy (falsum = consecutive-pair
+# llama NORM, verum = interleaved-pair qwen2). Infallible.
+@ privata
+functio _interposita(RopePolitica politica) → bivalens {
+    discerne politica {
+        casu Consecutiva { redde falsum }
+        casu Interposita { redde verum }
+    }
 }
 
 # Shared q/k/v validation: dtype parity + F32 gate, rank-2, shared [T,D]
@@ -501,15 +625,27 @@ functio _attention_core(tensor.Tensor q, tensor.Tensor k, tensor.Tensor v, f32 s
 }
 
 # -------------------------------------------------------------------------
-# Family: rotary_position_embedding — the GI3 Rope recipe over the staged
+# Family: rotary_position_embedding — the RoPE recipe over the staged
 # carrier. x [T,D]; positions is one non-negative integer per row; dim is
 # the (even) rotation width over the last axis.
+#
+# rotary_position_embedding is the fixed llama-arch NORM convenience row
+# (consecutive-pair, freq_base 100000, scale 1.0 — the GI3 frozen llama
+# recipe). rotary_position_embedding_configura generalizes it: frequency
+# base (theta), scale, and pair policy (consecutive-pair llama NORM vs
+# interleaved-pair qwen2, REF-01-U1.3).
 # -------------------------------------------------------------------------
 
 @ publica
 functio rotary_position_embedding(tensor.Tensor x, lista<numerus> positions, numerus dim) → tensor.Tensor ⇥ AttentionError {
     fixum lista<numerus> _ ← _valida_rope(x, positions, dim)
-    redde _rope(x, positions, dim)
+    redde _rope(x, positions, dim, ROPE_FREQ_BASE, (1.0 ∷ f32), falsum)
+}
+
+@ publica
+functio rotary_position_embedding_configura(tensor.Tensor x, lista<numerus> positions, numerus dim, RopeConfigura configura) → tensor.Tensor ⇥ AttentionError {
+    fixum lista<numerus> _ ← _valida_rope(x, positions, dim)
+    redde _rope(x, positions, dim, configura.base(), configura.scale(), _interposita(configura.politica()))
 }
 
 # -------------------------------------------------------------------------
@@ -549,7 +685,7 @@ functio scaled_dot_product_causal(tensor.Tensor q, tensor.Tensor k, tensor.Tenso
 functio scaled_dot_product_causal_rope(tensor.Tensor q, tensor.Tensor k, tensor.Tensor v, f32 scale, lista<numerus> positions, numerus dim) → tensor.Tensor ⇥ AttentionError {
     fixum lista<numerus> _ ← _valida_triplum(q, k, v)
     fixum lista<numerus> _ ← _valida_rope(q, positions, dim)
-    fixum tensor.Tensor qr ← _rope(q, positions, dim)
-    fixum tensor.Tensor kr ← _rope(k, positions, dim)
+    fixum tensor.Tensor qr ← _rope(q, positions, dim, ROPE_FREQ_BASE, (1.0 ∷ f32), falsum)
+    fixum tensor.Tensor kr ← _rope(k, positions, dim, ROPE_FREQ_BASE, (1.0 ∷ f32), falsum)
     redde _attention_core(qr, kr, v, scale, verum)
 }

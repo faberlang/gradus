@@ -41,7 +41,7 @@ pinned row is space-prefix-free (add_space_prefix = false)
 
 | Module | Error type | Variants | Source |
 | --- | --- | ---: | --- |
-| `gradus:attention` | `AttentionError` | 10 | `src/attention.fab` |
+| `gradus:attention` | `AttentionError` | 11 | `src/attention.fab` |
 | `gradus:cache` | `CacheError` | 8 | `src/cache.fab` |
 | `gradus:decode` | `DecodeError` | 11 | `src/decode.fab` |
 | `gradus:dtype` | `DTypeError` | 4 | `src/dtype.fab` |
@@ -132,6 +132,7 @@ Source: `src/attention.fab`. Render with module `causa(e)`.
 | `AttentionError.ElementaMismatch` | Element-count / emptiness failure. | `empty attention input`<br>`empty rope input` | Fix caller shapes, ranks, dtypes, and element counts so they satisfy the operation contract. |
 | `AttentionError.PositioInvalida` | Invalid position / epoch / step (negative or out of range). | `negative position` | Correct the field to the documented admitted range and re-construct. |
 | `AttentionError.DimensioInvalida` | Invalid dimension parameter (e.g. RoPE dim, embedding width). | `rope dim exceeds head width`<br>`rope dim must be at least 2`<br>`rope dim must be even` | Correct the field to the documented admitted range and re-construct. |
+| `AttentionError.ConfiguraInvalida` | Invalid RoPE config (frequency base / scale not positive and finite). | `rope frequency base must be positive`<br>`rope scale must be positive` | Correct the config field to the documented admitted range and re-construct via `structa_rope_configura`. |
 
 ## `gradus:cache` — `CacheError`
 
