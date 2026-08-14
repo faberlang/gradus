@@ -1,6 +1,6 @@
 # Delivery: PML5-GGUF — Qwen3.6 35B End-to-End Inference
 
-**Status**: active — GGUF-A1a and GGUF-A1b implemented; GGUF-A1c is implemented in the transitional A1C micro-unit chain but not yet validated, audited, or integrated (aggregate M8 gate pending)
+**Status**: active — GGUF-A1a and GGUF-A1b implemented; GGUF-A1c passed the aggregate M8R4 gate and integrated to Gradus main at 2b3e41a
 **Campaign**: [`CAMPAIGN.md`](CAMPAIGN.md), mandatory completion of PML5
 **Umbrella**: Radix `gpu-production-readiness` Qwen3.6 invariant
 **Repo**: `gradus`
@@ -389,14 +389,19 @@ callers in one unit; add no forwarding shim and leave no dual GGUF authority.
 identity/manifest values are the only authority; source, compile, and migrated
 format probas pass.
 
-**Implemented evidence**: the A1C clean break is implemented in the
-transitional A1C micro-unit chain (`factory/a1c-chain`, tip 888b656 — M1
-capsule schema-2 producer `1c3bc51`, M2 GGUF caller/parser migration
-`baa32c5`, M3 Safetensors caller migration `3a3d906`, M5 API/support docs
-`fb41344`, plus the visibility-correction fixes). Every micro-unit is
-non-integrable alone; the aggregate M8 package validation and the single
-atomic merge to `factory/merge` are pending, so the chain is not yet
-validated, audited, or integrated.
+**Implemented evidence**: the A1C clean break is implemented across the
+transitional A1C micro-unit chain M1–M7: M1 capsule schema-2 producer
+`1c3bc51`, M2 GGUF caller/parser migration `baa32c5`, M3 Safetensors
+caller/proba migration `3a3d906`, M4 conformance/fixtures schema-2 migration
+`ba2aae9`, M5 API/support docs `fb41344`, M6 inventory re-baseline `4f3abb7`,
+and M7 status records `77dd706`, plus the visibility-correction fixes. The
+refreshed candidate tip `3a1ef0f` passed the aggregate M8R4 gate (green
+receipt `b31b5a86`) and was integrated atomically to Gradus main at `2b3e41a`;
+schema 1 has no live constructor or parser caller and schema 2 is the only
+authority. This closes LIB-01 only — it is not campaign completion and claims
+no exact-Qwen Metal/CUDA execution. The next dependencies remain LIB-02
+(artifact-backed tokenizer/detokenizer) and LIB-03 (checked packed storage and
+tensor materialization).
 
 ### GGUF-A2 — Tokenizer Runtime
 

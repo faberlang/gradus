@@ -39,10 +39,13 @@ BOOL `numerum` rejection. A guarded source adapter separately matches six
 operator-local real files against independent offsets and counts without
 entering tensor data (`exempla/gguf-inspect/README.md`). Neither receipt is a
 tokenizer, architecture admission, model execution, or inference claim. The
-A1C clean-break migration is implemented in the transitional A1C micro-unit
-chain (`factory/a1c-chain`, tip 888b656) but is not yet validated, audited,
-or integrated — the aggregate M8 package validation and atomic merge are
-pending.
+A1C clean-break migration is implemented across the A1C micro-unit chain M1–M7
+(`1c3bc51`, `baa32c5`, `3a3d906`, `ba2aae9`, `fb41344`, `4f3abb7`, `77dd706`),
+passed the aggregate M8R4 gate (green receipt `b31b5a86`), and integrated to
+Gradus main at `2b3e41a`. It is not an executed tier, implies no exact-Qwen
+Metal/CUDA completion, and does not complete the campaign; the next
+dependencies are LIB-02 (tokenizer/detokenizer) and LIB-03 (packed storage and
+tensor materialization).
 
 ## 1. Admitted rows
 
