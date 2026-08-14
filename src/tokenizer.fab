@@ -62,11 +62,18 @@
 #   * tokenizer RUNTIME (encode text → ids) — faber-runtime owns
 #     execution; this module pins and verifies the EXPECTED ids.
 #
+# GGUF-A2 (LIB-02): the artifact-backed byte-level BPE runtime lives in this
+# module too (the runtime section at the bottom). It consumes the vocab/merge
+# arrays through the schema-2 manifest accessors (gradus:model/gguf_manifest)
+# and implements the llama.cpp llm_tokenizer_bpe core at the word boundary.
+#
 # -------------------------------------------------------------------------
 # Schema and pinned-row constants. schema_versio is the public contract
 # identity (tokenizer-identity-schema-1.0.0 → "1.0.0"); bump both the wire
 # form and the constant on a schema change.
 # -------------------------------------------------------------------------
+
+importa ex "gradus:model/gguf_manifest" manifestum
 
 fixum textus schema_versio ← "1.0.0"
 
@@ -200,6 +207,12 @@ fixum textus PINNATA_CONTEXTUS ← "54,369,259,314,253,1734,1789,327,2194,5646,3
 #   IdExtra            — token id outside the admitted range [0, vocab).
 #   ProbeDivergens     — probe id list diverges from the pinned fixture
 #                        (a different tokenizer — must fail admission).
+#   ArtificiumMala     — artifact tokenizer metadata is unavailable
+#                        or malformed (LIB-02-U2 runtime).
+#   MergesMala         — malformed merge entry in the artifact (U2).
+#   IdIgnotum          — unknown token id in decode (out of range) (U2).
+#   VestigiumIgnotum   — display character with no byte mapping (U2).
+#   Utf8Mala           — byte sequence is not valid UTF-8 (U2).
 #   WireMala           — malformed tokenizer identity wire form.
 # -------------------------------------------------------------------------
 
@@ -212,6 +225,11 @@ discretio TokenizerError {
     EogMala { textus causa },
     IdExtra { textus causa },
     ProbeDivergens { textus causa },
+    ArtificiumMala { textus causa },
+    MergesMala { textus causa },
+    IdIgnotum { textus causa },
+    VestigiumIgnotum { textus causa },
+    Utf8Mala { textus causa },
     WireMala { textus causa }
 }
 
@@ -225,6 +243,11 @@ functio causa(TokenizerError e) → textus {
         casu EogMala fixum causa { redde causa }
         casu IdExtra fixum causa { redde causa }
         casu ProbeDivergens fixum causa { redde causa }
+        casu ArtificiumMala fixum causa { redde causa }
+        casu MergesMala fixum causa { redde causa }
+        casu IdIgnotum fixum causa { redde causa }
+        casu VestigiumIgnotum fixum causa { redde causa }
+        casu Utf8Mala fixum causa { redde causa }
         casu WireMala fixum causa { redde causa }
     }
 }
@@ -570,4 +593,340 @@ functio deserializa_identitas(textus wire) → IdentitasTokenizator ⇥ Tokenize
     fixum textus digestio_vocabuli ← partes.accipe(5) vel ""
     fixum textus eog ← partes.accipe(6) vel ""
     redde structa(schema, progenies, pre_tokenizator, digestio_vocabuli, eog, verum, verum)
+}
+
+# -------------------------------------------------------------------------
+# Artifact-backed byte-level BPE runtime (LIB-02-U2, GGUF-A2).
+#
+# The runtime consumes the vocab and merge arrays from a schema-2
+# ManifestumGguf through the U1 accessors (textorum) and implements the
+# llama.cpp llm_tokenizer_bpe core at the word-level boundary:
+#   * gpt2 byte-to-unicode display mapping (each UTF-8 byte of the input maps
+#     to one display codepoint; the vocab/merge strings live in that space),
+#   * ranked bigram merging — one merge at a time, ties broken by leftmost
+#     position — matching the pinned reference queue semantics,
+#   * final-piece vocab lookup with a single-byte (fallback) split,
+#   * decode via the inverse display mapping, concatenating bytes and
+#     decoding UTF-8.
+# The pre-tokenizer is identity at this boundary (U3 composes it). No vocab
+# or merge table is hard-coded here: everything comes from the manifest.
+#
+# -------------------------------------------------------------------------
+
+# Byte-level BPE capability contract. The runtime only implements the gpt2
+# byte-to-unicode convention, so the manifest's declared tokenizer model must
+# be the byte-level family. Independent of the identity contract's pinned
+# SmolLM2 kind constant (clean break posture).
+fixum textus TOKENIZATOR_CAPABILIS ← "gpt2"
+
+# Sentinel rank for a pair absent from the merge table (never merges).
+fixum numerus MERGE_ABSENS ← 9223372036854775807
+
+# The artifact-backed runtime record. `verborum` is the vocab array indexed
+# by token id (decode path); `vocabulum` is the display-token → id map and
+# `concursus` the "left right" merge-pair → rank map (encode path).
+@ publica
+genus Tokenizator {
+    lista<textus> verborum
+    tabula<textus, numerus> vocabulum
+    tabula<textus, numerus> concursus
+    numerus multitudo
+}
+
+# --- Byte ↔ display-codepoint mapping (gpt2 convention) --------------------
+
+# Byte value → display codepoint. Bytes in the printable/Latin-1 ranges map
+# to themselves; the remaining 68 bytes map to 0x100+n in ascending byte
+# order (0x00 → U+0100, 0x20 → U+0120, 0x7F → U+0121, …, 0xAD → U+0143).
+@ privata
+functio _codicillus_ex_octeto(numerus byte) → numerus ⇥ TokenizerError {
+    si byte < 0 aut byte > 255 {
+        iace finge WireMala { causa = "byte value outside 0..255" }
+    }
+    si byte ≥ 0x21 et byte ≤ 0x7E ergo redde byte
+    si byte ≥ 0xA1 et byte ≤ 0xAC ergo redde byte
+    si byte ≥ 0xAE et byte ≤ 0xFF ergo redde byte
+    si byte ≤ 0x20 ergo redde 256 + byte
+    si byte ≤ 0xA0 ergo redde byte + 162
+    redde 323
+}
+
+# Display codepoint → byte value (inverse mapping). Unmappable codepoints
+# are malformed vocab content and fail closed.
+@ privata
+functio _octetus_ex_codicillo(numerus cpt) → numerus ⇥ TokenizerError {
+    si cpt ≥ 0x21 et cpt ≤ 0x7E ergo redde cpt
+    si cpt ≥ 0xA1 et cpt ≤ 0xAC ergo redde cpt
+    si cpt ≥ 0xAE et cpt ≤ 0xFF ergo redde cpt
+    si cpt ≥ 0x100 et cpt ≤ 0x120 ergo redde cpt - 256
+    si cpt ≥ 0x121 et cpt ≤ 0x142 ergo redde cpt - 162
+    si cpt ≡ 0x143 ergo redde 0xAD
+    iace finge VestigiumIgnotum { causa = "display character has no byte mapping (codepoint " + (cpt ↦ textus) + ")" }
+}
+
+# --- Codepoint ↔ textus helpers -------------------------------------------
+
+@ privata
+functio _textus_ex_octeti(lista<numerus> bs) → textus ⇥ TokenizerError {
+    varia lista<numerus<u8>> u8s ← vacua
+    itera ex bs fixum b {
+        u8s.appende(b ∷ numerus<u8>)
+    }
+    fixum octeti o ← u8s ↦ octeti
+    fac {
+        redde o ↦ textus
+    }
+    cape err {
+        iace finge Utf8Mala { causa = "display character bytes are not valid UTF-8" }
+    }
+    iace finge Utf8Mala { causa = "unreachable display character conversion" }
+}
+
+# UTF-8 encode one codepoint to its single-character textus. Display
+# codepoints are ≤ 0x143, so the 1- and 2-byte arms cover the mapping; the
+# longer arms keep the helper total for arbitrary vocab content.
+@ privata
+functio _textus_ex_codicillo(numerus cpt) → textus ⇥ TokenizerError {
+    si cpt < 0 {
+        iace finge WireMala { causa = "negative codepoint" }
+    }
+    si cpt < 0x80 ergo redde _textus_ex_octeti([cpt])
+    si cpt < 0x800 {
+        fixum numerus b0 ← 0xC0 ∨ (cpt ⇒ 6)
+        fixum numerus b1 ← 0x80 ∨ (cpt ∧ 0x3F)
+        redde _textus_ex_octeti([b0, b1])
+    }
+    si cpt < 0x10000 {
+        fixum numerus b0 ← 0xE0 ∨ (cpt ⇒ 12)
+        fixum numerus b1 ← 0x80 ∨ ((cpt ⇒ 6) ∧ 0x3F)
+        fixum numerus b2 ← 0x80 ∨ (cpt ∧ 0x3F)
+        redde _textus_ex_octeti([b0, b1, b2])
+    }
+    si cpt < 0x110000 {
+        fixum numerus b0 ← 0xF0 ∨ (cpt ⇒ 18)
+        fixum numerus b1 ← 0x80 ∨ ((cpt ⇒ 12) ∧ 0x3F)
+        fixum numerus b2 ← 0x80 ∨ ((cpt ⇒ 6) ∧ 0x3F)
+        fixum numerus b3 ← 0x80 ∨ (cpt ∧ 0x3F)
+        redde _textus_ex_octeti([b0, b1, b2, b3])
+    }
+    iace finge WireMala { causa = "codepoint exceeds the Unicode range" }
+}
+
+# UTF-8 decode one character back to its codepoint. A single character is
+# one to four bytes.
+@ privata
+functio _codicillus_ex_vestigio(textus c) → numerus ⇥ TokenizerError {
+    fixum lista<numerus> bs ← _octeti_numeri(c ↦ octeti)
+    fixum numerus n ← bs.longitudo()
+    fixum numerus b0 ← bs.accipe(0) vel 0
+    si n ≡ 1 ergo redde b0
+    fixum numerus b1 ← bs.accipe(1) vel 0
+    si n ≡ 2 ergo redde ((b0 ∧ 0x1F) ⇐ 6) ∨ (b1 ∧ 0x3F)
+    fixum numerus b2 ← bs.accipe(2) vel 0
+    si n ≡ 3 ergo redde ((b0 ∧ 0x0F) ⇐ 12) ∨ ((b1 ∧ 0x3F) ⇐ 6) ∨ (b2 ∧ 0x3F)
+    fixum numerus b3 ← bs.accipe(3) vel 0
+    si n ≡ 4 ergo redde ((b0 ∧ 0x07) ⇐ 18) ∨ ((b1 ∧ 0x3F) ⇐ 12) ∨ ((b2 ∧ 0x3F) ⇐ 6) ∨ (b3 ∧ 0x3F)
+    iace finge VestigiumIgnotum { causa = "malformed display character" }
+}
+
+# Bulk octeti → byte-value bridge (the runtime's analogue of the manifest
+# module's `_octeti_lista`; error-free by construction — the input always
+# comes from a textus UTF-8 encode, so the valor carrier is a byte list).
+@ privata
+functio _octeti_numeri(octeti o) → lista<numerus> {
+    fixum valor v ← o ↦ valor
+    redde v ↦ lista<numerus>
+}
+
+# One display character (the byte-level BPE symbol for a single source byte).
+@ privata
+functio _vestigium_ex_octeto(numerus byte) → textus ⇥ TokenizerError {
+    redde _textus_ex_codicillo(_codicillus_ex_octeto(byte))
+}
+
+# --- Manifest reads and merge-table construction ---------------------------
+
+@ privata
+functio _textum_artificii(manifestum.ManifestumGguf m, textus clavis) → textus ⇥ TokenizerError {
+    fac {
+        redde manifestum.textum(m, clavis)
+    }
+    cape err {
+        iace finge ArtificiumMala { causa = "tokenizer metadata is unavailable: " + manifestum.causa(err) }
+    }
+    iace finge ArtificiumMala { causa = "unreachable tokenizer metadata read" }
+}
+
+@ privata
+functio _textorum_artificii(manifestum.ManifestumGguf m, textus clavis) → lista<textus> ⇥ TokenizerError {
+    fac {
+        redde manifestum.textorum(m, clavis)
+    }
+    cape err {
+        iace finge ArtificiumMala { causa = "tokenizer array is unavailable: " + manifestum.causa(err) }
+    }
+    iace finge ArtificiumMala { causa = "unreachable tokenizer array read" }
+}
+
+# Merge-entry well-formedness: exactly "left right" with a single space
+# separator and non-empty halves (llama.cpp's find_bpe_rank asserts the same
+# no-space-in-token invariant).
+@ privata
+functio _par_recta(textus par) → bivalens {
+    si par.longitudo() ≡ 0 ergo redde falsum
+    fixum lista<textus> partes ← par.divide(" ")
+    si partes.longitudo() ≠ 2 ergo redde falsum
+    si (partes.accipe(0) vel "").longitudo() ≡ 0 ergo redde falsum
+    si (partes.accipe(1) vel "").longitudo() ≡ 0 ergo redde falsum
+    redde verum
+}
+
+# --- BPE merge loop (llama.cpp one-at-a-time semantics) --------------------
+
+# Repeatedly merge the adjacent pair with the lowest merge rank (ties broken
+# by the leftmost position), one occurrence per step, until no pair merges.
+# Matches the pinned reference's priority-queue behavior; a fresh scan each
+# step makes stale entries impossible.
+@ privata
+functio _bpe_coagmenta(tabula<textus, numerus> concursus, lista<textus> symbola) → lista<textus> {
+    varia lista<textus> cur ← symbola
+    dum verum {
+        fixum numerus n ← cur.longitudo()
+        si n < 2 {
+            rumpe
+        }
+        varia numerus melior_rank ← MERGE_ABSENS
+        varia numerus melior_pos ← -1
+        varia numerus i ← 0
+        dum i + 1 < n {
+            fixum textus l ← cur.accipe(i) vel ""
+            fixum textus r ← cur.accipe(i + 1) vel ""
+            fixum numerus rank ← concursus.accipe(l + " " + r) vel MERGE_ABSENS
+            si rank < melior_rank aut (rank ≡ melior_rank et melior_pos ≥ 0 et i < melior_pos) {
+                melior_rank ← rank
+                melior_pos ← i
+            }
+            i ↑
+        }
+        si melior_pos < 0 {
+            rumpe
+        }
+        fixum textus cohaesum ← (cur.accipe(melior_pos) vel "") + (cur.accipe(melior_pos + 1) vel "")
+        varia lista<textus> novum ← vacua
+        varia numerus j ← 0
+        dum j < n {
+            si j ≡ melior_pos {
+                novum.appende(cohaesum)
+                j ← j + 2
+            }
+            secus {
+                novum.appende(cur.accipe(j) vel "")
+                j ← j + 1
+            }
+        }
+        cur ← novum
+    }
+    redde cur
+}
+
+# --- Runtime construction, encode, decode -----------------------------------
+
+# Build the runtime from a parsed manifest. The vocab and merge arrays come
+# from the artifact; the declared model must be the byte-level BPE family.
+@ publica
+functio fabricare(manifestum.ManifestumGguf m) → Tokenizator ⇥ TokenizerError {
+    fixum textus progenies ← _textum_artificii(m, "tokenizer.ggml.model")
+    si progenies ≠ TOKENIZATOR_CAPABILIS {
+        iace finge ProgeniesIgnota { causa = "tokenizer runtime is byte-level BPE; manifest declares: " + progenies }
+    }
+    fixum lista<textus> verborum ← _textorum_artificii(m, "tokenizer.ggml.tokens")
+    si verborum.longitudo() ≡ 0 {
+        iace finge ArtificiumMala { causa = "tokenizer vocabulary is empty" }
+    }
+    fixum lista<textus> merges ← _textorum_artificii(m, "tokenizer.ggml.merges")
+    varia tabula<textus, numerus> vocabulum ← vacua
+    varia numerus i ← 0
+    dum i < verborum.longitudo() {
+        vocabulum.pone(verborum.accipe(i) vel "", i)
+        i ↑
+    }
+    varia tabula<textus, numerus> concursus ← vacua
+    varia numerus j ← 0
+    dum j < merges.longitudo() {
+        fixum textus par ← merges.accipe(j) vel ""
+        si non (_par_recta(par)) {
+            iace finge MergesMala { causa = "malformed merge entry: " + par }
+        }
+        concursus.pone(par, j)
+        j ↑
+    }
+    redde Tokenizator {
+        verborum = verborum,
+        vocabulum = vocabulum,
+        concursus = concursus,
+        multitudo = verborum.longitudo()
+    }
+}
+
+# Word-level encode: UTF-8 bytes → display symbols → BPE merges → vocab ids.
+# A final piece missing from the vocab falls back to its single-byte display
+# characters; a missing byte token is malformed vocab and fails closed.
+@ publica
+functio encoda(Tokenizator t, textus verbum) → lista<numerus> ⇥ TokenizerError {
+    fixum lista<numerus> byte_valores ← _octeti_numeri(verbum ↦ octeti)
+    varia lista<textus> symbola ← vacua
+    itera ex byte_valores fixum b {
+        symbola.appende(_vestigium_ex_octeto(b))
+    }
+    fixum lista<textus> finis ← _bpe_coagmenta(t.concursus, symbola)
+    varia lista<numerus> ids ← vacua
+    itera ex finis fixum piece {
+        fixum numerus id ← t.vocabulum.accipe(piece) vel -1
+        si id ≥ 0 {
+            ids.appende(id)
+        }
+        secus {
+            varia numerus i ← 0
+            dum i < piece.longitudo() {
+                fixum textus c ← piece.sectio(i, i + 1)
+                fixum numerus cid ← t.vocabulum.accipe(c) vel -1
+                si cid < 0 {
+                    iace finge VestigiumIgnotum { causa = "byte piece missing from the vocabulary: " + c }
+                }
+                ids.appende(cid)
+                i ↑
+            }
+        }
+    }
+    redde ids
+}
+
+# Word-level decode: ids → vocab display strings → inverse display mapping →
+# bytes → UTF-8 text. Unknown ids, unmappable display characters, and byte
+# sequences that are not valid UTF-8 fail with typed errors.
+@ publica
+functio decoda(Tokenizator t, lista<numerus> ids) → textus ⇥ TokenizerError {
+    varia lista<numerus<u8>> bytes ← vacua
+    itera ex ids fixum id {
+        si id < 0 aut id ≥ t.multitudo {
+            iace finge IdIgnotum { causa = "token id outside the vocabulary range: " + (id ↦ textus) }
+        }
+        fixum textus vestigium ← t.verborum.accipe(id) vel ""
+        varia numerus i ← 0
+        dum i < vestigium.longitudo() {
+            fixum textus c ← vestigium.sectio(i, i + 1)
+            fixum numerus cpt ← _codicillus_ex_vestigio(c)
+            fixum numerus byte ← _octetus_ex_codicillo(cpt)
+            bytes.appende(byte ∷ numerus<u8>)
+            i ↑
+        }
+    }
+    fixum octeti o ← bytes ↦ octeti
+    fac {
+        redde o ↦ textus
+    }
+    cape err {
+        iace finge Utf8Mala { causa = "decoded byte sequence is not valid UTF-8" }
+    }
+    iace finge Utf8Mala { causa = "unreachable decode conversion" }
 }

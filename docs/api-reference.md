@@ -757,6 +757,39 @@ different tokenizer, contract §3.3). The pinned add-* flags are `falsum`;
 (`bos_vacua ≡ ADD_BOS` fails closed), so only a BOS-free, space-prefix-free
 row is admitted.
 
+**Artifact-backed byte-level BPE runtime (LIB-02-U2, GGUF-A2)**: the
+runtime consumes the vocab and merge arrays from a parsed schema-2
+`ManifestumGguf` through the U1 array accessors (`manifestum.textorum`) and
+implements the llama.cpp `llm_tokenizer_bpe` core at the **word-level
+boundary** (the pre-tokenizer is identity here; U3 composes it). Display
+mapping, merge semantics, and decode are pinned to the delivery's word-level
+oracle rows.
+
+`genus Tokenizator` — the artifact-backed runtime record (vocab list,
+display-token → id map, `"left right"` merge-pair → rank map, vocab size).
+
+- `functio fabricare(manifestum.ManifestumGguf m) → Tokenizator ⇥
+  TokenizerError` — build the runtime from a parsed manifest. The declared
+  tokenizer model must be the byte-level BPE family (`tokenizer.ggml.model`
+  = `gpt2`); malformed merge entries and empty vocabs fail closed. Nothing
+  is hard-coded: the vocab and merge tables come from the artifact.
+- `functio encoda(Tokenizator t, textus verbum) → lista<numerus> ⇥
+  TokenizerError` — word-level encode: UTF-8 bytes → gpt2 display symbols →
+  ranked bigram merges (one merge at a time, ties leftmost — the pinned
+  reference queue semantics) → vocab ids. A final piece missing from the
+  vocab falls back to its single-byte display characters; a missing byte
+  token fails closed (`VestigiumIgnotum`).
+- `functio decoda(Tokenizator t, lista<numerus> ids) → textus ⇥
+  TokenizerError` — word-level decode: ids → vocab display strings →
+  inverse display mapping → bytes → UTF-8 text. Unknown ids
+  (`IdIgnotum`), unmappable display characters (`VestigiumIgnotum`), and
+  byte sequences that are not valid UTF-8 (`Utf8Mala`) fail with typed
+  errors.
+
+Pinned word-level rows (llama-tokenize 10150 `dee2a846b`): `transformers` →
+`[4549, 382]`, `สวัสดี` → `[34469, 168607]`, `人工智能` → `[109015]`, each
+decoding back to the exact input text.
+
 ## gradus:cache
 
 KV-cache values and mutation rules (PML5-U2). `KVCache` is the per-session

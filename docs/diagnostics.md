@@ -59,11 +59,11 @@ pinned row is space-prefix-free (add_space_prefix = false)
 | `gradus:serialize` | `SerializeError` | 6 | `src/serialize.fab` |
 | `gradus:shape` | `FormaError` | 6 | `src/shape.fab` |
 | `gradus:tensor` | `TensorError` | 3 | `src/tensor.fab` |
-| `gradus:tokenizer` | `TokenizerError` | 9 | `src/tokenizer.fab` |
+| `gradus:tokenizer` | `TokenizerError` | 14 | `src/tokenizer.fab` |
 | `gradus:train` | `TrainError` | 10 | `src/train.fab` |
 | `gradus:transformer` | `TransformerError` | 12 | `src/transformer.fab` |
 
-**Total**: 208 public error codes across 26 error types.
+**Total**: 213 public error codes across 26 error types.
 
 ## `gradus:model/artifact` — `ArtifactError`
 
@@ -434,6 +434,11 @@ Source: `src/tokenizer.fab`. Render with module `causa(e)`.
 | `TokenizerError.EogMala` | malformed EOG set (must be {0, 2}). | `EOG set does not match the pinned row: …`<br>`malformed EOG set`<br>`pinned row is BOS-free`<br>`pinned row is BOS-free (add_bos_token = false)`<br>`pinned row is space-prefix-free`<br>`pinned row is space-prefix-free (add_space_prefix = false)` | Admit the exact pinned EOG set `{0,2}` (wire `"0,2"`, ascending). A well-formed-but-different set is a **different tokenizer**. For BOS/space messages: set `bos_vacua`/`spatium_vacua` to `verum` (pinned row is BOS-free and space-prefix-free). |
 | `TokenizerError.IdExtra` | token id outside the admitted range [0, vocab). | `token id out of range: …` | Keep token ids in the admitted range for the row. |
 | `TokenizerError.ProbeDivergens` | probe id list diverges from the pinned fixture | `tokenizer ids diverge from the pinned llama.cpp probe: …` | Re-admit against the pinned probe fixtures — divergence means a different tokenizer. |
+| `TokenizerError.ArtificiumMala` | artifact tokenizer metadata is unavailable or malformed (LIB-02-U2 runtime). | `tokenizer array is unavailable: …`<br>`tokenizer metadata is unavailable: …`<br>`tokenizer vocabulary is empty` | Supply a schema-2 manifest whose tokenizer metadata block carries the tokens/merges arrays. |
+| `TokenizerError.MergesMala` | malformed merge entry in the artifact. | `malformed merge entry: …` | A merge entry must be exactly `left right` (one space, non-empty halves) — the no-space-in-token invariant. |
+| `TokenizerError.IdIgnotum` | unknown token id in decode (out of range). | `token id outside the vocabulary range: …` | Keep decoded ids within the artifact vocab range `[0, vocab)`. |
+| `TokenizerError.VestigiumIgnotum` | display character with no byte mapping (or byte piece missing from the vocab). | `display character has no byte mapping (codepoint …)`<br>`byte piece missing from the vocabulary: …` | The vocab must contain the 256 gpt2 byte tokens and only display-mapped characters. |
+| `TokenizerError.Utf8Mala` | byte sequence is not valid UTF-8 (decode output / display character). | `decoded byte sequence is not valid UTF-8`<br>`display character bytes are not valid UTF-8` | The byte-level decode is lossless only when every token's display characters map back to bytes that form valid UTF-8. |
 | `TokenizerError.WireMala` | malformed tokenizer identity wire form. | `malformed pinned id list`<br>`malformed tokenizer identity wire form`<br>`non-digit token id in pinned fixture`<br>`tokenizer identity failed verification`<br>`unknown pinned probe: …`<br>`unknown tokenizer identity marker` | Re-emit with the current schema stamp; never guess an unknown version. |
 
 ## `gradus:train` — `TrainError`
