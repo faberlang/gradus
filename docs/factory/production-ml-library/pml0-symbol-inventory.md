@@ -185,7 +185,7 @@ helpers, matching the captured output):
 
 ## Assertions (hold)
 
-- Per-module counts for **all 31 live modules** match the live tree exactly
+- Per-module counts for **all 32 live modules** match the live tree exactly
   (captured output above): foundation and proof-surface modules
   (attention 35, data 0, dtype 14, gradient 13, gradus 7, loss 11, math 23,
   nn 24, optimize 26, parameter 37, serialize 34, shape 9, tensor 11,
@@ -218,16 +218,16 @@ helpers, matching the captured output):
 
 ```bash
 cd /Users/ianzepp/work/faberlang/gradus
-./scripta/inventory-public-symbols            # exit 0; per-module counts + total 693 + coverage gate
+./scripta/inventory-public-symbols            # exit 0; per-module counts + total 704 + coverage gate
 diff <(./scripta/inventory-public-symbols) \
   <(awk 'BEGIN{n=0} /^```$/{n++; next} n==1{print} n>1{exit}' \
      docs/factory/production-ml-library/pml0-symbol-inventory.md)  # clean
-grep -c 'functio ' src/*.fab src/model/*.fab | awk -F: '{s+=$2} END {print s}'   # 693 (live all-module)
+grep -c 'functio ' src/*.fab src/model/*.fab | awk -F: '{s+=$2} END {print s}'   # 704 (live all-module)
 git diff --check
 ```
 
 Outcome: `./scripta/inventory-public-symbols` exits 0 (per-module baseline
-and tracked total 693 hold; every public symbol is documented in
+and tracked total 704 hold; every public symbol is documented in
 `docs/api-reference.md`); a fresh run diffs clean against the captured output
-above; the live all-module total == 693 matches live grep; `git diff --check`
+above; the live all-module total == 704 matches live grep; `git diff --check`
 clean.
