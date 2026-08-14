@@ -1,8 +1,9 @@
 # Gradus Regression Corpus
 
-**Version**: `gradus-regression-corpus v1.4.0` (2026-08-13, A1C-M5;
+**Version**: `gradus-regression-corpus v1.5.0` (2026-08-13, A1C-M5;
 2026-08-14, LIB-02-U1 tokenizer metadata array pins; LIB-03 GGUF-A3 C1/C2-U5 —
-`tensor_payload` / `tensor_view` suites + union-set dequant goldens)
+`tensor_payload` / `tensor_view` suites + union-set dequant goldens;
+MODEL-01-M8 — `model/qwen35moe` admission suite + admission exemplum)
 **Repo**: gradus. **Tier**: structural inventory.
 **Delivery**: `docs/factory/production-ml-library/pml6-delivery.md` §PML6-U4;
 GGUF-A1b delivery in `pml5-general-gguf-delivery.md`.
@@ -29,7 +30,7 @@ closeout, never a dev-loop suite.
 | --- | --- | --- |
 | Co-located package tests | `src/*.proba`, `src/model/*.proba` | Compile-level contract + oracle pins per module |
 | Model / tokenizer fixtures | `fixtures/safetensors/`, `fixtures/gguf/`, `fixtures/tokenizer/` | Legal fixtures + row-oracle docs, including the three GGUF-A1a manifest fixtures and the GGUF-A3 union-set dequant goldens (`gguf-dequant-goldens.json` + derivation contract) |
-| Exempla consumers | `exempla/gradient-seam`, `exempla/gradient-seam-nolib`, `exempla/training-loop-mlp`, `exempla/token-generation`, `exempla/gguf-manifest`, `exempla/gguf-inspect`, `exempla/qwen36-35b-inference` | Public-surface consumers plus the executed GGUF synthetic proof (40 PASS / 0 FAIL), guarded six-file local inspection receipt, and the capstone tokenizer-phase run (LIB-02-U4-1) |
+| Exempla consumers | `exempla/gradient-seam`, `exempla/gradient-seam-nolib`, `exempla/training-loop-mlp`, `exempla/token-generation`, `exempla/gguf-manifest`, `exempla/gguf-inspect`, `exempla/qwen36-35b-inference`, `exempla/gguf-admit-qwen35moe` | Public-surface consumers plus the executed GGUF synthetic proof (40 PASS / 0 FAIL), guarded six-file local inspection receipt, the capstone tokenizer-phase run (LIB-02-U4-1), and the guarded real-file qwen35moe admission receipt (MODEL-01-M7) |
 | Admission conformance | `tests/admission_conformance.fab` | Capsule admission composition check |
 
 Nested package dirs follow the Agents rule (≥2 modules); model package
@@ -39,7 +40,7 @@ tests live under `src/model/`.
 
 ## 2. Proba inventory (structural)
 
-Live co-located suites (28 files):
+Live co-located suites (29 files):
 
 | Suite | Module / surface | Pin class (summary) |
 | --- | --- | --- |
@@ -71,6 +72,7 @@ Live co-located suites (28 files):
 | `src/model/tensor_view.proba` | `gradus:model/tensor_view` (GGUF-A3 C2-U3/U4/U5) | `vincula` fail-closed bind (NomineIgnota / RangeMala / LongitudoMala / LayoutIgnota / TypoIgnotum); windowed `materializa_slicem` + single-block `materializa_glomulum` fail-closed rows |
 | `src/model/artifact.proba` | pathless content identity | Algorithm, digest, and positive-length validation |
 | `src/model/gguf_manifest.proba` | GGUF-A1b manifest and range seam | Unknown codec inspection, exact ranges, source failure, checked tensor fragments, and LIB-02-U1 tokenizer array pins (248320 tokens / 247587 merges / special ids) |
+| `src/model/qwen35moe.proba` | `gradus:model/qwen35moe` (MODEL-01) | qwen35moe architecture admission pins: frozen config rows + 55-entry metadata count + mutation family 1 (M3); canonical 753-tensor map + 41-block schedule + storage distribution + families 2–5 (M4); dimension/storage cross-reference validation (M5); identity precondition + seven-family typed refusal matrix (M6) |
 
 Every suite header states **EVIDENCE HONESTY (CTO Q2)**: structural /
 compile-level proof; executed value-identity deferred.
@@ -249,7 +251,7 @@ test -f fixtures/gguf/smollm2-360m-scaled-row.gguf
 test -f fixtures/tokenizer/tokenizer-identity-oracle.md
 
 # Proba count stays the admitted co-located surface
-find src -name '*.proba' | wc -l   # expect 28 at this corpus version
+find src -name '*.proba' | wc -l   # expect 29 at this corpus version
 
 # GGUF-A3 goldens fixtures present
 test -f fixtures/gguf/gguf-dequant-goldens.json
@@ -260,6 +262,12 @@ rg -n 'TOKENS_PIN|MERGES_PIN|BOS_PIN|EOS_PIN|PAD_PIN|248320|247587|248044|248046
   src/model/gguf_manifest.proba
 rg -n 'metadata array is not an integer array|metadata value is not a GGUF string array' \
   src/model/gguf_manifest.fab
+
+# MODEL-01 qwen35moe admission suite + exemplum (M8 inventory)
+rg -n 'MODEL-01-M6 admission entry point and typed refusal matrix' \
+  src/model/qwen35moe.proba
+test -d exempla/gguf-admit-qwen35moe
+test -f exempla/gguf-admit-qwen35moe/README.md
 ```
 
 ### 5.3 Executed pass (auditor-owned; not claimed by this unit)
@@ -305,7 +313,9 @@ remain in the support matrix; this corpus does not re-admit them.
 
 ## 8. Versioning
 
-`gradus-regression-corpus v1.4.0`. Adding a suite, fixture, or named pin
+`gradus-regression-corpus v1.5.0`. Adding a suite, fixture, or named pin
 bumps this version. Removing or retargeting a named pin (§4) is a
 **major** event and must update the support matrix / compatibility
-policy in the same change set.
+policy in the same change set. (v1.5.0 = MODEL-01-M8: the
+`model/qwen35moe` admission suite and the `gguf-admit-qwen35moe` admission
+exemplum, inventoried under the corpus contract.)

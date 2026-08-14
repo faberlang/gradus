@@ -9,12 +9,15 @@ One `.fab` file → one import path. Nested dirs for packages.
 
 ## Live modules (post-PML1–5 + correctness wave)
 
-The live tree has 29 modules and 611 declared functions (inventory
+The live tree has 30 modules and 693 declared functions (inventory
 re-baselined for the A1C capsule-schema-2.0.0 surface, the LIB-02-U1
 `gguf_manifest` array accessors, the LIB-02-U2 tokenizer runtime, and the
 GGUF-A3 `tensor_payload` / `tensor_view` + widened-dequant surface — see the
 Coverage Check in
-[`docs/api-reference.md`](api-reference.md)). The GGUF-A1b surface
+[`docs/api-reference.md`](api-reference.md)). The MODEL-01 qwen35moe
+admission module (M3–M6) adds its surface here; the machine-checked
+inventory re-baseline for its counts lands with the MODEL-01 M9 unit.
+The GGUF-A1b surface
 has an executed 40-case synthetic package-MIR proof and guarded real-file
 inspection receipts for six operator-local GGUFs. Exact evidence and boundaries
 are recorded in [`exempla/gguf-manifest/README.md`](../exempla/gguf-manifest/README.md)
@@ -45,6 +48,7 @@ and [`exempla/gguf-inspect/README.md`](../exempla/gguf-inspect/README.md).
 | `gradus:model/dequant` | `src/model/dequant.fab` | CPU dequant of the admitted GGML block types — union set F32/BF16/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K (PML2; GGUF-A3 widens to BF16 + Q5_K) |
 | `gradus:model/tensor_payload` | `src/model/tensor_payload.fab` | `TensorPayload` value + `PayloadError` diagnostics — pathless payload carrier (name, absolute start, length, bytes) (GGUF-A3) |
 | `gradus:model/tensor_view` | `src/model/tensor_view.fab` | `VisumTensoris` typed view + `VisioError` + `vincula` bind + bounded windowed materializers `materializa_slicem`/`materializa_glomulum` (GGUF-A3) |
+| `gradus:model/qwen35moe` | `src/model/qwen35moe.fab` | qwen35moe architecture admission: frozen config + canonical 753-tensor map + dimension/storage cross-reference validation + identity-precondition admission (MODEL-01, read through the `gguf_manifest` typed accessors) |
 | `gradus:tokenizer` | `src/tokenizer.fab` | Tokenizer identity + probe parity + `est_eog` (PML2/PML5) + artifact-backed byte-level BPE runtime with the composed qwen35 pre-tokenizer and special/EOG/BOS/chat policy surface (LIB-02-U2/U3; completion oracle pinned in `fixtures/tokenizer/pinned-probe-oracle.md`); capstone tokenizer phase run by `exempla/qwen36-35b-inference` (LIB-02-U4-1) |
 | `gradus:cache` | `src/cache.fab` | KV-cache values + mutation rules (PML5) |
 | `gradus:decode` | `src/decode.fab` | Decode/prefill/session/cancel + replica loop (PML5) |
@@ -66,6 +70,9 @@ PML2 Model admission    gradus:model/artifact, gradus:model/capsule,
                         gradus:model/gguf_manifest, gradus:model/gguf,
                         gradus:model/safetensors, gradus:model/dequant,
                         gradus:model/tensor_payload, gradus:model/tensor_view
+PML2 Architecture       gradus:model/qwen35moe — MODEL-01
+admission (specific)    architecture-specific admission over the
+                        format-general model rows
 PML2 Tokenizer identity gradus:tokenizer
 PML5 Inference          gradus:decode, gradus:cache, gradus:sampling,
                         gradus:generation
