@@ -1,8 +1,12 @@
 # Gradus API Reference
 
-**Version**: `gradus-api-reference v1.0.0` (re-baselined 2026-08-11, PML6-U1)
+**Version**: `gradus-api-reference v1.0.0` (re-baselined 2026-08-11, PML6-U1;
+A1C-M5 revision 2026-08-13 — capsule/gguf/safetensors sections → capsule-schema-2.0.0)
 **Repo**: gradus · **Scope**: the live post-PML1–5 + correctness-wave public
-`gradus:*` surface as committed on the `factory/hand-4` branch.
+`gradus:*` surface. The A1C-M5 revision documents the actual schema-2
+capsule surface at A1C-M1 and the frozen D3/D4 `gguf.admit` /
+`safetensors.admittas` contracts; the caller migrations (A1C-M2/M3) are
+pending in the A1C chain and are not claimed as integrated.
 **Authority**: this document is generated from the live source tree
 (`src/**/*.fab`) via `scripta/inventory-public-symbols`, which also asserts
 every module's `functio` count and runs the **committed coverage gate**: no
@@ -524,67 +528,86 @@ path, URL, reader, file handle, mapping, host/device object, or payload.
 ## gradus:model/capsule
 
 The admitted-model capsule — the typed identity handoff (council C8,
-PML2-U1, `capsule-schema-1.0.0`). Six field groups (validated bytes,
-cryptographic identity, tokenizer identity, quantization, bounds, and
-architecture facts) + provenance path + the schema-versioned identity
-record. Admission is fail-closed by every field.
+PML2-U1, `capsule-schema-2.0.0`, A1C-M1 clean break). Schema 2 carries
+exactly two value groups: a pathless `artifact.IdentitasContenuti` content
+identity (named digest algorithm, whole-artifact digest value, byte length
+— never a path, URL, reader, file handle, device object, or payload) and
+one per-format manifest (`Manifesta`): `manifestum.ManifestumGguf`
+(imported read-only from `gradus:model/gguf_manifest`) for GGUF rows or the
+`ManifestumSafetensors` genus (defined in this module) for Safetensors
+rows. There is no `BytesValida` byte ownership, no provenance path, and no
+single global quantization row. Admission is fail-closed by every field; a
+schema-1 stamp is rejected at every boundary with the typed
+`AdmissionError.SchemaVetus`.
 
 - `functio causa(AdmissionError e) → textus` — render the typed error
   message.
 
-`genus BytesValida` — methods `corpus()`, `longitudo()`, `opertum()`.
-`genus IdentitasCrypto` — methods `algorithmus()` (admitted: sha-256),
-`digestio()`.
-`genus IdentitasTokenizer` — methods `progenies()`, `pre_tokenizator()`,
-`digestio_vocabuli()`, `eog()`, `bos_vacua()`, `spatium_vacua()`.
-`genus Quantizatio` — methods `typo()`, `elementa_glomoris()`,
-`octeti_glomoris()`, `concordatio()`.
-`genus Limites` — methods `machina()`, `kv()`, `tensores()`, `nomen()`,
-`dimensio()`, `elementa()`, `textus()`.
-`genus Architectura` — methods `identificator()`, `densitas()`, `strata()`,
-`contextus()`.
+`discretio AdmissionError` variants: `VersioIgnota` (unknown schema
+version), `SchemaVetus` (schema 1 is retired), `AlgorithmusIgnotus`
+(un-admitted digest algorithm), `DigestioMala` (malformed or mismatched
+digest), `ManifestumMala` (malformed per-format manifest, identity
+inconsistency, or verification failure), and `WireMala` (malformed
+identity wire form); each carries `textus causa`.
+
+`genus MetadatumSafetensori` — methods `clavis()`, `valor()`.
+`genus DescriptioTensorisSafetensori` — methods `nomen()`, `typo()`,
+`forma()`, `initium()` (inclusive data offset), `finis()` (exclusive data
+end), `elementa()`.
+`genus ManifestumSafetensors` — methods `formatum()` (pinned row:
+"safetensors"), `versio()` (header format version), `longitudo_artefacti()`
+(whole-artifact byte length), `longitudo_datorum()` (data-region byte
+length), `metadatorum_numerus()`, `tensorum_numerus()`, `metadatum(numerus
+i)` (bounds-checked), `descriptio(numerus i)` (bounds-checked).
+`discretio Manifesta` — `Gguf { manifestum.ManifestumGguf gguf }` or
+`Safetensors { ManifestumSafetensors saf }`; the two wrappers below are the
+only construction entry points (a caller never pattern-builds a variant
+directly).
+`genus Capsula` — methods `schematis()`, `identitas_artificii()`,
+`algorithmus()`, `digestio()`, `longitudo()`, `formatum()` ("gguf" |
+"safetensors"), `tensorum_numerus()`, `manifestum_gguf()` (the GGUF
+manifest when the capsule holds a GGUF row, else `nihil`),
+`manifestum_safetensors()` (the Safetensors manifest when the capsule holds
+a Safetensors row, else `nihil`), `identia()` (the compact
+schema-versioned identity record).
 `genus Identitas` — methods `schematis()`, `algorithmus()`, `digestio()`,
-`longitudo_bytes()`, `quantizatio()`, `architectura()`, `strata()`.
-`genus Capsula` — methods `schematis()`, `corpus()`, `longitudo()`,
-`opertum()`, `algorithmus()`, `digestio()`, `progenies()`,
-`pre_tokenizator()`, `digestio_vocabuli()`, `eog()`, `bos_vacua()`,
-`spatium_vacua()`, `quantizatio()`, `elementa_glomoris()`,
-`octeti_glomoris()`, `concordatio()`, `limes_machinae()`, `limes_kv()`,
-`limes_tensorum()`, `limes_nominis()`, `limes_dimensionis()`,
-`limes_elementorum()`, `limes_textus()`, `identificator()`, `densitas()`,
-`strata()`, `contextus()`, `semita()` (provenance path — NEVER identity),
-`identia()` (the schema-versioned identity record).
+`longitudo_bytes()`.
 
 Free functions:
 
 - `functio identitas_aequus(Identitas a, Identitas b) → bivalens` —
-  field-wise identity equality.
-- `functio structa(textus schema, lista<numerus<u8>> bytes, bivalens opertum,
-  textus algorithmus, textus digestio, textus progenies, textus
-  pre_tokenizator, textus digestio_vocabuli, textus eog, bivalens bos_vacua,
-  bivalens spatium_vacua, textus typo_quantizationis, numerus
-  elementa_glomoris, numerus octeti_glomoris, numerus concordatio, numerus
-  limes_machinae, numerus limes_kv, numerus limes_tensorum, numerus
-  limes_nominis, numerus limes_dimensionis, numerus limes_elementorum,
-  numerus limes_textus, textus identificator, textus densitas, numerus
-  strata, textus contextus, textus semita) → Capsula ⇥ AdmissionError` — the
-  validated capsule constructor (admission gate).
+  field-wise identity equality (identity-bearing fields ONLY; never the
+  manifest contents).
+- `functio manifestum_gguf(manifestum.ManifestumGguf m) → Manifesta` —
+  wrap a GGUF manifest into the per-format carrier.
+- `functio manifestum_safetensors(ManifestumSafetensors m) → Manifesta` —
+  wrap a Safetensors manifest into the per-format carrier.
+- `functio structa_manifestum(textus schema, artifact.IdentitasContenuti
+  identitas, Manifesta manifestum) → Capsula ⇥ AdmissionError` — the
+  fail-closed ADMISSION and the only capsule constructor: rejects the
+  retired schema-1 stamp (`SchemaVetus`), unknown schema versions
+  (`VersioIgnota`), un-admitted algorithms, malformed digests, invalid
+  byte lengths, and manifests inconsistent with the carried identity.
 - `functio verifica(Capsula c) → bivalens ⇥ AdmissionError` — consumer-side
-  self-verification (re-runs the admission matrix).
+  self-verification (re-runs the admission matrix over a capsule without
+  re-parsing raw model bytes).
 - `functio verifica_contra(Capsula c, textus expectatum) → bivalens ⇥
-  AdmissionError` — verify against an expected identity wire.
+  AdmissionError` — verify against an expected digest; mismatch fails
+  closed.
 - `functio serializa_identitas(Capsula c) → textus ⇥ AdmissionError` —
-  identity wire form.
+  identity wire form (`capsule/identity/<schema>/<algo>/<digest>/<byte_len>`).
 - `functio deserializa_identitas(textus wire) → Identitas ⇥ AdmissionError`
-  — identity from wire, fail closed.
+  — identity from wire, fail closed; rejects the retired schema-1 stamp
+  with `SchemaVetus`.
 
-**EOG-set admission (correctness wave, `2cdc498` / `6cc0eb5`)**: capsule
-admission enforces the **exact pinned EOG set `{0,2}`**
-(`EOG ← "0,2"`; `_tokenizator_recta` requires `eog ≡ EOG`). A
-well-formed-but-different set is a **different tokenizer** — it fails
-closed at admission (`EogMala`), it is not a value error. The pinned
-add-* flags are `falsum`; `bos_vacua` / `spatium_vacua` are the positive
-facts (verum = BOS-free / space-prefix-free), enforced with `≡`.
+**Schema retirement (A1C-M1, `1c3bc51`)**: the schema-1 stamp (`"1.0.0"`)
+is retired as of 2026-08-13. The schema-2 constructor has no schema-1
+signature (a schema-1 call site fails to compile); `verifica` and
+`deserializa_identitas` reject a schema-1-stamped capsule/wire with the
+typed `SchemaVetus` error (`schema 1 is retired — capsule schema is 2.0.0`).
+EOG/tokenizer identity is no longer carried by the capsule — it lives in
+`gradus:tokenizer`, and the per-format admission entries enforce their own
+tokenizer facts (see the D3/D4 entries below).
 
 ## gradus:model/gguf_manifest
 
@@ -647,27 +670,41 @@ octeti_per_blockum, longitudo_octetorum)` or `Ignota(typo)`.
 
 ## gradus:model/gguf
 
-GGUF admission (PML2-U3) — one admitted row → capsule, fail-closed by
-format/quantization/shape/tokenizer facts.
+GGUF admission (PML2-U3, **D3 frozen contract** — A1C clean break). One
+admitted row → schema-2 capsule. D3 deletes the dual byte wire parser and
+keeps the public admission entry `admit` as a thin wrapper over
+`gradus:model/gguf_manifest`: parse via `manifestum.parse`/`inspice`,
+validate the pinned one-row contract through manifest accessors
+(`metadatum`, `textum`, `numerum`, `inveni_tensorem`), and build the
+schema-2 capsule. No alias, no forwarding, no compatibility import;
+`gradus:model/gguf_manifest` is the only GGUF parse path. The wrapper
+migration is A1C-M2 and is **pending in the A1C chain** — this section
+documents the frozen contract, not a claim that the migration has
+integrated.
 
 - `functio causa(GgufError e) → textus` — render the typed error message.
-- `functio admit(lista<numerus<u8>> bytes, textus digestio, textus
-  digestio_vocabuli, numerus expectatum_kv, numerus expectatum_tensorum,
-  numerus expectatum_elementa, numerus expectatum_f32, numerus
-  expectatum_q4k, numerus expectatum_q5, numerus expectatum_q6, numerus
-  expectatum_q8, textus semita) → capsula.Capsula ⇥ GgufError` — the GGUF
-  row admission entry: parses the GGUF header/tensor metadata and admits →
-  capsule, fail closed on any deviation.
+- `functio admit(...) → capsula.Capsula ⇥ GgufError` — the GGUF row
+  admission entry (D3 frozen contract; the exact parameter set is recorded
+  by A1C-M2): thin schema-2 wrapper that parses via `manifestum`, validates
+  the pinned one-row contract (`expectatum_*` counts) through manifest
+  accessors, and admits → schema-2 capsule, fail closed on any deviation.
 
 ## gradus:model/safetensors
 
-Safetensors admission (PML2-U2) — one admitted row → capsule, fail-closed.
+Safetensors admission (PML2-U2, **D4 frozen contract** — A1C clean break).
+One admitted row → schema-2 capsule. D4 keeps the `admittas` entry and
+returns the schema-2 capsule holding `artifact.IdentitasContenuti` +
+`ManifestumSafetensors`; the Safetensors row remains an F32 structural
+fixture — no real-file or quantization claims are added. The migration is
+A1C-M3 and is **pending in the A1C chain** — this section documents the
+frozen contract, not a claim that the migration has integrated.
 
 - `functio causa(SafetensorError e) → textus` — render the typed error
   message.
-- `functio admittas(lista<numerus<u8>> corpus, textus digestio, textus
-  semita) → capsula.Capsula ⇥ SafetensorError` — the Safetensors row
-  admission entry: JSON header parse → capsule, fail closed on any
+- `functio admittas(...) → capsula.Capsula ⇥ SafetensorError` — the
+  Safetensors row admission entry (D4 frozen contract; the exact parameter
+  set is recorded by A1C-M3): JSON header parse → schema-2 capsule holding
+  `IdentitasContenuti` + `ManifestumSafetensors`, fail closed on any
   deviation.
 
 ## gradus:model/dequant
@@ -692,7 +729,8 @@ independent reference goldens.
 ## gradus:tokenizer
 
 Tokenizer identity — `tokenizer-identity-schema-1.0.0` (PML2-U4, council
-C8). The deeper probe-parity contract the capsule references: pinned row
+C8). The deeper probe-parity contract the model-admission path references
+(the per-format admission entries enforce its facts): pinned row
 (gpt2 / BBPE, pre-tokenizer smollm, vocab 49152, merges 48900), EOG set
 `{0,2}`, BOS-free / space-prefix-free, 17 control specials, and the pinned
 probe fixtures (P1–P11 + the four workload id lists).
@@ -952,15 +990,22 @@ same training loop through the same batch interface.
 
 ```bash
 cd /Users/ianzepp/work/faberlang/gradus
-./scripta/inventory-public-symbols   # per-module counts + total 618 + the
-                                     # committed coverage gate: every public
-                                     # symbol below is documented here
+./scripta/inventory-public-symbols   # per-module counts + the tracked total +
+                                     # the committed coverage gate: every
+                                     # public symbol below is documented here
 ```
 
 The inventory script asserts every live module's `functio` count, the live
-all-module total (618), and — per module — that every public symbol name
+all-module tracked total, and — per module — that every public symbol name
 listed above appears in this reference's `### gradus:<module>` section. A
 public symbol added to `src/` without a matching entry here fails the
 script (zombie-doc gate, PML6-U1). Private `_`-prefixed helpers are exempt;
 the two renamed serialize readers are documented for the correctness-wave
 reconciliation.
+
+**Function-count total: pending A1C-M6.** The A1C capsule rewrite (M1) and
+the D3/D4 caller migrations (M2/M3) change the `model/capsule`,
+`model/gguf`, and `model/safetensors` counts and the tracked all-module
+total. The re-baselined total is asserted here only after A1C-M6 runs
+against the merged M1+M2+M3 source; until then no numeric total is
+asserted (the former 618 no longer holds and is not restated).

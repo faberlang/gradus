@@ -19,7 +19,12 @@ EOG-set mismatch is **tokenizer identity**, not a value error (correctness wave 
 
 | Code | Live messages | Resolution |
 | --- | --- | --- |
-| `TokenizerError.EogMala` | `malformed EOG set`<br>`EOG set does not match the pinned row: …`<br>`pinned row is BOS-free (add_bos_token = false)` / `pinned row is BOS-free`<br>`pinned row is space-prefix-free (add_space_prefix = false)` / `pinned row is space-prefix-free` | Admit the **exact** pinned EOG set `{0,2}` (wire form `"0,2"`, strictly ascending non-negative ids). A well-formed-but-different set is a **different tokenizer**. BOS / space-prefix polarity: pinned row is BOS-free and space-prefix-free — `bos_vacua` and `spatium_vacua` must be `verum` (guards use `≡` against the falsum add-* flags). Capsule admission surfaces the same identity failure as `AdmissionError.TokenizerMala` with message `invalid tokenizer identity`. |
+| `TokenizerError.EogMala` | `malformed EOG set`<br>`EOG set does not match the pinned row: …`<br>`pinned row is BOS-free (add_bos_token = false)` / `pinned row is BOS-free`<br>`pinned row is space-prefix-free (add_space_prefix = false)` / `pinned row is space-prefix-free` | Admit the **exact** pinned EOG set `{0,2}` (wire form `"0,2"`, strictly ascending non-negative ids). A well-formed-but-different set is a **different tokenizer**. BOS / space-prefix polarity: pinned row is BOS-free and space-prefix-free — `bos_vacua` and `spatium_vacua` must be `verum` (guards use `≡` against the falsum add-* flags). |
+
+The schema-2 capsule (A1C-M1) no longer carries tokenizer identity — EOG
+identity lives in `gradus:tokenizer` (`TokenizerError.EogMala`) and in the
+per-format admission entries' own tokenizer checks; it does not surface as
+an `AdmissionError` variant.
 
 Generation stop-policy binds the same identity via `tokenizator.est_eog` (admitted EOG tokens `{0, 2}`): generation terminates after the **first** admitted EOG token; `maxima_verborum` is a ceiling, never a promise to emit that many tokens (`0d50d60`).
 
@@ -47,7 +52,7 @@ pinned row is space-prefix-free (add_space_prefix = false)
 | `gradus:math` | `MathError` | 11 | `src/math.fab` |
 | `gradus:metrics` | `MetricError` | 7 | `src/metrics.fab` |
 | `gradus:model/artifact` | `ArtifactError` | 3 | `src/model/artifact.fab` |
-| `gradus:model/capsule` | `AdmissionError` | 9 | `src/model/capsule.fab` |
+| `gradus:model/capsule` | `AdmissionError` | 6 | `src/model/capsule.fab` |
 | `gradus:model/dequant` | `DequantError` | 4 | `src/model/dequant.fab` |
 | `gradus:model/gguf` | `GgufError` | 10 | `src/model/gguf.fab` |
 | `gradus:model/gguf_manifest` | `GgufManifestError` | 12 | `src/model/gguf_manifest.fab` |
@@ -63,7 +68,7 @@ pinned row is space-prefix-free (add_space_prefix = false)
 | `gradus:train` | `TrainError` | 10 | `src/train.fab` |
 | `gradus:transformer` | `TransformerError` | 12 | `src/transformer.fab` |
 
-**Total**: 208 public error codes across 26 error types.
+**Total**: 205 public error codes across 26 error types.
 
 ## `gradus:model/artifact` — `ArtifactError`
 
@@ -258,18 +263,17 @@ Source: `src/metrics.fab`. Render with module `causa(e)`.
 ## `gradus:model/capsule` — `AdmissionError`
 
 Source: `src/model/capsule.fab`. Render with module `causa(e)`.
+Schema: `capsule-schema-2.0.0` (A1C-M1 clean break). Schema 1 is retired —
+every entry point rejects a schema-1 stamp with the typed `SchemaVetus`.
 
 | Code | Class / when | Live messages (representative) | Resolution |
 | --- | --- | --- | --- |
-| `AdmissionError.VersioIgnota` | unknown capsule schema version (reject, no partial | `unknown capsule schema version: …` | Re-emit with the current schema stamp; never guess an unknown version. |
-| `AdmissionError.AlgorithmusIgnotus` | Unknown digest algorithm. | `unknown digest algorithm: …` | Supply a well-formed digest (64-hex vocab digest / admitted algorithm) that matches the artifact. |
-| `AdmissionError.DigestioMala` | malformed digest value (format / length / charset) | `digest mismatch — capsule does not match the expected artifact`<br>`malformed digest value`<br>`malformed vocabulary digest` | Supply a well-formed digest (64-hex vocab digest / admitted algorithm) that matches the artifact. |
-| `AdmissionError.BytesMala` | byte payload failures: empty payload, failed | `capsule failed verification`<br>`data-region coverage did not pass`<br>`data-region coverage did not pass — gapped or overlapping region`<br>`empty validated byte payload`<br>`invalid byte length in capsule identity`<br>`recorded byte length does not match the validated payload` | Provide a payload whose lengths/offsets match the layout (exact tile, no gaps/overlaps). |
-| `AdmissionError.TokenizerMala` | malformed tokenizer identity (empty kind / | `invalid tokenizer identity` | Use the pinned tokenizer identity (gpt2/BBPE, pre=`smollm`, EOG `{0,2}`, BOS-free, space-prefix-free). |
-| `AdmissionError.QuantizatioIgnota` | unknown quantization row or mis-laid-out block | `unknown or mis-laid-out quantization row: …`<br>`unknown quantization row: …` | Use an admitted type/quantization row from the closed set; ensure block layouts tile. |
-| `AdmissionError.LimitesMala` | ceilings outside the library's hard limits or a | `invalid bounds ceilings` | Stay within the library hard ceilings for counts, key lengths, and element totals. |
-| `AdmissionError.ArchitecturaMala` | malformed architecture facts. | `empty architecture identifier`<br>`invalid architecture facts`<br>`invalid layer count in capsule identity` | Match the admitted architecture facts (arch, layers, context, vocab, embedding). |
-| `AdmissionError.WireMala` | malformed capsule identity wire form. | `malformed capsule identity wire form`<br>`malformed numeric field`<br>`numeric field above the integer carrier`<br>`unknown capsule identity marker`<br>`unreachable` (internal) | Re-emit with the current schema stamp; never guess an unknown version. |
+| `AdmissionError.VersioIgnota` | Unknown capsule schema version (reject, no partial reads). | `unknown capsule schema version: …` | Re-emit with the current schema stamp; never guess an unknown version. |
+| `AdmissionError.SchemaVetus` | Retired schema-1 stamp at the schema-2 boundary (constructor, `verifica`, or wire form). | `schema 1 is retired — capsule schema is 2.0.0` | Re-admit with a `capsule-schema-2.0.0` capsule / identity wire. |
+| `AdmissionError.AlgorithmusIgnotus` | Un-admitted digest algorithm. | `unknown digest algorithm: …` | Supply the admitted lower-case `sha-256` algorithm. |
+| `AdmissionError.DigestioMala` | Malformed digest value (format / length / charset) or a digest mismatch on verification. | `digest mismatch — capsule does not match the expected artifact`<br>`malformed digest value` | Supply the canonical 64-digit lower-case hexadecimal digest that matches the artifact. |
+| `AdmissionError.ManifestumMala` | Malformed per-format manifest: empty or non-matching format/version, artifact-length mismatch, invalid byte length, malformed tensor descriptor, or a manifest inconsistent with the carried identity. | `manifestum is inconsistent with the artifact identity`<br>`invalid artifact byte length`<br>`capsule failed verification`<br>`metadata index out of bounds`<br>`tensor descriptor index out of bounds` | Supply a per-format manifest whose format/version, lengths, and tensor descriptors are consistent with the artifact identity. |
+| `AdmissionError.WireMala` | Malformed capsule identity wire form. | `malformed capsule identity wire form`<br>`malformed numeric field`<br>`numeric field above the integer carrier`<br>`unknown capsule identity marker`<br>`invalid byte length in capsule identity`<br>`unreachable` (internal) | Re-emit with the current schema stamp; never guess an unknown version. |
 
 ## `gradus:model/dequant` — `DequantError`
 
