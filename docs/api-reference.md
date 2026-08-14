@@ -828,6 +828,44 @@ Pinned word-level rows (llama-tokenize 10150 `dee2a846b`): `transformers` →
 `[4549, 382]`, `สวัสดี` → `[34469, 168607]`, `人工智能` → `[109015]`, each
 decoding back to the exact input text.
 
+**Composed full-prompt runtime (LIB-02-U3, GGUF-A2)**: the qwen35
+pre-tokenizer scanner and the policy surfaces compose the word-level BPE
+core into a full-prompt encode/decode path.
+
+- `functio scanna_verba(textus textum) → lista<textus> ⇥ TokenizerError` —
+  the qwen35 pre-tokenizer word split (Unicode-category scanner, U3-1..U3-3):
+  letter/mark/digit runs, whitespace and newline families, punct/emoji
+  groups with an optional leading space, and the ASCII contractions.
+- `functio encoda_promptum(Tokenizator t, textus textum) → lista<numerus> ⇥
+  TokenizerError` — full-prompt encode, parse-special off: every word goes
+  through `scanna_verba` + `encoda` (specials read as their literal bytes).
+- `functio encoda_promptum_specialia(Tokenizator t, textus textum) →
+  lista<numerus> ⇥ TokenizerError` — full-prompt encode, parse-special on:
+  split the prompt on the artifact special cache before the scanner (earliest
+  match, longest text on ties), emit each special's single id, scan each
+  plain slice independently. Identical to `encoda_promptum` when the prompt
+  has no specials.
+- `functio eog_artificii(Tokenizator t) → lista<numerus>` — the runtime EOG
+  stop set (ascending): the declared eos id plus every vocab token whose text
+  is in the reference EOG name list and the FIM pad/rep/sep ids (U3-5).
+- `functio est_eog_artificii(Tokenizator t, numerus id) → bivalens` — EOG
+  membership on the runtime set.
+- `functio add_bos(Tokenizator t) → bivalens` — the artifact's
+  `tokenizer.ggml.add_bos_token` (absent → falsum; encode is BOS-free).
+- `functio chat_template(Tokenizator t) → textus` — the artifact's
+  `tokenizer.chat_template` (absent → empty); `redde_turnum_user(t, content)`
+  renders the minimal Qwen3-ChatML user turn (U3-6).
+
+**LIB-02 completion oracle (U3-7)**: the fully composed runtime encodes
+Probe A `สวัสดีครับ ผมชื่ออเล็กซ์` → `[34469, 168607, 153295, 173922,
+153380, 22216, 151752, 172769]` and Probe B `你好，世界！今天是2026年8月13日
+🎉` → `[109266, 3709, 96748, 6115, 113128, 17, 15, 17, 21, 95859, 23,
+96212, 16, 18, 95971, 10838, 236, 231]` (raw-prompt rows, never through the
+template), and both decode back to the exact prompts. Pinned rows and the
+divergence-receipt form: `fixtures/tokenizer/pinned-probe-oracle.md`;
+bound in `src/tokenizer.proba` (`"LIB-02-U3-7 full two-probe composition +
+divergence receipts"` probandum).
+
 ## gradus:cache
 
 KV-cache values and mutation rules (PML5-U2). `KVCache` is the per-session
