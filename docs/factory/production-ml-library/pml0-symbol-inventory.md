@@ -16,12 +16,16 @@ GGUF-A3 C3-U6 (the final GGUF-A3 inventory baseline: the
 `model/dequant` union set — BF16/Q5_K codecs — and `limes_payloadis` on
 `model/gguf_manifest`), and re-baselined for LIB-02-U3/U4 (the qwen35
 pre-tokenizer scanner + special/EOG/BOS/chat policy surface and the
-two-probe composition — tokenizer 37 → 74, total 611 → 648)
+two-probe composition — tokenizer 37 → 74, total 611 → 648), and
+re-baselined for REF-01 wave batch 1 (the rmsnorm/silu/swiglu nn rows,
+the configurable RoPE attention row, and the dense_llama/dense_qwen2
+architecture-adapter modules — total 648 → 684)
 **Date**: 2026-08-08 (PML0) / 2026-08-09 (PML1/PML2 re-baselines) /
 2026-08-11 (PML6-U1 re-baseline) / 2026-08-12 (GGUF-A1b range seam; grep only,
 no cargo) / 2026-08-13 (GGUF-A1c A1C-M6 re-baseline) / 2026-08-14 (LIB-02-U1)
 / 2026-08-14 (GGUF-A3 C3-U6 final inventory baseline) / 2026-08-14
-(LIB-02-U3/U4 qwen35 pre-tokenizer + policy-surface re-baseline)
+(LIB-02-U3/U4 qwen35 pre-tokenizer + policy-surface re-baseline) /
+2026-08-14 (REF-01 wave batch 1 re-baseline)
 **Source**: live `grep -c 'functio ' src/*.fab` + `src/model/*.fab` per
 module — the scan is recursive so the PML2 model module (`src/model/`,
 sub-leaves artifact/capsule/dequant/gguf/gguf_manifest/safetensors/
@@ -29,10 +33,12 @@ tensor_payload/tensor_view) is covered
 **Method**: `scripta/inventory-public-symbols` — grep-based; counts `functio `
 declaration lines per `src/*.fab` module (recursively), prints the module →
 functio table plus the all-module total, and asserts the re-baselined
-baseline: per-module counts for **every live module** (29 modules: the
+baseline: per-module counts for **every live module** (31 modules: the
 PML0/PML1 foundation and proof-surface modules, the PML2 model module's
-eight sub-leaves, the PML4 training-layer modules, and the PML5 inference
-modules) and the tracked total **648** (the live all-module count — every
+ten sub-leaves including the two REF-01 architecture adapters
+`model/dense_llama` + `model/dense_qwen2`, the PML4 training-layer modules,
+and the PML5 inference modules) and the tracked total **684** (the live
+all-module count — every
 module is asserted, there is no untracked remainder). The script
 additionally runs the
 **committed coverage gate** (PML6-U1, zombie-doc): every public `functio`
@@ -65,7 +71,15 @@ the special/EOG/BOS/chat policy surface
 `est_eog_artificii`/`add_bos`/`chat_template`/`redde_turnum_user`), and the
 two-probe composition oracle (`fixtures/tokenizer/pinned-probe-oracle.md` +
 `chat-template-identity-oracle.md`); the re-baseline is the merged
-LIB-02+GGUF-A3 inventory baseline (29 modules / 648). This
+LIB-02+GGUF-A3 inventory baseline (29 modules / 648). REF-01 wave batch 1
+adds the REF-01 dense-reference surface: the generic `rmsnorm` row and the
+`silu`/`swiglu` gated-MLP rows on `nn` (17 → 24), the configurable RoPE
+surface on `attention` (`structa_rope_configura`, `base`/`scale`/
+`politica`/`politica_consecutiva`/`politica_interposita`/`politica_nomen`/
+`rotary_position_embedding_configura`, 21 → 30), and the two
+architecture-adapter modules `model/dense_llama` (6) and `model/dense_qwen2`
+(14); the re-baseline is the merged REF-01 wave inventory baseline
+(31 modules / 684). This
 inventory remains a structural count.
 remains a structural count.
 **Consumed by**: PML0-U3 (proof-shaped API ledger) feeds the fixed-shape rows
@@ -76,7 +90,7 @@ public symbol on this inventory.
 
 ```
 module           functio
-attention        21
+attention        30
 cache            37
 data             0
 decode           46
@@ -89,13 +103,15 @@ math             23
 metrics          6
 model/artifact   4
 model/capsule    45
+model/dense_llama 6
+model/dense_qwen2 14
 model/dequant    21
 model/gguf_manifest 46
 model/gguf       10
 model/safetensors 24
 model/tensor_payload 1
 model/tensor_view 7
-nn               17
+nn               24
 optimize         26
 parameter        37
 sampling         27
@@ -105,7 +121,7 @@ tensor           11
 tokenizer        74
 train            41
 transformer      9
-TOTAL            648
+TOTAL            684
 ```
 
 ## Symbol detail
@@ -116,7 +132,7 @@ helpers, matching the captured output):
 
 | Module | Count | Public `functio` names |
 | --- | --- | --- |
-| attention | 21 | `scaled_dot_product_2x8`, `scaled_dot_product_staticum`, `causa`, `rotary_position_embedding`, `scaled_dot_product`, `scaled_dot_product_causal`, `scaled_dot_product_causal_rope` (14 `@ privata` helpers; `scaled_dot_product_staticum` is a shape-generics P2 addition that landed after the A1b capture — see the coverage-gate note below) |
+| attention | 30 | `scaled_dot_product_2x8`, `scaled_dot_product_staticum`, `causa`, `rotary_position_embedding`, `scaled_dot_product`, `scaled_dot_product_causal`, `scaled_dot_product_causal_rope`, `rotary_position_embedding_configura`, `structa_rope_configura`, `base`, `scale`, `politica`, `politica_consecutiva`, `politica_interposita`, `politica_nomen` (16 `@ privata` helpers; `scaled_dot_product_staticum` is a shape-generics P2 addition that landed after the A1b capture — see the coverage-gate note below; the configurable RoPE surface `base`/`scale`/`politica` + `rotary_position_embedding_configura`/`structa_rope_configura`/`politica_*` is the REF-01-U1.3 row) |
 | cache | 37 | `causa`, `cache_aequus`, `cache_vacua`, `appende`, `redintegra`, `identitas_cache_aequus`, `identitas_cache`, `serializa_identitas`, `deserializa_identitas` + KVCache/IdentitasCache genus methods (`model`, `versio_modelis`, `configuratio`, `tokenizator`, `historia`, `stratorum`, `typo`, `ordinatio`, `clavis`, `valor`, `versio`, `dimensio`, `longitudo`, `positio`) (6 `@ privata` helpers) |
 | data | 0 | — (stub) |
 | decode | 46 | `causa`, `structa_pondera`, `structa_decodere`, `decodere_datum`, `praefundere`, `sessio_fresh`, `progredere`, `redintegra`, `cancelatum_fresh`, `cancelatum_cancellata`, `observa_cancellationem`, `replica` + Pondera/Decodere/Sessio/Cancelatum genus methods (`ln1_s`, `ln1_o`, `wq`, `bq`, `wk`, `bk`, `wv`, `bv`, `wo`, `bo`, `ln2_s`, `ln2_o`, `wf1`, `bf1`, `wf2`, `bf2`, `ln3_s`, `ln3_o`, `mensa`, `pondera`, `projectio`, `projectio_bias`, `scala`, `vocabulum`, `contextus`, `dimensio`, `positio`, `cancellata`) (5 `@ privata` helpers) |
@@ -129,13 +145,15 @@ helpers, matching the captured output):
 | metrics | 6 | `causa`, `accuratezza`, `metricum`, `metrica_aequus` + Metricum genus methods (`damnum`, `accuratezza`) |
 | model/artifact | 4 | `causa`, `identitas` (2 `@ privata` validators) |
 | model/capsule | 45 | `causa`, `identitas_aequus`, `verifica`, `verifica_contra`, `structa_manifestum`, `serializa_identitas`, `deserializa_identitas`, `manifestum_gguf`, `manifestum_safetensors` + the schema-2 genus methods (MetadatumSafetensori: `clavis`, `valor`; DescriptioTensorisSafetensori: `nomen`, `typo`, `forma`, `initium`, `finis`, `elementa`; ManifestumSafetensors: `formatum`, `versio`, `longitudo_artefacti`, `longitudo_datorum`, `metadatorum_numerus`, `tensorum_numerus`, `metadatum`, `descriptio`; Capsula: `schematis`, `identitas_artificii`, `algorithmus`, `digestio`, `longitudo`, `formatum`, `tensorum_numerus`, `manifestum_gguf`, `manifestum_safetensors`, `identia`; Identitas: `schematis`, `algorithmus`, `digestio`, `longitudo_bytes`) (6 `@ privata` validators) |
+| model/dense_llama | 6 | `causa`, `ars_smollm2`, `nomen_gguf`, `resolvo`, `layout_nota` (1 `@ privata` helper; the typed llama/SmolLM2 architecture adapter, REF-01-U1.6) |
+| model/dense_qwen2 | 14 | `causa`, `configura`, `resolve`, `descriptio_render` (10 `@ privata` helpers; the typed qwen2 architecture adapter, REF-01-U1.7) |
 | model/dequant | 21 | `causa`, `elementa_glomoris`, `octeti_glomoris`, `dequantizas_glomulus`, `dequantizas_ordo` (16 `@ privata` helpers; the GGUF-A3 union-set widening adds the BF16/Q5_K block codecs `_bfloat16`/`_dequant_bf16`/`_dequant_q5_k`, `82048b5`) |
 | model/gguf | 10 | `admit` (thin schema-2 wrapper over `manifestum`, D3) + `causa` + 8 `@ privata` bounded-wire/contract helpers |
 | model/gguf_manifest | 46 | `causa`, `layout`, `metadatum`, `textum`, `numerum`, `textorum`, `numerorum`, `inveni_tensorem`, `limes_payloadis`, `parse`, `inspice`, `lege_fragmentum` + 34 `@ privata` bounded-wire/range/layout helpers (incl. the shared `_numerum_scalarum` scalar reader; `limes_payloadis` is the A3-C2-U1 payload-range seam `tensor_view.vincula` binds against) |
 | model/safetensors | 24 | `admittas` (schema-2 capsule with `ManifestumSafetensors`, D4) + `causa` + 22 `@ privata` header/JSON parse helpers |
 | model/tensor_payload | 1 | `causa` (TensorPayload value carrier + PayloadError diagnostics, C2-U2 `e640a50`) |
 | model/tensor_view | 7 | `causa`, `vincula`, `materializa_slicem`, `materializa_glomulum` (3 `@ privata` helpers `_descriptio`/`_limes`/`_fons_lege`; the bounded windowed materializers, C2-U3..U5 `6dd29fb`/`686653c`/`d182c5c`) |
-| nn | 17 | `linear_2x2`, `linear_4x4`, `gelu_4x4`, `linear_2x8`, `layernorm_2x8`, `gelu_2x8`, `causa`, `linear`, `gelu`, `layernorm` (7 `@ privata` helpers) |
+| nn | 24 | `linear_2x2`, `linear_4x4`, `gelu_4x4`, `linear_2x8`, `layernorm_2x8`, `gelu_2x8`, `causa`, `linear`, `gelu`, `layernorm`, `rmsnorm`, `silu`, `swiglu` (11 `@ privata` helpers; the REF-01-U1.1 `rmsnorm` row and the REF-01-U1.2 `silu`/`swiglu` gated-MLP rows) |
 | optimize | 26 | `causa`, `statum_aequus`, `structa`, `sgd_aequus`, `sgd_vacuum`, `adscisco`, `passus`, `serializa_statum`, `deserializa_statum`, `serializa`, `deserializa` + SgdStatum/Sgd/Passus genus methods (`possessor`, `nomen`, `versio`, `generatio`, `passus`, `lentus`, `numerus`, `contineo`, `inveni`, `novus`, `statum`) (4 `@ privata` helpers) |
 | parameter | 37 | `statio_nomen`, `causa`, `identitas_aequus`, `est_trainabilis`, `est_gelida`, `structa`, `structa_gelida`, `muta`, `registrum_vacuum`, `adscisco`, `serializa`, `deserializa` + Identitas/Parametrum/Registrum genus methods (`nomen`, `nomen_typi`, `figura`, `versio`, `possessor`, `identia`, `statio`, `quantitas`, `valor`, `numerus`, `contineo`, `inveni`, `trainabiles`, `gelidae`, `ordo`) (5 `@ privata` helpers) |
 | sampling | 27 | `causa`, `structa_configura`, `maxima`, `distributio`, `sors` + Configura/Sortitio genus methods (`temperatura`, `top_k`, `top_p`, `min_p`, `poena_repetitionis`, `token_id`, `semen`) (15 `@ privata` helpers) |
@@ -148,17 +166,18 @@ helpers, matching the captured output):
 
 ## Assertions (hold)
 
-- Per-module counts for **all 29 live modules** match the live tree exactly
+- Per-module counts for **all 31 live modules** match the live tree exactly
   (captured output above): foundation and proof-surface modules
-  (attention 21, data 0, dtype 14, gradient 13, gradus 7, loss 11, math 23,
-  nn 17, optimize 26, parameter 37, serialize 34, shape 9, tensor 11,
+  (attention 30, data 0, dtype 14, gradient 13, gradus 7, loss 11, math 23,
+  nn 24, optimize 26, parameter 37, serialize 34, shape 9, tensor 11,
   transformer 9), the PML4 training-layer modules (metrics 6, train 41), the
   PML5 inference modules (cache 37, decode 46, generation 27, sampling 27),
   and the PML2 model module (`model/artifact` 4, `model/capsule` 45,
-  `model/dequant` 21, `model/gguf` 10, `model/gguf_manifest` 46,
+  `model/dense_llama` 6, `model/dense_qwen2` 14, `model/dequant` 21,
+  `model/gguf` 10, `model/gguf_manifest` 46,
   `model/safetensors` 24, `model/tensor_payload` 1, `model/tensor_view` 7) +
   tokenizer 74.
-- The tracked total == the live all-module total == **648**; every module is
+- The tracked total == the live all-module total == **684**; every module is
   asserted (no untracked remainder).
 - The **coverage gate** holds: every public symbol name above appears in
   `docs/api-reference.md` under its module's `## gradus:<module>` section —
@@ -179,16 +198,16 @@ helpers, matching the captured output):
 
 ```bash
 cd /Users/ianzepp/work/faberlang/gradus
-./scripta/inventory-public-symbols            # exit 0; per-module counts + total 648 + coverage gate
+./scripta/inventory-public-symbols            # exit 0; per-module counts + total 684 + coverage gate
 diff <(./scripta/inventory-public-symbols) \
   <(awk 'BEGIN{n=0} /^```$/{n++; next} n==1{print} n>1{exit}' \
      docs/factory/production-ml-library/pml0-symbol-inventory.md)  # clean
-grep -c 'functio ' src/*.fab src/model/*.fab | awk -F: '{s+=$2} END {print s}'   # 648 (live all-module)
+grep -c 'functio ' src/*.fab src/model/*.fab | awk -F: '{s+=$2} END {print s}'   # 684 (live all-module)
 git diff --check
 ```
 
 Outcome: `./scripta/inventory-public-symbols` exits 0 (per-module baseline
-and tracked total 648 hold; every public symbol is documented in
+and tracked total 684 hold; every public symbol is documented in
 `docs/api-reference.md`); a fresh run diffs clean against the captured output
-above; the live all-module total == 648 matches live grep; `git diff --check`
+above; the live all-module total == 684 matches live grep; `git diff --check`
 clean.

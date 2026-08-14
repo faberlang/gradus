@@ -370,12 +370,14 @@ execution, logits, or device execution; CTO8-1 stays the named gate.
 
 ```bash
 cd /Users/ianzepp/work/faberlang/gradus
-# 1. Nine admitted rows (2 PML2 format, 2 PML3 architecture, 1 PML4
+# 1. Eleven admitted rows (2 PML2 format, 2 PML3 architecture, 1 PML4
 #    training-layer, 1 PML5 inference-layer, 2 GGUF-A3 output-checked
-#    slice materialization, 1 GGUF-A2 executed-probe tokenizer runtime),
-#    each with all 11 schema fields.
-grep -c '^| `format`' docs/factory/production-ml-library/pml0-support-matrix.md   # 9
-grep -c '^| `schema version`' docs/factory/production-ml-library/pml0-support-matrix.md   # 9
+#    slice materialization, 1 GGUF-A2 executed-probe tokenizer runtime,
+#    1 REF-01 dense reference primitive, 1 REF-01 qwen2 architecture
+#    adapter); the ten schema-version rows carry all 11 schema fields
+#    (row 10, the REF-01 primitive row, uses its own Field/Value set).
+grep -c '^| `format`' docs/factory/production-ml-library/pml0-support-matrix.md   # 10
+grep -c '^| `schema version`' docs/factory/production-ml-library/pml0-support-matrix.md   # 10
 # 2. Committed unit commits + oracle pins cited as evidence links.
 grep -c '07291d6\|b392fc8\|f12deaf\|02fae61\|9822cfa\|5260049\|7bf9acc\|359c5f0\|5f98e8b\|e09c79c\|9bebda9\|4b24c81\|94d8a94\|fc85de7\|bdefb5a\|3b2fc9b\|b1b01f1\|56e70f0\|8cf798a\|1a6abd0' docs/factory/production-ml-library/pml0-support-matrix.md   # >= 5
 grep -c 'LN3_\|IN_LN3_\|COS_1\|SIN_1\|1.576448169383708\|0.01137' docs/factory/production-ml-library/pml0-support-matrix.md   # >= 1
