@@ -26,6 +26,13 @@ consume-or-add — neither is a MODEL-01/MODEL-02 dispatch gate.
 Oracle tool `llama-tokenize`/`llama-gguf` 10150 (`dee2a846b`) live on this
 host.
 
+**Amendments**: task `57c57d14` / audit `c7e9a272` (2026-08-13) —
+dependency-frontier correction (`936bb9d`; REF-01 sibling, A1 early
+eligibility). Task `f7ae2d38` / audit `524eb154` (2026-08-14) —
+campaign-rule-2 field-set verification: per-unit `stop condition` rows added
+(§4), field residence mapped (§11), F3 divergence-authority confirmed as an
+explicit open item (§13.1).
+
 ## 1. Goal-check verdict (compact)
 
 - **Goal path**: campaign mandatory work row `MODEL-02`, depends on MODEL-01
@@ -330,7 +337,16 @@ Eleven micro-units, each one behavioral outcome, 1–3 primary files for code
 units (A2/A3 are the fixture exceptions at 2–3; C2 is the docs exception at
 4; C3 is the records exception at 6), one focused red-green proof run once,
 3–8k est_work_tokens, no package/check-source/check-compile/stage/e2e/full
-child gate. G1 is the only integration-capable unit.
+child gate. G1 is the only integration-capable unit. All eight campaign
+rule-2 fields (outcome, exact write scope, first failing oracle, closeout
+command, expected observed result, est_basis justification, stop condition,
+depends_on) live **per unit** in the tables below — `red` is the first
+failing oracle, `green` carries the closeout command and expected observed
+result, the `est_work_tokens` row carries the est_basis justification, and
+each unit gained a `stop condition` row (added 2026-08-14, task `f7ae2d38`,
+audit `524eb154`). No field lives only at the aggregate, so no aggregate-field
+waiver is recorded (M3 follow-up pattern, task `954f8d4a`); G1's lane-owned
+closeout stays aggregate-resident as named once in §9.
 
 ```text
 MODEL-01 (GGUF-M1 aggregate gate lands on factory/merge — after LIB-02 + LIB-03 gates only; REF-01 is a sibling; A1 silu eligible before this gate)
@@ -373,6 +389,7 @@ C1/C2 run parallel after B4. Peak live Hands: 3.
 | `parallel_with` | A2, B1 (disjoint files); MODEL-01's own first units (sibling chain) |
 | `non_integrable` | **YES — blocked.** Changes the `nn` public-symbol count (inventory + zombie-doc coverage) and the module-map row; landing alone breaks repo gates. Only G1 merges. |
 | `risk` | low-medium — the REF-01 hunk-serialization is a recheck, not a block: consume-or-add recorded at the boundary |
+| `stop condition` | pause and route when — REF-01's generic SiLU row lands with a spelling/revision the consume-or-add cannot record as consumed against the frozen §2 `silu(tensor.Tensor x) → tensor.Tensor ⇥ NnError` pin (→ delivery-amendment path); the red fails for an unrelated reason (a pre-existing `silu` or conflicting public symbol); proceeding would require touching any file outside `src/nn.fab`/`src/nn.proba` |
 | `test_owner` | A1 hand; proof run once |
 
 ### MODEL-02-A2 — Probe vectors + synthetic fixtures (MoE oracle corpus)
@@ -393,6 +410,7 @@ C1/C2 run parallel after B4. Peak live Hands: 3.
 | `parallel_with` | A1, B1 (disjoint files) |
 | `non_integrable` | **YES — blocked.** Fixture ahead of the surface it feeds (B2/B3/B4 consume it); landing alone has no consumer. Only G1 merges. |
 | `risk` | low-medium — probe magnitudes must stay in the documented realistic band (RMSNorm unit-scale), never hand-tuned to a golden |
+| `stop condition` | pause and route when — probe magnitudes cannot sit in the documented RMSNorm unit-scale band without hand-tuning toward a golden (→ the band or probe contract needs amendment); the generator's output is not byte-identical across runs (determinism contract broken); the exact-tie config cannot be expressed in the `gguf-moe-probes-v1` schema |
 | `test_owner` | A2 hand; proof run once |
 
 ### MODEL-02-A3 — Goldens generator + committed goldens (independent oracle)
@@ -413,6 +431,7 @@ C1/C2 run parallel after B4. Peak live Hands: 3.
 | `parallel_with` | B2 (disjoint files) |
 | `non_integrable` | **YES — blocked.** Goldens ahead of the surface they validate; only G1 merges. |
 | `risk` | medium — the oracle must be independent (never read gradus code) and bit-exact per the pinned codec semantics |
+| `stop condition` | pause and route when — the artifact identity check fails (byte length/SHA-256 ≠ pinned; the artifact changed — route to Mind, never proceed on a different artifact); a dequantization diverges from bit-exact `ggml-quants.c` @ `a957b7747` semantics; the band/first-divergence rule cannot be derived per the gi0-6 method |
 | `test_owner` | A3 hand; proof run once |
 
 ### MODEL-02-B1 — MoE module type surface + fail-closed error contract
@@ -433,6 +452,7 @@ C1/C2 run parallel after B4. Peak live Hands: 3.
 | `parallel_with` | A1, A2 (disjoint files) |
 | `non_integrable` | **YES — blocked.** Partial module; only G1 merges. |
 | `risk` | low — spellings frozen in §2; any amendment routes through the delivery-amendment path |
+| `stop condition` | pause and route when — the MODEL-01 admission facts (256/8/512/512/2048) or the landed LIB-03 `tensor_view` surface differ from the frozen §2 spellings (→ route to the MODEL-01/LIB-03 owner, never re-derive); a `MoError` variant cannot fail closed in proba for its named reason |
 | `test_owner` | B1 hand; proof run once |
 
 ### MODEL-02-B2 — Router `eligito` (logits, softmax, deterministic top-k, renormalization)
@@ -453,6 +473,7 @@ C1/C2 run parallel after B4. Peak live Hands: 3.
 | `parallel_with` | A3 (disjoint files) |
 | `non_integrable` | **YES — blocked.** Partial module; only G1 merges. |
 | `risk` | medium — tie rule and renormalization are the frozen facts; index mismatches are hard fails (indices exact), never tolerance-widened |
+| `stop condition` | pause and route when — the crafted tie probe does not return `[2, 5]` (the lowest-index-first rule cannot be represented in Fab — route, never silently adopt llama.cpp's implementation-defined argsort order); the `6.103515625e-5` renorm guard cannot be reproduced exactly |
 | `test_owner` | B2 hand; proof run once |
 
 ### MODEL-02-B3 — Expert dispatch `expertum` (windowed rank-3 SwiGLU)
@@ -473,6 +494,7 @@ C1/C2 run parallel after B4. Peak live Hands: 3.
 | `parallel_with` | none (module seam) |
 | `non_integrable` | **YES — blocked.** Partial module; only G1 merges. |
 | `risk` | medium — the exact rank-3 mapping and storage union are frozen; a live layout outside {F32, BF16, Q4_K, Q5_K, Q6_K, Q8_0} is a stop-condition record, never a silent widening |
+| `stop condition` | pause and route when — a live layout outside the frozen {F32, BF16, Q4_K, Q5_K, Q6_K, Q8_0} appears (stop-condition record, never a silent widening — per the risk row); a rank-3 window diverges from the A3 goldens with no attributable first-divergent element |
 | `test_owner` | B3 hand; proof run once |
 
 ### MODEL-02-B4 — Complete layer FFN `ffn_moe` (accumulation + gated shared expert)
@@ -493,6 +515,7 @@ C1/C2 run parallel after B4. Peak live Hands: 3.
 | `parallel_with` | none (module seam) |
 | `non_integrable` | **YES — blocked.** The surface is complete, but the executed exemplar (C1), docs (C2), records (C3), and gate (G1) must land with it. Only G1 merges. |
 | `risk` | medium — the complete layer FFN semantics are the unit's done oracle; shared-expert gating and block-40 exclusion are frozen |
+| `stop condition` | pause and route when — full-probe goldens diverge beyond the declared band with no attributable first-divergent element (never tolerance-widened); recording the block-40 MTP exclusion would require an MTP execution claim (layer-40 probe is a BF16-codec exercise only) |
 | `test_owner` | B4 hand; proof run once |
 
 ### MODEL-02-C1 — Exemplar adapter + executed MoE probe receipt
@@ -513,6 +536,7 @@ C1/C2 run parallel after B4. Peak live Hands: 3.
 | `parallel_with` | C2 (disjoint files) |
 | `non_integrable` | **YES — blocked.** The executed proof lands with the surface it proves; records (C3) and gate (G1) must accompany. Only G1 merges. |
 | `risk` | low-medium — the bounded range reads must never touch bytes outside the operation-scoped windows |
+| `stop condition` | pause and route when — any real-artifact read touches bytes outside the operation-scoped ranges (bounded-range violation — stop); completing the receipt would require editing `src/` or `scripta/` (scope breach) |
 | `test_owner` | C1 hand; proof run once |
 
 ### MODEL-02-C2 — API/support docs
@@ -533,6 +557,7 @@ C1/C2 run parallel after B4. Peak live Hands: 3.
 | `parallel_with` | C1 (disjoint files) |
 | `non_integrable` | **YES — blocked.** Docs ahead of the verified surface; zombie-doc coverage breaks if merged alone. Only G1 merges. |
 | `risk` | low-medium — api-reference must document the actual merged surface (report-driven), not provisional names |
+| `stop condition` | pause and route when — the merged B1–B4 surface differs from the frozen §2 contracts (docs document the actual surface; a conflict routes, never a provisional name); a public symbol from the B1–B4 reports cannot be documented in the four doc files |
 | `test_owner` | C2 hand; proof run once |
 
 ### MODEL-02-C3 — Records + inventory re-baseline + registration
@@ -553,6 +578,7 @@ C1/C2 run parallel after B4. Peak live Hands: 3.
 | `parallel_with` | none |
 | `non_integrable` | **YES — blocked.** Records claim completion; only G1's validated merge makes that true. Only G1 merges. |
 | `risk` | low — must not overclaim or mask a symbol that should be private |
+| `stop condition` | pause and route when — `scripta/inventory-public-symbols` cannot be re-baselined to the merged surface on the expected delta (baseline drift beyond the `model/moe` row + nn count change); the support-matrix tier is disputed (output-checked component tier is frozen — no execution claim); a status line would overclaim (never write a claim the records cannot support) |
 | `test_owner` | C3 hand; proof run once |
 
 ### MODEL-02-G1 — Aggregate package validation and atomic integration
@@ -573,6 +599,7 @@ C1/C2 run parallel after B4. Peak live Hands: 3.
 | `parallel_with` | none — last |
 | `non_integrable` | **The only integrable unit** — sole holder of the aggregate merge gate. |
 | `risk` | low — the merged surface is fully specified by A1–C3; G1 verifies, it does not design |
+| `stop condition` | any closeout command fails, any closeout grep is non-empty, or the exemplar run diverges → **do not merge**; record the exact failure and stop (per the red row). A divergence not attributable under the first-divergence rule routes to the owning surface, never a silent aggregate match |
 | `test_owner` | G1 hand (or Mind-assigned integration owner); every child's proof ran once in its own unit, nothing is re-run here except the aggregate closeout |
 
 ## 5. Dependency and parallelism map
@@ -749,7 +776,24 @@ LIB-01 (A1C chain) → LIB-02 + LIB-03 → REF-01 (dense reference rungs)
 - Required fields present for every child: outcome, primary files,
   write/read/forbidden scope, red proof, green proof, done_when, narrow
   validation, 3–8k estimate, depends_on, parallel_with, non-integrable block,
-  risk, test_owner (§4).
+  risk, stop condition, test_owner (§4).
+- **Campaign-rule-2 field set per unit (verified 2026-08-14, task
+  `f7ae2d38`, audit `524eb154` disposition)** — all eight fields live per
+  unit in §4: `outcome` (outcome row); exact write scope (`primary files` +
+  `write_scope` rows); first failing oracle (`red` row); closeout command
+  (`green` row — lane-local `FABER_BIN`/`FABER_LIBRARY_HOME` invocation);
+  expected observed result (`green`/`done_when` rows); est_basis
+  justification (`est_work_tokens` row + §12 aggregate justification); stop
+  condition (`stop condition` row — added by this amendment); depends_on
+  (depends_on row). No field lives only at the aggregate → no aggregate-field
+  waiver is recorded (M3 follow-up pattern, task `954f8d4a`); G1's lane-owned
+  closeout is the only aggregate-resident validation (§9).
+- **Audit disposition absorbed (2026-08-14, audit `524eb154` — REVISE on
+  planner-26 `74c7af2`)**: substantive MoE content ADMITTED; frontier (F1) +
+  single-unit shape (F2) superseded by this re-split (`f81b687` + `936bb9d`);
+  F3 two-revision disclosure confirmed as an explicit open item (§13.1).
+  planner-26/`74c7af2` retired as dispatch authority; this artifact is the
+  MODEL-02 dispatch artifact.
 - Red oracle table checked for every child (§8).
 - `git diff --check` on this artifact: silent (run below).
 - **Frontier correction (2026-08-13, task `57c57d14`, audit `c7e9a272`)**:
@@ -795,6 +839,11 @@ law's shape; it is staged so no single Hand exceeds the law.
    authority question — which revision governs the full-model boundary and
    how a divergence between them is adjudicated — is routed to the MODEL-02
    audit and the GGUF-M4 boundary recheck, never resolved by an implementing
+   Hand. **F3 (audit `524eb154`, disposition 2026-08-14) — confirmed recorded
+   as an explicit open item**: the two-revision divergence authority
+   (`a957b7747` semantic source vs the 10150/`dee2a846b` full-model
+   comparator) is disclosed here exactly as cited, stays open, and is
+   adjudicated at the GGUF-M4 boundary recheck — never by an implementing
    Hand.
 2. **Dispatch timing.** The MODEL-01 aggregate gate lands after the **LIB-02 +
    LIB-03** aggregate gates only (REF-01 is a sibling, not a MODEL-01
@@ -849,4 +898,7 @@ authority question, deterministic tie rule, top-k probability selection and
 mapping/storage union {F32, BF16, Q4_K, Q5_K, Q6_K, Q8_0}, the block-40 MTP
 exclusion, and the successor chain through CLOSE-01 — is preserved; no child
 lane gate exists, and G1 is the single aggregate merge gate. The unit advances
-milestone Q2 without completing the campaign.*
+milestone Q2 without completing the campaign. Campaign-rule-2 field set
+verified per unit (task `f7ae2d38`, audit `524eb154`): per-unit `stop
+condition` rows added (§4); F3 divergence authority confirmed as an explicit
+open item (§13.1).*
