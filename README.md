@@ -29,7 +29,7 @@ auditor-owned gate, never claimed here.
 | Attention / transformer | **Shipped (PML3)** — SDPA/RoPE + transformer block on the staged carrier, plus the fixed-shape BERT-tiny rows |
 | Training (steps, schedules, mode, RNG, checkpoint) | **Shipped (PML4)** — `Tabula` checkpoint, LR schedules, mode, seeded RNG, dropout |
 | Metrics | **Shipped (PML4)** — `accuratezza` + `Metricum` record |
-| Model admission | **Shipped (PML2)** — `capsule-schema-2.0.0` capsule (A1C clean break: pathless identity + per-format manifest) + admitted rows; GGUF-A1b adds pathless range inspection proven against six operator-local GGUF v3 files; it does not admit those architectures or claim inference |
+| Model admission | **Shipped (PML2)** — `capsule-schema-2.0.0` capsule (A1C clean break: pathless identity + per-format manifest) + admitted rows; GGUF-A1b adds pathless range inspection proven against six operator-local GGUF v3 files; GGUF-A3 adds the `tensor_payload` / `tensor_view` typed-view surface (payload carrier, `vincula` bind, bounded windowed materializers) and widens the dequant union set to F32/BF16/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K; it does not admit those architectures or claim inference |
 | Tokenizer identity | **Shipped (PML2/PML5)** — pinned-row probe parity + `est_eog` stop binding |
 | Inference (decode, cache, sampling, generation) | **Shipped (PML5)** — decode/prefill, KV-cache, sampling pipeline, generation config + cursor |
 | GPU training / executed runs | Blocked on the FMIR lever (CTO8-1) — structural tier only, no executed claim |
@@ -135,7 +135,7 @@ gate.
 | Linear regression + FD gradient proof | **Shipped (S4-A)** — CPU seam proof | Gradus |
 | SGD optimizer state, loss (`mse`/`cross_entropy`), training (steps, schedules, mode, RNG, dropout, checkpoint `Tabula`) | **Shipped (PML4)** | Gradus |
 | NN primitives + attention/transformer (staged surface + fixed-shape rows) | **Shipped (PML3)** | Gradus |
-| Model admission (capsule + Safetensors + GGUF + dequant) | **Shipped (PML2)** — schema-2 capsule (pathless identity + per-format manifest); format-general GGUF manifest/range inspection has an **executed A1b proof** over six operator-local real files, without architecture admission, tokenizer, or inference claims | Gradus |
+| Model admission (capsule + Safetensors + GGUF + dequant) | **Shipped (PML2)** — schema-2 capsule (pathless identity + per-format manifest); format-general GGUF manifest/range inspection has an **executed A1b proof** over six operator-local real files; GGUF-A3 adds the `tensor_payload`/`tensor_view` modules (pathless payload carrier, `vincula` bind, bounded windowed materializers) and the widened dequant union set, without architecture admission, tokenizer, or inference claims | Gradus |
 | Tokenizer identity + probe parity + `est_eog` | **Shipped (PML2/PML5)** | Gradus |
 | Inference: decode, KV-cache, sampling, generation config | **Shipped (PML5)** | Gradus |
 | nanoGPT on Shakespeare (CPU) | **Planned** (forcing-function demo; corpus/ not yet in-tree) | Gradus |
