@@ -33,7 +33,7 @@ closeout, never a dev-loop suite.
 | --- | --- | --- |
 | Co-located package tests | `src/*.proba`, `src/model/*.proba` | Compile-level contract + oracle pins per module |
 | Model / tokenizer fixtures | `fixtures/safetensors/`, `fixtures/gguf/`, `fixtures/tokenizer/` | Legal fixtures + row-oracle docs, including the three GGUF-A1a manifest fixtures and the GGUF-A3 union-set dequant goldens (`gguf-dequant-goldens.json` + derivation contract) |
-| Exempla consumers | `exempla/gradient-seam`, `exempla/gradient-seam-nolib`, `exempla/training-loop-mlp`, `exempla/token-generation`, `exempla/gguf-manifest`, `exempla/gguf-inspect`, `exempla/qwen36-35b-inference`, `exempla/dense-rmsnorm`, `exempla/dense-swiglu`, `exempla/dense-llama-adapter` | Public-surface consumers plus the executed GGUF synthetic proof (40 PASS / 0 FAIL), guarded six-file local inspection receipt, the capstone tokenizer-phase run (LIB-02-U4-1), the REF-01-U1.1 RMSNorm executed proof (32 PASS / 0 FAIL), the executed REF-01-U1.2 SiLU/SwiGLU proof (14 PASS / 0 FAIL), and the REF-01-U1.6 llama-adapter executed proof (19 PASS / 0 FAIL) |
+| Exempla consumers | `exempla/gradient-seam`, `exempla/gradient-seam-nolib`, `exempla/training-loop-mlp`, `exempla/token-generation`, `exempla/gguf-manifest`, `exempla/gguf-inspect`, `exempla/qwen36-35b-inference`, `exempla/dense-rmsnorm`, `exempla/dense-swiglu`, `exempla/dense-llama-adapter`, `exempla/dense-qwen2-adapter` | Public-surface consumers plus the executed GGUF synthetic proof (40 PASS / 0 FAIL), guarded six-file local inspection receipt, the capstone tokenizer-phase run (LIB-02-U4-1), the REF-01-U1.1 RMSNorm executed proof (32 PASS / 0 FAIL), the executed REF-01-U1.2 SiLU/SwiGLU proof (14 PASS / 0 FAIL), the REF-01-U1.6 llama-adapter executed proof (19 PASS / 0 FAIL), and the qwen2 adapter executed proof (23 PASS / 0 FAIL, REF-01-U1.7) |
 | Admission conformance | `tests/admission_conformance.fab` | Capsule admission composition check |
 
 Nested package dirs follow the Agents rule (≥2 modules); model package
@@ -43,7 +43,7 @@ tests live under `src/model/`.
 
 ## 2. Proba inventory (structural)
 
-Live co-located suites (29 files):
+Live co-located suites (30 files):
 
 | Suite | Module / surface | Pin class (summary) |
 | --- | --- | --- |
@@ -76,6 +76,7 @@ Live co-located suites (29 files):
 | `src/model/artifact.proba` | pathless content identity | Algorithm, digest, and positive-length validation |
 | `src/model/dense_llama.proba` | `gradus:model/dense_llama` (REF-01-U1.6) | Frozen SmolLM2-360M config facts; every canonical name resolves to the exact descriptor facts the A1b inspect surface reports for the real SmolLM2 file (name, shape, layout); fail-closed typed rejection rows (unknown canonical, out-of-range layer, missing tensor, unknown layout) |
 | `src/model/gguf_manifest.proba` | GGUF-A1b manifest and range seam | Unknown codec inspection, exact ranges, source failure, checked tensor fragments, and LIB-02-U1 tokenizer array pins (248320 tokens / 247587 merges / special ids) |
+| `src/model/dense_qwen2.proba` | `gradus:model/dense_qwen2` (REF-01-U1.7) | qwen2 adapter descriptor-resolution pins — every canonical name resolves to the exact A1b descriptor facts for the Qwen2.5-0.5B row (layer 0 + layer 23, tied + untied `lm_head`), the frozen config render (`24/14/2/64/896/151936/1000000`), and the fail-closed rejection rows (unknown name / suffix, layer range, missing tensor, non-qwen2 arch) |
 
 Every suite header states **EVIDENCE HONESTY (CTO Q2)**: structural /
 compile-level proof; executed value-identity deferred.

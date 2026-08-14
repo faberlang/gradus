@@ -48,6 +48,15 @@ proofs, not tokenizer, model execution, or inference claims. Exact receipts
 live in `exempla/gguf-manifest/README.md` and
 `exempla/gguf-inspect/README.md`.
 
+The REF-01 dense reference surface begins with the typed architecture
+adapters: `gradus:model/dense_qwen2` resolves the canonical qwen2 dense
+tensor-name family (the same canonical family as the `llama` adapter) to the
+exact GGUF-A1b manifest descriptor facts, with the qwen2 deltas (tensor-set
+tie status, GQA head config, rope_theta 1000000) and fail-closed typed
+diagnostics. The adapter's executed proof (`exempla/dense-qwen2-adapter`)
+prints 23 PASS / 0 FAIL (exit 0) over the pinned Qwen2.5-0.5B descriptor
+facts; it does not tokenize, materialize payloads, or claim inference.
+
 The compiler's autograd capability is shipped (campaign `mir-autograd`, closed
 at `336f359ec`): the reverse-mode AD transform covers 16 of 18 AIR tensor ops
 with VJPs; two ops (broadcast, reduce) have partial support (rank-extension
@@ -63,6 +72,7 @@ The gradient seam consumers live under `exempla/`:
 | --- | --- | --- |
 | `exempla/gradient-seam` | Library import of `gradus:gradient` + FD check (SEM004 companion across `importa`) | **Structural** — `faber check`; oracle pins in the exemplum README |
 | `exempla/gradient-seam-nolib` | Self-contained `@ radix backward` + FD (no library import) | **Structural** — `faber check`; same arithmetic oracle |
+| `exempla/dense-qwen2-adapter` | Typed `qwen2` architecture adapter executed proof — every canonical resolution + fail-closed rejection row over the pinned Qwen2.5-0.5B descriptor facts (REF-01-U1.7) | **Executed** — package-MIR run, 23 PASS / 0 FAIL, exit 0; receipt in the exemplum README |
 
 Pinned oracle (f64 arithmetic of the documented loss): forward loss `2.25`,
 companion `grad_w = [0.25, 0.5, 0.75, 1.0]`, FD diffs ~`1e-11`. See each
