@@ -1,6 +1,6 @@
 # Campaign: Production ML Library
 
-**Status**: active — PML5-GGUF Qwen3.6 invariant; GGUF-A1a bounded parsing and GGUF-A1b guarded real-file inspection are implemented; GGUF-A1c is implemented in the transitional A1C micro-unit chain but not yet validated, audited, or integrated (aggregate M8 merge gate pending)
+**Status**: active — PML5-GGUF Qwen3.6 invariant; GGUF-A1a/A1b implemented, GGUF-A1c integrated at main 2b3e41a, and GGUF-A3 (checked packed storage + bounded tensor materialization, LIB-03) implemented at the output-checked slice tier; PML5 remains active until the Qwen3.6 invariant executes end to end
 **Created**: 2026-08-08
 **Mode**: routing artifact — draft/maintain; does not implement code directly
 **Control-plane repo**: `/Users/ianzepp/work/faberlang/gradus`
@@ -321,7 +321,7 @@ compose publicly; a bounded workload converges and resumes reproducibly.
 
 ### PML5 — Production inference computation layer
 
-**Status**: active — PML5 U1–U6 structural receipts landed (bdefb5a, 3b2fc9b, b1b01f1, 56e70f0, 8cf798a, 1a6abd0), and GGUF-A1a/A1b inspect the real corpus; PML5 remains incomplete until the Qwen3.6 invariant executes end to end
+**Status**: active — PML5 U1–U6 structural receipts landed (bdefb5a, 3b2fc9b, b1b01f1, 56e70f0, 8cf798a, 1a6abd0), GGUF-A1a/A1b inspect the real corpus, and GGUF-A3 packed-storage materialization is implemented at the output-checked slice tier (LIB-03); PML5 remains incomplete until the Qwen3.6 invariant executes end to end
 **Owner**: Gradus.
 **Source**: PML2/PML3, GI0-GI3 oracle and decoder contracts, and independent
 token/logit fixtures.

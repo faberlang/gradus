@@ -433,6 +433,27 @@ materialization phase of the capstone.
 range, shape, storage layout, and bounded materialization path; selected
 tensor slices match the independent oracle.
 
+**Implemented evidence**: GGUF-A3 is implemented across the micro-unit chain
+on the `factory/hand-24` packet (C1 `82048b5`; C2-U1 `fc59ac4`, C2-U2
+`e640a50`, C2-U3 `6dd29fb`, C2-U4 `686653c`, C2-U5 `d182c5c`, C3-U1
+`2ec80d8`/`4b1d165`, C3-U2 `edcff45`, C3-U6 `9643e5b`; the C3-U3/U4/U5 doc
+units land through the parallel hand-3/hand-9/hand-1 packets and are verified
+at merge time). The admitted codec set widens to
+{F32, BF16, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K}, and the surface adds
+`limes_payloadis`, `TensorPayload`/`PayloadError`, `VisumTensoris`/
+`VisioError` + `vincula`, and the bounded windowed materializers
+`materializa_slicem` / `materializa_glomulum` — every byte read flows through
+the operation-scoped source; no whole-tensor or whole-model read path exists.
+The A3 closeout gate ran green on 2026-08-14 from the hand-24 packet:
+`./scripta/check-source` exit 0, `./scripta/check-compile` ok, and the guarded
+real-file exempla run against the local Qwen3.6 artifact printed 13 PASS /
+0 FAIL with exit 0 — coverage `tensors=753 known=753 unknown=0` over
+BF16:2/F32:368/Q8_0:259/Q4_K:82/Q5_K:38/Q6_K:4, the two Qwen2.5 dense-row
+distributions, and all eight golden slices bit-exact against the committed
+goldens (full receipt in `exempla/gguf-materialize/README.md`). This is the
+output-checked slice-tier proof; executed token/model identity remains gated
+on CTO8-1 (GGUF-A4+).
+
 ### GGUF-A4 — Dense Llama/Qwen Full Model
 
 Implement RMSNorm, SiLU/SwiGLU, configurable RoPE, multi-head attention, GQA,
