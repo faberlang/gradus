@@ -364,6 +364,13 @@ proofs.
 - `functio layernorm(tensor.Tensor x, tensor.Tensor scale, tensor.Tensor
   offset, f32 epsilon) → tensor.Tensor ⇥ NnError` — shape-generic LayerNorm
   over the last axis.
+- `functio silu(tensor.Tensor x) → tensor.Tensor ⇥ NnError` — shape-generic
+  SiLU (`x·sigmoid(x)`, self-hosted sigmoid via the e^{−t} identity).
+- `functio swiglu(tensor.Tensor gate, tensor.Tensor up, tensor.Tensor
+  down_weight, tensor.Tensor down_bias) → tensor.Tensor ⇥ NnError` — the
+  SwiGLU gated-MLP row: `h = silu(gate) ⊙ up`, `y = linear(h, down_weight,
+  down_bias)`; gate/up share a rank-2 shape, down_weight [F,N], down_bias
+  per-channel [N] or same-shape [M,N].
 
 ## gradus:attention
 

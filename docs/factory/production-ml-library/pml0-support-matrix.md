@@ -75,6 +75,18 @@ app-owned range source. This is **output-checked slice evidence**, not
 executed token/model identity, logits, or device execution — CTO8-1 stays the
 named gate, and neither row claims more.
 
+**REF-01 U1.2 nn-surface note (2026-08-14, recorded).** The dense-reference
+wave (REF-01) extends the `gradus:nn` production surface with the SiLU
+activation and the SwiGLU gated-MLP row over the staged f32 carrier —
+pinned f64 values in `src/nn.proba` (silu identity + gated composition,
+5e-4 tolerance) and an executed 14-PASS/0-FAIL package-MIR proof in
+`exempla/dense-swiglu/`. These are **not yet an admitted support row**:
+REF-01 sits behind Gate 1 (Gate 0 = LIB-02 + LIB-03 receipts accepted), and
+the SwiGLU row's same-shape-bias workload is the executed contract until the
+per-channel-bias broadcast path is repaired (recorded residual — `linear`
+bias [N] against [M,N] requires `forma.broadcastum` singleton broadcast,
+which the current implementation rejects at runtime).
+
 ## 1. Admitted rows
 
 ### Row 1 — PML2 Safetensors model-file admission row
