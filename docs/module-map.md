@@ -9,11 +9,13 @@ One `.fab` file → one import path. Nested dirs for packages.
 
 ## Live modules (post-PML1–5 + correctness wave)
 
-The live tree has 30 modules and 654 declared functions (inventory
+The live tree has 31 modules and 704 declared functions (inventory
 re-baselined for the A1C capsule-schema-2.0.0 surface, the LIB-02-U1
 `gguf_manifest` array accessors, the LIB-02-U2 tokenizer runtime, the
-GGUF-A3 `tensor_payload` / `tensor_view` + widened-dequant surface, and the
-REF-01-U1.6 `dense_llama` llama architecture adapter — see the Coverage Check
+GGUF-A3 `tensor_payload` / `tensor_view` + widened-dequant surface, the
+REF-01-U1.6 `dense_llama` llama architecture adapter, the REF-01-U1.7
+`dense_qwen2` qwen2 adapter, and the REF-01-U1.8 `model/dense` dense model
+assembly — see the Coverage Check
 in [`docs/api-reference.md`](api-reference.md)). The GGUF-A1b surface
 has an executed 40-case synthetic package-MIR proof and guarded real-file
 inspection receipts for six operator-local GGUFs. Exact evidence and boundaries
@@ -47,6 +49,7 @@ and [`exempla/gguf-inspect/README.md`](../exempla/gguf-inspect/README.md).
 | `gradus:model/tensor_payload` | `src/model/tensor_payload.fab` | `TensorPayload` value + `PayloadError` diagnostics — pathless payload carrier (name, absolute start, length, bytes) (GGUF-A3) |
 | `gradus:model/tensor_view` | `src/model/tensor_view.fab` | `VisumTensoris` typed view + `VisioError` + `vincula` bind + bounded windowed materializers `materializa_slicem`/`materializa_glomulum` (GGUF-A3) |
 | `gradus:model/dense_qwen2` | `src/model/dense_qwen2.fab` | Typed `qwen2` (Qwen2.5) architecture adapter — canonical dense tensor-name → manifest-descriptor resolution (`configura`/`resolve`/`descriptio_render`) with the qwen2 deltas: tensor-set tie status, GQA head config, rope_theta 1000000 (REF-01-U1.7) |
+| `gradus:model/dense` | `src/model/dense.fab` | Dense model assembly — the complete ordered dense forward graph (`praevideo`): embedding gather → N ordered U1.5 `dense_block` rows → final RMSNorm → output projection, assembled from the typed architecture config (`ConfiguraDensa`) and materialized stored-weight views via canonical names; tied/untied embedding handling; zero per-row constants (REF-01-U1.8) |
 | `gradus:tokenizer` | `src/tokenizer.fab` | Tokenizer identity + probe parity + `est_eog` (PML2/PML5) + artifact-backed byte-level BPE runtime with the composed qwen35 pre-tokenizer and special/EOG/BOS/chat policy surface (LIB-02-U2/U3; completion oracle pinned in `fixtures/tokenizer/pinned-probe-oracle.md`); capstone tokenizer phase run by `exempla/qwen36-35b-inference` (LIB-02-U4-1) |
 | `gradus:cache` | `src/cache.fab` | KV-cache values + mutation rules (PML5) |
 | `gradus:decode` | `src/decode.fab` | Decode/prefill/session/cancel + replica loop (PML5) |
@@ -70,7 +73,8 @@ PML2 Model admission    gradus:model/artifact, gradus:model/capsule,
                         gradus:model/tensor_payload, gradus:model/tensor_view
 REF-01 Dense reference  gradus:model/dense_llama (llama/SmolLM2 adapter,
                         REF-01-U1.6), gradus:model/dense_qwen2 (qwen2
-                        adapter, REF-01-U1.7)
+                        adapter, REF-01-U1.7), gradus:model/dense (dense
+                        model assembly, REF-01-U1.8)
 PML2 Tokenizer identity gradus:tokenizer
 PML5 Inference          gradus:decode, gradus:cache, gradus:sampling,
                         gradus:generation

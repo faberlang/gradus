@@ -22,14 +22,16 @@ the configurable RoPE attention row, and the dense_llama/dense_qwen2
 architecture-adapter modules — total 648 → 684), and re-baselined for
 REF-01 wave batch 2 (the multi-head GQA attention row on `attention`
 and the generic dense transformer-block row on `transformer` — total
-684 → 693)
+684 → 693), and re-baselined for REF-01-U1.8 (the `model/dense` dense
+model assembly module — total 693 → 704)
 **Date**: 2026-08-08 (PML0) / 2026-08-09 (PML1/PML2 re-baselines) /
 2026-08-11 (PML6-U1 re-baseline) / 2026-08-12 (GGUF-A1b range seam; grep only,
 no cargo) / 2026-08-13 (GGUF-A1c A1C-M6 re-baseline) / 2026-08-14 (LIB-02-U1)
 / 2026-08-14 (GGUF-A3 C3-U6 final inventory baseline) / 2026-08-14
 (LIB-02-U3/U4 qwen35 pre-tokenizer + policy-surface re-baseline) /
 2026-08-14 (REF-01 wave batch 1 re-baseline) / 2026-08-14 (REF-01 wave
-batch 2 re-baseline)
+batch 2 re-baseline) / 2026-08-14 (REF-01-U1.8 dense model assembly
+re-baseline)
 **Source**: live `grep -c 'functio ' src/*.fab` + `src/model/*.fab` per
 module — the scan is recursive so the PML2 model module (`src/model/`,
 sub-leaves artifact/capsule/dequant/gguf/gguf_manifest/safetensors/
@@ -37,11 +39,12 @@ tensor_payload/tensor_view) is covered
 **Method**: `scripta/inventory-public-symbols` — grep-based; counts `functio `
 declaration lines per `src/*.fab` module (recursively), prints the module →
 functio table plus the all-module total, and asserts the re-baselined
-baseline: per-module counts for **every live module** (31 modules: the
+baseline: per-module counts for **every live module** (32 modules: the
 PML0/PML1 foundation and proof-surface modules, the PML2 model module's
-ten sub-leaves including the two REF-01 architecture adapters
-`model/dense_llama` + `model/dense_qwen2`, the PML4 training-layer modules,
-and the PML5 inference modules) and the tracked total **693** (the live
+eleven sub-leaves including the two REF-01 architecture adapters
+`model/dense_llama` + `model/dense_qwen2` and the REF-01-U1.8 dense model
+assembly `model/dense`, the PML4 training-layer modules,
+and the PML5 inference modules) and the tracked total **704** (the live
 all-module count — every
 module is asserted, there is no untracked remainder). The script
 additionally runs the
@@ -88,7 +91,12 @@ row on `attention` (`multi_head_attention` and the `_caput`/`_concilio`/
 `_matmul_attentio`/`_valida_multi` helpers, 30 → 35) and the generic dense
 transformer-block row on `transformer` (`dense_block` and the `_rmsnorm`/
 `_swiglu`/`_multi_attentio` helpers, 9 → 13); the re-baseline is the merged
-REF-01 wave batch 2 inventory baseline (31 modules / 693). This
+REF-01 wave batch 2 inventory baseline (31 modules / 693). REF-01-U1.8 adds
+the dense model assembly module `model/dense` (`praevideo`, the
+`ConfiguraDensa`/`Repertum`/`DenseError` genera and the
+`_fons`/`_forma_textus`/`_forma`/`_transpone`/`_collige`/`_nullum_bias`/
+`_rmsnorm`/`_linear`/`_block` helpers, 11); the re-baseline is the merged
+REF-01-U1.8 inventory baseline (32 modules / 704). This
 inventory remains a structural count.
 remains a structural count.
 **Consumed by**: PML0-U3 (proof-shaped API ledger) feeds the fixed-shape rows
@@ -114,6 +122,7 @@ model/artifact   4
 model/capsule    45
 model/dense_llama 6
 model/dense_qwen2 14
+model/dense      11
 model/dequant    21
 model/gguf_manifest 46
 model/gguf       10
@@ -130,7 +139,7 @@ tensor           11
 tokenizer        74
 train            41
 transformer      13
-TOTAL            693
+TOTAL            704
 ```
 
 ## Symbol detail
@@ -156,6 +165,7 @@ helpers, matching the captured output):
 | model/capsule | 45 | `causa`, `identitas_aequus`, `verifica`, `verifica_contra`, `structa_manifestum`, `serializa_identitas`, `deserializa_identitas`, `manifestum_gguf`, `manifestum_safetensors` + the schema-2 genus methods (MetadatumSafetensori: `clavis`, `valor`; DescriptioTensorisSafetensori: `nomen`, `typo`, `forma`, `initium`, `finis`, `elementa`; ManifestumSafetensors: `formatum`, `versio`, `longitudo_artefacti`, `longitudo_datorum`, `metadatorum_numerus`, `tensorum_numerus`, `metadatum`, `descriptio`; Capsula: `schematis`, `identitas_artificii`, `algorithmus`, `digestio`, `longitudo`, `formatum`, `tensorum_numerus`, `manifestum_gguf`, `manifestum_safetensors`, `identia`; Identitas: `schematis`, `algorithmus`, `digestio`, `longitudo_bytes`) (6 `@ privata` validators) |
 | model/dense_llama | 6 | `causa`, `ars_smollm2`, `nomen_gguf`, `resolvo`, `layout_nota` (1 `@ privata` helper; the typed llama/SmolLM2 architecture adapter, REF-01-U1.6) |
 | model/dense_qwen2 | 14 | `causa`, `configura`, `resolve`, `descriptio_render` (10 `@ privata` helpers; the typed qwen2 architecture adapter, REF-01-U1.7) |
+| model/dense | 11 | `causa`, `praevideo` (9 `@ privata` helpers — `_fons`/`_forma_textus`/`_forma`/`_transpone`/`_collige`/`_nullum_bias`/`_rmsnorm`/`_linear`/`_block`; the dense model assembly `praevideo` over the typed `ConfiguraDensa` config + `Repertum` resolver seam, REF-01-U1.8) |
 | model/dequant | 21 | `causa`, `elementa_glomoris`, `octeti_glomoris`, `dequantizas_glomulus`, `dequantizas_ordo` (16 `@ privata` helpers; the GGUF-A3 union-set widening adds the BF16/Q5_K block codecs `_bfloat16`/`_dequant_bf16`/`_dequant_q5_k`, `82048b5`) |
 | model/gguf | 10 | `admit` (thin schema-2 wrapper over `manifestum`, D3) + `causa` + 8 `@ privata` bounded-wire/contract helpers |
 | model/gguf_manifest | 46 | `causa`, `layout`, `metadatum`, `textum`, `numerum`, `textorum`, `numerorum`, `inveni_tensorem`, `limes_payloadis`, `parse`, `inspice`, `lege_fragmentum` + 34 `@ privata` bounded-wire/range/layout helpers (incl. the shared `_numerum_scalarum` scalar reader; `limes_payloadis` is the A3-C2-U1 payload-range seam `tensor_view.vincula` binds against) |
@@ -182,11 +192,12 @@ helpers, matching the captured output):
   transformer 13), the PML4 training-layer modules (metrics 6, train 41), the
   PML5 inference modules (cache 37, decode 46, generation 27, sampling 27),
   and the PML2 model module (`model/artifact` 4, `model/capsule` 45,
-  `model/dense_llama` 6, `model/dense_qwen2` 14, `model/dequant` 21,
+  `model/dense_llama` 6, `model/dense_qwen2` 14, `model/dense` 11,
+  `model/dequant` 21,
   `model/gguf` 10, `model/gguf_manifest` 46,
   `model/safetensors` 24, `model/tensor_payload` 1, `model/tensor_view` 7) +
   tokenizer 74.
-- The tracked total == the live all-module total == **693**; every module is
+- The tracked total == the live all-module total == **704**; every module is
   asserted (no untracked remainder).
 - The **coverage gate** holds: every public symbol name above appears in
   `docs/api-reference.md` under its module's `## gradus:<module>` section —

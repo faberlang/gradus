@@ -1,6 +1,10 @@
 # Gradus Regression Corpus
 
-**Version**: `gradus-regression-corpus v1.7.0` (2026-08-14, REF-01-U1.5 —
+**Version**: `gradus-regression-corpus v1.8.0` (2026-08-14, REF-01-U1.8 —
+dense model assembly pins: the full-graph logits (embedding gather → 2
+ordered U1.5 blocks → final RMSNorm → output projection) for a synthetic
+T=2/D=16/vocab-8 config with tied + untied embedding rows + exempla
+`dense-model` executed proof (37 PASS / 0 FAIL); REF-01-U1.5 —
 generic dense block pins: the ordered block composition (input RMSNorm →
 GQA causal+RoPE → residual → post-attn RMSNorm → SwiGLU → residual) over a
 synthetic T=2/D=16 config + exempla `dense-block` executed proof (32 PASS /
@@ -38,7 +42,7 @@ closeout, never a dev-loop suite.
 | --- | --- | --- |
 | Co-located package tests | `src/*.proba`, `src/model/*.proba` | Compile-level contract + oracle pins per module |
 | Model / tokenizer fixtures | `fixtures/safetensors/`, `fixtures/gguf/`, `fixtures/tokenizer/` | Legal fixtures + row-oracle docs, including the three GGUF-A1a manifest fixtures and the GGUF-A3 union-set dequant goldens (`gguf-dequant-goldens.json` + derivation contract) |
-| Exempla consumers | `exempla/gradient-seam`, `exempla/gradient-seam-nolib`, `exempla/training-loop-mlp`, `exempla/token-generation`, `exempla/gguf-manifest`, `exempla/gguf-inspect`, `exempla/qwen36-35b-inference`, `exempla/dense-rmsnorm`, `exempla/dense-swiglu`, `exempla/dense-llama-adapter`, `exempla/dense-qwen2-adapter`, `exempla/dense-block` | Public-surface consumers plus the executed GGUF synthetic proof (40 PASS / 0 FAIL), guarded six-file local inspection receipt, the capstone tokenizer-phase run (LIB-02-U4-1), the REF-01-U1.1 RMSNorm executed proof (32 PASS / 0 FAIL), the executed REF-01-U1.2 SiLU/SwiGLU proof (14 PASS / 0 FAIL), the REF-01-U1.6 llama-adapter executed proof (19 PASS / 0 FAIL), the qwen2 adapter executed proof (23 PASS / 0 FAIL, REF-01-U1.7), and the REF-01-U1.5 dense-block executed proof (32 PASS / 0 FAIL) |
+| Exempla consumers | `exempla/gradient-seam`, `exempla/gradient-seam-nolib`, `exempla/training-loop-mlp`, `exempla/token-generation`, `exempla/gguf-manifest`, `exempla/gguf-inspect`, `exempla/qwen36-35b-inference`, `exempla/dense-rmsnorm`, `exempla/dense-swiglu`, `exempla/dense-llama-adapter`, `exempla/dense-qwen2-adapter`, `exempla/dense-block`, `exempla/dense-model` | Public-surface consumers plus the executed GGUF synthetic proof (40 PASS / 0 FAIL), guarded six-file local inspection receipt, the capstone tokenizer-phase run (LIB-02-U4-1), the REF-01-U1.1 RMSNorm executed proof (32 PASS / 0 FAIL), the executed REF-01-U1.2 SiLU/SwiGLU proof (14 PASS / 0 FAIL), the REF-01-U1.6 llama-adapter executed proof (19 PASS / 0 FAIL), the qwen2 adapter executed proof (23 PASS / 0 FAIL, REF-01-U1.7), the REF-01-U1.5 dense-block executed proof (32 PASS / 0 FAIL), and the REF-01-U1.8 dense-model assembly executed proof (37 PASS / 0 FAIL, tied + untied rows + the fail-closed rejection row) |
 | Admission conformance | `tests/admission_conformance.fab` | Capsule admission composition check |
 
 Nested package dirs follow the Agents rule (≥2 modules); model package
@@ -82,6 +86,7 @@ Live co-located suites (30 files):
 | `src/model/dense_llama.proba` | `gradus:model/dense_llama` (REF-01-U1.6) | Frozen SmolLM2-360M config facts; every canonical name resolves to the exact descriptor facts the A1b inspect surface reports for the real SmolLM2 file (name, shape, layout); fail-closed typed rejection rows (unknown canonical, out-of-range layer, missing tensor, unknown layout) |
 | `src/model/gguf_manifest.proba` | GGUF-A1b manifest and range seam | Unknown codec inspection, exact ranges, source failure, checked tensor fragments, and LIB-02-U1 tokenizer array pins (248320 tokens / 247587 merges / special ids) |
 | `src/model/dense_qwen2.proba` | `gradus:model/dense_qwen2` (REF-01-U1.7) | qwen2 adapter descriptor-resolution pins — every canonical name resolves to the exact A1b descriptor facts for the Qwen2.5-0.5B row (layer 0 + layer 23, tied + untied `lm_head`), the frozen config render (`24/14/2/64/896/151936/1000000`), and the fail-closed rejection rows (unknown name / suffix, layer range, missing tensor, non-qwen2 arch) |
+| `src/model/dense.proba` | `gradus:model/dense` (REF-01-U1.8) | Full-graph logit pins for the small synthetic dense config (T=2, D=16, F=16, H=4, K=2, head_dim=4, vocab 8, tokens `[0, 7]`) — tied and untied embedding rows, f64 references @ **5e-4** (zero same-shape biases, the assembly's synthesized-bias contract) — plus the fail-closed typed-error rows (missing canonical tensor, token out of range, invalid config, shape contradiction, positions mismatch) |
 
 Every suite header states **EVIDENCE HONESTY (CTO Q2)**: structural /
 compile-level proof; executed value-identity deferred.
@@ -246,6 +251,26 @@ RMSNorm → GQA attention (causal + RoPE) → residual → post-attn RMSNorm →
 SwiGLU MLP → residual — via external Python/numpy (the PML3
 `transformer_block` pin precedent).
 
+### 4.12 Dense model assembly pins (REF-01-U1.8)
+
+| Pin family | Where | Band / rule |
+| --- | --- | --- |
+| Full-graph logits — tied embedding row (lm_head shares the embedding) — synthetic config T=2, D=16, F=16, num_heads=4, num_kv_heads=2, head_dim=4, vocab 8, tokens `[0, 7]`, positions `[0, 1]`, rope_dim 4, consecutive-pair (llama NORM) freq_base 100000, dk scale 0.5, RMSNorm ε=1e-5 | `src/model/dense.proba` + `exempla/dense-model` | **5e-4** absolute |
+| Full-graph logits — untied embedding row (lm_head is a separate canonical tensor) | `src/model/dense.proba` + `exempla/dense-model` | **5e-4** absolute |
+| Fail-closed typed-error contract (missing canonical tensor, token out of range, invalid config, shape contradiction, positions mismatch) | `src/model/dense.proba` + the executed rejection row in `exempla/dense-model` | exact causa identity |
+
+Pin count: 37 executed PASS rows (`exempla/dense-model` — 16 tied logit
+pins + 16 untied logit pins + 2 shape/dtype rows + the fail-closed
+rejection row, 0 FAIL, exit 0) + the co-located compile-level proba pins
+(representative subset + the typed-error rows). The reference values are
+the independent f64 evaluation of the documented full-graph formulas —
+embedding gather → 2 ordered U1.5 blocks → final RMSNorm → output
+projection — via external Python/numpy (the block transcription is first
+validated against the pinned dense-block values in §4.11). The full-graph
+pins use **zero same-shape biases** for every linear row: the assembly
+synthesizes the biases (the llama/qwen2 canonical family carries no bias
+weights — the executed same-shape-bias contract of the composed rows).
+
 ---
 
 ## 5. Structural validation
@@ -278,6 +303,10 @@ operator-local GGUFs and fails if an inspection request enters tensor data.
 This is manifest/range evidence only, not tokenizer or inference execution.
 The REF-01-U1.1 RMSNorm proof (`exempla/dense-rmsnorm`) runs through package
 MIR and exits 0 with 32 PASS / 0 FAIL on the pinned f64 references.
+The REF-01-U1.8 dense model assembly proof (`exempla/dense-model`) runs
+through package MIR and exits 0 with 37 PASS / 0 FAIL on the pinned
+full-graph f64 references (tied + untied embedding rows + the fail-closed
+rejection row).
 
 ### 5.2 Pin-consistency greps (U4)
 
@@ -306,7 +335,12 @@ test -f fixtures/gguf/smollm2-360m-scaled-row.gguf
 test -f fixtures/tokenizer/tokenizer-identity-oracle.md
 
 # Proba count stays the admitted co-located surface
-find src -name '*.proba' | wc -l   # expect 29 at this corpus version
+find src -name '*.proba' | wc -l   # expect 31 at this corpus version
+
+# REF-01-U1.8 dense-model pins in the proba + the executed exempla
+rg -n 'LG_T_|LG_U_|token id out of range for the embedding|positions must match the token count' \
+  src/model/dense.proba
+rg -n 'reject-missing|tied_0_0|untied_1_7' exempla/dense-model/src/main.fab
 
 # GGUF-A3 goldens fixtures present
 test -f fixtures/gguf/gguf-dequant-goldens.json

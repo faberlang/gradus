@@ -978,6 +978,59 @@ the rejection rows).
 `StratumExtraLimitem`, `TensorAbsens`, and `ConfiguraMala`; each carries
 `textus causa`.
 
+## gradus:model/dense
+
+Dense model assembly (REF-01-U1.8). `praevideo` is the complete ordered
+dense forward graph — embedding gather → N ordered U1.5 blocks → final
+RMSNorm → output projection — assembled from the typed architecture config
+and materialized stored-weight views via canonical tensor names. The caller
+supplies a resolver (`fons`) that returns the materialized STORED-weight
+view for one canonical tensor name (`model.embed_tokens`,
+`model.layers.{N}.input_layernorm`, `.self_attn.{q,k,v,o}_proj`,
+`.post_attention_layernorm`, `.mlp.{gate,up,down}_proj`, `model.norm`,
+`lm_head`) plus a layer index — the GGUF/A1b descriptor layout
+(`token_embd.weight` is `[D, V]`). The assembly transposes the embedding
+for the token-major gather and reuses it directly for a TIED `lm_head`; an
+UNTIED row resolves `lm_head` separately. Every linear bias is synthesized
+as a same-shape zero tensor (the llama/qwen2 canonical family carries no
+bias weights). Zero per-row special-case constants: every shape derives
+from the config and the runtime tensors. Fails closed with typed
+diagnostics on unknown/missing canonical tensors, an invalid config, a
+shape that contradicts the config, and token ids outside the embedding
+vocabulary. Executed proof: `exempla/dense-model` prints 37 PASS / 0 FAIL
+(exit 0) for a small synthetic dense config (T=2, D=16, F=16, H=4, K=2,
+head_dim=4, vocab 8) with tied and untied embedding rows, plus the
+fail-closed rejection row.
+
+`genus ConfiguraDensa` — fields `strata` (block count), `capita` (head
+count), `capita_kv` (KV head count), `dimensio_capitis` (head dim),
+`dimensio_occulta` (hidden dim), `vocabulum` (vocabulary size), and
+`ligatum` (tied embedding).
+
+`genus Repertum` — one resolver answer: `successus` (`bivalens`), `tensorem`
+(the materialized stored-weight view), and `causa` (the failure text). The
+assembly maps a `successus = falsum` answer into `TensorAbsens` carrying
+the resolver's causa verbatim.
+
+- `functio causa(DenseError e) → textus` — render the typed error message.
+- `functio praevideo(ConfiguraDensa cfg, (textus, numerus) → Repertum fons,
+  lista<numerus> tokens, f32 epsilon, f32 scale, lista<numerus> positions,
+  numerus rope_dim, attention.RopeConfigura rope_cfg) → tensor.Tensor ⇥
+  DenseError` — the complete ordered dense forward graph over the staged
+  carrier: embedding gather (from the transposed stored view), N ordered
+  U1.5 `dense_block` rows resolved by canonical name, the final RMSNorm,
+  and the output projection (tied `lm_head` reuses the stored embedding
+  view; an untied row resolves `lm_head`). Fails closed on a resolver
+  failure (`TensorAbsens`), an invalid architecture config (`ConfiguraMala`:
+  non-positive layers/heads/KV-heads/head-dim/hidden/vocab, KV heads beyond
+  the head count, a non-divisible head/KV ratio, a non-empty token
+  sequence, positions/token count mismatch), a shape contradicting the
+  config (`FormaMala`), and token ids outside the embedding vocabulary
+  (`TerminusExcedit`).
+
+`discretio DenseError` variants: `TensorAbsens`, `ConfiguraMala`,
+`FormaMala`, and `TerminusExcedit`; each carries `textus causa`.
+
 ## gradus:tokenizer
 
 Tokenizer identity — `tokenizer-identity-schema-1.0.0` (PML2-U4, council
@@ -1356,12 +1409,15 @@ script (zombie-doc gate, PML6-U1). Private `_`-prefixed helpers are exempt;
 the two renamed serialize readers are documented for the correctness-wave
 reconciliation.
 
-**Function-count total: 611 (re-baselined).** The A1C capsule rewrite (M1)
+**Function-count total: 704 (re-baselined).** The A1C capsule rewrite (M1)
 and the D3/D4 caller migrations (M2/M3) changed the `model/capsule`,
 `model/gguf`, and `model/safetensors` counts, LIB-02-U1 added the
 `textorum`/`numerorum` array accessors on `model/gguf_manifest`, and
 GGUF-A3 (C2/C3) added the `model/tensor_payload`/`model/tensor_view`
 modules plus the widened `model/dequant` codec surface and the LIB-02-U2
-tokenizer runtime. The tracked all-module total is re-baselined and
-asserted by the inventory script (611); the former 585/618 no longer hold
-and are not restated.
+tokenizer runtime. The REF-01 wave batches added the `dense_llama`/
+`dense_qwen2` architecture adapters, the multi-head GQA attention row, the
+generic dense transformer block, and the `model/dense` dense model
+assembly module (REF-01-U1.8). The tracked all-module total is re-baselined
+and asserted by the inventory script (704); the former 585/618/611 no
+longer hold and are not restated.

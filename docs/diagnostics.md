@@ -61,6 +61,7 @@ pinned row is space-prefix-free (add_space_prefix = false)
 | `gradus:model/tensor_payload` | `PayloadError` | 3 | `src/model/tensor_payload.fab` |
 | `gradus:model/tensor_view` | `VisioError` | 7 | `src/model/tensor_view.fab` |
 | `gradus:model/dense_qwen2` | `DenseQwen2Error` | 5 | `src/model/dense_qwen2.fab` |
+| `gradus:model/dense` | `DenseError` | 4 | `src/model/dense.fab` |
 | `gradus:nn` | `NnError` | 9 | `src/nn.fab` |
 | `gradus:optimize` | `OptimizeError` | 14 | `src/optimize.fab` |
 | `gradus:parameter` | `ParametrumError` | 10 | `src/parameter.fab` |
@@ -72,7 +73,7 @@ pinned row is space-prefix-free (add_space_prefix = false)
 | `gradus:train` | `TrainError` | 10 | `src/train.fab` |
 | `gradus:transformer` | `TransformerError` | 12 | `src/transformer.fab` |
 
-**Total**: 224 public error codes across 29 error types.
+**Total**: 228 public error codes across 30 error types.
 
 ## `gradus:model/artifact` — `ArtifactError`
 
@@ -372,6 +373,27 @@ canonical name, layer index, or tensor fact.
 | `DenseQwen2Error.StratumExtraLimitem` | Layer index outside `[0, strata)`. | `layer index out of range for canonical tensor: …` | Address a layer within the frozen block count. |
 | `DenseQwen2Error.TensorAbsens` | A canonical tensor is missing from the manifest. | `canonical … missing from manifest: …`<br>`canonical model.embed_tokens missing from manifest: token_embd.weight` | Resolve against a manifest whose tensor table carries the canonical tensor. |
 | `DenseQwen2Error.ConfiguraMala` | A frozen-config fact is unavailable or invalid. | `qwen2 metadata fact unavailable: …`<br>`qwen2 head count must be positive`<br>`qwen2 token_embd.weight must be rank 2` | Provide the qwen2 metadata facts (architecture, block/head/kv/embedding counts) and a rank-2 `token_embd.weight`. |
+
+## `gradus:model/dense` — `DenseError`
+
+Source: `src/model/dense.fab`. Render with module `causa(e)`.
+
+The dense model assembly (REF-01-U1.8) fails closed with typed diagnostics
+on every canonical resolution and shape/sequence fact: a resolver that
+cannot materialize a canonical tensor (`TensorAbsens` — the resolver's
+causa is preserved verbatim), an architecture config that cannot be
+assembled (`ConfiguraMala`), a materialized tensor whose shape contradicts
+the config (`FormaMala`), and a token id outside the embedding vocabulary
+(`TerminusExcedit`). Sub-call failures from `gradus:nn` /
+`gradus:transformer` / `gradus:tensor` are mapped into `FormaMala`
+preserving the documented causa text.
+
+| Code | Class / when | Live messages (representative) | Resolution |
+| --- | --- | --- | --- |
+| `DenseError.TensorAbsens` | A canonical tensor cannot be materialized (resolver `successus = falsum`). | `canonical tensor missing: …` (the resolver's causa, preserved) | Provide a resolver that materializes every canonical name the config requires (`model.embed_tokens`, `model.layers.{N}.*`, `model.norm`, and `lm_head` for untied rows). |
+| `DenseError.ConfiguraMala` | The architecture config cannot be assembled, or the token sequence/positions are inconsistent. | `layer count must be at least 1`<br>`head count must be at least 1`<br>`KV head count must be between 1 and the head count`<br>`head count must be a multiple of the KV head count`<br>`head dim must be at least 1`<br>`hidden dim must be at least 1`<br>`vocabulary size must be at least 1`<br>`token sequence must be non-empty`<br>`positions must match the token count` | Provide a positive config consistent with the materialized tensor shapes, and one position per token. |
+| `DenseError.FormaMala` | A canonical tensor's shape contradicts the config, or a composed-row sub-call failed. | `canonical tensor … has shape …, expected …`<br>`embedding must be rank 2`<br>`block input must be rank 2`<br>`block weight must be rank 2`<br>`canonical tensor … must be rank 2` + the preserved nn/transformer/tensor causa texts | Provide materialized stored-weight views whose shapes match the config (`[D, V]` embed, `[D]` norm scales, `[D, H·D]`/`[D, K·D]`/`[H·D, H·D]` projections, `[D, F]`/`[F, D]` MLP rows). |
+| `DenseError.TerminusExcedit` | A token id is outside the embedding vocabulary. | `token id out of range for the embedding` | Provide token ids within `[0, vocabulum)`. |
 
 ## `gradus:model/gguf` — `GgufError`
 
