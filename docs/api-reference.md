@@ -675,6 +675,14 @@ octeti_per_blockum, longitudo_octetorum)` or `Ignota(typo)`.
   the chat template stay on the `numerum`/`textum` surface.
 - `functio inveni_tensorem(ManifestumGguf m, textus nomen) →
   DescriptioTensorisGguf ⇥ GgufManifestError` — retrieve one tensor descriptor.
+- `functio limes_payloadis(ManifestumGguf m, textus nomen) → iuncta<numerus,
+  numerus> ⇥ GgufManifestError` — exact stored byte range of one known-layout
+  tensor as `(initium_absolutum, longitudo_payloadis)` relative to the content
+  identity (GGUF-A3 C2-U1). Reuses the already-validated range/overlap facts
+  from parse/inspice via `inveni_tensorem` — no new layout derivation.
+  `Ignota` layout fails closed (`LayoutIgnota`); unknown name fails closed via
+  the `inveni_tensorem` passthrough (`WireMala`). This is the payload-range
+  seam `tensor_view.vincula` binds against.
 - `functio layout(numerus typo_ggml, lista<numerus> forma) → LayoutGgml ⇥
   GgufManifestError` — resolve known GGML block geometry or return
   `LayoutGgml.Ignota` for an unknown raw type ID.
@@ -725,14 +733,27 @@ frozen contract, not a claim that the migration has integrated.
 
 ## gradus:model/dequant
 
-CPU dequantization of the four admitted GGML block types (PML2-U5, C3) —
-exact re-expression of the GI2-1 CPU dequant core (llama.cpp
-`ggml/src/ggml-quants.c` at the pinned checkout). Bit-exact against the
-independent reference goldens.
+CPU dequantization of the admitted GGML block types (PML2-U5, C3; widened
+by GGUF-A3 C1 to the Qwen3.6 completion-row **union set {F32, BF16, Q5_0,
+Q8_0, Q4_K, Q5_K, Q6_K}**) — exact re-expression of the GI2-1 CPU dequant
+core (llama.cpp `ggml/src/ggml-quants.c` at the pinned checkout). Bit-exact
+against the independent reference goldens.
+
+The A3 additions are **BF16** (`GGML_BF16`, id 30; 1 element/block, 2
+bytes/block — bf16→f32 value arithmetic via the `_potentia_duorum` seam,
+bit-exact for every finite bf16; NaN fails closed `ValorMala`) and **Q5_K**
+(`GGML_Q5_K`, id 13; 256 elements/block, 176 bytes/block —
+`dequantize_row_q5_K`: d/dmin halves + `get_scale_min_k4` + qh[32] +
+qs[128], same f32 operation order). The dequant layout constants
+(`elementa_glomoris`/`octeti_glomoris`) are cross-checked against
+`LayoutGgml.Cognita` at the view-binding boundary (`tensor_view.vincula`):
+the manifest is the single layout authority — dequant validates admission
+and never re-derives layout.
 
 - `functio causa(DequantError e) → textus` — render the typed error message.
 - `functio elementa_glomoris(numerus typo) → numerus` — block element count
-  for an admitted GGML type (closed set {F32, Q5_0, Q8_0, Q4_K, Q6_K}).
+  for an admitted GGML type (closed union set {F32, BF16, Q5_0, Q8_0, Q4_K,
+  Q5_K, Q6_K}).
 - `functio octeti_glomoris(numerus typo) → numerus` — block byte size for an
   admitted GGML type.
 - `functio dequantizas_glomulus(numerus typo, lista<numerus<u8>> blocci) →
@@ -741,6 +762,74 @@ independent reference goldens.
 - `functio dequantizas_ordo(numerus typo, lista<numerus<u8>> octeti) →
   lista<f32> ⇥ DequantError` — dequantize a whole row (byte length must be
   a whole multiple of block bytes).
+
+## gradus:model/tensor_payload
+
+Bounded per-tensor payload value and its typed diagnostics (GGUF-A3
+C2-U2). One validated tensor's bounded byte payload together with the exact
+stored range facts that describe it (name, absolute byte start, length). It
+deliberately carries no path, URL, reader, file handle, memory map,
+host/device object, or whole-model byte list — a source adapter supplies
+bounded bytes separately (delivery clean boundary).
+
+`genus TensorPayload` — fields `nomen` (descriptor name this payload binds
+to), `initium_absolutum` (absolute byte offset into the content identity),
+`longitudo` (exact stored byte length of these bounded bytes), `bytes`
+(bounded bytes for that range).
+
+`discretio PayloadError` variants: `NomineIgnota` (tensor name not present
+in the manifest), `RangeMala` (byte range lies outside the artifact), and
+`LongitudoMala` (payload length does not match the stored layout length);
+each carries `textus causa`.
+
+- `functio causa(PayloadError e) → textus` — render the typed error message.
+
+## gradus:model/tensor_view
+
+Bounded typed tensor view, fail-closed bind, and windowed materializer
+(GGUF-A3 C2-U3 + C2-U4). `vincula` binds one descriptor + one validated
+payload into the typed view; the manifest is the single layout authority —
+dequant cross-checks admission (`elementa_glomoris`) and never re-derives
+layout. `materializa_slicem` dequantizes an element-aligned window of a
+bound view to f32 in GGUF block order, one block per source read;
+`materializa_glomulum` is the single-block probe. Each payload sub-window is
+exactly one block (≤ CORPUS_LIMES); no whole-tensor or whole-model read
+path exists. `VisumTensoris` never retains a path, reader, or source
+function.
+
+`genus VisumTensoris` — fields `nomen` (descriptor name), `forma` (full
+GGUF shape; rank 3 = expert tensor, kept explicit), `typo_ggml` (physical
+storage type id), `elementa` (logical element count), `layout`
+(`LayoutGgml`: `Cognita` known or `Ignota` inspectable-but-not-materializable),
+`initium_absolutum` (absolute start of the tensor payload),
+`longitudo_payloadis` (exact stored byte length, `Cognita.longitudo_octetorum`).
+
+- `functio causa(VisioError e) → textus` — render the typed error message.
+- `functio vincula(manifestum.ManifestumGguf m, tensor_payload.TensorPayload
+  p) → VisumTensoris ⇥ VisioError` — bind one descriptor + one validated
+  payload into the typed view. Fails closed on: unknown name
+  (`NomineIgnota`), absolute-range mismatch — `p.initium_absolutum` must
+  equal `data_inceptum + offset_relativum` — (`RangeMala`), stored-length
+  mismatch vs `Cognita.longitudo_octetorum` (`LongitudoMala`), unknown
+  layout (`LayoutIgnota`), and un-admitted physical type
+  (`TypoIgnotum`).
+- `functio materializa_slicem(VisumTensoris v, numerus initium_elementum,
+  numerus longitudo_elementum, (numerus, numerus) → manifestum.LectioFontis
+  fons) → lista<f32> ⇥ VisioError` — materialize one bounded logical-element
+  window to f32 in GGUF block order, one block per source read. Fails closed
+  on: negative/out-of-tensor/over-cap windows (`LimitesMala`; the cap is
+  `MAXIMUM_SLICEM_ELEMENTA` = 16,777,216 elements = 64 MiB f32),
+  block-misaligned windows (`OrdoMala`), unknown layout (`LayoutIgnota`),
+  and source or block-decode failures (`RangeMala`).
+- `functio materializa_glomulum(VisumTensoris v, numerus index_glomuli,
+  (numerus, numerus) → manifestum.LectioFontis fons) → lista<f32> ⇥
+  VisioError` — dequantize exactly one block by block index. Fails closed on
+  an out-of-range block index (`LimitesMala`), unknown layout
+  (`LayoutIgnota`), and source or block-decode failures (`RangeMala`).
+
+`discretio VisioError` variants: `NomineIgnota`, `RangeMala`,
+`LongitudoMala`, `LayoutIgnota`, `TypoIgnotum`, `OrdoMala`, and
+`LimitesMala`; each carries `textus causa`.
 
 ## gradus:tokenizer
 
@@ -1052,9 +1141,12 @@ script (zombie-doc gate, PML6-U1). Private `_`-prefixed helpers are exempt;
 the two renamed serialize readers are documented for the correctness-wave
 reconciliation.
 
-**Function-count total: 585 (re-baselined).** The A1C capsule rewrite (M1)
+**Function-count total: 611 (re-baselined).** The A1C capsule rewrite (M1)
 and the D3/D4 caller migrations (M2/M3) changed the `model/capsule`,
-`model/gguf`, and `model/safetensors` counts, and LIB-02-U1 added the
-`textorum`/`numerorum` array accessors on `model/gguf_manifest`. The
-tracked all-module total is re-baselined and asserted by the inventory
-script (585); the former 618 no longer holds and is not restated.
+`model/gguf`, and `model/safetensors` counts, LIB-02-U1 added the
+`textorum`/`numerorum` array accessors on `model/gguf_manifest`, and
+GGUF-A3 (C2/C3) added the `model/tensor_payload`/`model/tensor_view`
+modules plus the widened `model/dequant` codec surface and the LIB-02-U2
+tokenizer runtime. The tracked all-module total is re-baselined and
+asserted by the inventory script (611); the former 585/618 no longer hold
+and are not restated.

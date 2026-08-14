@@ -57,6 +57,8 @@ pinned row is space-prefix-free (add_space_prefix = false)
 | `gradus:model/gguf` | `GgufError` | 10 | `src/model/gguf.fab` |
 | `gradus:model/gguf_manifest` | `GgufManifestError` | 12 | `src/model/gguf_manifest.fab` |
 | `gradus:model/safetensors` | `SafetensorError` | 11 | `src/model/safetensors.fab` |
+| `gradus:model/tensor_payload` | `PayloadError` | 3 | `src/model/tensor_payload.fab` |
+| `gradus:model/tensor_view` | `VisioError` | 7 | `src/model/tensor_view.fab` |
 | `gradus:nn` | `NnError` | 9 | `src/nn.fab` |
 | `gradus:optimize` | `OptimizeError` | 14 | `src/optimize.fab` |
 | `gradus:parameter` | `ParametrumError` | 10 | `src/parameter.fab` |
@@ -68,7 +70,7 @@ pinned row is space-prefix-free (add_space_prefix = false)
 | `gradus:train` | `TrainError` | 10 | `src/train.fab` |
 | `gradus:transformer` | `TransformerError` | 12 | `src/transformer.fab` |
 
-**Total**: 210 public error codes across 26 error types.
+**Total**: 220 public error codes across 28 error types.
 
 ## `gradus:model/artifact` — `ArtifactError`
 
@@ -282,12 +284,57 @@ every entry point rejects a schema-1 stamp with the typed `SchemaVetus`.
 
 Source: `src/model/dequant.fab`. Render with module `causa(e)`.
 
+Admitted physical set (GGUF-A3 C1): **{F32, BF16, Q5_0, Q8_0, Q4_K, Q5_K,
+Q6_K}** — the Qwen3.6 completion-row union set. The two A3 additions are
+**BF16** (`GGML_BF16`, id 30; 1 element/block, 2 bytes/block — bf16→f32
+value arithmetic, bit-exact for every finite bf16) and **Q5_K**
+(`GGML_Q5_K`, id 13; 256 elements/block, 176 bytes/block —
+`dequantize_row_q5_K`). The layout constants are cross-checked against
+`LayoutGgml.Cognita` at the `tensor_view.vincula` view-binding boundary —
+the manifest is the single layout authority, dequant validates admission
+and never re-derives layout.
+
 | Code | Class / when | Live messages (representative) | Resolution |
 | --- | --- | --- | --- |
 | `DequantError.TypoIgnotum` | un-admitted / unknown GGML type id. | `un-admitted GGML type id: …`<br>`unreachable` (internal) | Use an admitted type/quantization row from the closed set; ensure block layouts tile. |
 | `DequantError.GlomulusMala` | block byte length != the layout's block_bytes. | `block byte length mismatch` | Provide a payload whose lengths/offsets match the layout (exact tile, no gaps/overlaps). |
 | `DequantError.OrdoMala` | row byte length not a multiple of block_bytes. | `row byte length not a multiple of block_bytes` | Provide a payload whose lengths/offsets match the layout (exact tile, no gaps/overlaps). |
-| `DequantError.ValorMala` | malformed value (NaN half) fails closed. | `NaN f32 value in dequant block`<br>`NaN half in dequant block` | Ensure inputs are finite; reject NaN/Inf at the boundary. |
+| `DequantError.ValorMala` | malformed value (NaN half/bf16) fails closed. | `NaN f32 value in dequant block`<br>`NaN half in dequant block`<br>`NaN bf16 value in dequant block` | Ensure inputs are finite; reject NaN/Inf at the boundary. |
+
+## `gradus:model/tensor_payload` — `PayloadError`
+
+Source: `src/model/tensor_payload.fab`. Render with module `causa(e)`.
+
+The bounded per-tensor payload value (GGUF-A3 C2-U2) carries exactly the
+stored range facts — name, absolute byte start, stored length — plus the
+bounded bytes. It carries no path, reader, handle, or whole-model byte list.
+
+| Code | Class / when | Live messages (representative) | Resolution |
+| --- | --- | --- | --- |
+| `PayloadError.NomineIgnota` | Tensor name not present in the manifest. | `tensor name is not present in the manifest` | Bind against a name the manifest's tensor table actually carries. |
+| `PayloadError.RangeMala` | Byte range lies outside the artifact. | `tensor byte range lies outside the artifact` | Provide a payload whose lengths/offsets match the layout (exact tile, no gaps/overlaps). |
+| `PayloadError.LongitudoMala` | Payload length does not match the stored layout length. | `tensor payload length does not match the stored layout length` | Provide a payload whose lengths/offsets match the layout (exact tile, no gaps/overlaps). |
+
+## `gradus:model/tensor_view` — `VisioError`
+
+Source: `src/model/tensor_view.fab`. Render with module `causa(e)`.
+
+The typed view + bind + windowed materializers (GGUF-A3 C2-U3/C2-U4).
+`vincula` binds one descriptor + one validated payload; the manifest is the
+single layout authority (dequant only cross-checks admission via
+`elementa_glomoris`). `materializa_slicem`/`materializa_glomulum`
+dequantize bounded windows one block per source read; no whole-tensor or
+whole-model read path exists.
+
+| Code | Class / when | Live messages (representative) | Resolution |
+| --- | --- | --- | --- |
+| `VisioError.NomineIgnota` | Descriptor name absent from the manifest (bind). | `tensor not found: …`<br>`manifest tensor range facts are invalid` (mapped) | Bind against a name the manifest's tensor table actually carries. |
+| `VisioError.RangeMala` | Absolute-range mismatch — payload start must equal `data_inceptum + offset_relativum` — or a source/decode failure (materialize). | `payload start does not match the manifest tensor range`<br>`payload range source failed: …`<br>`payload range source returned an unexpected byte length`<br>`block sub-window range is negative`<br>`block value decode failed: …`<br>`block decode failed` | Provide a payload whose range facts match the manifest; repair the caller-owned source adapter and return exactly the requested bytes. |
+| `VisioError.LongitudoMala` | Stored-length mismatch vs `Cognita.longitudo_octetorum`. | `payload length does not match the stored layout length` | Provide a payload whose lengths/offsets match the layout (exact tile, no gaps/overlaps). |
+| `VisioError.LayoutIgnota` | Unknown layout — inspectable, not materializable. | `tensor layout is unknown; payload range is unavailable` | Add and verify that layout before requesting payload bytes. |
+| `VisioError.TypoIgnotum` | Un-admitted physical type (dequant `elementa_glomoris` cross-check). | `un-admitted GGML type id: …` | Use an admitted type/quantization row from the closed set; ensure block layouts tile. |
+| `VisioError.OrdoMala` | Element window not block-aligned. | `element window is not aligned to the tensor block boundary` | Request windows aligned to `Cognita.elementa_per_blockum`. |
+| `VisioError.LimitesMala` | Negative / out-of-tensor / over-cap window, or out-of-range block index. | `element window is negative`<br>`element window exceeds the bounded slice cap`<br>`element window exceeds the tensor`<br>`block index is negative`<br>`block index exceeds the tensor block count` | Keep windows within the tensor and at or under `MAXIMUM_SLICEM_ELEMENTA` (16 Mi elements); larger consumption is the caller's windowed loop. |
 
 ## `gradus:model/gguf` — `GgufError`
 
