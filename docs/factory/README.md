@@ -29,7 +29,7 @@ in [`docs/archived/`](../archived/README.md).
 
 | Goal | Status | Done | goal | campaign | delivery | ledger | council | evidence | other |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| [production-ml-library](production-ml-library/CAMPAIGN.md) | active | — | 0 | 1 | 10 | 1 | 0 | 0 | 22 |
+| [production-ml-library](production-ml-library/CAMPAIGN.md) | active | — | 0 | 1 | 20 | 1 | 0 | 0 | 27 |
 
 ## Planned
 
