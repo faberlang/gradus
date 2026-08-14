@@ -28,7 +28,7 @@ closeout, never a dev-loop suite.
 | --- | --- | --- |
 | Co-located package tests | `src/*.proba`, `src/model/*.proba` | Compile-level contract + oracle pins per module |
 | Model / tokenizer fixtures | `fixtures/safetensors/`, `fixtures/gguf/`, `fixtures/tokenizer/` | Legal fixtures + row-oracle docs, including the three GGUF-A1a manifest fixtures |
-| Exempla consumers | `exempla/gradient-seam`, `exempla/gradient-seam-nolib`, `exempla/training-loop-mlp`, `exempla/token-generation`, `exempla/gguf-manifest`, `exempla/gguf-inspect` | Public-surface consumers plus the executed GGUF synthetic proof (40 PASS / 0 FAIL) and guarded six-file local inspection receipt |
+| Exempla consumers | `exempla/gradient-seam`, `exempla/gradient-seam-nolib`, `exempla/training-loop-mlp`, `exempla/token-generation`, `exempla/gguf-manifest`, `exempla/gguf-inspect`, `exempla/qwen36-35b-inference` | Public-surface consumers plus the executed GGUF synthetic proof (40 PASS / 0 FAIL), guarded six-file local inspection receipt, and the capstone tokenizer-phase run (LIB-02-U4-1) |
 | Admission conformance | `tests/admission_conformance.fab` | Capsule admission composition check |
 
 Nested package dirs follow the Agents rule (≥2 modules); model package
@@ -187,6 +187,7 @@ Tolerance policy detail: `docs/numeric-tolerances.md`.
 | **Errors** | Same typed rows as 4.7; a divergent first probe id or decoded character is a **divergence receipt** (campaign rule 5) that names the first divergent id/character and routes the repair — the probe rows never hard-code probe ids |
 | **No hard-coded tables** | Probe A runs on a structural fixture `_corpus_proba_a` (pinned tokens at pinned ids, max id 248046 — eos in range, the 38 real ranked merge pairs the BPE applies to the two Thai words, policy metadata present); Probe B reuses the U3-6 chat fixture. No artifact bytes are committed |
 | **Receipt** | `fixtures/tokenizer/pinned-probe-oracle.md` — revisions, model identity, prompt hashes (`e30101d6…` / `855d7303…`), tokenizer identity, command, expected vs observed, residuals |
+| **Capstone consumer** | `exempla/qwen36-35b-inference` (LIB-02-U4-1) runs the tokenizer phase through the public surface — `fabricare` on the admitted artifact manifest, then `encoda_promptum` for both probes and `decoda` for both id lists — and prints PASS rows when the observed rows equal these pins (raw-prompt rows, never through the template). A divergence names the first divergent id/character and fails closed (campaign rule 5); the exempla never hard-codes probe ids |
 | **Live** | `src/tokenizer.proba` — `"LIB-02-U3-7 full two-probe composition + divergence receipts"` probandum |
 
 ---

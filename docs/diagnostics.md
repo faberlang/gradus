@@ -453,6 +453,12 @@ the campaign's stop condition (rule 5): the receipt names the first
 divergent probe id or decoded character and routes the repair — the probe
 rows never hard-code probe ids.
 
+The capstone tokenizer phase (`exempla/qwen36-35b-inference`, LIB-02-U4-1)
+runs the composed runtime through the public surface on the target
+artifact and surfaces the same `TokenizerError` rows fail-closed; a probe
+or decode divergence exits nonzero with the typed cause naming the first
+divergent id/character.
+
 ## `gradus:train` — `TrainError`
 
 Source: `src/train.fab`. Render with module `causa(e)`.
