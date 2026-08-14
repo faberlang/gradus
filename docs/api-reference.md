@@ -772,6 +772,23 @@ octeti_per_blockum, longitudo_octetorum)` or `Ignota(typo)`.
   non-array value or a non-integer element kind returns a typed `WireMala`
   error. Scalar tokenizer ids (`tokenizer.ggml.bos_token_id` and friends) and
   the chat template stay on the `numerum`/`textum` surface.
+- `functio numerorum_u32(ManifestumGguf m, textus clavis) → lista<numerus> ⇥
+  GgufManifestError` — typed uint32-array accessor (MODEL-01-M1); returns the
+  elements of a GGUF array whose wire element kind is exactly `GGUF_UINT32`,
+  without coercing other integer kinds. A missing key, a non-array value, or a
+  non-uint32 element kind fails closed with a typed `WireMala` error; an array
+  count beyond the bounded limit fails closed with `LimitesMala`.
+- `functio boleanum(ManifestumGguf m, textus clavis) → bivalens ⇥
+  GgufManifestError` — typed bool accessor (MODEL-01-M1); returns the
+  `GGUF_BOOL` metadata value (the parser has already validated the wire byte
+  is 0 or 1). A missing key or a present non-bool value fails closed with a
+  typed `WireMala` error instead of coercing.
+- `functio longitudo_listae(ManifestumGguf m, textus clavis) → numerus ⇥
+  GgufManifestError` — typed array-length accessor (MODEL-01-M1); reads only
+  the array count from the GGUF array wire header without decoding elements.
+  A missing key or a non-array value fails closed with a typed `WireMala`
+  error; an array count beyond the bounded limit fails closed with
+  `LimitesMala`.
 - `functio inveni_tensorem(ManifestumGguf m, textus nomen) →
   DescriptioTensorisGguf ⇥ GgufManifestError` — retrieve one tensor descriptor.
 - `functio limes_payloadis(ManifestumGguf m, textus nomen) → iuncta<numerus,
@@ -930,6 +947,7 @@ storage type id), `elementa` (logical element count), `layout`
 `LongitudoMala`, `LayoutIgnota`, `TypoIgnotum`, `OrdoMala`, and
 `LimitesMala`; each carries `textus causa`.
 
+
 ## gradus:model/dense_qwen2
 
 Typed `qwen2` (Qwen2.5) architecture adapter (REF-01-U1.7). Resolves the
@@ -1030,6 +1048,86 @@ the resolver's causa verbatim.
 
 `discretio DenseError` variants: `TensorAbsens`, `ConfiguraMala`,
 `FormaMala`, and `TerminusExcedit`; each carries `textus causa`.
+## gradus:model/qwen35moe
+
+Typed qwen35moe architecture admission (MODEL-01 chain). Reads the frozen
+architecture rows and the canonical tensor map from a parsed GGUF manifest
+through `gradus:model/gguf_manifest`, cross-references the map against the
+frozen configuration, and admits one artifact under a pathless identity
+precondition. `congela` freezes the 30 frozen configuration rows and enforces
+the 55-entry metadata count; the canonical map admits exactly 753 tensors
+across the four family sets (3 global, 19 hybrid × 30, 16 full-attention × 10,
+20 nextn on `blk.40`) with the 41-block schedule (full-attention at index
+≡ 3 mod 4; `blk.40` the sole nextn block), the storage distribution
+(f32 368 / q8_0 259 / q4_K 82 / q5_K 38 / q6_K 4 / bf16 2), and the per-tensor
+blk.40 bf16 + blk.34/38/39 q6_K anomalies (block 40 is map-complete;
+the main-pass schedule is blocks 0..39 — no nextn execution claim). Mutation
+families 1–5 (frozen value changed / required key missing / extra unknown
+`qwen35moe.*` key / tensor name / shape / storage / count divergence) and the
+M5 cross-reference validation fail closed with a typed first-divergence
+diagnostic naming the first diverging fact. `admitto` is the admission entry:
+the identity precondition (SHA-256 digest + byte length against
+operator-measured facts) runs before any architecture read, and the
+seven-family typed refusal matrix reports every divergence. Tokenizer facts
+are frozen as identity only; tokenizer execution is LIB-02's unit.
+
+`genus ConfiguratioQwen35moe` — fields `architectura`, `typus_limaturae`,
+`versio_quantificationis`, `numerus_tractuum`, `longitudo_contextus`,
+`longitudo_vestimenti`, `numerus_capita`, `numerus_capita_kv`,
+`longitudo_clavis`, `longitudo_valoris`, `epsilon_normae_rms`,
+`basis_frequentiae`, `numerus_dimensionum_rotae`, `sectiones_rotae`,
+`numerus_expertorum`, `numerus_expertorum_activorum`, `longitudo_ffn_experti`,
+`longitudo_ffn_communi`, `nucleus_convolutus`, `magnitudo_status`,
+`numerus_coetuum`, `gradus_temporis`, `magnitudo_interior`,
+`intervallum_attentionis_plenae`, `numerus_strata_nextn`,
+`exemplum_tokenizoris`, `praeparatio_tokenizoris`, `numerus_tokenum`,
+`numerus_typorum_tokenum`, `numerus_concatenationum`, `eos_token_id`,
+`padding_token_id`, `bos_token_id`, and `add_bos_token`.
+`genus SummaTensoriorumQwen` — fields `totalis`, `globalium`, `hybridorum`,
+`attentionis_plenae`, `nextn`, `stipula_f32`, `stipula_q8_0`, `stipula_q4_k`,
+`stipula_q5_k`, `stipula_q6_k`, `stipula_bf16`, and `experti_rank3`.
+`genus AdmissioQwen35moe` — fields `configuratio` (`ConfiguratioQwen35moe`)
+and `summa` (`SummaTensoriorumQwen`).
+`discretio ErrorConfiguratioQwen35moe` — `MetadatumDiversum(clavis)`.
+`discretio ErrorTensorumQwen35moe` — `NomenDiversum(nomen)`,
+`FormaDiversa(nomen)`, `StipulaDiversa(nomen)`, `NumerusDiversus(causa)`.
+`discretio ErrorReferentiaeQwen35moe` — `NomenIgnotum(nomen)`,
+`DimensioDiversa(nomen)`, `NumerusDivergens(causa)`, `AmbitusMala(causa)`.
+`discretio ErrorAdmissionisQwen35moe` — `IdentitasDiversa(causa)`,
+`ArchitecturaIgnota(causa)`, `TypusIgnotus(causa)`, `ConfiguratioDiversa(causa)`,
+`TensorumDiversum(causa)`, `ReferentiaDiversa(causa)`, `ManifestumMala(causa)`.
+
+- `functio causa(ErrorConfiguratioQwen35moe e) → textus` — render the
+  config-freeze divergence diagnostic.
+- `functio congela(manifestum.ManifestumGguf m) → ConfiguratioQwen35moe ⇥
+  ErrorConfiguratioQwen35moe` — freeze the frozen configuration rows from a
+  parsed manifest; enforces the 55-entry metadata count and fails closed on
+  family-1 divergences, naming the first diverging key.
+- `functio causa_tensorum(ErrorTensorumQwen35moe e) → textus` — render the
+  tensor-map divergence diagnostic.
+- `functio tensores_canonici(manifestum.ManifestumGguf m) →
+  SummaTensoriorumQwen ⇥ ErrorTensorumQwen35moe` — the canonical 753-tensor
+  map: the four family sets, the 41-block schedule, the storage distribution,
+  the per-tensor anomalies, and the count invariants; families 2–5 fail
+  closed with a typed first-divergence diagnostic.
+- `functio causa_referantiae(ErrorReferentiaeQwen35moe e) → textus` — render
+  the cross-reference divergence diagnostic.
+- `functio referantia(ConfiguratioQwen35moe c, manifestum.ManifestumGguf m) →
+  bivalens ⇥ ErrorReferentiaeQwen35moe` — M5 dimension/storage
+  cross-reference validation: every canonical tensor's stored shape and
+  storage row must match the frozen-configuration-derived expectations;
+  divergences fail closed (name / dimension / count / range).
+- `functio causa_admissionis(ErrorAdmissionisQwen35moe e) → textus` — render
+  the admission refusal diagnostic.
+- `functio admitto(manifestum.CorpusGguf corpus, textus digestio_exspectata,
+  numerus longitudo_exspectata) → AdmissioQwen35moe ⇥ ErrorAdmissionisQwen35moe`
+  — the admission entry. The identity precondition (family 6) runs before any
+  architecture read; then the config freeze (family 1), the canonical tensor
+  map (families 2–5), and the M5 cross-reference validation compose, with the
+  family-7 unknown-architecture / unknown-raw-type refusals.
+  `manifestum.parse` failures surface as `ManifestumMala`. The
+  application-owned adapter `exempla/gguf-admit-qwen35moe` feeds this entry
+  the bounded table-prefix corpus and prints the ADMIT receipt.
 
 ## gradus:tokenizer
 

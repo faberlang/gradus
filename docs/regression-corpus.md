@@ -1,21 +1,6 @@
 # Gradus Regression Corpus
 
-**Version**: `gradus-regression-corpus v1.8.0` (2026-08-14, REF-01-U1.8 —
-dense model assembly pins: the full-graph logits (embedding gather → 2
-ordered U1.5 blocks → final RMSNorm → output projection) for a synthetic
-T=2/D=16/vocab-8 config with tied + untied embedding rows + exempla
-`dense-model` executed proof (37 PASS / 0 FAIL); REF-01-U1.5 —
-generic dense block pins: the ordered block composition (input RMSNorm →
-GQA causal+RoPE → residual → post-attn RMSNorm → SwiGLU → residual) over a
-synthetic T=2/D=16 config + exempla `dense-block` executed proof (32 PASS /
-0 FAIL); REF-01-U1.4 — multi-head GQA attention pins: GQA n_h=14/n_kv=2 +
-MHA n_kv=n_h config rows + exempla `dense-gqa`; REF-01-U1.3 configurable
-RoPE pins + exempla `dense-rope`; REF-01-U1.2 `nn` SiLU/SwiGLU pins +
-`exempla/dense-swiglu` executed proof; REF-01-U1.1 RMSNorm pins +
-`exempla/dense-rmsnorm`; REF-01-U1.6 `dense_llama` llama adapter
-descriptor-resolution pins + `exempla/dense-llama-adapter`; REF-01-U1.7
-`dense_qwen2` qwen2 adapter pins; LIB-03 GGUF-A3 C1/C2-U5 —
-`tensor_payload` / `tensor_view` suites + union-set dequant goldens)
+**Version**: `gradus-regression-corpus v1.9.0` (2026-08-14 — merged REF-01-U1.8 dense-model assembly + MODEL-01 qwen35moe admission: the full-graph logits (embedding gather → 2 ordered U1.5 blocks → final RMSNorm → output projection) for a synthetic T=2/D=16/vocab-8 config with tied + untied embedding rows + exempla `dense-model` executed proof (37 PASS / 0 FAIL); REF-01-U1.5 — generic dense block pins: the ordered block composition (input RMSNorm → GQA causal+RoPE → residual → post-attn RMSNorm → SwiGLU → residual) over a synthetic T=2/D=16 config + exempla `dense-block` executed proof (32 PASS / 0 FAIL); REF-01-U1.4 — multi-head GQA attention pins: GQA n_h=14/n_kv=2 + MHA n_kv=n_h config rows + exempla `dense-gqa`; REF-01-U1.3 configurable RoPE pins + exempla `dense-rope`; REF-01-U1.2 `nn` SiLU/SwiGLU pins + `exempla/dense-swiglu` executed proof; REF-01-U1.1 RMSNorm pins + `exempla/dense-rmsnorm`; REF-01-U1.6 `dense_llama` llama adapter descriptor-resolution pins + `exempla/dense-llama-adapter`; REF-01-U1.7 `dense_qwen2` qwen2 adapter pins; MODEL-01 — qwen35moe architecture admission pins + M1 `gguf_manifest` typed accessors + the guarded real-file admission receipt (M7); LIB-03 GGUF-A3 C1/C2-U5 — `tensor_payload` / `tensor_view` suites + union-set dequant goldens)
 **Repo**: gradus. **Tier**: structural inventory.
 **Delivery**: `docs/factory/production-ml-library/pml6-delivery.md` §PML6-U4;
 GGUF-A1b delivery in `pml5-general-gguf-delivery.md`.
@@ -42,7 +27,7 @@ closeout, never a dev-loop suite.
 | --- | --- | --- |
 | Co-located package tests | `src/*.proba`, `src/model/*.proba` | Compile-level contract + oracle pins per module |
 | Model / tokenizer fixtures | `fixtures/safetensors/`, `fixtures/gguf/`, `fixtures/tokenizer/` | Legal fixtures + row-oracle docs, including the three GGUF-A1a manifest fixtures and the GGUF-A3 union-set dequant goldens (`gguf-dequant-goldens.json` + derivation contract) |
-| Exempla consumers | `exempla/gradient-seam`, `exempla/gradient-seam-nolib`, `exempla/training-loop-mlp`, `exempla/token-generation`, `exempla/gguf-manifest`, `exempla/gguf-inspect`, `exempla/qwen36-35b-inference`, `exempla/dense-rmsnorm`, `exempla/dense-swiglu`, `exempla/dense-llama-adapter`, `exempla/dense-qwen2-adapter`, `exempla/dense-block`, `exempla/dense-model` | Public-surface consumers plus the executed GGUF synthetic proof (40 PASS / 0 FAIL), guarded six-file local inspection receipt, the capstone tokenizer-phase run (LIB-02-U4-1), the REF-01-U1.1 RMSNorm executed proof (32 PASS / 0 FAIL), the executed REF-01-U1.2 SiLU/SwiGLU proof (14 PASS / 0 FAIL), the REF-01-U1.6 llama-adapter executed proof (19 PASS / 0 FAIL), the qwen2 adapter executed proof (23 PASS / 0 FAIL, REF-01-U1.7), the REF-01-U1.5 dense-block executed proof (32 PASS / 0 FAIL), and the REF-01-U1.8 dense-model assembly executed proof (37 PASS / 0 FAIL, tied + untied rows + the fail-closed rejection row) |
+| Exempla consumers | `exempla/gradient-seam`, `exempla/gradient-seam-nolib`, `exempla/training-loop-mlp`, `exempla/token-generation`, `exempla/gguf-manifest`, `exempla/gguf-inspect`, `exempla/qwen36-35b-inference`, `exempla/dense-rmsnorm`, `exempla/dense-swiglu`, `exempla/dense-llama-adapter`, `exempla/dense-qwen2-adapter`, `exempla/dense-block`, `exempla/dense-model`, `exempla/gguf-admit-qwen35moe` | Public-surface consumers plus the executed GGUF synthetic proof (40 PASS / 0 FAIL), guarded six-file local inspection receipt, the capstone tokenizer-phase run (LIB-02-U4-1), the REF-01-U1.1 RMSNorm executed proof (32 PASS / 0 FAIL), the executed REF-01-U1.2 SiLU/SwiGLU proof (14 PASS / 0 FAIL), the REF-01-U1.6 llama-adapter executed proof (19 PASS / 0 FAIL), the qwen2 adapter executed proof (23 PASS / 0 FAIL, REF-01-U1.7), the REF-01-U1.5 dense-block executed proof (32 PASS / 0 FAIL), the REF-01-U1.8 dense-model assembly executed proof (37 PASS / 0 FAIL, tied + untied rows + the fail-closed rejection row), and the guarded real-file qwen35moe admission receipt (MODEL-01-M7) |
 | Admission conformance | `tests/admission_conformance.fab` | Capsule admission composition check |
 
 Nested package dirs follow the Agents rule (≥2 modules); model package
@@ -52,7 +37,7 @@ tests live under `src/model/`.
 
 ## 2. Proba inventory (structural)
 
-Live co-located suites (30 files):
+Live co-located suites (32 files):
 
 | Suite | Module / surface | Pin class (summary) |
 | --- | --- | --- |
@@ -87,6 +72,7 @@ Live co-located suites (30 files):
 | `src/model/gguf_manifest.proba` | GGUF-A1b manifest and range seam | Unknown codec inspection, exact ranges, source failure, checked tensor fragments, and LIB-02-U1 tokenizer array pins (248320 tokens / 247587 merges / special ids) |
 | `src/model/dense_qwen2.proba` | `gradus:model/dense_qwen2` (REF-01-U1.7) | qwen2 adapter descriptor-resolution pins — every canonical name resolves to the exact A1b descriptor facts for the Qwen2.5-0.5B row (layer 0 + layer 23, tied + untied `lm_head`), the frozen config render (`24/14/2/64/896/151936/1000000`), and the fail-closed rejection rows (unknown name / suffix, layer range, missing tensor, non-qwen2 arch) |
 | `src/model/dense.proba` | `gradus:model/dense` (REF-01-U1.8) | Full-graph logit pins for the small synthetic dense config (T=2, D=16, F=16, H=4, K=2, head_dim=4, vocab 8, tokens `[0, 7]`) — tied and untied embedding rows, f64 references @ **5e-4** (zero same-shape biases, the assembly's synthesized-bias contract) — plus the fail-closed typed-error rows (missing canonical tensor, token out of range, invalid config, shape contradiction, positions mismatch) |
+| `src/model/qwen35moe.proba` | `gradus:model/qwen35moe` (MODEL-01) | qwen35moe architecture admission pins: frozen config rows + 55-entry metadata count + mutation family 1 (M3); canonical 753-tensor map + 41-block schedule + storage distribution + families 2–5 (M4); dimension/storage cross-reference validation (M5); identity precondition + seven-family typed refusal matrix (M6) |
 
 Every suite header states **EVIDENCE HONESTY (CTO Q2)**: structural /
 compile-level proof; executed value-identity deferred.
@@ -335,7 +321,7 @@ test -f fixtures/gguf/smollm2-360m-scaled-row.gguf
 test -f fixtures/tokenizer/tokenizer-identity-oracle.md
 
 # Proba count stays the admitted co-located surface
-find src -name '*.proba' | wc -l   # expect 31 at this corpus version
+find src -name '*.proba' | wc -l   # expect 32 at this corpus version
 
 # REF-01-U1.8 dense-model pins in the proba + the executed exempla
 rg -n 'LG_T_|LG_U_|token id out of range for the embedding|positions must match the token count' \
@@ -351,6 +337,12 @@ rg -n 'TOKENS_PIN|MERGES_PIN|BOS_PIN|EOS_PIN|PAD_PIN|248320|247587|248044|248046
   src/model/gguf_manifest.proba
 rg -n 'metadata array is not an integer array|metadata value is not a GGUF string array' \
   src/model/gguf_manifest.fab
+
+# MODEL-01 qwen35moe admission suite + exemplum (M8 inventory)
+rg -n 'MODEL-01-M6 admission entry point and typed refusal matrix' \
+  src/model/qwen35moe.proba
+test -d exempla/gguf-admit-qwen35moe
+test -f exempla/gguf-admit-qwen35moe/README.md
 ```
 
 ### 5.3 Executed pass (auditor-owned; not claimed by this unit)
@@ -400,4 +392,6 @@ remain in the support matrix; this corpus does not re-admit them.
 `gradus-regression-corpus v1.5.0`. Adding a suite, fixture, or named pin
 bumps this version. Removing or retargeting a named pin (§4) is a
 **major** event and must update the support matrix / compatibility
-policy in the same change set.
+policy in the same change set. (v1.5.0 = MODEL-01-M8: the
+`model/qwen35moe` admission suite and the `gguf-admit-qwen35moe` admission
+exemplum, inventoried under the corpus contract.)

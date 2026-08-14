@@ -17,7 +17,8 @@ row-oracle docs (`fixtures/safetensors/safetensors-row-oracle.md`,
 tokenizer-identity-oracle.md`), not duplicated.
 
 This matrix holds **admitted rows only**, per `pml0-support-matrix-schema.md`
-§2/§3 (fail-closed R1–R11; one row is the unit of support claim). Thirteen
+
+§2/§3 (fail-closed R1–R11; one row is the unit of support claim). Fourteen
 admitted rows: two PML2 model-file format rows (Safetensors, GGUF), two PML3
 architecture rows (one training, one selected inference), one PML4
 training-layer row, one PML5 inference-layer row, two GGUF-A3
@@ -27,8 +28,10 @@ the **executed probe tier** (row 9, LIB-02-U4-1/U4-3), one REF-01 dense
 reference primitive row (row 10, generic RMSNorm, executed proof —
 REF-01-U1.1), one qwen2 architecture-adapter row (row 11, executed
 descriptor-resolution tier — REF-01-U1.7), one generic dense
-transformer-block row (row 12, executed proof tier — REF-01-U1.5), and one
-dense model assembly row (row 13, executed proof tier — REF-01-U1.8). Every row is
+transformer-block row (row 12, executed proof tier — REF-01-U1.5), one
+dense model assembly row (row 13, executed proof tier — REF-01-U1.8), and
+one MODEL-01 qwen35moe architecture admission row at the **structural
+tier** (row 14, facts only). Every row is
 **structural tier** — the executed tier is recorded, never claimed (see §2 reject log and
 each row's structural-tier note).
 
@@ -361,6 +364,29 @@ execution, logits, or device execution; CTO8-1 stays the named gate.
 | `executed proof` | `exempla/dense-model` runs through package MIR (hand-11 Radix binary) — exit 0, **37 PASS / 0 FAIL** on the pinned f64 references, including the fail-closed rejection row (2026-08-14 receipt) |
 | `compatibility policy` | exact admitted combination: the complete ordered dense forward graph over the F32 staged carrier — embedding gather → N ordered U1.5 blocks → final RMSNorm → output projection — assembled from `ConfiguraDensa` and materialized stored-weight views via canonical names, with tied/untied embedding handling and zero per-row constants. Non-goals: no real-model payload execution, logits against a real file, or device execution (that is the U1.9/U1.10 receipt rows); no KV-cache state (that is the U2 wave); no non-f32 dtypes |
 
+### Row 14 — MODEL-01 qwen35moe architecture admission row (structural tier, facts only)
+
+```markdown
+| `format` | `gguf` (GGUF file version 3; quant version 2 — the PML2-U3 admitted GGUF row; no new format claim) |
+| `architecture` | `qwen35moe` (Qwen3.6-35B-A3B — the admitted real-file artifact's architecture; typed admission via `gradus:model/qwen35moe`) |
+| `dtype` | not part of this row — admission is metadata-only (frozen configuration + canonical tensor map); no compute or storage dtype claim |
+| `quantization` | `q4_k_m` file type (15 MOSTLY_Q4_K_M, quant version 2); the storage distribution is a tensor-map fact of this row, never a forward-path claim |
+| `shape` | tensor-map facts from the canonical 753-tensor map: 753 tensors; 41-block schedule 30 hybrid / 10 full-attention / 1 nextn / 3 global; storage distribution f32 368 / q8_0 259 / q4_K 82 / q5_K 38 / q6_K 4 / bf16 2; rank-3 expert count 123; blk.40 bf16 and blk.34/38/39 q6_K anomalies; block-40 load-not-main-pass rule; frozen config rows (block_count 41, context_length 262144, embedding_length 2048, head_count 16 / head_count_kv 2, expert_count 256 / expert_used_count 8, rope dimension_sections `[11,11,10,0]`, full_attention_interval 4, nextn_predict_layers 1) |
+| `tokenizer identity` | `gpt2` (byte-level BPE) pre-tokenizer `qwen35`; vocab 248,320; token_type 248,320; merges 247,587; BOS/EOS/PAD 248044/248046/248055; `add_bos_token` false; EOG set {248044, 248046, 248063, 248064, 248065} (frozen config facts, read through the `model/gguf_manifest` typed accessors) |
+| `legal fixture ref` | operator-local artifact `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` — 22,663,387,424 bytes, SHA-256 `0b21525e972670ed59e1812e170b27c26355381f0656ecc4e25617ece7dac58b`; operator evidence under `/Users/ianzepp/ai/models/`, **never committed**; pinned by content hash per the MODEL-01 delivery, no acquisition or redistribution claim |
+| `oracle ref` | the frozen MODEL-01 admission facts (delivery §M2 oracle table + the expected-vs-observed rows in `exempla/gguf-admit-qwen35moe/README.md`); the guarded real-file run compares every printed frozen fact against the pinned table — the first divergent fact fails the receipt |
+| `evidence links` | `src/model/qwen35moe.fab` + `src/model/qwen35moe.proba`; the M1 typed accessors on `src/model/gguf_manifest.fab` (`numerorum_u32`/`boleanum`/`longitudo_listae`, `5f93ef7`); `exempla/gguf-admit-qwen35moe` (guarded adapter: reads only the bounded `data_expectata`-byte prefix, never a tensor-payload byte) + its README (guarded command, model identity, expected vs observed rows); committed units 0f70590 (M3), 9e015b4 (M4), f3683b1 (M5), 0c28ca3/227ca74 (M6), db2eddf (M7) |
+| `compatibility policy` | exact admitted combination: metadata admission of the hash-pinned Qwen3.6 artifact (qwen35moe) through the public `gradus:model/qwen35moe` surface — frozen configuration, canonical 753-tensor map, dimension/storage cross-reference validation, and identity-precondition admission with the typed refusal matrix. Non-goals: no tokenizer runtime, tensor materialization, model execution, logits, sampling, or device claim; no other architectures/files; CTO8-1 stays the named gate |
+| `schema version` | `gradus-support-matrix-schema v0.1.0` |
+```
+
+**Structural tier (recorded, not claimed).** Row 14 records architecture +
+tensor-map facts only, with the guarded exemplar's expected-vs-observed rows
+as the receipt shape; the executed admission run (ADMIT + 753-tensor receipt)
+is validated once at the G1 aggregate gate. This row does **NOT** claim
+executed model identity, logits, tokens, or device execution — CTO8-1 stays
+the named open clause.
+
 ## 2. Reject log (recorded, never support)
 
 | Proposed row | Reject reason (gate) |
@@ -400,15 +426,17 @@ execution, logits, or device execution; CTO8-1 stays the named gate.
 
 ```bash
 cd /Users/ianzepp/work/faberlang/gradus
-# 1. Thirteen admitted rows (2 PML2 format, 2 PML3 architecture, 1 PML4
+# 1. Fourteen admitted rows (2 PML2 format, 2 PML3 architecture, 1 PML4
 #    training-layer, 1 PML5 inference-layer, 2 GGUF-A3 output-checked
 #    slice materialization, 1 GGUF-A2 executed-probe tokenizer runtime,
 #    1 REF-01 dense reference primitive, 1 REF-01 qwen2 architecture
-#    adapter, 1 REF-01 generic dense transformer block); the ten
-#    schema-version rows carry all 11 schema fields (rows 10 and 12, the
-#    REF-01 primitive/block rows, use their own Field/Value sets).
-grep -c '^| `format`' docs/factory/production-ml-library/pml0-support-matrix.md   # 10
-grep -c '^| `schema version`' docs/factory/production-ml-library/pml0-support-matrix.md   # 10
+#    adapter, 1 REF-01 generic dense transformer block, 1 REF-01 dense
+#    model assembly, 1 MODEL-01 qwen35moe architecture admission); the
+#    eleven schema-version rows carry all 11 schema fields (rows 10, 12
+#    and 13, the REF-01 primitive/block/assembly rows, use their own
+#    Field/Value sets).
+grep -c '^| `format`' docs/factory/production-ml-library/pml0-support-matrix.md   # 11
+grep -c '^| `schema version`' docs/factory/production-ml-library/pml0-support-matrix.md   # 11
 # 2. Committed unit commits + oracle pins cited as evidence links.
 grep -c '07291d6\|b392fc8\|f12deaf\|02fae61\|9822cfa\|5260049\|7bf9acc\|359c5f0\|5f98e8b\|e09c79c\|9bebda9\|4b24c81\|94d8a94\|fc85de7\|bdefb5a\|3b2fc9b\|b1b01f1\|56e70f0\|8cf798a\|1a6abd0' docs/factory/production-ml-library/pml0-support-matrix.md   # >= 5
 grep -c 'LN3_\|IN_LN3_\|COS_1\|SIN_1\|1.576448169383708\|0.01137' docs/factory/production-ml-library/pml0-support-matrix.md   # >= 1
@@ -418,6 +446,10 @@ grep -c '0b21525e972670ed59e1812e170b27c26355381f0656ecc4e25617ece7dac58b' docs/
 grep -c '4ceb1d3\|58786db\|00f5540\|e1b818f\|90b0522\|a2dcd8d\|cc92176\|82a2863\|c4d0750\|f3cfa58' docs/factory/production-ml-library/pml0-support-matrix.md   # >= 1 (LIB-02 U1..U4-1 commits)
 grep -c '34469, 168607, 153295, 173922, 153380, 22216, 151752, 172769\|109266, 3709, 96748, 6115, 113128' docs/factory/production-ml-library/pml0-support-matrix.md   # >= 1 (pinned probe id lists)
 grep -c 'llama-tokenize' docs/factory/production-ml-library/pml0-support-matrix.md   # >= 1 (oracle pin)
+# 2c. MODEL-01 qwen35moe admission row (row 10) evidence links resolve.
+grep -c '0f70590\|9e015b4\|f3683b1\|0c28ca3\|227ca74\|db2eddf\|5f93ef7' docs/factory/production-ml-library/pml0-support-matrix.md   # >= 1 (MODEL-01 M1/M3..M7 commits)
+grep -c 'gguf-admit-qwen35moe' docs/factory/production-ml-library/pml0-support-matrix.md   # >= 1 (guarded admission exemplar)
+grep -c '\[11,11,10,0\]' docs/factory/production-ml-library/pml0-support-matrix.md   # >= 1 (rope.dimension_sections frozen fact)
 # 3. Structural tier recorded, never upgraded — no executed-identity claim.
 grep -c 'does NOT claim executed' docs/factory/production-ml-library/pml0-support-matrix.md   # >= 3
 grep -c 'CTO8-1' docs/factory/production-ml-library/pml0-support-matrix.md   # >= 2
