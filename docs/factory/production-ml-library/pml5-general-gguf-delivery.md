@@ -417,6 +417,26 @@ accessors, and the tokenizer phase of `exempla/qwen36-35b-inference`.
 no hard-coded prompt or token-id fallback exists in the capstone path; encode
 and decode match the independent oracle.
 
+**Implemented evidence**: LIB-02 is implemented across the micro-unit chain on
+the `factory/hand-16` packet (U1 `c4d0750`, U2 `f3cfa58`, U3-1 `58786db`,
+U3-2 `00f5540`, U3-3 `e1b818f`, U3-4 `90b0522`, U3-5 `a2dcd8d`, U3-6
+`cc92176`, U3-7 `82a2863`, U4-1 `4ceb1d3`), with the capstone tokenizer-phase
+exempla running green on the target artifact on 2026-08-14. The run printed
+`PASS` for both pinned probe id lists and both decoded round-trips (Probe A
+Thai → 8 ids, Probe B CJK/emoji/digits → 18 ids, both decode back to the
+exact prompt text), `TOKENIZER PHASE PASS`, and exited 0 with no read into
+the tensor data region; focused negatives exit nonzero with typed causes and
+any probe divergence prints a `DIVERGENCE` receipt naming the first divergent
+id/character. The artifact-backed runtime is consumed through the public
+`gradus:tokenizer` surface (vocab 248,320, merges 247,587, `gpt2` byte-level
+BPE + `qwen35` pre-tokenizer, EOG {248044, 248046, 248063, 248064, 248065},
+BOS-free); no hard-coded prompt or token-id fallback exists in the capstone
+path. Full receipts are in `pml5-lib02-tokenizer-delivery.md` §Delivery
+Receipt and `exempla/qwen36-35b-inference/README.md`. This executes the
+tokenizer input of milestone Q1 — it is not model execution: no logits,
+tensor materialization, GPU work, or generated tokens are claimed (GGUF-A3+
+and GGUF-M4..M6 remain mandatory with their frozen oracles).
+
 ### GGUF-A3 — Packed Storage And Reference Materialization
 
 Separate logical dtype from physical storage. Bind one `TensorDescriptor` and
