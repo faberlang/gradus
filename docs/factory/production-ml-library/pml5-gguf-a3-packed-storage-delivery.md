@@ -1,6 +1,6 @@
 # Delivery: GGUF-A3 — Checked Packed Storage And Tensor Materialization (Qwen LIB-03)
 
-**Status**: lowered 2026-08-13 by planner-23 (task `67de6722` / handle `e06a6ef5`) — **READY at the spec level; dispatch-gated on LIB-01 (GGUF-A1c) landing**. Planning artifact only: no product code is written by this lowering.
+**Status**: re-split 2026-08-14 by planner-23 (task `5655bca9`) — GGUF-A1c (LIB-01) landed at main `2b3e41a` and A3-C1 landed at main `82048b5` (merge `24928b9`); the 2026-08-13 entry gate is **OPEN**. C2 and C3 are re-lowered into **12 dispatch-ready one-behavior-family micro-units** per operator directive 2026-08-14 (granularity bar: ~10–15 min per unit, all 8 campaign-rule-2 fields). Planning artifact only: no product code is written by this revision.
 **Campaign**: [`CAMPAIGN.md`](CAMPAIGN.md) — PML5-GGUF Qwen3.6 invariant; umbrella Radix `gpu-production-readiness` row **LIB-03**
 **Delivery authority**: [`pml5-general-gguf-delivery.md`](pml5-general-gguf-delivery.md) — unit **GGUF-A3** ("Packed Storage And Reference Materialization")
 **Repo**: `gradus` (branch `factory/planner-23`, baseline `bc500993c97b99bb4ca3ff0d98828b56c750eec0`); planning docs only
@@ -32,7 +32,7 @@ Whole-model conversion to F32 is **not** an admitted execution path: there is no
 
 ## Ground Truth (verified live 2026-08-13)
 
-Baseline state (gradus `bc500993c97b`, tree clean; `./scripta/check-source` PASS):
+Baseline state (gradus `bc500993c97b`, tree clean; `./scripta/check-source` PASS). Codec facts below are superseded by the C1 landing (`82048b5` — see §Predecessor And Entry Gate); the manifest/dtype facts remain current:
 
 - `gradus:model/gguf_manifest` (GGUF-A1a/A1b) already provides: format-general `ManifestumGguf`, `DescriptioTensorisGguf` (name, forma, typo_ggml, offset_relativum, elementa, `LayoutGgml`), `inveni_tensorem`, checked absolute-range validation and overlap rejection in `_constitue`, `layout(typo_ggml, forma)` resolving `LayoutGgml.Cognita` block geometry for 22 GGML ids, and `lege_fragmentum` (checked bounded tensor subrange reads through an operation-scoped `LectioFontis`). A1b's guarded `exempla/gguf-inspect` already inspects all six local rows incl. `qwen35moe/753`.
 - `gradus:model/dequant` (PML2-U5) provides CPU block/row dequant for the pinned **SmolLM2 row set {F32, Q5_0, Q8_0, Q4_K, Q6_K}** (`dequantizas_glomulus`, `dequantizas_ordo`, `elementa_glomoris`, `octeti_glomoris`, `DequantError`), bit-exact against the GI2-1 reference semantics (`_dimidium` half decode, `_scala_minima_k4`, left-associative f32 operation order).
@@ -46,14 +46,14 @@ Baseline state (gradus `bc500993c97b`, tree clean; `./scripta/check-source` PASS
 | `Qwen2.5-1.5B-Instruct-Q4_K_M.gguf` | `qwen2` | 338 | **not recorded in shared evidence — derive at unit boundary** |
 | `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` | `qwen35moe` | 753 | **BF16 2 / F32 368 / Q4_K 82 / Q5_K 38 / Q6_K 4 / Q8_0 259** |
 
-- The Qwen3.6 completion row uses exactly six physical layouts: **BF16, F32, Q4_K, Q5_K, Q6_K, Q8_0**. The current dequant set covers all except **BF16** and **Q5_K** — the two missing codecs are the unit's first implementation frontier.
+- The Qwen3.6 completion row uses exactly six physical layouts: **BF16, F32, Q4_K, Q5_K, Q6_K, Q8_0**. **C1 landed the two missing codecs (BF16, Q5_K) at `82048b5` — the admitted union set is complete**; what remains is the windowed materialization surface that consumes them.
 - Size constraint that shapes the design: the largest Qwen3.6 tensors (e.g. `token_embd.weight`, hundreds of MB of payload) exceed the manifest's single-read `CORPUS_LIMES` of 64 MiB and would produce multi-GB f32 lists. The materialization surface is therefore **windowed**: bounded payload reads + bounded logical-element windows.
 
 ## Predecessor And Entry Gate
 
-- **Predecessor receipt**: LIB-01 = **GGUF-A1c** (capsule/caller clean break). Its done oracle: schema 1 has no live constructor or parser caller; schema-2 `artifact.IdentitasContenuti` + `gguf_manifest` values are the only authority; source, compile, and migrated format probas pass.
-- **Entry-gate state at the lowering boundary**: GGUF-A1c is **NOT landed** — `pml5-general-gguf-delivery.md` and gradus `CAMPAIGN.md` both record "GGUF-A1c is the next mandatory unit". The A1b receipt (`exempla/gguf-inspect/README.md`, 2026-08-13) is the latest landed proof.
-- **Lowering disposition**: this spec is **complete and READY**; dispatch of the implementing Hand is **gated on the A1c receipt** (the affected edge `A1c → A3` blocks; execution rule 6 — no other ready unit is affected, and GGUF-A2/LIB-02 runs parallel-safe on disjoint surfaces). **Recheck handle**: the A1c closeout record in `pml5-general-gguf-delivery.md` / gradus `CAMPAIGN.md` status line.
+- **Predecessor receipt**: LIB-01 = **GGUF-A1c** (capsule/caller clean break). **Landed** at main `2b3e41a` (a1c-chain M1–M7, M8R4 aggregate gate, post-integration record correction `aace34b`) — schema 1 has no live constructor or parser caller; schema-2 `artifact.IdentitasContenuti` + `gguf_manifest` values are the only authority; source, compile, and migrated format probas pass. **The A3 entry gate is OPEN.**
+- **C1 receipt**: A3-C1 (BF16 + Q5_K codecs, union-set goldens) landed at main `82048b5` (merge `24928b9`, 2026-08-14; Hand receipt task `3158007b`): check-source/check-compile green, goldens bit-exact 15/15, proba execution FMIR-blocked tree-wide (recorded residual, not a unit defect).
+- **Dispatch disposition (2026-08-14 revision)**: C2 and C3 are re-lowered into 12 micro-units (§Implementation Frontier And Split Boundary) — **READY for dispatch, no outstanding gate**. Every unit carries the 8 campaign-rule-2 fields and obeys the operator's granularity bar (one behavior family, ~10–15 min).
 - **Executed-tier lever (CTO8-1)**: the FMIR library-call gap remains the named open gate for *executed-token/model identity* claims. This unit's executed claims are at the **A1b precedent tier**: package-MIR exemplar receipts with observed PASS lines over real tensor slices and in-repo fixtures. No token, logit, model-execution, or device claim is made here; full executed-model identity remains gated on CTO8-1 (GGUF-A4+).
 
 ## First Failing Oracle
@@ -67,7 +67,7 @@ case q5k-block-dequant-golden:
   current: TypoIgnotum (un-admitted GGML type id: 13)  ← RED
 ```
 
-then the BF16 twin case (`GGML_BF16`), then the windowed-materializer boundary cases (requested element window and payload window exceed bounds → typed error; block-aligned windows only), then the rank-3 expert slice case. All fail closed until the extended codecs and the view/materializer surface land.
+then the BF16 twin case (`GGML_BF16`), then the windowed-materializer boundary cases (requested element window and payload window exceed bounds → typed error; block-aligned windows only), then the rank-3 expert slice case. All fail closed until the extended codecs and the view/materializer surface land. The codec oracles above are **landed** with C1 (`82048b5`); each C2/C3 micro-unit's own first-failing oracle is in §Implementation Frontier And Split Boundary.
 
 ## Public Surface (frozen for this unit)
 
@@ -164,13 +164,13 @@ All paths under the implementing Hand's gradus worktree on `factory/planner-23`;
 
 - `src/model/tensor_payload.fab`, `src/model/tensor_payload.proba` (create)
 - `src/model/tensor_view.fab`, `src/model/tensor_view.proba` (create)
-- `src/model/dequant.fab`, `src/model/dequant.proba` (extend: BF16 + Q5_K codecs, layout cross-check, widened admitted set)
+- `src/model/dequant.fab`, `src/model/dequant.proba` (extend: BF16 + Q5_K codecs, layout cross-check, widened admitted set) — **C1 landed the codecs and the widened admitted set (`82048b5`); the remaining A3 touch is the dequant layout cross-check at the view-binding boundary (C2-U3)**
 - `src/model/gguf_manifest.fab`, `src/model/gguf_manifest.proba` (add `limes_payloadis` only)
-- `fixtures/gguf/gen_dequant_goldens.py` + `fixtures/gguf/gguf-dequant-goldens.json` (create; deterministic block fixtures for the union set, schema `gguf-dequant-goldens-v2`)
-- `fixtures/gguf/gguf-dequant-goldens-oracle.md` (create; derivation contract: llama.cpp `ggml-quants.c` @ `a957b7747`, generator command, SHA-256 pins)
+- `fixtures/gguf/gen_dequant_goldens.py` + `fixtures/gguf/gguf-dequant-goldens.json` (create; deterministic block fixtures for the union set, schema `gguf-dequant-goldens-v2`) — **C1 landed (schema v2 present); no further fixture-json touch**
+- `fixtures/gguf/gguf-dequant-goldens-oracle.md` (create; derivation contract: llama.cpp `ggml-quants.c` @ `a957b7747`, generator command, SHA-256 pins) — **not yet landed; created in C3-U5**
 - `exempla/gguf-materialize/faber.toml`, `exempla/gguf-materialize/src/main.fab`, `exempla/gguf-materialize/README.md` (create; app-owned file adapter + real-file slice receipt, mirroring `exempla/gguf-inspect`)
-- `scripta/check-compile` and `scripta/check-compile.fab` (add the `gguf-materialize` exemplar target)
-- Docs: `README.md` (module/surface list), `docs/module-map.md` (two new module rows + counts), `docs/api-reference.md` (new `tensor_payload`/`tensor_view` sections; dequant section widened to the union set), `docs/diagnostics.md` (new `PayloadError`/`VisioError` tables; `DequantError` rows for the new codecs), `docs/regression-corpus.md` (bump to `gradus-regression-corpus v1.3.0`; new proba suites + goldens), `docs/factory/production-ml-library/pml0-symbol-inventory.md` (new public symbols + module counts), `docs/factory/production-ml-library/pml0-support-matrix.md` (storage/materialization rows at the **output-checked slice tier** — see §Validation), and the owning delivery/status docs (`pml5-general-gguf-delivery.md` GGUF-A3 section marked implemented + gradus `CAMPAIGN.md` status line) at the unit's closeout.
+- `scripta/check-compile` and `scripta/check-compile.fab` (add the `gguf-materialize` exemplar target) — **the bash launcher is the live gate; C3-U1 extends it (the `.fab` variant is not an execution surface — see Open Item 4)**
+- Docs: `README.md` (module/surface list), `docs/module-map.md` (two new module rows + counts), `docs/api-reference.md` (new `tensor_payload`/`tensor_view` sections; dequant section widened to the union set), `docs/diagnostics.md` (new `PayloadError`/`VisioError` tables; `DequantError` rows for the new codecs), `docs/regression-corpus.md` (bump the corpus version — next after `v1.3.0`; new proba suites + goldens), `docs/factory/production-ml-library/pml0-symbol-inventory.md` (new public symbols + module counts), `docs/factory/production-ml-library/pml0-support-matrix.md` (storage/materialization rows at the **output-checked slice tier** — see §Validation), and the owning delivery/status docs (`pml5-general-gguf-delivery.md` GGUF-A3 section marked implemented + gradus `CAMPAIGN.md` status line) at the unit's closeout.
 - Closeout commit on `factory/planner-23` (gradus lane).
 
 ## Read Scope
@@ -187,13 +187,331 @@ All paths under the implementing Hand's gradus worktree on `factory/planner-23`;
 
 ## Implementation Frontier And Split Boundary
 
-Split-on-boundary (each slice a landed commit; no dual authority ever exists between slices):
+Re-split **2026-08-14** (planner-23, task `5655bca9`): the C1 grain — one
+70-minute bag across 4 files with a latent-bug detour (`_scala_minima_k4`) —
+was rejected by the operator. C2 and C3 are re-lowered here into
+**one-behavior-family micro-units** (~10–15 min each, all 8 campaign-rule-2
+fields). C1 is landed and kept as-is (receipt in §Predecessor And Entry Gate).
+The mandatory scope of §Write Scope and §Public Surface is unchanged: every
+path and behavior lands; nothing is narrowed, deferred, or made optional.
 
-- **A3-C1 — codec extension (first implementation frontier)**: BF16 + Q5_K in `dequant.fab`, the two `elementa_glomoris`/`octeti_glomoris` rows, the goldens generator + `gguf-dequant-goldens.json` (union set), the dequant proba cases. Independent and first — it is the first missing capability and carries the first failing oracle.
-- **A3-C2 — payload + view + bounded materializer**: `tensor_payload.fab`, `tensor_view.fab`, `limes_payloadis`, their probas, the `MAXIMUM_SLICEM_ELEMENTA` bound, the windowed read loop. Consumes C1's codecs; the public surface lands once here.
-- **A3-C3 — exempla receipt + docs + closeout**: `exempla/gguf-materialize` real-file slice receipt across the mandatory corpus, `scripta/check-compile` targets, all doc updates, the coverage record, the closeout commit. Closes the unit.
+Split-on-boundary rules stay: each micro-unit lands as one commit; no dual
+authority ever exists between units; the shared `src/model/` tree stays
+hunk-serialized against the sibling LIB-02 Hand via landed-commit boundaries.
+In the closeout commands below, `$WS` is the workspace root (e.g.
+`/Users/ianzepp/work/faberlang/worktrees/hand-N`) and `$GRADUS` = `$WS/gradus`.
 
-Serial `C1 → C2 → C3`; no parallel children needed (single Hand owns the shared `dequant.fab`/`gguf_manifest.fab` files; sibling LIB-02 Hand is hunk-serialized on the shared `src/model/` tree via landed-commit boundaries).
+### C2 — payload, view, bounded materializer (5 micro-units)
+
+```text
+A3-C1 (landed 82048b5)
+  ├─→ C2-U1 limes_payloadis (gguf_manifest.fab) ─┐
+  └─→ C2-U2 tensor_payload module ────────────────┼─→ C2-U3 tensor_view + vincula
+                                                  └──→ C2-U4 materializa_slicem
+                                                        └──→ C2-U5 materializa_glomulum
+```
+
+C2-U1 ∥ C2-U2 are file-disjoint (parallel-safe); C2-U3 → C2-U5 are serial on
+`src/model/tensor_view.fab`/`.proba`.
+
+**C2-U1 — `limes_payloadis` payload-range accessor**
+- **outcome**: one additive accessor on the existing `gradus:model/gguf_manifest`:
+  `limes_payloadis(ManifestumGguf m, textus nomen) → (numerus, numerus) ⇥ GgufManifestError`
+  returning the exact stored byte range `(initium_absolutum, longitudo_payloadis)`
+  of one known-layout tensor, reusing `inveni_tensorem` + the already-validated
+  `Cognita` facts (no new layout derivation); unknown name fails closed via the
+  `inveni_tensorem` passthrough (`WireMala`); `Ignota` layout fails closed
+  (`LayoutIgnota`). Marked `@ publica` per the landed post-visibility-flip
+  convention.
+- **write_scope**: `src/model/gguf_manifest.fab`, `src/model/gguf_manifest.proba`
+- **first_failing_oracle**: proba case
+  `manifestum.limes_payloadis(m, "token_embd.weight")` fails to compile (symbol
+  absent) → RED.
+- **closeout**: `cd $GRADUS && env FABER_LIBRARY_HOME=$WS $WS/radix/target/debug/faber check .` + `git diff --check -- src/model/gguf_manifest.fab src/model/gguf_manifest.proba`
+- **expected_observed_result**: `faber check` ends `ok: .`; the accessor and its
+  proba cases type-check; `git diff --check` silent.
+- **est_basis**: mirrors the `inveni_tensorem`/`lege_fragmentum` accessor seam
+  (offset + checked-arithmetic pattern); ~25 fab lines + ~40 proba lines; no new
+  error variant. ~12 min.
+- **stop_condition**: if the accessor needs a range fact the manifest does not
+  already carry at parse time, stop and route — the manifest is the single
+  layout authority; never re-derive layout independently.
+- **depends_on**: A3-C1 (landed `82048b5`)
+
+**C2-U2 — `tensor_payload` module (value + diagnostics)**
+- **outcome**: new module `gradus:model/tensor_payload`:
+  `genus TensorPayload { textus nomen, numerus initium_absolutum, numerus longitudo, octeti bytes }`,
+  `discretio PayloadError { NomineIgnota, RangeMala, LongitudoMala }`,
+  `causa(PayloadError) → textus`; all `@ publica`. The value carries no path,
+  URL, reader, handle, or whole-model byte list (delivery clean boundary).
+- **write_scope**: `src/model/tensor_payload.fab`,
+  `src/model/tensor_payload.proba` (both new)
+- **first_failing_oracle**: proba `importa ex "gradus:model/tensor_payload"` fails
+  to compile (module absent) → RED.
+- **closeout**: `cd $GRADUS && env FABER_LIBRARY_HOME=$WS $WS/radix/target/debug/faber check .` + `git diff --check -- src/model/tensor_payload.fab src/model/tensor_payload.proba`
+- **expected_observed_result**: `faber check` ends `ok: .`; payload construction
+  and all three `PayloadError` `causa` renderings type-check.
+- **est_basis**: value + 3-variant error + `causa` ≈ the `artifact.fab` module
+  pattern; ~50 lines + ~45 proba lines. ~12 min.
+- **stop_condition**: if a field would carry a path/reader/device object or a
+  whole-model byte list, stop (clean boundary).
+- **depends_on**: A3-C1 (landed `82048b5`)
+
+**C2-U3 — `tensor_view` module (value, diagnostics, `vincula` binding)**
+- **outcome**: new module `gradus:model/tensor_view`: `genus VisumTensoris`
+  (frozen field list), `discretio VisioError` (frozen 7 variants), `causa`, and
+  `vincula(ManifestumGguf m, TensorPayload p) → VisumTensoris ⇥ VisioError` —
+  bind one descriptor + one validated payload into the typed view with the full
+  fail-closed matrix: unknown name → `NomineIgnota`; absolute-range mismatch
+  (`payload.initium_absolutum` vs the `limes_payloadis` start) → `RangeMala`;
+  stored-length mismatch (vs `Cognita.longitudo_octetorum`) → `LongitudoMala`;
+  `Ignota` layout → `LayoutIgnota`; un-admitted physical type (dequant
+  `elementa_glomoris` cross-check — the manifest stays the single layout
+  authority) → `TypoIgnotum`. All `@ publica`.
+- **write_scope**: `src/model/tensor_view.fab`, `src/model/tensor_view.proba`
+  (both new)
+- **first_failing_oracle**: proba `tensor_view.vincula(m, p)` fails to compile
+  (module absent) → RED.
+- **closeout**: `cd $GRADUS && env FABER_LIBRARY_HOME=$WS $WS/radix/target/debug/faber check .` + `git diff --check -- src/model/tensor_view.fab src/model/tensor_view.proba`
+- **expected_observed_result**: `faber check` ends `ok: .`; the positive bind and
+  each of the five fail-closed cases type-check.
+- **est_basis**: one bind with five fail-closed branches reusing
+  `limes_payloadis` + `inveni_tensorem` + dequant layout facts; ~90 lines + ~70
+  proba lines. ~15 min.
+- **stop_condition**: if binding would retain the source callback or read payload
+  bytes, stop — windowed materialization is C2-U4's behavior family.
+- **depends_on**: C2-U1, C2-U2
+
+**C2-U4 — `materializa_slicem` windowed materializer + cap**
+- **outcome**: add `MAXIMUM_SLICEM_ELEMENTA ← 16777216` and
+  `materializa_slicem(VisumTensoris v, numerus initium_elementum, numerus longitudo_elementum, (numerus, numerus) → LectioFontis fons) → lista<f32> ⇥ VisioError`:
+  element-window bounds check → `LimitesMala`; block-alignment check via
+  `Cognita.elementa_per_blockum` → `OrdoMala`; window cap → `LimitesMala`;
+  per-block payload sub-window reads through the operation-scoped source (source
+  failure → `RangeMala`); `dequantizas_glomulus` assembly in GGUF block order.
+  Each sub-window is one block (≤ `CORPUS_LIMES`); no whole-tensor or
+  whole-model read path exists.
+- **write_scope**: `src/model/tensor_view.fab`, `src/model/tensor_view.proba`
+  (extend)
+- **first_failing_oracle**: proba
+  `tensor_view.materializa_slicem(v, 0, 256, fons)` fails to compile (symbol
+  absent) → RED.
+- **closeout**: `cd $GRADUS && env FABER_LIBRARY_HOME=$WS $WS/radix/target/debug/faber check .` + `git diff --check -- src/model/tensor_view.fab src/model/tensor_view.proba`
+- **expected_observed_result**: `faber check` ends `ok: .`; the positive window
+  and the misaligned / over-cap / source-failure cases type-check.
+- **est_basis**: the windowed loop is the `dequantizas_ordo` pattern over a
+  source callback (the `lege_fragmentum` seam) with three bound checks;
+  ~100 lines + ~60 proba lines. ~15 min.
+- **stop_condition**: if the forward graph needs a window above
+  `MAXIMUM_SLICEM_ELEMENTA` or a sub-window above `CORPUS_LIMES`, record with
+  the consuming successor (GGUF-A4/M-rungs) and escalate — the bounded-window
+  design is the contract, not a negotiable ceiling.
+- **depends_on**: C2-U3
+
+**C2-U5 — `materializa_glomulum` single-block probe**
+- **outcome**: add
+  `materializa_glomulum(VisumTensoris v, numerus index_glomuli, (numerus, numerus) → LectioFontis fons) → lista<f32> ⇥ VisioError`:
+  block-index bounds check (`LimitesMala` when `index_glomuli` ≥ block count),
+  one-block payload sub-window read, `dequantizas_glomulus` result.
+- **write_scope**: `src/model/tensor_view.fab`, `src/model/tensor_view.proba`
+  (extend)
+- **first_failing_oracle**: proba `tensor_view.materializa_glomulum(v, 0, fons)`
+  fails to compile (symbol absent) → RED.
+- **closeout**: `cd $GRADUS && env FABER_LIBRARY_HOME=$WS $WS/radix/target/debug/faber check .` + `git diff --check -- src/model/tensor_view.fab src/model/tensor_view.proba`
+- **expected_observed_result**: `faber check` ends `ok: .`; the first-block probe
+  and the out-of-range index case type-check.
+- **est_basis**: thin wrapper over the C2-U4 read path; ~25 lines + ~40 proba
+  lines. ~10 min.
+- **stop_condition**: same as C2-U4 — never a whole-tensor read.
+- **depends_on**: C2-U4
+
+### C3 — exempla receipt + docs + closeout (7 micro-units)
+
+```text
+C2-U5 ──┬─→ C3-U1 exempla fixture mode + check-compile wiring ──→ C3-U2 exempla real-file mode + receipt
+        ├─→ C3-U3 api-reference + diagnostics re-baseline
+        ├─→ C3-U4 module-map + README surface lists
+        └─→ C3-U5 regression-corpus + goldens-oracle docs
+              └─→ C3-U6 symbol-inventory + support-matrix (also after C3-U2)
+                    └─→ C3-U7 delivery/CAMPAIGN status + full closeout gate
+```
+
+C3-U1 ∥ C3-U3 ∥ C3-U4 ∥ C3-U5 are file-disjoint and parallel after C2-U5;
+C3-U2 is serial after C3-U1 (extends its `main.fab`); C3-U6 needs the C3-U2
+receipt for the support-matrix tier; C3-U7 closes.
+
+**C3-U1 — exempla/gguf-materialize fixture mode + check-compile wiring**
+- **outcome**: create `exempla/gguf-materialize/` (`faber.toml` +
+  `src/main.fab`) as the app-owned file adapter (the `gguf-inspect` pattern):
+  resolve one GGUF path, `inspice` the manifest, bind + materialize named
+  tensor slices via `vincula`/`materializa_slicem`, print observed PASS lines.
+  First cut proves slices of the committed
+  `fixtures/gguf/smollm2-360m-scaled-row.gguf` (deterministic data region;
+  F32/Q8_0/Q4_K tensors). Wire the `gguf-materialize` block into
+  `scripta/check-compile` (bash launcher — the live gate, per the
+  gguf-manifest/gguf-inspect precedent).
+- **write_scope**: `exempla/gguf-materialize/faber.toml`,
+  `exempla/gguf-materialize/src/main.fab` (new), `scripta/check-compile`
+- **first_failing_oracle**: `faber check $GRADUS/exempla/gguf-materialize` errors
+  (package absent) → RED.
+- **closeout**: `cd $GRADUS && env FABER_LIBRARY_HOME=$WS $WS/radix/target/debug/faber check .`; `env FABER_LIBRARY_HOME=$WS $WS/radix/target/debug/faber check exempla/gguf-materialize`; `env FABER_LIBRARY_HOME=$WS $WS/radix/target/debug/faber run --target fmir exempla/gguf-materialize -- fixtures/gguf/smollm2-360m-scaled-row.gguf`; `git diff --check -- exempla/gguf-materialize scripta/check-compile`
+- **expected_observed_result**: both `faber check` runs end `ok: .`; the fixture
+  run prints observed PASS lines for the fixture slices with exit 0;
+  `git diff --check` silent.
+- **est_basis**: mirrors `exempla/gguf-inspect` (adapter + range source + PASS
+  printing, ~70 lines) plus the slice table and the
+  `vincula`/`materializa_slicem` calls; ~130 lines + `faber.toml` + one
+  check-compile block. ~15 min.
+- **stop_condition**: if a fixture tensor's type falls outside the admitted set,
+  record it and pick an admitted slice — never widen the codec set.
+- **depends_on**: C2-U5
+
+**C3-U2 — exempla real-file mode + coverage + receipt**
+- **outcome**: extend `exempla/gguf-materialize/src/main.fab` with the real-file
+  mode (path + data-offset + sha256 args, the `gguf-inspect` 3-arg form), the
+  Qwen3.6 slice table (BF16 ×2, Q4_K, Q5_K, Q6_K, Q8_0, F32, rank-3 expert
+  window), bit-exact comparison against the committed
+  `fixtures/gguf/gguf-dequant-goldens.json` values, the coverage line
+  `PASS coverage tensors=753 known=753 unknown=0 types=…`, and the two Qwen2.5
+  dense-row derived distribution lines; execute the guarded run against the
+  local Qwen3.6 artifact; write `exempla/gguf-materialize/README.md` (command,
+  content identities, slice names/ranges, observed values, dense-row
+  distributions).
+- **write_scope**: `exempla/gguf-materialize/src/main.fab`,
+  `exempla/gguf-materialize/README.md`
+- **first_failing_oracle**: the guarded real-file run errors or prints no PASS
+  lines (real-file mode absent) → RED.
+- **closeout**: `cd $GRADUS && env FABER_LIBRARY_HOME=$WS $WS/radix/target/debug/faber run --target fmir exempla/gguf-materialize -- /Users/ianzepp/ai/models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf 10991392 0b21525e972670ed59e1812e170b27c26355381f0656ecc4e25617ece7dac58b` + `git diff --check -- exempla/gguf-materialize`
+- **expected_observed_result**: one PASS per golden slice (BF16 ×2, Q4_K, Q5_K,
+  Q6_K, Q8_0, F32, rank-3 expert) matching the goldens bit-exactly, the coverage
+  line 753/753/0, the two dense-row distribution lines, zero FAIL, exit 0; the
+  receipt records the exact command and observed values.
+- **est_basis**: extends the C3-U1 app with the slice table + golden comparison
+  (golden values already committed) + one guarded run + the README receipt;
+  ~80 lines + ~60 README lines. ~15 min plus run latency.
+- **stop_condition**: a golden mismatch on any slice is a divergence receipt
+  naming the first divergent block element (never tolerance-widened); a
+  mandatory-artifact layout outside the admitted set is a unit-scope gap with
+  the exact tensor and a correction route.
+- **depends_on**: C3-U1
+
+**C3-U3 — api-reference + diagnostics re-baseline**
+- **outcome**: `docs/api-reference.md` — new `gradus:model/tensor_payload` and
+  `gradus:model/tensor_view` sections (the frozen public surface), widen the
+  `gradus:model/dequant` section to the union set (BF16/Q5_K layout facts + the
+  view-boundary cross-check note); `docs/diagnostics.md` — new
+  `PayloadError`/`VisioError` tables and the `DequantError` rows for the two new
+  codecs; re-run the committed coverage gate so no public symbol is missing.
+- **write_scope**: `docs/api-reference.md`, `docs/diagnostics.md`
+- **first_failing_oracle**: `scripta/inventory-public-symbols` fails the
+  committed coverage gate (new public symbols without a mention) → RED.
+- **closeout**: `cd $GRADUS && ./scripta/inventory-public-symbols` + `env FABER_LIBRARY_HOME=$WS $WS/radix/target/debug/faber check .` + `git diff --check -- docs/api-reference.md docs/diagnostics.md`
+- **expected_observed_result**: the inventory gate passes with every new public
+  symbol inventoried; `faber check` ends `ok: .`; `git diff --check` silent.
+- **est_basis**: two reference docs over an already-landed surface (the A1a/A1b
+  module-section pattern); ~60–80 doc lines + one inventory re-baseline.
+  ~12 min.
+- **stop_condition**: if a doc claim would assert executed value-identity (proba
+  execution / FMIR stepper), stop — the reference stays at the compiled-surface
+  tier (CTO8-1).
+- **depends_on**: C2-U5
+
+**C3-U4 — module-map + README surface lists**
+- **outcome**: `docs/module-map.md` — two new module rows
+  (`gradus:model/tensor_payload`, `gradus:model/tensor_view`) + updated module/
+  function counts; `README.md` — the module/surface list adds the two modules
+  and the widened dequant union set.
+- **write_scope**: `docs/module-map.md`, `README.md`
+- **first_failing_oracle**: the module-map lacks the two new module rows and
+  their `functio` counts → RED (counts must match the inventory script).
+- **closeout**: `cd $GRADUS && ./scripta/inventory-public-symbols` + `env FABER_LIBRARY_HOME=$WS $WS/radix/target/debug/faber check .` + `git diff --check -- docs/module-map.md README.md`
+- **expected_observed_result**: the inventory asserts every module's `functio`
+  count including the two new modules; `faber check` ends `ok: .`.
+- **est_basis**: two small list/table docs over landed module names; ~20 lines.
+  ~10 min.
+- **stop_condition**: documents the landed surface only — if a list needs an
+  un-landed surface, stop.
+- **depends_on**: C2-U5
+
+**C3-U5 — regression-corpus + goldens-oracle contract docs**
+- **outcome**: `docs/regression-corpus.md` — bump the corpus version (next after
+  the current `v1.3.0`) and inventory the two new proba suites (`tensor_payload`,
+  `tensor_view`), the widened `dequant` suite, and the
+  `gguf-dequant-goldens.json` / `gguf-dequant-goldens-oracle.md` fixture
+  entries; `fixtures/gguf/gguf-dequant-goldens-oracle.md` (new) — the goldens
+  derivation contract (llama.cpp `ggml-quants.c` @ `a957b7747` pin, generator
+  command, SHA-256 pins) for the C1-landed goldens.
+- **write_scope**: `docs/regression-corpus.md`,
+  `fixtures/gguf/gguf-dequant-goldens-oracle.md`
+- **first_failing_oracle**: the corpus totals are stale against the landed proba
+  suite count (suite/fixture totals mismatch) → RED.
+- **closeout**: recount `find src -name '*.proba'` totals against the corpus
+  inventory + `git diff --check -- docs/regression-corpus.md fixtures/gguf/gguf-dequant-goldens-oracle.md`
+- **expected_observed_result**: corpus totals match the landed suites and
+  fixtures; the oracle doc pins the derivation; `git diff --check` silent.
+- **est_basis**: one table bump + a ~30-line derivation-contract doc over
+  C1-landed facts; ~40 lines. ~10 min.
+- **stop_condition**: if a pin (commit / SHA-256) cannot be verified against the
+  pinned toolchain, record and escalate — no unverifiable pin is committed.
+- **depends_on**: C2-U5
+
+**C3-U6 — factory inventory docs (symbol inventory + support matrix)**
+- **outcome**: `docs/factory/production-ml-library/pml0-symbol-inventory.md` —
+  new public symbols + module counts for the two new modules and the widened
+  `dequant`/`gguf_manifest` surfaces;
+  `docs/factory/production-ml-library/pml0-support-matrix.md` — storage/
+  materialization rows at the **output-checked slice tier** citing the C3-U2
+  receipt (never executed-token/model identity — CTO8-1 stays the named gate).
+- **write_scope**: `docs/factory/production-ml-library/pml0-symbol-inventory.md`,
+  `docs/factory/production-ml-library/pml0-support-matrix.md`
+- **first_failing_oracle**: the symbol inventory misses the landed public symbols
+  (count mismatch vs `scripta/inventory-public-symbols`) → RED.
+- **closeout**: `cd $GRADUS && ./scripta/inventory-public-symbols` +
+  `git diff --check -- docs/factory/production-ml-library/pml0-symbol-inventory.md docs/factory/production-ml-library/pml0-support-matrix.md`
+- **expected_observed_result**: inventory counts match the landed surface; the
+  support-matrix rows classify the output-checked slice tier with the receipt
+  link.
+- **est_basis**: two factory inventory docs over landed, executed facts; ~50
+  lines. ~10 min.
+- **stop_condition**: if a support-matrix row would claim executed-token/model
+  identity, stop — the tier is output-checked slices only (CTO8-1).
+- **depends_on**: C2-U5, C3-U2
+
+**C3-U7 — delivery/CAMPAIGN status closeout + full closeout gate**
+- **outcome**: mark the GGUF-A3 section implemented in
+  `docs/factory/production-ml-library/pml5-general-gguf-delivery.md`; update the
+  gradus `CAMPAIGN.md` status line; run the delivery's declared closeout command
+  set (§Closeout Commands And Expected Observed Result) over the whole A3 path
+  list and record the receipt; the A3 closeout commit.
+- **write_scope**: `docs/factory/production-ml-library/pml5-general-gguf-delivery.md`
+  (GGUF-A3 section only), `docs/factory/production-ml-library/CAMPAIGN.md`
+  (status line only)
+- **first_failing_oracle**: the declared closeout commands fail (e.g.,
+  check-compile errors on the `gguf-materialize` exemplar) → RED; nothing claims
+  implemented before green.
+- **closeout**: the §Closeout Commands command set: `./scripta/check-source`;
+  `env FABER_LIBRARY_HOME=$WS FABER_BIN=$WS/radix/target/debug/faber ./scripta/check-compile`;
+  the guarded real-file exempla run (C3-U2 form); `git diff --check -- <the full
+  A3 path list from §Closeout Commands>`.
+- **expected_observed_result**: `check-source` and `check-compile` exit 0; the
+  exempla prints the PASS receipt (8 golden slices + coverage + dense-row
+  distributions, zero FAIL, exit 0); `git diff --check` silent; the status docs
+  describe the observed result exactly.
+- **est_basis**: status-line edits + one full closeout run (tool-latency
+  dominated); ~10 min of Hand time.
+- **stop_condition**: any closeout gate failure is a real finding — record and
+  route, never weaken the gate; READY is a readiness verdict, not a GO stamp
+  (dispatch stays Mind/operator-owned).
+- **depends_on**: C3-U1, C3-U2, C3-U3, C3-U4, C3-U5, C3-U6
+
+### Parallelism and lane boundaries
+
+- Maximum safe parallelism: **4** (C3-U1 ∥ C3-U3 ∥ C3-U4 ∥ C3-U5 after C2-U5);
+  C2 opens with 2 (C2-U1 ∥ C2-U2).
+- Lane-owned gates unchanged: lint owns stages 1–2; test owns stages 3–6 and
+  broad suites; merge owns integration. No micro-unit carries a lane gate on its
+  closeout — the narrow `faber check` is the unit gate; the full declared
+  command set runs once at C3-U7.
 
 ## Oracle And Local Corpus Boundary
 
@@ -203,7 +521,11 @@ Serial `C1 → C2 → C3`; no parallel children needed (single Hand owns the sha
 
 ## Closeout Commands And Expected Observed Result
 
-From the Hand packet (substitute the lane worktree paths):
+**A3 closeout gate (owned by C3-U7).** Each micro-unit's own closeout is the
+narrow `faber check` on its touched surface (in the unit definitions in
+§Implementation Frontier And Split Boundary); the full declared command set
+below runs once at the C3-U7 closeout against the whole A3 path list. From the
+Hand packet (substitute the lane worktree paths):
 
 ```bash
 cd <hand-worktree>/gradus
@@ -248,22 +570,37 @@ This lowering preserves every mandatory successor; nothing is narrowed, deferred
 
 ## Estimate
 
-- **est_work_tokens**: 18k–28k. **est_basis**: pilot (extrapolated — gradus Fab codec + tensor-view surface + goldens + package-MIR receipt; no close ledger class; the two new codecs carry the bulk).
-- **tool_latency**: medium — `check-source`/`check-compile` (narrow) plus one `faber run --target fmir` exempla execution and the oracle-derivation step; no cargo, no device runs.
+- **Micro-unit estimates** (Hand-active minutes, per the granularity bar):
+  C2-U1 ~12, C2-U2 ~12, C2-U3 ~15, C2-U4 ~15, C2-U5 ~10, C3-U1 ~15, C3-U2 ~15,
+  C3-U3 ~12, C3-U4 ~10, C3-U5 ~10, C3-U6 ~10, C3-U7 ~10. The serial chain
+  C2-U1/U2 → C2-U5 bounds wall-clock; C3 opens 4-way parallel after C2-U5.
+- **est_work_tokens**: 12 × 2k–4k ≈ 24k–48k total. **est_basis**: per-unit
+  basis in the unit definitions (mirrors the landed A1a/A1b and C1 patterns; no
+  close ledger class).
+- **tool_latency**: medium — per-unit `faber check` (seconds) plus one
+  `faber run --target fmir` real-file exempla execution and the
+  oracle-derivation step at C3-U2; no cargo, no device runs.
 
 ## Stop Conditions / Escalation
 
-- If GGUF-A1c has not landed at the dispatch boundary, the Hand records the recheck and stops (never proceeds on the assumed post-A1c authority — "summaries are claims").
+- ~~If GGUF-A1c has not landed at the dispatch boundary, the Hand records the recheck and stops~~ — **resolved**: A1c landed at `2b3e41a` and C1 at `82048b5` (see §Predecessor And Entry Gate); the C2/C3 micro-units dispatch against the landed post-A1c authority.
 - If a mandatory-artifact layout outside the admitted set appears in the live distributions, the unit records the exact tensor and routes a correction (campaign stop condition) — no silent widening of the codec set.
 - A golden mismatch on any slice is a divergence receipt naming the first divergent block element, never a tolerance-widened pass (truth over safety; bit-exact f32 contract).
 - A window/materialization bound that would need to exceed `MAXIMUM_SLICEM_ELEMENTA` or `CORPUS_LIMES` for the forward graph is recorded with its consuming successor (GGUF-A4/M-rungs) and escalated — the bounded-window design is the contract, not a negotiable ceiling.
 
-## Open Items For Mind (none blocks this lowering)
+## Open Items For Mind (none blocks this re-split)
 
-1. **GGUF-A1c (LIB-01) landing** — the dispatch gate for this unit; recheck at the A1c closeout.
-2. **Qwen2.5 dense-row type distributions** — derived at the unit boundary (evidence gap recorded; low risk given the admitted union set).
+1. **GGUF-A1c / A3-C1 landing** — resolved (`2b3e41a` / `82048b5`); the dispatch
+   gate recorded by the 2026-08-13 lowering is open.
+2. **Qwen2.5 dense-row type distributions** — derived at the C3-U2 boundary
+   (evidence gap recorded; low risk given the admitted union set).
 3. **Exact public spellings** (`TensorPayload`/`VisumTensoris`/`vincula`/`materializa_slicem`/`limes_payloadis`) — frozen by this lowering per the codebase Latin convention; any amendment routes through the delivery-amendment path (A1a precedent).
+4. **`scripta/check-compile.fab` status** — the native-Faber variant is not an
+   execution surface (PKG001) and was not extended for the gguf-manifest/
+   gguf-inspect exempla; C3-U1 extends the bash launcher (the live gate).
+   Whether to retire or resurface the `.fab` variant is a housekeeping question
+   for Mind, not an A3 blocker.
 
 ---
 
-*Planning artifact only. No product code was written by this lowering. LIB-03/GGUF-A3 is lowered as three serial slices (C1 codec extension → C2 payload/view/materializer → C3 exempla receipt + docs + closeout); dispatch is gated on LIB-01 (GGUF-A1c). The unit preserves every mandatory successor through CLOSE-01 and advances umbrella milestone Q1 without completing the campaign.*
+*Planning artifact only. No product code was written by this revision. LIB-03/GGUF-A3: C1 landed (`82048b5`); C2 and C3 re-lowered into 12 dispatch-ready one-behavior-family micro-units (operator granularity bar, 2026-08-14). The unit preserves every mandatory successor through CLOSE-01 and advances umbrella milestone Q1 without completing the campaign.*
