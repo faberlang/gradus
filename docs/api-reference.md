@@ -609,6 +609,56 @@ EOG/tokenizer identity is no longer carried by the capsule — it lives in
 `gradus:tokenizer`, and the per-format admission entries enforce their own
 tokenizer facts (see the D3/D4 entries below).
 
+## gradus:model/dense_llama
+
+Typed `llama` (SmolLM2) architecture adapter (REF-01-U1.6, feeds Gate 1).
+The adapter is a canonical tensor-name → manifest-descriptor mapping over the
+`gradus:model/gguf_manifest` surface. Canonical families: `model.embed_tokens`,
+`model.layers.{N}.input_layernorm`, `model.layers.{N}.self_attn.q_proj`,
+`model.layers.{N}.self_attn.k_proj`, `model.layers.{N}.self_attn.v_proj`,
+`model.layers.{N}.self_attn.o_proj`,
+`model.layers.{N}.post_attention_layernorm`,
+`model.layers.{N}.mlp.gate_proj`, `model.layers.{N}.mlp.up_proj`,
+`model.layers.{N}.mlp.down_proj`, `model.norm`, and `lm_head`. Layer-indexed
+families take the layer index as `stratum`; it must be within the frozen
+layer range. The adapter retains no path, reader, source function, or payload.
+
+- `discretio DensumLlamaError` — typed fail-closed diagnostics: every
+  variant carries `textus causa`, rendered by `causa(e)`. Variants:
+  `NomenCanonicumIgnotum` (unknown canonical name), `StrataExcessiva` (layer
+  index outside the frozen layer range), `TensorDeest` (the canonical target's
+  GGUF tensor is absent from the manifest), `LayoutIgnota` (the resolved
+  tensor's GGML layout is unknown).
+- `genus ArsLlama` — the frozen architecture config: `nomen`, `strata`
+  (layer count), `capita` (heads), `capita_kv` (KV heads), `dimensio_capitis`
+  (head_dim), `dimensio_occulta` (hidden dim), `vocabularia` (vocab),
+  `nexa_immortalia` (tied embeddings).
+- `genus DescriptioCanonica` — one resolved canonical descriptor:
+  `nomen_canonicum`, `nomen_gguf`, `forma`, `typo_ggml`, `layout`.
+- `functio causa(DensumLlamaError e) → textus` — render the typed error
+  message.
+- `functio ars_smollm2() → ArsLlama` — the frozen SmolLM2-360M config
+  (32 layers, 15 heads, 5 KV heads, head_dim 64, hidden 960, vocab 49152,
+  tied embedding). Facts are the read-only GGUF-A1b inspect-surface pins for
+  the real SmolLM2-360M-Instruct-Q4_K_M.gguf file (recorded in
+  `src/model/dense_llama.proba`).
+- `functio layout_nota(manifestum.LayoutGgml l) → textus` — deterministic
+  layout knownness render (`"known"`/`"unknown"`); the module owns the
+  imported-union discrimination.
+- `functio nomen_gguf(ArsLlama a, textus canonicum, numerus stratum) →
+  textus ⇥ DensumLlamaError` — canonical name → GGUF tensor name
+  (`token_embd.weight`, `blk.{N}.attn_{q,k,v}_weight`,
+  `blk.{N}.attn_output.weight`, `blk.{N}.attn_norm.weight`,
+  `blk.{N}.ffn_{gate,up,down}_weight`, `blk.{N}.ffn_norm.weight`,
+  `output_norm.weight`, `output.weight`); fail closed on unknown names and
+  out-of-range layer indices. The tied `lm_head` maps to the shared
+  `token_embd.weight`; an untied row maps to `output.weight`.
+- `functio resolvo(manifestum.ManifestumGguf m, ArsLlama a, textus canonicum,
+  numerus stratum) → DescriptioCanonica ⇥ DensumLlamaError` — resolve a
+  canonical name to its manifest descriptor (canonical name, GGUF name,
+  shape, GGML type id, layout); fail closed when the GGUF tensor is absent
+  (`TensorDeest`) or its layout is unknown (`LayoutIgnota`).
+
 ## gradus:model/gguf_manifest
 
 Format-general GGUF v3 manifest inspection (GGUF-A1b). `CorpusGguf` accepts a

@@ -53,6 +53,7 @@ pinned row is space-prefix-free (add_space_prefix = false)
 | `gradus:metrics` | `MetricError` | 7 | `src/metrics.fab` |
 | `gradus:model/artifact` | `ArtifactError` | 3 | `src/model/artifact.fab` |
 | `gradus:model/capsule` | `AdmissionError` | 6 | `src/model/capsule.fab` |
+| `gradus:model/dense_llama` | `DensumLlamaError` | 4 | `src/model/dense_llama.fab` |
 | `gradus:model/dequant` | `DequantError` | 4 | `src/model/dequant.fab` |
 | `gradus:model/gguf` | `GgufError` | 10 | `src/model/gguf.fab` |
 | `gradus:model/gguf_manifest` | `GgufManifestError` | 12 | `src/model/gguf_manifest.fab` |
@@ -70,7 +71,7 @@ pinned row is space-prefix-free (add_space_prefix = false)
 | `gradus:train` | `TrainError` | 10 | `src/train.fab` |
 | `gradus:transformer` | `TransformerError` | 12 | `src/transformer.fab` |
 
-**Total**: 220 public error codes across 28 error types.
+**Total**: 224 public error codes across 29 error types.
 
 ## `gradus:model/artifact` — `ArtifactError`
 
@@ -279,6 +280,21 @@ every entry point rejects a schema-1 stamp with the typed `SchemaVetus`.
 | `AdmissionError.DigestioMala` | Malformed digest value (format / length / charset) or a digest mismatch on verification. | `digest mismatch — capsule does not match the expected artifact`<br>`malformed digest value` | Supply the canonical 64-digit lower-case hexadecimal digest that matches the artifact. |
 | `AdmissionError.ManifestumMala` | Malformed per-format manifest: empty or non-matching format/version, artifact-length mismatch, invalid byte length, malformed tensor descriptor, or a manifest inconsistent with the carried identity. | `manifestum is inconsistent with the artifact identity`<br>`invalid artifact byte length`<br>`capsule failed verification`<br>`metadata index out of bounds`<br>`tensor descriptor index out of bounds` | Supply a per-format manifest whose format/version, lengths, and tensor descriptors are consistent with the artifact identity. |
 | `AdmissionError.WireMala` | Malformed capsule identity wire form. | `malformed capsule identity wire form`<br>`malformed numeric field`<br>`numeric field above the integer carrier`<br>`unknown capsule identity marker`<br>`invalid byte length in capsule identity`<br>`unreachable` (internal) | Re-emit with the current schema stamp; never guess an unknown version. |
+
+## `gradus:model/dense_llama` — `DensumLlamaError`
+
+Source: `src/model/dense_llama.fab` (REF-01-U1.6). Render with module
+`causa(e)`. The typed `llama` architecture adapter fails closed on any
+canonical resolution that cannot be represented: unknown canonical names,
+layer indices outside the frozen range, a canonical target's GGUF tensor
+absent from the manifest, and unknown GGML layouts.
+
+| Code | Class / when | Live messages (representative) | Resolution |
+| --- | --- | --- | --- |
+| `DensumLlamaError.NomenCanonicumIgnotum` | Unknown canonical tensor name in the llama mapping. | `unknown canonical tensor name: …` | Use a canonical family the adapter defines (`model.embed_tokens`, `model.layers.{N}.{…}`, `model.norm`, `lm_head`). |
+| `DensumLlamaError.StrataExcessiva` | Layer index outside the frozen layer range `[0, strata)`. | `layer index outside the frozen llama layer range: …` | Supply a layer index within the frozen config's layer count. |
+| `DensumLlamaError.TensorDeest` | The canonical target's GGUF tensor is absent from the manifest (or descriptor resolution failed). | `canonical tensor is absent from the manifest: …`<br>`canonical tensor resolution failed: …` | Admit a manifest whose tensor table carries the canonical target's GGUF row (e.g. tied rows share `token_embd.weight`). |
+| `DensumLlamaError.LayoutIgnota` | The resolved tensor's GGML layout is unknown (unlisted type id). | `canonical tensor resolves to an unknown GGML layout: …` | Use a manifest whose GGML type ids resolve to known layouts. |
 
 ## `gradus:model/dequant` — `DequantError`
 

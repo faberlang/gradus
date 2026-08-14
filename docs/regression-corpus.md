@@ -1,8 +1,10 @@
 # Gradus Regression Corpus
 
-**Version**: `gradus-regression-corpus v1.4.0` (2026-08-13, A1C-M5;
+**Version**: `gradus-regression-corpus v1.5.0` (2026-08-13, A1C-M5;
 2026-08-14, LIB-02-U1 tokenizer metadata array pins; LIB-03 GGUF-A3 C1/C2-U5 —
-`tensor_payload` / `tensor_view` suites + union-set dequant goldens)
+`tensor_payload` / `tensor_view` suites + union-set dequant goldens;
+2026-08-14, REF-01-U1.6 `dense_llama` llama adapter descriptor-resolution
+pins + `exempla/dense-llama-adapter`)
 **Repo**: gradus. **Tier**: structural inventory.
 **Delivery**: `docs/factory/production-ml-library/pml6-delivery.md` §PML6-U4;
 GGUF-A1b delivery in `pml5-general-gguf-delivery.md`.
@@ -29,7 +31,7 @@ closeout, never a dev-loop suite.
 | --- | --- | --- |
 | Co-located package tests | `src/*.proba`, `src/model/*.proba` | Compile-level contract + oracle pins per module |
 | Model / tokenizer fixtures | `fixtures/safetensors/`, `fixtures/gguf/`, `fixtures/tokenizer/` | Legal fixtures + row-oracle docs, including the three GGUF-A1a manifest fixtures and the GGUF-A3 union-set dequant goldens (`gguf-dequant-goldens.json` + derivation contract) |
-| Exempla consumers | `exempla/gradient-seam`, `exempla/gradient-seam-nolib`, `exempla/training-loop-mlp`, `exempla/token-generation`, `exempla/gguf-manifest`, `exempla/gguf-inspect`, `exempla/qwen36-35b-inference` | Public-surface consumers plus the executed GGUF synthetic proof (40 PASS / 0 FAIL), guarded six-file local inspection receipt, and the capstone tokenizer-phase run (LIB-02-U4-1) |
+| Exempla consumers | `exempla/gradient-seam`, `exempla/gradient-seam-nolib`, `exempla/training-loop-mlp`, `exempla/token-generation`, `exempla/gguf-manifest`, `exempla/gguf-inspect`, `exempla/qwen36-35b-inference`, `exempla/dense-llama-adapter` | Public-surface consumers plus the executed GGUF synthetic proof (40 PASS / 0 FAIL), guarded six-file local inspection receipt, the capstone tokenizer-phase run (LIB-02-U4-1), and the REF-01-U1.6 llama-adapter executed proof (19 PASS / 0 FAIL) |
 | Admission conformance | `tests/admission_conformance.fab` | Capsule admission composition check |
 
 Nested package dirs follow the Agents rule (≥2 modules); model package
@@ -39,7 +41,7 @@ tests live under `src/model/`.
 
 ## 2. Proba inventory (structural)
 
-Live co-located suites (28 files):
+Live co-located suites (29 files):
 
 | Suite | Module / surface | Pin class (summary) |
 | --- | --- | --- |
@@ -70,6 +72,7 @@ Live co-located suites (28 files):
 | `src/model/tensor_payload.proba` | `gradus:model/tensor_payload` (GGUF-A3 C2-U2) | TensorPayload carries the exact stored range facts (name, absolute start, length) + bounded byte list; PayloadError → causa render path type-checks |
 | `src/model/tensor_view.proba` | `gradus:model/tensor_view` (GGUF-A3 C2-U3/U4/U5) | `vincula` fail-closed bind (NomineIgnota / RangeMala / LongitudoMala / LayoutIgnota / TypoIgnotum); windowed `materializa_slicem` + single-block `materializa_glomulum` fail-closed rows |
 | `src/model/artifact.proba` | pathless content identity | Algorithm, digest, and positive-length validation |
+| `src/model/dense_llama.proba` | `gradus:model/dense_llama` (REF-01-U1.6) | Frozen SmolLM2-360M config facts; every canonical name resolves to the exact descriptor facts the A1b inspect surface reports for the real SmolLM2 file (name, shape, layout); fail-closed typed rejection rows (unknown canonical, out-of-range layer, missing tensor, unknown layout) |
 | `src/model/gguf_manifest.proba` | GGUF-A1b manifest and range seam | Unknown codec inspection, exact ranges, source failure, checked tensor fragments, and LIB-02-U1 tokenizer array pins (248320 tokens / 247587 merges / special ids) |
 
 Every suite header states **EVIDENCE HONESTY (CTO Q2)**: structural /
@@ -249,7 +252,7 @@ test -f fixtures/gguf/smollm2-360m-scaled-row.gguf
 test -f fixtures/tokenizer/tokenizer-identity-oracle.md
 
 # Proba count stays the admitted co-located surface
-find src -name '*.proba' | wc -l   # expect 28 at this corpus version
+find src -name '*.proba' | wc -l   # expect 29 at this corpus version
 
 # GGUF-A3 goldens fixtures present
 test -f fixtures/gguf/gguf-dequant-goldens.json
@@ -285,7 +288,7 @@ Until then, §5.1–§5.2 are the only green criteria for this document.
 | 1 Safetensors | `fixtures/safetensors/*`, `src/model/safetensors.proba`, `src/model/capsule.proba` |
 | 2 GGUF | `fixtures/gguf/*`, `src/model/gguf.proba`, `src/model/capsule.proba`, `src/model/dequant.proba`, `src/model/tensor_payload.proba`, `src/model/tensor_view.proba` |
 | 3 BERT-tiny training arch | `src/nn.proba`, `src/attention.proba`, `src/transformer.proba`, `src/gradus.proba` |
-| 4 SmolLM2-360M scaled inference arch | `src/attention.proba`, `src/transformer.proba` + GGUF fixture facts |
+| 4 SmolLM2-360M scaled inference arch | `src/attention.proba`, `src/transformer.proba`, `src/model/dense_llama.proba` + GGUF fixture facts + `exempla/dense-llama-adapter` (REF-01-U1.6) |
 | 5 PML4 training layer | `src/loss.proba`, `src/gradient.proba`, `src/optimize.proba`, `src/train.proba`, `src/metrics.proba`, `exempla/training-loop-mlp` |
 | 6 PML5 inference layer | `src/decode.proba`, `src/cache.proba`, `src/sampling.proba`, `src/generation.proba`, `src/tokenizer.proba`, `exempla/token-generation` |
 
