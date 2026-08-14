@@ -17,7 +17,7 @@ row-oracle docs (`fixtures/safetensors/safetensors-row-oracle.md`,
 tokenizer-identity-oracle.md`), not duplicated.
 
 This matrix holds **admitted rows only**, per `pml0-support-matrix-schema.md`
-§2/§3 (fail-closed R1–R11; one row is the unit of support claim). Twelve
+§2/§3 (fail-closed R1–R11; one row is the unit of support claim). Thirteen
 admitted rows: two PML2 model-file format rows (Safetensors, GGUF), two PML3
 architecture rows (one training, one selected inference), one PML4
 training-layer row, one PML5 inference-layer row, two GGUF-A3
@@ -26,8 +26,9 @@ packed-storage materialization rows at the **output-checked slice tier**
 the **executed probe tier** (row 9, LIB-02-U4-1/U4-3), one REF-01 dense
 reference primitive row (row 10, generic RMSNorm, executed proof —
 REF-01-U1.1), one qwen2 architecture-adapter row (row 11, executed
-descriptor-resolution tier — REF-01-U1.7), and one generic dense
-transformer-block row (row 12, executed proof tier — REF-01-U1.5). Every row is
+descriptor-resolution tier — REF-01-U1.7), one generic dense
+transformer-block row (row 12, executed proof tier — REF-01-U1.5), and one
+dense model assembly row (row 13, executed proof tier — REF-01-U1.8). Every row is
 **structural tier** — the executed tier is recorded, never claimed (see §2 reject log and
 each row's structural-tier note).
 
@@ -346,6 +347,20 @@ execution, logits, or device execution; CTO8-1 stays the named gate.
 | `executed proof` | `exempla/dense-block` runs through package MIR (hand-7 Radix binary) — exit 0, **32 PASS / 0 FAIL** on the pinned f64 references (2026-08-14 receipt) |
 | `compatibility policy` | exact admitted combination: the ordered dense block over the F32 staged carrier — input RMSNorm → GQA attention (causal + RoPE) → residual → post-attn RMSNorm → SwiGLU MLP → residual — shared by the llama and qwen2 dense rows (no per-row constants). Non-goals: no model execution, logits, tokens, or device execution (CTO8-1 stays the named gate); no full-model stack (that is the U1.8 assembly row); no non-f32 dtypes |
 
+### Row 13 — dense model assembly, executed proof tier (REF-01-U1.8)
+
+| Field | Value |
+| --- | --- |
+| `family` | REF-01 dense reference — complete ordered dense forward graph, `gradus:model/dense` |
+| `dtype` | F32 staged carrier only (the composed rows' contract) |
+| `shape` | logits `[T, V]`; embed stored view `[D, V]` (the GGUF/A1b descriptor layout); per-layer weights as the composed `dense_block` row; final norm scale `[D]`; head `[D, V]`; all runtime-derived from `ConfiguraDensa` + the materialized views (no fixed-shape constants) |
+| `formula` | `x = gather(transpose(embed), tokens)` → N ordered U1.5 `dense_block` rows (each resolved by its canonical `model.layers.{N}.*` name and shape-validated against the config) → `hn = rmsnorm(h, model.norm, ε)` → `logits = linear(hn, w_head, zeros)` — a TIED `lm_head` reuses the stored embedding view directly; an UNTIED row resolves `lm_head` as its own canonical tensor. Every linear bias is a synthesized same-shape zero (the llama/qwen2 canonical family carries no bias weights). Composing the U1.5 block + U1.1 RMSNorm + the U1.6/U1.7 canonical-name contract |
+| `typed errors` | `DenseError`: `TensorAbsens` (resolver failure, causa preserved), `ConfiguraMala` (invalid config / token sequence), `FormaMala` (shape contradictions + mapped sub-call causa texts), `TerminusExcedit` (token id out of the embedding vocabulary) |
+| `oracle ref` | independent f64 evaluation of the documented full-graph formulas (external Python/numpy — the block transcription is first validated against the pinned dense-block values) for a small synthetic config — T=2, D=16, F=16, n_h=4, n_kv=2, head_dim=4, vocab 8, tokens [0,7], positions [0,1], rope_dim 4, consecutive-pair base 100000, ε=1e-5, dk scale 0.5 — pinned within the documented **5e-4** absolute tolerance for the TIED and UNTIED embedding rows (zero same-shape biases, the assembly's synthesized-bias contract) |
+| `evidence links` | `src/model/dense.fab` (`praevideo`, `ConfiguraDensa`, `Repertum`, `DenseError`), `src/model/dense.proba` (full-graph pin subset + typed-error rows), `exempla/dense-model/` (faber.toml, src/main.fab, README.md receipt), `pml5-ref01-dense-reference-delivery.md` §REF-01-U1.8 |
+| `executed proof` | `exempla/dense-model` runs through package MIR (hand-11 Radix binary) — exit 0, **37 PASS / 0 FAIL** on the pinned f64 references, including the fail-closed rejection row (2026-08-14 receipt) |
+| `compatibility policy` | exact admitted combination: the complete ordered dense forward graph over the F32 staged carrier — embedding gather → N ordered U1.5 blocks → final RMSNorm → output projection — assembled from `ConfiguraDensa` and materialized stored-weight views via canonical names, with tied/untied embedding handling and zero per-row constants. Non-goals: no real-model payload execution, logits against a real file, or device execution (that is the U1.9/U1.10 receipt rows); no KV-cache state (that is the U2 wave); no non-f32 dtypes |
+
 ## 2. Reject log (recorded, never support)
 
 | Proposed row | Reject reason (gate) |
@@ -385,7 +400,7 @@ execution, logits, or device execution; CTO8-1 stays the named gate.
 
 ```bash
 cd /Users/ianzepp/work/faberlang/gradus
-# 1. Twelve admitted rows (2 PML2 format, 2 PML3 architecture, 1 PML4
+# 1. Thirteen admitted rows (2 PML2 format, 2 PML3 architecture, 1 PML4
 #    training-layer, 1 PML5 inference-layer, 2 GGUF-A3 output-checked
 #    slice materialization, 1 GGUF-A2 executed-probe tokenizer runtime,
 #    1 REF-01 dense reference primitive, 1 REF-01 qwen2 architecture
