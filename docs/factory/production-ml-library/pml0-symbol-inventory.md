@@ -19,13 +19,17 @@ pre-tokenizer scanner + special/EOG/BOS/chat policy surface and the
 two-probe composition — tokenizer 37 → 74, total 611 → 648), and
 re-baselined for REF-01 wave batch 1 (the rmsnorm/silu/swiglu nn rows,
 the configurable RoPE attention row, and the dense_llama/dense_qwen2
-architecture-adapter modules — total 648 → 684)
+architecture-adapter modules — total 648 → 684), and re-baselined for
+REF-01 wave batch 2 (the multi-head GQA attention row on `attention`
+and the generic dense transformer-block row on `transformer` — total
+684 → 693)
 **Date**: 2026-08-08 (PML0) / 2026-08-09 (PML1/PML2 re-baselines) /
 2026-08-11 (PML6-U1 re-baseline) / 2026-08-12 (GGUF-A1b range seam; grep only,
 no cargo) / 2026-08-13 (GGUF-A1c A1C-M6 re-baseline) / 2026-08-14 (LIB-02-U1)
 / 2026-08-14 (GGUF-A3 C3-U6 final inventory baseline) / 2026-08-14
 (LIB-02-U3/U4 qwen35 pre-tokenizer + policy-surface re-baseline) /
-2026-08-14 (REF-01 wave batch 1 re-baseline)
+2026-08-14 (REF-01 wave batch 1 re-baseline) / 2026-08-14 (REF-01 wave
+batch 2 re-baseline)
 **Source**: live `grep -c 'functio ' src/*.fab` + `src/model/*.fab` per
 module — the scan is recursive so the PML2 model module (`src/model/`,
 sub-leaves artifact/capsule/dequant/gguf/gguf_manifest/safetensors/
@@ -37,7 +41,7 @@ baseline: per-module counts for **every live module** (31 modules: the
 PML0/PML1 foundation and proof-surface modules, the PML2 model module's
 ten sub-leaves including the two REF-01 architecture adapters
 `model/dense_llama` + `model/dense_qwen2`, the PML4 training-layer modules,
-and the PML5 inference modules) and the tracked total **684** (the live
+and the PML5 inference modules) and the tracked total **693** (the live
 all-module count — every
 module is asserted, there is no untracked remainder). The script
 additionally runs the
@@ -79,7 +83,12 @@ surface on `attention` (`structa_rope_configura`, `base`/`scale`/
 `rotary_position_embedding_configura`, 21 → 30), and the two
 architecture-adapter modules `model/dense_llama` (6) and `model/dense_qwen2`
 (14); the re-baseline is the merged REF-01 wave inventory baseline
-(31 modules / 684). This
+(31 modules / 684). REF-01 wave batch 2 adds the multi-head GQA attention
+row on `attention` (`multi_head_attention` and the `_caput`/`_concilio`/
+`_matmul_attentio`/`_valida_multi` helpers, 30 → 35) and the generic dense
+transformer-block row on `transformer` (`dense_block` and the `_rmsnorm`/
+`_swiglu`/`_multi_attentio` helpers, 9 → 13); the re-baseline is the merged
+REF-01 wave batch 2 inventory baseline (31 modules / 693). This
 inventory remains a structural count.
 remains a structural count.
 **Consumed by**: PML0-U3 (proof-shaped API ledger) feeds the fixed-shape rows
@@ -90,7 +99,7 @@ public symbol on this inventory.
 
 ```
 module           functio
-attention        30
+attention        35
 cache            37
 data             0
 decode           46
@@ -120,8 +129,8 @@ shape            9
 tensor           11
 tokenizer        74
 train            41
-transformer      9
-TOTAL            684
+transformer      13
+TOTAL            693
 ```
 
 ## Symbol detail
@@ -132,7 +141,7 @@ helpers, matching the captured output):
 
 | Module | Count | Public `functio` names |
 | --- | --- | --- |
-| attention | 30 | `scaled_dot_product_2x8`, `scaled_dot_product_staticum`, `causa`, `rotary_position_embedding`, `scaled_dot_product`, `scaled_dot_product_causal`, `scaled_dot_product_causal_rope`, `rotary_position_embedding_configura`, `structa_rope_configura`, `base`, `scale`, `politica`, `politica_consecutiva`, `politica_interposita`, `politica_nomen` (16 `@ privata` helpers; `scaled_dot_product_staticum` is a shape-generics P2 addition that landed after the A1b capture — see the coverage-gate note below; the configurable RoPE surface `base`/`scale`/`politica` + `rotary_position_embedding_configura`/`structa_rope_configura`/`politica_*` is the REF-01-U1.3 row) |
+| attention | 35 | `scaled_dot_product_2x8`, `scaled_dot_product_staticum`, `causa`, `rotary_position_embedding`, `scaled_dot_product`, `scaled_dot_product_causal`, `scaled_dot_product_causal_rope`, `rotary_position_embedding_configura`, `structa_rope_configura`, `base`, `scale`, `politica`, `politica_consecutiva`, `politica_interposita`, `politica_nomen`, `multi_head_attention` (19 `@ privata` helpers; `scaled_dot_product_staticum` is a shape-generics P2 addition that landed after the A1b capture — see the coverage-gate note below; the configurable RoPE surface `base`/`scale`/`politica` + `rotary_position_embedding_configura`/`structa_rope_configura`/`politica_*` is the REF-01-U1.3 row; the `multi_head_attention` row with its `_caput`/`_concilio`/`_matmul_attentio`/`_valida_multi` helpers is the REF-01-U1.4 GQA row) |
 | cache | 37 | `causa`, `cache_aequus`, `cache_vacua`, `appende`, `redintegra`, `identitas_cache_aequus`, `identitas_cache`, `serializa_identitas`, `deserializa_identitas` + KVCache/IdentitasCache genus methods (`model`, `versio_modelis`, `configuratio`, `tokenizator`, `historia`, `stratorum`, `typo`, `ordinatio`, `clavis`, `valor`, `versio`, `dimensio`, `longitudo`, `positio`) (6 `@ privata` helpers) |
 | data | 0 | — (stub) |
 | decode | 46 | `causa`, `structa_pondera`, `structa_decodere`, `decodere_datum`, `praefundere`, `sessio_fresh`, `progredere`, `redintegra`, `cancelatum_fresh`, `cancelatum_cancellata`, `observa_cancellationem`, `replica` + Pondera/Decodere/Sessio/Cancelatum genus methods (`ln1_s`, `ln1_o`, `wq`, `bq`, `wk`, `bk`, `wv`, `bv`, `wo`, `bo`, `ln2_s`, `ln2_o`, `wf1`, `bf1`, `wf2`, `bf2`, `ln3_s`, `ln3_o`, `mensa`, `pondera`, `projectio`, `projectio_bias`, `scala`, `vocabulum`, `contextus`, `dimensio`, `positio`, `cancellata`) (5 `@ privata` helpers) |
@@ -162,22 +171,22 @@ helpers, matching the captured output):
 | tensor | 11 | `causa`, `structa`, `structa_typo`, `impleta` + Tensor genus methods (`figura`, `gradus`, `quantitas`, `typus`, `valet`, `accipe`) (1 `@ privata` helper) |
 | tokenizer | 74 | `est_eog`, `causa`, `proba_aequa`, `proba_ida`, `verifica_proba`, `pinnata_proba`, `structa`, `verifica`, `clavis_tokenizatoris`, `serializa_identitas`, `deserializa_identitas`, `fabricare`, `encoda`, `decoda` + IdentitasTokenizator genus methods (`schematis`, `progenies`, `pre_tokenizator`, `digestio_vocabuli`, `eog`, `bos_vacua`, `spatium_vacua`) + the LIB-02-U3/U4 qwen35 pre-tokenizer + policy surface (`categoria`, `est_littera`, `est_signum`, `est_numerus`, `est_spatium`, `est_novum_linea`, `est_aliud`, `categoria_nomen`, `scanna_verba`, `encoda_promptum`, `encoda_promptum_specialia`, `eog_artificii`, `est_eog_artificii`, `add_bos`, `chat_template`, `redde_turnum_user`) (37 `@ privata` helpers; the LIB-02-U2 artifact-backed byte-level BPE runtime adds `fabricare`/`encoda`/`decoda`; U3/U4 add the qwen35 scanner families + special/EOG/BOS/chat policy surface) |
 | train | 41 | `train_step_2x2`, `train_step_4x4`, `train_step_bert_linear`, `train_step_bert_layernorm`, `causa`, `structa_schedula`, `lentus_schedulata`, `modus_nomen`, `est_disciplina`, `est_aestimatio`, `modus`, `dropout_pars`, `structa_semen`, `proximus`, `proximus_f32`, `excutio`, `serializa_semen`, `deserializa_semen`, `structa_tabula`, `tabula_aequus`, `serializa_tabula`, `deserializa_tabula` + Schedula/Semen/Fructus/FructusF32/Excutio/Tabula genus methods (`lentus_vertex`, `incalesco`, `passus_total`, `lentus_finis`, `status`, `valor`, `semen`, `aetas`, `passus`, `rng`, `statum_wire`) (4 `@ privata` helpers) |
-| transformer | 9 | `bert_tiny_block_2x8`, `causa`, `transformer_block` (6 `@ privata` helpers) |
+| transformer | 13 | `bert_tiny_block_2x8`, `causa`, `transformer_block`, `dense_block` (9 `@ privata` helpers; `dense_block` with its `_rmsnorm`/`_swiglu`/`_multi_attentio` helpers is the REF-01-U1.5 dense transformer-block row) |
 
 ## Assertions (hold)
 
 - Per-module counts for **all 31 live modules** match the live tree exactly
   (captured output above): foundation and proof-surface modules
-  (attention 30, data 0, dtype 14, gradient 13, gradus 7, loss 11, math 23,
+  (attention 35, data 0, dtype 14, gradient 13, gradus 7, loss 11, math 23,
   nn 24, optimize 26, parameter 37, serialize 34, shape 9, tensor 11,
-  transformer 9), the PML4 training-layer modules (metrics 6, train 41), the
+  transformer 13), the PML4 training-layer modules (metrics 6, train 41), the
   PML5 inference modules (cache 37, decode 46, generation 27, sampling 27),
   and the PML2 model module (`model/artifact` 4, `model/capsule` 45,
   `model/dense_llama` 6, `model/dense_qwen2` 14, `model/dequant` 21,
   `model/gguf` 10, `model/gguf_manifest` 46,
   `model/safetensors` 24, `model/tensor_payload` 1, `model/tensor_view` 7) +
   tokenizer 74.
-- The tracked total == the live all-module total == **684**; every module is
+- The tracked total == the live all-module total == **693**; every module is
   asserted (no untracked remainder).
 - The **coverage gate** holds: every public symbol name above appears in
   `docs/api-reference.md` under its module's `## gradus:<module>` section —
@@ -198,16 +207,16 @@ helpers, matching the captured output):
 
 ```bash
 cd /Users/ianzepp/work/faberlang/gradus
-./scripta/inventory-public-symbols            # exit 0; per-module counts + total 684 + coverage gate
+./scripta/inventory-public-symbols            # exit 0; per-module counts + total 693 + coverage gate
 diff <(./scripta/inventory-public-symbols) \
   <(awk 'BEGIN{n=0} /^```$/{n++; next} n==1{print} n>1{exit}' \
      docs/factory/production-ml-library/pml0-symbol-inventory.md)  # clean
-grep -c 'functio ' src/*.fab src/model/*.fab | awk -F: '{s+=$2} END {print s}'   # 684 (live all-module)
+grep -c 'functio ' src/*.fab src/model/*.fab | awk -F: '{s+=$2} END {print s}'   # 693 (live all-module)
 git diff --check
 ```
 
 Outcome: `./scripta/inventory-public-symbols` exits 0 (per-module baseline
-and tracked total 684 hold; every public symbol is documented in
+and tracked total 693 hold; every public symbol is documented in
 `docs/api-reference.md`); a fresh run diffs clean against the captured output
-above; the live all-module total == 684 matches live grep; `git diff --check`
+above; the live all-module total == 693 matches live grep; `git diff --check`
 clean.
