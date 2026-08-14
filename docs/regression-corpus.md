@@ -29,7 +29,7 @@ closeout, never a dev-loop suite.
 | --- | --- | --- |
 | Co-located package tests | `src/*.proba`, `src/model/*.proba` | Compile-level contract + oracle pins per module |
 | Model / tokenizer fixtures | `fixtures/safetensors/`, `fixtures/gguf/`, `fixtures/tokenizer/` | Legal fixtures + row-oracle docs, including the three GGUF-A1a manifest fixtures and the GGUF-A3 union-set dequant goldens (`gguf-dequant-goldens.json` + derivation contract) |
-| Exempla consumers | `exempla/gradient-seam`, `exempla/gradient-seam-nolib`, `exempla/training-loop-mlp`, `exempla/token-generation`, `exempla/gguf-manifest`, `exempla/gguf-inspect`, `exempla/qwen36-35b-inference` | Public-surface consumers plus the executed GGUF synthetic proof (40 PASS / 0 FAIL), guarded six-file local inspection receipt, and the capstone tokenizer-phase run (LIB-02-U4-1) |
+| Exempla consumers | `exempla/gradient-seam`, `exempla/gradient-seam-nolib`, `exempla/training-loop-mlp`, `exempla/token-generation`, `exempla/gguf-manifest`, `exempla/gguf-inspect`, `exempla/qwen36-35b-inference`, `exempla/dense-qwen2-adapter` | Public-surface consumers plus the executed GGUF synthetic proof (40 PASS / 0 FAIL), guarded six-file local inspection receipt, the capstone tokenizer-phase run (LIB-02-U4-1), and the qwen2 adapter executed proof (23 PASS / 0 FAIL, REF-01-U1.7) |
 | Admission conformance | `tests/admission_conformance.fab` | Capsule admission composition check |
 
 Nested package dirs follow the Agents rule (≥2 modules); model package
@@ -71,6 +71,7 @@ Live co-located suites (28 files):
 | `src/model/tensor_view.proba` | `gradus:model/tensor_view` (GGUF-A3 C2-U3/U4/U5) | `vincula` fail-closed bind (NomineIgnota / RangeMala / LongitudoMala / LayoutIgnota / TypoIgnotum); windowed `materializa_slicem` + single-block `materializa_glomulum` fail-closed rows |
 | `src/model/artifact.proba` | pathless content identity | Algorithm, digest, and positive-length validation |
 | `src/model/gguf_manifest.proba` | GGUF-A1b manifest and range seam | Unknown codec inspection, exact ranges, source failure, checked tensor fragments, and LIB-02-U1 tokenizer array pins (248320 tokens / 247587 merges / special ids) |
+| `src/model/dense_qwen2.proba` | `gradus:model/dense_qwen2` (REF-01-U1.7) | qwen2 adapter descriptor-resolution pins — every canonical name resolves to the exact A1b descriptor facts for the Qwen2.5-0.5B row (layer 0 + layer 23, tied + untied `lm_head`), the frozen config render (`24/14/2/64/896/151936/1000000`), and the fail-closed rejection rows (unknown name / suffix, layer range, missing tensor, non-qwen2 arch) |
 
 Every suite header states **EVIDENCE HONESTY (CTO Q2)**: structural /
 compile-level proof; executed value-identity deferred.

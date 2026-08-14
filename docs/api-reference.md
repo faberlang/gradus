@@ -831,6 +831,54 @@ storage type id), `elementa` (logical element count), `layout`
 `LongitudoMala`, `LayoutIgnota`, `TypoIgnotum`, `OrdoMala`, and
 `LimitesMala`; each carries `textus causa`.
 
+## gradus:model/dense_qwen2
+
+Typed `qwen2` (Qwen2.5) architecture adapter (REF-01-U1.7). Resolves the
+canonical dense tensor-name family — `model.embed_tokens`,
+`model.layers.{N}.input_layernorm`, `.self_attn.{q,k,v,o}_proj`,
+`.post_attention_layernorm`, `.mlp.{gate,up,down}_proj`, `model.norm`,
+`lm_head` — to the exact GGUF-A1b manifest descriptors of a qwen2 row,
+with the qwen2 deltas over the llama family: lm_head tie status read from
+the tensor set (`output.weight` present → untied, absent → tied; the
+gi0-model-contract precedent), the GQA head config
+(`qwen2.attention.head_count_kv`), and rope_theta frozen at 1000000 (the
+qwen2 family fact — the float `qwen2.rope.freq_base` wire value is
+preserved by the manifest but not decoded by the integer accessor). Fails
+closed with typed diagnostics on unknown canonical names, unknown layer
+tensor suffixes, out-of-range layer indices, tensors missing from the
+manifest, and non-qwen2 manifests. Executed proof: `exempla/dense-qwen2-adapter`
+prints 23 PASS / 0 FAIL (exit 0) over the pinned Qwen2.5-0.5B descriptor
+facts (tied + untied lm_head rows, layer 0 and layer 23 boundary rows, and
+the rejection rows).
+
+`genus ConfiguraDensaQwen2` — fields `strata` (block count), `capita`
+(head count), `capita_kv` (KV head count), `dimensio_capitis` (head_dim =
+`embedding_length / head_count`), `dimensio_occulta` (embedding length),
+`vocabulum` (from the token_embd shape), `theta` (rope_theta, frozen
+1000000), and `ligatum` (tied embedding, from the tensor set).
+
+- `functio causa(DenseQwen2Error e) → textus` — render the typed error
+  message.
+- `functio configura(manifestum.ManifestumGguf m) → ConfiguraDensaQwen2 ⇥
+  DenseQwen2Error` — freeze the qwen2 architecture config from the manifest
+  metadata facts. Fails closed on a non-qwen2 architecture
+  (`ArchaegrammaIgnota`), unavailable metadata facts (`ConfiguraMala`), and
+  a missing `token_embd.weight` (`TensorAbsens`).
+- `functio resolve(ConfiguraDensaQwen2 cfg, manifestum.ManifestumGguf m,
+  textus nomen) → manifestum.DescriptioTensorisGguf ⇥ DenseQwen2Error` —
+  resolve one canonical tensor name to its exact manifest descriptor. Fails
+  closed on unknown canonical names (`CanonicoIgnota`), unknown layer tensor
+  suffixes (`CanonicoIgnota`), out-of-range layer indices
+  (`StratumExtraLimitem`), and tensors missing from the manifest
+  (`TensorAbsens`).
+- `functio descriptio_render(manifestum.DescriptioTensorisGguf t) → textus`
+  — render the resolved descriptor facts (`gguf-name/shape/layout`) for the
+  executed proof and the proba pins.
+
+`discretio DenseQwen2Error` variants: `ArchaegrammaIgnota`, `CanonicoIgnota`,
+`StratumExtraLimitem`, `TensorAbsens`, and `ConfiguraMala`; each carries
+`textus causa`.
+
 ## gradus:tokenizer
 
 Tokenizer identity — `tokenizer-identity-schema-1.0.0` (PML2-U4, council

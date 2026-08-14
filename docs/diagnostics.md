@@ -59,6 +59,7 @@ pinned row is space-prefix-free (add_space_prefix = false)
 | `gradus:model/safetensors` | `SafetensorError` | 11 | `src/model/safetensors.fab` |
 | `gradus:model/tensor_payload` | `PayloadError` | 3 | `src/model/tensor_payload.fab` |
 | `gradus:model/tensor_view` | `VisioError` | 7 | `src/model/tensor_view.fab` |
+| `gradus:model/dense_qwen2` | `DenseQwen2Error` | 5 | `src/model/dense_qwen2.fab` |
 | `gradus:nn` | `NnError` | 9 | `src/nn.fab` |
 | `gradus:optimize` | `OptimizeError` | 14 | `src/optimize.fab` |
 | `gradus:parameter` | `ParametrumError` | 10 | `src/parameter.fab` |
@@ -335,6 +336,25 @@ whole-model read path exists.
 | `VisioError.TypoIgnotum` | Un-admitted physical type (dequant `elementa_glomoris` cross-check). | `un-admitted GGML type id: …` | Use an admitted type/quantization row from the closed set; ensure block layouts tile. |
 | `VisioError.OrdoMala` | Element window not block-aligned. | `element window is not aligned to the tensor block boundary` | Request windows aligned to `Cognita.elementa_per_blockum`. |
 | `VisioError.LimitesMala` | Negative / out-of-tensor / over-cap window, or out-of-range block index. | `element window is negative`<br>`element window exceeds the bounded slice cap`<br>`element window exceeds the tensor`<br>`block index is negative`<br>`block index exceeds the tensor block count` | Keep windows within the tensor and at or under `MAXIMUM_SLICEM_ELEMENTA` (16 Mi elements); larger consumption is the caller's windowed loop. |
+
+## `gradus:model/dense_qwen2` — `DenseQwen2Error`
+
+Source: `src/model/dense_qwen2.fab`. Render with module `causa(e)`.
+
+The typed `qwen2` (Qwen2.5) architecture adapter (REF-01-U1.7): canonical
+dense tensor-name → manifest-descriptor resolution. The canonical family is
+the same as the `llama` adapter; the qwen2 deltas are the tensor-set tie
+status for `lm_head`, the GQA head config, and the frozen rope_theta
+1000000. Every failure is a typed diagnostic — the adapter never guesses a
+canonical name, layer index, or tensor fact.
+
+| Code | Class / when | Live messages (representative) | Resolution |
+| --- | --- | --- | --- |
+| `DenseQwen2Error.ArchaegrammaIgnota` | Manifest architecture is not qwen2. | `architecture is not qwen2: …` | Admit a qwen2 row (the qwen2 family adapter resolves only qwen2 manifests). |
+| `DenseQwen2Error.CanonicoIgnota` | Unknown canonical tensor name or unknown layer-tensor suffix. | `unknown canonical qwen2 tensor name: …`<br>`unknown canonical qwen2 layer tensor suffix: …` | Use one of the canonical family names (`model.embed_tokens`, `model.layers.{N}.*`, `model.norm`, `lm_head`) with a known layer suffix. |
+| `DenseQwen2Error.StratumExtraLimitem` | Layer index outside `[0, strata)`. | `layer index out of range for canonical tensor: …` | Address a layer within the frozen block count. |
+| `DenseQwen2Error.TensorAbsens` | A canonical tensor is missing from the manifest. | `canonical … missing from manifest: …`<br>`canonical model.embed_tokens missing from manifest: token_embd.weight` | Resolve against a manifest whose tensor table carries the canonical tensor. |
+| `DenseQwen2Error.ConfiguraMala` | A frozen-config fact is unavailable or invalid. | `qwen2 metadata fact unavailable: …`<br>`qwen2 head count must be positive`<br>`qwen2 token_embd.weight must be rank 2` | Provide the qwen2 metadata facts (architecture, block/head/kv/embedding counts) and a rank-2 `token_embd.weight`. |
 
 ## `gradus:model/gguf` — `GgufError`
 

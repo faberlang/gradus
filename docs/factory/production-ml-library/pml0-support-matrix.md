@@ -262,6 +262,30 @@ tensor data region (LIB-02-U4-1, 2026-08-14). This is the executed
 generated tokens, or device execution; that boundary stays the **NAMED OPEN
 clause** CTO8-1 (`pml5-closeout.md`).
 
+### Row 10 — qwen2 (Qwen2.5) architecture adapter, executed descriptor-resolution tier (REF-01-U1.7)
+
+```markdown
+| `format` | `gguf` (GGUF file version 3 — the A1b manifest surface; the adapter consumes manifest descriptor facts only, never tensor payload bytes) |
+| `architecture` | `qwen2` (Qwen2.5; the canonical dense tensor-name family — `model.embed_tokens`, `model.layers.{N}.input_layernorm`, `.self_attn.{q,k,v,o}_proj`, `.post_attention_layernorm`, `.mlp.{gate,up,down}_proj`, `model.norm`, `lm_head` — resolved to GGUF-A1b manifest descriptors) |
+| `dtype` | not part of this row — descriptor facts (name/shape/layout) and frozen config integers only; no compute |
+| `quantization` | not part of this row — the pinned Qwen2.5-0.5B row's GGML storage types are A1b descriptor facts; no payload is materialized |
+| `shape` | pinned Qwen2.5-0.5B row facts (A1b inspect surface): `token_embd` [896,151936] Q8_0, `attn_norm`/`ffn_norm`/`output_norm` [896] F32, `attn_q`/`attn_output` [896,896] Q5_0, `attn_k`/`attn_v` [896,128], `ffn_gate`/`ffn_up` [896,4864] Q5_0, `ffn_down` [4864,896] (Q6_K at layer 0 / Q4_K at layer 23); the adapter's frozen config carries the same facts (block 24, heads 14, KV heads 2, head_dim 64, hidden 896, vocab 151936) |
+| `tokenizer identity` | not part of this row — no tokenization; the adapter resolves tensor names only |
+| `legal fixture ref` | operator-local artifact `Qwen2.5-0.5B-Instruct-Q4_K_M.gguf` — 397,808,192 bytes, SHA-256 `6eb923e7d26e9cea28811e1a8e852009b21242fb157b26149d3b188f3a8c8653`; the A1b inspect-surface facts are pinned read-only (metadata count 38, tensor count 290, data offset 5,948,480); operator evidence under `/Users/ianzepp/ai/models/`, **never committed** |
+| `oracle ref` | GGUF-A1b inspect-surface facts for the pinned Qwen2.5-0.5B row (the `gguf-inspect` guarded six-file receipt, 2026-08-13); every canonical resolution and rejection row is pinned in `src/model/dense_qwen2.proba` and executed by `exempla/dense-qwen2-adapter` (23 PASS / 0 FAIL, exit 0, 2026-08-14) |
+| `evidence links` | `src/model/dense_qwen2.fab`, `src/model/dense_qwen2.proba`; `exempla/dense-qwen2-adapter` + the U1.7 receipt `exempla/dense-qwen2-adapter/README.md` (guarded command, observed PASS rows, exit 0, zero FAIL); `pml5-ref01-dense-reference-delivery.md` §REF-01-U1.7; committed unit (this hand's factory/hand-11 commit) |
+| `compatibility policy` | exact admitted combination: the canonical qwen2 dense tensor-name family resolves to the exact A1b manifest descriptor facts of the pinned Qwen2.5-0.5B row, with the qwen2 deltas — lm_head tie status read from the tensor set (`output.weight` present → untied, absent → tied), GQA head config (KV heads 2), and rope_theta frozen 1000000. Fail-closed typed diagnostics cover unknown canonical names/suffixes, layer range, missing tensors, and non-qwen2 manifests. Non-goals: no tensor materialization, model execution, logits, sampling, or device claim; no payload read; the same adapter is the U3.3 row's zero-constant surface, not a per-row special case |
+| `schema version` | `gradus-support-matrix-schema v0.1.0` |
+```
+
+**Executed descriptor-resolution tier (recorded, not claimed).** Row 10's
+qualification is the executed adapter receipt: `exempla/dense-qwen2-adapter`
+prints a PASS line for every canonical resolution (tied and untied `lm_head`,
+layer 0 and layer 23) plus the fail-closed rejection rows, and exits 0 with
+no tensor-payload read (REF-01-U1.7, 2026-08-14). This is the executed
+**adapter** phase only — it does **NOT** claim tensor materialization, model
+execution, logits, or device execution; CTO8-1 stays the named gate.
+
 ## 2. Reject log (recorded, never support)
 
 | Proposed row | Reject reason (gate) |
