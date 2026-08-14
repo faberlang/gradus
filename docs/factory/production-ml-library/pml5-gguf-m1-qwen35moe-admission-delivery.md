@@ -11,6 +11,15 @@
 behavior family per unit; see §Hand Unit Graph)
 **Integration stop**: `factory/merge` only; this delivery does not fast-forward any main branch
 
+## Dispatch Authority (resolves need `13bce68c`)
+
+This document — planner-25's amended `pml5-gguf-m1-qwen35moe-admission-delivery.md`
+(head `76d306c`, M1–M9 + G1) — is **THE single dispatch authority** for MODEL-01.
+planner-39's `pml5-gguf-m1-qwen35moe-micro-units.md` (`df3c016`, frontier-corrected
+`c69d6a7`) carries the same M1–M9 + G1 boundaries and is **superseded**; it is not
+a competing authority. Dispatch reads unit definitions, write scopes, dependencies,
+and the serialization frontier from this document only.
+
 ## Executed Outcome
 
 One new public Gradus module, `gradus:model/qwen35moe`, admits the exact local
@@ -635,11 +644,11 @@ successor receipts leaves the campaign incomplete by design.
 3. **`docs/diagnostics.md` rows**: the typed diagnostic variants could get
    error-table rows there; the current write scope does not list the file —
    Mind decide whether to add it to M8.
-4. **Sibling delivery artifact**: the planner-39 lane carries
-   `pml5-gguf-m1-qwen35moe-micro-units.md` (`df3c016`, frontier-corrected
-   `c69d6a7`) for the same unit with the same M1–M9 + G1 boundaries. The merge
-   lane should reconcile the two delivery artifacts into one integrated
-   authority before dispatch.
+4. **Sibling delivery artifact — RESOLVED** (need `13bce68c`, 2026-08-14):
+   the planner-39 lane's `pml5-gguf-m1-qwen35moe-micro-units.md` (`df3c016`,
+   frontier-corrected `c69d6a7`) carried the same M1–M9 + G1 boundaries but is
+   **superseded** by this document as the single dispatch authority (§Dispatch
+   Authority). No merge-lane reconciliation is needed.
 5. **Regression-corpus version**: current `v1.3.0`; M8 bumps under the corpus
    contract to the next version (v1.4.0 unless LIB-02/LIB-03 already bumped)
    and records the observed version.
