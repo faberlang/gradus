@@ -39,6 +39,13 @@ BOOL `numerum` rejection. A guarded source adapter separately matches six
 operator-local real files against independent offsets and counts without
 entering tensor data (`exempla/gguf-inspect/README.md`). Neither receipt is a
 tokenizer, architecture admission, model execution, or inference claim. The
+LIB-02-U1 typed array accessors (`textorum`/`numerorum`, `src/model/gguf_manifest.fab`) read the tokenizer metadata block of a parsed schema-2
+manifest — `tokenizer.ggml.tokens` / `tokenizer.ggml.merges` (string arrays)
+and `tokenizer.ggml.token_type` (integer array) — with the exact target-prefix
+counts (248320 tokens, 247587 merges) and pinned special ids pinned in
+`src/model/gguf_manifest.proba`; missing/malformed/duplicate keys return typed
+`GgufManifestError` rows. This remains metadata-only evidence for the LIB-02
+tokenizer units; it does not implement encode/decode. The
 existing Row 2 capsule admission
 remains the old one-row authority until GGUF-A1c performs the clean-break
 migration.

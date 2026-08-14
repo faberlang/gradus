@@ -90,14 +90,17 @@ synthetic cases with 40 PASS / 0 FAIL. A guarded source adapter also inspected
 six operator-local real files, matched independent offsets/counts, and rejected
 any attempted read into tensor data. Exact receipts are in
 `exempla/gguf-manifest/README.md` and `exempla/gguf-inspect/README.md`.
+The LIB-02-U1 array accessors (`textorum`/`numerorum`) additionally expose the
+tokenizer metadata arrays with typed `WireMala`/`LimitesMala` rows for
+non-array values, wrong element kinds, and oversized counts.
 
 | Code | Class / when | Resolution |
 | --- | --- | --- |
 | `GgufManifestError.FormatMala` | GGUF magic is malformed. | Supply a GGUF file prefix beginning with `GGUF`. |
 | `GgufManifestError.VersioIgnota` | GGUF version is not v3. | Use a supported GGUF v3 artifact or a later parser unit. |
 | `GgufManifestError.Truncata` | The bounded corpus ends before a required field. | Supply the complete header, metadata, tensor table, and permitted alignment padding. |
-| `GgufManifestError.WireMala` | Value kind, UTF-8, boolean, array, or wire field is malformed. | Repair the GGUF wire encoding. |
-| `GgufManifestError.LimitesMala` | Count, rank, dimension, string, array, or checked arithmetic ceiling is exceeded. | Keep bounded counts and lengths within the documented parser ceilings. |
+| `GgufManifestError.WireMala` | Value kind, UTF-8, boolean, array, or wire field is malformed; array accessors reject non-array values and non-string/non-integer element kinds. | Repair the GGUF wire encoding; read string arrays with `textorum` and integer arrays with `numerorum`. |
+| `GgufManifestError.LimitesMala` | Count, rank, dimension, string, array, or checked arithmetic ceiling is exceeded (including accessor-side array count and per-string ceilings). | Keep bounded counts and lengths within the documented parser ceilings. |
 | `GgufManifestError.Superfluitas` | The supplied corpus contains bytes from the tensor data region. | Stop the corpus at or before the checked data offset. |
 | `GgufManifestError.ClavisDuplicata` | A metadata key occurs more than once. | Keep metadata keys unique. |
 | `GgufManifestError.TensorDuplicatum` | A tensor name occurs more than once. | Keep tensor names unique. |
