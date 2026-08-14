@@ -1,8 +1,9 @@
 # Gradus Regression Corpus
 
-**Version**: `gradus-regression-corpus v1.4.0` (2026-08-13, A1C-M5;
-2026-08-14, LIB-02-U1 tokenizer metadata array pins; LIB-03 GGUF-A3 C1/C2-U5 —
-`tensor_payload` / `tensor_view` suites + union-set dequant goldens)
+**Version**: `gradus-regression-corpus v1.5.0` (2026-08-14, REF-01-U1.3 —
+configurable RoPE pins: both pair policies at pinned theta + scale + exempla
+`dense-rope`; LIB-03 GGUF-A3 C1/C2-U5 — `tensor_payload` / `tensor_view`
+suites + union-set dequant goldens)
 **Repo**: gradus. **Tier**: structural inventory.
 **Delivery**: `docs/factory/production-ml-library/pml6-delivery.md` §PML6-U4;
 GGUF-A1b delivery in `pml5-general-gguf-delivery.md`.
@@ -50,7 +51,7 @@ Live co-located suites (28 files):
 | `src/serialize.proba` | `gradus:serialize` | Wire round-trip; `_be4_lege` / `_be8_lege` readers |
 | `src/parameter.proba` | `gradus:parameter` | Identity + version schema |
 | `src/nn.proba` | `gradus:nn` | GELU / layernorm / linear — f64 pins @ **5e-4** |
-| `src/attention.proba` | `gradus:attention` | SDPA / RoPE — f64 pins @ **5e-4** |
+| `src/attention.proba` | `gradus:attention` | SDPA / RoPE — f64 pins @ **5e-4**; configurable RoPE — both pair policies (consecutive-pair freq_base 100000 / interleaved-pair theta 1000000) + scale + fail-closed config (REF-01-U1.3) |
 | `src/transformer.proba` | `gradus:transformer` | Block + LN3 / IN_LN3 pins @ **5e-4** |
 | `src/loss.proba` | `gradus:loss` | MSE / CE scalars @ **5e-4** |
 | `src/gradient.proba` | `gradus:gradient` | Companion-call contract; oracle pins for runtime gate |
@@ -195,6 +196,17 @@ Tolerance policy detail: `docs/numeric-tolerances.md`.
 | **Capstone consumer** | `exempla/qwen36-35b-inference` (LIB-02-U4-1) runs the tokenizer phase through the public surface — `fabricare` on the admitted artifact manifest, then `encoda_promptum` for both probes and `decoda` for both id lists — and prints PASS rows when the observed rows equal these pins (raw-prompt rows, never through the template). A divergence names the first divergent id/character and fails closed (campaign rule 5); the exempla never hard-codes probe ids |
 | **Live** | `src/tokenizer.proba` — `"LIB-02-U3-7 full two-probe composition + divergence receipts"` probandum |
 
+### 4.9 Configurable RoPE pins (REF-01-U1.3)
+
+| Pin family | Where | Band / rule |
+| --- | --- | --- |
+| Consecutive-pair (llama NORM) freq_base 100000, pos 1 & 2, dim 4 | `src/attention.proba` + `exempla/dense-rope` | **5e-4** absolute |
+| Interleaved-pair (qwen2) theta 1000000, pos 1 & 2, dim 4 | `src/attention.proba` + `exempla/dense-rope` | **5e-4** absolute |
+| Scale knob (scale 2.0) + beyond-dim untouched + fail-closed config | `src/attention.proba` + `exempla/dense-rope` | **5e-4** (config rows exact causa) |
+
+Pin count: 22 executed PASS rows (`exempla/dense-rope`, 0 FAIL, exit 0) + the
+co-located compile-level proba pins.
+
 ---
 
 ## 5. Structural validation
@@ -285,7 +297,7 @@ Until then, §5.1–§5.2 are the only green criteria for this document.
 | 1 Safetensors | `fixtures/safetensors/*`, `src/model/safetensors.proba`, `src/model/capsule.proba` |
 | 2 GGUF | `fixtures/gguf/*`, `src/model/gguf.proba`, `src/model/capsule.proba`, `src/model/dequant.proba`, `src/model/tensor_payload.proba`, `src/model/tensor_view.proba` |
 | 3 BERT-tiny training arch | `src/nn.proba`, `src/attention.proba`, `src/transformer.proba`, `src/gradus.proba` |
-| 4 SmolLM2-360M scaled inference arch | `src/attention.proba`, `src/transformer.proba` + GGUF fixture facts |
+| 4 SmolLM2-360M scaled inference arch | `src/attention.proba`, `src/transformer.proba` + GGUF fixture facts; `exempla/dense-rope` (REF-01-U1.3 executed proof) |
 | 5 PML4 training layer | `src/loss.proba`, `src/gradient.proba`, `src/optimize.proba`, `src/train.proba`, `src/metrics.proba`, `exempla/training-loop-mlp` |
 | 6 PML5 inference layer | `src/decode.proba`, `src/cache.proba`, `src/sampling.proba`, `src/generation.proba`, `src/tokenizer.proba`, `exempla/token-generation` |
 
@@ -305,7 +317,7 @@ remain in the support matrix; this corpus does not re-admit them.
 
 ## 8. Versioning
 
-`gradus-regression-corpus v1.4.0`. Adding a suite, fixture, or named pin
+`gradus-regression-corpus v1.5.0`. Adding a suite, fixture, or named pin
 bumps this version. Removing or retargeting a named pin (§4) is a
 **major** event and must update the support matrix / compatibility
 policy in the same change set.

@@ -134,7 +134,7 @@ gate.
 | `gradus:gradient` wrapper | **Shipped (PML4)** — one companion-call entry | Gradus |
 | Linear regression + FD gradient proof | **Shipped (S4-A)** — CPU seam proof | Gradus |
 | SGD optimizer state, loss (`mse`/`cross_entropy`), training (steps, schedules, mode, RNG, dropout, checkpoint `Tabula`) | **Shipped (PML4)** | Gradus |
-| NN primitives + attention/transformer (staged surface + fixed-shape rows) | **Shipped (PML3)** | Gradus |
+| NN primitives + attention/transformer (staged surface + fixed-shape rows) | **Shipped (PML3)**; configurable RoPE (freq base/scale/pair policy — consecutive-pair llama NORM vs interleaved-pair qwen2, REF-01-U1.3) with executed proof `exempla/dense-rope` | Gradus |
 | Model admission (capsule + Safetensors + GGUF + dequant) | **Shipped (PML2)** — schema-2 capsule (pathless identity + per-format manifest); format-general GGUF manifest/range inspection has an **executed A1b proof** over six operator-local real files; GGUF-A3 adds the `tensor_payload`/`tensor_view` modules (pathless payload carrier, `vincula` bind, bounded windowed materializers) and the widened dequant union set, without architecture admission, tokenizer, or inference claims | Gradus |
 | Tokenizer identity + probe parity + `est_eog` | **Shipped (PML2/PML5)** | Gradus |
 | Inference: decode, KV-cache, sampling, generation config | **Shipped (PML5)** | Gradus |

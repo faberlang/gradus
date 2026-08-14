@@ -32,7 +32,7 @@ and [`exempla/gguf-inspect/README.md`](../exempla/gguf-inspect/README.md).
 | `gradus:loss` | `src/loss.fab` | Losses: `mse`, `cross_entropy` + fixed-shape MSE rows (PML4) |
 | `gradus:optimize` | `src/optimize.fab` | SGD optimizer state: slots, step, wires (PML4) |
 | `gradus:nn` | `src/nn.fab` | Primitives: `linear`, `gelu`, `layernorm` + fixed-shape rows (PML3) |
-| `gradus:attention` | `src/attention.fab` | SDPA + RoPE (fixed-shape row + staged surface, PML3) |
+| `gradus:attention` | `src/attention.fab` | SDPA + RoPE (fixed-shape row + staged surface, PML3); configurable RoPE — frequency base/scale/pair policy, consecutive-pair vs interleaved-pair (REF-01-U1.3) |
 | `gradus:transformer` | `src/transformer.fab` | Transformer block (fixed-shape row + staged surface, PML3) |
 | `gradus:train` | `src/train.fab` | Train steps, schedules, mode, RNG, dropout, checkpoint `Tabula` (PML4) |
 | `gradus:metrics` | `src/metrics.fab` | Defined metrics: `accuratezza`, `Metricum` (PML4) |

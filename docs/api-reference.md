@@ -378,7 +378,21 @@ transformer component — never imports `gradus:transformer`.
   message.
 - `functio rotary_position_embedding(tensor.Tensor x, lista<numerus>
   positions, numerus dim) → tensor.Tensor ⇥ AttentionError` — RoPE on the
-  staged carrier.
+  staged carrier (llama-arch NORM consecutive-pair, freq_base 100000).
+- `functio rotary_position_embedding_configura(tensor.Tensor x,
+  lista<numerus> positions, numerus dim, RopeConfigura configura) →
+  tensor.Tensor ⇥ AttentionError` — configurable RoPE: frequency base
+  (theta), scale, and pair policy (consecutive-pair llama NORM vs
+  interleaved-pair qwen2) — the REF-01-U1.3 generalization.
+- `genus RopeConfigura` (fields `base`, `scale`, `politica`, accessor
+  methods `base()`/`scale()`/`politica()`) — the validated config carrier;
+  construct via `structa_rope_configura(base, scale, politica)`.
+- `functio structa_rope_configura(f32 base, f32 scale, RopePolitica
+  politica) → RopeConfigura ⇥ AttentionError` — validated constructor
+  (positive finite base/scale).
+- `discretio RopePolitica` (`Consecutiva` / `Interposita`) with factories
+  `politica_consecutiva()` / `politica_interposita()` and renderer
+  `politica_nomen()` — the RoPE pair-policy discriminator.
 - `functio scaled_dot_product(tensor.Tensor q, tensor.Tensor k,
   tensor.Tensor v, f32 scale) → tensor.Tensor ⇥ AttentionError` —
   shape-generic SDPA.
