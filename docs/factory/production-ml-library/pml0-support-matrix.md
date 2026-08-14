@@ -3,9 +3,10 @@
 **Admitted by**: PML6-U3 (full-matrix aggregation, `pml6-delivery.md` §PML6-U3).
 Rows were admitted by their owning units: PML2-U2/U3 (model-file format rows),
 PML3-U5 (architecture rows), PML4 (training-layer row, closeout), PML5
-(inference-layer row, closeout). PML6-U3 aggregates every admitted row
-(formats, architectures, dtypes, quantizations, shapes, tokenizers, backends)
-into this matrix with evidence links.
+(inference-layer row, closeout), and LIB-02-U4-3 (GGUF-A2 artifact-backed
+tokenizer runtime row, this delivery's closeout). PML6-U3 aggregates every
+admitted row (formats, architectures, dtypes, quantizations, shapes,
+tokenizers, backends) into this matrix with evidence links.
 **Schema version**: `gradus-support-matrix-schema v0.1.0` (2026-08-08, PML0-U5;
 kept at v0.1.0 — no field was genuinely needed for the training/inference row
 families, per `pml6-delivery.md` Open Question 6).
@@ -16,13 +17,14 @@ row-oracle docs (`fixtures/safetensors/safetensors-row-oracle.md`,
 tokenizer-identity-oracle.md`), not duplicated.
 
 This matrix holds **admitted rows only**, per `pml0-support-matrix-schema.md`
-§2/§3 (fail-closed R1–R11; one row is the unit of support claim). Eight
+§2/§3 (fail-closed R1–R11; one row is the unit of support claim). Nine
 admitted rows: two PML2 model-file format rows (Safetensors, GGUF), two PML3
 architecture rows (one training, one selected inference), one PML4
-training-layer row, one PML5 inference-layer row, and two GGUF-A3
+training-layer row, one PML5 inference-layer row, two GGUF-A3
 packed-storage materialization rows at the **output-checked slice tier**
-(rows 7–8, C3-U6). Every row is **structural
-tier** — the executed tier is recorded, never claimed (see §2 reject log and
+(rows 7–8, C3-U6), and one GGUF-A2 artifact-backed tokenizer runtime row at
+the **executed probe tier** (row 9, LIB-02-U4-1/U4-3). Every row is
+**structural tier** — the executed tier is recorded, never claimed (see §2 reject log and
 each row's structural-tier note).
 
 GGUF-A1b extends the separate **format-inspection foundation**; it is not an admitted
@@ -235,6 +237,31 @@ They do **NOT** claim executed token/model identity, logits, or device
 execution — that boundary stays the **NAMED OPEN clause** CTO8-1
 (`pml5-closeout.md`), and neither row upgrades to an executed tier.
 
+### Row 9 — GGUF-A2 artifact-backed tokenizer runtime row, executed probe tier (LIB-02)
+
+```markdown
+| `format` | `gguf` (GGUF file version 3; quant version 2 — the PML2-U3 admitted GGUF row; no new format claim; the tokenizer consumes schema-2 manifest metadata values) |
+| `architecture` | `qwen35moe` (Qwen3.6-35B-A3B — the admitted real-file artifact's architecture, per the LIB-02 delivery and U4-1 receipt) |
+| `dtype` | not part of this row — the tokenizer runtime is pure byte-level values and operations; no compute or storage dtype |
+| `quantization` | not part of this row — the tokenizer operates on vocab/merge/token-type string and integer arrays, never on quantized tensor payloads |
+| `shape` | not part of this row — the tokenizer consumes string/integer arrays (vocab 248,320; merges 247,587; token-type), not tensor shapes |
+| `tokenizer identity` | `gpt2` (byte-level BPE) with pre-tokenizer `qwen35`; vocab 248,320; merges 247,587; special-token cache 33; BOS/EOS/PAD 248044/248046/248055; `add_bos_token` false; EOG set {248044, 248046, 248063, 248064, 248065}; pinned probe id lists in the delivery oracle section and `src/tokenizer.proba` |
+| `legal fixture ref` | operator-local artifact `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` — 22,663,387,424 bytes, SHA-256 `0b21525e972670ed59e1812e170b27c26355381f0656ecc4e25617ece7dac58b`; operator evidence under `/Users/ianzepp/ai/models/`, **never committed**; pinned by content hash per the U4-1 receipt, no acquisition or redistribution claim |
+| `oracle ref` | pinned `llama-tokenize` 10150 `dee2a846b` (the PML2-U4 pin); two Unicode probes with exact pinned id lists (Probe A `[34469, 168607, 153295, 173922, 153380, 22216, 151752, 172769]`; Probe B `[109266, 3709, 96748, 6115, 113128, 17, 15, 17, 21, 95859, 23, 96212, 16, 18, 95971, 10838, 236, 231]`) and exact decoded-text round-trips; the first divergent id/character would print a `DIVERGENCE` receipt and fail the row |
+| `evidence links` | `src/tokenizer.fab`, `src/tokenizer.proba`, `src/model/gguf_manifest.fab` (+ proba); `exempla/qwen36-35b-inference` + the U4-1 receipt `exempla/qwen36-35b-inference/README.md` (guarded command, model identity, observed PASS run, exit 0, zero FAIL, no tensor-data read); `pml5-lib02-tokenizer-delivery.md` §Delivery Receipt; committed units c4d0750 (U1), f3cfa58 (U2), 58786db..82a2863 (U3-1..U3-7), 4ceb1d3 (U4-1) |
+| `compatibility policy` | exact admitted combination: artifact-backed encode/decode of the hash-pinned Qwen3.6 artifact (qwen35moe, `gpt2`/`qwen35`) matching the pinned llama.cpp ids and decoded text for the two probes through the public `gradus:tokenizer` surface. Non-goals: no model execution, logits, sampling, generated tokens, or device claim; no other architectures/tokenizers; no hard-coded prompt or token-id fallback; CTO8-1 stays the named gate |
+| `schema version` | `gradus-support-matrix-schema v0.1.0` |
+```
+
+**Executed probe tier (recorded, not claimed).** Row 9's qualification is the
+executed tokenizer-phase receipt: the capstone exempla run against the real
+artifact printed PASS rows for both pinned probe id lists and both decoded
+round-trips, `TOKENIZER PHASE PASS`, and exited 0 with no read into the
+tensor data region (LIB-02-U4-1, 2026-08-14). This is the executed
+**tokenizer** phase only — it does **NOT** claim model execution, logits,
+generated tokens, or device execution; that boundary stays the **NAMED OPEN
+clause** CTO8-1 (`pml5-closeout.md`).
+
 ## 2. Reject log (recorded, never support)
 
 | Proposed row | Reject reason (gate) |
@@ -262,7 +289,7 @@ execution — that boundary stays the **NAMED OPEN clause** CTO8-1
   `fixtures/tokenizer/tokenizer-identity-oracle.md`) and aggregated into this
   matrix at PML6 per `pml6-delivery.md` PML6-U3.
 - The PML6 gate's "support matrix is the full-matrix aggregation" clause is
-  satisfied by these eight admitted rows; the phase gate also requires README
+  satisfied by these nine admitted rows; the phase gate also requires README
   regen + audit 0 findings (planner/Mind-owned at gate).
 - Compatibility promises at the row level are each row's `compatibility
   policy` field; `docs/compatibility-policy.md`
@@ -274,16 +301,21 @@ execution — that boundary stays the **NAMED OPEN clause** CTO8-1
 
 ```bash
 cd /Users/ianzepp/work/faberlang/gradus
-# 1. Eight admitted rows (2 PML2 format, 2 PML3 architecture, 1 PML4
+# 1. Nine admitted rows (2 PML2 format, 2 PML3 architecture, 1 PML4
 #    training-layer, 1 PML5 inference-layer, 2 GGUF-A3 output-checked
-#    slice materialization), each with all 11 schema fields.
-grep -c '^| `format`' docs/factory/production-ml-library/pml0-support-matrix.md   # 8
-grep -c '^| `schema version`' docs/factory/production-ml-library/pml0-support-matrix.md   # 8
+#    slice materialization, 1 GGUF-A2 executed-probe tokenizer runtime),
+#    each with all 11 schema fields.
+grep -c '^| `format`' docs/factory/production-ml-library/pml0-support-matrix.md   # 9
+grep -c '^| `schema version`' docs/factory/production-ml-library/pml0-support-matrix.md   # 9
 # 2. Committed unit commits + oracle pins cited as evidence links.
 grep -c '07291d6\|b392fc8\|f12deaf\|02fae61\|9822cfa\|5260049\|7bf9acc\|359c5f0\|5f98e8b\|e09c79c\|9bebda9\|4b24c81\|94d8a94\|fc85de7\|bdefb5a\|3b2fc9b\|b1b01f1\|56e70f0\|8cf798a\|1a6abd0' docs/factory/production-ml-library/pml0-support-matrix.md   # >= 5
 grep -c 'LN3_\|IN_LN3_\|COS_1\|SIN_1\|1.576448169383708\|0.01137' docs/factory/production-ml-library/pml0-support-matrix.md   # >= 1
 grep -c 'edcff45\|2ec80d8\|d182c5c\|686653c\|6dd29fb\|82048b5\|fc59ac4' docs/factory/production-ml-library/pml0-support-matrix.md   # >= 1 (GGUF-A3 C2/C3 evidence links)
 grep -c '0b21525e972670ed59e1812e170b27c26355381f0656ecc4e25617ece7dac58b' docs/factory/production-ml-library/pml0-support-matrix.md   # >= 1 (Qwen3.6 receipt pin)
+# 2b. GGUF-A2 tokenizer runtime row (row 9) evidence links resolve.
+grep -c '4ceb1d3\|58786db\|00f5540\|e1b818f\|90b0522\|a2dcd8d\|cc92176\|82a2863\|c4d0750\|f3cfa58' docs/factory/production-ml-library/pml0-support-matrix.md   # >= 1 (LIB-02 U1..U4-1 commits)
+grep -c '34469, 168607, 153295, 173922, 153380, 22216, 151752, 172769\|109266, 3709, 96748, 6115, 113128' docs/factory/production-ml-library/pml0-support-matrix.md   # >= 1 (pinned probe id lists)
+grep -c 'llama-tokenize' docs/factory/production-ml-library/pml0-support-matrix.md   # >= 1 (oracle pin)
 # 3. Structural tier recorded, never upgraded — no executed-identity claim.
 grep -c 'does NOT claim executed' docs/factory/production-ml-library/pml0-support-matrix.md   # >= 3
 grep -c 'CTO8-1' docs/factory/production-ml-library/pml0-support-matrix.md   # >= 2
