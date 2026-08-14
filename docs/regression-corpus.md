@@ -2,7 +2,8 @@
 
 **Version**: `gradus-regression-corpus v1.4.0` (2026-08-13, A1C-M5;
 2026-08-14, LIB-02-U1 tokenizer metadata array pins; LIB-03 GGUF-A3 C1/C2-U5 —
-`tensor_payload` / `tensor_view` suites + union-set dequant goldens)
+`tensor_payload` / `tensor_view` suites + union-set dequant goldens; REF-01-U1.2 —
+`nn` SiLU/SwiGLU pins + `exempla/dense-swiglu` executed proof)
 **Repo**: gradus. **Tier**: structural inventory.
 **Delivery**: `docs/factory/production-ml-library/pml6-delivery.md` §PML6-U4;
 GGUF-A1b delivery in `pml5-general-gguf-delivery.md`.
@@ -29,7 +30,7 @@ closeout, never a dev-loop suite.
 | --- | --- | --- |
 | Co-located package tests | `src/*.proba`, `src/model/*.proba` | Compile-level contract + oracle pins per module |
 | Model / tokenizer fixtures | `fixtures/safetensors/`, `fixtures/gguf/`, `fixtures/tokenizer/` | Legal fixtures + row-oracle docs, including the three GGUF-A1a manifest fixtures and the GGUF-A3 union-set dequant goldens (`gguf-dequant-goldens.json` + derivation contract) |
-| Exempla consumers | `exempla/gradient-seam`, `exempla/gradient-seam-nolib`, `exempla/training-loop-mlp`, `exempla/token-generation`, `exempla/gguf-manifest`, `exempla/gguf-inspect`, `exempla/qwen36-35b-inference`, `exempla/dense-rmsnorm` | Public-surface consumers plus the executed GGUF synthetic proof (40 PASS / 0 FAIL), guarded six-file local inspection receipt, the capstone tokenizer-phase run (LIB-02-U4-1), and the REF-01-U1.1 RMSNorm executed proof (32 PASS / 0 FAIL) |
+| Exempla consumers | `exempla/gradient-seam`, `exempla/gradient-seam-nolib`, `exempla/training-loop-mlp`, `exempla/token-generation`, `exempla/gguf-manifest`, `exempla/gguf-inspect`, `exempla/qwen36-35b-inference`, `exempla/dense-rmsnorm`, `exempla/dense-swiglu` | Public-surface consumers plus the executed GGUF synthetic proof (40 PASS / 0 FAIL), guarded six-file local inspection receipt, the capstone tokenizer-phase run (LIB-02-U4-1), the REF-01-U1.1 RMSNorm executed proof (32 PASS / 0 FAIL), and the executed REF-01-U1.2 SiLU/SwiGLU proof (14 PASS / 0 FAIL) |
 | Admission conformance | `tests/admission_conformance.fab` | Capsule admission composition check |
 
 Nested package dirs follow the Agents rule (≥2 modules); model package
@@ -49,7 +50,7 @@ Live co-located suites (28 files):
 | `src/math.proba` | `gradus:math` | Tensor-aware math foundation |
 | `src/serialize.proba` | `gradus:serialize` | Wire round-trip; `_be4_lege` / `_be8_lege` readers |
 | `src/parameter.proba` | `gradus:parameter` | Identity + version schema |
-| `src/nn.proba` | `gradus:nn` | GELU / layernorm / linear / **rmsnorm** — f64 pins @ **5e-4** (RMSNorm rows: unit scale, per-feature scale, per-row `[2,4]` normalization, sign-preserving negatives — REF-01-U1.1) |
+| `src/nn.proba` | `gradus:nn` | GELU / layernorm / linear / **rmsnorm** — f64 pins @ **5e-4** (RMSNorm rows: unit scale, per-feature scale, per-row `[2,4]` normalization, sign-preserving negatives — REF-01-U1.1) + **SiLU / SwiGLU (REF-01-U1.2)** — f64 pins @ **5e-4** |
 | `src/attention.proba` | `gradus:attention` | SDPA / RoPE — f64 pins @ **5e-4** |
 | `src/transformer.proba` | `gradus:transformer` | Block + LN3 / IN_LN3 pins @ **5e-4** |
 | `src/loss.proba` | `gradus:loss` | MSE / CE scalars @ **5e-4** |

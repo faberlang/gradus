@@ -31,7 +31,7 @@ and [`exempla/gguf-inspect/README.md`](../exempla/gguf-inspect/README.md).
 | `gradus:gradient` | `src/gradient.fab` | Autograd wrapper — the ONE companion-call entry (PML4) |
 | `gradus:loss` | `src/loss.fab` | Losses: `mse`, `cross_entropy` + fixed-shape MSE rows (PML4) |
 | `gradus:optimize` | `src/optimize.fab` | SGD optimizer state: slots, step, wires (PML4) |
-| `gradus:nn` | `src/nn.fab` | Primitives: `linear`, `gelu`, `layernorm`, `rmsnorm` + fixed-shape rows (PML3; RMSNorm REF-01-U1.1) |
+| `gradus:nn` | `src/nn.fab` | Primitives: `linear`, `gelu`, `layernorm`, `rmsnorm`, `silu`, `swiglu` + fixed-shape rows (PML3; RMSNorm REF-01-U1.1, SiLU/SwiGLU REF-01-U1.2) |
 | `gradus:attention` | `src/attention.fab` | SDPA + RoPE (fixed-shape row + staged surface, PML3) |
 | `gradus:transformer` | `src/transformer.fab` | Transformer block (fixed-shape row + staged surface, PML3) |
 | `gradus:train` | `src/train.fab` | Train steps, schedules, mode, RNG, dropout, checkpoint `Tabula` (PML4) |
