@@ -1,11 +1,20 @@
 # Delivery: PML5-GGUF — Qwen3.6 35B End-to-End Inference
 
-**Status**: active — GGUF-A1a and GGUF-A1b implemented; GGUF-A1c passed the aggregate M8R4 gate and integrated to Gradus main at 2b3e41a
+**Status**: active — LIB-02 (artifact-backed tokenizer, incl. real-artifact TOKENIZER PHASE PASS) and LIB-03 (checked packed storage + materialization, real-artifact coverage 753/753) COMPLETE and integrated on gradus main (`294c706`, `af139cc`); next frontier = REF-01 dense reference + MODEL-01 qwen35moe admission (see "Session state" below; full delivery map in radix `gpu-production-readiness/CAMPAIGN.md`)
 **Campaign**: [`CAMPAIGN.md`](CAMPAIGN.md), mandatory completion of PML5
 **Umbrella**: Radix `gpu-production-readiness` Qwen3.6 invariant
 **Repo**: `gradus`
 **Integration stop**: `factory/merge` only; this delivery does not fast-forward
 any main branch
+
+## Session state (2026-08-14 wind-down)
+
+- LIB-02 COMPLETE: U1+U2 on main; U3-1..U3-7 (`58786db`..`82a2863`), U4-1 (`4ceb1d3`, real-artifact tokenizer phase — Probe A/B exact pinned ids, TOKENIZER PHASE PASS), U4-2 (`690d6e3`), U4-3 (`1af9aca`); chain merged at `294c706`.
+- LIB-03 COMPLETE: C1 (`82048b5`), C2-U1..U5 (`fc59ac4`..`d182c5c`), C3-U1..U7 (`2ec80d8`..`244bcb8`); C3-U2 real-file proof on the actual Qwen3.6 artifact (coverage 753/753, 8 slices bit-exact); wave merged at `af139cc`.
+- REF-01 in progress: U1.1–U1.8 on main (`9effe60`); U1.9/U1.10 receipts BLOCKED on the compiled-route repair (need `f5e39491`; engine decision memo `bea14474`, spec amendment `b907df1`). MODEL-01 M1–M9 implemented; G1 pending need `05699261`.
+- SEM006 migration: cohort-1 (12 modules) on main; cohort-2 (overlap files) pending — need `8e70a5b2`.
+- Key open needs: `f5e39491`, `05699261`, `8e70a5b2`, `0b620e94`, `0953f66b`, `b1f97eb8`, `59d14768`, `ecbde0e1`, `dc7c4b25`, `96912faa`.
+- Last gradus main tip: `9effe60`.
 
 ## Outcome
 
