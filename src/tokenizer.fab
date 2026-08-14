@@ -623,14 +623,24 @@ fixum textus TOKENIZATOR_CAPABILIS ← "gpt2"
 # Sentinel rank for a pair absent from the merge table (never merges).
 fixum numerus MERGE_ABSENS ← 9223372036854775807
 
+# llama.cpp llama_token_type NORMAL — the special-cache boundary: every
+# vocab entry whose token_type is not NORMAL is special (the
+# llama_vocab::init_special rule; U3-4).
+fixum numerus TYPI_NORMALIS ← 1
+
 # The artifact-backed runtime record. `verborum` is the vocab array indexed
 # by token id (decode path); `vocabulum` is the display-token → id map and
 # `concursus` the "left right" merge-pair → rank map (encode path).
+# `specialia_textus`/`specialia_ids` are the artifact special-token cache
+# (parallel lists; every non-NORMAL token_type entry, U3-4) that drives the
+# parse-special on/off policy.
 @ publica
 genus Tokenizator {
     lista<textus> verborum
     tabula<textus, numerus> vocabulum
     tabula<textus, numerus> concursus
+    lista<textus> specialia_textus
+    lista<numerus> specialia_ids
     numerus multitudo
 }
 
@@ -769,6 +779,26 @@ functio _textorum_artificii(manifestum.ManifestumGguf m, textus clavis) → list
     iace finge ArtificiumMala { causa = "unreachable tokenizer array read" }
 }
 
+# tokenizer.ggml.token_type is OPTIONAL in GGUF: llama.cpp defaults absent
+# types to NORMAL (→ an empty special cache). A PRESENT but malformed
+# token_type fails closed.
+@ privata
+functio _typi_artificii_optativa(manifestum.ManifestumGguf m) → lista<numerus> ⇥ TokenizerError {
+    fac {
+        redde manifestum.numerorum(m, "tokenizer.ggml.token_type")
+    }
+    cape err {
+        fixum textus causa ← manifestum.causa(err)
+        si causa.longitudo() ≥ 24 {
+            si causa.sectio(0, 24) ≡ "metadata key not found: " {
+                redde vacua
+            }
+        }
+        iace finge ArtificiumMala { causa = "tokenizer token_type is malformed: " + causa }
+    }
+    iace finge ArtificiumMala { causa = "unreachable tokenizer token_type read" }
+}
+
 # Merge-entry well-formedness: exactly "left right" with a single space
 # separator and non-empty halves (llama.cpp's find_bpe_rank asserts the same
 # no-space-in-token invariant).
@@ -861,10 +891,30 @@ functio fabricare(manifestum.ManifestumGguf m) → Tokenizator ⇥ TokenizerErro
         concursus.pone(par, j)
         j ↑
     }
+    # Special-token cache (U3-4): every vocab entry whose token_type is not
+    # NORMAL is special (llama.cpp llama_vocab::init_special); absent
+    # token_type means no specials (the reference defaults to NORMAL).
+    fixum lista<numerus> typi ← _typi_artificii_optativa(m)
+    si typi.longitudo() > 0 et typi.longitudo() ≠ verborum.longitudo() {
+        iace finge ArtificiumMala { causa = "tokenizer token_type length does not match the vocabulary" }
+    }
+    varia lista<textus> specialia_textus ← vacua
+    varia lista<numerus> specialia_ids ← vacua
+    varia numerus k ← 0
+    dum k < verborum.longitudo() {
+        fixum numerus typus ← typi.accipe(k) vel TYPI_NORMALIS
+        si typus ≠ TYPI_NORMALIS {
+            specialia_textus.appende(verborum.accipe(k) vel "")
+            specialia_ids.appende(k)
+        }
+        k ↑
+    }
     redde Tokenizator {
         verborum = verborum,
         vocabulum = vocabulum,
         concursus = concursus,
+        specialia_textus = specialia_textus,
+        specialia_ids = specialia_ids,
         multitudo = verborum.longitudo()
     }
 }
@@ -1355,9 +1405,25 @@ functio scanna_verba(textus textum) → lista<textus> ⇥ TokenizerError {
     redde verba
 }
 
-# Full-prompt encode: scanner split → word-level BPE encode → id list.
-@ publica
-functio encoda_promptum(Tokenizator t, textus textum) → lista<numerus> ⇥ TokenizerError {
+# First occurrence of `quid` in `ubi` at or after `ab` (character
+# indices), or -1 when absent — the reference's std::string::find.
+@ privata
+functio _inveni(textus ubi, textus quid, numerus ab) → numerus {
+    fixum numerus n ← ubi.longitudo()
+    fixum numerus m ← quid.longitudo()
+    si m ≡ 0 aut m > n ergo redde -1
+    varia numerus i ← ab
+    dum i + m ≤ n {
+        si ubi.sectio(i, i + m) ≡ quid ergo redde i
+        i ← i + 1
+    }
+    redde -1
+}
+
+# Scanner-split + word-level BPE encode of one plain-text slice (the
+# shared literal path of both parse policies).
+@ privata
+functio _encoda_verborum(Tokenizator t, textus textum) → lista<numerus> ⇥ TokenizerError {
     fixum lista<textus> verba ← scanna_verba(textum)
     varia lista<numerus> ids ← vacua
     itera ex verba fixum verbum {
@@ -1365,6 +1431,59 @@ functio encoda_promptum(Tokenizator t, textus textum) → lista<numerus> ⇥ Tok
         itera ex partes fixum id {
             ids.appende(id)
         }
+    }
+    redde ids
+}
+
+# Full-prompt encode, parse_special = falsum: the whole prompt goes
+# through scanner + BPE (specials read as their literal bytes).
+@ publica
+functio encoda_promptum(Tokenizator t, textus textum) → lista<numerus> ⇥ TokenizerError {
+    redde _encoda_verborum(t, textum)
+}
+
+# Full-prompt encode, parse_special = verum: split the prompt on the
+# artifact special cache BEFORE the scanner (llama.cpp
+# split_special_tokens/find_special_token — earliest match, longest text
+# on ties), emitting each special's single id and scanning each plain
+# slice independently. A prompt with no specials encodes identically to
+# encoda_promptum.
+@ publica
+functio encoda_promptum_specialia(Tokenizator t, textus textum) → lista<numerus> ⇥ TokenizerError {
+    varia lista<numerus> ids ← vacua
+    varia numerus pos ← 0
+    dum pos < textum.longitudo() {
+        varia numerus melior_pos ← -1
+        varia numerus melior_id ← -1
+        varia numerus melior_longitudo ← -1
+        varia numerus i ← 0
+        dum i < t.specialia_textus.longitudo() {
+            fixum textus specialis ← t.specialia_textus.accipe(i) vel ""
+            si specialis.longitudo() > 0 {
+                fixum numerus p ← _inveni(textum, specialis, pos)
+                si p ≥ 0 et (melior_pos < 0 aut p < melior_pos aut (p ≡ melior_pos et specialis.longitudo() > melior_longitudo)) {
+                    melior_pos ← p
+                    melior_id ← t.specialia_ids.accipe(i) vel -1
+                    melior_longitudo ← specialis.longitudo()
+                }
+            }
+            i ← i + 1
+        }
+        si melior_pos < 0 {
+            fixum lista<numerus> partes ← _encoda_verborum(t, textum.sectio(pos, textum.longitudo()))
+            itera ex partes fixum id {
+                ids.appende(id)
+            }
+            rumpe
+        }
+        si melior_pos > pos {
+            fixum lista<numerus> partes ← _encoda_verborum(t, textum.sectio(pos, melior_pos))
+            itera ex partes fixum id {
+                ids.appende(id)
+            }
+        }
+        ids.appende(melior_id)
+        pos ← melior_pos + melior_longitudo
     }
     redde ids
 }
