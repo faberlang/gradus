@@ -214,23 +214,38 @@ divisibility checks against the first GGML dimension (q4_K/q5_K/q6_K blocks =
 
 ## Dimension And Cross-Reference Validation
 
-The admission validates every canonical tensor against the frozen config:
+The admission validates every canonical tensor against the frozen config.
+Stored dims are GGUF file order (last logical dimension first); each bullet
+names the exact stored-dim position per tensor family so per-tensor
+validation predicates copy directly:
 
-- `embedding_length` 2048 is the first stored dim of `attn_*` weights, norms,
-  and `ffn_*_shexp`/`ffn_*_inp*` tensors.
-- `expert_count` 256 is the third stored dim of the three `*_exps` rank-3
-  tensors in every block.
-- `expert_feed_forward_length` 512 is the second stored dim of
-  `ffn_*_exps` and the `ffn_*_shexp` weights.
+- `embedding_length` 2048 is stored dim 0 of `attn_gate`, `attn_qkv`,
+  `attn_k`, `attn_v`, `attn_q`, `ffn_gate_inp`, `ssm_alpha`, `ssm_beta`,
+  `output`/`token_embd`, and stored dim 1 of `ffn_down_exps`/
+  `ffn_down_shexp`, `ssm_out`, `attn_output`, and `nextn.eh_proj`. It is the
+  single dim of `attn_norm`, `post_attention_norm`, `ffn_gate_inp_shexp`,
+  `output_norm`, and the `nextn.*` norms. It is NOT dim 0 of
+  `attn_output`/`ssm_out`/`nextn.eh_proj` (4096), `ffn_down_exps`/
+  `ffn_down_shexp` (512), or `attn_k_norm`/`attn_q_norm` (256).
+- Expert rank-3 families: `ffn_down_exps` stores `[ffn, embd, experts]` =
+  `(512, 2048, 256)`; `ffn_gate_exps` and `ffn_up_exps` store
+  `[embd, ffn, experts]` = `(2048, 512, 256)`.
+- `expert_count` 256 is stored dim 2 of the three `*_exps` rank-3 tensors in
+  every block and stored dim 1 of `ffn_gate_inp`.
+- `expert_feed_forward_length` 512 is stored dim 0 of the down family
+  (`ffn_down_exps`, `ffn_down_shexp`) and stored dim 1 of the gate/up
+  family (`ffn_gate_exps`, `ffn_up_exps`, `ffn_gate_shexp`, `ffn_up_shexp`).
 - `ssm.state_size` 128 matches `ssm_norm.weight`; `ssm.time_step_rank` 32
   matches `ssm_a`, `ssm_dt.bias`, and the second stored dim of
   `ssm_alpha`/`ssm_beta`.
 - `ssm.conv_kernel` 4 matches the first stored dim of `ssm_conv1d.weight`.
-- `ssm.inner_size` 4096 matches `ssm_out.weight`/`attn_output.weight` first
-  stored dim and `attn_gate.weight` second stored dim.
-- `attention.head_count_kv` 2 × `attention.key_length` 256 = 512 = the second
-  stored dim of `attn_k.weight`/`attn_v.weight`; `attn_q_norm.weight` and
-  `attn_k_norm.weight` carry 256.
+- `ssm.inner_size` 4096 is stored dim 0 of `ssm_out.weight`,
+  `attn_output.weight`, and `nextn.eh_proj.weight`, and stored dim 1 of
+  `attn_gate.weight`.
+- `attention.head_count_kv` 2 × `attention.key_length` 256 = 512 = the
+  second stored dim of `attn_k.weight`/`attn_v.weight`; `attn_q_norm.weight`
+  and `attn_k_norm.weight` are single-dim 256 (= `key_length` =
+  `value_length`).
 - Block schedule: exactly 10 full-attention blocks at index ≡ 3 mod 4 and
   exactly one nextn block (`blk.40`) when `nextn_predict_layers` = 1.
 - Element counts equal the product of stored dims and every tensor's checked
