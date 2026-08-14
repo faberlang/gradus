@@ -917,6 +917,74 @@ Pinned word-level rows (llama-tokenize 10150 `dee2a846b`): `transformers` →
 `[4549, 382]`, `สวัสดี` → `[34469, 168607]`, `人工智能` → `[109015]`, each
 decoding back to the exact input text.
 
+**Composed full-prompt runtime (LIB-02-U3, GGUF-A2)**: the qwen35
+pre-tokenizer scanner and the policy surfaces compose the word-level BPE
+core into a full-prompt encode/decode path.
+
+`discretio CategoriaUnicode` (`Littera` / `Signum` / `Numerus` / `Spatium`
+/ `NovumLinea` / `Aliud`) is the scanner-relevant character classification
+(U3-1). The category tables cover the probe-relevant classes: `\p{L}`
+(Basic Latin, Latin-1 Supplement, Thai, CJK), `\p{M}` (Thai vowel/tone
+signs), `\p{N}` (ASCII + Thai digits), the space and newline families.
+
+- `functio categoria(textus c) → CategoriaUnicode` — classify one character
+  against the category tables (a character outside every table is `Aliud`).
+- `functio categoria_nomen(textus c) → textus` — canonical category name
+  (`littera` / `signum` / `numerus` / `spatium` / `novum_linea` / `aliud`);
+  the textus→textus seam the proba/consumer rows use.
+- `functio est_littera(textus c) → bivalens` — `\p{L}` membership.
+- `functio est_signum(textus c) → bivalens` — `\p{M}` membership.
+- `functio est_numerus(textus c) → bivalens` — `\p{N}` membership.
+- `functio est_spatium(textus c) → bivalens` — whitespace membership.
+- `functio est_novum_linea(textus c) → bivalens` — `[\r\n]` membership.
+- `functio est_aliud(textus c) → bivalens` — the remaining class: the
+  punct/emoji/symbol runs the scanner splits as edge groups (U3-3). The
+  ASCII contractions are a separate scanner arm (matched as literal text,
+  not by category).
+
+- `functio scanna_verba(textus textum) → lista<textus> ⇥ TokenizerError` —
+  the qwen35 pre-tokenizer word split (Unicode-category scanner, U3-1..U3-3):
+  letter/mark/digit runs, whitespace and newline families, punct/emoji
+  groups with an optional leading space, and the ASCII contractions.
+- `functio encoda_promptum(Tokenizator t, textus textum) → lista<numerus> ⇥
+  TokenizerError` — full-prompt encode, parse-special off: every word goes
+  through `scanna_verba` + `encoda` (specials read as their literal bytes).
+- `functio encoda_promptum_specialia(Tokenizator t, textus textum) →
+  lista<numerus> ⇥ TokenizerError` — full-prompt encode, parse-special on:
+  split the prompt on the artifact special cache before the scanner (earliest
+  match, longest text on ties), emit each special's single id, scan each
+  plain slice independently. Identical to `encoda_promptum` when the prompt
+  has no specials.
+- `functio eog_artificii(Tokenizator t) → lista<numerus>` — the runtime EOG
+  stop set (ascending): the declared eos id plus every vocab token whose text
+  is in the reference EOG name list and the FIM pad/rep/sep ids (U3-5).
+- `functio est_eog_artificii(Tokenizator t, numerus id) → bivalens` — EOG
+  membership on the runtime set.
+- `functio add_bos(Tokenizator t) → bivalens` — the artifact's
+  `tokenizer.ggml.add_bos_token` (absent → falsum; encode is BOS-free).
+- `functio chat_template(Tokenizator t) → textus` — the artifact's
+  `tokenizer.chat_template` (absent → empty); `redde_turnum_user(t, content)`
+  renders the minimal Qwen3-ChatML user turn (U3-6).
+
+**LIB-02 completion oracle (U3-7)**: the fully composed runtime encodes
+Probe A `สวัสดีครับ ผมชื่ออเล็กซ์` → `[34469, 168607, 153295, 173922,
+153380, 22216, 151752, 172769]` and Probe B `你好，世界！今天是2026年8月13日
+🎉` → `[109266, 3709, 96748, 6115, 113128, 17, 15, 17, 21, 95859, 23,
+96212, 16, 18, 95971, 10838, 236, 231]` (raw-prompt rows, never through the
+template), and both decode back to the exact prompts. Pinned rows and the
+divergence-receipt form: `fixtures/tokenizer/pinned-probe-oracle.md`;
+bound in `src/tokenizer.proba` (`"LIB-02-U3-7 full two-probe composition +
+divergence receipts"` probandum).
+
+**Capstone tokenizer phase (LIB-02-U4-1)**: the capstone application
+`exempla/qwen36-35b-inference` (M6-U1 admission scaffold) runs the
+tokenizer phase through the public surface — `fabricare` on the admitted
+artifact manifest, then `encoda_promptum` for both pinned probes and
+`decoda` for both id lists (raw-prompt rows, never through the template) —
+and prints PASS rows when the observed rows equal the pinned oracle. A
+divergence names the first divergent id/character and fails closed
+(campaign rule 5); the exempla never hard-codes probe ids.
+
 ## gradus:cache
 
 KV-cache values and mutation rules (PML5-U2). `KVCache` is the per-session

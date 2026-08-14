@@ -492,6 +492,20 @@ Source: `src/tokenizer.fab`. Render with module `causa(e)`.
 | `TokenizerError.Utf8Mala` | byte sequence is not valid UTF-8 (decode output / display character). | `decoded byte sequence is not valid UTF-8`<br>`display character bytes are not valid UTF-8` | The byte-level decode is lossless only when every token's display characters map back to bytes that form valid UTF-8. |
 | `TokenizerError.WireMala` | malformed tokenizer identity wire form. | `malformed pinned id list`<br>`malformed tokenizer identity wire form`<br>`non-digit token id in pinned fixture`<br>`tokenizer identity failed verification`<br>`unknown pinned probe: …`<br>`unknown tokenizer identity marker` | Re-emit with the current schema stamp; never guess an unknown version. |
 
+The LIB-02 artifact-backed runtime (U2/U3) renders through the same
+`TokenizerError` table; the composed two-probe completion oracle
+(Probe A/B exact id lists, raw-prompt rows, decode round-trips) is pinned in
+`fixtures/tokenizer/pinned-probe-oracle.md`. A divergence from those rows is
+the campaign's stop condition (rule 5): the receipt names the first
+divergent probe id or decoded character and routes the repair — the probe
+rows never hard-code probe ids.
+
+The capstone tokenizer phase (`exempla/qwen36-35b-inference`, LIB-02-U4-1)
+runs the composed runtime through the public surface on the target
+artifact and surfaces the same `TokenizerError` rows fail-closed; a probe
+or decode divergence exits nonzero with the typed cause naming the first
+divergent id/character.
+
 ## `gradus:train` — `TrainError`
 
 Source: `src/train.fab`. Render with module `causa(e)`.

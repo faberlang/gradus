@@ -45,7 +45,7 @@ and [`exempla/gguf-inspect/README.md`](../exempla/gguf-inspect/README.md).
 | `gradus:model/dequant` | `src/model/dequant.fab` | CPU dequant of the admitted GGML block types — union set F32/BF16/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K (PML2; GGUF-A3 widens to BF16 + Q5_K) |
 | `gradus:model/tensor_payload` | `src/model/tensor_payload.fab` | `TensorPayload` value + `PayloadError` diagnostics — pathless payload carrier (name, absolute start, length, bytes) (GGUF-A3) |
 | `gradus:model/tensor_view` | `src/model/tensor_view.fab` | `VisumTensoris` typed view + `VisioError` + `vincula` bind + bounded windowed materializers `materializa_slicem`/`materializa_glomulum` (GGUF-A3) |
-| `gradus:tokenizer` | `src/tokenizer.fab` | Tokenizer identity + probe parity + `est_eog` (PML2/PML5) |
+| `gradus:tokenizer` | `src/tokenizer.fab` | Tokenizer identity + probe parity + `est_eog` (PML2/PML5) + artifact-backed byte-level BPE runtime with the composed qwen35 pre-tokenizer and special/EOG/BOS/chat policy surface (LIB-02-U2/U3; completion oracle pinned in `fixtures/tokenizer/pinned-probe-oracle.md`); capstone tokenizer phase run by `exempla/qwen36-35b-inference` (LIB-02-U4-1) |
 | `gradus:cache` | `src/cache.fab` | KV-cache values + mutation rules (PML5) |
 | `gradus:decode` | `src/decode.fab` | Decode/prefill/session/cancel + replica loop (PML5) |
 | `gradus:sampling` | `src/sampling.fab` | Sampling pipeline: greedy + filters + draw (PML5) |

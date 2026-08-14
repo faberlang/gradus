@@ -29,7 +29,7 @@ closeout, never a dev-loop suite.
 | --- | --- | --- |
 | Co-located package tests | `src/*.proba`, `src/model/*.proba` | Compile-level contract + oracle pins per module |
 | Model / tokenizer fixtures | `fixtures/safetensors/`, `fixtures/gguf/`, `fixtures/tokenizer/` | Legal fixtures + row-oracle docs, including the three GGUF-A1a manifest fixtures and the GGUF-A3 union-set dequant goldens (`gguf-dequant-goldens.json` + derivation contract) |
-| Exempla consumers | `exempla/gradient-seam`, `exempla/gradient-seam-nolib`, `exempla/training-loop-mlp`, `exempla/token-generation`, `exempla/gguf-manifest`, `exempla/gguf-inspect` | Public-surface consumers plus the executed GGUF synthetic proof (40 PASS / 0 FAIL) and guarded six-file local inspection receipt |
+| Exempla consumers | `exempla/gradient-seam`, `exempla/gradient-seam-nolib`, `exempla/training-loop-mlp`, `exempla/token-generation`, `exempla/gguf-manifest`, `exempla/gguf-inspect`, `exempla/qwen36-35b-inference` | Public-surface consumers plus the executed GGUF synthetic proof (40 PASS / 0 FAIL), guarded six-file local inspection receipt, and the capstone tokenizer-phase run (LIB-02-U4-1) |
 | Admission conformance | `tests/admission_conformance.fab` | Capsule admission composition check |
 
 Nested package dirs follow the Agents rule (≥2 modules); model package
@@ -57,7 +57,7 @@ Live co-located suites (28 files):
 | `src/optimize.proba` | `gradus:optimize` | SGD step pins @ **1e-4** absolute |
 | `src/train.proba` | `gradus:train` | Schedules @ **5e-4**; seeds; checkpoint; U6 trajectory |
 | `src/metrics.proba` | `gradus:metrics` | Accuracy / metric record |
-| `src/tokenizer.proba` | `gradus:tokenizer` | Identity + **`est_eog` {0,2}** + EOG admission rejects + **LIB-02-U2 byte-level BPE word oracle** (`transformers` → `[4549, 382]`, `สวัสดี` → `[34469, 168607]`, `人工智能` → `[109015]`, decode round-trips, typed error rows) |
+| `src/tokenizer.proba` | `gradus:tokenizer` | Identity + **`est_eog` {0,2}** + EOG admission rejects + **LIB-02-U2 byte-level BPE word oracle** (`transformers` → `[4549, 382]`, `สวัสดี` → `[34469, 168607]`, `人工智能` → `[109015]`, decode round-trips, typed error rows) + **LIB-02-U3 composed full-prompt oracle** (scanner + special/EOG/BOS/chat policy rows, Probe A/B exact id lists §4.8) |
 | `src/decode.proba` | `gradus:decode` | Logits @ **5e-4**; **tokens `[0]` / `[1,1]`**; reset/replay; first-token-divergence |
 | `src/cache.proba` | `gradus:cache` | KV identity + `redintegra` |
 | `src/sampling.proba` | `gradus:sampling` | Softmax / filters @ **5e-4** |
@@ -181,6 +181,19 @@ Tolerance policy detail: `docs/numeric-tolerances.md`.
 | **Errors** | Unknown/out-of-range ids → `IdIgnotum`; unmappable display characters → `VestigiumIgnotum`; invalid UTF-8 → `Utf8Mala`; malformed merge entries → `MergesMala`; non-byte-level manifest model → `ProgeniesIgnota` |
 | **No hard-coded tables** | The runtime consumes vocab/merges from the manifest; the proba fixture corpus models the pinned rows structurally (pinned tokens at pinned ids + the real merge sequences), committing no artifact bytes |
 | **Live** | `src/tokenizer.proba` — `"LIB-02-U2 artifact-backed byte-level BPE core"` probandum |
+
+### 4.8 Full two-probe composition oracle (LIB-02-U3-7)
+
+| Field | Value |
+| --- | --- |
+| **Pin** | `encoda_promptum_specialia`/`encoda_promptum` of **Probe A** `สวัสดีครับ ผมชื่ออเล็กซ์` = **`[34469, 168607, 153295, 173922, 153380, 22216, 151752, 172769]`** and **Probe B** `你好，世界！今天是2026年8月13日 🎉` = **`[109266, 3709, 96748, 6115, 113128, 17, 15, 17, 21, 95859, 23, 96212, 16, 18, 95971, 10838, 236, 231]`** through the fully composed runtime (scanner + BPE core + special policy + EOG/BOS + chat policy); `decoda` of each pinned id list reproduces the exact prompt |
+| **Oracle** | llama-tokenize 10150 `dee2a846b` raw-prompt rows on Qwen3.6-35B-A3B-UD-Q4_K_M.gguf (delivery `pml5-lib02-tokenizer-delivery.md`, probe rows re-ran identical) |
+| **Why** | This is the **LIB-02 completion oracle** (Normalized Spec rule 2): the full qwen35 pipeline composes the U3 scanner families, the BPE core, and the policy surfaces to the exact pinned id lists and exact decode round-trips. Probe rows are raw-prompt rows, never through the template |
+| **Errors** | Same typed rows as 4.7; a divergent first probe id or decoded character is a **divergence receipt** (campaign rule 5) that names the first divergent id/character and routes the repair — the probe rows never hard-code probe ids |
+| **No hard-coded tables** | Probe A runs on a structural fixture `_corpus_proba_a` (pinned tokens at pinned ids, max id 248046 — eos in range, the 38 real ranked merge pairs the BPE applies to the two Thai words, policy metadata present); Probe B reuses the U3-6 chat fixture. No artifact bytes are committed |
+| **Receipt** | `fixtures/tokenizer/pinned-probe-oracle.md` — revisions, model identity, prompt hashes (`e30101d6…` / `855d7303…`), tokenizer identity, command, expected vs observed, residuals |
+| **Capstone consumer** | `exempla/qwen36-35b-inference` (LIB-02-U4-1) runs the tokenizer phase through the public surface — `fabricare` on the admitted artifact manifest, then `encoda_promptum` for both probes and `decoda` for both id lists — and prints PASS rows when the observed rows equal these pins (raw-prompt rows, never through the template). A divergence names the first divergent id/character and fails closed (campaign rule 5); the exempla never hard-codes probe ids |
+| **Live** | `src/tokenizer.proba` — `"LIB-02-U3-7 full two-probe composition + divergence receipts"` probandum |
 
 ---
 
