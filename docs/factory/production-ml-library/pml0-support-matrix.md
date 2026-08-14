@@ -17,7 +17,7 @@ row-oracle docs (`fixtures/safetensors/safetensors-row-oracle.md`,
 tokenizer-identity-oracle.md`), not duplicated.
 
 This matrix holds **admitted rows only**, per `pml0-support-matrix-schema.md`
-§2/§3 (fail-closed R1–R11; one row is the unit of support claim). Eleven
+§2/§3 (fail-closed R1–R11; one row is the unit of support claim). Twelve
 admitted rows: two PML2 model-file format rows (Safetensors, GGUF), two PML3
 architecture rows (one training, one selected inference), one PML4
 training-layer row, one PML5 inference-layer row, two GGUF-A3
@@ -25,8 +25,9 @@ packed-storage materialization rows at the **output-checked slice tier**
 (rows 7–8, C3-U6), one GGUF-A2 artifact-backed tokenizer runtime row at
 the **executed probe tier** (row 9, LIB-02-U4-1/U4-3), one REF-01 dense
 reference primitive row (row 10, generic RMSNorm, executed proof —
-REF-01-U1.1), and one qwen2 architecture-adapter row (row 11, executed
-descriptor-resolution tier — REF-01-U1.7). Every row is
+REF-01-U1.1), one qwen2 architecture-adapter row (row 11, executed
+descriptor-resolution tier — REF-01-U1.7), and one generic dense
+transformer-block row (row 12, executed proof tier — REF-01-U1.5). Every row is
 **structural tier** — the executed tier is recorded, never claimed (see §2 reject log and
 each row's structural-tier note).
 
@@ -176,8 +177,8 @@ is env-blocked tree-wide today).
 | `shape` | forward-qualified shapes: `transformer_block` modus 2 over the fragment B=2 D=8 with RoPE positions [0,1], dim 2 (IN_LN3 pins, `src/transformer.proba`); model-level facts from the PML2-U3 row: 32 layers, context 8192, vocab 49152, embedding 960 (scaled tensor table [32,16]/[16]/[256,16]) |
 | `tokenizer identity` | `gpt2` (BPE) pre-tokenizer `smollm`; BOS/EOS/PAD/UNK = 1/2/2/0; EOG set {0,2}; BOS-free + space-prefix-free; vocab fingerprint per PML2-U3/U4 (`fixtures/tokenizer/tokenizer-identity-oracle.md` — digest is host-computed at admission) |
 | `legal fixture ref` | `fixtures/gguf/smollm2-360m-scaled-row.gguf` — SHA-256 `d89c9ef917158bfb5600f417020479499c6c042f728e9a29c8457a6b1a8f0974`; scaled structural stand-in for SmolLM2-360M-Instruct-Q4_K_M of gi0-model-contract 1.0.0; local synthetic fixture, no acquisition or redistribution claim |
-| `oracle ref` | GI3 frozen recipes (read-only facts): CausalMaskedSoftmax (row i attends columns j ≤ i, diagonal included — no mask tensor) and Rope (llama-arch NORM consecutive-pair rotation, freq_base frozen 100000); pinned f64 CPU-reference values in `src/attention.proba` (COS_1/SIN_1) and `src/transformer.proba` (IN_LN3_*) within a documented 5e-4 absolute tolerance; independent external-Python f64 evaluation of the documented formulas reproduces the pins exactly; REF-01-U1.3 adds the configurable RoPE row (freq base/scale/pair policy — consecutive-pair llama NORM vs interleaved-pair qwen2, theta 1000000) with both policies pinned and executed by `exempla/dense-rope` |
-| `evidence links` | `src/attention.fab`, `src/transformer.fab`; tests `src/attention.proba`, `src/transformer.proba`; executed proof `exempla/dense-rope` (REF-01-U1.3); PML2-U3 row facts `fixtures/gguf/gguf-row-oracle.md`; committed units 5260049 (U2), 7bf9acc (U3) |
+| `oracle ref` | GI3 frozen recipes (read-only facts): CausalMaskedSoftmax (row i attends columns j ≤ i, diagonal included — no mask tensor) and Rope (llama-arch NORM consecutive-pair rotation, freq_base frozen 100000); pinned f64 CPU-reference values in `src/attention.proba` (COS_1/SIN_1) and `src/transformer.proba` (IN_LN3_*) within a documented 5e-4 absolute tolerance; independent external-Python f64 evaluation of the documented formulas reproduces the pins exactly; REF-01-U1.3 adds the configurable RoPE row (freq base/scale/pair policy — consecutive-pair llama NORM vs interleaved-pair qwen2, theta 1000000) with both policies pinned and executed by `exempla/dense-rope`; REF-01-U1.4 adds multi-head attention with GQA KV-head sharing (per-head q/k/v splits, scaled causal scores, v accumulation, head concatenation, output projection, q/k rotated by position) pinned for a GQA config (n_h=14, n_kv=2 — the qwen2 head ratio) and an MHA config (n_kv = n_h) and executed by `exempla/dense-gqa` |
+| `evidence links` | `src/attention.fab`, `src/transformer.fab`; tests `src/attention.proba`, `src/transformer.proba`; executed proofs `exempla/dense-rope` (REF-01-U1.3) and `exempla/dense-gqa` (REF-01-U1.4); PML2-U3 row facts `fixtures/gguf/gguf-row-oracle.md`; committed units 5260049 (U2), 7bf9acc (U3) |
 | `compatibility policy` | exact admitted combination: llama/dense (SmolLM2-360M scaled) transformer block with causal + RoPE attention over the F32 staged carrier, forward-only, oracle-matching per above, shared with the training row's forward semantics (the same `transformer_block` composes both paths). Non-goals: no quantized forward (Q4_K_M is storage); no decode/KV-cache/sampling (PML5); no other architectures/dtypes/shapes; no runtime identity claim |
 | `schema version` | `gradus-support-matrix-schema v0.1.0` |
 ```
@@ -331,6 +332,20 @@ no tensor-payload read (REF-01-U1.7, 2026-08-14). This is the executed
 **adapter** phase only — it does **NOT** claim tensor materialization, model
 execution, logits, or device execution; CTO8-1 stays the named gate.
 
+### Row 12 — generic dense transformer block, executed proof tier (REF-01-U1.5)
+
+| Field | Value |
+| --- | --- |
+| `family` | REF-01 dense reference — ordered dense transformer block, `gradus:transformer` |
+| `dtype` | F32 staged carrier only (the admitted row; the composed rows' `_typo` gates reject non-f32) |
+| `shape` | block input/output `[T, D]`; q `[T, H·D]`, k/v `[T, K·D]` with `0 < K ≤ H`, `H % K == 0`; attention output projection `[H·D, H·D]`; MLP gate/up `[D, F]`, down `[F, D]`; all runtime-derived (no fixed-shape constants) |
+| `formula` | `ln1 = rmsnorm(x, ln1_s, ε)` → GQA attention (causal + RoPE: `q/k` rotated at their positions via the configurable RoPE row, scaled causal scores, per-head KV groups, head concatenation, `[H·D, H·D]` output projection) → `r1 = x + ctx` → `ln2 = rmsnorm(r1, ln2_s, ε)` → `h = swiglu(gate, up, wd, bd)` → `r2 = ln2 + h` — composing the U1.1 (RMSNorm), U1.2 (SiLU/SwiGLU), and U1.4 (multi-head GQA) rows |
+| `typed errors` | `TransformerError`: mapped sub-call errors by documented causa text — rank (`rmsnorm requires rank >= 1`, `swiglu requires rank-2 gate and up`, `multi-head attention requires rank-2 tensors`, `linear requires rank-2 input`), shape (`query, key, value must share shape`, `output projection must be [H*D, H*D]`, `shapes not broadcastable`), dtype (`dtype mismatch`), epsilon (`negative epsilon`), position (`negative position`), rope dim (`rope dim exceeds head width`, …) |
+| `oracle ref` | independent f64 evaluation of the documented block formulas (external Python/numpy, the PML3 `transformer_block` pin precedent) for a small synthetic config — T=2, D=16, F=16, n_h=4, n_kv=2, head_dim=4, positions [0,1], rope_dim 4, consecutive-pair base 100000, ε=1e-5 — pinned within the documented **5e-4** absolute tolerance |
+| `evidence links` | `src/transformer.fab` (`dense_block`), `src/transformer.proba` (dense-block pin subset + typed error contract), `exempla/dense-block/` (faber.toml, src/main.fab, README.md receipt), `pml5-ref01-dense-reference-delivery.md` §REF-01-U1.5 |
+| `executed proof` | `exempla/dense-block` runs through package MIR (hand-7 Radix binary) — exit 0, **32 PASS / 0 FAIL** on the pinned f64 references (2026-08-14 receipt) |
+| `compatibility policy` | exact admitted combination: the ordered dense block over the F32 staged carrier — input RMSNorm → GQA attention (causal + RoPE) → residual → post-attn RMSNorm → SwiGLU MLP → residual — shared by the llama and qwen2 dense rows (no per-row constants). Non-goals: no model execution, logits, tokens, or device execution (CTO8-1 stays the named gate); no full-model stack (that is the U1.8 assembly row); no non-f32 dtypes |
+
 ## 2. Reject log (recorded, never support)
 
 | Proposed row | Reject reason (gate) |
@@ -370,12 +385,13 @@ execution, logits, or device execution; CTO8-1 stays the named gate.
 
 ```bash
 cd /Users/ianzepp/work/faberlang/gradus
-# 1. Eleven admitted rows (2 PML2 format, 2 PML3 architecture, 1 PML4
+# 1. Twelve admitted rows (2 PML2 format, 2 PML3 architecture, 1 PML4
 #    training-layer, 1 PML5 inference-layer, 2 GGUF-A3 output-checked
 #    slice materialization, 1 GGUF-A2 executed-probe tokenizer runtime,
 #    1 REF-01 dense reference primitive, 1 REF-01 qwen2 architecture
-#    adapter); the ten schema-version rows carry all 11 schema fields
-#    (row 10, the REF-01 primitive row, uses its own Field/Value set).
+#    adapter, 1 REF-01 generic dense transformer block); the ten
+#    schema-version rows carry all 11 schema fields (rows 10 and 12, the
+#    REF-01 primitive/block rows, use their own Field/Value sets).
 grep -c '^| `format`' docs/factory/production-ml-library/pml0-support-matrix.md   # 10
 grep -c '^| `schema version`' docs/factory/production-ml-library/pml0-support-matrix.md   # 10
 # 2. Committed unit commits + oracle pins cited as evidence links.

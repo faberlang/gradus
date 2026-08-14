@@ -1,12 +1,17 @@
 # Gradus Regression Corpus
 
-**Version**: `gradus-regression-corpus v1.5.0` (2026-08-13, A1C-M5;
-2026-08-14, LIB-02-U1 tokenizer metadata array pins; LIB-03 GGUF-A3 C1/C2-U5 —
-`tensor_payload` / `tensor_view` suites + union-set dequant goldens; REF-01-U1.2 —
-`nn` SiLU/SwiGLU pins + `exempla/dense-swiglu` executed proof; REF-01-U1.3 —
-configurable RoPE pins: both pair policies at pinned theta + scale + exempla
-`dense-rope`; REF-01-U1.6 `dense_llama` llama adapter descriptor-resolution
-pins + `exempla/dense-llama-adapter`)
+**Version**: `gradus-regression-corpus v1.7.0` (2026-08-14, REF-01-U1.5 —
+generic dense block pins: the ordered block composition (input RMSNorm →
+GQA causal+RoPE → residual → post-attn RMSNorm → SwiGLU → residual) over a
+synthetic T=2/D=16 config + exempla `dense-block` executed proof (32 PASS /
+0 FAIL); REF-01-U1.4 — multi-head GQA attention pins: GQA n_h=14/n_kv=2 +
+MHA n_kv=n_h config rows + exempla `dense-gqa`; REF-01-U1.3 configurable
+RoPE pins + exempla `dense-rope`; REF-01-U1.2 `nn` SiLU/SwiGLU pins +
+`exempla/dense-swiglu` executed proof; REF-01-U1.1 RMSNorm pins +
+`exempla/dense-rmsnorm`; REF-01-U1.6 `dense_llama` llama adapter
+descriptor-resolution pins + `exempla/dense-llama-adapter`; REF-01-U1.7
+`dense_qwen2` qwen2 adapter pins; LIB-03 GGUF-A3 C1/C2-U5 —
+`tensor_payload` / `tensor_view` suites + union-set dequant goldens)
 **Repo**: gradus. **Tier**: structural inventory.
 **Delivery**: `docs/factory/production-ml-library/pml6-delivery.md` §PML6-U4;
 GGUF-A1b delivery in `pml5-general-gguf-delivery.md`.
@@ -33,7 +38,7 @@ closeout, never a dev-loop suite.
 | --- | --- | --- |
 | Co-located package tests | `src/*.proba`, `src/model/*.proba` | Compile-level contract + oracle pins per module |
 | Model / tokenizer fixtures | `fixtures/safetensors/`, `fixtures/gguf/`, `fixtures/tokenizer/` | Legal fixtures + row-oracle docs, including the three GGUF-A1a manifest fixtures and the GGUF-A3 union-set dequant goldens (`gguf-dequant-goldens.json` + derivation contract) |
-| Exempla consumers | `exempla/gradient-seam`, `exempla/gradient-seam-nolib`, `exempla/training-loop-mlp`, `exempla/token-generation`, `exempla/gguf-manifest`, `exempla/gguf-inspect`, `exempla/qwen36-35b-inference`, `exempla/dense-rmsnorm`, `exempla/dense-swiglu`, `exempla/dense-llama-adapter`, `exempla/dense-qwen2-adapter` | Public-surface consumers plus the executed GGUF synthetic proof (40 PASS / 0 FAIL), guarded six-file local inspection receipt, the capstone tokenizer-phase run (LIB-02-U4-1), the REF-01-U1.1 RMSNorm executed proof (32 PASS / 0 FAIL), the executed REF-01-U1.2 SiLU/SwiGLU proof (14 PASS / 0 FAIL), the REF-01-U1.6 llama-adapter executed proof (19 PASS / 0 FAIL), and the qwen2 adapter executed proof (23 PASS / 0 FAIL, REF-01-U1.7) |
+| Exempla consumers | `exempla/gradient-seam`, `exempla/gradient-seam-nolib`, `exempla/training-loop-mlp`, `exempla/token-generation`, `exempla/gguf-manifest`, `exempla/gguf-inspect`, `exempla/qwen36-35b-inference`, `exempla/dense-rmsnorm`, `exempla/dense-swiglu`, `exempla/dense-llama-adapter`, `exempla/dense-qwen2-adapter`, `exempla/dense-block` | Public-surface consumers plus the executed GGUF synthetic proof (40 PASS / 0 FAIL), guarded six-file local inspection receipt, the capstone tokenizer-phase run (LIB-02-U4-1), the REF-01-U1.1 RMSNorm executed proof (32 PASS / 0 FAIL), the executed REF-01-U1.2 SiLU/SwiGLU proof (14 PASS / 0 FAIL), the REF-01-U1.6 llama-adapter executed proof (19 PASS / 0 FAIL), the qwen2 adapter executed proof (23 PASS / 0 FAIL, REF-01-U1.7), and the REF-01-U1.5 dense-block executed proof (32 PASS / 0 FAIL) |
 | Admission conformance | `tests/admission_conformance.fab` | Capsule admission composition check |
 
 Nested package dirs follow the Agents rule (≥2 modules); model package
@@ -54,8 +59,8 @@ Live co-located suites (30 files):
 | `src/serialize.proba` | `gradus:serialize` | Wire round-trip; `_be4_lege` / `_be8_lege` readers |
 | `src/parameter.proba` | `gradus:parameter` | Identity + version schema |
 | `src/nn.proba` | `gradus:nn` | GELU / layernorm / linear / **rmsnorm** — f64 pins @ **5e-4** (RMSNorm rows: unit scale, per-feature scale, per-row `[2,4]` normalization, sign-preserving negatives — REF-01-U1.1) + **SiLU / SwiGLU (REF-01-U1.2)** — f64 pins @ **5e-4** |
-| `src/attention.proba` | `gradus:attention` | SDPA / RoPE — f64 pins @ **5e-4**; configurable RoPE — both pair policies (consecutive-pair freq_base 100000 / interleaved-pair theta 1000000) + scale + fail-closed config (REF-01-U1.3) |
-| `src/transformer.proba` | `gradus:transformer` | Block + LN3 / IN_LN3 pins @ **5e-4** |
+| `src/attention.proba` | `gradus:attention` | SDPA / RoPE — f64 pins @ **5e-4**; configurable RoPE — both pair policies (consecutive-pair freq_base 100000 / interleaved-pair theta 1000000) + scale + fail-closed config (REF-01-U1.3); multi-head GQA — n_h=14/n_kv=2 and n_kv=n_h config rows + typed error contract (REF-01-U1.4) |
+| `src/transformer.proba` | `gradus:transformer` | Block + LN3 / IN_LN3 pins @ **5e-4** + **dense block (REF-01-U1.5)** — f64 pins @ **5e-4** (synthetic T=2/D=16/F=16, n_h=4/n_kv=2/head_dim=4 config: input RMSNorm → GQA causal+RoPE → residual → post-attn RMSNorm → SwiGLU → residual) + typed error rows |
 | `src/loss.proba` | `gradus:loss` | MSE / CE scalars @ **5e-4** |
 | `src/gradient.proba` | `gradus:gradient` | Companion-call contract; oracle pins for runtime gate |
 | `src/optimize.proba` | `gradus:optimize` | SGD step pins @ **1e-4** absolute |
@@ -212,6 +217,35 @@ Tolerance policy detail: `docs/numeric-tolerances.md`.
 Pin count: 22 executed PASS rows (`exempla/dense-rope`, 0 FAIL, exit 0) + the
 co-located compile-level proba pins.
 
+### 4.10 Multi-head GQA attention pins (REF-01-U1.4)
+
+| Pin family | Where | Band / rule |
+| --- | --- | --- |
+| GQA config — n_h=14, n_kv=2, head_dim=4 (qwen2 head ratio 14:2 at a compact head_dim), positions [1, 2], rope_dim 4, interleaved-pair theta 1000000 | `src/attention.proba` + `exempla/dense-gqa` | **5e-4** absolute |
+| MHA config — n_kv = n_h = 14, positions [0, 0] (RoPE identity), consecutive-pair base 100000 | `src/attention.proba` + `exempla/dense-gqa` | **5e-4** absolute |
+| Typed error contract (head counts, packed widths, output projection, positions, rope dim, dtype) | `src/attention.proba` | exact causa identity |
+
+Pin count: 228 executed PASS rows (`exempla/dense-gqa` — 224 pinned output
+elements + shape/dtype rows, 0 FAIL, exit 0) + the co-located compile-level
+proba pins. The reference values are the independent f64 evaluation of the
+documented multi-head formula (external Python, cross-checked against
+numpy).
+
+### 4.11 Generic dense block pins (REF-01-U1.5)
+
+| Pin family | Where | Band / rule |
+| --- | --- | --- |
+| Dense block output — synthetic config T=2, D=16, F=16 (MLP hidden), num_heads=4, num_kv_heads=2, head_dim=4, positions [0, 1], rope_dim 4, consecutive-pair (llama NORM) freq_base 100000, scale 1.0, RMSNorm ε=1e-5, dk scale 0.5 | `src/transformer.proba` + `exempla/dense-block` | **5e-4** absolute |
+| Typed error contract (dtype, rank, head counts, output projection width, RoPE position) | `src/transformer.proba` | exact causa identity |
+
+Pin count: 32 executed PASS rows (`exempla/dense-block` — the 32 pinned
+output elements + shape/dtype rows, 0 FAIL, exit 0) + the co-located
+compile-level proba pins (representative subset). The reference values are
+the independent f64 evaluation of the documented block formulas — input
+RMSNorm → GQA attention (causal + RoPE) → residual → post-attn RMSNorm →
+SwiGLU MLP → residual — via external Python/numpy (the PML3
+`transformer_block` pin precedent).
+
 ---
 
 ## 5. Structural validation
@@ -232,6 +266,10 @@ cd /path/to/faberlang/gradus
 - `exempla/token-generation`,
 - `exempla/gguf-manifest`.
 - `exempla/gguf-inspect`.
+
+Executed proofs additionally run `exempla/dense-rope` (REF-01-U1.3, 22 PASS /
+0 FAIL) and `exempla/dense-gqa` (REF-01-U1.4, 228 PASS / 0 FAIL) through
+package MIR.
 
 The GGUF package proof runs through package MIR with the hand-2 Radix binary.
 Its receipt exits 0 with 40 PASS lines and 0 FAIL lines across bounded

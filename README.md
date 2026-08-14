@@ -73,6 +73,7 @@ The gradient seam consumers live under `exempla/`:
 | `exempla/gradient-seam` | Library import of `gradus:gradient` + FD check (SEM004 companion across `importa`) | **Structural** — `faber check`; oracle pins in the exemplum README |
 | `exempla/gradient-seam-nolib` | Self-contained `@ radix backward` + FD (no library import) | **Structural** — `faber check`; same arithmetic oracle |
 | `exempla/dense-qwen2-adapter` | Typed `qwen2` architecture adapter executed proof — every canonical resolution + fail-closed rejection row over the pinned Qwen2.5-0.5B descriptor facts (REF-01-U1.7) | **Executed** — package-MIR run, 23 PASS / 0 FAIL, exit 0; receipt in the exemplum README |
+| `exempla/dense-block` | Generic dense transformer block executed proof — input RMSNorm → GQA attention (causal + RoPE) → residual → post-attn RMSNorm → SwiGLU MLP → residual over a synthetic T=2/D=16 config, composing the U1.1/U1.2/U1.4 rows (REF-01-U1.5) | **Executed** — package-MIR run, 32 PASS / 0 FAIL, exit 0; receipt in the exemplum README |
 
 Pinned oracle (f64 arithmetic of the documented loss): forward loss `2.25`,
 companion `grad_w = [0.25, 0.5, 0.75, 1.0]`, FD diffs ~`1e-11`. See each
@@ -144,7 +145,7 @@ gate.
 | `gradus:gradient` wrapper | **Shipped (PML4)** — one companion-call entry | Gradus |
 | Linear regression + FD gradient proof | **Shipped (S4-A)** — CPU seam proof | Gradus |
 | SGD optimizer state, loss (`mse`/`cross_entropy`), training (steps, schedules, mode, RNG, dropout, checkpoint `Tabula`) | **Shipped (PML4)** | Gradus |
-| NN primitives + attention/transformer (staged surface + fixed-shape rows) | **Shipped (PML3)**; configurable RoPE (freq base/scale/pair policy — consecutive-pair llama NORM vs interleaved-pair qwen2, REF-01-U1.3) with executed proof `exempla/dense-rope` | Gradus |
+| NN primitives + attention/transformer (staged surface + fixed-shape rows) | **Shipped (PML3)**; configurable RoPE (freq base/scale/pair policy — consecutive-pair llama NORM vs interleaved-pair qwen2, REF-01-U1.3) with executed proof `exempla/dense-rope`; multi-head attention with GQA KV-head sharing — causal + RoPE + output projection (REF-01-U1.4) with executed proof `exempla/dense-gqa`; generic dense transformer block — input RMSNorm → GQA (causal + RoPE) → residual → post-attn RMSNorm → SwiGLU → residual, composing the U1.1/U1.2/U1.4 rows (REF-01-U1.5) with executed proof `exempla/dense-block` | Gradus |
 | Model admission (capsule + Safetensors + GGUF + dequant) | **Shipped (PML2)** — schema-2 capsule (pathless identity + per-format manifest); format-general GGUF manifest/range inspection has an **executed A1b proof** over six operator-local real files; GGUF-A3 adds the `tensor_payload`/`tensor_view` modules (pathless payload carrier, `vincula` bind, bounded windowed materializers) and the widened dequant union set, without architecture admission, tokenizer, or inference claims | Gradus |
 | Tokenizer identity + probe parity + `est_eog` | **Shipped (PML2/PML5)** | Gradus |
 | Inference: decode, KV-cache, sampling, generation config | **Shipped (PML5)** | Gradus |
