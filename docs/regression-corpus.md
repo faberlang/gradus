@@ -56,7 +56,7 @@ Live co-located suites (26 files):
 | `src/optimize.proba` | `gradus:optimize` | SGD step pins @ **1e-4** absolute |
 | `src/train.proba` | `gradus:train` | Schedules @ **5e-4**; seeds; checkpoint; U6 trajectory |
 | `src/metrics.proba` | `gradus:metrics` | Accuracy / metric record |
-| `src/tokenizer.proba` | `gradus:tokenizer` | Identity + **`est_eog` {0,2}** + EOG admission rejects |
+| `src/tokenizer.proba` | `gradus:tokenizer` | Identity + **`est_eog` {0,2}** + EOG admission rejects + **LIB-02-U2 byte-level BPE word oracle** (`transformers` → `[4549, 382]`, `สวัสดี` → `[34469, 168607]`, `人工智能` → `[109015]`, decode round-trips, typed error rows) |
 | `src/decode.proba` | `gradus:decode` | Logits @ **5e-4**; **tokens `[0]` / `[1,1]`**; reset/replay; first-token-divergence |
 | `src/cache.proba` | `gradus:cache` | KV identity + `redintegra` |
 | `src/sampling.proba` | `gradus:sampling` | Softmax / filters @ **5e-4** |
@@ -165,6 +165,17 @@ Tolerance policy detail: `docs/numeric-tolerances.md`.
 | **Why** | The counts/ids are the frozen target-prefix corpus facts (Qwen3.6-35B-A3B-UD-Q4_K_M.gguf metadata block) that LIB-02-U2/U3 encode/decode must consume |
 | **Errors** | Missing keys, non-array values, and wrong element kinds produce typed `GgufManifestError` (`WireMala` / `LimitesMala`) rows; duplicate tokenizer keys fail at parse (`ClavisDuplicata`) |
 | **Live** | `src/model/gguf_manifest.proba` — `"LIB-02-U1 tokenizer metadata accessors"` probandum |
+
+### 4.7 Byte-level BPE word oracle (LIB-02-U2)
+
+| Field | Value |
+| --- | --- |
+| **Pin** | `encoda(t, "transformers")` = **`[4549, 382]`**; `encoda(t, "สวัสดี")` = **`[34469, 168607]`**; `encoda(t, "人工智能")` = **`[109015]`**; `decoda` of each pinned id list reproduces the exact input text |
+| **Oracle** | llama-tokenize 10150 `dee2a846b` word-level rows on Qwen3.6-35B-A3B-UD-Q4_K_M.gguf (delivery `pml5-lib02-tokenizer-delivery.md`) |
+| **Why** | The word-level boundary proves the BPE core (display mapping, ranked merges, vocab lookup, decode) before the U3 pre-tokenizer composes to the full two-probe oracle |
+| **Errors** | Unknown/out-of-range ids → `IdIgnotum`; unmappable display characters → `VestigiumIgnotum`; invalid UTF-8 → `Utf8Mala`; malformed merge entries → `MergesMala`; non-byte-level manifest model → `ProgeniesIgnota` |
+| **No hard-coded tables** | The runtime consumes vocab/merges from the manifest; the proba fixture corpus models the pinned rows structurally (pinned tokens at pinned ids + the real merge sequences), committing no artifact bytes |
+| **Live** | `src/tokenizer.proba` — `"LIB-02-U2 artifact-backed byte-level BPE core"` probandum |
 
 ---
 
