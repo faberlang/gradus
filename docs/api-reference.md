@@ -673,6 +673,23 @@ octeti_per_blockum, longitudo_octetorum)` or `Ignota(typo)`.
   non-array value or a non-integer element kind returns a typed `WireMala`
   error. Scalar tokenizer ids (`tokenizer.ggml.bos_token_id` and friends) and
   the chat template stay on the `numerum`/`textum` surface.
+- `functio numerorum_u32(ManifestumGguf m, textus clavis) → lista<numerus> ⇥
+  GgufManifestError` — typed uint32-array accessor (MODEL-01-M1); returns the
+  elements of a GGUF array whose wire element kind is exactly `GGUF_UINT32`,
+  without coercing other integer kinds. A missing key, a non-array value, or a
+  non-uint32 element kind fails closed with a typed `WireMala` error; an array
+  count beyond the bounded limit fails closed with `LimitesMala`.
+- `functio boleanum(ManifestumGguf m, textus clavis) → bivalens ⇥
+  GgufManifestError` — typed bool accessor (MODEL-01-M1); returns the
+  `GGUF_BOOL` metadata value (the parser has already validated the wire byte
+  is 0 or 1). A missing key or a present non-bool value fails closed with a
+  typed `WireMala` error instead of coercing.
+- `functio longitudo_listae(ManifestumGguf m, textus clavis) → numerus ⇥
+  GgufManifestError` — typed array-length accessor (MODEL-01-M1); reads only
+  the array count from the GGUF array wire header without decoding elements.
+  A missing key or a non-array value fails closed with a typed `WireMala`
+  error; an array count beyond the bounded limit fails closed with
+  `LimitesMala`.
 - `functio inveni_tensorem(ManifestumGguf m, textus nomen) →
   DescriptioTensorisGguf ⇥ GgufManifestError` — retrieve one tensor descriptor.
 - `functio limes_payloadis(ManifestumGguf m, textus nomen) → iuncta<numerus,
