@@ -16,10 +16,12 @@ row-oracle docs (`fixtures/safetensors/safetensors-row-oracle.md`,
 tokenizer-identity-oracle.md`), not duplicated.
 
 This matrix holds **admitted rows only**, per `pml0-support-matrix-schema.md`
-§2/§3 (fail-closed R1–R11; one row is the unit of support claim). Six admitted
-rows: two PML2 model-file format rows (Safetensors, GGUF), two PML3
+§2/§3 (fail-closed R1–R11; one row is the unit of support claim). Eight
+admitted rows: two PML2 model-file format rows (Safetensors, GGUF), two PML3
 architecture rows (one training, one selected inference), one PML4
-training-layer row, one PML5 inference-layer row. Every row is **structural
+training-layer row, one PML5 inference-layer row, and two GGUF-A3
+packed-storage materialization rows at the **output-checked slice tier**
+(rows 7–8, C3-U6). Every row is **structural
 tier** — the executed tier is recorded, never claimed (see §2 reject log and
 each row's structural-tier note).
 
@@ -52,6 +54,24 @@ counts (248320 tokens, 247587 merges) and pinned special ids pinned in
 `src/model/gguf_manifest.proba`; missing/malformed/duplicate keys return typed
 `GgufManifestError` rows. This remains metadata-only evidence for the LIB-02
 tokenizer units; it does not implement encode/decode.
+
+GGUF-A3 C2+C3 add the **packed-storage materialization** rows 7–8 at the
+**output-checked slice tier**. `gradus:model/tensor_payload` and
+`gradus:model/tensor_view` bind one validated tensor payload into a typed
+view (`vincula`) and dequantize bounded element windows to f32 in GGUF block
+order (`materializa_slicem` / `materializa_glomulum`), one block per source
+read, over the admitted GGML union set {F32, BF16, Q5_0, Q8_0, Q4_K, Q5_K,
+Q6_K}. The C3-U2 exempla receipt (`exempla/gguf-materialize/README.md`,
+committed `edcff45`) proves output-checked slices: the guarded real-file run
+materializes the Qwen3.6 slice table (BF16 ×2, Q4_K, Q5_K, Q6_K, Q8_0, F32,
+rank-3 expert) bit-exactly against the committed
+`fixtures/gguf/gguf-dequant-goldens.json` values, with the coverage line
+`tensors=753 known=753 unknown=0` and the two Qwen2.5 dense-row distributions,
+exit 0, zero FAIL. Gradus receives no path, reader, file handle, mapping, or
+whole-model payload; every byte read is a bounded sub-window through the
+app-owned range source. This is **output-checked slice evidence**, not
+executed token/model identity, logits, or device execution — CTO8-1 stays the
+named gate, and neither row claims more.
 
 ## 1. Admitted rows
 
@@ -176,6 +196,45 @@ first-token-divergence rule + reset/replay determinism. Executed token identity
 is env-blocked on the FMIR lever and is a **NAMED OPEN clause** (CTO8-1,
 `pml5-closeout.md`) — **this row does NOT claim executed tokens**.
 
+### Row 7 — GGUF-A3 packed-storage materialization row, fixture-mode slice tier (C3-U6)
+
+```markdown
+| `format` | `gguf` (GGUF file version 3; quant version 2 — the PML2-U3 admitted GGUF row; no new format claim) |
+| `architecture` | `llama` / `dense` (the PML2-U3 scaled SmolLM2-360M structural stand-in — the committed fixture mode; `general.architecture` = `llama`) |
+| `dtype` | compute = `f32` (the materialized output list is f32); storage is mixed GGML types per fixture tensor (F32, Q8_0, Q4_K) |
+| `quantization` | `none` file-level (storage quant blocks are a per-tensor property of the admitted GGML block set {Q8_0, Q4_K}; the fixture's file type is 15 MOSTLY_Q4_K_M per the PML2-U3 row) |
+| `shape` | bounded materialization windows over the pinned 3-tensor scaled table (`[32,16]`/`[16]`/`[256,16]` — 4624 elements, 2912 data bytes), each window element-aligned and ≤ `MAXIMUM_SLICEM_ELEMENTA` (16,777,216) and `CORPUS_LIMES`; no whole-tensor or whole-model read |
+| `tokenizer identity` | not part of this row — packed-storage materialization is tokenizer-free by contract; tokenizer identity is a model-file admission dimension (PML2-U4 row facts / `fixtures/tokenizer/tokenizer-identity-oracle.md`) |
+| `legal fixture ref` | `fixtures/gguf/smollm2-360m-scaled-row.gguf` — SHA-256 `d89c9ef917158bfb5600f417020479499c6c042f728e9a29c8457a6b1a8f0974` (3936 bytes); local synthetic fixture, no acquisition or redistribution claim |
+| `oracle ref` | committed `fixtures/gguf/gguf-dequant-goldens.json` (schema `gguf-dequant-goldens-v2`) — llama.cpp `ggml-quants.c` @ `a957b7747` pin (GI2-1), expressed by the committed generator kernels; fixture mode compares each materialized slice bit-exactly (no tolerance) |
+| `evidence links` | `src/model/tensor_payload.fab`, `src/model/tensor_view.fab`, `src/model/dequant.fab`, `src/model/gguf_manifest.fab` + co-located probas (`tensor_payload.proba`, `tensor_view.proba`, `dequant.proba`, `gguf_manifest.proba`); `exempla/gguf-materialize` (fixture mode) + `exempla/gguf-materialize/README.md`; committed units 2ec80d8 (C3-U1), edcff45 (C3-U2), d182c5c/686653c/6dd29fb (C2-U3..U5), 82048b5 (A3-C1), fc59ac4 (A3-C2-U1) |
+| `compatibility policy` | exact admitted combination: bounded windowed materialization of the pinned scaled GGUF fixture (llama/dense) at the output-checked slice tier. Non-goals: no tokenizer, model execution, logits, device, or executed-identity claim; no whole-model reads; no other architectures/files/quants; CTO8-1 stays the named gate |
+| `schema version` | `gradus-support-matrix-schema v0.1.0` |
+```
+
+### Row 8 — GGUF-A3 packed-storage materialization row, real-file output-checked slice tier (C3-U6)
+
+```markdown
+| `format` | `gguf` (GGUF file version 3; quant version 2 — the PML2-U3 admitted GGUF row; no new format claim) |
+| `architecture` | `qwen35moe` (Qwen3.6-35B-A3B — the admitted real-file artifact's architecture, per the C3-U2 receipt) |
+| `dtype` | compute = `f32` (the materialized output list is f32); storage is mixed GGML types per tensor (observed union set on the artifact: BF16 2, F32 368, Q8_0 259, Q4_K 82, Q5_K 38, Q6_K 4) |
+| `quantization` | `q4_k_m` file type (15 MOSTLY_Q4_K_M, quant version 2); storage quant blocks are a per-tensor property of the admitted GGML union set {F32, BF16, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K} |
+| `shape` | the named 8-slice table from the C3-U2 receipt (BF16 ×2 window 8, Q4_K window 256, Q5_K window 256, Q6_K window 256, Q8_0 window 32, F32 window 8, Q4_K rank-3 expert window 256) — every window element-aligned and ≤ `MAXIMUM_SLICEM_ELEMENTA` / `CORPUS_LIMES`; bounded per-expert window for the rank-3 row; no whole-tensor or whole-model read |
+| `tokenizer identity` | not part of this row — packed-storage materialization is tokenizer-free by contract; tokenizer identity is a model-file admission dimension (PML2-U4 row facts / `fixtures/tokenizer/tokenizer-identity-oracle.md`) |
+| `legal fixture ref` | operator-local artifact `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` — 22,663,387,424 bytes, SHA-256 `0b21525e972670ed59e1812e170b27c26355381f0656ecc4e25617ece7dac58b`; operator evidence under `/Users/ianzepp/ai/models/`, **never committed**; pinned by content hash per the C3-U2 receipt, no acquisition or redistribution claim |
+| `oracle ref` | committed `fixtures/gguf/gguf-dequant-goldens.json` (schema `gguf-dequant-goldens-v2`; llama.cpp `ggml-quants.c` @ `a957b7747` pin, GI2-1); the guarded real-file run compares every materialized window bit-exactly (no tolerance) — the first divergent element would fail the slice |
+| `evidence links` | `src/model/tensor_payload.fab`, `src/model/tensor_view.fab`, `src/model/dequant.fab`, `src/model/gguf_manifest.fab` + co-located probas; `exempla/gguf-materialize` (real-file mode) + the C3-U2 receipt `exempla/gguf-materialize/README.md` (guarded command, content identities, coverage + dense-row lines, observed PASS receipt, exit 0, zero FAIL); committed units edcff45 (C3-U2), 2ec80d8 (C3-U1), d182c5c/686653c/6dd29fb (C2-U3..U5), 82048b5 (A3-C1), fc59ac4 (A3-C2-U1) |
+| `compatibility policy` | exact admitted combination: output-checked slice materialization of the hash-pinned Qwen3.6 artifact (qwen35moe) — manifest admission, per-type coverage (753/753/0), and the named slice table bit-exact against committed goldens. Non-goals: no tokenizer, model execution, logits, device, or executed-identity claim; no whole-model read; no other architectures/files; CTO8-1 stays the named gate |
+| `schema version` | `gradus-support-matrix-schema v0.1.0` |
+```
+
+**Output-checked slice tier (recorded, not claimed).** Both rows' qualification
+is the output-checked slice receipt: bounded materialization of real bytes
+through the package-MIR exempla run, bit-exact against the committed goldens.
+They do **NOT** claim executed token/model identity, logits, or device
+execution — that boundary stays the **NAMED OPEN clause** CTO8-1
+(`pml5-closeout.md`), and neither row upgrades to an executed tier.
+
 ## 2. Reject log (recorded, never support)
 
 | Proposed row | Reject reason (gate) |
@@ -188,6 +247,7 @@ is env-blocked on the FMIR lever and is a **NAMED OPEN clause** (CTO8-1,
 | **Executed-identity row for any admitted row** (executed forward≡companion identity, executed convergence values, or executed tokens) | R9/R11 — the structural tier is recorded and **never upgraded**: proba execution is env-blocked on the FMIR lever; executed identity is the auditor-owned runtime-evidence gate (CTO8-1, named open clause). Every row's structural-tier note marks the boundary. |
 | A tokenizer-identity row with an EOG set other than the pinned `{0,2}` | R6 / R10 — the pinned EOG set is identity (`2cdc498`): a well-formed-but-different set is a different tokenizer; capsule admission fails closed (`EogMala`). Rows cite the pinned `{0,2}` exactly. |
 | A support row wider than one exact admitted combination (e.g. "the library supports GGUF") | R10 / R11 — support is claimed per row, never at the library level; a compatibility policy that implies broader support rejects the row. |
+| **An output-checked slice row upgraded to executed identity** (Qwen3.6 model execution, logits, tokens, or device execution from the materialization receipt) | R9/R11 — the output-checked slice tier (rows 7–8) is recorded and **never upgraded**: the C3-U2 receipt proves bounded slice materialization only; token/model-execution identity is the auditor-owned runtime-evidence gate (CTO8-1, named open clause), and it stays the campaign's pending invariant. |
 
 ## 3. Relationship to other artifacts
 
@@ -202,7 +262,7 @@ is env-blocked on the FMIR lever and is a **NAMED OPEN clause** (CTO8-1,
   `fixtures/tokenizer/tokenizer-identity-oracle.md`) and aggregated into this
   matrix at PML6 per `pml6-delivery.md` PML6-U3.
 - The PML6 gate's "support matrix is the full-matrix aggregation" clause is
-  satisfied by these six admitted rows; the phase gate also requires README
+  satisfied by these eight admitted rows; the phase gate also requires README
   regen + audit 0 findings (planner/Mind-owned at gate).
 - Compatibility promises at the row level are each row's `compatibility
   policy` field; `docs/compatibility-policy.md`
@@ -214,13 +274,16 @@ is env-blocked on the FMIR lever and is a **NAMED OPEN clause** (CTO8-1,
 
 ```bash
 cd /Users/ianzepp/work/faberlang/gradus
-# 1. Six admitted rows (2 PML2 format, 2 PML3 architecture, 1 PML4
-#    training-layer, 1 PML5 inference-layer), each with all 11 schema fields.
-grep -c '^| `format`' docs/factory/production-ml-library/pml0-support-matrix.md   # 6
-grep -c '^| `schema version`' docs/factory/production-ml-library/pml0-support-matrix.md   # 6
+# 1. Eight admitted rows (2 PML2 format, 2 PML3 architecture, 1 PML4
+#    training-layer, 1 PML5 inference-layer, 2 GGUF-A3 output-checked
+#    slice materialization), each with all 11 schema fields.
+grep -c '^| `format`' docs/factory/production-ml-library/pml0-support-matrix.md   # 8
+grep -c '^| `schema version`' docs/factory/production-ml-library/pml0-support-matrix.md   # 8
 # 2. Committed unit commits + oracle pins cited as evidence links.
 grep -c '07291d6\|b392fc8\|f12deaf\|02fae61\|9822cfa\|5260049\|7bf9acc\|359c5f0\|5f98e8b\|e09c79c\|9bebda9\|4b24c81\|94d8a94\|fc85de7\|bdefb5a\|3b2fc9b\|b1b01f1\|56e70f0\|8cf798a\|1a6abd0' docs/factory/production-ml-library/pml0-support-matrix.md   # >= 5
 grep -c 'LN3_\|IN_LN3_\|COS_1\|SIN_1\|1.576448169383708\|0.01137' docs/factory/production-ml-library/pml0-support-matrix.md   # >= 1
+grep -c 'edcff45\|2ec80d8\|d182c5c\|686653c\|6dd29fb\|82048b5\|fc59ac4' docs/factory/production-ml-library/pml0-support-matrix.md   # >= 1 (GGUF-A3 C2/C3 evidence links)
+grep -c '0b21525e972670ed59e1812e170b27c26355381f0656ecc4e25617ece7dac58b' docs/factory/production-ml-library/pml0-support-matrix.md   # >= 1 (Qwen3.6 receipt pin)
 # 3. Structural tier recorded, never upgraded — no executed-identity claim.
 grep -c 'does NOT claim executed' docs/factory/production-ml-library/pml0-support-matrix.md   # >= 3
 grep -c 'CTO8-1' docs/factory/production-ml-library/pml0-support-matrix.md   # >= 2
