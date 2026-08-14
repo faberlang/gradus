@@ -9,12 +9,12 @@ One `.fab` file → one import path. Nested dirs for packages.
 
 ## Live modules (post-PML1–5 + correctness wave)
 
-The live tree has 29 modules and 611 declared functions (inventory
+The live tree has 30 modules and 654 declared functions (inventory
 re-baselined for the A1C capsule-schema-2.0.0 surface, the LIB-02-U1
-`gguf_manifest` array accessors, the LIB-02-U2 tokenizer runtime, and the
-GGUF-A3 `tensor_payload` / `tensor_view` + widened-dequant surface — see the
-Coverage Check in
-[`docs/api-reference.md`](api-reference.md)). The GGUF-A1b surface
+`gguf_manifest` array accessors, the LIB-02-U2 tokenizer runtime, the
+GGUF-A3 `tensor_payload` / `tensor_view` + widened-dequant surface, and the
+REF-01-U1.6 `dense_llama` llama architecture adapter — see the Coverage Check
+in [`docs/api-reference.md`](api-reference.md)). The GGUF-A1b surface
 has an executed 40-case synthetic package-MIR proof and guarded real-file
 inspection receipts for six operator-local GGUFs. Exact evidence and boundaries
 are recorded in [`exempla/gguf-manifest/README.md`](../exempla/gguf-manifest/README.md)
@@ -39,6 +39,7 @@ and [`exempla/gguf-inspect/README.md`](../exempla/gguf-inspect/README.md).
 | `gradus:data` | `src/data.fab` | Stub — batching/shuffling/tokenization declared future |
 | `gradus:model/artifact` | `src/model/artifact.fab` | Pathless content identity for bounded model artifacts (GGUF-A1a) |
 | `gradus:model/capsule` | `src/model/capsule.fab` | Admitted-model capsule — the typed identity handoff (`capsule-schema-2.0.0`, PML2, C8; A1C-M1 clean break — schema 1 retired) |
+| `gradus:model/dense_llama` | `src/model/dense_llama.fab` | Typed `llama` (SmolLM2) architecture adapter — canonical tensor-name → manifest-descriptor mapping over the GGUF-A1b surface, frozen SmolLM2-360M config, fail-closed typed diagnostics (REF-01-U1.6) |
 | `gradus:model/gguf_manifest` | `src/model/gguf_manifest.fab` | Format-general GGUF v3 bounded-corpus parser plus pathless range inspection, checked tensor fragments, and typed tokenizer metadata array accessors (`textorum`/`numerorum`, LIB-02-U1) |
 | `gradus:model/gguf` | `src/model/gguf.fab` | GGUF row admission → capsule (PML2) |
 | `gradus:model/safetensors` | `src/model/safetensors.fab` | Safetensors row admission → capsule (PML2) |
@@ -66,6 +67,8 @@ PML2 Model admission    gradus:model/artifact, gradus:model/capsule,
                         gradus:model/gguf_manifest, gradus:model/gguf,
                         gradus:model/safetensors, gradus:model/dequant,
                         gradus:model/tensor_payload, gradus:model/tensor_view
+REF-01 Dense reference  gradus:model/dense_llama (llama/SmolLM2 adapter;
+                        dense_qwen2 follows in REF-01-U1.7)
 PML2 Tokenizer identity gradus:tokenizer
 PML5 Inference          gradus:decode, gradus:cache, gradus:sampling,
                         gradus:generation

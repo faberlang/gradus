@@ -88,6 +88,22 @@ per-channel-bias broadcast path is repaired (recorded residual — `linear`
 bias [N] against [M,N] requires `forma.broadcastum` singleton broadcast,
 which the current implementation rejects at runtime).
 
+REF-01-U1.6 (2026-08-14) adds the typed **`llama` architecture adapter**
+(`gradus:model/dense_llama`): canonical tensor-name → manifest-descriptor
+mapping (`model.embed_tokens`, `model.layers.{N}.input_layernorm`,
+`.self_attn.{q,k,v,o}_proj`, `.post_attention_layernorm`,
+`.mlp.{gate,up,down}_proj`, `model.norm`, `lm_head`) over the GGUF-A1b
+manifest surface, with the frozen SmolLM2-360M config (32 layers, 15 heads,
+5 KV heads, head_dim 64, hidden 960, vocab 49152, tied embedding) and
+fail-closed typed diagnostics (unknown canonical, out-of-range layer, missing
+tensor, unknown layout). The adapter exempla (`exempla/dense-llama-adapter`,
+committed this unit) executes 19 PASS / 0 FAIL through package MIR on a
+synthetic corpus carrying the real file's descriptor facts. This is
+**structural-tier architecture-adapter evidence** feeding Gate 1 (REF-01-U1.8
+assembly and the U1.9/U1.10 prefill receipts); it admits no new support row,
+claims no model execution, logits, tokenizer, or device semantics — CTO8-1
+stays the named gate.
+
 ## 1. Admitted rows
 
 ### Row 1 — PML2 Safetensors model-file admission row
