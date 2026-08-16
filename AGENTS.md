@@ -1,6 +1,11 @@
 # Gradus Agent Instructions
 
-Gradus is the public Faber source library for `gradus:*` imports — automatic
+**Workspace work mode.** Ordinary development is **direct** in this
+checkout on `main`. Worktree packets under `../worktrees/<lane>/` are
+optional Tugboat isolation. Do not stand up lanes unless the operator
+asked. Container law: [`../AGENTS.md`](../AGENTS.md).
+
+Gradus is the public Faber source library for `gradus:*` imports — automatic,
 differentiation, loss functions, optimizers, neural-network primitives, and
 training-loop mechanics. This repo owns `.fab` source under `src/`; Radix and
 `faber` consume it through `FABER_LIBRARY_HOME`, usually the parent
@@ -39,7 +44,8 @@ is flattened to a top-level leaf (`gradus:optimize`, not
 
 Full map: [`docs/module-map.md`](docs/module-map.md). API shape:
 [`docs/api-shape-policy.md`](docs/api-shape-policy.md). Target architecture:
-[`docs/factory/gradus-ml-foundation/GOAL.md`](docs/factory/gradus-ml-foundation/GOAL.md).
+[`docs/archived/gradus-ml-foundation/GOAL.md`](docs/archived/gradus-ml-foundation/GOAL.md)
+(archived); live ML work is under `docs/factory/production-ml-library/`.
 
 ## Corpus
 
