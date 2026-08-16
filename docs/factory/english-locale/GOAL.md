@@ -1,6 +1,6 @@
 # Goal: Gradus English locale + English identifiers
 
-**Status**: active — S1 3/5: S1-U1 landed (`108ce41`, la frontmatter stamp); S1-U2 landed (`40e1246`, check-compile ok at closeout); S1-U3 landed (`2d32834`, grep gate 167-hits-all-comments at closeout); S1-U4 in progress; S1-U5 pending
+**Status**: active — S1 Pass A complete (5/5): S1-U1 landed (`108ce41`, la frontmatter stamp); S1-U2 landed (`40e1246`, check-compile ok at closeout); S1-U3 landed (`2d32834`, grep gate 167-hits-all-comments at closeout); S1-U4 landed (`733b3c5`, exempla + tests conversion); S1-U5 closeout recorded below; S2 identifier rename and S3 sibling consumers remain pending
 **Repo**: gradus
 **Created**: 2026-08-15
 **Consumer**: campaign `docs/factory/english-locale/CAMPAIGN.md`, then delivery / factory
@@ -231,8 +231,77 @@ Decision: included.
 | S1-U1 | done | — | `108ce41` | `la` frontmatter stamped on all 83 owned files; no other content changes |
 | S1-U2 | done | — | `40e1246` | `src/**/*.fab` → en (convert + frontmatter flip + root manifest + gate greps); check-compile ok at closeout; landed after the converter repair series, with the parity receipts linked above |
 | S1-U3 | done | — | `2d32834` | `src/**/*.proba` → en + frontmatter flip; grep gate 167-hits-all-comments at closeout; all 32 test-source files landed on the English surface |
-| S1-U4 | in-progress | — | — | exempla + tests → en; manifest flips |
-| S1-U5 | pending | — | — | S1 closeout: full gate evidence |
+| S1-U4 | done | — | `733b3c5` | 17 exempla + admission test → en; all 17 exempla manifests flipped to canonical `[locale] locale = "en"` |
+| S1-U5 | done | hand `7fabb282` | this closeout commit | Five gates green; sanctioned 750-symbol inventory re-baseline and acceptance evidence recorded below |
+
+## S1 Pass A closeout (2026-08-16)
+
+The closeout ran on Gradus `main` at the landed S1-U4 state. The Faber
+1.7.0 binary was built from Radix `c96250a55bbfb8897485c9bd1729c99d386490a8`
+in a temporary `/tmp` worktree because the Radix main checkout had foreign
+`Cargo.lock` dirt. The five gates below are the current execution evidence.
+
+| Gate | Command / scope | Result |
+| --- | --- | --- |
+| Compile | `FABER_BIN=/tmp/faber-s1-u5-c96250a55bbf FABER_LIBRARY_HOME=/Users/ianzepp/work/faberlang ./scripta/check-compile` — Gradus root plus `gradient-seam`, `training-loop-mlp`, `token-generation`, `gguf-manifest`, `gguf-inspect`, `gguf-materialize`, `qwen36-35b-inference`, and `gguf-admit-qwen35moe` | **PASS** — exit 0; only the documented non-blocking LOCALE002/WARN018 warnings appeared |
+| Source | `./scripta/check-source` | **PASS** — exit 0 |
+| Inventory | `./scripta/inventory-public-symbols` | **PASS** — exit 0; the sanctioned U2 post-English baseline is **750**, not the stale U5-text 749; full map is recorded below |
+| Acceptance grep | `rg -n '\\b(functio|importa|textus|redde|sponte)\\b' src exempla tests` | **PASS** by code-position criterion — 191 hits: 181 comments, 3 preserved user identifiers, 2 preserved string literals, 5 README prose hits, and 0 forbidden keyword/type tokens |
+| Clean break | landing commit message | **RECORDED** — Gradus is pre-1.0; Pass A is a clean break with no aliases or shims |
+
+The exact acceptance grep is intentionally broad so the review can see
+preserved Pass A material. The two string-literal hits and five README hits
+are allowed by the Phase Intent (strings and documentation are not code
+keywords); the three identifier hits are the preserved `textus` field in
+`model/safetensors`. No hit is a forbidden keyword/type token in code.
+
+### Sanctioned 750-symbol inventory map
+
+The U5 delivery text's 749 figure predates the U2-sanctioned re-baseline. The
+live script and this closeout use the sanctioned **750** total and this
+per-module map:
+
+```text
+attention              35
+cache                  37
+data                    0
+decode                 46
+dtype                  14
+generation             27
+gradient               13
+gradus                   7
+loss                   11
+math                   23
+metrics                 6
+model/artifact          4
+model/capsule          45
+model/dense_llama       6
+model/dense_qwen2      14
+model/dense             11
+model/dequant          21
+model/gguf_manifest    49
+model/gguf             10
+model/qwen35moe        42
+model/safetensors      24
+model/tensor_payload    1
+model/tensor_view       7
+nn                      24
+optimize                26
+parameter               37
+sampling                27
+serialize               34
+shape                    9
+tensor                  11
+tokenizer               74
+train                   41
+transformer             14
+TOTAL                  750
+```
+
+S1 Pass A is complete. S2 owns identifier renames and the compatibility-policy
+follow-up; S3 owns sibling consumer migration. The dormant `scripta/` and
+`fixtures/` migration sources, and the retained Latin prose in comments,
+strings, and exempla README files, remain recorded residuals by scope.
 
 ## Open Questions
 
