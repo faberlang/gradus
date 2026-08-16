@@ -227,3 +227,355 @@ accepted.
 4. Inventory count stability held on the `dtype.fab` probe (14 == 14); if
    another module drifts after conversion the cause is comment/string Latin
    `functio` and the re-baseline must say so. Audit spot-checks this.
+
+---
+
+# S2 — Pass B: identifier renames (collision-preflight first)
+
+**Status**: READY for delivery audit — S2 is lowered into one mandatory
+collision-preflight unit followed by the nine campaign families. This section
+is planning authority only; it does not rename source, tests, exempla, packs,
+or sibling consumers.
+
+**Goal**: [`GOAL.md`](GOAL.md), S2 identifier surface after S1 commit
+`e114ea3`. **Campaign**: [`CAMPAIGN.md`](CAMPAIGN.md), S2 family list.
+**Seed**: [`rename-seed.md`](rename-seed.md), used as the base table only.
+Live Radix and live Gradus evidence below supersede a seed default whenever
+they disagree.
+
+## S2 normalized outcome
+
+The Gradus-owned `src/` member surface, its co-located `.proba` proofs, and
+in-repo exempla/tests are migrated to English identifiers as a pre-1.0 clean
+break. Import coordinates (`gradus:tensor`, `gradus:model/gguf`, and the rest)
+stay unchanged. There are no forwarding aliases, dual-authority names, or
+Gradus `[[library_members]]` pack rows. Every family lands with its collision
+ledger row and reserved-probe receipt before the next family starts.
+
+The live S1 inventory is **750** `grep -c 'fn '` declarations. The old `749`
+wording in earlier S1 prose is stale: the live script explicitly records the
+English-locale re-baseline and the intentional `transformer` comment match.
+The family declaration counts used here are therefore:
+
+| Family | Live files | Live `fn ` count | Source boundary |
+| --- | ---: | ---: | --- |
+| L1 dtype/shape/tensor/math | 4 | 57 | `src/dtype*`, `shape*`, `tensor*`, `math*` |
+| Shared parameter/serialize/gradient | 3 | 84 | `src/parameter*`, `serialize*`, `gradient*` |
+| Train loss/optimize/nn/train/metrics/data | 6 | 108 | the six named top-level modules |
+| Arch attention/transformer | 2 | 49 | `src/attention*`, `transformer*` |
+| Model artifact/capsule/gguf/safetensors/dequant/tensor_*/dense_* | 12 | 234 | every live `src/model/*.fab` and `.proba` |
+| Tokenizer | 1 | 74 | `src/tokenizer*` |
+| Inference cache/decode/sampling/generation | 4 | 137 | the four named top-level modules |
+| Facade + exempla/tests chase | 1 plus callers | 7 | `src/gradus*`, `exempla/**`, `tests/**`, remaining call sites |
+| **Total source inventory** | **33** | **750** | all live modules; no remainder |
+
+The `fn ` count is an inventory baseline, not the number of renamed members:
+private `_` helpers, comments containing `fn `, already-English names, fields,
+classes, variants, and parameters are handled by the family ledger rules below.
+
+## Mandatory first unit — S2-PREFLIGHT collision ledger
+
+This unit is the hard gate. No family rename may start until the preflight
+artifact is committed and every family row is locked.
+
+| Field | S2-PREFLIGHT contract |
+| --- | --- |
+| **id** | `S2-PREFLIGHT` |
+| **outcome** | Create `docs/factory/english-locale/s2-collision-ledger.md` with one post-rename symbol/collision row for each of the nine families, the exact live-source evidence used, the reserved-name decisions, and the nine scratch first-file probe receipts. |
+| **write_scope** | `gradus/docs/factory/english-locale/s2-collision-ledger.md` only; temporary probe copies may live under `/tmp/gradus-s2-*`; read-only Radix paths are listed below. No `src/`, `.proba`, `exempla/`, `tests/`, pack, or sibling-repo writes. |
+| **done_when** | (1) the 750-symbol live census is recorded; (2) every family row has a complete old→new member ledger, including private helpers and collision-sensitive fields; (3) the reserved lock is checked against live Radix `[keywords]`, `[types]`, `[intrinsics]`, builtin `STATUS_VARIANTS`, scalar-interval rules, tensor-directed rules, and frame-view methods; (4) the Tensor field/method shape probe is recorded; (5) the member-scoped parameter policy is recorded; (6) one scratch convert+rename+`faber check` probe has run for each source family before any batch; (7) the artifact says explicitly that Gradus owns this preflight and that no pack-row mechanism is involved. |
+| **depends_on** | S1 closeout `e114ea3`; no PML5 source overlap during the rename wave. |
+| **sanity** | `git diff --check`; inspect the nine ledger rows and all probe paths. |
+| **non_goals** | No implementation rename; no `[[library_members]]`; no Radix edit; no Norma/Tela/Triga work; no sibling-consumer migration. |
+| **risk** | high — a false collision decision can make every later family fail or silently create a compiler-owned name collision. |
+| **integrable** | yes — the artifact is the gate and contains no product code. |
+
+### Preflight evidence lock
+
+The preflight must use these live paths, not a copied or historical name list:
+
+| Collision surface | Live evidence | Required S2 decision |
+| --- | --- | --- |
+| English reserved names | `radix/stdlib/locale/en/pack.toml`, sections `[keywords]`, `[types]`, and `[intrinsics]` | Snapshot the exact rows at probe time. Treat `value` (`valor` type), `string`, `int`, `bool`, `float`, `list`, `map`, `set`, `bytes`, `void`, `unknown`, `null`, `tensor`, `vector`, `matrix`, `fn`, `class`, `union`, `enum`, `type`, `const`, `let`, `var`, `import`, `from`, `as`, `public`, `private`, `optional`, `return`, `if`, `else`, `elif`, `then`, `for`, `while`, `match`, `case`, `throw`, `catch`, `do`, `assert`, `panic`, `true`, `false`, `and`, `or`, `not`, `is`, `self`, `main`, `print`, `test`, `read`, `write`, `warn`, `debug`, `size`, `name`, `step`, `range`, `between`, `within`, `until`, `line`, `args`, `call`, `await`, `async`, `future`, `format`, `require`, and `exit` as reserved until the live first-file probe proves the exact member position. |
+| Builtin frame variants | `radix/crates/radix/src/builtins/frame_types.rs`, `STATUS_VARIANTS` | Lock `request`, `item`, `byte`, `bulk`, `done`, `error`, and `cancel` out of every new target. Also read `radix/crates/radix-runtime-contract/src/frame.rs`; its `FrameStatus` order and terminal/content classification are part of the same live contract. A plain declaration probe is not enough if frame registration is active. |
+| Scalar intervals | `radix/crates/radix/src/semantic/passes/typecheck/intervallum.rs` and the interval intrinsic dispatch in `.../typecheck/intrinsics.rs` | `longitudo` is currently constrained to a bare `numerus` interval bound. A Gradus user member `longitudo` may target `length`, but the probe must not turn compiler interval semantics into a Gradus alias or suggest `size`. |
+| Tensor-directed names | `radix/crates/radix/src/semantic/passes/typecheck/tensor_type_directed.rs`, `radix/crates/radix/src/semantic/tensor_type_directed.rs` | Check `structa`, `creata`, `crea`, and `formata` against every family ledger. `structa` is a Gradus user constructor and targets `construct`; compiler-directed `creata`/`crea`/`formata` are not Gradus members and must not be renamed as if they were. |
+| Tensor/scalar intrinsic allowlist | `radix/crates/radix/src/semantic/passes/typecheck/intrinsics.rs` | Check `subtrahe`, `longitudo`, `applica`, and `magnitudines` against every S2 target. The live rows are `subtract`, `length`, `apply`, and `shape`; preserve compiler intrinsic meaning, while renaming a Gradus user member only when its receiver/member ledger says so. |
+| Compiler view methods | `radix/crates/radix/src/semantic/passes/typecheck/call.rs` | Census the live `meus.da`, `meus.fini`, `tuus.accipe`, `tuus.cursor`, `tuus.exhauri`, and `tuus.fini` branches. `Tensor.accipe → get` is a Gradus member decision and must be probed against this compiler-owned receiver surface; do not edit the compiler view names. |
+| Valor/catch/class typo class | Live Gradus `src/**/*.fab`/`.proba` plus Radix HIR catch/typecheck nodes (`radix/crates/radix-hir/src/nodes.rs`, `radix/crates/radix/src/semantic/passes/typecheck/*.rs`) | Classify every `valor` hit as a member/field, parameter/local, or string/comment. `valor` must never become the en type spelling `value`. `catch err` bindings remain bindings; only a `causa` member accessor becomes `message`. `class` is the en rendering of the Faber `genus` keyword, not a user type target. Record any typo or ambiguous catch/error class before a family is unlocked. |
+
+The live source census is a required cross-check, not a prose exercise. The
+preflight receipt must include the commands (run from the repository roots)
+that produced it:
+
+```bash
+# Gradus inventory and source census
+./scripta/inventory-public-symbols
+rg -n --glob '*.fab' --glob '*.proba' \\
+  '\\b(figura|forma|gradus|typus|typo|valor|causa|accipe|structa|verifica|serializa|deserializa|quantitas|longitudo|nomen)\\b' src
+
+# Radix reserved/allowlist census
+rg -n '^(typus|valor|magnitudo|nomen|subtrahe|longitudo|applica|magnitudines|crea)\\s*=' \\
+  /Users/ianzepp/work/faberlang/radix/stdlib/locale/en/pack.toml
+rg -n 'STATUS_VARIANTS|request|item|byte|bulk|done|error|cancel' \\
+  /Users/ianzepp/work/faberlang/radix/crates/radix/src/builtins/frame_types.rs \\
+  /Users/ianzepp/work/faberlang/radix/crates/radix-runtime-contract/src/frame.rs
+rg -n 'structa|creata|crea|formata|subtrahe|longitudo|applica|magnitudines' \\
+  /Users/ianzepp/work/faberlang/radix/crates/radix/src/semantic
+```
+
+The existing live scratch result is already useful evidence: with the in-tree
+Faber 1.7.0 binary, a temporary English file containing a `Tensor` field
+`shape` and a `shape()` method returned `ok`. The preflight must preserve that
+receipt and still probe the first real Tensor family file. The locked default
+is therefore **field `forma → shape` plus method `figura() → shape()`**. If a
+fresh first-file probe contradicts the scratch result, stop and amend the
+ledger before any rename; do not invent a facade.
+
+The seed's other collision defaults are locked as follows unless a live
+first-file probe finds a concrete contradiction:
+
+- `valor` never targets `value`; tensor/value carriers use `payload`, and an
+  accessor may use `get` only where the receiver has no existing `get` member.
+- `typus`/`typo` targets `dtype` on DType-bearing carriers and `kind` only
+  outside that dtype meaning. It never targets `type`.
+- `quantitas` targets `numel`, not `size`; live en maps `magnitudo = "size"`
+  and `size` is therefore a reserved compiler spelling even though a bare
+  scratch declaration may parse.
+- `nomen` keeps the seed's `name` candidate only for a member position after
+  the first-file probe includes the live `@ name` annotation-key context; if
+  that probe reports a namespace collision, the family row must record the
+  specific semantic escape (`label`, `field_name`, or another non-reserved
+  target) before rename. This is a probe decision, not permission to use a
+  guessed synonym.
+- `causa` targets `message`; `structa` targets `construct`; `serializa_*`
+  and `deserializa_*` target `serialize_*` and `deserialize_*`; `forma` and
+  `figura` follow the Tensor shape collapse above; `longitudo` user members
+  target `length` only after the receiver-specific probe.
+
+### First-file probe discipline
+
+`S2-PREFLIGHT` runs these scratch probes in order, one per source family, and
+records the exact input copy, rename map, compiler revision, and result before
+that family's batch is admitted:
+
+| Family | First-file probe | Required collision focus |
+| --- | --- | --- |
+| L1 | `src/tensor.fab` | `forma` field + `figura()` method → `shape`/`shape()`, `gradus→rank`, `quantitas→numel`, `typus→dtype`, `accipe→get`, `structa→construct` |
+| Shared | `src/parameter.fab` | `Parametrum→Parameter`, `Identitas→Identity`, `valor→payload`, `nomen→name` probe, `causa→message`, member-only params |
+| Train | `src/optimize.fab` | `SgdStatum→SgdState`, `Passus→Step`, `structa→construct`, `inveni→find`, `lentus→rate`, `passus→step`, reserved status/type names |
+| Arch | `src/attention.fab` | `RopeConfigura→RopeConfig`, `RopePolitica→RopePolicy`, `causa→message`, no compiler view/intrinsic capture |
+| Model | `src/model/capsule.fab` | `Capsula→Capsule`, `valor→payload`/non-value escape, `nomen→name`, `forma→shape`, `longitudo→length`, error-class spellings |
+| Tokenizer | `src/tokenizer.fab` | `Tokenizator→Tokenizer`, `IdentitasTokenizator→TokenizerIdentity`, `structa→construct`, `verifica→verify`, `CategoriaUnicode→UnicodeCategory` |
+| Inference | `src/cache.fab` | `KVCache` accessors, `clavis→key`, `valor→payload`, `longitudo→length`, `redintegra→reset`, `appende→append` |
+| Facade/callers | `src/gradus.fab` | `causa→message`, private helper spellings, facade exports, then exempla/tests call-site chase |
+| Docs/inventory | no source file | Rebase only after all source probes and family ledgers are closed; rerun inventory against live names |
+
+A probe is a scratch conversion of the first file plus its direct in-family
+references, followed by the normal post-S1 English `faber check`; it is not a
+second Pass A locale conversion and it does not write a source file. The probe
+must check the renamed member in its real receiver/namespace position, not just
+as a free declaration. A failing probe blocks that family and is a ledger
+finding, not a reason to weaken the compiler check.
+
+## Per-family locked ledger and unit graph
+
+The rows below are the delivery ledger. Each family unit copies its row into
+the preflight artifact, updates the row with the actual probe receipt, then
+performs the one family rename. The path list names declaration/proof files;
+call-site edits are limited to the old identifiers in that row. Import paths,
+pack rows, and unrelated declarations are out of scope.
+
+### S2-L1 — dtype / shape / tensor / math
+
+| Field | Value |
+| --- | --- |
+| **id** | `S2-L1` |
+| **outcome** | Rename the L1 foundation members to English, including the locked Tensor shape collapse, while preserving compiler intrinsics and `gradus:*` coordinates. |
+| **write_scope** | `src/dtype.fab`, `src/dtype.proba`, `src/shape.fab`, `src/shape.proba`, `src/tensor.fab`, `src/tensor.proba`, `src/math.fab`, `src/math.proba`; matching Gradus source call sites for this row only. |
+| **ledger** | `figura→shape`, field `forma→shape`, `gradus→rank`, `quantitas→numel`, `typus→dtype`, `valet→valid`, `accipe→get`, `structa→construct`, `structa_typo→construct_dtype`, `impleta→fill`, `FormaInvalida→InvalidShape`, `ElementaMismatch→ElementMismatch`, `TerminusExcedit→IndexOutOfBounds`, `causa→message`; `broadcastum→broadcast`, `reformanda→reshape`, `expansio→expand`, `promovet→promote`, `angusta→narrow`, `finita→finite`, `concatenatio→concatenate`, `segmentum→slice`; already-English arithmetic names stay. `nomen`/`typo` use the preflight member-position result. |
+| **done_when** | The ledger row is updated with the scratch receipt; all listed `.fab` and `.proba` declarations/call sites use the locked names; no compiler intrinsic `forma`, `crea`, `formata`, `subtrahe`, `magnitudines`, or `longitudo` implementation is edited; narrow `faber check` on the touched first-file/module surface is green. |
+| **depends_on** | `S2-PREFLIGHT`. |
+| **sanity** | `FABER_BIN=… FABER_LIBRARY_HOME=… faber check src/tensor.fab` plus the touched L1 module checks. |
+| **non_goals** | No S2 callers in exempla/tests, no docs rebase, no Radix changes, no dtype/shape behavior changes. |
+| **risk** | high — field/method namespace collapse and compiler tensor intrinsic overlap. |
+| **integrable** | no — later family call sites and the final exempla/tests chase remain on the pre-S2 names until the integration gate. |
+
+### S2-SHARED — parameter / serialize / gradient
+
+| Field | Value |
+| --- | --- |
+| **id** | `S2-SHARED` |
+| **outcome** | Rename the shared parameter, wire-format, and gradient contracts as one API family, preserving serialization field order and error text. |
+| **write_scope** | `src/parameter.fab`, `src/parameter.proba`, `src/serialize.fab`, `src/serialize.proba`, `src/gradient.fab`, `src/gradient.proba`; matching Gradus source call sites for this row only. |
+| **ledger** | `Parametrum→Parameter`, `ParametrumError→ParameterError`, `Identitas→Identity`, `Statio→Station`, `Registrum→Registry`, `Tensum→SerializedTensor`, `ParametrumWire→ParameterWire`, `Gradiente→Gradient`, `Gradientes→Gradients`, `GradienteError→GradientError`; `valor→payload`, `figura→shape`, `quantitas→numel`, `typo→dtype`, `datos→data`, `nomen_typi→dtype_name`, `possessor→owner`, `identia→identity`, `muta→mutate`, `adscisco→add`, `inveni→find`, `contineo→contains`, `trainabiles→trainable`, `gelidae→frozen`, `ordo→order`, `causa→message`, and the seed `serializa/deserializa` pairs. `nomen` is a probe-locked member target; non-member params retain Latin unless swept incidentally. |
+| **done_when** | The parameter/gradient public contracts and wire carrier names agree in `.fab`, `.proba`, and internal source call sites; the ledger includes the post-rename wire field map; no wire literal, version marker, or error message changes; first-file probe and touched-module checks are green. |
+| **depends_on** | `S2-L1`. |
+| **sanity** | `faber check src/parameter.fab`, `src/serialize.fab`, and `src/gradient.fab`; inspect serialization literals unchanged. |
+| **non_goals** | No pack rows, no wire-format version bump, no parameter policy expansion, no exempla/tests chase. |
+| **risk** | high — shared public names and serialized carriers are consumed throughout the library. |
+| **integrable** | no — downstream training/model callers are intentionally chased by their family units. |
+
+### S2-TRAIN — loss / optimize / nn / train / metrics / data
+
+| Field | Value |
+| --- | --- |
+| **id** | `S2-TRAIN` |
+| **outcome** | Rename the training-stack members without changing numerical behavior, error text, optimizer state wire shape, or the already-English loss/activation names. |
+| **write_scope** | `src/loss.fab`, `src/loss.proba`, `src/optimize.fab`, `src/optimize.proba`, `src/nn.fab`, `src/nn.proba`, `src/train.fab`, `src/train.proba`, `src/metrics.fab`, `src/metrics.proba`, `src/data.fab`; matching Gradus source call sites for this row only. `data.fab` has no co-located `.proba` in the live tree. |
+| **ledger** | `OptimizeError→OptimizeError` stays only where already English, `SgdStatum→SgdState`, `Passus→Step`, `Schedula→Schedule`, `Modus→Mode`, `Semen→Seed`, `Fructus→Draw`, `FructusF32→DrawF32`, `Excutio→Dropout`, `Tabula→Checkpoint`, `Metricum→Metric`; `structa→construct`, `lentus→rate`, `passus→step`, `semen→seed`, `stratorum→layers`, `dimensio→dimension`, `adscisco→add`, `inveni→find`, `contineo→contains`, `statum_aequus/sgd_aequus/tabula_aequus→*_equal`, `causa→message`; `mse`, `cross_entropy`, `linear`, `gelu`, `layernorm`, `rmsnorm`, `silu`, `swiglu`, and other already-English names stay. `data` has zero `fn ` declarations in the live inventory but is still included for call-site and header chase. |
+| **done_when** | The six modules and their proofs use the family ledger; optimizer serialization markers and numeric formulas are byte/behavior identical; the reserved probe confirms no target is a keyword, type, STATUS_VARIANT, or compiler intrinsic; narrow checks are green. |
+| **depends_on** | `S2-SHARED`. |
+| **sanity** | `faber check src/optimize.fab`, `src/loss.fab`, `src/nn.fab`, `src/train.fab`; no full suite on the Hand. |
+| **non_goals** | No model/inference rename, no new training API, no parameter renaming outside the member-scoped rule. |
+| **risk** | high — optimizer state and training callers span several modules. |
+| **integrable** | no — model and inference callers remain until their family units. |
+
+### S2-ARCH — attention / transformer
+
+| Field | Value |
+| --- | --- |
+| **id** | `S2-ARCH` |
+| **outcome** | Rename attention and transformer configuration/error members while retaining already-English operation names and tensor semantics. |
+| **write_scope** | `src/attention.fab`, `src/attention.proba`, `src/transformer.fab`, `src/transformer.proba`; matching Gradus source call sites for this row only. |
+| **ledger** | `RopeConfigura→RopeConfig`, `RopePolitica→RopePolicy`, `TransformerError→TransformerError` stays, `causa→message`, `structa_rope_configura→construct_rope_config`, `politica_nomen→policy_name`, `politica_consecutiva→consecutive_policy`, `politica_interposita→interleaved_policy`, `rotary_position_embedding_configura→rotary_position_embedding_config`, `scaled_dot_product_causal_rope` and other already-English names stay; private helper renames follow the same English verb table and remain out of API inventory coverage. |
+| **done_when** | Both modules, their proofs, and in-family references use the locked row; attention/transformer formulas and shape contracts are unchanged; first-file probe and narrow checks pass. |
+| **depends_on** | `S2-TRAIN`. |
+| **sanity** | `faber check src/attention.fab` and `src/transformer.fab`. |
+| **non_goals** | No compiler attention feature, no math behavior change, no model assembly rename. |
+| **risk** | medium-high — many private helpers share `typo`, `forma`, and error accessors. |
+| **integrable** | no — model and facade callers remain until later units. |
+
+### S2-MODEL — model artifact / capsule / GGUF / safetensors / dequant / tensor_* / dense_*
+
+| Field | Value |
+| --- | --- |
+| **id** | `S2-MODEL` |
+| **outcome** | Rename every live `src/model/*.fab` and matching `.proba` surface to the English model vocabulary, preserving artifact identity, file formats, admission rows, and tensor layout contracts. |
+| **write_scope** | `src/model/artifact.{fab,proba}`, `capsule.{fab,proba}`, `dense.{fab,proba}`, `dense_llama.{fab,proba}`, `dense_qwen2.{fab,proba}`, `dequant.{fab,proba}`, `gguf.{fab,proba}`, `gguf_manifest.{fab,proba}`, `qwen35moe.{fab,proba}`, `safetensors.{fab,proba}`, `tensor_payload.{fab,proba}`, `tensor_view.{fab,proba}`; matching Gradus source call sites for this row only. |
+| **ledger** | Apply seed types: `Capsula→Capsule`, `IdentitasContenuti→ContentIdentity`, `IdentitasCache→CacheIdentity`, `IdentitasTokenizator→TokenizerIdentity`, `ManifestumGguf→GgufManifest`, `ManifestumSafetensors→SafetensorsManifest`, `MetadatumGguf→GgufMetadata`, `DescriptioTensorisGguf→GgufTensorDescriptor`, `DescriptioTensorisSafetensori→SafetensorsTensorDescriptor`, `CorpusGguf→GgufCorpus`, `LectioFontis→SourceRead`, `VisumTensoris→TensorView`, `VisioError→ViewError`, `Manifesta→Manifest`, `FormaError→ShapeError`, plus every seed model type through `QwenCanonicalTensor`; `causa→message`, `valor→payload` or a receiver-specific non-value escape, `forma→shape`, `figura→shape`, `typus/typo→dtype` or `kind`, `longitudo→length`, `nomen→name` only after the annotation-key probe, `clavis→key`, `lege_*→read_*`, `admitto/admissio→admit/admission`, `praevideo→forward`, `inspice→inspect`, `verifica→verify`, `structa→construct`, `serializa/deserializa→serialize/deserialize`; already-English `TensorError`, `GgufError`, `DenseError`, `parse`, `layout`, `admit`, and technical dtype names stay. |
+| **done_when** | All twelve model modules and their proofs use the row; GGUF/safetensors wire keys, hashes, tensor descriptor fields, admission constants, and error messages remain unchanged; the model first-file probe includes `valor`, `nomen`, `forma`, `longitudo`, and error/catch classes; touched module checks are green. |
+| **depends_on** | `S2-ARCH`. |
+| **sanity** | `faber check src/model/capsule.fab`, then the exact touched model leaves named by the batch. |
+| **non_goals** | No GGUF/Safetensors format change, no PML5 implementation, no pack-row addition, no external model-consumer migration. |
+| **risk** | high — 234 inventory rows and several artifact identity/wire contracts. |
+| **integrable** | no — tokenizer/inference/facade callers remain until later units. |
+
+### S2-TOKENIZER — tokenizer
+
+| Field | Value |
+| --- | --- |
+| **id** | `S2-TOKENIZER` |
+| **outcome** | Rename tokenizer identity, admission, encoding, decoding, and Unicode-category members while preserving pinned vocabulary and EOG/BOS behavior. |
+| **write_scope** | `src/tokenizer.fab`, `src/tokenizer.proba`; matching Gradus source call sites for this row only. |
+| **ledger** | `Tokenizator→Tokenizer`, `IdentitasTokenizator→TokenizerIdentity`, `CategoriaUnicode→UnicodeCategory`, `causa→message`, `structa→construct`, `verifica→verify`, `serializa/deserializa→serialize/deserialize`, `encoda/decoda→encode/decode`, `fabricare→build`, `categoria→category`, `nomen_categoriae→category_name`, `clavis→key`, `progenies→merges`, `digestio_vocabuli→vocab_digest`, `eog→eog`, `add_bos→add_bos`; already-English technical names stay, and the target `test`/`print`/`name`/`value` set remains reserved. |
+| **done_when** | Tokenizer source/proofs and in-family references use the row; pinned vocab, EOG set, BOS/space policy, and serialized identity strings are unchanged; first-file probe and narrow `faber check` pass. |
+| **depends_on** | `S2-MODEL`. |
+| **sanity** | `faber check src/tokenizer.fab`. |
+| **non_goals** | No tokenizer behavior correction, no corpus consumer migration, no compatibility alias. |
+| **risk** | high — identity and wire strings are externally meaningful even in a pre-1.0 clean break. |
+| **integrable** | no — inference and exempla callers remain. |
+
+### S2-INFERENCE — cache / decode / sampling / generation
+
+| Field | Value |
+| --- | --- |
+| **id** | `S2-INFERENCE` |
+| **outcome** | Rename inference cache, decode, sampling, and generation members while preserving cache identity, token sampling behavior, and generation stop policy. |
+| **write_scope** | `src/cache.{fab,proba}`, `src/decode.{fab,proba}`, `src/sampling.{fab,proba}`, `src/generation.{fab,proba}`; matching Gradus source call sites for this row only. |
+| **ledger** | `KVCache` stays, `IdentitasCache→CacheIdentity`, `Pondera→Weights`, `Decodere→Decoder`, `Sessio→Session`, `Cancelatum→Cancellation`, `Configura→Config`, `Sortitio→Sampler`, `GeneratioConfigura→GenerationConfig`, `GenereCursor→GenerationCursor`, `causa→message`, `valor→payload`, `clavis→key`, `longitudo→length`, `redintegra→reset`, `appende→append`, `structa_*→construct_*`, `verifica→verify`, `serializa/deserializa→serialize/deserialize`, `praefundere→prefill`, `progredere→advance`, `cancellata→cancelled`, `prolata→emitted`; already-English `top_k`, `top_p`, `min_p`, `temperature`-style members stay. |
+| **done_when** | All four modules and proofs use the row; cache identity fields, sampler probabilities, cancellation behavior, and generation EOG termination remain byte/behavior identical; first-file probe covers `payload`, `length`, `key`, `reset`, and `message`; narrow checks pass. |
+| **depends_on** | `S2-TOKENIZER`. |
+| **sanity** | `faber check src/cache.fab`, `src/decode.fab`, `src/sampling.fab`, and `src/generation.fab`. |
+| **non_goals** | No runtime/GPU work, no PML5 re-lowering, no sibling consumer changes. |
+| **risk** | high — 137 rows cross cache, decoder, sampler, and generation contracts. |
+| **integrable** | no — the facade and exempla/tests chase is still outstanding. |
+
+### S2-FACADE — facade plus exempla/tests chase
+
+| Field | Value |
+| --- | --- |
+| **id** | `S2-FACADE` |
+| **outcome** | Rename the `gradus` facade's remaining members and migrate every remaining in-repo Gradus call site, exemplum, and admission test to the completed family ledger. |
+| **write_scope** | `src/gradus.fab`, `src/gradus.proba`, all `src/**/*.fab`/`.proba` call sites still matching the closed S2 ledger, `exempla/**/*.fab`, `exempla/**/faber.toml` only if a source path/name is quoted, and `tests/**/*.fab`; no sibling repos. |
+| **ledger** | `GradusError→GradusError` stays as an already-English product type, `causa→message`, `_mappa→_map_error`, and any remaining facade helper follows its family row; facade imports remain `gradus:*`; no new facade genus is introduced. |
+| **done_when** | `rg` finds no pre-S2 member spelling in code positions outside the sanctioned retained-parameter/comment/string set; all exempla/tests call the new names; `./scripta/check-compile` and the relevant `.proba` checks are green; every prior family ledger row has its final caller receipt. This is the first integrated source state. |
+| **depends_on** | `S2-INFERENCE`. |
+| **sanity** | `FABER_BIN=… FABER_LIBRARY_HOME=… ./scripta/check-compile` on the exact Gradus gate set; this is the one family sanity allowed to be broad. |
+| **non_goals** | No `examples/training/*`, Inferentia docs, Norma/Tela/Triga, Radix pack rows, or pml5 work. |
+| **risk** | high — it closes the cross-family caller graph and can expose a missed ledger row. |
+| **integrable** | yes — after this unit the Gradus source, in-repo proofs, exempla, and tests share one identifier surface. |
+
+### S2-DOCS — docs / inventory / compatibility rebase
+
+| Field | Value |
+| --- | --- |
+| **id** | `S2-DOCS` |
+| **outcome** | Rebase live Gradus documentation and gates to the completed English identifier surface and record the pre-1.0 clean break. |
+| **write_scope** | `docs/api-reference.md`, `docs/module-map.md`, `AGENTS.md` only where it quotes live member names, `docs/compatibility-policy.md`, `scripta/inventory-public-symbols`, `scripta/check-source`, and the S2 ledger/delivery receipts. |
+| **ledger** | Documentation must consume the final family ledgers, not repeat seed defaults. Inventory must assert the post-S2 live `fn ` total and coverage; guards ban renamed members only. Retained Latin parameters (`via`, `nomen`, `partes`, `clavis`, `initium`, and similar) are sanctioned by the member-scoped policy and are not added to the member guard. |
+| **done_when** | Every `## gradus:<module>` API section matches live public names; module map and live headers agree; compatibility policy records the clean break and no aliases; inventory and source gates pass at the post-S2 baseline; `rg` confirms no stale member names except sanctioned params/comments/strings; docs claim no pack-row or sibling migration. |
+| **depends_on** | `S2-FACADE`. |
+| **sanity** | `./scripta/inventory-public-symbols`; `./scripta/check-source`; `git diff --check`. |
+| **non_goals** | No product source rename in this unit, no comment-language rewrite, no sibling consumer migration, no new docs architecture. |
+| **risk** | medium-high — stale docs or guard vocabulary can hide a real public-surface mismatch. |
+| **integrable** | yes. |
+
+## Parameter-depth policy (locked)
+
+Gradus adopts the Norma reconciliation in `norma` commit `f7a5cc8`
+(`docs(factory): reconcile param-rename depth policy`). Pass B renames
+**members**: functions, types, fields, and private helpers. A parameter is
+renamed only incidentally when the same spelling is swept by a member rename,
+and the English spelling comes from the family ledger. Every other Latin
+parameter is retained by decision, is outside the member guard, and is not a
+unit done-when. This avoids positional-parameter churn and false positives
+for words that are also valid English or domain vocabulary. `catch err`
+bindings are local bindings, not member rows.
+
+This policy is not a license to leave a renamed member's parameter stale when
+the member sweep necessarily changes it. The family Hand must update that
+same-spelling parameter when it is part of the declaration/reference sweep,
+but must not widen the sweep to every Latin parameter in the file.
+
+## Integration and merge gate
+
+`S2-PREFLIGHT` is integrable and must land first. `S2-L1` through
+`S2-INFERENCE` are ordered, non-integrable transitional family commits because
+later Gradus modules and the final exempla/tests chase intentionally retain
+old call sites until their owning unit. `S2-FACADE` is the aggregate source
+integration point. The merge gate after `S2-FACADE` must verify:
+
+1. every family row has a committed first-file probe and final ledger receipt;
+2. the Gradus root and the exact `check-compile` exempla set are green;
+3. no `src/`/`.proba`/exempla/test code position uses a stale renamed member;
+4. no `[[library_members]]` row or sibling-repo edit was introduced; and
+5. the staged-carrying PML5 gate remains separate.
+
+`S2-DOCS` follows that gate. The pml5 re-lowering request `88010bfc` is
+unlocked only after S2 completion; it is not a dependency of any S2 Hand.
+
+## Lane-owned validation (named once)
+
+- **Family sanity:** one post-S1 English `faber check` on the first real file
+  of each family, then the touched module set. Scratch probes do not replace
+  the real-file check.
+- **Integrated source gate:** `FABER_BIN=… FABER_LIBRARY_HOME=…
+  ./scripta/check-compile` after `S2-FACADE` and at the merge gate.
+- **Source guard:** `./scripta/check-source` at `S2-DOCS`/merge gate. The
+  guard is member-scoped per the parameter policy.
+- **Inventory/docs gate:** `./scripta/inventory-public-symbols` after the
+  API-reference rebase. The pre-S2 750 baseline is not reused as the
+  post-S2 name map; the script must be rebaselined only from the live final
+  tree, with any `grep -c 'fn '` drift explained.
+- **Clean-break review:** `docs/compatibility-policy.md` and landing commit
+  record no aliases, no translation rows, and no sibling-repo claims.
+
+## Open questions for Mind
+
+1. None blocking delivery. The `name` member-position result and every other
+   reserved-name result are intentionally owned by `S2-PREFLIGHT`; a probe
+   contradiction is a ledger finding that must be resolved before dispatch,
+   not an implementation-time guess.
+2. Sibling consumers remain S3 by campaign contract. Do not add them to S2 to
+   make the in-repo checks convenient.
