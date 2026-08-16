@@ -227,7 +227,7 @@ Decision: included.
 | Unit | Status | Hand | Receipt | Notes |
 | --- | --- | --- | --- | --- |
 | S1-U1 | done | — | `108ce41` | `la` frontmatter stamped on all 83 owned files; no other content changes |
-| S1-U2 | in progress | — | — | `src/**/*.fab` → en (convert + frontmatter flip + root manifest + gate greps); in flight, resumed after radix emitter repair `5794d9ecb` |
+| S1-U2 | in progress | — | — | `src/**/*.fab` → en (convert + frontmatter flip + root manifest + gate greps); in flight, run 4 — resumed after radix emitter repair `5794d9ecb`, continued through convert-path interface/visibility repair `a90c15e54` (repair 2) and paren-drop/companion `def_N` leak repair `846bb82a1` (repair 3) |
 | S1-U3 | pending | — | — | `src/**/*.proba` → en + frontmatter flip |
 | S1-U4 | pending | — | — | exempla + tests → en; manifest flips |
 | S1-U5 | pending | — | — | S1 closeout: full gate evidence |
