@@ -117,6 +117,8 @@ with no shims.
 - `docs/api-reference.md`, `scripta/inventory-public-symbols`
 - `docs/compatibility-policy.md`, `docs/api-shape-policy.md`
 - `docs/factory/english-locale/rename-seed.md` — reserved names + seed map
+- [Converter parity repair ledger](../../../../radix/docs/factory/converter-parity/converter-repairs.md)
+  — Radix emitter receipts used by the S1 conversion
 - Validation: `./scripta/check-source`, `./scripta/check-compile`
 
 ## Constraints And Invariants
@@ -227,8 +229,8 @@ Decision: included.
 | Unit | Status | Hand | Receipt | Notes |
 | --- | --- | --- | --- | --- |
 | S1-U1 | done | — | `108ce41` | `la` frontmatter stamped on all 83 owned files; no other content changes |
-| S1-U2 | in progress | — | — | `src/**/*.fab` → en (convert + frontmatter flip + root manifest + gate greps); in flight, run 4 — resumed after radix emitter repair `5794d9ecb`, continued through convert-path interface/visibility repair `a90c15e54` (repair 2) and paren-drop/companion `def_N` leak repair `846bb82a1` (repair 3) |
-| S1-U3 | pending | — | — | `src/**/*.proba` → en + frontmatter flip |
+| S1-U2 | done | — | `40e1246` | `src/**/*.fab` → en (convert + frontmatter flip + root manifest + gate greps); landed after the converter repair series, with the parity receipts linked above |
+| S1-U3 | done | — | `2d32834` | `src/**/*.proba` → en + frontmatter flip; all 32 test-source files landed on the English surface |
 | S1-U4 | pending | — | — | exempla + tests → en; manifest flips |
 | S1-U5 | pending | — | — | S1 closeout: full gate evidence |
 
