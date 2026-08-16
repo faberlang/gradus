@@ -31,24 +31,26 @@ These were verified against the live tree + binary on 2026-08-16 (faber
    campaign/goal prose pass to retire the `format --locale` spelling is a
    docs amendment for Mind (non-blocking; this spec is the authority for S1).
 2. **`faber convert` accepts only `.fab` paths** (`is_fab_file`, format.rs
-   `resolve_convert_paths`), and `--stdin` is a locale no-op (virtual sources
-   skip the package probe and emit canonical/Latin). So `src/**/*.proba`
-   cannot be converted directly. Sanctioned route (still the pack renderer,
+   `resolve_convert_paths`). So `src/**/*.proba` cannot be converted
+   directly. Sanctioned route (still the pack renderer,
    no hand-rolled token script): copy each stamped `.proba` to a
    `<name>.proba.fab` file outside the repo (e.g. `mktemp` dir), run
    `faber convert --to en --stdout` on that copy, and write the converted
    output back to the `.proba` path; then flip the frontmatter. Never leave a
    stray `*.fab` in `src/` during a package check.
 3. **Mixed wave states are green (probed).** An `en` package whose co-located
-   `.proba` still declares `locale = "la"` frontmatter passes `faber check`.
-   The root `faber.toml` flip to `en` may land mid-wave (unit 2) without
-   breaking the gate; each file's frontmatter is the input-locale authority.
+   `.proba` still declares `locale = "la"` frontmatter passes `faber check` —
+   because `.proba` are test sources and never enter the `faber check`
+   package graph (`analyze_package` hard-codes `include_proba = false`), so
+   their frontmatter is irrelevant to the gate. The root `faber.toml` flip
+   to `en` may land mid-wave (unit 2) without breaking the gate; each file's
+   frontmatter is the input-locale authority for `faber convert`.
 4. **Convert preserves the source frontmatter as `la`.** The flip
    `locale = "la"` → `locale = "en"` is a separate mechanical edit in the
    same unit, per the goal ("After a green rewrite, flip frontmatter").
 5. **Inventory counts survive conversion.** Probed on `src/dtype.fab`:
    `grep -c 'functio '` (14) == `grep -c 'fn '` (14) after conversion; the
-   declaration lines map 1:1 even though total lines grow (340 → 418). The
+   declaration lines map 1:1 even though total lines grow (336 → 418). The
    749 baseline and per-module counts should hold; unit 2 re-verifies and
    re-baselines **only** if comment/string Latin `functio` interference
    drifts a count (explain the drift in the unit report).
@@ -89,8 +91,11 @@ These were verified against the live tree + binary on 2026-08-16 (faber
   training-loop-mlp, token-generation, gguf-manifest, gguf-inspect,
   gguf-materialize, qwen36-35b-inference, gguf-admit-qwen35moe),
   `scripta/inventory-public-symbols` (grep `functio` baseline 749 +
-  doc-coverage gate). `faber check` compiles `src/*.fab` **and** co-located
-  `.proba` (probed; PML6 delivery records the same).
+  doc-coverage gate). `faber check` compiles **only** `src/*.fab` — `.proba`
+  are test sources and enter only the `faber test` path (`analyze_package`
+  hard-codes `include_proba = false`; only `analyze_package_for_tests` sets
+  it true). Check-compile green therefore proves the `.fab` surface only;
+  the `.proba` surface is gated by U3's full 32-file grep.
 - Manifest locale table: parser accepts canonical `[locale]` and legacy
   `[reader]` alias (radix `parse_reader_locale_from_toml`). Flip writes the
   canonical `[locale]` table.
@@ -127,7 +132,7 @@ stdout), then run the family, per rename-seed's probe discipline.
 | **outcome** | Every owned `.fab`/`.proba` declares its input locale: prepend a `+++ locale = "la" +++` block to the 33 `src/**/*.fab`, 32 `src/**/*.proba`, 17 `exempla/*/src/main.fab`, and `tests/admission_conformance.fab` (83 files; none have frontmatter today). No other content changes. |
 | **write_scope** | `gradus/src/**/*.fab`, `gradus/src/**/*.proba`, `gradus/exempla/*/src/main.fab`, `gradus/tests/admission_conformance.fab` (frontmatter block only) |
 | **read_scope** | `scripta/check-source` (pattern contract), `scripta/check-compile` (gate set) |
-| **done_when** | All 83 files start with the exact block `+++\nlocale = "la"\n+++\n`; `rg -l '^\+?\+' src exempla tests` shows only the stamped files and none of `scripta/`/`fixtures/` was touched; `faber check` on the root package and on a sample of the 8 gate exempla is green (stamp is semantically neutral — la frontmatter == la package default). |
+| **done_when** | All 83 files start with the exact block `+++\nlocale = "la"\n+++\n`; `rg -l '^\+?\+' src exempla tests` shows only the stamped files and none of `scripta/`/`fixtures/` was touched; `faber check` on the root package and on a sample of the 8 gate exempla is green — this proves the `.fab` stamp is semantically neutral (la frontmatter == la package default); the `.proba` stamps sit off the check surface (`include_proba = false`, baseline) and are verified by the `rg` content gate here, then exercised by U3's convert + gate. |
 | **validation** | `FABER_BIN=… ./scripta/check-compile` (sanity — expected green), `./scripta/check-source` |
 | **depends_on** | S0 lock (committed); no in-flight PML5 Hand on the same `src/` files |
 | **non_goals** | No conversion, no manifest edit, no `scripta/`/`fixtures/` files, no comment edits |
@@ -156,12 +161,12 @@ stdout), then run the family, per rename-seed's probe discipline.
 | **id** | S1-U3 |
 | **outcome** | All 32 `src/**/*.proba` are re-emitted in the English surface with `locale = "en"` frontmatter. The pack renderer (via `faber convert`) does the keyword/type/intrinsic rewrite — the file routing around its `.fab`-only filter is mechanical. |
 | **write_scope** | `gradus/src/**/*.proba` (body via convert output + frontmatter flip) |
-| **read_scope** | `radix/crates/faber/src/commands/convert.rs` + `format.rs` (extension filter, stdin no-op), S1-U2's converted `src/*.fab` (import targets) |
-| **done_when** | Every `.proba`'s body is English and its frontmatter is `locale = "en"`; `faber check` on the root package is green (`.proba` are part of the package check surface — probed), proving no Latin keyword/type token remains in a code position. Route (per file, in a temp dir outside the repo, e.g. `mktemp -d`): copy the stamped `X.proba` to `X.proba.fab`, run `faber convert --to en --stdout` on the copy (with `FABER_LIBRARY_HOME` set so `gradus:*` imports resolve), write the output back to `X.proba`, delete the temp copy, then flip the frontmatter. Never leave a `*.fab` in `src/` while running a package check. |
-| **validation** | `faber check` root green; spot-grep a few `.proba` for `fn ` / `string` and for residual Latin keywords in code positions |
+| **read_scope** | `radix/crates/faber/src/commands/convert.rs` + `format.rs` (extension filter), S1-U2's converted `src/*.fab` (import targets) |
+| **done_when** | Every `.proba`'s body is English and its frontmatter is `locale = "en"`. Route (per file, in a temp dir outside the repo, e.g. `mktemp -d`): copy the stamped `X.proba` to `X.proba.fab`, run `faber convert --to en --stdout` on the copy (with `FABER_LIBRARY_HOME` set so `gradus:*` imports resolve), write the output back to `X.proba`, delete the temp copy, then flip the frontmatter. Never leave a `*.fab` in `src/` while running a package check. **U3 gate** — `.proba` are not on the `faber check` surface (test sources load only under `faber test`; `analyze_package` hard-codes `include_proba = false`), so the acceptance proof is a **full 32-file Latin-token grep** (not a spot-grep): `rg -n '\b(functio|importa|textus|redde|sponte|nihil|adfirma|probandum|proba)\b' src -g '*.proba'` — every hit is a comment line or a user identifier, none a keyword/type token. The test-block vocabulary localizes too (`adfirma`→`assert`, `probandum`→`describe`, `proba`→`test`), so its en spellings in code positions are expected. |
+| **validation** | Full 32-file Latin-token grep (done_when) with zero non-comment/non-identifier hits; `faber convert` exit 0 per converted file (route sanity) |
 | **depends_on** | S1-U2 (library `.fab` already en; unit order also keeps the wave's grep gates consistent) |
 | **non_goals** | No `.fab` edits, no manifest changes, no rename of proba assertion names (identifiers survive Pass A) |
-| **risk** | medium — same en-pack gap stop condition as U2; the routing workaround is the one non-`convert` step, kept to file movement only. |
+| **risk** | medium — same en-pack gap stop condition as U2; the routing workaround is the one non-`convert` step, kept to file movement only. Per-file `faber check` on a `.proba.fab` temp copy is **not** a viable gate: single-file check rejects proba-shaped content (probed — PARSE001 on the la original, PARSE050/PARSE060 on the converted copy), so the full grep is the acceptance. |
 | **integrable** | yes |
 
 ### S1-U4 — Convert exempla + tests to English; flip their manifests
@@ -187,7 +192,7 @@ stdout), then run the family, per rename-seed's probe discipline.
 | **outcome** | The whole S1 surface is proven green as one integrated state: the full `check-compile` set (root + 8 gate exempla), `check-source`, and `inventory-public-symbols` all pass with no `--locale` overrides, and the acceptance grep finds no Latin keyword/type tokens in code positions anywhere in `src/`, `exempla/`, or `tests/`. |
 | **write_scope** | `gradus/` — restricted to mechanical leftovers of S1 only (a missed frontmatter flip, a stale grep word, a missed file). Any failure that is not a mechanical S1 leftover — in particular a missing en-pack row — is **not** fixed here: STOP and file a radix locale need. |
 | **read_scope** | S1-U1..U4 diffs, `radix/stdlib/locale/en/pack.toml`, `docs/api-reference.md` (read-only; confirms inventory coverage gate still passes) |
-| **done_when** | (a) `FABER_BIN=… ./scripta/check-compile` exit 0 (library + gradient-seam, training-loop-mlp, token-generation, gguf-manifest, gguf-inspect, gguf-materialize, qwen36-35b-inference, gguf-admit-qwen35moe); (b) `./scripta/check-source` exit 0; (c) `./scripta/inventory-public-symbols` exit 0 with the 749 baseline and full doc-coverage (names unchanged in Pass A); (d) goal acceptance grep — `rg -n '\b(functio|importa|textus|redde|sponte)\b' src exempla tests` — every hit is a comment line or a user identifier, none a keyword/type token (the en compiler check already guarantees the latter; the grep is the review evidence); (e) the clean break is recorded in the landing commit message per goal Release Posture. |
+| **done_when** | (a) `FABER_BIN=… ./scripta/check-compile` exit 0 (library + gradient-seam, training-loop-mlp, token-generation, gguf-manifest, gguf-inspect, gguf-materialize, qwen36-35b-inference, gguf-admit-qwen35moe); (b) `./scripta/check-source` exit 0; (c) `./scripta/inventory-public-symbols` exit 0 with the 749 baseline and full doc-coverage (names unchanged in Pass A); (d) goal acceptance grep — `rg -n '\b(functio|importa|textus|redde|sponte)\b' src exempla tests` — every hit is a comment line or a user identifier, none a keyword/type token (the en compiler check already guarantees that on the compiled `.fab` surface; the `.proba` test sources are covered by the U3 gate grep; this grep is the review evidence); (e) the clean break is recorded in the landing commit message per goal Release Posture. |
 | **validation** | `FABER_BIN=… ./scripta/check-compile`; `./scripta/check-source`; `./scripta/inventory-public-symbols`; the goal's acceptance rg |
 | **depends_on** | S1-U1..U4 |
 | **non_goals** | No identifier rename (S2), no docs/api-reference rebase (S2 family 9), no compatibility-policy edit (S2 family 9), no `examples/training/*` / Inferentia work (S3) |
