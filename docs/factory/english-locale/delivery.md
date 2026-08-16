@@ -300,6 +300,7 @@ The preflight must use these live paths, not a copied or historical name list:
 | Builtin frame variants | `radix/crates/radix/src/builtins/frame_types.rs`, `STATUS_VARIANTS` | Lock `request`, `item`, `byte`, `bulk`, `done`, `error`, and `cancel` out of every new target. Also read `radix/crates/radix-runtime-contract/src/frame.rs`; its `FrameStatus` order and terminal/content classification are part of the same live contract. A plain declaration probe is not enough if frame registration is active. |
 | Scalar intervals | `radix/crates/radix/src/semantic/passes/typecheck/intervallum.rs` and the interval intrinsic dispatch in `.../typecheck/intrinsics.rs` | `longitudo` is currently constrained to a bare `numerus` interval bound. A Gradus user member `longitudo` may target `length`, but the probe must not turn compiler interval semantics into a Gradus alias or suggest `size`. |
 | Tensor-directed names | `radix/crates/radix/src/semantic/passes/typecheck/tensor_type_directed.rs`, `radix/crates/radix/src/semantic/tensor_type_directed.rs` | Check `structa`, `creata`, `crea`, and `formata` against every family ledger. `structa` is a Gradus user constructor and targets `construct`; compiler-directed `creata`/`crea`/`formata` are not Gradus members and must not be renamed as if they were. |
+| Tensor-index and scalar-text method keys | `radix/crates/radix/src/semantic/passes/typecheck/tensor_index.rs` (live `TENSOR_STRUE`, `TENSOR_SECTIO`, `TENSOR_TRANSPONE`, `TENSOR_ADDITA`, `TENSOR_MULTIPLICA`, and `TENSOR_MATMUL`) plus `radix/crates/radix/src/semantic/passes/typecheck/scalar_text.rs:102` | Add the live L1 keys `strue`, `sectio`, `transpone`, `addita`, `multiplica`, and `matmul` to the collision census. The requested `tranzone` spelling is absent at the verified Radix tip; the live key is `transpone`. Include the `scalar_text.rs:102` `MethodCall` `sectio` branch as compiler evidence, not a Gradus alias. The Gradus L1 member `segmentum` targets `slice` and must be probed separately from compiler-owned `sectio`. |
 | Tensor/scalar intrinsic allowlist | `radix/crates/radix/src/semantic/passes/typecheck/intrinsics.rs` | Check `subtrahe`, `longitudo`, `applica`, and `magnitudines` against every S2 target. The live rows are `subtract`, `length`, `apply`, and `shape`; preserve compiler intrinsic meaning, while renaming a Gradus user member only when its receiver/member ledger says so. |
 | Compiler view methods | `radix/crates/radix/src/semantic/passes/typecheck/call.rs` | Census the live `meus.da`, `meus.fini`, `tuus.accipe`, `tuus.cursor`, `tuus.exhauri`, and `tuus.fini` branches. `Tensor.accipe → get` is a Gradus member decision and must be probed against this compiler-owned receiver surface; do not edit the compiler view names. |
 | Valor/catch/class typo class | Live Gradus `src/**/*.fab`/`.proba` plus Radix HIR catch/typecheck nodes (`radix/crates/radix-hir/src/nodes.rs`, `radix/crates/radix/src/semantic/passes/typecheck/*.rs`) | Classify every `valor` hit as a member/field, parameter/local, or string/comment. `valor` must never become the en type spelling `value`. `catch err` bindings remain bindings; only a `causa` member accessor becomes `message`. `class` is the en rendering of the Faber `genus` keyword, not a user type target. Record any typo or ambiguous catch/error class before a family is unlocked. |
@@ -312,7 +313,7 @@ that produced it:
 # Gradus inventory and source census
 ./scripta/inventory-public-symbols
 rg -n --glob '*.fab' --glob '*.proba' \\
-  '\\b(figura|forma|gradus|typus|typo|valor|causa|accipe|structa|verifica|serializa|deserializa|quantitas|longitudo|nomen)\\b' src
+  '\\b(figura|forma|gradus|typus|typo|valor|causa|accipe|structa|verifica|serializa|deserializa|quantitas|longitudo|nomen|segmentum)\\b' src
 
 # Radix reserved/allowlist census
 rg -n '^(typus|valor|magnitudo|nomen|subtrahe|longitudo|applica|magnitudines|crea)\\s*=' \\
@@ -320,6 +321,11 @@ rg -n '^(typus|valor|magnitudo|nomen|subtrahe|longitudo|applica|magnitudines|cre
 rg -n 'STATUS_VARIANTS|request|item|byte|bulk|done|error|cancel' \\
   /Users/ianzepp/work/faberlang/radix/crates/radix/src/builtins/frame_types.rs \\
   /Users/ianzepp/work/faberlang/radix/crates/radix-runtime-contract/src/frame.rs
+# `tranzone` was requested in the audit note; the live tensor key is `transpone`.
+rg -n 'strue|sectio|transpone|addita|multiplica|matmul' \\
+  /Users/ianzepp/work/faberlang/radix/crates/radix/src/semantic/passes/typecheck/tensor_index.rs
+rg -n 'MethodCall|sectio' \\
+  /Users/ianzepp/work/faberlang/radix/crates/radix/src/semantic/passes/typecheck/scalar_text.rs
 rg -n 'structa|creata|crea|formata|subtrahe|longitudo|applica|magnitudines' \\
   /Users/ianzepp/work/faberlang/radix/crates/radix/src/semantic
 ```
@@ -361,7 +367,7 @@ that family's batch is admitted:
 
 | Family | First-file probe | Required collision focus |
 | --- | --- | --- |
-| L1 | `src/tensor.fab` | `forma` field + `figura()` method → `shape`/`shape()`, `gradus→rank`, `quantitas→numel`, `typus→dtype`, `accipe→get`, `structa→construct` |
+| L1 | `src/tensor.fab` | `forma` field + `figura()` method → `shape`/`shape()`, `gradus→rank`, `quantitas→numel`, `typus→dtype`, `accipe→get`, `structa→construct`; probe the compiler-owned tensor keys `strue`, `sectio`, `transpone`, `addita`, `multiplica`, and `matmul` (the audit spelling `tranzone` is absent in live Radix), the scalar-text `MethodCall` `sectio` at `scalar_text.rs:102`, and Gradus `segmentum→slice` |
 | Shared | `src/parameter.fab` | `Parametrum→Parameter`, `Identitas→Identity`, `valor→payload`, `nomen→name` probe, `causa→message`, member-only params |
 | Train | `src/optimize.fab` | `SgdStatum→SgdState`, `Passus→Step`, `structa→construct`, `inveni→find`, `lentus→rate`, `passus→step`, reserved status/type names |
 | Arch | `src/attention.fab` | `RopeConfigura→RopeConfig`, `RopePolitica→RopePolicy`, `causa→message`, no compiler view/intrinsic capture |
