@@ -1,6 +1,6 @@
 # Goal: Gradus English locale + English identifiers
 
-**Status**: active — S1 Pass A in flight: S1-U1 landed (`108ce41`, la frontmatter stamp); S1-U2 converting `src/**/*.fab` after the radix emitter repair (`5794d9ecb`); S1-U3–U5 pending
+**Status**: active — S1 3/5: S1-U1 landed (`108ce41`, la frontmatter stamp); S1-U2 landed (`40e1246`, check-compile ok at closeout); S1-U3 landed (`2d32834`, grep gate 167-hits-all-comments at closeout); S1-U4 in progress; S1-U5 pending
 **Repo**: gradus
 **Created**: 2026-08-15
 **Consumer**: campaign `docs/factory/english-locale/CAMPAIGN.md`, then delivery / factory
@@ -229,9 +229,9 @@ Decision: included.
 | Unit | Status | Hand | Receipt | Notes |
 | --- | --- | --- | --- | --- |
 | S1-U1 | done | — | `108ce41` | `la` frontmatter stamped on all 83 owned files; no other content changes |
-| S1-U2 | done | — | `40e1246` | `src/**/*.fab` → en (convert + frontmatter flip + root manifest + gate greps); landed after the converter repair series, with the parity receipts linked above |
-| S1-U3 | done | — | `2d32834` | `src/**/*.proba` → en + frontmatter flip; all 32 test-source files landed on the English surface |
-| S1-U4 | pending | — | — | exempla + tests → en; manifest flips |
+| S1-U2 | done | — | `40e1246` | `src/**/*.fab` → en (convert + frontmatter flip + root manifest + gate greps); check-compile ok at closeout; landed after the converter repair series, with the parity receipts linked above |
+| S1-U3 | done | — | `2d32834` | `src/**/*.proba` → en + frontmatter flip; grep gate 167-hits-all-comments at closeout; all 32 test-source files landed on the English surface |
+| S1-U4 | in-progress | — | — | exempla + tests → en; manifest flips |
 | S1-U5 | pending | — | — | S1 closeout: full gate evidence |
 
 ## Open Questions
