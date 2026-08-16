@@ -1,6 +1,6 @@
 # Goal: Gradus English locale + English identifiers
 
-**Status**: planned — Pass A is `faber format --locale en` after each file declares input locale `la`; Pass B renames user identifiers
+**Status**: active — S1 Pass A in flight: S1-U1 landed (`108ce41`, la frontmatter stamp); S1-U2 converting `src/**/*.fab` after the radix emitter repair (`5794d9ecb`); S1-U3–U5 pending
 **Repo**: gradus
 **Created**: 2026-08-15
 **Consumer**: campaign `docs/factory/english-locale/CAMPAIGN.md`, then delivery / factory
@@ -221,6 +221,16 @@ Decision: included.
 - Pass B proof: `./scripta/check-compile` + `./scripta/inventory-public-symbols`.
 - Review: no `functio` / `importa` / `textus` / `redde` in code tokens;
   `rg -n '\\b(functio|importa|textus|redde|sponte)\\b' src exempla tests`.
+
+## Ledger
+
+| Unit | Status | Hand | Receipt | Notes |
+| --- | --- | --- | --- | --- |
+| S1-U1 | done | — | `108ce41` | `la` frontmatter stamped on all 83 owned files; no other content changes |
+| S1-U2 | in progress | — | — | `src/**/*.fab` → en (convert + frontmatter flip + root manifest + gate greps); in flight, resumed after radix emitter repair `5794d9ecb` |
+| S1-U3 | pending | — | — | `src/**/*.proba` → en + frontmatter flip |
+| S1-U4 | pending | — | — | exempla + tests → en; manifest flips |
+| S1-U5 | pending | — | — | S1 closeout: full gate evidence |
 
 ## Open Questions
 

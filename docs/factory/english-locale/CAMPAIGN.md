@@ -1,6 +1,6 @@
 # Campaign: Gradus Latin → English
 
-**Status**: planned — routing artifact; does not implement code
+**Status**: active — S1 Pass A in flight (S1-U1 landed `108ce41`; S1-U2 converting `src/*.fab`); S2/S3 pending
 **Created**: 2026-08-15
 **Mode**: draft/maintain
 **Control-plane repo**: `/Users/ianzepp/work/faberlang/gradus`
