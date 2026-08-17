@@ -156,41 +156,41 @@ division by zero follows f32 semantics (±Inf/NaN, representable in F32).
 ## gradus:parameter
 
 Parameter identity and traversal — `parameter-identity-schema-1.0.0`
-(PML1-U5). Explicit `(nomen, possessor, versio)` identity, trainable/frozen
+(PML1-U5). Explicit `(name, owner, version)` identity, trainable/frozen
 status, mutation rules, and registry traversal.
 
-- `functio statio_nomen(Statio s) → textus` — "trainable" | "frozen".
-- `functio causa(ParametrumError e) → textus` — render the typed error
+- `functio status_name(Station s) → textus` — "trainable" | "frozen".
+- `functio message(ParameterError e) → textus` — render the typed error
   message.
 
-`genus Identitas` — `nomen`, `nomen_typi`, `figura`, `versio`, `possessor`
-methods; plus `functio identitas_aequus(Identitas a, Identitas b) →
-bivalens` (field-wise identity equality).
+`genus Identity` — methods `name()`, `dtype_name()`, `shape()`, `version()`,
+`owner()`; plus `functio identity_equal(Identity a, Identity b) → bivalens`
+(field-wise identity equality).
 
-`genus Parametrum` — methods `identia()`, `statio()`, `nomen()`,
-`nomen_typi()`, `figura()`, `versio()`, `possessor()`, `quantitas()`,
-`valor()`; plus:
+`genus Parameter` — methods `identity()`, `status()`, `name()`,
+`dtype_name()`, `shape()`, `version()`, `owner()`, `numel()`, `payload()`;
+plus:
 
-- `functio est_trainabilis(Parametrum p) → bivalens` — not frozen.
-- `functio est_gelida(Parametrum p) → bivalens` — frozen.
-- `functio structa(textus nomen, textus possessor, textus typo_nomen,
-  lista<numerus> forma, lista<f32> datos) → Parametrum ⇥ ParametrumError` —
+- `functio is_trainable(Parameter p) → bivalens` — not frozen.
+- `functio is_frozen(Parameter p) → bivalens` — frozen.
+- `functio construct(textus name, textus owner, textus dtype_name,
+  lista<numerus> shape, lista<f32> datos) → Parameter ⇥ ParameterError` —
   validated trainable constructor.
-- `functio structa_gelida(textus nomen, textus possessor, textus typo_nomen,
-  lista<numerus> forma, lista<f32> datos) → Parametrum ⇥ ParametrumError` —
+- `functio construct_frozen(textus name, textus owner, textus dtype_name,
+  lista<numerus> shape, lista<f32> datos) → Parameter ⇥ ParameterError` —
   validated frozen constructor.
-- `functio muta(Parametrum p, lista<f32> datos) → Parametrum ⇥
-  ParametrumError` — values-only mutation; bumps `versio` by 1.
+- `functio mutate(Parameter p, lista<f32> datos) → Parameter ⇥
+  ParameterError` — values-only mutation; bumps `version` by 1.
 
-`genus Registrum` — methods `numerus()`, `contineo(possessor, nomen)`,
-`inveni(possessor, nomen)` (fail closed on a miss), `trainabiles()`,
-`gelidae()`, `ordo()` (trainables first, then frozen, insertion order); plus:
+`genus Registry` — methods `count()`, `contains(owner, name)`,
+`find(owner, name)` (fail closed on a miss), `trainable()`, `frozen()`,
+`order()` (trainables first, then frozen, insertion order); plus:
 
-- `functio registrum_vacuum() → Registrum` — empty registry.
-- `functio adscisco(Registrum r, Parametrum p) → Registrum ⇥
-  ParametrumError` — append (duplicate identity fails closed).
-- `functio serializa(Identitas i) → textus` — identity wire form.
-- `functio deserializa(textus s) → Identitas ⇥ ParametrumError` — identity
+- `functio empty_registry() → Registry` — empty registry.
+- `functio add(Registry r, Parameter p) → Registry ⇥
+  ParameterError` — append (duplicate identity fails closed).
+- `functio serialize(Identity i) → textus` — identity wire form.
+- `functio deserialize(textus s) → Identity ⇥ ParameterError` — identity
   from wire, fail closed.
 
 ## gradus:serialize
@@ -199,31 +199,31 @@ Versioned bytes serialization contract — `serialize-schema-1.0.0` (PML1-U7).
 dtype/shape/tensor/parameter wire forms; exact round-trip; version rejection
 and fail-closed reads (capsule rule — no best-effort partial reads).
 
-- `functio causa(SerializeError e) → textus` — render the typed error
+- `functio message(SerializeError e) → textus` — render the typed error
   message.
 
-`genus Tensum` (deserialized tensor) — methods `typo()`, `figura()`,
-`datos()`.
-`genus ParametrumWire` (deserialized parameter) — methods `nomen()`,
-`possessor()`, `typo()`, `figura()`, `versio()`, `statium()`, `datos()`.
+`genus SerializedTensor` (deserialized tensor) — methods `dtype()`, `shape()`,
+`data()`.
+`genus ParameterWire` (deserialized parameter) — methods `name()`, `owner()`,
+`dtype()`, `shape()`, `version()`, `status()`, `data()`.
 
-- `functio serializa_dtype(textus typo_nomen) → octeti ⇥ SerializeError` —
+- `functio serialize_dtype(textus dtype_name) → octeti ⇥ SerializeError` —
   dtype wire.
-- `functio serializa_shape(lista<numerus> forma) → octeti ⇥ SerializeError` —
+- `functio serialize_shape(lista<numerus> shape) → octeti ⇥ SerializeError` —
   shape wire (i64be dims; element ceiling 1e9, no per-dim 65536 cap — the
   CTO-2 mirror alignment).
-- `functio serializa_tensor(lista<f32> datos, lista<numerus> forma, textus
-  typo_nomen) → octeti ⇥ SerializeError` — tensor wire.
-- `functio serializa_parametrum(textus nomen, textus possessor, textus
-  typo_nomen, lista<numerus> forma, numerus versio, textus statio_nomen,
-  lista<f32> datos) → octeti ⇥ SerializeError` — parameter wire.
-- `functio deserializa_dtype(octeti wire) → textus ⇥ SerializeError` —
+- `functio serialize_tensor(lista<f32> data, lista<numerus> shape, textus
+  dtype_name) → octeti ⇥ SerializeError` — tensor wire.
+- `functio serialize_parameter(textus name, textus owner, textus dtype_name,
+  lista<numerus> shape, numerus version, textus status_name, lista<f32> data)
+  → octeti ⇥ SerializeError` — parameter wire.
+- `functio deserialize_dtype(octeti wire) → textus ⇥ SerializeError` —
   dtype name from wire.
-- `functio deserializa_shape(octeti wire) → lista<numerus> ⇥ SerializeError`
+- `functio deserialize_shape(octeti wire) → lista<numerus> ⇥ SerializeError`
   — shape from wire.
-- `functio deserializa_tensor(octeti wire) → Tensum ⇥ SerializeError` —
-  tensor from wire.
-- `functio deserializa_parametrum(octeti wire) → ParametrumWire ⇥
+- `functio deserialize_tensor(octeti wire) → SerializedTensor ⇥ SerializeError`
+  — tensor from wire.
+- `functio deserialize_parameter(octeti wire) → ParameterWire ⇥
   SerializeError` — parameter from wire.
 
 **Correctness-wave rename (2026-08-09, `3c295c0`)**: the big-endian readers
@@ -233,9 +233,9 @@ helpers, not public API — no external migration — but they are the shipped
 surface's readers and are recorded here for the correctness-wave
 reconciliation:
 
-- `functio _be4_lege(lista<numerus<u8>> b, numerus off) → numerus` — read a
+- `functio _be4_read(lista<numerus<u8>> b, numerus off) → numerus` — read a
   big-endian u32 at `off`.
-- `functio _be8_lege(lista<numerus<u8>> b, numerus off) → numerus` — read a
+- `functio _be8_read(lista<numerus<u8>> b, numerus off) → numerus` — read a
   big-endian i64 at `off`.
 
 ## gradus:gradient
@@ -243,30 +243,29 @@ reconciliation:
 The gradient-call contract (PML4-U2) — compiler-generated backward
 companions invoked through ONE public entry. Pure calculus: no imports from
 loss/optimize/nn/attention/transformer. Parameter identity enters as plain
-`(possessor, nomen, versio)` fields.
+`(owner, name, version)` fields.
 
-- `functio causa(GradienteError e) → textus` — render the typed error
+- `functio message(GradientError e) → textus` — render the typed error
   message.
 
-`genus Gradiente` (per-parameter gradient bundle slot) — methods
-`possessor()`, `nomen()`, `versio()` (generation — the parameter versio at
-gradient computation), `valor()`; plus `functio structa(textus nomen,
-textus possessor, numerus versio, tensor.Tensor valor) → Gradiente ⇥
-GradienteError`.
+`genus Gradient` (per-parameter gradient bundle slot) — methods `owner()`,
+`name()`, `version()` (generation — the parameter version at gradient
+computation), `payload()`; plus `functio construct(textus name, textus owner,
+numerus version, tensor.Tensor payload) → Gradient ⇥ GradientError`.
 
-`genus Gradientes` — methods `numerus()`, `inveni(possessor, nomen)` (fail
-closed on a miss); plus `functio structa_gradientes(lista<Gradiente>
-gradientes) → Gradientes`.
+`genus Gradients` — methods `count()`, `find(owner, name)` (fail closed on a
+miss); plus `functio construct_gradients(lista<Gradient> gradients) →
+Gradients`.
 
-- `functio obsoletus(Gradiente g, numerus versio_currens) → bivalens` —
+- `functio obsolete(Gradient g, numerus versio_currens) → bivalens` —
   staleness predicate: a stored gradient is provably stale once the
   parameter has been mutated past its generation.
 - `functio nil() → vacuum` — empty marker (no-op forward).
 - `functio simple_loss(tensor<f32, [2,2]> x, tensor<f32, [2,2]> w) → f32` —
   the annotated forward (linear regression 2×2 seam).
 - `functio gradientes_simple_loss(tensor<f32, [2,2]> x, tensor<f32, [2,2]>
-  w, f32 upstream, textus nomen, textus possessor, numerus versio) →
-  Gradientes ⇥ GradienteError` — the ONE public companion-call entry: runs
+  w, f32 upstream, textus name, textus owner, numerus version) →
+  Gradients ⇥ GradientError` — the ONE public companion-call entry: runs
   the compiler-generated backward and pairs every gradient with its
   parameter identity + generation.
 

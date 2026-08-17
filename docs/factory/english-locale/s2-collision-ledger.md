@@ -462,6 +462,8 @@ The post-rename wire field order and literals remain identical. The first-file p
 
 **Probe receipt**: first file `src/parameter.fab`; `/tmp/gradus-s2-shared/`. `convert` exit `0`; renamed `parameter.probe.fab` checked with exit `0`. The probe preserved the external `gradus:shape` alias and old external Tensor/DType APIs; only Shared members were renamed.
 
+**Implementation receipt**: checked. `src/parameter.fab`, `src/serialize.fab`, and `src/gradient.fab` use the locked Shared names, including `numel`, `payload`, and the private byte-helper targets; wire field order and literals remain unchanged. The annotated `simple_loss` target-lane section is byte-for-byte isolated; the wrapper around it uses the renamed Gradient surface and the landed L1 Tensor/DType/Shape APIs. Real-module `faber check` passed with exit `0` for all three files under `FABER_LIBRARY_HOME=/Users/ianzepp/work/faberlang`; only existing locale/unused warnings remain. `./scripta/inventory-public-symbols` reports the unchanged 750 total and Shared counts `parameter=37`, `serialize=34`, `gradient=13`; the rebased API reference covers every Shared public symbol. The full shared-workspace inventory invocation still reports only public-name coverage gaps from concurrent non-Shared family WIP, with no Shared coverage failures.
+
 ### 3. S2-TRAIN — loss / optimize / nn / train / metrics / data
 
 **Files**: `src/loss.{fab,proba}`, `src/optimize.{fab,proba}`, `src/nn.{fab,proba}`, `src/train.{fab,proba}`, `src/metrics.{fab,proba}`, `src/data.fab`.
@@ -602,7 +604,7 @@ causa → message
 rotary_position_embedding_configura → rotary_position_embedding_config
 ```
 
-The already-English `AttentionError`, `TransformerError`, `scaled_dot_product`, `scaled_dot_product_causal`, `scaled_dot_product_causal_rope`, `multi_head_attention`, `base`, `scale`, and `_attention_core` stay. `Transformer._mappa → _map_error`; `_linear`, `_gelu`, `_layernorm`, `_add`, `_rmsnorm`, and `_swiglu` are already English. `_multi_attentio → _multi_attention` follows the same private-helper rule. `_softmax` is already English and retained.
+The already-English `AttentionError`, `TransformerError`, `scaled_dot_product`, `scaled_dot_product_causal`, `scaled_dot_product_causal_rope`, `multi_head_attention`, `base`, `scale`, and `_attention_core` stay. `Transformer._mappa → _map_error`; `Transformer._attentio → _attention` is the mode-selected wrapper; `_linear`, `_gelu`, `_layernorm`, `_add`, `_rmsnorm`, and `_swiglu` are already English. `_multi_attentio → _multi_attention` follows the same private-helper rule. `_softmax` is already English and retained.
 
 **Private helpers**:
 
@@ -638,6 +640,8 @@ RopeConfig.politica → policy
 `forma`, `figura`, and `typus` occurrences on imported `tensor.Tensor` remain old in this isolated probe; they belong to L1 and are not Arch members.
 
 **Probe receipt**: first file `src/attention.fab`; `/tmp/gradus-s2-arch/`. `convert` exit `0`; renamed attention probe checked with exit `0`. External Tensor/DType/Math APIs and import coordinates were protected.
+
+**Implementation receipt**: source/proof batch applied. `src/attention.fab` checks green with exit `0` under `FABER_LIBRARY_HOME=/Users/ianzepp/work/faberlang`, with only the existing locale/unused warnings; the clean committed-base transformer probe at `/tmp/gradus-s2-arch/transformer-isolated.stderr` also checks green with exit `0`. The live transformer check is currently blocked before Arch diagnostics by `PKG001:library_conflicting_aliases` in the concurrent uncommitted S2-TRAIN `nn` lane; no Arch source error is reported. The Arch declaration inventory remains `attention=35`, `transformer=14` (49 family declarations; total 750), and the final docs/API inventory rebase remains owned by S2-DOCS.
 
 ### 5. S2-MODEL — model artifacts and format leaves
 
@@ -804,6 +808,8 @@ TensorPayload.nomen/initium_absolutum/longitudo → name/absolute_start/length
 Model wire keys, hashes, offsets, schema markers, admission constants, error strings, and serialized field order remain unchanged. The Model probe settled `valor → payload`, `nomen → name`, `forma → shape`, `longitudo → length`, and `causa → message` in the actual capsule receiver positions.
 
 **Probe receipt**: first file `src/model/capsule.fab`; `/tmp/gradus-s2-model/`. `convert` exit `0`; renamed capsule probe checked with exit `0`. The qualified imported `artifact.IdentitasContenuti` and `manifestum.ManifestumGguf` names were kept on their live pre-S2 surface.
+
+**Family-unit receipt (`f50fbbfb`)**: the twelve `.fab` modules and matching `.proba` proof surfaces were swept with the locked member-scoped mappings. `faber check` is green for eleven model source leaves; `dense.fab` reproduces the pre-existing `PKG001:library_conflicting_aliases` diagnostic at `src/shape.fab:4544` even when checked from a clean `git archive HEAD` library, so no foreign-family fix was absorbed here. The required inventory run remains structurally stable at **750** declarations, including **234** model declarations; API-reference coverage failures are the later S2-DOCS chase, not a model-source failure. Wire literals, hashes, format keys, admission constants, and diagnostic strings were byte-for-byte preserved.
 
 ### 6. S2-TOKENIZER — tokenizer
 
