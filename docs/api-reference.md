@@ -276,7 +276,7 @@ over the staged carrier, plus the three admitted fixed-shape MSE rows (same
 formula, one documented `mean((p − t)²)`). Every failure is a typed
 `LossError`.
 
-- `functio causa(LossError e) → textus` — render the typed error message.
+- `functio message(LossError e) → textus` — render the typed error message.
 - `functio mse(tensor.Tensor prediction, tensor.Tensor target) → f32 ⇥
   LossError` — mean squared error, shape-generic.
 - `functio cross_entropy(tensor.Tensor logits, tensor.Tensor target) → f32 ⇥
@@ -291,44 +291,44 @@ formula, one documented `mean((p − t)²)`). Every failure is a typed
 ## gradus:optimize
 
 Optimizer state contract (PML4-U3) — SGD with explicit per-parameter state.
-The update is the accepted SGD row `param' = param − lentus·grad`, applied
-via `parameter.muta` (versio bump). State identity ≡ parameter identity;
+The update is the accepted SGD row `param' = param − rate·grad`, applied
+via `parameter.mutate` (version bump). State identity ≡ parameter identity;
 stale/frozen/identity-mismatched gradients fail closed.
 
-- `functio causa(OptimizeError e) → textus` — render the typed error
+- `functio message(OptimizeError e) → textus` — render the typed error
   message.
 
-`genus SgdStatum` (per-parameter state slot) — methods `possessor()`,
-`nomen()`, `versio()`, `generatio()` (parameter versio at the last applied
-step), `passus()` (applied step count), `lentus()` (learning rate); plus:
+`genus SgdState` (per-parameter state slot) — methods `owner()`,
+`name()`, `version()`, `generation()` (parameter version at the last applied
+step), `step()` (applied step count), `rate()` (learning rate); plus:
 
-- `functio statum_aequus(SgdStatum a, SgdStatum b) → bivalens` — field-wise
+- `functio state_equal(SgdState a, SgdState b) → bivalens` — field-wise
   equality.
-- `functio structa(textus nomen, textus possessor, numerus generatio, f32
-  lentus) → SgdStatum ⇥ OptimizeError` — validated slot constructor.
+- `functio construct(textus name, textus owner, numerus generation, f32
+  rate) → SgdState ⇥ OptimizeError` — validated slot constructor.
 
-`genus Sgd` (optimizer state) — methods `numerus()`, `contineo(possessor,
-nomen)`, `inveni(possessor, nomen)` (fail closed); plus:
+`genus Sgd` (optimizer state) — methods `count()`, `contains(owner,
+name)`, `find(owner, name)` (fail closed); plus:
 
-- `functio sgd_aequus(Sgd a, Sgd b) → bivalens` — field-wise equality.
-- `functio sgd_vacuum() → Sgd` — empty optimizer.
-- `functio adscisco(Sgd o, SgdStatum s) → Sgd ⇥ OptimizeError` — register a
+- `functio sgd_equal(Sgd a, Sgd b) → bivalens` — field-wise equality.
+- `functio empty_sgd() → Sgd` — empty optimizer.
+- `functio add(Sgd o, SgdState s) → Sgd ⇥ OptimizeError` — register a
   slot.
 
-`genus Passus` (step outcome) — methods `novus()` (the updated parameter,
-versio bumped), `statum()` (the advanced state slot); plus:
+`genus StepResult` (step outcome) — methods `fresh()` (the updated parameter,
+version bumped), `state()` (the advanced state slot); plus:
 
-- `functio passus(SgdStatum s, parametrum.Parametrum p, gradient.Gradiente
-  g) → Passus ⇥ OptimizeError` — the ONLY mutation: applies the SGD update,
+- `functio passus(SgdState s, parametrum.Parameter p, gradient.Gradient
+  g) → StepResult ⇥ OptimizeError` — the ONLY mutation: applies the SGD update,
   fail closed on identity/staleness/frozen/shape violations.
-- `functio serializa_statum(SgdStatum s) → textus` — slot wire
+- `functio serialize_state(SgdState s) → textus` — slot wire
   (`optimizer/sgd-state/1.0.0/...`).
-- `functio deserializa_statum(textus wire) → SgdStatum ⇥ OptimizeError` —
+- `functio deserialize_state(textus wire) → SgdState ⇥ OptimizeError` —
   slot from wire.
-- `functio serializa(Sgd o) → textus` — full optimizer wire
+- `functio serialize(Sgd o) → textus` — full optimizer wire
   (`optimizer/sgd/1.0.0/<count>;...`).
-- `functio deserializa(textus wire) → Sgd ⇥ OptimizeError` — optimizer from
-  wire; round-trip exact by `sgd_aequus`.
+- `functio deserialize(textus wire) → Sgd ⇥ OptimizeError` — optimizer from
+  wire; round-trip exact by `sgd_equal`.
 
 ## gradus:nn
 
@@ -354,7 +354,7 @@ proofs.
   LayerNorm.
 - `functio gelu_2x8(tensor<f32, [2,8]> x) → tensor<f32, [2,8]>` — admitted
   fixed-shape GELU.
-- `functio causa(NnError e) → textus` — render the typed error message.
+- `functio message(NnError e) → textus` — render the typed error message.
 - `functio linear(tensor.Tensor x, tensor.Tensor w, tensor.Tensor b) →
   tensor.Tensor ⇥ NnError` — shape-generic linear (`x·w + b`; b per-channel
   [N] or same-shape [M,N]).
@@ -485,75 +485,75 @@ inline (FMIR stepper lib→lib gap).
   step (12 trainable weight/bias pairs + lr → 24-tuple update).
 - `functio train_step_bert_layernorm(...)` — fixed-shape BERT-tiny
   layernorm-grad step (6 scale/offset pairs + lr → 12-tuple update).
-- `functio causa(TrainError e) → textus` — render the typed error message.
+- `functio message(TrainError e) → textus` — render the typed error message.
 
-`genus Schedula` (LR schedule) — methods `lentus_vertex()`, `incalesco()`
-(warmup steps), `passus_total()` (decay horizon), `lentus_finis()`; plus:
+`genus Schedule` (LR schedule) — methods `rate_vertex()`, `warmup()`
+(warmup steps), `total_steps()` (decay horizon), `rate_end()`; plus:
 
-- `functio structa_schedula(f32 lentus_vertex, numerus incalesco, numerus
-  passus_total, f32 lentus_finis) → Schedula ⇥ TrainError` — validated
+- `functio construct_schedule(f32 rate_vertex, numerus warmup, numerus
+  total_steps, f32 rate_end) → Schedule ⇥ TrainError` — validated
   constructor.
-- `functio lentus_schedulata(Schedula s, numerus passus) → f32 ⇥ TrainError`
-  — linear warmup → cosine decay to `lentus_finis`.
+- `functio scheduled_rate(Schedule s, numerus passus) → f32 ⇥ TrainError`
+  — linear warmup → cosine decay to `rate_end`.
 
 Mode:
 
-- `functio modus_nomen(Modus m) → textus` — mode name ("disciplina" |
+- `functio mode_name(Mode m) → textus` — mode name ("disciplina" |
   "aestimatio").
-- `functio est_disciplina(Modus m) → bivalens` — training-mode predicate.
-- `functio est_aestimatio(Modus m) → bivalens` — evaluation-mode predicate.
-- `functio modus(textus nomen) → Modus ⇥ TrainError` — mode from name, fail
+- `functio is_discipline(Mode m) → bivalens` — training-mode predicate.
+- `functio is_estimate(Mode m) → bivalens` — evaluation-mode predicate.
+- `functio mode(textus nomen) → Mode ⇥ TrainError` — mode from name, fail
   closed.
-- `functio dropout_pars(Modus m, f32 rate) → f32 ⇥ TrainError` — the
+- `functio dropout_probability(Mode m, f32 rate) → f32 ⇥ TrainError` — the
   dropout pass probability in the given mode (1.0 in evaluation mode).
 
-RNG (xorshift64, the Semen rule: nonzero state; 0 degenerates and fails
+RNG (xorshift64, the Seed rule: nonzero state; 0 degenerates and fails
 closed):
 
-`genus Semen` — method `status()`; plus `functio structa_semen(numerus
-semen) → Semen ⇥ TrainError`.
-`genus Fructus` (integer draw) — methods `valor()`, `semen()`; plus
-`functio proximus(Semen s) → Fructus`.
-`genus FructusF32` (unit draw) — methods `valor()` (∈ [0,1)), `semen()`;
-plus `functio proximus_f32(Semen s) → FructusF32`.
-`genus Excutio` (masked tensor + advanced state) — methods `valor()`,
-`semen()`; plus:
+`genus Seed` — method `status()`; plus `functio construct_seed(numerus
+seed) → Seed ⇥ TrainError`.
+`genus Draw` (integer draw) — methods `payload()`, `seed()`; plus
+`functio next(Seed s) → Draw`.
+`genus DrawF32` (unit draw) — methods `payload()` (∈ [0,1)), `seed()`;
+plus `functio next_f32(Seed s) → DrawF32`.
+`genus Dropout` (masked tensor + advanced state) — methods `payload()`,
+`seed()`; plus:
 
-- `functio excutio(tensor.Tensor x, Semen s, Modus m, f32 rate) → Excutio ⇥
+- `functio dropout(tensor.Tensor x, Seed s, Mode m, f32 rate) → Dropout ⇥
   TrainError` — dropout application.
-- `functio serializa_semen(Semen s) → textus` — RNG state wire.
-- `functio deserializa_semen(textus wire) → Semen ⇥ TrainError` — RNG state
+- `functio serialize_seed(Seed s) → textus` — RNG state wire.
+- `functio deserialize_seed(textus wire) → Seed ⇥ TrainError` — RNG state
   from wire.
 
-Checkpoint `Tabula` (PML4-U6):
+Checkpoint `Checkpoint` (PML4-U6):
 
-`genus Tabula` — methods `aetas()` (epoch), `passus()` (step in epoch),
-`rng()` (Semen), `statum_wire()` (embedded optimizer-state wire); plus:
+`genus Checkpoint` — methods `age()` (epoch), `step()` (step in epoch),
+`rng()` (Seed), `state_wire()` (embedded optimizer-state wire); plus:
 
-- `functio structa_tabula(numerus aetas, numerus passus, Semen rng, textus
-  statum_wire) → Tabula ⇥ TrainError` — validated constructor.
-- `functio tabula_aequus(Tabula a, Tabula b) → bivalens` — field-wise
+- `functio construct_checkpoint(numerus age, numerus passus, Seed rng, textus
+  state_wire) → Checkpoint ⇥ TrainError` — validated constructor.
+- `functio checkpoint_equal(Checkpoint a, Checkpoint b) → bivalens` — field-wise
   equality.
-- `functio serializa_tabula(Tabula c) → textus` — checkpoint wire.
-- `functio deserializa_tabula(textus wire) → Tabula ⇥ TrainError` —
+- `functio serialize_checkpoint(Checkpoint c) → textus` — checkpoint wire.
+- `functio deserialize_checkpoint(textus wire) → Checkpoint ⇥ TrainError` —
   checkpoint from wire, fail closed.
 
 ## gradus:metrics
 
 Defined metric values with a deterministic contract (PML4-U5) —
-`accuratezza` is top-1 classification accuracy with documented tie-breaks;
-`Metricum` is the per-step loss + accuracy record.
+`accuracy` is top-1 classification accuracy with documented tie-breaks;
+`Metric` is the per-step loss + accuracy record.
 
-- `functio causa(MetricError e) → textus` — render the typed error message.
-- `functio accuratezza(tensor.Tensor prediction, tensor.Tensor target) → f32
+- `functio message(MetricError e) → textus` — render the typed error message.
+- `functio accuracy(tensor.Tensor prediction, tensor.Tensor target) → f32
   ⇥ MetricError` — (1/N)·Σ_n [argmax_c pred[n,c] == target[n]]; ties go to
   the LOWEST class index; deterministic, no RNG.
 
-`genus Metricum` — methods `damnum()`, `accuratezza()`; plus:
+`genus Metric` — methods `loss()`, `accuracy()`; plus:
 
-- `functio metricum(f32 damnum, f32 accuratezza) → Metricum ⇥ MetricError` —
+- `functio metric(f32 loss, f32 accuracy) → Metric ⇥ MetricError` —
   validated record (finite loss, accuracy ∈ [0, 1]).
-- `functio metrica_aequus(Metricum a, Metricum b) → bivalens` — field-wise
+- `functio metric_equal(Metric a, Metric b) → bivalens` — field-wise
   equality.
 
 ## gradus:model/artifact

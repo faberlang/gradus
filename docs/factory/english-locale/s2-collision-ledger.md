@@ -586,6 +586,8 @@ Metric.accuratezza → accuracy
 
 **Probe receipt**: first file `src/optimize.fab`; `/tmp/gradus-s2-train/`. `convert` exit `0`; source-only optimizer state/serialization probe checked with exit `0`. `gradient` import and the gradient-dependent `passus` block are explicitly recorded in `check.stderr`/this row as the target-lane isolation, not silently treated as product evidence.
 
+**Implementation receipt**: source/proof batch applied. `src/loss.fab`, `src/optimize.fab`, `src/nn.fab`, `src/train.fab`, `src/metrics.fab`, and the co-located Train proofs use the locked row, including `numel`, `payload`, and the reserved `step` member positions; wire literals and diagnostic strings remain unchanged. Real-module `faber check` passed with exit `0` for all six `.fab` modules under `FABER_LIBRARY_HOME=/Users/ianzepp/work/faberlang`; only the existing locale/unused warnings remain. The source declaration inventory remains stable at `loss=11`, `optimize=26`, `nn=24`, `train=41`, `metrics=6`, `data=0` (108 Train declarations; 750 total). The Train public-name map is rebased in `docs/api-reference.md`; the known `shape.fab:4544` PKG001 and later caller/proof integration remain outside this family unit.
+
 ### 4. S2-ARCH — attention / transformer
 
 **Files**: `src/attention.{fab,proba}`, `src/transformer.{fab,proba}`.
