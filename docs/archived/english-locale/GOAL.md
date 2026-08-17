@@ -1,6 +1,6 @@
 # Goal: Gradus English locale + English identifiers
 
-**Status**: done — S1 Pass A and S2 identifier surface complete through S2-DOCS (`a9e1596`); S3 sibling consumers remain a named follow-up outside this goal's completion contract
+**Status**: done — S2 delivered the locked member-ledger English surface through S2-DOCS (`a9e1596`) and leftover chase `6ea7bab`; remaining Latin is retained by named ledger class, not unfinished S2; S3 sibling consumers remain a named follow-up outside this goal's completion contract
 **Repo**: gradus
 **Created**: 2026-08-15
 **Consumer**: campaign `docs/factory/english-locale/CAMPAIGN.md`, then delivery / factory
@@ -10,10 +10,10 @@
 
 Convert Gradus from the Latin reader surface to English in two passes. Pass A
 changes only locale-pack vocabulary (keywords, types, localized intrinsics)
-and flips every package to `locale = "en"`. Pass B renames user-chosen
-functions, types, fields, and parameters to English. Import coordinates such
-as `gradus:tensor` stay. Gradus is pre-1.0, so this is a recorded clean break
-with no shims.
+and flips every package to `locale = "en"`. Pass B applies the locked member
+ledger (functions, types, fields, and private helpers). Named retained Latin
+classes stay. Import coordinates such as `gradus:tensor` stay. Gradus is
+pre-1.0, so this is a recorded clean break with no shims.
 
 ## Problem
 
@@ -44,8 +44,9 @@ with no shims.
 3. Pass A is `faber format --locale en` after each converted file declares
    input locale `la` in frontmatter. Pack vocabulary localizes. Comments,
    strings, import paths, and user identifiers stay.
-4. Pass B lands an English public identifier surface with a locked rename
-   table. Reserved-name collisions are named before any rename lands.
+4. Pass B lands the locked member-ledger English surface. Named retained
+   Latin classes stay. Reserved-name collisions are named before any rename
+   lands.
 5. `scripta/check-source`, `scripta/check-compile`, and
    `scripta/inventory-public-symbols` track the English surface.
 6. `docs/api-reference.md` and the symbol inventory rebase to the new names.
@@ -138,7 +139,9 @@ with no shims.
 - `@ publica` / `@ privata` become `@ public` / `@ private`.
 - `scripta/inventory-public-symbols` must count `fn ` after Pass A, then the
   renamed names after Pass B.
-- Pre-1.0 clean break: no Latin aliases left in `src/`.
+- Pre-1.0 clean break: no shims. Pass B applied the locked member ledger.
+  Error-variant identities, unmapped public members, member-scoped
+  parameters, comments, strings, and wire literals are retained.
 - Do not mix this work into an in-flight PML5 GGUF unit.
 
 ## Architecture Direction
@@ -150,8 +153,10 @@ Pass A  pack vocabulary only     functio→fn, textus→string, sponte→optiona
         + manifest locale = en
         identifiers stay Latin   fn figura() → list<int>
 
-Pass B  user identifiers         figura→shape, accipe→get, Capsula→Capsule
+Pass B  locked member ledger     figura→shape, accipe→get, Capsula→Capsule
         reserved-name escapes    valor↛value, typus↛type
+        retained Latin classes   error variants, unmapped members,
+                                 member-scoped parameters
 ```
 
 Pass A tool is `faber format --locale en`. Stamp
@@ -160,9 +165,9 @@ is English. After a green rewrite, flip frontmatter and
 `[locale] locale = "en"`. Prove with `faber check`. Do not substitute a
 hand-rolled token script for the pack renderer.
 
-Pass B is a reviewed rename table applied module-family by module-family,
-then one docs/inventory rebase. Sibling-repo consumers are a later campaign
-stage, not a reason to keep Latin names in Gradus.
+Pass B is a reviewed member ledger applied module-family by module-family,
+then one docs/inventory rebase. Named retained Latin classes stay. Sibling
+consumers are a later campaign stage, not a reason to reopen those classes.
 
 ## Supporting Skills
 
