@@ -1,6 +1,6 @@
 # Gradus Compatibility Policy
 
-**Version**: `compatibility-policy v1.1.0` (2026-08-17, S2 identifier clean break)
+**Version**: `compatibility-policy v1.1.1` (2026-08-17, S2 member-ledger English amend)
 **Repo**: gradus. **Applies to**: the gradus library surface (version 0.1.0,
 pre-1.0) and every admitted support-matrix row
 (`docs/factory/production-ml-library/pml0-support-matrix.md`).
@@ -20,13 +20,14 @@ factory receipt. Consumers migrate to the new surface. Import coordinates
 remain stable, but member names, types, fields, and private helpers are not
 preserved through aliases.
 
-## 2. S2 English identifier break
+## 2. S2 member-ledger English identifier break
 
-Pass B replaced the Gradus-owned Latin identifier surface with the final
-English member surface across the library source, co-located proofs, in-repo
-exempla, and admission tests. The break is member-scoped: functions, types,
-fields, and private helpers were renamed; retained parameters, comments,
-strings, wire literals, and import coordinates were not mechanically rewritten.
+Pass B replaced the locked S2 member-ledger Latin identifiers (functions,
+types, fields, private helpers on the family maps) across library source,
+co-located proofs, in-repo exempla, and admission tests. Retained:
+error-variant identities; public members never put on a family map;
+member-scoped Latin parameters; comments, strings, wire literals, and
+`gradus:*` import coordinates.
 
 The ordered implementation receipts are:
 

@@ -1,6 +1,6 @@
 # Campaign: Gradus Latin → English
 
-**Status**: active — S1 Pass A and S2 Pass B complete through S2-DOCS (`a9e1596`); S3 sibling consumer follow-up remains planned
+**Status**: active — S1 Pass A and S2 member-ledger English complete through S2-DOCS (`a9e1596`) and leftover chase `6ea7bab`; remaining Latin is retained by named ledger class; S3 sibling consumer follow-up remains planned
 **Created**: 2026-08-15
 **Mode**: draft/maintain
 **Control-plane repo**: `/Users/ianzepp/work/faberlang/gradus`
@@ -11,9 +11,10 @@
 ## Summary
 
 Two mandatory passes convert Gradus to the English reader surface and then
-to English identifiers. Pass A is `faber format --locale en` after each
-file declares input locale `la`. Pass B is a reviewed public-API rename.
-Sibling consumers are a named follow-up, not silent leftovers.
+to the locked S2 member-ledger English surface, with named retained Latin
+classes. Pass A is `faber format --locale en` after each file declares input
+locale `la`. Pass B is a reviewed member-ledger rename. Sibling consumers
+are a named follow-up, not silent leftovers.
 
 ## Problem
 
@@ -27,16 +28,18 @@ the rest. Doing both at once hides reserved-name collisions
 ## Desired End State
 
 1. Gradus packages declare `[locale] locale = "en"` and compile that way.
-2. Code tokens use the English pack. User identifiers are English, with
-   reserved-name escapes from the seed.
+2. Code tokens use the English pack. User identifiers follow the locked S2
+   member ledger, with the retained classes named in the ledger.
 3. In-repo exempla, tests, inventory, and live API docs match.
 4. The compatibility policy records the pre-1.0 clean break.
 5. Sibling consumers are listed with an owner, not left as surprise breakage.
 
 ## Development Posture
 
-Clean break. No Latin aliases. No `[[library_members]]` translation layer
-over old Gradus names. Pass A must not use HIR re-emission as the rewriter.
+Clean break. No shims or forwarding aliases. No `[[library_members]]`
+translation layer over old Gradus names. Pass B is member-ledger English
+with named retained Latin classes. Pass A must not use HIR re-emission as
+the rewriter.
 
 ## Implementation Workflow
 
