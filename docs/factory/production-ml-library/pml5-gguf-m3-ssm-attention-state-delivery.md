@@ -51,7 +51,7 @@ The functional requirements F1–F8 are carried intact; no clause is softened:
 - **F5 — Prefill / one-token decode equivalence.** The 40 trunk layers run in prefill over a pinned token sequence must produce, **per layer and per position**, the same state and attention-subblock output as incremental one-token decode replaying the same sequence.
 - **F6 — Reset and replay.** Fresh-session construction (empty conv state, zero recurrent state, empty KV, generation-counter restart) and deterministic replay: same pinned prompt + same session identity → identical per-layer state and outputs. Executed, not merely structural.
 - **F7 — MTP block recognition.** Block 40 (NextN/MTP) recognized and admitted in the schedule, carries its own tensor inventory (`nextn.*`, full-attention-style q/k/v), and is **not executed in the main trunk pass** — matching the oracle, which runs only blocks 0..39 in the main graph.
-- **F8 — Session identity.** The hybrid state carries an identity key covering model, model version, execution config, tokenizer identity, layer schedule, per-layer state types, and dtype — mirroring the `IdentitasCache` precedent — so EXEC-03 can bind two prompts to one resident session without reload.
+- **F8 — Session identity.** The hybrid state carries an identity key covering model, model version, execution config, tokenizer identity, layer schedule, per-layer state types, and dtype — mirroring the `CacheIdentity` precedent — so EXEC-03 can bind two prompts to one resident session without reload.
 
 **Constraints (unchanged)**: device neutral (no device handle/path/residency in any Gradus value); executed proof required (compilation/documentation support but never replace the per-layer oracle agreement); no dual authority (schedule and state semantics owned by these modules; MODEL-04 consumes, never re-derives); no silent F32-expansion claim, no performance claim.
 
@@ -322,7 +322,7 @@ Lane-owned gates (named once, owned by their lanes):
 - **lint** — `./scripta/check-source` (stages 1–2) over the landed unit set.
 - **test** — `faber check` + broad proba suites (stages 3–6) over the landed unit set.
 - **merge** — integration onto `factory/merge` + build stability + the aggregate acceptance above.
-- **closeout (factory)** — `python3 ../radix/scripta/generate-factory-readme.py --factory-root docs/factory --check` and `./scripta/check-factory-goal-status --fail-on error` at the aggregate, not on children.
+- **closeout (factory)** — `./scripta/check-factory-goal-status --fail-on error` at the aggregate, not on children.
 
 ## 8. Oracle, EOG/Numeric Authority, FMIR Gate
 

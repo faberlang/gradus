@@ -55,13 +55,12 @@ Decode, KV-cache, sampling, and generation configuration produce oracle-matching
 - Lane 2: U1 → U3 (parallel with U2) → U4.
 - Lane 3: U4 → U5 (parallel with U6's planning).
 - Cross-campaign: PML5 runs beside NGAB4 (generic composite proof, disjoint repos); PML5 + NGAB4 → NGAB5 convergence is the first cross-campaign merge point (per campaign ordering graph). The generation-config contract is the adapter seam NGAB5 must consume (cpo/cxo: NGAB5 never a second authority). GI4+ persistent-decode work re-lowered into this phase's semantics (C1) — no duplicate KV/decode owner.
-- **Phase gate**: U1–U6 done; oracle-matching tokens for the admitted model; reject rows enforced; README regen + audit 0 findings.
+- **Phase gate**: U1–U6 done; oracle-matching tokens for the admitted model; reject rows enforced; factory status audit 0 findings.
 
 ## Validation
 
 ```bash
 cd gradus && ./scripta/check-source && ./scripta/check-compile
-cd gradus && python3 ../radix/scripta/generate-factory-readme.py --factory-root docs/factory --check
 cd gradus && ./scripta/check-factory-goal-status --fail-on error
 ```
 Unit-level: targeted decode/sampling/oracle tests once at closeout.

@@ -15,9 +15,8 @@ Reconcile one current authority chain for the exact local
 the same immutable artifact identity, the same end-to-end invariant, the same
 ownership split, the same predecessor evidence, and the same next mandatory
 implementation unit. Historical broad-platform records must remain available
-as provenance but must not be mistaken for current Qwen authority. Generated
-factory indexes and the two live Vivi goal registrations must resolve to the
-same active chain.
+as provenance but must not be mistaken for current Qwen authority. Factory status audits and the two live Vivi goal registrations must resolve
+to the same active chain.
 
 The immutable identity is:
 
@@ -34,8 +33,8 @@ The immutable identity is:
 `TRUTH-01` is not complete merely because the current campaign documents
 already agree on most fields. It closes only when stale broad-era authority is
 explicitly quarantined, the support matrix has a current exact-Qwen campaign
-row, generated indexes are current, and Vivi registration is verified against
-the reconciled paths.
+row, the factory status audit is green, and Vivi registration is verified
+against the reconciled paths.
 
 ## 2. Normalized Spec
 
@@ -70,7 +69,7 @@ fragment, one-backend run, or planning document may replace a clause.
    graph.
 3. Exact artifact receipt and support-matrix row.
 4. Current Gradus campaign status and ownership routing.
-5. Generated Radix and Gradus factory indexes.
+5. Radix and Gradus factory status audits.
 6. Vivi registrations that point to items 1 and 2.
 7. Historical broad-platform frontier records, read-only and explicitly
    superseded for current routing.
@@ -143,9 +142,9 @@ Verified from clean `factory/planner-1` packets on 2026-08-13:
 6. `gradus/docs/factory/production-ml-library/pml0-support-matrix.md` records
    A1b as a format-inspection foundation but lacks one explicit current
    exact-Qwen campaign row and its Q0-to-Q4 promotion policy.
-7. The generated Radix and Gradus factory indexes are currently fresh, but any
-   added delivery/check artifact changes document counts and therefore requires
-   regeneration in the owning repository before closeout.
+7. The Radix and Gradus factory status audits are the live inventory
+   authority. After a documentation change, re-run the owning repository's
+   status audit before closeout.
 8. Vivi currently lists exactly two Qwen authorities. Closeout must preserve
    that exact topology unless an explicit campaign amendment changes it.
 
@@ -154,7 +153,7 @@ Verified from clean `factory/planner-1` packets on 2026-08-13:
 ```text
 TRUTH-01A Gradus semantic reconciliation + exact receipt
   -> TRUTH-01B Radix control-plane reconciliation + historical quarantine
-       -> TRUTH-01C generated indexes + status audit + Vivi closeout
+       -> TRUTH-01C status audits + Vivi closeout
             -> LIB-01 / GGUF-A1c product implementation
                  -> LIB-02 + LIB-03
                       -> REF-01 + MODEL-01
@@ -183,8 +182,6 @@ complete `Q0`'s descendants and cannot be mistaken for campaign completion.
   - `gradus/docs/factory/production-ml-library/pml5-general-gguf-delivery.md`
   - `gradus/docs/factory/production-ml-library/pml0-support-matrix.md`
   - `gradus/docs/factory/production-ml-library/evidence/qwen36-35b-authority-chain.md` (create)
-  - `gradus/docs/factory/README.md` only through the generator if document
-    counts change
 - **read_scope**:
   - the five Gradus write-scope source documents before edit;
   - `gradus/exempla/gguf-inspect/README.md` for the already recorded A1b facts;
@@ -224,13 +221,12 @@ complete `Q0`'s descendants and cannot be mistaken for campaign completion.
      successor IDs;
   4. the receipt says explicitly that A1b and TRUTH-01 do not complete the
      campaign;
-  5. Gradus factory index is regenerated if required and passes `--check`.
+  5. The Gradus factory status audit reports zero findings.
 - **closeout_command**:
 
   ```bash
   cd <fresh-hand-packet>/gradus
-  python3 ../radix/scripta/generate-factory-readme.py --factory-root docs/factory
-  python3 ../radix/scripta/generate-factory-readme.py --factory-root docs/factory --check
+  ./scripta/check-factory-goal-status --fail-on error
   python3 - <<'PY'
   from pathlib import Path
 
@@ -261,22 +257,21 @@ complete `Q0`'s descendants and cannot be mistaken for campaign completion.
     docs/factory/production-ml-library/CAMPAIGN.md \
     docs/factory/production-ml-library/pml5-general-gguf-delivery.md \
     docs/factory/production-ml-library/pml0-support-matrix.md \
-    docs/factory/production-ml-library/evidence/qwen36-35b-authority-chain.md \
-    docs/factory/README.md
+    docs/factory/production-ml-library/evidence/qwen36-35b-authority-chain.md
   ```
-- **expected_observed_result**: generator reports one current Gradus goal and
-  `factory README: up to date`; Python prints `PASS exact Qwen Gradus authority
-  chain`; `git diff --check` is silent.
+- **expected_observed_result**: the Gradus status audit reports zero findings;
+  Python prints `PASS exact Qwen Gradus authority chain`; `git diff --check` is
+  silent.
 - **depends_on**: none.
 - **non_goals**: no product code, test, model-byte, source-adapter, backend, or
   Vivi mutation; no support-row promotion above format inspection.
 - **risk**: medium. The main risk is accidentally promoting inspection into
   execution or losing a mandatory successor while summarizing the chain.
 - **est_work_tokens**: 7k–11k.
-- **est_basis**: `pilot` — four bounded authority documents plus one generated
-  index, analogous to a documentation/evidence reconciliation packet; no
+- **est_basis**: `pilot` — four bounded authority documents plus one status-
+  audit pass, analogous to a documentation/evidence reconciliation packet; no
   compile-heavy ledger class.
-- **tool_latency**: low. Grep, Python, Git, and one docs index generator; no
+- **tool_latency**: low. Grep, Python, Git, and one status-audit run; no
   Cargo or device run.
 - **parallel_children_considered**: none. This is one Gradus-owned semantic
   authority update, and the shared documents must commit atomically.
@@ -299,8 +294,6 @@ complete `Q0`'s descendants and cannot be mistaken for campaign completion.
   - `radix/docs/factory/gpu-production-readiness/evidence/frontier-1/t3-support-matrix.md`
   - `radix/docs/factory/gpu-production-readiness/evidence/frontier-1/t4-claim-freeze.md`
   - `radix/docs/factory/gpu-production-readiness/evidence/qwen36-35b-truth01-reconciliation.md` (create)
-  - `radix/docs/factory/README.md` only through the generator if document
-    counts change
 - **read_scope**:
   - the Radix write-scope files before edit;
   - the committed `TRUTH-01A` receipt and Gradus current authorities read-only;
@@ -310,7 +303,6 @@ complete `Q0`'s descendants and cannot be mistaken for campaign completion.
 - **forbidden_scope**:
   - all Radix/Faber/Hosts product source and tests;
   - semantic rewriting or deletion of historical broad records;
-  - hand-editing `docs/factory/README.md`;
   - new product claims or campaign completion.
 - **predecessor_receipts**: committed `TRUTH-01A`; exact-Qwen Radix amendment
   `b6d6e17c8`; historical TRUTH records `93878851d` through `35136c634`.
@@ -344,13 +336,11 @@ complete `Q0`'s descendants and cannot be mistaken for campaign completion.
      completion contract;
   4. the new Radix Q0 receipt records exact identity, ownership, predecessor
      evidence, remaining `Q1` through `Q4` work, and `LIB-01` next;
-  5. Radix generated index is regenerated and current.
+  5. Radix's factory status audit is green.
 - **closeout_command**:
 
   ```bash
   cd <fresh-hand-packet>/radix
-  python3 scripta/generate-factory-readme.py
-  python3 scripta/generate-factory-readme.py --check
   ./scripta/check-factory-goal-status --json --fail-on error
   python3 - <<'PY'
   from pathlib import Path
@@ -375,11 +365,11 @@ complete `Q0`'s descendants and cannot be mistaken for campaign completion.
       assert unit in campaign, f'campaign: missing {unit}'
   print('PASS exact Qwen Radix authority chain')
   PY
-  git diff --check -- docs/factory/gpu-production-readiness docs/factory/README.md
+  git diff --check -- docs/factory/gpu-production-readiness
   ```
-- **expected_observed_result**: generator reports `factory README: up to date`;
-  status audit JSON contains `"findings": []`; Python prints `PASS exact Qwen
-  Radix authority chain`; `git diff --check` is silent.
+- **expected_observed_result**: the Radix status audit reports `"findings": []`;
+  Python prints `PASS exact Qwen Radix authority chain`; `git diff --check` is
+  silent.
 - **depends_on**: `TRUTH-01A` committed and available in the assigned packet.
 - **non_goals**: no deletion of historical evidence, no product code, no
   factory archival, no claim that `TRUTH-01` proves any executed model clause.
@@ -388,7 +378,7 @@ complete `Q0`'s descendants and cannot be mistaken for campaign completion.
   receipt are the clean boundary.
 - **est_work_tokens**: 6k–10k.
 - **est_basis**: `pilot` — one campaign status/receipt update plus five
-  add-only supersession banners and one generated index.
+  add-only supersession banners and one status-audit pass.
 - **tool_latency**: low to medium. The Radix status audit scans factory docs but
   performs no Cargo build or device work.
 - **parallel_children_considered**: none. Radix follows the committed Gradus
@@ -398,7 +388,7 @@ complete `Q0`'s descendants and cannot be mistaken for campaign completion.
   that cannot be fixed within exact Qwen planning-doc scope; or if preserving
   history would require deleting or materially rewriting old receipts.
 
-### TRUTH-01C — Cross-repository index and Vivi closeout
+### TRUTH-01C — Cross-repository status-audit and Vivi closeout
 
 - **outcome**: Radix and Gradus documentation gates pass together; both
   campaigns remain active with `LIB-01` / `GGUF-A1c` next; Vivi contains
@@ -409,14 +399,12 @@ complete `Q0`'s descendants and cannot be mistaken for campaign completion.
     line only if `TRUTH-01` completion is not already recorded by `TRUTH-01B`;
   - `radix/docs/factory/gpu-production-readiness/evidence/qwen36-35b-truth01-reconciliation.md`
     closeout section only;
-  - `radix/docs/factory/README.md` and `gradus/docs/factory/README.md` only via
-    their generators;
   - Vivi goal registration through Mind only, and only when read-only
     verification shows a missing, duplicate, or wrong-path Qwen authority.
 - **read_scope**:
   - committed `TRUTH-01A` and `TRUTH-01B` receipts;
   - both current campaigns, detailed Gradus delivery, support matrix, and
-    generated indexes;
+    status-audit output;
   - read-only `vivi goal list` and `vivi goal show` output.
 - **forbidden_scope**:
   - all product source/tests and local model bytes;
@@ -439,7 +427,7 @@ complete `Q0`'s descendants and cannot be mistaken for campaign completion.
   before `TRUTH-01A` and `TRUTH-01B` land, the final reconciliation receipt and
   historical quarantine checks fail. Do not churn already-correct Vivi state.
 - **done_when**:
-  1. Gradus and Radix index freshness checks pass from the integrated packet;
+  1. Gradus and Radix status-audit checks pass from the integrated packet;
   2. Radix factory status audit has zero findings;
   3. a cross-file script proves exact identity and `GGUF-A1c` selection across
      both campaigns, detailed delivery, support matrix, and both Q0 receipts;
@@ -461,13 +449,12 @@ complete `Q0`'s descendants and cannot be mistaken for campaign completion.
   GRADUS=<integrated-packet>/gradus
 
   cd "$RADIX"
-  python3 scripta/generate-factory-readme.py --check
   ./scripta/check-factory-goal-status --json --fail-on error
 
   cd "$GRADUS"
-  python3 ../radix/scripta/generate-factory-readme.py --factory-root docs/factory --check
+  ./scripta/check-factory-goal-status --fail-on error
 
-  RADIX="$RADIX" GRADUS="$GRADUS" python3 - <<'PY'
+  RADIX="$RADIX" GRADUS="$GRADUS" python3 - <<'PY
   import os
   from pathlib import Path
 
@@ -506,22 +493,22 @@ complete `Q0`'s descendants and cannot be mistaken for campaign completion.
     python3 -c 'import json,sys; rows=json.load(sys.stdin); expected={"radix/docs/factory/gpu-production-readiness/CAMPAIGN.md","gradus/docs/factory/production-ml-library/pml5-general-gguf-delivery.md"}; assert len(rows)==2 and {r["path"] for r in rows}==expected and all(r["exists"] for r in rows); print("PASS two exact Qwen Vivi authorities")'
   vivi goal show gol_634a0417d02c510f --project "$ROOT" --json
   vivi goal show gol_67b635603712f01b --project "$ROOT" --json
-  git -C "$RADIX" diff --check -- docs/factory/gpu-production-readiness docs/factory/README.md
-  git -C "$GRADUS" diff --check -- docs/factory/production-ml-library docs/factory/README.md
+  git -C "$RADIX" diff --check -- docs/factory/gpu-production-readiness
+  git -C "$GRADUS" diff --check -- docs/factory/production-ml-library
   ```
-- **expected_observed_result**: both generators report `factory README: up to
-  date`; Radix status JSON contains `"findings": []`; cross-file Python prints
+- **expected_observed_result**: both status audits report zero findings;
+  cross-file Python prints
   `PASS exact Qwen cross-repository authority chain`; Vivi Python prints `PASS
   two exact Qwen Vivi authorities`; both `goal show` objects have `exists:
   true` and the canonical paths; both `git diff --check` calls are silent.
 - **depends_on**: `TRUTH-01A`, then `TRUTH-01B`, both committed and integrated.
 - **non_goals**: no product work, no Hand task filing, no new goal registration
   when the current two are already correct, no campaign archive or completion.
-- **risk**: medium. Vivi mutation is external control state and generated index
-  changes are repository-specific. Verification precedes mutation, and Mind
+- **risk**: medium. Vivi mutation is external control state and status-audit
+  results are repository-specific. Verification precedes mutation, and Mind
   owns any corrective registration.
 - **est_work_tokens**: 4k–7k.
-- **est_basis**: `pilot` — two index checks, one Radix status audit, one bounded
+- **est_basis**: `pilot` — two status-audit checks, one bounded
   cross-file oracle, and one two-row Vivi topology check.
 - **tool_latency**: medium. Documentation audit scans are local; no Cargo.
 - **parallel_children_considered**: none. This is the serial closeout gate.
@@ -536,7 +523,7 @@ complete `Q0`'s descendants and cannot be mistaken for campaign completion.
 | --- | --- | --- |
 | G1 — semantic chain | `TRUTH-01A` exact Gradus receipt and support row | Gradus authority is current; no product claim |
 | G2 — control plane | `TRUTH-01B` exact Radix Q0 receipt and historical banners | Old broad records cannot route work; no product claim |
-| G3 — control closeout | `TRUTH-01C` indexes, zero audit findings, exact two-row Vivi topology | `TRUTH-01` complete; `LIB-01` ready |
+| G3 — control closeout | `TRUTH-01C` status audits, zero findings, exact two-row Vivi topology | `TRUTH-01` complete; `LIB-01` ready |
 | Campaign closeout | `CLOSE-01` after CAP-01 and CAP-02 | Qwen campaign may become done |
 
 **Release checkpoint**: `not-applicable`. TRUTH-01 changes only planning and

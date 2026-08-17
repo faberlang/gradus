@@ -59,7 +59,7 @@ whole-model byte list.
 
 TRUTH-01 is planning-document and control-record reconciliation only. It may
 update the Radix campaign, the Gradus campaign and delivery, the Gradus support
-matrix, generated factory indexes, historical supersession banners, and the
+matrix, factory status-audit results, historical supersession banners, and the
 Qwen authority receipt. It may verify or, through Mind, reconcile the two Vivi
 goal registrations. It may not edit product source or tests, read or copy
 operator model bytes, run paid infrastructure, claim GPU execution, or mark the
@@ -69,7 +69,7 @@ campaign complete.
 
 The delivery artifact names exact red and closeout oracles for each unit. The
 final closeout checks exact cross-file identity, explicit historical
-supersession, current generated indexes, zero Radix factory-status findings,
+supersession, current status-audit results, zero Radix factory-status findings,
 and exactly the two intended Vivi goal registrations. The observed A1b line is
 retained as format-inspection evidence and is explicitly barred from satisfying
 Q1 through Q4.

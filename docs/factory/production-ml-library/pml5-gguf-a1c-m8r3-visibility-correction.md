@@ -11,7 +11,7 @@ without cross-module reference). This revision removes the 11 uncited symbols
 (`93b33d05f385aebd55f76a9d939a6a47e8c90bd8`, `factory/a1c-chain`); baseline/main `61aac27`
 (`61aac27d1b3c1c66882480ccea3b6d57f3a369fe`).
 **Predecessor correction**: planner-38 delivery
-[`pml5-gguf-a1c-visibility-correction.md`](../../../../../planner-38/gradus/docs/factory/production-ml-library/pml5-gguf-a1c-visibility-correction.md)
+[`pml5-gguf-a1c-visibility-correction.md`](pml5-gguf-a1c-visibility-correction.md)
 (revision `b386f3f`, admitted by audit report `953afcd3`), whose VIS-S/D/T units
 (shape/dtype/tensor) landed as hand-16/17/18 (`5d388f4`/`eefa5f2`/`bb76992`) and are
 ancestors of the candidate. The M8R3 refusal shows that correction cleared its own
@@ -20,8 +20,8 @@ delivery.
 **Campaign**: [`radix/docs/factory/gpu-production-readiness/CAMPAIGN.md`](../../../../radix/docs/factory/gpu-production-readiness/CAMPAIGN.md)
 (row `LIB-01` / GGUF-A1c).
 **Delivery authority**: [`pml5-general-gguf-delivery.md`](pml5-general-gguf-delivery.md) §GGUF-A1c;
-A1C micro-unit doc [`pml5-gguf-a1c-micro-units.md`](../../../../../planner-39/gradus/docs/factory/production-ml-library/pml5-gguf-a1c-micro-units.md)
-unit M8.
+A1C micro-unit doc `pml5-gguf-a1c-micro-units.md` from the historical
+planner-39 packet (not retained in the current checkout), unit M8.
 **Repo baselines**: Gradus main/factory-merge `61aac27`; candidate `93b33d0` (A1C chain on
 `factory/a1c-chain`); Radix `b6d6e17c8` (lane-local faber 1.6.0); planner-40 lane clean at those tips.
 

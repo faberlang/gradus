@@ -4,7 +4,7 @@
 2026-08-13T20:38:52+00:00): re-lower the fresh Qwen MODEL-02 MoE
 router/expert-execution delivery into one-logical-change Hand units before
 audit. **Cited source**: planner-26 lowering
-[`pml5-gguf-m2-moe-router-delivery.md`](../../../../../planner-26/gradus/docs/factory/production-ml-library/pml5-gguf-m2-moe-router-delivery.md)
+[`pml5-gguf-m2-moe-router-delivery.md`](pml5-gguf-m2-moe-router-delivery.md)
 at commit `74c7af2` (fresh lowering — independently derived from campaign,
 delivery authority, live repos, the pinned llama.cpp source checkout, and the
 real local artifact; no cancelled planner-1..19 work, commit, partial

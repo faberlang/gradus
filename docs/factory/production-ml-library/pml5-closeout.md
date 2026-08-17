@@ -14,7 +14,7 @@ U6 1a6abd0 (oracle-matching token proof). Delivery: `pml5-delivery.md`.
 
 All six PML5 units landed. The phase gate (`pml5-delivery.md` §Phase gate:
 U1–U6 done; oracle-matching tokens for the admitted model; reject rows
-enforced; README regen + audit 0) is satisfied at the **structural
+enforced; factory status audit 0 findings) is satisfied at the **structural
 (compile-level) tier**: decode, KV-cache, sampling, generation
 configuration, and reset/limits/cancellation compose over the shared
 forward functions (PML3), and the bounded generation run's expected token
@@ -53,7 +53,7 @@ Clause section). No executed-token claims exist anywhere.
 | Oracle-matching tokens for the admitted model | Bounded generation run (greedy `[0]` + seeded `[1, 1]`) with f64-evaluated token pins, first-token-divergence comparison policy, reset/replay determinism probed — **at the compile level** (the U6 exemplum + pins) | **MET (structural)** |
 | Oracle-matching tokens (EXECUTED) | Env-blocked on the sole remaining blocker (FMIR library-call gap — the PML4 closeout's other blocker, TARGETLANE001, no longer applies to the token run's lane posture) | **NAMED OPEN CLAUSE (CTO8-1)** — see below |
 | Reject rows enforced | `generation.proba` reject-row matrix (unsupported llama.cpp-style controls pinned row by row); config wire rejects extra fields | **MET** |
-| README regen + audit 0 findings | `generate-factory-readme.py` regenerated + `--check` green; goal-status audit 0 findings (see Validation) | **MET** |
+| Factory status audit 0 findings | `./scripta/check-factory-goal-status --fail-on error` green (see Validation) | **MET** |
 | No executed-token claims | Every unit recorded PARTIAL per CTO Q2; no executed value claimed anywhere | **MET (honesty)** |
 
 ## CTO8-1 — NAMED EXECUTED-GATE CLAUSE (mandatory, dated trigger)
@@ -127,11 +127,7 @@ semantic mapping is cross-checked against when it opens.
   machine-parseable (`**Status**: delivered (structural tier) — …PML6
   next…` with the named clause + dated trigger); all other stage lines
   unchanged.
-- `python3 ../radix/scripta/generate-factory-readme.py --factory-root
-  docs/factory --check`: PASS after regeneration (this record added to the
-  gradus factory README).
-- goal-status audit (`./scripta/check-factory-goal-status`): **0
-  findings**.
+- `./scripta/check-factory-goal-status --fail-on error`: **0 findings**.
 - `git diff --check`: PASS.
 
 ## Residuals + owners
