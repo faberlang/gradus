@@ -360,6 +360,8 @@ Tensor.accipe() → Tensor.get()
 
 **Probe receipt**: first file `src/tensor.fab`; `/tmp/gradus-s2-l1/`. `tensor.input.fab` → `tensor.converted.fab` with `convert` exit `0`; renamed `tensor.probe.fab` checked with exit `0`. The map includes the field/method shape collapse, `rank`, `numel`, `dtype`, `get`, `construct`, and `fill`. Import coordinates were protected. `convert.stderr`, `check.stdout`, and `check.stderr` are retained.
 
+**Implementation receipt**: checked. The four source modules and co-located proofs use the row's locked names; compiler-owned `forma`, `crea`, `formata`, `subtrahe`, `magnitudines`, and `longitudo` implementations were not edited. Real-module checks passed with exit `0` for `src/dtype.fab`, `src/shape.fab`, `src/tensor.fab`, and `src/math.fab` under `FABER_LIBRARY_HOME=/Users/ianzepp/work/faberlang`; only existing locale/unused warnings remain. `./scripta/inventory-public-symbols` also passes with the 750 total and L1 counts `dtype=14`, `shape=9`, `tensor=11`, `math=23`. The L1 public-name map is rebased in `docs/api-reference.md`.
+
 ### 2. S2-SHARED — parameter / serialize / gradient
 
 **Files**: `src/parameter.{fab,proba}`, `src/serialize.{fab,proba}`, `src/gradient.{fab,proba}`.

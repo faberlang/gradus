@@ -48,19 +48,19 @@ the serialized form.
 - `functio f16() → DType` — the F16 tag.
 - `functio i32() → DType` — the I32 tag.
 - `functio u8() → DType` — the U8 tag.
-- `functio causa(DTypeError e) → textus` — render the typed error message.
-- `functio nomen(DType t) → textus` — canonical dtype name ("f32", …).
-- `functio ex_nomine(textus s) → DType ⇥ DTypeError` — tag from name;
+- `functio message(DTypeError e) → textus` — render the typed error message.
+- `functio name(DType t) → textus` — canonical dtype name ("f32", …).
+- `functio from_name(textus s) → DType ⇥ DTypeError` — tag from name;
   unknown name fails closed (`NomenIgnotum`).
-- `functio amplitudo(DType t) → numerus` — element width in bytes.
-- `functio serializa(DType t) → textus` — serialized tag form.
-- `functio deserializa(textus s) → DType ⇥ DTypeError` — tag from wire.
-- `functio promovet(DType a, DType b) → bivalens` — lossless widening
+- `functio width(DType t) → numerus` — element width in bytes.
+- `functio serialize(DType t) → textus` — serialized tag form.
+- `functio deserialize(textus s) → DType ⇥ DTypeError` — tag from wire.
+- `functio promote(DType a, DType b) → bivalens` — lossless widening
   relation (F16→F32, U8→F16/I32/F32, identity pairs).
-- `functio angusta(DType a, DType b) → bivalens` — narrowing relation
+- `functio narrow(DType a, DType b) → bivalens` — narrowing relation
   (round + range-check; overflow is a typed error).
-- `functio finita(f32 x) → bivalens` — finite check (no NaN/±Inf).
-- `functio casta(f32 valor, DType origo, DType scopum) → f32 ⇥ DTypeError`
+- `functio finite(f32 x) → bivalens` — finite check (no NaN/±Inf).
+- `functio cast(f32 valor, DType origo, DType scopum) → f32 ⇥ DTypeError`
   — elementwise cast per the round rule, fail closed on overflow /
   non-finite.
 
@@ -71,20 +71,20 @@ The 65536 per-dimension cap is a capsule/support-row admission fact
 (`pml0-model-capsule-contract.md` §5 row 5), **not** a general math limit;
 general checked arithmetic admits 128k–152k vocab rows.
 
-- `functio causa(FormaError e) → textus` — render the typed error message.
-- `functio valet(lista<numerus> forma) → bivalens` — shape validity
+- `functio message(ShapeError e) → textus` — render the typed error message.
+- `functio valid(lista<numerus> forma) → bivalens` — shape validity
   (non-negative dims).
-- `functio gradus(lista<numerus> forma) → numerus` — rank (dimension count).
-- `functio quantitas(lista<numerus> forma) → numerus ⇥ FormaError` — element
+- `functio rank(lista<numerus> forma) → numerus` — rank (dimension count).
+- `functio numel(lista<numerus> forma) → numerus ⇥ ShapeError` — element
   count (product; `[]` → 1), fail closed on negative dims; the ONE
   validator tensor construction routes through.
-- `functio broadcastum(lista<numerus> a, lista<numerus> b) → lista<numerus>
-  ⇥ FormaError` — broadcast shape; incompatible ranks/dims fail closed.
-- `functio reformanda(lista<numerus> forma, lista<numerus> novus) →
-  lista<numerus> ⇥ FormaError` — reshape, element-count-preserving, fail
+- `functio broadcast(lista<numerus> a, lista<numerus> b) → lista<numerus>
+  ⇥ ShapeError` — broadcast shape; incompatible ranks/dims fail closed.
+- `functio reshape(lista<numerus> forma, lista<numerus> novus) →
+  lista<numerus> ⇥ ShapeError` — reshape, element-count-preserving, fail
   closed otherwise.
-- `functio expansio(lista<numerus> forma, numerus ad_gradum) →
-  lista<numerus> ⇥ FormaError` — expand (broadcast up) to a higher rank.
+- `functio expand(lista<numerus> forma, numerus ad_gradum) →
+  lista<numerus> ⇥ ShapeError` — expand (broadcast up) to a higher rank.
 
 ## gradus:tensor
 
@@ -94,38 +94,38 @@ list, and flat row-major `f32` data.
 
 `genus Tensor` — methods:
 
-- `functio figura() → lista<numerus>` — runtime shape.
-- `functio gradus() → numerus` — rank.
-- `functio quantitas() → numerus` — element count.
-- `functio typus() → dtype.DType` — dtype tag.
-- `functio valet() → bivalens` — consistency predicate (flat length == shape
+- `functio shape() → lista<numerus>` — runtime shape.
+- `functio rank() → numerus` — rank.
+- `functio numel() → numerus` — element count.
+- `functio dtype() → dtype.DType` — dtype tag.
+- `functio valid() → bivalens` — consistency predicate (flat length == shape
   product; dims non-negative).
-- `functio accipe(lista<numerus> indices) → f32 ⇥ TensorError` — validated
+- `functio get(lista<numerus> indices) → f32 ⇥ TensorError` — validated
   element access (row-major stride walk; rank/index/empty violations fail
   closed).
 
 Free functions:
 
-- `functio causa(TensorError e) → textus` — render the typed error message.
-- `functio structa(lista<f32> datos, lista<numerus> forma) → Tensor ⇥
+- `functio message(TensorError e) → textus` — render the typed error message.
+- `functio construct(lista<f32> datos, lista<numerus> forma) → Tensor ⇥
   TensorError` — validated construction (dtype F32).
-- `functio structa_typo(lista<f32> datos, lista<numerus> forma, dtype.DType
+- `functio construct_dtype(lista<f32> datos, lista<numerus> forma, dtype.DType
   typo) → Tensor ⇥ TensorError` — validated construction with a dtype.
-- `functio impleta(lista<numerus> forma, f32 valor) → Tensor ⇥ TensorError`
+- `functio fill(lista<numerus> forma, f32 valor) → Tensor ⇥ TensorError`
   — filled tensor (all elements `valor`).
 
 ## gradus:math
 
 Pure operation families over the production tensor surface (PML1-U4) —
 construction, elementwise, reduce, matmul, cast, concat/slice. Every failure
-is a typed `MathError`. Promotion is explicit (`casta`), never implicit;
+is a typed `MathError`. Promotion is explicit (`cast`), never implicit;
 division by zero follows f32 semantics (±Inf/NaN, representable in F32).
 
-- `functio causa(MathError e) → textus` — render the typed error message.
-- `functio structa(lista<f32> datos, lista<numerus> forma) → tensor.Tensor ⇥
+- `functio message(MathError e) → textus` — render the typed error message.
+- `functio construct(lista<f32> datos, lista<numerus> forma) → tensor.Tensor ⇥
   MathError` — validated construction mapped onto the family vocabulary.
 - `functio add(tensor.Tensor a, tensor.Tensor b) → tensor.Tensor ⇥ MathError`
-  — elementwise add (broadcast per `forma.broadcastum`).
+  — elementwise add (broadcast per `shape.broadcast`).
 - `functio sub(tensor.Tensor a, tensor.Tensor b) → tensor.Tensor ⇥ MathError`
   — elementwise subtract.
 - `functio mul(tensor.Tensor a, tensor.Tensor b) → tensor.Tensor ⇥ MathError`
@@ -137,19 +137,19 @@ division by zero follows f32 semantics (±Inf/NaN, representable in F32).
   absolute value.
 - `functio signum(tensor.Tensor t) → tensor.Tensor ⇥ MathError` — elementwise
   sign (PML4 executed-lane arm: signum elementwise + proba cases).
-- `functio summa(tensor.Tensor t, numerus axis) → tensor.Tensor ⇥ MathError`
+- `functio sum(tensor.Tensor t, numerus axis) → tensor.Tensor ⇥ MathError`
   — reduce sum over one axis (axis ∈ [0, rank); zero-length axis fails
   closed).
-- `functio media(tensor.Tensor t, numerus axis) → tensor.Tensor ⇥ MathError`
+- `functio mean(tensor.Tensor t, numerus axis) → tensor.Tensor ⇥ MathError`
   — reduce mean over one axis.
 - `functio matmul(tensor.Tensor a, tensor.Tensor b) → tensor.Tensor ⇥
   MathError` — rank-2 × rank-2 matmul ([M,K] × [K,N] → [M,N]).
-- `functio casta(tensor.Tensor t, textus nomen) → tensor.Tensor ⇥ MathError`
+- `functio cast(tensor.Tensor t, textus nomen) → tensor.Tensor ⇥ MathError`
   — elementwise value cast by dtype name ("f32"/"f16"/"i32"/"u8").
-- `functio concatenatio(lista<tensor.Tensor> partes, numerus axis) →
+- `functio concatenate(lista<tensor.Tensor> partes, numerus axis) →
   tensor.Tensor ⇥ MathError` — join along one axis (equal rank/dtype/shape
   except the axis).
-- `functio segmentum(tensor.Tensor t, numerus axis, numerus initium, numerus
+- `functio slice(tensor.Tensor t, numerus axis, numerus initium, numerus
   finis) → tensor.Tensor ⇥ MathError` — slice with closed-open bounds
   `[initium, finis)`.
 
