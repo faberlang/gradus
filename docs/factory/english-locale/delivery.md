@@ -232,10 +232,9 @@ accepted.
 
 # S2 — Pass B: identifier renames (collision-preflight first)
 
-**Status**: READY for delivery audit — S2 is lowered into one mandatory
-collision-preflight unit followed by the nine campaign families. This section
-is planning authority only; it does not rename source, tests, exempla, packs,
-or sibling consumers.
+**Status**: complete — S2-FACADE landed `12944bf`; S2-DOCS is the final
+family closeout. This section records the delivery authority and receipts; it
+does not authorize product-source renames outside the named family scopes.
 
 **Goal**: [`GOAL.md`](GOAL.md), S2 identifier surface after S1 commit
 `e114ea3`. **Campaign**: [`CAMPAIGN.md`](CAMPAIGN.md), S2 family list.
@@ -252,10 +251,11 @@ stay unchanged. There are no forwarding aliases, dual-authority names, or
 Gradus `[[library_members]]` pack rows. Every family lands with its collision
 ledger row and reserved-probe receipt before the next family starts.
 
-The live S1 inventory is **750** `grep -c 'fn '` declarations. The old `749`
-wording in earlier S1 prose is stale: the live script explicitly records the
-English-locale re-baseline and the intentional `transformer` comment match.
-The family declaration counts used here are therefore:
+The final post-S2 inventory is **750** `grep -c 'fn '` declarations across
+33 live modules. The old `749` wording in earlier S1 prose is historical; the
+live script now records the post-S2 re-baseline and the intentional
+`transformer` comment match. The family declaration counts used here are
+therefore:
 
 | Family | Live files | Live `fn ` count | Source boundary |
 | --- | ---: | ---: | --- |
@@ -585,3 +585,24 @@ unlocked only after S2 completion; it is not a dependency of any S2 Hand.
    not an implementation-time guess.
 2. Sibling consumers remain S3 by campaign contract. Do not add them to S2 to
    make the in-repo checks convenient.
+
+## S2-DOCS closeout receipt
+
+**Status**: complete — S2-FACADE `12944bf` and S2-DOCS are landed;
+this receipt is the final S2 family record.
+
+- `docs/api-reference.md` is generated from the final live declarations and
+  covers every public non-private function in its `## gradus:<module>` section.
+- `docs/module-map.md` and the compatibility policy quote final English names,
+  record the pre-1.0 clean break, and state that aliases and containment
+  facades are not provided.
+- `scripta/inventory-public-symbols` re-baselines from the live tree at 750
+  `fn ` declarations across 33 modules; it does not reuse the pre-S2 name map.
+- `scripta/check-source` retains the existing source syntax checks and adds a
+  member-scoped stale-name guard. Retained parameters, comments, strings,
+  compiler-owned intrinsics, and proof-local helpers remain outside that
+  guard.
+- Sanity commands: `./scripta/inventory-public-symbols`,
+  `./scripta/check-source`, and `git diff --check`.
+- Scope boundary: no product source rename, no `[[library_members]]` row, and
+  no sibling-repository migration.

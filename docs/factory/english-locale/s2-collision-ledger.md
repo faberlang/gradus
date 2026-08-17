@@ -1053,7 +1053,10 @@ The compatibility record says clean break, no aliases, no [[library_members]], a
 
 Retained Latin parameters such as `via`, `nomen` when not a member, `partes`, `clavis`, and `initium` remain outside the member guard under the policy above.
 
-**No-source probe receipt**: `/tmp/gradus-s2-docs/`. The synthetic representative API smoke input contains final `name`, `payload`, `shape`, and `message` field/method positions. It ran `convert --to en --stdout` with exit `0` and `faber check` with exit `0`. This is explicitly a no-source docs/inventory smoke receipt, not a claim that docs have already been rebased.
+**No-source probe receipt**: `/tmp/gradus-s2-docs/`. The synthetic representative API smoke input contains final `name`, `payload`, `shape`, and `message` field/method positions. It ran `convert --to en --stdout` with exit `0` and `faber check` with exit `0`.
+
+**Implementation receipt**: complete in the S2-DOCS closeout after S2-FACADE
+`12944bf`. `docs/api-reference.md` was regenerated from the live `src/**/*.fab` declarations; `docs/module-map.md` and the compatibility policy now quote the final names and record the pre-1.0 clean break. `scripta/inventory-public-symbols` re-counts the live tree at 750 `fn ` declarations across 33 modules and passes the committed coverage gate. `scripta/check-source` passes with a member-scoped stale-name guard that excludes retained parameters, comments, strings, compiler-owned list intrinsics, and proof-local helpers. No product source was renamed in this row. No `[[library_members]]` row or sibling-repository migration is claimed.
 
 ## Probe order and receipts
 
