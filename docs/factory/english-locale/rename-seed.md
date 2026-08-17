@@ -1,6 +1,6 @@
 # Rename seed — Pass B identifier map
 
-**Status**: planned — reserved names locked; remaining rows are defaults until S2 starts
+**Status**: complete — reserved names locked and consumed by the landed S2 identifier surface
 **Pass A does not apply this file.** Pass A only rewrites locale-pack vocabulary.
 
 ## How to use

@@ -1,6 +1,6 @@
 # Goal: Gradus English locale + English identifiers
 
-**Status**: active — S1 Pass A complete (5/5): S1-U1 landed (`108ce41`, la frontmatter stamp); S1-U2 landed (`40e1246`, check-compile ok at closeout); S1-U3 landed (`2d32834`, grep gate 167-hits-all-comments at closeout); S1-U4 landed (`733b3c5`, exempla + tests conversion); S1-U5 closeout recorded below; S2 identifier rename and S3 sibling consumers remain pending
+**Status**: done — S1 Pass A and S2 identifier surface complete through S2-DOCS (`a9e1596`); S3 sibling consumers remain a named follow-up outside this goal's completion contract
 **Repo**: gradus
 **Created**: 2026-08-15
 **Consumer**: campaign `docs/factory/english-locale/CAMPAIGN.md`, then delivery / factory

@@ -1,6 +1,6 @@
 # Campaign: Gradus Latin → English
 
-**Status**: active — S1 Pass A in flight (S1-U1 landed `108ce41`; S1-U2 converting `src/*.fab`); S2/S3 pending
+**Status**: active — S1 Pass A and S2 Pass B complete through S2-DOCS (`a9e1596`); S3 sibling consumer follow-up remains planned
 **Created**: 2026-08-15
 **Mode**: draft/maintain
 **Control-plane repo**: `/Users/ianzepp/work/faberlang/gradus`
@@ -79,16 +79,16 @@ See `GOAL.md` §Ground Truth. Headline facts:
 
 | Track | State | Next action |
 | --- | --- | --- |
-| Prep / lock | drafted | accept goal + seed defaults, or correct open questions |
-| Pass A locale surface | planned | lower delivery for rewriter + manifest flip |
-| Pass B identifiers | planned | lock remaining seed rows, then family Hands |
+| Prep / lock | complete | goal, campaign, seed, and reserved-name lock landed |
+| Pass A locale surface | complete | S1-U1 through S1-U5 landed with green closeout gates |
+| Pass B identifiers | complete | S2-DOCS and the final docs/inventory rebase landed in `a9e1596` |
 | Sibling consumers | planned follow-up | file examples/Inferentia units after Pass B |
 
 ## Campaign Path
 
 ### S0 — Prep lock
 
-- **Status**: active (this draft)
+- **Status**: complete — goal, campaign, seed, and reserved-name lock landed
 - **Why now**: user asked to prep, not implement
 - **Gate**: goal + seed committed; reserved names locked
 - **Lowers to**: none (docs only)
@@ -96,7 +96,7 @@ See `GOAL.md` §Ground Truth. Headline facts:
 
 ### S1 — Pass A: locale surface
 
-- **Status**: planned
+- **Status**: complete — S1-U1 through S1-U5 landed with green closeout gates
 - **Source**: `GOAL.md` Pass A; `convert-corpus-locale.py`
 - **Why now**: identifiers cannot be renamed honestly while keywords are still Latin
 - **Overlap rule**: do not edit the same `src/` files as an in-flight PML5 Hand
@@ -114,7 +114,7 @@ See `GOAL.md` §Ground Truth. Headline facts:
 
 ### S2 — Pass B: identifier rename
 
-- **Status**: planned
+- **Status**: complete — S2-DOCS and the final docs/inventory rebase landed in `a9e1596`
 - **Source**: `rename-seed.md`
 - **Why now**: after S1, names are the only Latin left in code tokens
 - **Overlap rule**: one module family per Hand; docs rebase may trail by one family

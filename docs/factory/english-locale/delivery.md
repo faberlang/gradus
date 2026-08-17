@@ -2,7 +2,7 @@
 
 **Goal**: `docs/factory/english-locale/GOAL.md` (Milestone 1 / Pass A)
 **Campaign**: `docs/factory/english-locale/CAMPAIGN.md` (stage S1, lines 98–116)
-**Status**: planned — lowered for delivery audit
+**Status**: complete — S1 Pass A landed through S1-U5; S2 Pass B closeout is recorded below; S3 sibling consumers remain a named follow-up
 **Repo**: gradus (direct mode, main checkout; container law `../AGENTS.md`)
 **Predecessors**: S0 committed `a1f25fb` (goal + campaign + rename seed); goal registered `gol_d6cea6c6e788d18d`
 **Posture**: batch-by-default (campaign line 59). Pass A is the mechanical locale flip only — **no identifier rename** (S2). Sibling consumers (`examples/training/*`, Inferentia) are S3. PML work is out.
@@ -232,9 +232,10 @@ accepted.
 
 # S2 — Pass B: identifier renames (collision-preflight first)
 
-**Status**: complete — S2-FACADE landed `12944bf`; S2-DOCS is the final
-family closeout. This section records the delivery authority and receipts; it
-does not authorize product-source renames outside the named family scopes.
+**Status**: complete — S2-FACADE landed `12944bf`; S2-DOCS landed `a9e1596` and is
+the final family closeout. This section records the delivery authority and
+receipts; it does not authorize product-source renames outside the named family
+scopes.
 
 **Goal**: [`GOAL.md`](GOAL.md), S2 identifier surface after S1 commit
 `e114ea3`. **Campaign**: [`CAMPAIGN.md`](CAMPAIGN.md), S2 family list.
@@ -588,7 +589,7 @@ unlocked only after S2 completion; it is not a dependency of any S2 Hand.
 
 ## S2-DOCS closeout receipt
 
-**Status**: complete — S2-FACADE `12944bf` and S2-DOCS are landed;
+**Status**: complete — S2-FACADE `12944bf` and S2-DOCS `a9e1596` are landed;
 this receipt is the final S2 family record.
 
 - `docs/api-reference.md` is generated from the final live declarations and
