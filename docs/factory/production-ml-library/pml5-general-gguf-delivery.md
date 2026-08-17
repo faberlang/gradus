@@ -213,40 +213,40 @@ tensor counts, offsets, and type distributions.
 
 **Frozen public surface**:
 
-- `gradus:model/artifact` exports `IdentitasContenuti { textus algorithmus,
-  textus digestio, numerus longitudo }`, `ArtifactError { AlgorithmusIgnotus
-  { textus causa }, DigestioMala { textus causa }, LongitudoMala { textus
-  causa } }`, `causa(ArtifactError)`, and
+- `gradus:model/artifact` exports `ContentIdentity { textus algorithm,
+  textus digest, numerus length }`, `ArtifactError { AlgorithmusIgnotus
+  { textus message }, DigestioMala { textus message }, LongitudoMala { textus
+  message } }`, `message(ArtifactError)`, and
   `identitas(textus algorithmus, textus digestio, numerus longitudo) ->
-  IdentitasContenuti ⇥ ArtifactError`. The first row accepts only the
+  ContentIdentity ⇥ ArtifactError`. The first row accepts only the
   lower-case `sha-256` name, a 64-digit lower-case hexadecimal digest, and a
   positive length. It contains no path, URL, reader, file handle, host/device
   object, or payload.
-- `gradus:model/gguf_manifest` exports `CorpusGguf { octeti tabula, numerus
-  longitudo_artifacti, artifact.IdentitasContenuti identitas }`,
-  `MetadatumGguf { textus clavis, numerus typo, octeti valor_wire }`,
-  `LayoutGgml { Cognita { numerus elementa_per_blockum, numerus
-  octeti_per_blockum, numerus longitudo_octetorum }, Ignota { numerus typo }
-  }`, `DescriptioTensorisGguf { textus nomen, lista<numerus> forma, numerus
-  typo_ggml, numerus offset_relativum, numerus elementa, LayoutGgml layout }`,
-  and `ManifestumGguf { artifact.IdentitasContenuti identitas, numerus
-  versio, numerus concordatio, numerus data_inceptum, numerus
-  longitudo_artifacti, lista<MetadatumGguf> metadata,
-  lista<DescriptioTensorisGguf> tensores }`.
-- Its operations are `parse(CorpusGguf) -> ManifestumGguf ⇥
-  GgufManifestError`, `metadatum(ManifestumGguf, textus) -> MetadatumGguf ⇥
-  GgufManifestError`, `textum(ManifestumGguf, textus) -> textus ⇥
-  GgufManifestError`, `numerum(ManifestumGguf, textus) -> numerus ⇥
-  GgufManifestError`, `inveni_tensorem(ManifestumGguf, textus) ->
-  DescriptioTensorisGguf ⇥ GgufManifestError`, and
-  `layout(numerus typo_ggml, lista<numerus> forma) -> LayoutGgml ⇥
+- `gradus:model/gguf_manifest` exports `GgufCorpus { octeti tabula, numerus
+  artifact_length, artifact.ContentIdentity identitas }`,
+  `GgufMetadata { textus key, numerus dtype, octeti valor_wire }`,
+  `GgmlLayout { Cognita { numerus elementa_per_blockum, numerus
+  octeti_per_blockum, numerus longitudo_octetorum }, Ignota { numerus dtype }
+  }`, `GgufTensorDescriptor { textus name, lista<numerus> shape, numerus
+  typo_ggml, numerus offset_relativum, numerus elements, GgmlLayout layout }`,
+  and `GgufManifest { artifact.ContentIdentity identitas, numerus
+  version, numerus concordatio, numerus data_inceptum, numerus
+  artifact_length, lista<GgufMetadata> metadata,
+  lista<GgufTensorDescriptor> tensors }`.
+- Its operations are `parse(GgufCorpus) -> GgufManifest ⇥
+  GgufManifestError`, `metadata(GgufManifest, textus) -> GgufMetadata ⇥
+  GgufManifestError`, `textum(GgufManifest, textus) -> textus ⇥
+  GgufManifestError`, `numerum(GgufManifest, textus) -> numerus ⇥
+  GgufManifestError`, `inveni_tensorem(GgufManifest, textus) ->
+  GgufTensorDescriptor ⇥ GgufManifestError`, and
+  `layout(numerus typo_ggml, lista<numerus> forma) -> GgmlLayout ⇥
   GgufManifestError`.
 - `GgufManifestError` is the only parser error surface. Its frozen variants
   are `FormatMala`, `VersioIgnota`, `Truncata`, `WireMala`, `LimitesMala`,
   `Superfluitas`, `ClavisDuplicata`, `TensorDuplicatum`, `OffsetMala`, and
-  `IdentitasMala`, each carrying `textus causa`; `causa(GgufManifestError)`
+  `IdentitasMala`, each carrying `textus message`; `message(GgufManifestError)`
   renders it. Unknown architecture names and raw GGML type ids are data, not
-  parser errors. `LayoutGgml.Ignota` is the explicit unresolved codec state;
+  parser errors. `GgmlLayout.Ignota` is the explicit unresolved codec state;
   an architecture adapter introduced after this unit owns typed unsupported
   execution.
 - `gradus:model/gguf` remains the old one-row capsule authority through
@@ -255,7 +255,7 @@ tensor counts, offsets, and type distributions.
   migrating callers. A1a adds no forwarding import or compatibility facade.
 
 **API spelling amendment (2026-08-12, head-cxo).** The frozen tensor accessor
-is `inveni_tensorem(ManifestumGguf, textus)`. The earlier provisional spelling
+is `inveni_tensorem(GgufManifest, textus)`. The earlier provisional spelling
 `tensor` is retired because it is reserved in current Radix; `tensorum` is not
 the public spelling. This is a clean break with no compatibility alias.
 
@@ -361,8 +361,8 @@ GPU work, Hosts work, Inferentia, or main-branch integration.
 ### GGUF-A1b — Range Source And Real-File Inspection
 
 **Implemented evidence**: `gradus:model/gguf_manifest` now exposes the
-operation-scoped `LectioFontis` callback contract, `inspice`, and
-`lege_fragmentum`. The 40-case synthetic package proof covers source failures,
+operation-scoped `SourceRead` callback contract, `inspect`, and
+`read_fragmentum`. The 40-case synthetic package proof covers source failures,
 short reads, exact tensor fragments, range rejection, and unknown layouts. The
 guarded `exempla/gguf-inspect` adapter matched the six local rows as
 `llama/290`, `qwen2/290`, `qwen2/338`, and
@@ -469,9 +469,9 @@ on the `factory/hand-24` packet (C1 `82048b5`; C2-U1 `fc59ac4`, C2-U2
 units land through the parallel hand-3/hand-9/hand-1 packets and are verified
 at merge time). The admitted codec set widens to
 {F32, BF16, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K}, and the surface adds
-`limes_payloadis`, `TensorPayload`/`PayloadError`, `VisumTensoris`/
-`VisioError` + `vincula`, and the bounded windowed materializers
-`materializa_slicem` / `materializa_glomulum` — every byte read flows through
+`limes_payloadis`, `TensorPayload`/`PayloadError`, `TensorView`/
+`ViewError` + `links`, and the bounded windowed materializers
+`materialize_slice` / `materialize_block` — every byte read flows through
 the operation-scoped source; no whole-tensor or whole-model read path exists.
 The A3 closeout gate ran green on 2026-08-14 from the hand-24 packet:
 `./scripta/check-source` exit 0, `./scripta/check-compile` ok, and the guarded

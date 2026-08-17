@@ -76,7 +76,7 @@ Locked decisions (defaults recorded; not left to Hands):
    `norma:processus` arguments and `norma:solum` file operations, reads the
    bounded table prefix / validated tensor byte ranges it needs, and passes
    Gradus only pathless descriptors and operation-scoped range functions
-   (the GGUF-A1b `LectioFontis` seam precedent). Gradus never receives or
+   (the GGUF-A1b `SourceRead` seam precedent). Gradus never receives or
    retains a path, file handle, mapping, or whole-model byte list.
 3. **Content identity is operator-supplied and application-checked.** The
    pinned digest is passed as a CLI argument (the `gguf-inspect` precedent —
@@ -142,12 +142,12 @@ public Faber `1fb6cc97e66d`.
 
 ### Live surface the capstone binds to
 
-- `gradus:model/artifact` — `IdentitasContenuti`, `identitas`, `ArtifactError`
+- `gradus:model/artifact` — `ContentIdentity`, `identitas`, `ArtifactError`
   (pathless content identity; form validation only).
-- `gradus:model/gguf_manifest` — `CorpusGguf`, `ManifestumGguf`,
-  `MetadatumGguf`, `DescriptioTensorisGguf`, `LayoutGgml`, `parse`, `inspice`,
-  `lege_fragmentum`, `textum`, `numerum`, `metadatum`, `inveni_tensorem`,
-  `LectioFontis` (format-general GGUF v3; 4,096-entry and 64 MiB bounds admit
+- `gradus:model/gguf_manifest` — `GgufCorpus`, `GgufManifest`,
+  `GgufMetadata`, `GgufTensorDescriptor`, `GgmlLayout`, `parse`, `inspect`,
+  `read_fragmentum`, `textum`, `numerum`, `metadata`, `inveni_tensorem`,
+  `SourceRead` (format-general GGUF v3; 4,096-entry and 64 MiB bounds admit
   the 753-tensor target).
 - `norma:processus` / `norma:solum` — CLI arguments, file size, partial reads
   (application-owned I/O).
@@ -240,13 +240,13 @@ surface plus its executed proof at the application boundary.
   (c) the application resolves the path via `processus.argumenta`, reads the
   file size via `solum.mensura`, validates digest form + byte length via
   `artifact.identitas`, and admits the manifest via
-  `manifestum.inspice`/`textum`/`numerum` with an application-owned range
+  `manifestum.inspect`/`textum`/`numerum` with an application-owned range
   function over the bounded table prefix (the `gguf-inspect` guard: no read
   may enter the tensor data region);
   (d) the run prints PASS lines for the target oracle facts — version 3,
   alignment 32, data offset 10,991,392, metadata 55, tensors 753,
   architecture `qwen35moe`, byte length 22,663,387,424 — and fails closed
-  (nonzero exit + typed `causa`) on identity mismatch, short prefix, or any
+  (nonzero exit + typed `message`) on identity mismatch, short prefix, or any
   tensor-data read;
   (e) `faber check` and `faber run --target fmir` exit 0 with the observed
   receipt written to the README and the `--receipt` path; `git diff --check`

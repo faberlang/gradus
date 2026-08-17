@@ -38,10 +38,10 @@ Clause section). No executed-token claims exist anywhere.
 
 | Unit | Commit | Evidence (structural tier) | Tier |
 | --- | --- | --- | --- |
-| U1 — Decode loop semantics | bdefb5a | `src/decode.fab` `decodere_datum` (token id + position → full-vocab logits over embedding → transformer_block mode 2 causal+RoPE → output projection), `praefundere` sharing the same forward functions, `Sessio` reset/limit; f64 logit oracle pins | structural |
-| U2 — KV-cache values + mutation | 3b2fc9b | `src/cache.fab` `KVCache` typed logical value (identity fields + exact history + K/V + generation), `appende` per-position (strictly sequential), `redintegra` reset, `IdentitasCache` per MD-A9; exact append/readback pins | structural |
-| U3 — Deterministic sampling | b1b01f1 | `src/sampling.fab` `Configura` validation + `maxima` (greedy exact) / `sors` (rep-penalty → temperature → top-k → softmax → top-p → min-p, pure logits+config+RNG); pinned per-knob oracle | structural |
-| U4 — Generation-config contract | 56e70f0 | `src/generation.fab` nine-field contract (values/defaults/validation), deterministic mapping (Configura + Semen), explicit reject rows, single-authority statement (NGAB5 adapts); exact mapping + wire pins | structural |
+| U1 — Decode loop semantics | bdefb5a | `src/decode.fab` `decodere_datum` (token id + position → full-vocab logits over embedding → transformer_block mode 2 causal+RoPE → output projection), `prefill` sharing the same forward functions, `Session` reset/limit; f64 logit oracle pins | structural |
+| U2 — KV-cache values + mutation | 3b2fc9b | `src/cache.fab` `KVCache` typed logical value (identity fields + exact history + K/V + generation), `append` per-position (strictly sequential), `reset`, `CacheIdentity` per MD-A9; exact append/readback pins | structural |
+| U3 — Deterministic sampling | b1b01f1 | `src/sampling.fab` `Config` validation + `max` (greedy exact) / `sample` (rep-penalty → temperature → top-k → softmax → top-p → min-p, pure logits+config+RNG); pinned per-knob oracle | structural |
+| U4 — Generation-config contract | 56e70f0 | `src/generation.fab` nine-field contract (values/defaults/validation), deterministic mapping (Config + Seed), explicit reject rows, single-authority statement (NGAB5 adapts); exact mapping + wire pins | structural |
 | U5 — Reset, limits, cancellation, determinism | 8cf798a | `decode`/`generation` reset + context-limit reject policy, cooperative cancellation observation, deterministic replay; proba'd | structural |
 | U6 — Oracle-matching token proof | 1a6abd0 | `exempla/token-generation` bounded run (decode → sampling → cursor; greedy + one seeded stochastic config) on the tiny pinned decoder; expected sequences `[0]` / `[1, 1]` pinned (f64), first-token-divergence rule, reset/replay determinism | structural |
 

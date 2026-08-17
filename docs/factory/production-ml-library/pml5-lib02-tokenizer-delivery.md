@@ -213,18 +213,18 @@ on the re-split (U1/U2 have landed since):
 - **gradus** branch `factory/planner-22` tip `a0f311f` (this delivery
   commit), tree clean. **U1 landed on hand-16** (`c4d0750`, typed
   `textorum`/`numerorum` array accessors) and **U2 landed on hand-16**
-  (`f3cfa58`, `Tokenizator` genus with `fabricare`/`encoda`/`decoda`,
+  (`f3cfa58`, `Tokenizer` genus with `build`/`encode`/`decode`,
   byte↔display mapping, ranked merges, decode, new typed errors).
 - **radix** branch `factory/planner-22` tip `b6d6e17c8`
   (`docs(factory): narrow GPU campaign to Qwen3.6`), tree clean.
 - `src/model/gguf_manifest.fab` (1090 lines) already exposes schema-2
-  `ManifestumGguf`, `parse`, `metadatum`, `textum`, `numerum`,
-  `inveni_tensorem`, `layout`, `inspice`, `lege_fragmentum`. The U1
+  `GgufManifest`, `parse`, `metadata`, `textum`, `numerum`,
+  `inveni_tensorem`, `layout`, `inspect`, `read_fragmentum`. The U1
   accessors (`textorum`, `numerorum`) read `tokenizer.ggml.tokens` /
   `token_type` / `merges` as typed lists.
 - `src/tokenizer.fab` carries the SmolLM2 **identity** contract (pinned
-  P1–P11 + workload lists, `est_eog`, `IdentitasTokenizator`) plus the U2
-  artifact-backed `Tokenizator` runtime. GGUF-A2 continues extending this
+  P1–P11 + workload lists, `est_eog`, `TokenizerIdentity`) plus the U2
+  artifact-backed `Tokenizer` runtime. GGUF-A2 continues extending this
   module with the pre-tokenizer + policy surface (U3-1..U3-7).
 - `exempla/qwen36-35b-inference` does not exist yet — U4-1 creates its
   tokenizer phase (the delivery authority names this exempla as the GGUF-A2
@@ -273,7 +273,7 @@ graph (LIB-02 after LIB-01) binds U2–U4 after the A1c clean break commits.
 ### LIB-02-U1 — Manifest tokenizer metadata accessors
 
 - **outcome**: typed array and scalar accessors on `gradus:model/gguf_manifest`
-  read the tokenizer metadata block of a parsed `ManifestumGguf` with exact
+  read the tokenizer metadata block of a parsed `GgufManifest` with exact
   values and typed errors.
 - **write_scope**: `src/model/gguf_manifest.fab`, `src/model/gguf_manifest.proba`,
   `docs/api-reference.md`, `docs/module-map.md`, `docs/diagnostics.md`,
@@ -282,8 +282,8 @@ graph (LIB-02 after LIB-01) binds U2–U4 after the A1c clean break commits.
   manifest proba.
 - **forbidden_scope**: any tokenizer runtime code, any edit to
   `src/tokenizer.fab`, any tensor-payload access, main-checkout edits.
-- **done_when**: `textorum(ManifestumGguf, clavis) -> lista<textus>` and
-  `numerorum(ManifestumGguf, clavis) -> lista<numerus>` (or the module's
+- **done_when**: `textorum(GgufManifest, clavis) -> lista<textus>` and
+  `numerorum(GgufManifest, clavis) -> lista<numerus>` (or the module's
   naming convention) return the tokenizer arrays from a corpus containing
   the metadata block; scalar tokenizer ids/template read via the existing
   `textum`/`numerum` surface; missing/malformed/duplicate keys produce typed
@@ -584,7 +584,7 @@ graph (LIB-02 after LIB-01) binds U2–U4 after the A1c clean break commits.
 - **forbidden_scope**: source/tokenizer edits, campaign/factory docs,
   main-checkout edits.
 - **first failing oracle**: a docs-consistency check asserting the
-  tokenizer runtime surface (Tokenizator runtime, encoda/decoda, EOG,
+  tokenizer runtime surface (Tokenizer runtime, encode/decode, EOG,
   special policy, chat render) is named in module-map/api-reference —
   fails today (docs describe only the identity contract).
 - **closeout command**: `./scripta/check-source`; `git diff --check -- <write

@@ -32,8 +32,8 @@ planner-21 worktree heads.
   Safetensors row is represented inside the schema-2 capsule — is named with a
   default in §5 and flagged to Mind in §13.
 - **Key points**: schema-1 live callers are exactly `gguf.fab`
-  (`capsula.structa` at src/model/gguf.fab:773) and `safetensors.fab`
-  (`capsula.structa` at src/model/safetensors.fab:1056);
+  (`capsula.construct` at src/model/gguf.fab:773) and `safetensors.fab`
+  (`capsula.construct` at src/model/safetensors.fab:1056);
   `tests/admission_conformance.fab` composes both. No non-gradus repo imports
   `gradus:model/capsule`, `gradus:model/gguf`, or `gradus:model/safetensors`
   (checked `norma`, `faber`, `radix`, `examples`); the migration is contained
@@ -60,7 +60,7 @@ The unit must:
 
 1. Replace the schema-1 capsule with a schema-2 capsule that carries
    **identity/manifest values only** — pathless content identity
-   (`artifact.IdentitasContenuti`) plus a per-format manifest with per-tensor
+   (`artifact.ContentIdentity`) plus a per-format manifest with per-tensor
    storage descriptors (mixed F32/quantized, rank-3 capable) — and that
    **rejects schema 1 at the new boundary**.
 2. Migrate every constructor caller (`gguf.fab`, `safetensors.fab`) to the
@@ -77,8 +77,8 @@ The unit must:
 One coherent delivery-sized outcome:
 
 > After this unit, `gradus:model/capsule` is `capsule-schema-2.0.0` and holds
-> exactly `IdentitasContenuti` + a per-format manifest (GGUF:
-> `ManifestumGguf`; Safetensors: see §5 default). It owns no bytes, no path,
+> exactly `ContentIdentity` + a per-format manifest (GGUF:
+> `GgufManifest`; Safetensors: see §5 default). It owns no bytes, no path,
 > no reader, no device handle, and no single global quantization row. The
 > schema-1 wire form (`capsule-schema-1.0.0`) is rejected with a typed error
 > at the new boundary. `gguf.fab` and `safetensors.fab` admit through the
@@ -99,17 +99,17 @@ Verified in `/Users/ianzepp/work/faberlang/worktrees/planner-21/gradus`
 
 | Surface | Current state | Role in A1c |
 | --- | --- | --- |
-| `src/model/capsule.fab` | `capsule-schema-1.0.0`; `genus Capsula` with `BytesValida bytes` + `semita` path + one `Quantizatio` row; constructor `structa(26 params) → Capsula ⇥ AdmissionError`; 9 `AdmissionError` variants incl. `BytesMala` | Rewrite to schema 2 (identity/manifest values) |
-| `src/model/capsule.proba` | 41 compile-level cases against schema-1 `structa` | Migrate to schema-2 proba |
-| `src/model/gguf.fab` | One-row (SmolLM2-360M scaled) GGUF wire parser; `admit(...) → capsula.Capsula ⇥ GgufError`; calls `capsula.structa` (line 773) | Delete dual wire parser; admit via `manifestum.parse`/`inspice` → schema-2 capsule |
+| `src/model/capsule.fab` | `capsule-schema-1.0.0`; `genus Capsule` with `BytesValida bytes` + `semita` path + one `Quantizatio` row; constructor `construct(26 params) → Capsule ⇥ AdmissionError`; 9 `AdmissionError` variants incl. `BytesMala` | Rewrite to schema 2 (identity/manifest values) |
+| `src/model/capsule.proba` | 41 compile-level cases against schema-1 `construct` | Migrate to schema-2 proba |
+| `src/model/gguf.fab` | One-row (SmolLM2-360M scaled) GGUF wire parser; `admit(...) → capsula.Capsule ⇥ GgufError`; calls `capsula.construct` (line 773) | Delete dual wire parser; admit via `manifestum.parse`/`inspect` → schema-2 capsule |
 | `src/model/gguf.proba` | Builds the scaled row byte sequence in code; asserts schema-1 capsule | Migrate to schema-2 |
-| `src/model/safetensors.fab` | Safetensors header/JSON parser; `admittas(...) → capsula.Capsula ⇥ SafetensorError`; calls `capsula.structa` (line 1056) | Migrate to schema-2 capsule (per §5 default) |
+| `src/model/safetensors.fab` | Safetensors header/JSON parser; `admittas(...) → capsula.Capsule ⇥ SafetensorError`; calls `capsula.construct` (line 1056) | Migrate to schema-2 capsule (per §5 default) |
 | `src/model/safetensors.proba` | Schema-1 capsule assertions | Migrate to schema-2 |
-| `tests/admission_conformance.fab` | Composes `safetensors.admittas` + `gguf.admit` into `capsula.Capsula` | Migrate caller (part of "all constructor callers") |
-| `src/model/artifact.fab` | `IdentitasContenuti` + `identitas(algorithmus, digestio, longitudo) ⇥ ArtifactError` — pathless | Schema-2 identity source (read-only) |
-| `src/model/gguf_manifest.fab` | `ManifestumGguf`, `parse`, `inspice`, `lege_fragmentum`, `metadatum`, `textum`, `numerum`, `inveni_tensorem`, `layout` (A1b) | Schema-2 GGUF manifest (read-only for this unit) |
+| `tests/admission_conformance.fab` | Composes `safetensors.admittas` + `gguf.admit` into `capsula.Capsule` | Migrate caller (part of "all constructor callers") |
+| `src/model/artifact.fab` | `ContentIdentity` + `identitas(algorithmus, digestio, longitudo) ⇥ ArtifactError` — pathless | Schema-2 identity source (read-only) |
+| `src/model/gguf_manifest.fab` | `GgufManifest`, `parse`, `inspect`, `read_fragmentum`, `metadata`, `textum`, `numerum`, `inveni_tensorem`, `layout` (A1b) | Schema-2 GGUF manifest (read-only for this unit) |
 | `exempla/gguf-manifest`, `exempla/gguf-inspect` | Consume `artifact` + `gguf_manifest` only; 40 PASS / 0 FAIL synthetic proof and six-file inspection receipt | Unaffected (verify they still compile) |
-| Fixture contracts | `fixtures/gguf/gguf-row-oracle.md`, `fixtures/safetensors/safetensors-row-oracle.md` cite `capsule-schema-1.0.0` and `capsula.verifica_contra` | Update to schema-2 facts |
+| Fixture contracts | `fixtures/gguf/gguf-row-oracle.md`, `fixtures/safetensors/safetensors-row-oracle.md` cite `capsule-schema-1.0.0` and `capsula.verify_against` | Update to schema-2 facts |
 | Docs | `docs/api-reference.md` (§capsule/gguf/safetensors), `docs/module-map.md`, `docs/diagnostics.md` (`AdmissionError` table), `docs/regression-corpus.md` (v1.2.0), `README.md`, `docs/factory/production-ml-library/pml0-symbol-inventory.md`, `pml0-support-matrix.md` (Rows 1–2 + A1b note) | Update (API/support docs scope) |
 | Historical docs | `pml0-model-capsule-contract.md`, `pml0-module-dag.md`, `pml0-claim-register.md` cite schema 1 | Leave as historical; supersession note goes in support-matrix/api-reference (see §13 Q3) |
 
@@ -120,47 +120,47 @@ The exempla `gguf-manifest`/`gguf-inspect` do not reference the capsule.
 ## 5. Design decisions (defaults for the implementing Hand)
 
 **D1 — schema-2 capsule shape (default, matches the authority's
-`ParsedArtifact` boundary).** `capsula.Capsula` becomes
+`ParsedArtifact` boundary).** `capsula.Capsule` becomes
 `capsule-schema-2.0.0` and carries exactly:
 
-- `artifact.IdentitasContenuti` identity (algorithm, digest, byte_length),
+- `artifact.ContentIdentity` identity (algorithm, digest, byte_length),
   pathless;
-- one per-format manifest genus: `manifestum.ManifestumGguf` for GGUF, and —
-  for Safetensors — a new `ManifestumSafetensors` genus defined **inside
+- one per-format manifest genus: `manifestum.GgufManifest` for GGUF, and —
+  for Safetensors — a new `SafetensorsManifest` genus defined **inside
   `capsule.fab`** (format/version + header metadata + per-tensor descriptors:
-  name, dtype, shape, data_offsets), mirroring `ManifestumGguf`'s
+  name, dtype, shape, data_offsets), mirroring `GgufManifest`'s
   descriptor style.
 
 The schema-1 field groups that die: `BytesValida` (byte ownership),
 `semita` (path), the single `Quantizatio` row, and the schema-1 hard-coded
 architecture/tokenizer pins. Per-tensor storage lives in the manifest
-descriptors (`LayoutGgml` / dtype+offsets), so mixed storage is representable.
+descriptors (`GgmlLayout` / dtype+offsets), so mixed storage is representable.
 `AdmissionError` drops `BytesMala` and gains a schema-1 rejection variant
 (see D2); the remaining variants stay where they still apply.
 
 **D2 — schema 1 rejection at the new boundary.** `schema_versio` becomes
-`"2.0.0"`. The schema-2 constructor, `verifica`, and
-`deserializa_identitas` return a **typed error that explicitly names schema 1**
-(e.g. `AdmissionError.VersioIgnota` with causa `schema 1 is retired — capsule
+`"2.0.0"`. The schema-2 constructor, `verify`, and
+`deserialize_identity` return a **typed error that explicitly names schema 1**
+(e.g. `AdmissionError.VersioIgnota` with message `schema 1 is retired — capsule
 schema is 2.0.0`, or a dedicated `SchemaVetus` variant; the Hand freezes one
 variant and its docs row). Because the schema-2 constructor has a different
 signature (no bytes, no path, no single-quantization row), a schema-1 call
 site also fails to compile — the dual guarantee: compile-time (no such
-constructor) and runtime (wire/`verifica` rejection).
+constructor) and runtime (wire/`verify` rejection).
 
 **D3 — single GGUF authority, no façade.** The byte-level GGUF wire parser
 inside `src/model/gguf.fab` (`_legere_u32` … `_legere_bool`,
 `_clavis_admissa`, `_typo_admissus`, …) is **deleted**. `gguf.fab` keeps its
 public admission entry `admit` as a thin wrapper that (a) calls
-`manifestum.parse`/`inspice` to obtain the `ManifestumGguf`, (b) validates the
-pinned one-row contract **through manifest accessors** (`metadatum`, `textum`,
+`manifestum.parse`/`inspect` to obtain the `GgufManifest`, (b) validates the
+pinned one-row contract **through manifest accessors** (`metadata`, `textum`,
 `numerum`, `inveni_tensorem`), and (c) builds the schema-2 capsule. No alias,
 no forwarding, no compatibility import. `gradus:model/gguf_manifest` is the
 only GGUF parse path; the A1a "frozen public surface" of `gguf_manifest` is
 not modified by this unit.
 
 **D4 — Safetensors row.** `safetensors.admittas` keeps its entry and returns
-the schema-2 capsule holding `IdentitasContenuti` + `ManifestumSafetensors`
+the schema-2 capsule holding `ContentIdentity` + `SafetensorsManifest`
 (D1). The Safetensors row remains an F32 structural fixture; no real-file
 claim is added.
 
@@ -179,11 +179,11 @@ not separate tasks) and a named split boundary.
 | Field | Value |
 | --- | --- |
 | `id` | `A1C-01` |
-| `outcome` | `gradus:model/capsule` is schema-2 (`capsule-schema-2.0.0`): pathless `IdentitasContenuti` + per-format manifest only, no bytes/path/one-global-quantization; schema 1 rejected at the boundary; `gguf.fab` and `safetensors.fab` are the only admission entries and both produce the schema-2 capsule; the dual GGUF wire parser in `gguf.fab` is deleted; `gradus:model/gguf_manifest` is the one GGUF authority; all probas, the conformance test, fixture contracts, and API/support docs are migrated; no forwarding shim exists |
+| `outcome` | `gradus:model/capsule` is schema-2 (`capsule-schema-2.0.0`): pathless `ContentIdentity` + per-format manifest only, no bytes/path/one-global-quantization; schema 1 rejected at the boundary; `gguf.fab` and `safetensors.fab` are the only admission entries and both produce the schema-2 capsule; the dual GGUF wire parser in `gguf.fab` is deleted; `gradus:model/gguf_manifest` is the one GGUF authority; all probas, the conformance test, fixture contracts, and API/support docs are migrated; no forwarding shim exists |
 | `write_scope` | Gradus worktree (this lowering's lane or the Mind-assigned Hand lane), all on `factory/planner-21`: `src/model/capsule.fab`, `src/model/capsule.proba`, `src/model/gguf.fab`, `src/model/gguf.proba`, `src/model/safetensors.fab`, `src/model/safetensors.proba`, `tests/admission_conformance.fab`, `fixtures/gguf/gguf-row-oracle.md`, `fixtures/safetensors/safetensors-row-oracle.md`, `docs/api-reference.md`, `docs/module-map.md`, `docs/diagnostics.md`, `docs/regression-corpus.md`, `docs/factory/production-ml-library/pml0-symbol-inventory.md`, `docs/factory/production-ml-library/pml0-support-matrix.md`, `docs/factory/production-ml-library/CAMPAIGN.md` (status line only), `docs/factory/production-ml-library/pml5-general-gguf-delivery.md` (status line + A1c "implemented evidence" note) |
 | `read_scope` | `src/model/artifact.fab`, `src/model/gguf_manifest.fab` + `.proba`, `exempla/gguf-manifest/`, `exempla/gguf-inspect/`, `docs/factory/production-ml-library/pml0-model-capsule-contract.md` (historical), `docs/factory/production-ml-library/pml0-support-matrix-schema.md`, `docs/factory/production-ml-library/pml5-general-gguf-delivery.md`, `docs/compatibility-policy.md` |
 | `forbidden_scope` | `src/model/artifact.fab` and `src/model/gguf_manifest.fab` (schema-2 authorities — read-only for this unit); `src/model/dequant.fab`; `src/tokenizer.fab` (GGUF-A2 owns it); `src/cache.fab`, `src/generation.fab`, `src/decode.fab`; any radix/hosts/faber/norma checkout or main-branch edit; any new public module outside the listed files; any forwarding shim, compatibility alias, or dual parser; no commit that leaves both a schema-1 constructor caller and schema-2 authority live |
-| `done_when` | (a) schema 1 has no live constructor or parser caller: `capsula.structa(` absent from `src` and `tests`; `capsule-schema-1.0.0` absent from `src`, `fixtures`, `tests`; (b) schema-2 identity/manifest values are the only authority: `gguf.fab` delegates all wire parsing to `manifestum` and its old wire helpers are gone; (c) `schema_versio` in `capsule.fab` is `"2.0.0"`; a schema-1 stamp is rejected by a typed error case in `capsule.proba`; (d) `./scripta/check-source` and `./scripta/check-compile` exit 0; `faber check` on the gradus package ends `ok: .`; (e) migrated `capsule.proba`, `gguf.proba`, `safetensors.proba` and `tests/admission_conformance.fab` type-check; (f) `git diff --check` silent; (g) the docs inventory is migrated (support-matrix Rows 1–2 cite `capsule-schema-2.0.0`, diagnostics `AdmissionError` table matches the new surface, regression-corpus version bumped, symbol inventory counts refreshed) |
+| `done_when` | (a) schema 1 has no live constructor or parser caller: `capsula.construct(` absent from `src` and `tests`; `capsule-schema-1.0.0` absent from `src`, `fixtures`, `tests`; (b) schema-2 identity/manifest values are the only authority: `gguf.fab` delegates all wire parsing to `manifestum` and its old wire helpers are gone; (c) `schema_versio` in `capsule.fab` is `"2.0.0"`; a schema-1 stamp is rejected by a typed error case in `capsule.proba`; (d) `./scripta/check-source` and `./scripta/check-compile` exit 0; `faber check` on the gradus package ends `ok: .`; (e) migrated `capsule.proba`, `gguf.proba`, `safetensors.proba` and `tests/admission_conformance.fab` type-check; (f) `git diff --check` silent; (g) the docs inventory is migrated (support-matrix Rows 1–2 cite `capsule-schema-2.0.0`, diagnostics `AdmissionError` table matches the new surface, regression-corpus version bumped, symbol inventory counts refreshed) |
 | `validation` | See §10 closeout commands |
 | `depends_on` | GGUF-A1b receipt (`exempla/gguf-inspect/README.md`; the 40-case synthetic proof + six-file real inspection). A1b evidence must be re-verified to still hold after the caller migration (the exempla do not import the capsule, so they must be unaffected — a compile check confirms) |
 | `non_goals` | Tokenizer runtime (GGUF-A2), packed storage/materialization (GGUF-A3), `qwen35moe` admission (GGUF-M1), real-file tensor-payload reads, native kernels, Metal/CUDA, HTTP/serving, any other model architecture, main-branch integration |
@@ -249,8 +249,8 @@ Before the migration lands:
 - Run `faber check` on the package and the schema-1-caller greps.
 
 **Expected first failure**: the schema-1 surface fails the new cases — e.g.
-`capsula.deserializa_identitas` accepts a `1.0.0`-stamped wire (schema-2 must
-reject it), `capsula.Capsula` exposes `corpus`/`semita` (schema-2 forbids
+`capsula.deserialize_identity` accepts a `1.0.0`-stamped wire (schema-2 must
+reject it), `capsula.Capsule` exposes `corpus`/`semita` (schema-2 forbids
 them), and `gguf.fab` still references the to-be-removed schema-1 constructor.
 Record the failing command and the first divergence (variant/method/line)
 before proceeding; the proba/grep pair is the divergence recorder.
@@ -282,7 +282,7 @@ env FABER_LIBRARY_HOME=/Users/ianzepp/work/faberlang/worktrees/<lane> \
   /Users/ianzepp/work/faberlang/worktrees/<lane>/radix/target/debug/faber \
   check --diagnostics .
 # schema-1 rejection + single-authority greps
-grep -rn "capsula\.structa(" src tests        # must print nothing
+grep -rn "capsula\.construct(" src tests        # must print nothing
 grep -rn "capsule-schema-1.0.0" src fixtures tests   # must print nothing
 grep -n "schema_versio" src/model/capsule.fab # must show 2.0.0
 grep -rln "importa ex \"gradus:model/gguf_manifest\"" src tests   # every GGUF parse caller
@@ -328,9 +328,9 @@ not read real tensor payloads and does not claim inference.
 ## 13. Open questions for Mind
 
 1. **Safetensors manifest representation (default chosen: new
-   `ManifestumSafetensors` genus inside `capsule.fab`).** The delivery
+   `SafetensorsManifest` genus inside `capsule.fab`).** The delivery
    authority's `ParsedArtifact` boundary names `GgufManifest` only; Safetensors
-   has no manifest module. The default mirrors `ManifestumGguf`'s descriptor
+   has no manifest module. The default mirrors `GgufManifest`'s descriptor
    style inside the capsule module so the migration stays in the stated write
    scope. **Options**: (a) default; (b) format-agnostic generic manifest genus
    shared by both formats (more abstraction, no existing precedent); (c)
@@ -339,7 +339,7 @@ not read real tensor payloads and does not claim inference.
    callers in one unit"). Confirm (a) or route to head-cto for the capsule
    surface shape.
 2. **Schema-1 rejection variant naming.** Whether the typed rejection is
-   `AdmissionError.VersioIgnota` with a schema-1-specific causa or a new
+   `AdmissionError.VersioIgnota` with a schema-1-specific message or a new
    `SchemaVetus` variant. The Hand freezes one and documents it; Mind should
    confirm no external consumer depends on the schema-1 `AdmissionError`
    surface (none found in `norma`/`faber`/`radix`/`examples`).

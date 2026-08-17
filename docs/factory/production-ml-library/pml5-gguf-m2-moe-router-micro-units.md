@@ -18,7 +18,7 @@ chain dispatches only after the MODEL-01 aggregate gate (G1) lands**, which
 lands after the **LIB-02 + LIB-03** aggregate gates **only** (campaign
 dependency graph; REF-01 is a sibling of MODEL-01, not a predecessor, and
 does not gate its dispatch). MODEL-02 also consumes LIB-03's windowed
-`VisumTensoris`/`materializa_slicem` surface (codec set + windowed reads) and
+`TensorView`/`materialize_slice` surface (codec set + windowed reads) and
 resolves A1's `silu` against the sibling REF-01 (GGUF-A4 dense primitives) by
 consume-or-add — neither is a MODEL-01/MODEL-02 dispatch gate.
 **Repo baselines**: Gradus `1462cd8` (lane tip, tree clean — verified; equals
@@ -60,8 +60,8 @@ explicit open item (§13.1).
 - **Key points**: `src/model/moe.fab`/`.proba` do not exist (confirmed — the
   module is entirely new); `src/nn.fab` has **no** public `silu` row
   (confirmed — only `linear`/`gelu`/`layernorm` + fixed-shape rows; the
-  self-hosted `_exponens` precedent exists at `:251`); `gradus:model/tensor_view`
-  (the LIB-03 `VisumTensoris`/`materializa_slicem`/`LectioFontis` surface)
+  self-hosted `_exp` precedent exists at `:251`); `gradus:model/tensor_view`
+  (the LIB-03 `TensorView`/`materialize_slice`/`SourceRead` surface)
   does not exist in this tree yet (LIB-03 is lowered at `a7d7bcd`, not
   landed); `exempla/moe-router-probe` does not exist; `fixtures/gguf/` has no
   `gen_moe_*` files. Every split surface is locatable and each micro-unit has
@@ -127,7 +127,7 @@ blk.34/38/39). Physical layouts used by the MoE path are exactly
 set **{F32, BF16, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K}**. The BF16 rows exist only
 on layer 40 (the MTP layer); probing layer 40 exercises the BF16 codec. No
 layout outside the union set appears in the MoE path. All rank-3 expert
-window reads go through the LIB-03 `VisumTensoris`/`materializa_slicem`
+window reads go through the LIB-03 `TensorView`/`materialize_slice`
 windowed surface with an operation-scoped range source — never a whole
 rank-3 tensor materialization.
 
@@ -221,20 +221,20 @@ genus ConfiguraMoe {
 }
 
 discretio MoError {
-    FormaMismatch { textus causa }
-    DimensioMala { textus causa }
-    TypoIgnotum { textus causa }
-    NomineIgnota { textus causa }
-    IndexMala { textus causa }
-    NonFinita { textus causa }
-    Superfluitas { textus causa }
+    FormaMismatch { textus message }
+    DimensioMala { textus message }
+    TypoIgnotum { textus message }
+    NomineIgnota { textus message }
+    IndexMala { textus message }
+    NonFinita { textus message }
+    Superfluitas { textus message }
 }
-functio causa(MoError e) → textus
+functio message(MoError e) → textus
 
 genus SelectioExpertarum {
     lista<numerus> indices        # top-n_usae expert indices, descending-probability order;
                                   # exact ties → lowest index first (deterministic tie rule)
-    lista<f32> pondera            # normalized weights, same order; sum ≈ 1
+    lista<f32> weights            # normalized weights, same order; sum ≈ 1
     lista<f32> logita             # full [n_expert] router logits (oracle surface)
     lista<f32> probabilitates     # full [n_expert] softmax probabilities (oracle surface)
 }
@@ -242,7 +242,7 @@ genus SelectioExpertarum {
 # Router: logits = x @ ffn_gate_inp; softmax over all n_expertae; top-n_usae by
 # probability with the deterministic tie rule; weights renormalized by sum
 # (norm_w semantics). x is a bounded pinned hidden-state probe [n_embd].
-functio eligito(lista<f32> x, visum.VisumTensoris ffn_gate_inp, ConfiguraMoe cfg)
+functio eligito(lista<f32> x, visum.TensorView ffn_gate_inp, ConfiguraMoe cfg)
     → SelectioExpertarum ⇥ MoError
 
 # One routed expert's SwiGLU FFN on a bounded hidden-state probe:
@@ -250,21 +250,21 @@ functio eligito(lista<f32> x, visum.VisumTensoris ffn_gate_inp, ConfiguraMoe cfg
 # Reads only the expert-e window of the three rank-3 tensors through the
 # operation-scoped range source (never the whole rank-3 tensor).
 functio expertum(lista<f32> x, numerus index_expertae,
-    visum.VisumTensoris ffn_gate_exps, visum.VisumTensoris ffn_up_exps,
-    visum.VisumTensoris ffn_down_exps, ConfiguraMoe cfg,
-    (numerus, numerus) → visum.LectioFontis fons) → lista<f32> ⇥ MoError
+    visum.TensorView ffn_gate_exps, visum.TensorView ffn_up_exps,
+    visum.TensorView ffn_down_exps, ConfiguraMoe cfg,
+    (numerus, numerus) → visum.SourceRead fons) → lista<f32> ⇥ MoError
 
 # Complete layer FFN output: routed weighted sum + gated shared expert.
-#   moe_out = Σ_e pondera[e]·expertum(x,e)
+#   moe_out = Σ_e weights[e]·expertum(x,e)
 #   g = sigmoid(x · ffn_gate_inp_shexp)
 #   shexp = (silu(x @ ffn_gate_shexp) * (x @ ffn_up_shexp)) @ ffn_down_shexp
 #   redde moe_out + g·shexp
 functio ffn_moe(lista<f32> x,
-    visum.VisumTensoris ffn_gate_inp, visum.VisumTensoris ffn_gate_exps,
-    visum.VisumTensoris ffn_up_exps, visum.VisumTensoris ffn_down_exps,
-    visum.VisumTensoris ffn_gate_inp_shexp, visum.VisumTensoris ffn_gate_shexp,
-    visum.VisumTensoris ffn_up_shexp, visum.VisumTensoris ffn_down_shexp,
-    ConfiguraMoe cfg, (numerus, numerus) → visum.LectioFontis fons)
+    visum.TensorView ffn_gate_inp, visum.TensorView ffn_gate_exps,
+    visum.TensorView ffn_up_exps, visum.TensorView ffn_down_exps,
+    visum.TensorView ffn_gate_inp_shexp, visum.TensorView ffn_gate_shexp,
+    visum.TensorView ffn_up_shexp, visum.TensorView ffn_down_shexp,
+    ConfiguraMoe cfg, (numerus, numerus) → visum.SourceRead fons)
     → lista<f32> ⇥ MoError
 ```
 
@@ -278,7 +278,7 @@ reader, source function, or device object.
 ### `gradus:nn` — additive public primitive (frozen)
 
 ```text
-# SiLU activation: silu(x) = x · sigmoid(x), self-hosted exp precedent (nn._exponens).
+# SiLU activation: silu(x) = x · sigmoid(x), self-hosted exp precedent (nn._exp).
 functio silu(tensor.Tensor x) → tensor.Tensor ⇥ NnError
 ```
 
@@ -310,9 +310,9 @@ adding a duplicate — the shared-file discipline below.
 | Surface | Current state | Micro-unit |
 | --- | --- | --- |
 | `src/model/moe.fab` / `.proba` | **Do not exist** — the module is entirely new | B1–B4 |
-| `src/nn.fab` | Public rows: `linear`/`gelu`/`layernorm` + fixed-shape rows; `_exponens` helper at `:251`; **no `silu`** | A1 |
-| `src/model/tensor_view.fab` | **Does not exist** — LIB-03 lowered (`a7d7bcd`), not landed; `VisumTensoris`/`materializa_slicem`/`VisioError`/`LectioFontis` surface arrives with GGUF-A3 | B1–B4 entry gate |
-| `src/model/gguf_manifest.fab` | Live `LectioFontis`/`inveni_tensorem`/`lege_fragmentum` surface (A1b) | read-only (B3 adapter pattern) |
+| `src/nn.fab` | Public rows: `linear`/`gelu`/`layernorm` + fixed-shape rows; `_exp` helper at `:251`; **no `silu`** | A1 |
+| `src/model/tensor_view.fab` | **Does not exist** — LIB-03 lowered (`a7d7bcd`), not landed; `TensorView`/`materialize_slice`/`ViewError`/`SourceRead` surface arrives with GGUF-A3 | B1–B4 entry gate |
+| `src/model/gguf_manifest.fab` | Live `SourceRead`/`inveni_tensorem`/`read_fragmentum` surface (A1b) | read-only (B3 adapter pattern) |
 | `src/model/qwen35moe.fab` / `.proba` | **Do not exist yet** (MODEL-01 chain lowered at `df3c016`, not landed); its admitted `ConfiguraMoe`-equivalent facts (256/8/512/512/2048) are the spec | read-only at dispatch |
 | `src/sampling.fab` | "first-index ties" convention live | A3/B2 tie-rule precedent |
 | `fixtures/gguf/` | `gen_manifest_fixtures.py`, `general-manifest-oracle.md`, `gguf-row-oracle.md`, three manifest fixtures; **no `gen_moe_*` files** | A2, A3 |
@@ -375,10 +375,10 @@ C1/C2 run parallel after B4. Peak live Hands: 3.
 
 | Field | Value |
 | --- | --- |
-| `outcome` | the public `silu` row lands in `gradus:nn` — `silu(tensor.Tensor x) → tensor.Tensor ⇥ NnError` (plus the internal scalar helper over the self-hosted `_exponens` precedent), with `nn.proba` value pins; **if REF-01's generic SiLU row is present at the unit boundary, consume it instead and record the consumed revision** (no duplicate row, no dual authority) |
+| `outcome` | the public `silu` row lands in `gradus:nn` — `silu(tensor.Tensor x) → tensor.Tensor ⇥ NnError` (plus the internal scalar helper over the self-hosted `_exp` precedent), with `nn.proba` value pins; **if REF-01's generic SiLU row is present at the unit boundary, consume it instead and record the consumed revision** (no duplicate row, no dual authority) |
 | `primary files` | `src/nn.fab`, `src/nn.proba` (2) |
 | `write_scope` | those two only |
-| `read_scope` | live `nn.fab` (`_exponens` :251, `_gelu_scalaris` :284), `docs/api-reference.md` `gradus:nn` section (:330), the frozen `silu` spelling in §2 |
+| `read_scope` | live `nn.fab` (`_exp` :251, `_scalar_gelu` :284), `docs/api-reference.md` `gradus:nn` section (:330), the frozen `silu` spelling in §2 |
 | `forbidden_scope` | any `src/model/moe.*`; `gradus:model/tensor_view`; other modules; main-checkout edits |
 | `red` | add proba cases asserting `silu([0, 1, -1, 2])`-style values and a tensor case (fail today — no `silu` exists); record the first failing case; if REF-01's row exists, the red is the absence of the consumed-row recording instead |
 | `green` | `faber check src/nn.fab` exit 0 (lane-local `FABER_BIN`, `FABER_LIBRARY_HOME`); proba cases pass (or compile-level pins per the recorded invocation); `grep -n "functio silu" src/nn.fab` present; `git diff --check` silent |
@@ -438,7 +438,7 @@ C1/C2 run parallel after B4. Peak live Hands: 3.
 
 | Field | Value |
 | --- | --- |
-| `outcome` | `src/model/moe.fab` opens with the frozen type surface: `importa ex "gradus:model/tensor_view" visum`, genus `ConfiguraMoe` (256/8/512/512/2048 — from MODEL-01 admission, never re-derived), discretio `MoError` with all seven variants + `causa`, and genus `SelectioExpertarum`; `moe.proba` pins the ConfiguraMoe values and the fail-closed error rows (`NonFinita` on NaN/±Inf probe, `TypoIgnotum` un-admitted-type, `NomineIgnota` unknown-tensor-name, shape/dimension/order rows) — typed `MoError`, never a silent default |
+| `outcome` | `src/model/moe.fab` opens with the frozen type surface: `importa ex "gradus:model/tensor_view" visum`, genus `ConfiguraMoe` (256/8/512/512/2048 — from MODEL-01 admission, never re-derived), discretio `MoError` with all seven variants + `message`, and genus `SelectioExpertarum`; `moe.proba` pins the ConfiguraMoe values and the fail-closed error rows (`NonFinita` on NaN/±Inf probe, `TypoIgnotum` un-admitted-type, `NomineIgnota` unknown-tensor-name, shape/dimension/order rows) — typed `MoError`, never a silent default |
 | `primary files` | `src/model/moe.fab`, `src/model/moe.proba` (2) |
 | `write_scope` | those two only |
 | `read_scope` | MODEL-01 admission facts (§2 + the landed `src/model/qwen35moe.fab` at dispatch), the LIB-03 `gradus:model/tensor_view` surface, §2 frozen public surface |
@@ -459,7 +459,7 @@ C1/C2 run parallel after B4. Peak live Hands: 3.
 
 | Field | Value |
 | --- | --- |
-| `outcome` | `eligito(lista<f32> x, visum.VisumTensoris ffn_gate_inp, ConfiguraMoe cfg) → SelectioExpertarum ⇥ MoError` computes the full `[n_expert]` router logits (`x @ ffn_gate_inp`, no bias), softmax over all `n_expert` (max-subtracted f32), the top-`n_usae` by probability in descending order with the **deterministic tie rule (lowest index first)**, and weight renormalization `weights /= max(sum(weights), 6.103515625e-5)` (`norm_w=true`; no `expert_weights_scale` step) |
+| `outcome` | `eligito(lista<f32> x, visum.TensorView ffn_gate_inp, ConfiguraMoe cfg) → SelectioExpertarum ⇥ MoError` computes the full `[n_expert]` router logits (`x @ ffn_gate_inp`, no bias), softmax over all `n_expert` (max-subtracted f32), the top-`n_usae` by probability in descending order with the **deterministic tie rule (lowest index first)**, and weight renormalization `weights /= max(sum(weights), 6.103515625e-5)` (`norm_w=true`; no `expert_weights_scale` step) |
 | `primary files` | `src/model/moe.fab`, `src/model/moe.proba` (2) |
 | `write_scope` | those two only |
 | `read_scope` | B1 branch head, A2 tie-probe fixture, §2 exact MoE semantics steps 1–4 + tie rule, `src/sampling.fab` first-index-ties convention |
@@ -480,7 +480,7 @@ C1/C2 run parallel after B4. Peak live Hands: 3.
 
 | Field | Value |
 | --- | --- |
-| `outcome` | `expertum(lista<f32> x, numerus index_expertae, visum.VisumTensoris ffn_gate_exps, visum.VisumTensoris ffn_up_exps, visum.VisumTensoris ffn_down_exps, ConfiguraMoe cfg, (numerus, numerus) → visum.LectioFontis fons) → lista<f32> ⇥ MoError` reads only the expert-`e` window of the three rank-3 tensors through the operation-scoped range source (never a whole rank-3 tensor), computes `h = silu(x @ gate_e) * (x @ up_e)` and `out = h @ down_e`, and returns the expert's `[512]` output; the synthetic multi-expert fixture exercises a Q4_K/Q5_K expert window through the real codecs; the per-expert window materializes to the pinned f32 golden values |
+| `outcome` | `expertum(lista<f32> x, numerus index_expertae, visum.TensorView ffn_gate_exps, visum.TensorView ffn_up_exps, visum.TensorView ffn_down_exps, ConfiguraMoe cfg, (numerus, numerus) → visum.SourceRead fons) → lista<f32> ⇥ MoError` reads only the expert-`e` window of the three rank-3 tensors through the operation-scoped range source (never a whole rank-3 tensor), computes `h = silu(x @ gate_e) * (x @ up_e)` and `out = h @ down_e`, and returns the expert's `[512]` output; the synthetic multi-expert fixture exercises a Q4_K/Q5_K expert window through the real codecs; the per-expert window materializes to the pinned f32 golden values |
 | `primary files` | `src/model/moe.fab`, `src/model/moe.proba` (2) |
 | `write_scope` | those two only |
 | `read_scope` | B2 branch head, A1 silu (branch head), A3 goldens (window values), `exempla/gguf-inspect` operation-scoped range pattern, §2 rank-3 mapping/storage union |
@@ -501,7 +501,7 @@ C1/C2 run parallel after B4. Peak live Hands: 3.
 
 | Field | Value |
 | --- | --- |
-| `outcome` | `ffn_moe(lista<f32> x, …all nine tensors…, ConfiguraMoe cfg, (numerus, numerus) → visum.LectioFontis fons) → lista<f32> ⇥ MoError` composes the routed weighted sum `moe_out = Σ_e pondera[e]·expertum(x,e)`, the sigmoid gate `g = sigmoid(x · ffn_gate_inp_shexp)`, the shared-expert FFN `shexp = (silu(x @ ffn_gate_shexp) * (x @ ffn_up_shexp)) @ ffn_down_shexp`, and returns `ffn_out = moe_out + g·shexp`; full-probe goldens match (per (layer, probe)) |
+| `outcome` | `ffn_moe(lista<f32> x, …all nine tensors…, ConfiguraMoe cfg, (numerus, numerus) → visum.SourceRead fons) → lista<f32> ⇥ MoError` composes the routed weighted sum `moe_out = Σ_e weights[e]·expertum(x,e)`, the sigmoid gate `g = sigmoid(x · ffn_gate_inp_shexp)`, the shared-expert FFN `shexp = (silu(x @ ffn_gate_shexp) * (x @ ffn_up_shexp)) @ ffn_down_shexp`, and returns `ffn_out = moe_out + g·shexp`; full-probe goldens match (per (layer, probe)) |
 | `primary files` | `src/model/moe.fab`, `src/model/moe.proba` (2) |
 | `write_scope` | those two only |
 | `read_scope` | B3 branch head, A1 silu, A3 goldens (full-probe rows), §2 exact MoE semantics steps 5–8 |

@@ -92,7 +92,7 @@ The reference implementation is the pinned llama.cpp `build_moe_ffn` + the qwen3
 ## Predecessor And Entry Gate
 
 - **Predecessor receipt**: MODEL-01 = **GGUF-M1** (`qwen35moe` admission and tensor map). Its done oracle: the exact Qwen3.6 artifact admits with 753 tensors and a complete typed execution configuration; mutated metadata/names/shapes/storage layouts fail with typed first-divergence diagnostics. MODEL-01 owns `src/model/qwen35moe.fab` + proba (the admitted `ConfiguraMoe`-equivalent facts `n_expert`, `n_expert_used`, `n_ff_exp`, `n_ff_shexp`, `n_embd`, canonical tensor names) that this unit consumes — it does not re-derive them.
-- **Transitive codec prerequisite**: LIB-03 = **GGUF-A3** must be landed for the union codec set **{F32, BF16, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K}** and the windowed `VisumTensoris`/`materializa_slicem` surface. The MoE probes on layers 0/3/39 need F32/Q4_K/Q5_K/Q6_K/Q8_0; the layer-40 probe additionally needs **BF16**. No layout outside the LIB-03 union set appears in the MoE path.
+- **Transitive codec prerequisite**: LIB-03 = **GGUF-A3** must be landed for the union codec set **{F32, BF16, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K}** and the windowed `TensorView`/`materialize_slice` surface. The MoE probes on layers 0/3/39 need F32/Q4_K/Q5_K/Q6_K/Q8_0; the layer-40 probe additionally needs **BF16**. No layout outside the LIB-03 union set appears in the MoE path.
 - **Shared primitives**: `silu` is not yet a public `gradus:nn` primitive (the live `nn.fab` exposes `linear`, `gelu`, `layernorm`). This unit adds the public `silu` row (scalar + tensor) in `gradus:nn` if it is not present at its boundary — hunk-serialized with REF-01's planned nn rows (see §Implementation Frontier).
 - **Entry-gate state at the lowering boundary**: GGUF-M1 is **NOT landed** (planner-25 is lowering it in parallel; no MODEL-01 commit exists on any `factory/planner-*` branch at this boundary). LIB-03/GGUF-A3 is lowered (planner-23, commit `a7d7bcd`) but not yet landed either.
 - **Lowering disposition**: this spec is **complete and READY**; dispatch of the implementing Hand is **gated on the GGUF-M1 receipt** (the affected edge `M1 → M2` blocks; execution rule 6 — no other ready unit is affected, and GGUF-M3 (MODEL-03) runs parallel-safe on the disjoint attention/SSM state surface). **Recheck handles**: the GGUF-M1 closeout record in `pml5-general-gguf-delivery.md` / gradus `CAMPAIGN.md` status line; the GGUF-A3 closeout record for the union codec set.
@@ -129,20 +129,20 @@ genus ConfiguraMoe {
 }
 
 discretio MoError {
-    FormaMismatch { textus causa }
-    DimensioMala { textus causa }
-    TypoIgnotum { textus causa }
-    NomineIgnota { textus causa }
-    IndexMala { textus causa }
-    NonFinita { textus causa }
-    Superfluitas { textus causa }
+    FormaMismatch { textus message }
+    DimensioMala { textus message }
+    TypoIgnotum { textus message }
+    NomineIgnota { textus message }
+    IndexMala { textus message }
+    NonFinita { textus message }
+    Superfluitas { textus message }
 }
-functio causa(MoError e) → textus
+functio message(MoError e) → textus
 
 genus SelectioExpertarum {
     lista<numerus> indices        # top-n_usae expert indices, descending-probability order;
                                   # exact ties → lowest index first (deterministic tie rule)
-    lista<f32> pondera            # normalized weights, same order; sum ≈ 1
+    lista<f32> weights            # normalized weights, same order; sum ≈ 1
     lista<f32> logita             # full [n_expert] router logits (oracle surface)
     lista<f32> probabilitates     # full [n_expert] softmax probabilities (oracle surface)
 }
@@ -150,7 +150,7 @@ genus SelectioExpertarum {
 # Router: logits = x @ ffn_gate_inp; softmax over all n_expertae; top-n_usae by
 # probability with the deterministic tie rule; weights renormalized by sum
 # (norm_w semantics). x is a bounded pinned hidden-state probe [n_embd].
-functio eligito(lista<f32> x, visum.VisumTensoris ffn_gate_inp, ConfiguraMoe cfg)
+functio eligito(lista<f32> x, visum.TensorView ffn_gate_inp, ConfiguraMoe cfg)
     → SelectioExpertarum ⇥ MoError
 
 # One routed expert's SwiGLU FFN on a bounded hidden-state probe:
@@ -158,21 +158,21 @@ functio eligito(lista<f32> x, visum.VisumTensoris ffn_gate_inp, ConfiguraMoe cfg
 # Reads only the expert-e window of the three rank-3 tensors through the
 # operation-scoped range source (never the whole rank-3 tensor).
 functio expertum(lista<f32> x, numerus index_expertae,
-    visum.VisumTensoris ffn_gate_exps, visum.VisumTensoris ffn_up_exps,
-    visum.VisumTensoris ffn_down_exps, ConfiguraMoe cfg,
-    (numerus, numerus) → visum.LectioFontis fons) → lista<f32> ⇥ MoError
+    visum.TensorView ffn_gate_exps, visum.TensorView ffn_up_exps,
+    visum.TensorView ffn_down_exps, ConfiguraMoe cfg,
+    (numerus, numerus) → visum.SourceRead fons) → lista<f32> ⇥ MoError
 
 # Complete layer FFN output: routed weighted sum + gated shared expert.
-#   moe_out = Σ_e pondera[e]·expertum(x,e)
+#   moe_out = Σ_e weights[e]·expertum(x,e)
 #   g = sigmoid(x · ffn_gate_inp_shexp)
 #   shexp = (silu(x @ ffn_gate_shexp) * (x @ ffn_up_shexp)) @ ffn_down_shexp
 #   redde moe_out + g·shexp
 functio ffn_moe(lista<f32> x,
-    visum.VisumTensoris ffn_gate_inp, visum.VisumTensoris ffn_gate_exps,
-    visum.VisumTensoris ffn_up_exps, visum.VisumTensoris ffn_down_exps,
-    visum.VisumTensoris ffn_gate_inp_shexp, visum.VisumTensoris ffn_gate_shexp,
-    visum.VisumTensoris ffn_up_shexp, visum.VisumTensoris ffn_down_shexp,
-    ConfiguraMoe cfg, (numerus, numerus) → visum.LectioFontis fons)
+    visum.TensorView ffn_gate_inp, visum.TensorView ffn_gate_exps,
+    visum.TensorView ffn_up_exps, visum.TensorView ffn_down_exps,
+    visum.TensorView ffn_gate_inp_shexp, visum.TensorView ffn_gate_shexp,
+    visum.TensorView ffn_up_shexp, visum.TensorView ffn_down_shexp,
+    ConfiguraMoe cfg, (numerus, numerus) → visum.SourceRead fons)
     → lista<f32> ⇥ MoError
 ```
 
@@ -181,7 +181,7 @@ functio ffn_moe(lista<f32> x,
 ### `gradus:nn` — additive public primitive
 
 ```text
-# SiLU activation: silu(x) = x · sigmoid(x), self-hosted exp precedent (nn._exponens).
+# SiLU activation: silu(x) = x · sigmoid(x), self-hosted exp precedent (nn._exp).
 functio silu(tensor.Tensor x) → tensor.Tensor ⇥ NnError
 ```
 
@@ -218,7 +218,7 @@ All paths under the implementing Hand's gradus worktree on `factory/planner-26`;
 Split-on-boundary (each slice a landed commit; no dual authority ever exists between slices):
 
 - **M2-C1 — silu + router (first implementation frontier)**: the public `silu` row in `nn.fab` (if absent), then `eligito` — router logits, softmax, deterministic top-k with the tie rule, weight renormalization — with the synthetic fixture + crafted tie probe in `moe.proba`. Independent and first; carries the first failing oracle.
-- **M2-C2 — rank-3 expert dispatch + accumulation**: `expertum` (per-expert window reads through `VisumTensoris`/`materializa_slicem` + per-expert SwiGLU) and the weighted-sum accumulation; the synthetic multi-expert fixture (including a Q4_K/Q5_K expert window exercised through the real codecs).
+- **M2-C2 — rank-3 expert dispatch + accumulation**: `expertum` (per-expert window reads through `TensorView`/`materialize_slice` + per-expert SwiGLU) and the weighted-sum accumulation; the synthetic multi-expert fixture (including a Q4_K/Q5_K expert window exercised through the real codecs).
 - **M2-C3 — shared expert + full `ffn_moe`**: `ffn_gate_inp_shexp` sigmoid gate + shared-expert FFN + the complete `ffn_moe` composition; full-probe goldens.
 - **M2-C4 — exempla receipt + docs + closeout**: `exempla/moe-router-probe` real-file receipt across the selected layers (0, 3, 39, 40 — see §Oracle), `scripta/check-compile` targets, all doc updates, the support-matrix row, the closeout commit.
 
@@ -292,7 +292,7 @@ This lowering preserves every mandatory successor; nothing is narrowed, deferred
 ## Open Items For Mind (none blocks this lowering)
 
 1. **GGUF-M1 (MODEL-01) landing** — the dispatch gate for this unit; recheck at the GGUF-M1 closeout.
-2. **GGUF-A3 (LIB-03) landing** — the BF16/Q5_K codec and `VisumTensoris` surface the MoE probes consume; recheck at the A3 closeout.
+2. **GGUF-A3 (LIB-03) landing** — the BF16/Q5_K codec and `TensorView` surface the MoE probes consume; recheck at the A3 closeout.
 3. **Exact public spellings** (`ConfiguraMoe`/`SelectioExpertarum`/`eligito`/`expertum`/`ffn_moe`/`silu`) — frozen by this lowering per the codebase Latin convention; any amendment routes through the delivery-amendment path (A1a precedent).
 4. **Tie-rule validation scope** — the crafted exact-tie probe proves OUR deterministic rule (lowest index first); llama.cpp's argsort tie order is implementation-defined and is only re-validated at GGUF-M4's full-model boundary. Recorded honestly; not a block.
 

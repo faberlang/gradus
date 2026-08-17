@@ -70,10 +70,10 @@ SEM010 at the same sites. Deduplicated to **17 distinct (file, merged-line) site
 
 | File | Sites | Referenced provider symbols |
 | --- | --- | --- |
-| `src/attention.fab` | 4 | `math.matmul` ×2, `math.mul`, `math.causa` |
-| `src/nn.fab` | 3 | `math.matmul`, `math.add`, `math.causa` |
-| `src/optimize.fab` | 5 | `parametrum.Parametrum` ×4, `gradient.Gradiente` |
-| `src/sampling.fab` | 5 | `train.Semen` ×4, `train.FructusF32` + `train.proximus_f32` |
+| `src/attention.fab` | 4 | `math.matmul` ×2, `math.mul`, `math.message` |
+| `src/nn.fab` | 3 | `math.matmul`, `math.add`, `math.message` |
+| `src/optimize.fab` | 5 | `parametrum.Parameter` ×4, `gradient.Gradient` |
+| `src/sampling.fab` | 5 | `train.Seed` ×4, `train.DrawF32` + `train.next_f32` |
 
 **Provenance**: the four files are byte-identical between baseline `61aac27` and
 candidate `93b33d0` (report `88009081`; re-verified). A fresh reproduction on the
@@ -82,9 +82,9 @@ post-flip enabling work, not A1C regression — same class as the planner-38 13-
 surface, which the VIS-S/D/T repairs cleared.
 
 **Root-cause correction vs report `88009081`**: the report states "src/math.fab carries
-zero @ publica annotations; matmul/mul/causa/… are module-private". That is only true for
-7 of the 17 distinct sites. The remaining 10 sites reference `parameter.Parametrum`,
-`gradient.Gradiente`, `train.Semen`, `train.FructusF32`, `train.proximus_f32` — four
+zero @ publica annotations; matmul/mul/message/… are module-private". That is only true for
+7 of the 17 distinct sites. The remaining 10 sites reference `parameter.Parameter`,
+`gradient.Gradient`, `train.Seed`, `train.DrawF32`, `train.next_f32` — four
 provider modules, not one. A math.fab-only repair would leave 10 SEM006 (optimize +
 sampling) and the gate still red.
 
@@ -122,12 +122,12 @@ removed** because the audit proved they have no cross-module reference and targe
 compiler simulation (§3a) proved they are not compiler-transitive required either:
 
 - **6 gratuitous standalone functions** (removed, no consumer, no transitive
-  justification): `optimize.statum_aequus`, `optimize.sgd_aequus`,
-  `optimize.serializa_statum`, `optimize.deserializa_statum`, `metrics.accuratezza`,
-  `metrics.causa`.
+  justification): `optimize.state_equal`, `optimize.sgd_equal`,
+  `optimize.serialize_state`, `optimize.deserialize_state`, `metrics.accuracy`,
+  `metrics.message`.
 - **5 error-type / formatter symbols** (removed — not compiler-transitive required):
   `decode.DecodeError`, `generation.GeneratioError`, `gradus.GradusError`,
-  `transformer.TransformerError`, `gradus.causa`.
+  `transformer.TransformerError`, `gradus.message`.
 
 Every remaining symbol below is consumed cross-module by a gradus library or exempla
 file, carries **no** `@ publica` on the baseline/candidate, and is **not** `_`-prefixed
@@ -141,7 +141,7 @@ landed — the 6 annotations below are the ones still missing).
 
 | Line | Declaration |
 | --- | --- |
-| 92 | `functio causa(MathError e) → textus {` |
+| 92 | `functio message(MathError e) → textus {` |
 | 297 | `functio add(tensor.Tensor a, tensor.Tensor b) → tensor.Tensor ⇥ MathError {` |
 | 331 | `functio mul(tensor.Tensor a, tensor.Tensor b) → tensor.Tensor ⇥ MathError {` |
 | 486 | `functio matmul(tensor.Tensor a, tensor.Tensor b) → tensor.Tensor ⇥ MathError {` |
@@ -153,11 +153,11 @@ of the exact 21.
 
 | Line | Declaration |
 | --- | --- |
-| 113 | `functio causa(ParametrumError e) → textus {` |
-| 182 | `genus Parametrum {` |
-| 255 | `functio est_gelida(Parametrum p) → bivalens {` |
-| 304 | `functio structa(textus nomen, textus possessor, textus typo_nomen, lista<numerus> forma, lista<f32> datos) → Parametrum ⇥ ParametrumError {` |
-| 320 | `functio muta(Parametrum p, lista<f32> datos) → Parametrum ⇥ ParametrumError {` |
+| 113 | `functio message(ParameterError e) → textus {` |
+| 182 | `genus Parameter {` |
+| 255 | `functio is_frozen(Parameter p) → bivalens {` |
+| 304 | `functio construct(textus name, textus owner, textus typo_nomen, lista<numerus> shape, lista<f32> datos) → Parameter ⇥ ParameterError {` |
+| 320 | `functio mutate(Parameter p, lista<f32> datos) → Parameter ⇥ ParameterError {` |
 
 Consumers: optimize.fab, exempla/training-loop-mlp.
 
@@ -165,9 +165,9 @@ Consumers: optimize.fab, exempla/training-loop-mlp.
 
 | Line | Declaration |
 | --- | --- |
-| 94 | `genus Gradiente {` |
-| 124 | `functio structa(textus nomen, textus possessor, numerus versio, tensor.Tensor valor) → Gradiente ⇥ GradienteError {` |
-| 173 | `functio obsoletus(Gradiente g, numerus versio_currens) → bivalens {` |
+| 94 | `genus Gradient {` |
+| 124 | `functio construct(textus name, textus owner, numerus version, tensor.Tensor payload) → Gradient ⇥ GradientError {` |
+| 173 | `functio obsolete(Gradient g, numerus versio_currens) → bivalens {` |
 | 183 | `functio nil() → vacuum {` |
 | 195 | `functio simple_loss(tensor<f32, [2,2]> x, tensor<f32, [2,2]> w) → f32 {` |
 
@@ -180,19 +180,19 @@ these annotations.)
 
 | Line | Declaration |
 | --- | --- |
-| 293 | `functio causa(TrainError e) → textus {` |
-| 319 | `genus Schedula {` |
-| 346 | `functio structa_schedula(f32 lentus_vertex, numerus incalesco, numerus passus_total, f32 lentus_finis) → Schedula ⇥ TrainError {` |
-| 386 | `functio lentus_schedulata(Schedula s, numerus passus) → f32 ⇥ TrainError {` |
-| 539 | `genus Semen {` |
-| 549 | `functio structa_semen(numerus semen) → Semen ⇥ TrainError {` |
-| 591 | `genus FructusF32 {` |
-| 606 | `functio proximus_f32(Semen s) → FructusF32 {` |
-| 708 | `genus Tabula {` |
-| 737 | `functio structa_tabula(numerus aetas, numerus passus, Semen rng, textus statum_wire) → Tabula ⇥ TrainError {` |
-| 751 | `functio tabula_aequus(Tabula a, Tabula b) → bivalens {` |
-| 765 | `functio serializa_tabula(Tabula c) → textus {` |
-| 788 | `functio deserializa_tabula(textus wire) → Tabula ⇥ TrainError {` |
+| 293 | `functio message(TrainError e) → textus {` |
+| 319 | `genus Schedule {` |
+| 346 | `functio construct_schedule(f32 rate_vertex, numerus warmup, numerus total_steps, f32 rate_end) → Schedule ⇥ TrainError {` |
+| 386 | `functio scheduled_rate(Schedule s, numerus passus) → f32 ⇥ TrainError {` |
+| 539 | `genus Seed {` |
+| 549 | `functio construct_seed(numerus seed) → Seed ⇥ TrainError {` |
+| 591 | `genus DrawF32 {` |
+| 606 | `functio next_f32(Seed s) → DrawF32 {` |
+| 708 | `genus Checkpoint {` |
+| 737 | `functio construct_checkpoint(numerus age, numerus passus, Seed rng, textus state_wire) → Checkpoint ⇥ TrainError {` |
+| 751 | `functio checkpoint_equal(Checkpoint a, Checkpoint b) → bivalens {` |
+| 765 | `functio serialize_checkpoint(Checkpoint c) → textus {` |
+| 788 | `functio deserialize_checkpoint(textus wire) → Checkpoint ⇥ TrainError {` |
 
 Consumers: sampling.fab, decode.fab, generation.fab, exempla/training-loop-mlp,
 exempla/token-generation.
@@ -201,7 +201,7 @@ exempla/token-generation.
 
 | Line | Declaration |
 | --- | --- |
-| 174 | `functio causa(NnError e) → textus {` |
+| 174 | `functio message(NnError e) → textus {` |
 | 297 | `functio linear(tensor.Tensor x, tensor.Tensor w, tensor.Tensor b) → tensor.Tensor ⇥ NnError {` |
 | 366 | `functio gelu(tensor.Tensor x) → tensor.Tensor ⇥ NnError {` |
 | 385 | `functio layernorm(tensor.Tensor x, tensor.Tensor scale, tensor.Tensor offset, f32 epsilon) → tensor.Tensor ⇥ NnError {` |
@@ -213,7 +213,7 @@ exempla/token-generation.
 
 | Line | Declaration |
 | --- | --- |
-| 153 | `functio causa(AttentionError e) → textus {` |
+| 153 | `functio message(AttentionError e) → textus {` |
 | 519 | `functio scaled_dot_product(tensor.Tensor q, tensor.Tensor k, tensor.Tensor v, f32 scale) → tensor.Tensor ⇥ AttentionError {` |
 | 531 | `functio scaled_dot_product_causal(tensor.Tensor q, tensor.Tensor k, tensor.Tensor v, f32 scale) → tensor.Tensor ⇥ AttentionError {` |
 | 543 | `functio scaled_dot_product_causal_rope(tensor.Tensor q, tensor.Tensor k, tensor.Tensor v, f32 scale, lista<numerus> positions, numerus dim) → tensor.Tensor ⇥ AttentionError {` |
@@ -225,12 +225,12 @@ Consumer: transformer.fab.
 | Line | Declaration |
 | --- | --- |
 | 67 | `discretio SamplingError {` |
-| 73 | `functio causa(SamplingError e) → textus {` |
-| 86 | `genus Configura {` |
-| 122 | `functio structa_configura(` |
-| 157 | `genus Sortitio {` |
-| 177 | `functio maxima(lista<f32> logits) → numerus ⇥ SamplingError {` |
-| 229 | `functio sors(lista<f32> logits, Configura c, lista<numerus> historia, train.Semen semen) → Sortitio ⇥ SamplingError {` |
+| 73 | `functio message(SamplingError e) → textus {` |
+| 86 | `genus Config {` |
+| 122 | `functio construct_config(` |
+| 157 | `genus Sampler {` |
+| 177 | `functio max(lista<f32> logits) → numerus ⇥ SamplingError {` |
+| 229 | `functio sample(lista<f32> logits, Config c, lista<numerus> history, train.Seed seed) → Sampler ⇥ SamplingError {` |
 
 Consumers: decode.fab, generation.fab, exempla/token-generation.
 
@@ -238,18 +238,18 @@ Consumers: decode.fab, generation.fab, exempla/token-generation.
 
 | Line | Declaration |
 | --- | --- |
-| 117 | `functio causa(DecodeError e) → textus {` |
-| 142 | `genus Pondera {` |
-| 184 | `functio structa_pondera(` |
-| 213 | `genus Decodere {` |
-| 264 | `functio structa_decodere(` |
+| 117 | `functio message(DecodeError e) → textus {` |
+| 142 | `genus Weights {` |
+| 184 | `functio construct_weights(` |
+| 213 | `genus Decoder {` |
+| 264 | `functio construct_decoder(` |
 | 415 | `functio decodere_datum(` |
-| 470 | `genus Sessio {` |
-| 486 | `functio sessio_fresh(` |
-| 503 | `functio redintegra(` |
-| 516 | `genus Cancelatum {` |
-| 526 | `functio cancelatum_fresh(` |
-| 538 | `functio observa_cancellationem(` |
+| 470 | `genus Session {` |
+| 486 | `functio fresh_session(` |
+| 503 | `functio reset(` |
+| 516 | `genus Cancellation {` |
+| 526 | `functio fresh_cancellation(` |
+| 538 | `functio observe_cancellation(` |
 
 Consumers: generation.fab, exempla/token-generation.
 
@@ -257,14 +257,14 @@ Consumers: generation.fab, exempla/token-generation.
 
 | Line | Declaration |
 | --- | --- |
-| 117 | `genus GeneratioConfigura {` |
-| 193 | `functio structa_generatio(` |
-| 284 | `functio configura(GeneratioConfigura g) → sampling.Configura ⇥ GeneratioError {` |
-| 297 | `functio semen(GeneratioConfigura g) → train.Semen ⇥ GeneratioError {` |
-| 454 | `genus GenereCursor {` |
-| 470 | `functio cursor_fresh(` |
-| 485 | `functio verbum_licet(` |
-| 494 | `functio cursor_progredere(` |
+| 117 | `genus GenerationConfig {` |
+| 193 | `functio construct_generation(` |
+| 284 | `functio configura(GenerationConfig g) → sampling.Config ⇥ GeneratioError {` |
+| 297 | `functio seed(GenerationConfig g) → train.Seed ⇥ GeneratioError {` |
+| 454 | `genus GenerationCursor {` |
+| 470 | `functio fresh_cursor(` |
+| 485 | `functio token_allowed(` |
+| 494 | `functio cursor_advance(` |
 
 Consumer: exempla/token-generation.
 
@@ -272,15 +272,15 @@ Consumer: exempla/token-generation.
 
 | Line | Declaration |
 | --- | --- |
-| 189 | `genus SgdStatum {` |
-| 258 | `functio structa(textus nomen, textus possessor, numerus generatio, f32 lentus) → SgdStatum ⇥ OptimizeError {` |
+| 189 | `genus SgdState {` |
+| 258 | `functio construct(textus name, textus owner, numerus generation, f32 rate) → SgdState ⇥ OptimizeError {` |
 | 267 | `genus Sgd {` |
-| 309 | `functio sgd_vacuum() → Sgd {` |
-| 314 | `functio adscisco(Sgd o, SgdStatum s) → Sgd ⇥ OptimizeError {` |
-| 328 | `genus Passus {` |
-| 350 | `functio passus(SgdStatum s, parametrum.Parametrum p, gradient.Gradiente g) → Passus ⇥ OptimizeError {` |
-| 465 | `functio serializa(Sgd o) → textus {` |
-| 473 | `functio deserializa(textus wire) → Sgd ⇥ OptimizeError {` |
+| 309 | `functio empty_sgd() → Sgd {` |
+| 314 | `functio add(Sgd o, SgdState s) → Sgd ⇥ OptimizeError {` |
+| 328 | `genus StepResult {` |
+| 350 | `functio step(SgdState s, parametrum.Parameter p, gradient.Gradient g) → StepResult ⇥ OptimizeError {` |
+| 465 | `functio serialize(Sgd o) → textus {` |
+| 473 | `functio deserialize(textus wire) → Sgd ⇥ OptimizeError {` |
 
 Consumer: exempla/training-loop-mlp.
 
@@ -300,8 +300,8 @@ annotations.)
 
 | Line | Declaration |
 | --- | --- |
-| 155 | `genus Metricum {` |
-| 172 | `functio metricum(` |
+| 155 | `genus Metric {` |
+| 172 | `functio metric(` |
 
 Consumer: exempla/training-loop-mlp.
 
@@ -317,7 +317,7 @@ Consumer: exempla/token-generation.
 
 | Line | Declaration |
 | --- | --- |
-| 179 | `functio causa(TransformerError e) → textus {` |
+| 179 | `functio message(TransformerError e) → textus {` |
 | 334 | `functio transformer_block(` |
 
 Consumer: decode.fab.
@@ -326,16 +326,16 @@ Consumer: decode.fab.
 
 | Line | Declaration |
 | --- | --- |
-| 96 | `genus CorpusGguf {` |
-| 119 | `discretio LayoutGgml {` |
-| 124 | `genus DescriptioTensorisGguf {` |
-| 691 | `functio inveni_tensorem(ManifestumGguf m, textus nomen) → DescriptioTensorisGguf ⇥ GgufManifestError {` |
-| 784 | `functio parse(CorpusGguf corpus) → ManifestumGguf ⇥ GgufManifestError {` |
-| 1071 | `functio lege_fragmentum(` |
+| 96 | `genus GgufCorpus {` |
+| 119 | `discretio GgmlLayout {` |
+| 124 | `genus GgufTensorDescriptor {` |
+| 691 | `functio inveni_tensorem(GgufManifest m, textus name) → GgufTensorDescriptor ⇥ GgufManifestError {` |
+| 784 | `functio parse(GgufCorpus corpus) → GgufManifest ⇥ GgufManifestError {` |
+| 1071 | `functio read_fragmentum(` |
 
 Consumers: exempla/gguf-manifest, exempla/gguf-inspect. (The A1C chain already landed
-`@ publica` on `GgufManifestError`, `LectioFontis`, `MetadatumGguf`, `ManifestumGguf`,
-`causa`, `metadatum`, `textum`, `numerum`, `inspice` — those stay; these six are the
+`@ publica` on `GgufManifestError`, `SourceRead`, `GgufMetadata`, `GgufManifest`,
+`message`, `metadata`, `textum`, `numerum`, `inspect` — those stay; these six are the
 remaining consumers' symbols.)
 
 ### 3a. Targeted compiler evidence — why the 11 disputed symbols are removed
@@ -364,10 +364,10 @@ exempla, and the `gguf-inspect` exemplum fails only on the same three cross-repo
 `norma:*` symbols (Q1). The 5 error types are therefore **not** compiler-transitive
 required — Faber's cross-module error flow (returned via `⇥`, caught via `capta`/
 propagation) never names them across modules in the compiled consumers. The 6 standalone
-functions have no call site in the gate surface (`metricae.accuratezza`'s only bare-name
-hits in library/exempla code are the `Metricum` genus method of the same name and a local
-parameter in `metricum`, not calls to the free function; `optimize.serializa_statum`/
-`deserializa_statum` are never invoked by `serializa`/`deserializa` at compile-reachable
+functions have no call site in the gate surface (`metricae.accuracy`'s only bare-name
+hits in library/exempla code are the `Metric` genus method of the same name and a local
+parameter in `metric`, not calls to the free function; `optimize.serialize_state`/
+`deserialize_state` are never invoked by `serialize`/`deserialize` at compile-reachable
 sites in library or exempla code), so their exposure is the exact accidental public-API
 expansion audit F1 targeted. Per task `7dec37a5` instructions 2–3, all 11 are **removed**
 from the implementation units. No explicit API-policy authority (e.g.
@@ -375,15 +375,15 @@ from the implementation units. No explicit API-policy authority (e.g.
 
 **Proba nuance (audit F1 scan limit, recorded for re-audit).** F1's "0 cross-module
 refs" claim was computed over `.fab` files only; the co-located `.proba` test files do
-refer to some of these symbols (`optimize.proba` calls `serializa_statum`/
-`deserializa_statum`/`statum_aequus`/`sgd_aequus`; `metrics.proba` calls
-`metricae.accuratezza`/`metricae.causa`; `gradus.proba` calls `gradus.causa`). This does
+refer to some of these symbols (`optimize.proba` calls `serialize_state`/
+`deserialize_state`/`state_equal`/`sgd_equal`; `metrics.proba` calls
+`metricae.accuracy`/`metricae.message`; `gradus.proba` calls `gradus.message`). This does
 **not** change the removal decision: (1) `check-compile` — the M8 gate G runs — never
 compiles proba files (0 references in the script), and `faber test` is provider-blocked,
 so the proba surface is outside the gate authority; (2) the pristine candidate's proba
 surface is **already broken** independently of this delivery (e.g. `optimize.proba` has
 90 SEM006 on the unannotated candidate) because proba files also reference symbols outside
-the 85/96-set entirely (`gradient.Gradientes`, `math.casta`, `loss.mse`); exposing just
+the 85/96-set entirely (`gradient.Gradients`, `math.cast`, `loss.mse`); exposing just
 these 11 would not make proba green. A separate proba-surface closure (annotating the
 full proba-referenced set) is out of scope here and recorded as a residual (§10).
 
@@ -395,9 +395,9 @@ gradus exemplum (verified per-module against consumers in §3).
 ## 4. Non-goals, preserved privacy, ripple
 
 - **Preserved `@ privata` / `_`-prefixed helpers (no blanket sweep)**: every `_`-prefixed
-  function in the 15 modules stays private (e.g. `math._forma_broadcast`,
-  `_quantitas_valid`, `_index_broadcast`, `_index_axis`, `_coordinata`, `_planus_axis`,
-  `_typo_par`, `_typus_ex_nomine`; `train`/`nn`/`attention`/`sampling`/`decode`/
+  function in the 15 modules stays private (e.g. `math._shape_broadcast`,
+  `_numel_valid`, `_index_broadcast`, `_index_axis`, `_coordinate`, `_flat_axis`,
+  `_dtype_pair`, `_dtype_from_name`; `train`/`nn`/`attention`/`sampling`/`decode`/
   `generation`/`optimize`/`gguf_manifest` `_*` helpers). Only the 85 top-level names in
   §3 are annotated.
 - **No other files edited** by the 15 units: no `.proba`, no `docs/`, no `scripta/`, no
@@ -498,7 +498,7 @@ V-TOK → `exempla/token-generation`; V-TRANS → `src/decode.fab`; V-GGUFM →
 | `read_scope` | merged `factory/merge` (post all 15 units), the A1C candidate, report `88009081` evidence |
 | `forbidden_scope` | any product code; re-running any unit's work; editing source to "fix" the check; absorbing the `norma:*` repair into gradus; running before all 15 units are merged; `hand-23`/`hand-26` |
 | `red` (do not merge) | `./scripta/check-compile` still emits any SEM006 on gradus library or gradus exempla, or `git diff --check` not silent → record the exact residual and stop; do not weaken the gate |
-| `green` (run once) | authority setup (`FABER_BIN` = lane-local faber 1.6.0 from radix `b6d6e17c8`, `FABER_LIBRARY_HOME` = lane parent): `./scripta/check-source` exit 0; `./scripta/check-compile` exit 0 (library + all gradus exempla); `faber check --diagnostics .` ends `ok: .`; the A1C clean-break greps per the A1C micro-unit doc M8 (`capsula.structa(` in src/tests empty; `capsule-schema-1.0.0` absent from live surfaces; `schema_versio` = `"2.0.0"`); `./scripta/inventory-public-symbols` exit 0 (total 582); `git diff --check` silent. Then merge the A1C integration branch atomically to `factory/merge` and fast-forward main per the merge recipe |
+| `green` (run once) | authority setup (`FABER_BIN` = lane-local faber 1.6.0 from radix `b6d6e17c8`, `FABER_LIBRARY_HOME` = lane parent): `./scripta/check-source` exit 0; `./scripta/check-compile` exit 0 (library + all gradus exempla); `faber check --diagnostics .` ends `ok: .`; the A1C clean-break greps per the A1C micro-unit doc M8 (`capsula.construct(` in src/tests empty; `capsule-schema-1.0.0` absent from live surfaces; `schema_versio` = `"2.0.0"`); `./scripta/inventory-public-symbols` exit 0 (total 582); `git diff --check` silent. Then merge the A1C integration branch atomically to `factory/merge` and fast-forward main per the merge recipe |
 | `done_when` | (a) the 21-SEM006 first-wave set is 0 under the authority setup on the refreshed candidate; (b) the complete gradus closure (§3) yields zero SEM006 on library + gradus exempla; (c) residual `norma:*` diagnostics are either fixed on the norma side or explicitly routed (Q1); (d) A1C candidate refreshed on corrected main yields green M8 closeout; (e) merge lane re-queues A1C-M8R4 after the candidate refresh |
 | `est_work_tokens` | 3–5k |
 | `est_basis` | pilot; one aggregate validation pass + merge (matches A1C-M8 scale) |
@@ -554,7 +554,7 @@ This delivery must fail review if any child:
 - **Co-located proba test surface** (outside the M8 gate; pre-existing broken,
   not a regression): the `src/*.proba` package tests reference a set of symbols larger
   than the 85-symbol closure — including several of the 11 removed here and additional
-  symbols outside the set entirely (`gradient.Gradientes`, `math.casta`, `loss.mse`,
+  symbols outside the set entirely (`gradient.Gradients`, `math.cast`, `loss.mse`,
   …). `check-compile` never compiles proba files and `faber test` is provider-blocked,
   so this surface is not part of gate G; the pristine candidate's proba files already
   fail to compile independently of this delivery (e.g. `optimize.proba` shows 90 SEM006

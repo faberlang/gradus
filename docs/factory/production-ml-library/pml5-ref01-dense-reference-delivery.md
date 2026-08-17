@@ -67,8 +67,8 @@ Current gradus dense surface (live tree, this worktree):
 - `src/nn.fab` — `linear_2x2/4x4/2x8`, `gelu_2x8/4x4`, `layernorm_2x8` (fixed-shape rows only; no generic RMSNorm/SiLU/SwiGLU) plus the PML3 staged-carrier `linear`/`gelu`/`layernorm` production rows.
 - `src/attention.fab` — `scaled_dot_product_staticum`, `scaled_dot_product(_causal)`, `rotary_position_embedding` over staged carriers; no GQA, no per-head KV, no configurable RoPE theta/pair policy.
 - `src/transformer.fab` — `bert_tiny_block_2x8` and `transformer_block` (PML3 fixed-shape rows).
-- `src/decode.fab` — `structa_pondera`, `structa_decodere`, `decodere_datum`, `praefundere`, `sessio_fresh/progredere/redintegra`, `cancelatum_*`, `replica` (fixed one-block forward row, PML5).
-- `src/cache.fab` — `cache_vacua`, `appende`, `redintegra`, identity serialization (logical KV values, `stratorum = 1`; no per-layer per-head execution).
+- `src/decode.fab` — `construct_weights`, `construct_decoder`, `decodere_datum`, `prefill`, `fresh_session/advance/reset`, `cancellation_*`, `replica` (fixed one-block forward row, PML5).
+- `src/cache.fab` — `empty_cache`, `append`, `reset`, identity serialization (logical KV values, `layers = 1`; no per-layer per-head execution).
 - `src/model/` — `artifact`, `gguf_manifest` (GGUF-A1a/A1b), `capsule`, `gguf`, `safetensors`, `dequant` (PML2 rows).
 - `src/tokenizer.fab` — tokenizer **identity** contract (PML2-U4); tokenizer **runtime** (encode/decode text) is GGUF-A2 = LIB-02.
 
@@ -269,12 +269,12 @@ The campaign already sequences these: `TRUTH-01 → LIB-01 → LIB-02 + LIB-03 �
 
 | Field | Value |
 | --- | --- |
-| `outcome` | One-token incremental decode consumes the per-layer per-KV-head cache and appends each position; `Sessio` advance with context rejection at the limit; cooperative cancellation observation at step boundaries; deterministic replay; session identity — wired onto the dense decode surface. Executed proof: the decode-cache exempla prints PASS for agreement + typed-behavior rows. |
+| `outcome` | One-token incremental decode consumes the per-layer per-KV-head cache and appends each position; `Session` advance with context rejection at the limit; cooperative cancellation observation at step boundaries; deterministic replay; session identity — wired onto the dense decode surface. Executed proof: the decode-cache exempla prints PASS for agreement + typed-behavior rows. |
 | `write_scope` | `src/decode.fab`, `src/decode.proba` (dense session rows), `src/model/dense.fab` (decode entry as needed), `exempla/dense-decode-cache/` (`faber.toml`, `src/main.fab`, `README.md`), the five docs listed in U1.1, README as needed |
 | `first_failing_oracle` | Red proof: proba pinned agreement — incremental decode reproduces prefill-equivalent logits at the declared boundary; context-rejection, cancellation, and replay typed-error pins — recorded failing. |
 | `closeout_command` | Same shape as U1.1 with `exempla/dense-decode-cache` and the decode+dense changed-path list. |
 | `expected_observed_result` | Same as U1.1; decode agreement + rejection/cancellation/replay rows PASS. |
-| `est_basis` | ≈2k–4k tokens (10–15 min): reuses the landed `Sessio`/`Cancelatum`/`replica` semantics; one decode behavior family. |
+| `est_basis` | ≈2k–4k tokens (10–15 min): reuses the landed `Session`/`Cancellation`/`replica` semantics; one decode behavior family. |
 | `stop_condition` | Shared §6 conditions; first failing pin recorded and routed. |
 | `depends_on` | U2.3. |
 
