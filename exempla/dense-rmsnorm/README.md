@@ -30,16 +30,38 @@ model payload, no device handle.
 
 ## Receipt
 
+### Compiled rust (CR-EX-01)
+
 Command, from the Hand packet:
 
 ```text
-cd /Users/ianzepp/work/faberlang/worktrees/hand-2/gradus
-env FABER_LIBRARY_HOME=/Users/ianzepp/work/faberlang/worktrees/hand-2 \
-  /Users/ianzepp/work/faberlang/worktrees/hand-2/radix/target/debug/faber \
-  run --target fmir exempla/dense-rmsnorm
+cd /Users/ianzepp/work/faberlang/worktrees/hand-12/gradus
+env FABER_SUPPORT_PATH_OVERRIDE=/Users/ianzepp/work/faberlang \
+  FABER_LIBRARY_HOME=/Users/ianzepp/work/faberlang/worktrees/hand-12 \
+  /Users/ianzepp/work/faberlang/worktrees/hand-12/radix/target/debug/faber \
+  build --target rust exempla/dense-rmsnorm
 ```
 
-Observed result (2026-08-14): exit `0`; 32 PASS lines and 0 FAIL lines.
+Build exit `0`. Printed binary path:
+
+```text
+/Users/ianzepp/work/faberlang/worktrees/hand-12/gradus/exempla/dense-rmsnorm/target/debug/dense-rmsnorm
+```
+
+Revisions: radix `fc6f81143`, gradus `0188fad79`. Execute that binary: exit `0`; 32 PASS lines and 0 FAIL lines (2026-08-17). Pin names match the table above.
+
+### FMIR (package default `target = "fmir"`)
+
+FMIR remains documented and is not replaced by the compiled-rust route. Live runner (no `--target` on `run`):
+
+```text
+cd /Users/ianzepp/work/faberlang/worktrees/hand-12/gradus
+env FABER_LIBRARY_HOME=/Users/ianzepp/work/faberlang/worktrees/hand-12 \
+  /Users/ianzepp/work/faberlang/worktrees/hand-12/radix/target/debug/faber \
+  run exempla/dense-rmsnorm
+```
+
+Observed FMIR result (2026-08-14): exit `0`; 32 PASS lines and 0 FAIL lines.
 
 ```text
 rmsnorm-row1-x0: PASS observed=0.19802946976603086
