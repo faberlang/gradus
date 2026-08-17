@@ -298,6 +298,13 @@ transformer             14
 TOTAL                  750
 ```
 
+S2-MODEL receipt (`f50fbbfb`): the live inventory still reports the sanctioned
+750 total and 234 model declarations after the model-family rename. The model
+source batch owns twelve `.fab`/`.proba` pairs; its only check residual is the
+pre-existing `PKG001:library_conflicting_aliases` at `src/shape.fab:4544` when
+`dense.fab` is checked from a clean `git archive HEAD` library. API-reference
+coverage is intentionally deferred to S2-DOCS.
+
 S1 Pass A is complete. S2 owns identifier renames and the compatibility-policy
 follow-up; S3 owns sibling consumer migration. The dormant `scripta/` and
 `fixtures/` migration sources, and the retained Latin prose in comments,
