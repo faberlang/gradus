@@ -473,6 +473,8 @@ Ordered dense-model forward assembly over canonical architecture descriptors and
 - `fn message(DenseError e) → string {`
 - `fn forward(DenseConfig cfg, (string, int) → Lookup fons, list<int> tokens, f32 epsilon, f32 scale, list<int> positions, int rope_dim, attention.RopeConfig rope_cfg) → tensor.Tensor ⇥ DenseError {`
 
+REF-01-U1.10 consumer: `exempla/dense-prefill-qwen2` (Qwen2.5-0.5B real-file prefill through this `forward`). Compiled rust receipt is **not** recorded: `CODEGEN001` in `dense_qwen2.fab` (definition id 4127 unresolved). llvm-host fallback `PKG001:llvm_emission_failed`. See the exemplum README.
+
 
 ## gradus:model/dense_llama
 

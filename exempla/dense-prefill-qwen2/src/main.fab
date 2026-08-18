@@ -1,0 +1,584 @@
++++
+locale = "en"
++++
+# REF-01-U1.10 — Qwen2.5-0.5B full-model prefill logit receipt.
+#
+# Application-owned file adapter over the operator-local
+# Qwen2.5-0.5B-Instruct-Q4_K_M.gguf artifact. The app resolves the path,
+# admits the GGUF v3 table prefix through gradus:model/gguf_manifest,
+# materializes stored-weight views through the bounded slice materializer,
+# runs the U1.8 dense.forward graph, and prints the prefill-logit receipt
+# (comparison policy, token ids, per-position top-1 / top-5, finite gate).
+# Gradus never receives the path or a whole-model byte list.
+#
+# Compiled receipt tier: faber build --target rust, then execute the printed
+# binary. The MIR stepper is not the receipt-tier engine.
+
+import from "gradus:attention" attention
+import from "gradus:model/artifact" artifact
+import from "gradus:model/dequant" dequant
+import from "gradus:model/dense" dense
+import from "gradus:model/dense_qwen2" dense_qwen2
+import from "gradus:model/gguf_manifest" manifestum
+import from "gradus:model/tensor_payload" tensor_payload
+import from "gradus:model/tensor_view" tensor_view
+import from "gradus:tensor" tensor
+import from "gradus:tokenizer" tokenizer
+import from "norma:processus" processus
+import from "norma:solum" solum
+
+const int SLICE_CAP ← 16777216
+const int ORACLE_BYTES ← 397808192
+const int ORACLE_DATA ← 5948480
+const string ORACLE_DIGEST ← "6eb923e7d26e9cea28811e1a8e852009b21242fb157b26149d3b188f3a8c8653"
+const string PROMPT ← "The capital of France is Paris and the capital of Japan is Tokyo. The next city"
+const list<int> PINNED_TOKENS ← [785, 6722, 315, 9625, 374, 12095, 323, 279, 6722, 315, 6323, 374, 26194, 13, 576, 1790, 3283]
+
+union PrefillError {
+    ArgumentError { string message }
+    LengthError { string message }
+    ManifestError { string message }
+    AdapterError { string message }
+    TokenizerError { string message }
+    MaterializeError { string message }
+    ForwardError { string message }
+    CompareError { string message }
+}
+
+fn render(PrefillError e) → string {
+    match e {
+        case ArgumentError const message { return message }
+        case LengthError const message { return message }
+        case ManifestError const message { return message }
+        case AdapterError const message { return message }
+        case TokenizerError const message { return message }
+        case MaterializeError const message { return message }
+        case ForwardError const message { return message }
+        case CompareError const message { return message }
+    }
+}
+
+fn file_range(string path, int total, int start, int length) → manifestum.SourceRead {
+    if start < 0 or length < 0 or start > total - length {
+        return manifestum.SourceRead {
+            successus = false,
+            bytes = ||,
+            message = "range request exceeds the artifact"
+        }
+    }
+    const bytes bytes ← solum.read_range(path, start, length)
+    if bytes.length() ≠ length {
+        return manifestum.SourceRead {
+            successus = false,
+            bytes = ||,
+            message = "short range read"
+        }
+    }
+    return manifestum.SourceRead { successus = true, bytes = bytes, message = "" }
+}
+
+fn prefix_range(list<int> prefix, int start, int length) → manifestum.SourceRead {
+    if start < 0 or length < 0 or start > prefix.length() - length {
+        return manifestum.SourceRead {
+            successus = false,
+            bytes = ||,
+            message = "inspection attempted to read the tensor data region"
+        }
+    }
+    const list<int> segment ← prefix.slice(start, start + length)
+    const bytes bytes ← segment ↦ bytes
+    return manifestum.SourceRead { successus = true, bytes = bytes, message = "" }
+}
+
+fn as_ints(string s) → int {
+    do {
+        return s ↦ int
+    }
+    catch err {
+        panic "malformed integer operand"
+    }
+    return 0
+}
+
+fn slot_of(string suffix) → int {
+    if suffix ≡ ".input_layernorm" then return 0
+    if suffix ≡ ".self_attn.q_proj" then return 1
+    if suffix ≡ ".self_attn.k_proj" then return 2
+    if suffix ≡ ".self_attn.v_proj" then return 3
+    if suffix ≡ ".self_attn.o_proj" then return 4
+    if suffix ≡ ".post_attention_layernorm" then return 5
+    if suffix ≡ ".mlp.gate_proj" then return 6
+    if suffix ≡ ".mlp.up_proj" then return 7
+    if suffix ≡ ".mlp.down_proj" then return 8
+    return -1
+}
+
+fn find_dot(string text, int from) → int {
+    const int n ← text.length()
+    var int i ← from
+    while i ≺ n {
+        if text.slice(i, i + 1) ≡ "." then return i
+        i ← i + 1
+    }
+    return -1
+}
+
+fn layer_suffix(string name) → string {
+    const int p ← find_dot(name, 13)
+    if p ≺ 0 then return ""
+    return name.slice(p, name.length())
+}
+
+fn lookup_one(string name, int layer, tensor.Tensor embed, tensor.Tensor norm, list<tensor.Tensor> weights) → dense.Lookup {
+    if name ≡ "model.embed_tokens" then return dense.Lookup {successus = true, tensorem = embed, message = ""}
+    if name ≡ "model.norm" then return dense.Lookup {successus = true, tensorem = norm, message = ""}
+    if name ≡ "lm_head" then return dense.Lookup {successus = true, tensorem = embed, message = ""}
+    const string suffix ← layer_suffix(name)
+    const int slot ← slot_of(suffix)
+    if slot ≺ 0 then return dense.Lookup {successus = false, tensorem = embed, message = "unknown canonical tensor: " + name}
+    const int index ← (layer * 9) + slot
+    if index ≺ 0 or index ≥ weights.length() {
+        return dense.Lookup {successus = false, tensorem = embed, message = "layer index out of range for canonical tensor: " + name}
+    }
+    const tensor.Tensor t ← weights.get(index) coalesce embed
+    return dense.Lookup {successus = true, tensorem = t, message = ""}
+}
+
+fn payload_bounds(manifestum.GgufManifest m, string gguf_name) → tuple<int, int> ⇥ PrefillError {
+    do {
+        return manifestum.limes_payloadis(m, gguf_name)
+    }
+    catch err {
+        throw variant MaterializeError { message = "payload range failed for " + gguf_name }
+    }
+}
+
+fn bind_view(manifestum.GgufManifest m, string gguf_name) → tensor_view.TensorView ⇥ PrefillError {
+    const tuple<int, int> bounds ← payload_bounds(m, gguf_name)
+    const tensor_payload.TensorPayload p ← tensor_payload.TensorPayload {
+        name = gguf_name,
+        absolute_start = bounds[0],
+        length = bounds[1],
+        bytes = ||
+    }
+    do {
+        return tensor_view.links(m, p)
+    }
+    catch err {
+        throw variant MaterializeError { message = "view bind failed for " + gguf_name }
+    }
+}
+
+fn chunk_len(int remaining, int block) → int {
+    if remaining ≤ SLICE_CAP then return remaining
+    const int aligned ← (SLICE_CAP / block) * block
+    if aligned ≺ block then return remaining
+    return aligned
+}
+
+fn materialize_named(
+    string path,
+    int total,
+    manifestum.GgufManifest m,
+    string gguf_name
+) → tensor.Tensor ⇥ PrefillError {
+    const tensor_view.TensorView view ← bind_view(m, gguf_name)
+    const int block ← dequant.block_elements(view.dtype_ggml)
+    if block ≺ 1 {
+        throw variant MaterializeError { message = "un-admitted GGML type for " + gguf_name }
+    }
+    var list<f32> data ← vacua
+    var int off ← 0
+    while off ≺ view.elements {
+        const int n ← chunk_len(view.elements - off, block)
+        do {
+            const list<f32> part ← tensor_view.materialize_slice(
+                view,
+                off,
+                n,
+                (int start, int length) → manifestum.SourceRead ∴ file_range(path, total, start, length)
+            )
+            for from part const x {
+                data.append(x)
+            }
+        }
+        catch err {
+            throw variant MaterializeError { message = "slice materialize failed for " + gguf_name + ": " + tensor_view.message(err) }
+        }
+        off ← off + n
+    }
+    var tensor.Tensor t ← tensor.default()
+    do {
+        t ← tensor.construct(data, view.shape)
+        return t
+    }
+    catch err {
+        throw variant MaterializeError { message = "tensor construct failed for " + gguf_name }
+    }
+    return t
+}
+
+fn resolve_gguf(dense_qwen2.DenseQwen2Config cfg, manifestum.GgufManifest m, string name) → string ⇥ PrefillError {
+    do {
+        const manifestum.GgufTensorDescriptor d ← dense_qwen2.resolve(cfg, m, name)
+        return d.name
+    }
+    catch err {
+        throw variant AdapterError { message = dense_qwen2.message(err) }
+    }
+}
+
+fn load_layer(
+    string path,
+    int total,
+    manifestum.GgufManifest m,
+    dense_qwen2.DenseQwen2Config cfg,
+    int layer
+) → list<tensor.Tensor> ⇥ PrefillError {
+    const string prefix ← "model.layers." + (layer ↦ string)
+    var list<tensor.Tensor> out ← vacua
+    const list<string> names ← [
+        prefix + ".input_layernorm",
+        prefix + ".self_attn.q_proj",
+        prefix + ".self_attn.k_proj",
+        prefix + ".self_attn.v_proj",
+        prefix + ".self_attn.o_proj",
+        prefix + ".post_attention_layernorm",
+        prefix + ".mlp.gate_proj",
+        prefix + ".mlp.up_proj",
+        prefix + ".mlp.down_proj"
+    ]
+    for from names const name {
+        const string gguf_name ← resolve_gguf(cfg, m, name)
+        out.append(materialize_named(path, total, m, gguf_name))
+    }
+    return out
+}
+
+fn ids_text(list<int> ids) → string {
+    var string out ← "["
+    var int i ← 0
+    while i ≺ ids.length() {
+        if i ≻ 0 {
+            out ← out + ","
+        }
+        out ← out + ((ids.get(i) coalesce 0) ↦ string)
+        i ← i + 1
+    }
+    return out + "]"
+}
+
+fn same_ids(list<int> a, list<int> b) → bool {
+    if a.length() ≠ b.length() then return false
+    var int i ← 0
+    while i ≺ a.length() {
+        if (a.get(i) coalesce -1) ≠ (b.get(i) coalesce -2) then return false
+        i ← i + 1
+    }
+    return true
+}
+
+fn is_finite(f32 x) → bool {
+    if x ≠ x then return false
+    const f32 huge ← 100000000000000000000000000000000000000.0 ∷ f32
+    if x ≻ huge then return false
+    if (0.0 ∷ f32) - x ≻ huge then return false
+    return true
+}
+
+fn logit_at(tensor.Tensor logits, int row, int col) → f32 {
+    do {
+        return logits.get([row, col])
+    }
+    catch err {
+        return 0.0 ∷ f32
+    }
+}
+
+fn render_f32(f32 x) → string {
+    if x ≠ x then return "nan"
+    if x ≥ 0.0 {
+        const int n ← (x * 1000000.0) ↦ int
+        return n ↦ string
+    }
+    const f32 abs ← (0.0 ∷ f32) - x
+    const int n ← (abs * 1000000.0) ↦ int
+    return "-" + (n ↦ string)
+}
+
+fn print_position(tensor.Tensor logits, int row, int vocab) → bool {
+    var f32 best ← logit_at(logits, row, 0)
+    var int best_id ← 0
+    var list<int> top_ids ← [0, 0, 0, 0, 0]
+    var list<f32> top_vals ← [best, best, best, best, best]
+    var int filled ← 1
+    var bool finite ← is_finite(best)
+    var int col ← 1
+    while col ≺ vocab {
+        const f32 v ← logit_at(logits, row, col)
+        if not is_finite(v) {
+            finite ← false
+        }
+        if v ≻ best {
+            best ← v
+            best_id ← col
+        }
+        if filled ≺ 5 {
+            top_ids ← _insert_id(top_ids, top_vals, filled, col, v)
+            top_vals ← _insert_val(top_vals, filled, v)
+            filled ← filled + 1
+        }
+        elif v ≻ (top_vals.get(4) coalesce best) {
+            top_ids ← _insert_id(top_ids, top_vals, 5, col, v)
+            top_vals ← _insert_val(top_vals, 5, v)
+        }
+        col ← col + 1
+    }
+    print "pos=" + (row ↦ string)
+    print "top1=" + (best_id ↦ string)
+    print "top1_logit_u6=" + render_f32(best)
+    print "top5_0=" + ((top_ids.get(0) coalesce 0) ↦ string)
+    print "top5_1=" + ((top_ids.get(1) coalesce 0) ↦ string)
+    print "top5_2=" + ((top_ids.get(2) coalesce 0) ↦ string)
+    print "top5_3=" + ((top_ids.get(3) coalesce 0) ↦ string)
+    print "top5_4=" + ((top_ids.get(4) coalesce 0) ↦ string)
+    if finite {
+        print "finite=PASS"
+    }
+    else {
+        print "finite=FAIL"
+    }
+    return finite
+}
+
+fn _insert_id(list<int> ids, list<f32> vals, int n, int id, f32 v) → list<int> {
+    var list<int> out ← vacua
+    var bool placed ← false
+    var int i ← 0
+    while i ≺ n {
+        const f32 cur ← vals.get(i) coalesce v
+        if (not placed) and v ≻ cur {
+            out.append(id)
+            placed ← true
+        }
+        if out.length() ≺ 5 {
+            out.append(ids.get(i) coalesce 0)
+        }
+        i ← i + 1
+    }
+    if (not placed) and out.length() ≺ 5 {
+        out.append(id)
+    }
+    while out.length() ≺ 5 {
+        out.append(0)
+    }
+    return out
+}
+
+fn _insert_val(list<f32> vals, int n, f32 v) → list<f32> {
+    var list<f32> out ← vacua
+    var bool placed ← false
+    var int i ← 0
+    while i ≺ n {
+        const f32 cur ← vals.get(i) coalesce v
+        if (not placed) and v ≻ cur {
+            out.append(v)
+            placed ← true
+        }
+        if out.length() ≺ 5 {
+            out.append(vals.get(i) coalesce v)
+        }
+        i ← i + 1
+    }
+    if (not placed) and out.length() ≺ 5 {
+        out.append(v)
+    }
+    while out.length() ≺ 5 {
+        out.append(0.0 ∷ f32)
+    }
+    return out
+}
+
+fn rope_cfg() → attention.RopeConfig {
+    var attention.RopeConfig c ← attention.default()
+    do {
+        c ← attention.construct_rope_config(1000000.0 ∷ f32, 1.0 ∷ f32, attention.interleaved_policy())
+        return c
+    }
+    catch err {
+        panic attention.message(err)
+    }
+    return c
+}
+
+fn admit_manifest(list<int> prefix, int total, artifact.ContentIdentity identity) → manifestum.GgufManifest {
+    do {
+        return manifestum.inspect(
+            (int start, int length) → manifestum.SourceRead ∴ prefix_range(prefix, start, length),
+            total,
+            identity
+        )
+    }
+    catch err {
+        panic manifestum.message(err)
+    }
+}
+
+fn admit_config(manifestum.GgufManifest m) → dense_qwen2.DenseQwen2Config {
+    do {
+        return dense_qwen2.config(m)
+    }
+    catch err {
+        panic dense_qwen2.message(err)
+    }
+}
+
+fn admit_tokenizer(manifestum.GgufManifest m) → tokenizer.Tokenizer {
+    do {
+        return tokenizer.build(m)
+    }
+    catch err {
+        panic tokenizer.message(err)
+    }
+}
+
+fn encode_ids(tokenizer.Tokenizer tok, string text) → list<int> {
+    do {
+        return tokenizer.encode_prompt(tok, text)
+    }
+    catch err {
+        panic tokenizer.message(err)
+    }
+}
+
+fn run_forward(dense.DenseConfig cfg, tensor.Tensor embed, tensor.Tensor norm, list<tensor.Tensor> weights, list<int> ids, list<int> positions, int rope_dim) → tensor.Tensor {
+    do {
+        return dense.forward(
+            cfg,
+            (string name, int layer_i) → dense.Lookup ∴ lookup_one(name, layer_i, embed, norm, weights),
+            ids,
+            0.00001 ∷ f32,
+            0.125 ∷ f32,
+            positions,
+            rope_dim,
+            rope_cfg()
+        )
+    }
+    catch err {
+        panic dense.message(err)
+    }
+}
+
+main {
+    const list<string> args ← processus.argv() ↦ list<string>
+    if args.length() ≠ 3 {
+        panic "usage: dense-prefill-qwen2 <path> <expected-data-offset> <sha256>"
+    }
+    const string path ← args.get(0) coalesce ""
+    const int data_expected ← as_ints(args.get(1) coalesce "0")
+    const string digest ← args.get(2) coalesce ""
+    if data_expected ≠ ORACLE_DATA {
+        panic "expected-data-offset is not the pinned Qwen2.5-0.5B fact"
+    }
+    if digest ≠ ORACLE_DIGEST {
+        panic "sha256 is not the pinned Qwen2.5-0.5B identity"
+    }
+    const int total ← solum.byte_length(path)
+    if total ≠ ORACLE_BYTES {
+        panic "artifact byte length is not the pinned Qwen2.5-0.5B identity"
+    }
+    const bytes prefix_bytes ← solum.read_range(path, 0, data_expected)
+    if prefix_bytes.length() ≠ data_expected {
+        panic "file adapter returned a short table-prefix read"
+    }
+    const value prefix_value ← prefix_bytes ↦ value
+    const list<int> prefix ← prefix_value ↦ list<int>
+    const artifact.ContentIdentity identity ← artifact.ContentIdentity {
+        algorithm = "sha-256",
+        digest = digest,
+        length = total
+    }
+    print "policy=gi0-numeric-contract v1.0.0 finite/top-1-exact/top-5-overlap>=4/5/delta=1e-5 window=0..16"
+    print "backend=CPU/reference"
+    print "model=Qwen2.5-0.5B-Instruct-Q4_K_M.gguf"
+    print "bytes=" + (total ↦ string)
+    print "sha256=" + digest
+    print "prompt=" + PROMPT
+    const manifestum.GgufManifest m ← admit_manifest(prefix, total, identity)
+    if m.data_inceptum ≠ data_expected {
+        panic "Gradus data offset disagrees with the independent GGUF oracle"
+    }
+    print "architecture=qwen2"
+    print "tensors=" + (m.tensors.length() ↦ string)
+    const dense_qwen2.DenseQwen2Config qcfg ← admit_config(m)
+    print "layers=" + (qcfg.layers ↦ string)
+    print "heads=" + (qcfg.heads ↦ string)
+    print "kv_heads=" + (qcfg.kv_heads ↦ string)
+    print "head_dim=" + (qcfg.head_dim ↦ string)
+    print "hidden_dim=" + (qcfg.hidden_dim ↦ string)
+    print "vocab=" + (qcfg.vocab ↦ string)
+    if qcfg.tied {
+        print "tied=true"
+    }
+    else {
+        print "tied=false"
+    }
+    const tokenizer.Tokenizer tok ← admit_tokenizer(m)
+    const list<int> ids ← encode_ids(tok, PROMPT)
+    print "observed_token_ids=" + ids_text(ids)
+    if not same_ids(ids, PINNED_TOKENS) {
+        panic "tokenizer ids diverge from the pinned llama.cpp probe"
+    }
+    print "tokenizer_ids=PASS"
+    print "loading stored-weight views through the U1.8 resolver"
+    do {
+        const tensor.Tensor embed ← materialize_named(path, total, m, resolve_gguf(qcfg, m, "model.embed_tokens"))
+        const tensor.Tensor norm ← materialize_named(path, total, m, resolve_gguf(qcfg, m, "model.norm"))
+        var list<tensor.Tensor> weights ← vacua
+        var int layer ← 0
+        while layer ≺ qcfg.layers {
+            const list<tensor.Tensor> one ← load_layer(path, total, m, qcfg, layer)
+            for from one const t {
+                weights.append(t)
+            }
+            print "loaded_layer=" + (layer ↦ string)
+            layer ← layer + 1
+        }
+        const dense.DenseConfig cfg ← dense.DenseConfig {
+            layers = qcfg.layers,
+            heads = qcfg.heads,
+            kv_heads = qcfg.kv_heads,
+            head_dim = qcfg.head_dim,
+            hidden_dim = qcfg.hidden_dim,
+            vocab = qcfg.vocab,
+            tied = qcfg.tied
+        }
+        var list<int> positions ← vacua
+        var int p ← 0
+        while p ≺ ids.length() {
+            positions.append(p)
+            p ← p + 1
+        }
+        const tensor.Tensor logits ← run_forward(cfg, embed, norm, weights, ids, positions, qcfg.head_dim)
+        print "logits_shape=" + ids_text(logits.shape())
+        var bool all_finite ← true
+        var int row ← 0
+        while row ≺ ids.length() {
+            if not print_position(logits, row, qcfg.vocab) {
+                all_finite ← false
+            }
+            row ← row + 1
+        }
+        if all_finite {
+            print "finite_gate=PASS"
+        }
+        else {
+            print "finite_gate=FAIL"
+        }
+        print "no Metal/CUDA execution claim"
+        print "no full-model payload-residency claim"
+    }
+    catch err {
+        panic render(err)
+    }
+}

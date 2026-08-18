@@ -11,7 +11,7 @@
 - **Message** = the `textus causa` on the variant, rendered by `causa(e)`. Messages are locale-ready English. Dynamic suffixes (appended names, versions, counts) are written as a trailing `…` when the live source concatenates.
 - **Resolution** = the closed action that makes the call succeed. Gradus fails closed — no silent coercion.
 - **Reserved / mapped variants**: some variants exist for cross-module mapping or class coverage and have no direct `iace finge "…"` literal site; they still have stable codes. Mapped facades (e.g. `GradusError`, `TransformerError`) preserve the underlying causa text.
-- **Executed tier**: this map documents fail-closed identity on the compiled surface. Focused `faber test` proba execution and broader inference exempla remain on the FMIR lever (CTO8-1); the separate GGUF-A1b synthetic and real-file inspection receipts are recorded in their exemplar READMEs and are not model-execution or inference claims.
+- **Executed tier**: this map documents fail-closed identity on the compiled surface. Focused `faber test` proba execution and broader inference exempla remain on the FMIR lever (CTO8-1); the separate GGUF-A1b synthetic and real-file inspection receipts are recorded in their exemplar READMEs and are not model-execution or inference claims. REF-01-U1.10 (`exempla/dense-prefill-qwen2`) did not reach Gradus typed diagnostics: the rust receipt tier stopped on compiler `CODEGEN001` (`dense_qwen2.fab`, definition id 4127 unresolved). That is a Faber/Radix codegen diagnostic, not a `DenseError` / `DenseQwen2Error` variant.
 
 ## EOG identity — `TokenizerError.EogMala`
 

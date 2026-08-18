@@ -364,6 +364,18 @@ execution, logits, or device execution; CTO8-1 stays the named gate.
 | `executed proof` | `exempla/dense-model` runs through package MIR (hand-11 Radix binary) — exit 0, **37 PASS / 0 FAIL** on the pinned f64 references, including the fail-closed rejection row (2026-08-14 receipt) |
 | `compatibility policy` | exact admitted combination: the complete ordered dense forward graph over the F32 staged carrier — embedding gather → N ordered U1.5 blocks → final RMSNorm → output projection — assembled from `ConfiguraDensa` and materialized stored-weight views via canonical names, with tied/untied embedding handling and zero per-row constants. Non-goals: no real-model payload execution, logits against a real file, or device execution (that is the U1.9/U1.10 receipt rows); no KV-cache state (that is the U2 wave); no non-f32 dtypes |
 
+### Row 13b — Qwen2.5-0.5B prefill logit receipt, compiled-route stop (REF-01-U1.10)
+
+| Field | Value |
+| --- | --- |
+| `family` | REF-01 dense reference — Qwen2.5-0.5B full-prefill logits vs pinned llama.cpp, compiled rust receipt tier |
+| `dtype` | F32 staged carrier through the U1.8 `forward` surface (not executed) |
+| `legal fixture ref` | operator-local `Qwen2.5-0.5B-Instruct-Q4_K_M.gguf` — 397,808,192 bytes, SHA-256 `6eb923e7d26e9cea28811e1a8e852009b21242fb157b26149d3b188f3a8c8653` |
+| `oracle ref` | gi0-numeric-contract v1.0.0 (finite / top-1 exact / top-5 overlap ≥ 4/5 / Δ=1e-5) on positions 0..16; comparator llama.cpp 10150 `dee2a846b` binary SHA-256 `e5c153a1…4952a` |
+| `evidence links` | `exempla/dense-prefill-qwen2/` (consumer + README stop receipt) |
+| `executed proof` | **not executed.** `faber check` green; `faber build --target rust` stops with `CODEGEN001` (`dense_qwen2.fab`: definition id 4127 could not be resolved). llvm-host fallback: `PKG001:llvm_emission_failed`. No binary, no Gradus logits, no first-divergence. |
+| `compatibility policy` | no executed-tier claim. The compiled-route stop is recorded in the exemplum README. No Metal/CUDA or payload-residency claim. |
+
 ### Row 14 — MODEL-01 qwen35moe architecture admission row (structural tier, facts only)
 
 ```markdown
