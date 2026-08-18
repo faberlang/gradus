@@ -11,16 +11,18 @@ The receipt tier is the compiled route (`faber build --target rust`,
 then execute the printed binary). llvm-host is the named fallback. The
 MIR stepper is not the receipt-tier engine.
 
-## Resume-2 stop (2026-08-17)
+## FINAL stop (2026-08-17)
 
-U1.10 RESUME-2 on handle `fe98cfef` / packet hand-13. Readable radix
-`3853d4b8f` includes the E0432 façade fix (`7f0c7de51` — re-export
-`ImportedEnumVariantInfo` on `faber-hir-rust`). Packet `cargo build -p
-faber` now succeeds. The rust-target emit reaches the runtime-plan
-gate and stops on a new diagnostic. Stop rule: new diagnostic → record
-exactly, stop. Numerics were not tuned. TARGETLANE001 was not
-weakened (`[build] target = "fmir"` stays). The GGUF file was not
-executed.
+U1.10 FINAL on handle `836c3b55` / packet hand-13. Readable radix
+`2ed9914e4` includes the `processus:exi` builtin-route fix (`9f828b2b6`
+/ merge `ec9210315`). Workspace faber `b1adfc9` delivers
+`processus:exi` via `process::exit`. Packet `cargo build -p faber` is
+green. The rust-target emit now **clears the runtime-plan gate**
+(PKG001:host_provider_selection_invalid did **not** reproduce) and
+prints a generated crate. Cargo then fails to compile that crate.
+Stop rule: new diagnostic → record exactly, stop. Numerics were not
+tuned. TARGETLANE001 was not weakened (`[build] target = "fmir"`
+stays). The GGUF file was not executed.
 
 ### Packet faber rebuild (green)
 
@@ -31,12 +33,13 @@ cd /Users/ianzepp/work/faberlang/worktrees/hand-13/radix
 cargo build -p faber
 ```
 
-Exit 0 in 8.48s. Binary
+Exit 0 in 19.32s. Binary
 `/Users/ianzepp/work/faberlang/worktrees/hand-13/radix/target/debug/faber`
-(`faber 1.7.0`, mtime 2026-08-17 21:11, 94,047,368 bytes). The prior
-E0432 (`faber_hir_rust::ImportedEnumVariantInfo`) did not reproduce.
+(`faber 1.7.0`, mtime 2026-08-17 22:03, 94,349,432 bytes) at radix
+`2ed9914e4`. Prior E0432 and PKG001 (`processus:exi`) did not
+reproduce.
 
-### Rust-target emit (blocked)
+### Rust-target emit (runtime plan green; cargo 101)
 
 ```text
 cd /Users/ianzepp/work/faberlang/worktrees/hand-13/gradus
@@ -48,63 +51,54 @@ env FABER_SUPPORT_PATH_OVERRIDE=/Users/ianzepp/work/faberlang \
 
 `FABER_LIBRARY_HOME` is a directory with `gradus` → this packet and
 `norma` → `/Users/ianzepp/work/faberlang/norma`.
+`[target.rust] host = "native"` is already on the consumer
+(`target = "fmir"` kept).
 
-First emit, host unset, exit 1:
-
-```text
-error[PKG001:package_host_selection_required]: exempla/dense-prefill-qwen2/faber.toml
-runtime plan failed
-```
-
-In-scope consumer fix (not a TARGETLANE001 change): add the rust
-receipt-tier host selection and keep the package default on FMIR.
-
-```toml
-[build]
-target = "fmir"
-kind = "bin"
-
-[target.rust]
-host = "native"
-```
-
-Second emit, host set, exit 1. Exact diagnostic (coded PKG001 hides
-the underlying message in normal render; the issue arg is the identity):
+Faber compiled the package, emitted
+`exempla/dense-prefill-qwen2/target/faber`, and invoked Cargo.
+Cargo compiled `dense-prefill-qwen2 v0.1.0` and failed. Faber
+wrapper (last line):
 
 ```text
-error[PKG001:host_provider_selection_invalid]: /Users/ianzepp/work/faberlang/worktrees/hand-13/gradus/exempla/dense-prefill-qwen2/faber.toml
-runtime plan failed
+error: cargo build exited with status exit status: 101
 ```
 
-Recorded source facts (readable trees only; hosts/radix not patched):
+Rustc: 248 errors, 350 warnings. First identity (generated
+`src/main.rs:26`):
 
-- `[target.rust] host = "native"` selects providers for every non-runtime
-  `ad` route in the package units **and** the expanded library import
-  bodies (`radix/crates/faber/src/package/cargo.rs`
-  `rust_runtime_plan_for_package`).
-- This consumer imports `norma:processus` (`processus.argv`) and
-  `norma:solum`. Gradus source has no `call '` routes.
-- `norma/src/processus.fab` `exit_process` emits `call 'processus:exi'`.
-  Norma processus routes: `argumenta`, `captura`, `dimitte`, `exi`,
-  `exsequetur`, `exsequi`, `identitas`, `lege`, `muta`, `scribe`, `sedes`.
-- `hosts/crates/processus/src/manifest.json` exports every one of those
-  except `processus:exi`. Solum Norma routes match the solum host
-  manifest (empty missing set).
-- `load_provider_manifests` fail-closes on a required route the selected
-  providers do not export (`dispatch.rs`
-  `host_provider_route_missing`). That error is stored as
-  `plan.provider_error` and re-issued as
-  `PKG001:host_provider_selection_invalid`.
+```text
+error[E0015]: cannot call non-const associated function `Box::<[i64; 17]>::new_uninit` in constants
+  --> src/main.rs:26:37
+   |
+26 |   pub const PINNED_TOKENS: Vec<i64> = vec![
+   |  _____________________________________^
+27 | |     785, 6722, 315, 9625, 374, 12095, 323, 279, 6722, 315, 6323, 374, 26194, 13, 576, 1790, 3283,
+28 | | ];
+```
 
-No rust binary was printed. llvm-host was not chased: the rust receipt
-tier produced a new diagnostic. The GGUF file was not executed. No
-logits, no observed token ids, no first-divergence field, no
-Metal/CUDA or payload-residency claim.
+Error-code families (count of `error[E…]` lines):
 
-Repair belongs to the hosts `processus` provider manifest (export
-`processus:exi`) or to faber used-route collection (do not require
-unused library `ad` routes). Neither surface is writable in this
-packet.
+| Code | Count | First site / meaning |
+| --- | --- | --- |
+| E0015 | 171 | `PINNED_TOKENS` const `vec![]`; later const `format!` |
+| E0493 | 37 | destructor of `String` cannot be evaluated at compile-time |
+| E0308 | 25 | first: closure capturing `path`/`total` passed where `fn(i64, i64) -> SourceRead` is required (`materialize_slice` reader) |
+| E0599 | 9 | `faber::Tensor<f32>` has no `transpone` / `activatio_softmax` |
+| E0605 | 1 | `segment as Vec<u8>` non-primitive cast |
+| E0277 | 1 | `f32 / i64` (`shifted / TAU.floor() as i64`) |
+| E0061 | 1 | `fons(nomen.clone())` missing second `i64` (layer) argument |
+| E0609 | 1 | `alignment_meta.dtype` on `Option<GgufMetadata>` |
+| E0382 | 1 | moved `cohaesum: String` inside a loop |
+
+No rust binary was printed (path line absent; no
+`target/debug/dense-prefill-qwen2`). llvm-host was not chased: the
+rust receipt tier produced a new diagnostic. The GGUF file was not
+executed. No logits, no observed token ids, no first-divergence
+field, no Metal/CUDA or payload-residency claim.
+
+Repair belongs to rust HIR emit / generated-Rust runtime (const
+`Vec` materialization, closure-vs-fn-pointer readers, tensor
+methods). Those surfaces are not writable in this packet.
 
 Toolchain: rustc 1.97.1 (8bab26f4f 2026-07-14) Homebrew, cargo 1.97.1
 (c980f4866 2026-06-30). Host: Darwin 25.5.0 arm64
@@ -120,6 +114,16 @@ Toolchain: rustc 1.97.1 (8bab26f4f 2026-07-14) Homebrew, cargo 1.97.1
 ```
 
 ## Prior stops
+
+### 2026-08-17, handle `fe98cfef` (d23ce56) — resume-2
+
+Readable radix `3853d4b8f`. Packet `cargo build -p faber` green
+(E0432 closed). Rust-target emit reached the runtime-plan gate and
+stopped `PKG001:host_provider_selection_invalid` because
+`norma:processus` emits `processus:exi` and the hosts processus
+manifest did not export it. Closed on main by radix `9f828b2b6` /
+`ec9210315` and faber `6e13687` / `b1adfc9`. Did not reproduce on
+this FINAL run.
 
 ### 2026-08-17, handle `6ecefd40` (b4ec573)
 
@@ -139,8 +143,8 @@ compilation failed
 ```
 
 llvm-host fallback: `error[PKG001:llvm_emission_failed]`. `d66e1f93e`
-/ `b919052f0` aimed to close that `CODEGEN001`. This resume loaded a
-runnable `faber` at `3853d4b8f` and did not re-exercise CODEGEN001.
+/ `b919052f0` aimed to close that `CODEGEN001`. Resume-2 and this
+FINAL run did not re-exercise CODEGEN001.
 
 ## Pinned row facts (not a comparison)
 
@@ -157,9 +161,11 @@ runnable `faber` at `3853d4b8f` and did not re-exercise CODEGEN001.
 | Pinned tokenizer ids (llama-tokenize 10150 `dee2a846b`, `--no-bos`) | `[785, 6722, 315, 9625, 374, 12095, 323, 279, 6722, 315, 6323, 374, 26194, 13, 576, 1790, 3283]` |
 | Backend (declared) | CPU/reference |
 | Hardware/OS | Darwin 25.5.0 arm64 (`burgus.local`, `RELEASE_ARM64_T6050`) |
-| Gradus | `a0d78a5` (packet base; this commit records the resume-2 stop) |
-| Radix | `3853d4b8f` (readable; `7f0c7de51` on tree; packet `faber` rebuild green) |
-| Faber | packet 1.7.0 at `3853d4b8f` (mtime 2026-08-17 21:11) |
+| Gradus | `1baaaa6` (packet base; this commit records the FINAL stop) |
+| Radix | `2ed9914e4` (readable; `9f828b2b6` on tree; packet `faber` rebuild green) |
+| Faber | packet 1.7.0 at `2ed9914e4` (mtime 2026-08-17 22:03); workspace `b1adfc9` via `FABER_SUPPORT_PATH_OVERRIDE` |
+| Hosts (read via override) | `24687cda4` |
+| Norma (read via libhome) | `7d71dafdb` |
 | Comparator binary | `/opt/homebrew/Cellar/llama.cpp/10150/bin/llama-server` SHA-256 `e5c153a1237e1c8e14ce0721d9afba4fd07936c7dc17dc7bd156d4dbe454952a`, version 10150 (`dee2a846b`) |
 
 The real file carries `attn_q.bias` / `attn_k.bias` / `attn_v.bias`.
