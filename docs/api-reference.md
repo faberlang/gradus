@@ -584,9 +584,9 @@ Bounded GGUF v3 parsing, range inspection, typed metadata, and tensor descriptor
 - `fn numerum(GgufManifest m, string clavis) → int ⇥ GgufManifestError {`
 - `fn textorum(GgufManifest m, string clavis) → list<string> ⇥ GgufManifestError {`
 - `fn numerorum(GgufManifest m, string clavis) → list<int> ⇥ GgufManifestError {`
-- `fn numerorum_u32(GgufManifest m, string clavis) → list<int> ⇥ GgufManifestError {`
-- `fn boleanum(GgufManifest m, string clavis) → bool ⇥ GgufManifestError {`
-- `fn longitudo_listae(GgufManifest m, string clavis) → int ⇥ GgufManifestError {`
+- `fn numerorum_u32(GgufManifest m, string clavis) → list<int> ⇥ GgufManifestError {` — typed uint32-array accessor (MODEL-01-M1); returns the elements of a GGUF array whose wire element kind is exactly `GGUF_UINT32`, without coercing other integer kinds. A missing key, a non-array value, or a non-uint32 element kind fails closed with a typed `WireMala` error; an array count beyond the bounded limit fails closed with `LimitesMala`. Pins `qwen35moe.rope.dimension_sections` → `[11, 11, 10, 0]`.
+- `fn boleanum(GgufManifest m, string clavis) → bool ⇥ GgufManifestError {` — typed bool accessor (MODEL-01-M1); returns the `GGUF_BOOL` metadata value (the parser has already validated the wire byte is 0 or 1). A missing key or a present non-bool value fails closed with a typed `WireMala` error instead of coercing. Pins `tokenizer.ggml.add_bos_token` → `false`.
+- `fn longitudo_listae(GgufManifest m, string clavis) → int ⇥ GgufManifestError {` — typed array-length accessor (MODEL-01-M1); reads only the array count from the GGUF array wire header without decoding elements. A missing key or a non-array value fails closed with a typed `WireMala` error; an array count beyond the bounded limit fails closed with `LimitesMala`. Pins the tokenizer identity counts 248320 / 248320 / 247587.
 - `fn inveni_tensorem(GgufManifest m, string nomen) → GgufTensorDescriptor ⇥ GgufManifestError {`
 - `fn limes_payloadis(GgufManifest m, string nomen) → tuple<int, int> ⇥ GgufManifestError {`
 - `fn parse(GgufCorpus corpus) → GgufManifest ⇥ GgufManifestError {`
