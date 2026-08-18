@@ -45,6 +45,32 @@ U1.10 is not CLOSE. GATE 13 re-ran after the named residual-2 /
 MHA wo / QKV-bias landings: position-0 top-1 moved to `2701` and
 still misses comparator `304`.
 
+## GATE 13 pos-0 probe (2026-08-18, handle a2ccc371)
+
+**Verdict: no layer-0 numerical defect at token-index 0.** The 304
+golden is GATE 9 llama-server `/completion` **generation position 0**
+(first token after the full 17-token prompt). That is prefill **row 16**,
+already observed top-1 `304` on GATE 13. Prefill `pos=0` is the next
+token after `The` (785), not the gi0/GATE 9 oracle. Token 504 is the
+SmolLM2 first id, not a Qwen2 BOS. Pinned tokenize is `--no-bos`.
+`dense.forward` prefill is uncached full-sequence attention (no KV
+first-write path). Consumer now prints the gi0 prompt-end row explicitly.
+
+Compiled rust `trace` on packet `hand-60` (layer-0 only; no 24-layer
+rerun):
+
+| probe | pos 0 | pos 16 | note |
+| --- | --- | --- | --- |
+| Q/K/V + bias vs GI2-1 CPU linear | PASS `0` | PASS `0` | 896 / 128 / 128 |
+| RoPE first-head vs unroped | PASS `0` (identity) | FAIL `28.06` / `18.65` | pos-16 fail is the live-path control |
+| causal mask row 0 | PASS `0` (self only) | — | 2×2 toy: ctx0 = v0 |
+| KV cache write | none | none | no cache on this prefill |
+| frame | token `785` `The` | token `3283` `city` | no BOS; `add_bos=false` |
+
+First divergent op vs the 304 golden: **none in the library**. The
+divergence is the window index (prefill row 0 compared to generation
+pos 0). No radix surface. No numerical retune.
+
 ## GATE 13 (2026-08-18)
 
 **Verdict: ORACLE REACHED — finite PASS; first-divergence vs comparator

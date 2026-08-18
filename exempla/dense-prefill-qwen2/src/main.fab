@@ -782,6 +782,56 @@ fn _linear_ok(tensor.Tensor x, tensor.Tensor w, tensor.Tensor b) → tensor.Tens
     return x
 }
 
+fn _prompt_positions() → list<int> {
+    var list<int> positions ← vacua
+    var int p ← 0
+    while p ≺ PINNED_TOKENS.length() {
+        positions.append(p)
+        p ← p + 1
+    }
+    return positions
+}
+
+fn _slice_cols(tensor.Tensor t, int start, int width) → tensor.Tensor ⇥ PrefillError {
+    const list<int> f ← t.shape()
+    const int rows ← f.get(0) coalesce 0
+    const int cols ← f.get(1) coalesce 0
+    if start ≺ 0 or width ≺ 1 or start + width ≻ cols {
+        throw variant AdapterError { message = "column slice out of range" }
+    }
+    var list<f32> out ← vacua
+    var int r ← 0
+    while r ≺ rows {
+        var int c ← 0
+        while c ≺ width {
+            out.append(t.data.get(((r * cols) + start) + c) coalesce 0.0 ∷ f32)
+            c ← c + 1
+        }
+        r ← r + 1
+    }
+    return _tensor_from(out, [rows, width])
+}
+
+fn _rope_ok(tensor.Tensor x, list<int> positions, int dim) → tensor.Tensor {
+    do {
+        return attention.rotary_position_embedding_config(x, positions, dim, rope_cfg())
+    }
+    catch err {
+        panic "trace rope failed: " + attention.message(err)
+    }
+    return x
+}
+
+fn _causal_ok(tensor.Tensor q, tensor.Tensor k, tensor.Tensor v, f32 scale) → tensor.Tensor {
+    do {
+        return attention.scaled_dot_product_causal(q, k, v, scale)
+    }
+    catch err {
+        panic "trace causal failed: " + attention.message(err)
+    }
+    return q
+}
+
 fn _tensor_from(list<f32> data, list<int> forma) → tensor.Tensor ⇥ PrefillError {
     do {
         return tensor.construct(data, forma)
@@ -922,7 +972,7 @@ main {
         catch err {
             panic render(err)
         }
-        print "trace: Qwen2 layer-0 Q/K/V activations vs GI2-1 CPU linear (no GI2-2 golden)"
+        print "trace: Qwen2 layer-0 pos-0 vs pos-16 (Q/K/V+bias, RoPE, mask, cache, frame)"
         do {
             const tensor.Tensor gathered ← _gather_prompt(path)
             const list<f32> ln1_w ← _dequant_bytes(0, path, 150591552, 3584)
@@ -936,32 +986,49 @@ main {
             print "bias_q_shape=" + ids_text(bq_ch.shape())
             print "bias_k_shape=" + ids_text(bk_ch.shape())
             print "bias_v_shape=" + ids_text(bv_ch.shape())
+            print "token0=" + ((PINNED_TOKENS.get(0) coalesce -1) ↦ string)
+            print "token16=" + ((PINNED_TOKENS.get(16) coalesce -1) ↦ string)
+            print "bos_guess_504_present=false"
+            print "add_bos=false"
+            print "frame=17 tokens --no-bos, pos0=785 The, not BOS 504 (SmolLM2 first id)"
             const tensor.Tensor ln1 ← _rmsnorm_ok(gathered, ln1_s)
-            const int last ← PINNED_TOKENS.length() - 1
-            const list<f32> x_row ← _row_at(ln1, last)
+            const list<int> probe_rows ← [0, 16]
             const tensor.Tensor bq ← _tile_bias(PINNED_TOKENS.length(), bq_ch)
             const tensor.Tensor bk ← _tile_bias(PINNED_TOKENS.length(), bk_ch)
             const tensor.Tensor bv ← _tile_bias(PINNED_TOKENS.length(), bv_ch)
-            const tensor.Tensor bq0 ← _zeros2(PINNED_TOKENS.length(), 896)
-            const tensor.Tensor bk0 ← _zeros2(PINNED_TOKENS.length(), 128)
-            const tensor.Tensor bv0 ← _zeros2(PINNED_TOKENS.length(), 128)
             const tensor.Tensor qb ← _linear_ok(ln1, wq, bq)
             const tensor.Tensor kb ← _linear_ok(ln1, wk, bk)
             const tensor.Tensor vb ← _linear_ok(ln1, wv, bv)
-            const tensor.Tensor qb0 ← _linear_ok(ln1, wq, bq0)
-            const tensor.Tensor kb0 ← _linear_ok(ln1, wk, bk0)
-            const tensor.Tensor vb0 ← _linear_ok(ln1, wv, bv0)
-            const list<f32> q_ref ← _ref_linear_row(x_row, wq, bq_ch)
-            const list<f32> k_ref ← _ref_linear_row(x_row, wk, bk_ch)
-            const list<f32> v_ref ← _ref_linear_row(x_row, wv, bv_ch)
-            print _probe_lists("q_linear_zero_bias", _row_at(qb0, last), q_ref, TRACE_BAND)
-            print _probe_lists("k_linear_zero_bias", _row_at(kb0, last), k_ref, TRACE_BAND)
-            print _probe_lists("v_linear_zero_bias", _row_at(vb0, last), v_ref, TRACE_BAND)
-            print _probe_lists("q_linear_with_bias", _row_at(qb, last), q_ref, TRACE_BAND)
-            print _probe_lists("k_linear_with_bias", _row_at(kb, last), k_ref, TRACE_BAND)
-            print _probe_lists("v_linear_with_bias", _row_at(vb, last), v_ref, TRACE_BAND)
-            print "ordering: linear+bias then rope(q/k); v is not roped (transformer.fab:467-471, attention.fab:930-935, prefill_run.rs:1441-1520)"
-            print "TRACE: STOP after Qwen2 layer-0 Q/K/V bias probe"
+            for from probe_rows const row {
+                const string tag ← "pos" + (row ↦ string)
+                const list<f32> x_row ← _row_at(ln1, row)
+                const list<f32> q_ref ← _ref_linear_row(x_row, wq, bq_ch)
+                const list<f32> k_ref ← _ref_linear_row(x_row, wk, bk_ch)
+                const list<f32> v_ref ← _ref_linear_row(x_row, wv, bv_ch)
+                print _probe_lists("q_linear_with_bias_" + tag, _row_at(qb, row), q_ref, TRACE_BAND)
+                print _probe_lists("k_linear_with_bias_" + tag, _row_at(kb, row), k_ref, TRACE_BAND)
+                print _probe_lists("v_linear_with_bias_" + tag, _row_at(vb, row), v_ref, TRACE_BAND)
+            }
+            print "ordering: linear+bias then rope(q/k); v is not roped"
+            const list<int> positions ← _prompt_positions()
+            const tensor.Tensor qh0 ← _slice_cols(qb, 0, 64)
+            const tensor.Tensor kh0 ← _slice_cols(kb, 0, 64)
+            const tensor.Tensor qr ← _rope_ok(qh0, positions, 64)
+            const tensor.Tensor kr ← _rope_ok(kh0, positions, 64)
+            print _probe_lists("rope_q_pos0_vs_identity", _row_at(qr, 0), _row_at(qh0, 0), TRACE_BAND)
+            print _probe_lists("rope_k_pos0_vs_identity", _row_at(kr, 0), _row_at(kh0, 0), TRACE_BAND)
+            print _probe_lists("rope_q_pos16_vs_identity", _row_at(qr, 16), _row_at(qh0, 16), TRACE_BAND)
+            print _probe_lists("rope_k_pos16_vs_identity", _row_at(kr, 16), _row_at(kh0, 16), TRACE_BAND)
+            const tensor.Tensor toy_q ← _tensor_from([1.0 ∷ f32, 0.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32], [2, 2])
+            const tensor.Tensor toy_k ← _tensor_from([1.0 ∷ f32, 0.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32], [2, 2])
+            const tensor.Tensor toy_v ← _tensor_from([3.0 ∷ f32, 4.0 ∷ f32, 30.0 ∷ f32, 40.0 ∷ f32], [2, 2])
+            const tensor.Tensor toy_ctx ← _causal_ok(toy_q, toy_k, toy_v, 1.0 ∷ f32)
+            const list<f32> mask_row0 ← _row_at(toy_ctx, 0)
+            const list<f32> mask_self ← [3.0 ∷ f32, 4.0 ∷ f32]
+            print _probe_lists("causal_mask_row0_self_only", mask_row0, mask_self, TRACE_BAND)
+            print "kv_cache=none — dense.forward prefill is uncached full-sequence attention (no first-write path)"
+            print "gi0_note: GATE 9 golden 304 is llama-server /completion generation pos 0 (prompt-end), not prefill row 0"
+            print "TRACE: STOP after Qwen2 pos-0 vs pos-16 layer-0 probe"
         }
         catch err {
             panic render(err)
@@ -1058,6 +1125,10 @@ main {
         else {
             print "finite_gate=FAIL"
         }
+        const int end_row ← ids.length() - 1
+        print "gi0_position=0 (prompt end, last prefill row " + (end_row ↦ string) + ")"
+        print "gi0_golden_top1=304"
+        print "gi0_note=GATE 9 llama-server /completion generation pos 0; not prefill row 0"
         print "no Metal/CUDA execution claim"
         print "no full-model payload-residency claim"
     }
