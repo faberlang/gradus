@@ -62,13 +62,16 @@ locale = "en"
 #     gi1-closeout.md + evidence/contract-tokenize-probes.txt.
 #   * KV block key (MD-A9) — this module owns the tokenizer identity
 #     component (clavis_tokenizatoris); the full key digest is host-side.
-#   * tokenizer RUNTIME (encode text → ids) — faber-runtime owns
-#     execution; this module pins and verifies the EXPECTED ids.
+#   * tokenizer RUNTIME (encode text → ids) — this module. G3 provider
+#     surface: `tokenize` (parse-special on) / `encode_prompt` (off) over
+#     the model's vocab+merge tables. Detokenize is deferred.
 #
 # GGUF-A2 (LIB-02): the artifact-backed byte-level BPE runtime lives in this
 # module too (the runtime section at the bottom). It consumes the vocab/merge
 # arrays through the schema-2 manifest accessors (gradus:model/gguf_manifest)
-# and implements the llama.cpp llm_tokenizer_bpe core at the word boundary.
+# or `build_tables` (sparse table constructor) and implements the llama.cpp
+# llm_tokenizer_bpe core at the word boundary. SmolLM2 (`pre=smollm`) uses
+# the SMOLLM scanner; other gpt2 artifacts keep the qwen35 scanner.
 #
 # -------------------------------------------------------------------------
 # Schema and pinned-row constants. schema_versio is the public contract
@@ -979,6 +982,77 @@ fn build(manifestum.GgufManifest m) → Tokenizer ⇥ TokenizerError {
     return Tokenizer {verborum = verborum, vocabulum = vocabulum, concursus = concursus, specialia_textus = specialia_textus, specialia_ids = specialia_ids, eog = eog, add_bos = add_bos, chat_template = chat_template, multitudo = verborum.length()}
 }
 
+# Sparse table constructor — the provider builds a runtime over the model's
+# vocab/merge arrays without wrapping them in a GGUF corpus. `ids`/`tokens`
+# are parallel (token `tokens[i]` lives at id `ids[i]`); `special_ids` are
+# the parse-special cache (must appear in `ids`). Unmapped bytes fail
+# closed at encode time (VestigiumIgnotum).
+@ public { }
+fn build_tables(list<int> ids, list<string> tokens, list<string> merges, list<int> special_ids) → Tokenizer ⇥ TokenizerError {
+    if ids.length() ≠ tokens.length() {
+        throw variant ArtificiumMala {message = "tokenizer table ids and tokens are different lengths"}
+    }
+    if ids.length() ≡ 0 {
+        throw variant ArtificiumMala {message = "tokenizer vocabulary is empty"}
+    }
+    var int max_id ← -1
+    var map<int, string> per_id ← vacua
+    var map<string, int> vocabulum ← vacua
+    var int i ← 0
+    while i ≺ ids.length() {
+        const int id ← ids.get(i) coalesce (-1)
+        if id ≺ 0 {
+            throw variant IdExtra {message = "tokenizer table id is negative"}
+        }
+        const string token ← tokens.get(i) coalesce ""
+        per_id.put(id, token)
+        vocabulum.put(token, id)
+        if id ≻ max_id {
+            max_id ← id
+        }
+        i ↑
+    }
+    var list<string> verborum ← vacua
+    var int k ← 0
+    while k ≤ max_id {
+        verborum.append(per_id.get(k) coalesce "")
+        k ↑
+    }
+    var map<string, int> concursus ← vacua
+    var int j ← 0
+    while j ≺ merges.length() {
+        const string par ← merges.get(j) coalesce ""
+        if not _pair_ok(par) {
+            throw variant MergesMala {message = "malformed merge entry: " + par}
+        }
+        concursus.put(par, j)
+        j ↑
+    }
+    var list<string> specialia_textus ← vacua
+    var list<int> specialia_ids ← vacua
+    for from special_ids const sid {
+        if sid ≺ 0 or sid ≻ max_id {
+            throw variant ArtificiumMala {message = "special token id is outside the table: " + (sid ↦ string)}
+        }
+        const string txt ← verborum.get(sid) coalesce ""
+        if txt.length() ≡ 0 {
+            throw variant ArtificiumMala {message = "special token id has no table entry: " + (sid ↦ string)}
+        }
+        specialia_textus.append(txt)
+        specialia_ids.append(sid)
+    }
+    var list<int> eog_cand ← vacua
+    var int e ← 0
+    while e ≺ ids.length() {
+        const string v ← tokens.get(e) coalesce ""
+        if _in_name(v, EOG_NOMINA) {
+            eog_cand.append(ids.get(e) coalesce (-1))
+        }
+        e ↑
+    }
+    return Tokenizer {verborum = verborum, vocabulum = vocabulum, concursus = concursus, specialia_textus = specialia_textus, specialia_ids = specialia_ids, eog = _sort_ascending(eog_cand), add_bos = false, chat_template = "", multitudo = verborum.length()}
+}
+
 # Word-level encode: UTF-8 bytes → display symbols → BPE merges → vocab ids.
 # A final piece missing from the vocab falls back to its single-byte display
 # characters; a missing byte token is malformed vocab and fails closed.
@@ -1476,6 +1550,136 @@ fn scan_words(string textum) → list<string> ⇥ TokenizerError {
     return verba
 }
 
+# SMOLLM pre-tokenizer (llama-vocab.cpp LLAMA_VOCAB_PRE_TYPE_SMOLLM):
+# first isolate each `\p{N}` digit, then run the GPT-2 custom scanner on
+# every remaining span (`'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+|
+# ?[^\s\p{L}\p{N}]+|\s+(?!\S)`). P1–P11 are ASCII and exercise the
+# letter / other / whitespace arms; digit isolation is the SMOLLM
+# difference from a bare GPT-2 pre.
+@ public { }
+fn scan_smollm(string textum) → list<string> ⇥ TokenizerError {
+    const list<int> cpts ← _text_codes(textum)
+    const int n ← cpts.length()
+    var list<string> verba ← vacua
+    var int pos ← 0
+    while pos ≺ n {
+        if _number_code(cpts.get(pos) coalesce 0) {
+            verba.append(_words_from_codes(cpts, pos, pos + 1))
+            pos ← pos + 1
+            continue
+        }
+        const int initium ← pos
+        while pos ≺ n {
+            if _number_code(cpts.get(pos) coalesce 0) {
+                break
+            }
+            pos ← pos + 1
+        }
+        const list<string> partes ← _scan_gpt2_span(cpts, initium, pos)
+        for from partes const p {
+            verba.append(p)
+        }
+    }
+    return verba
+}
+
+# GPT-2 custom scanner on one [lo, hi) codepoint span (unicode.cpp
+# unicode_regex_split_custom_gpt2). Contractions are case-sensitive
+# lowercase; an optional leading U+0020 joins a following letter /
+# number / other run; a 2+ whitespace run followed by more text emits
+# all-but-last (add_space_prefix = false — P11).
+@ private { }
+fn _scan_gpt2_span(list<int> cpts, int lo, int hi) → list<string> ⇥ TokenizerError {
+    var list<string> verba ← vacua
+    var int pos ← lo
+    while pos ≺ hi {
+        const int cpt ← cpts.get(pos) coalesce 0
+        const int initium ← pos
+        if cpt ≡ 39 and pos + 1 ≺ hi {
+            const int prox ← cpts.get(pos + 1) coalesce 0
+            if ((prox ≡ 115 or prox ≡ 116) or prox ≡ 109) or prox ≡ 100 {
+                pos ← pos + 2
+                verba.append(_words_from_codes(cpts, initium, pos))
+                continue
+            }
+            if pos + 2 ≺ hi {
+                const int prox2 ← cpts.get(pos + 2) coalesce 0
+                if (prox ≡ 114 and prox2 ≡ 101 or prox ≡ 118 and prox2 ≡ 101) or prox ≡ 108 and prox2 ≡ 108 {
+                    pos ← pos + 3
+                    verba.append(_words_from_codes(cpts, initium, pos))
+                    continue
+                }
+            }
+        }
+        var int c2 ← cpt
+        var bool in_span ← true
+        if cpt ≡ 32 {
+            if pos + 1 ≺ hi {
+                c2 ← cpts.get(pos + 1) coalesce 0
+            }
+            else {
+                in_span ← false
+            }
+        }
+        if in_span and _letter_code(c2) {
+            if cpt ≡ 32 {
+                pos ← pos + 1
+            }
+            while pos ≺ hi {
+                if not _letter_code(cpts.get(pos) coalesce 0) {
+                    break
+                }
+                pos ← pos + 1
+            }
+            verba.append(_words_from_codes(cpts, initium, pos))
+            continue
+        }
+        if in_span and _number_code(c2) {
+            if cpt ≡ 32 {
+                pos ← pos + 1
+            }
+            while pos ≺ hi {
+                if not _number_code(cpts.get(pos) coalesce 0) {
+                    break
+                }
+                pos ← pos + 1
+            }
+            verba.append(_words_from_codes(cpts, initium, pos))
+            continue
+        }
+        if in_span and _other_code(c2) {
+            if cpt ≡ 32 {
+                pos ← pos + 1
+            }
+            while pos ≺ hi and _other_code(cpts.get(pos) coalesce 0) {
+                pos ← pos + 1
+            }
+            verba.append(_words_from_codes(cpts, initium, pos))
+            continue
+        }
+        var int multi ← 0
+        while pos + multi ≺ hi {
+            if not _blank_code(cpts.get(pos + multi) coalesce 0) {
+                break
+            }
+            multi ← multi + 1
+        }
+        if multi ≻ 1 and pos + multi ≺ hi {
+            pos ← (pos + multi) - 1
+            verba.append(_words_from_codes(cpts, initium, pos))
+            continue
+        }
+        if multi ≻ 0 {
+            pos ← pos + multi
+            verba.append(_words_from_codes(cpts, initium, pos))
+            continue
+        }
+        pos ← pos + 1
+        verba.append(_words_from_codes(cpts, initium, pos))
+    }
+    return verba
+}
+
 # First occurrence of `quid` in `ubi` at or after `ab` (character
 # indices), or -1 when absent — the reference's std::string::find.
 @ private { }
@@ -1491,11 +1695,18 @@ fn _find(string ubi, string quid, int ab) → int {
     return -1
 }
 
-# Scanner-split + word-level BPE encode of one plain-text slice (the
-# shared literal path of both parse policies).
+# Scanner-split + word-level BPE encode of one plain-text slice.
+# `smollm` selects the SMOLLM / GPT-2 custom scanner (provider tokenize
+# route); otherwise the qwen35 scanner (existing encode_prompt path).
 @ private { }
-fn _encode_words(Tokenizer t, string textum) → list<int> ⇥ TokenizerError {
-    const list<string> verba ← scan_words(textum)
+fn _encode_words_kind(Tokenizer t, string textum, bool smollm) → list<int> ⇥ TokenizerError {
+    var list<string> verba ← vacua
+    if smollm {
+        verba ← scan_smollm(textum)
+    }
+    else {
+        verba ← scan_words(textum)
+    }
     var list<int> ids ← vacua
     for from verba const verbum {
         const list<int> partes ← encode(t, verbum)
@@ -1506,6 +1717,12 @@ fn _encode_words(Tokenizer t, string textum) → list<int> ⇥ TokenizerError {
     return ids
 }
 
+# Shared literal path of both parse policies (qwen35 scanner).
+@ private { }
+fn _encode_words(Tokenizer t, string textum) → list<int> ⇥ TokenizerError {
+    return _encode_words_kind(t, textum, false)
+}
+
 # Full-prompt encode, parse_special = falsum: the whole prompt goes
 # through scanner + BPE (specials read as their literal bytes).
 @ public { }
@@ -1513,14 +1730,13 @@ fn encode_prompt(Tokenizer t, string textum) → list<int> ⇥ TokenizerError {
     return _encode_words(t, textum)
 }
 
-# Full-prompt encode, parse_special = verum: split the prompt on the
-# artifact special cache BEFORE the scanner (llama.cpp
-# split_special_tokens/find_special_token — earliest match, longest text
-# on ties), emitting each special's single id and scanning each plain
-# slice independently. A prompt with no specials encodes identically to
-# encoda_promptum.
-@ public { }
-fn encode_prompt_special(Tokenizer t, string textum) → list<int> ⇥ TokenizerError {
+# Full-prompt encode with an explicit scanner. `specials` splits on the
+# artifact special cache first; `smollm` selects the SMOLLM scanner.
+@ private { }
+fn _encode_prompt_kind(Tokenizer t, string textum, bool specials, bool smollm) → list<int> ⇥ TokenizerError {
+    if not specials {
+        return _encode_words_kind(t, textum, smollm)
+    }
     var list<int> ids ← vacua
     var int pos ← 0
     while pos ≺ textum.length() {
@@ -1541,14 +1757,14 @@ fn encode_prompt_special(Tokenizer t, string textum) → list<int> ⇥ Tokenizer
             i ← i + 1
         }
         if melior_pos ≺ 0 {
-            const list<int> partes ← _encode_words(t, textum.slice(pos, textum.length()))
+            const list<int> partes ← _encode_words_kind(t, textum.slice(pos, textum.length()), smollm)
             for from partes const id {
                 ids.append(id)
             }
             break
         }
         if melior_pos ≻ pos {
-            const list<int> partes ← _encode_words(t, textum.slice(pos, melior_pos))
+            const list<int> partes ← _encode_words_kind(t, textum.slice(pos, melior_pos), smollm)
             for from partes const id {
                 ids.append(id)
             }
@@ -1557,6 +1773,31 @@ fn encode_prompt_special(Tokenizer t, string textum) → list<int> ⇥ Tokenizer
         pos ← melior_pos + melior_longitudo
     }
     return ids
+}
+
+# Full-prompt encode, parse_special = verum: split the prompt on the
+# artifact special cache BEFORE the scanner (llama.cpp
+# split_special_tokens/find_special_token — earliest match, longest text
+# on ties), emitting each special's single id and scanning each plain
+# slice independently. A prompt with no specials encodes identically to
+# encoda_promptum.
+@ public { }
+fn encode_prompt_special(Tokenizer t, string textum) → list<int> ⇥ TokenizerError {
+    return _encode_prompt_kind(t, textum, true, false)
+}
+
+# Provider encode route (G3): text → ids over the model's tables.
+# SMOLLM scanner + parse-special on (llama-tokenize default; P5/P7/P8/P9).
+# BOS is never prepended. Detokenize is deferred.
+@ public { }
+fn tokenize(Tokenizer t, string textum) → list<int> ⇥ TokenizerError {
+    return _encode_prompt_kind(t, textum, true, true)
+}
+
+# Provider encode, parse-special off (P6 literal BPE bytes).
+@ public { }
+fn tokenize_literal(Tokenizer t, string textum) → list<int> ⇥ TokenizerError {
+    return _encode_prompt_kind(t, textum, false, true)
 }
 
 # -------------------------------------------------------------------------
