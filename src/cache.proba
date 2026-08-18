@@ -489,3 +489,159 @@ test "KVStructure wire rejects unknown markers, unadmitted dtypes, and bad reser
     assert structure_wire_detail("cache/structure/1.0.0/0:dense:8:64/f16/q4_k/transposed/single/classic/8/1/2048/gi4-reserve") ≡ "quantized V requires the flash-attention family"
     assert structure_wire_detail("cache/structure/1.0.0/0:dense:8:64/f16/f16/transposed/single/classic/8/1/2048/other-reserve") ≡ "unknown reserve policy"
 }
+
+# ---- W5c-U8: per-layer cache classes + indexer partition
+
+fn structure_ok_p(list<cache.LayerSet> layers, cache.KvDtype dtype_k, cache.KvDtype dtype_v, cache.VLayout v_layout, cache.KvSharing sharing, cache.AttentionFamily family, int query_heads, int slots, int context_length, list<cache.CachePartition> partitions) → cache.KVStructure {
+    var cache.KVStructure s ← cache.default_kv_structure()
+    do {
+        s ← cache.construct_kv_structure_with_partitions(layers, dtype_k, dtype_v, v_layout, sharing, family, query_heads, slots, context_length, partitions)
+    }
+    catch err {
+        return s
+    }
+    return s
+}
+
+fn structure_detail_p(list<cache.LayerSet> layers, cache.KvDtype dtype_k, cache.KvDtype dtype_v, cache.VLayout v_layout, cache.KvSharing sharing, cache.AttentionFamily family, int query_heads, int slots, int context_length, list<cache.CachePartition> partitions) → string {
+    do {
+        cache.construct_kv_structure_with_partitions(layers, dtype_k, dtype_v, v_layout, sharing, family, query_heads, slots, context_length, partitions)
+        return "ok"
+    }
+    catch err {
+        return cache.message(err)
+    }
+}
+
+fn one_budget(int bytes) → list<cache.CachePartition> {
+    var list<cache.CachePartition> parts ← vacua
+    do {
+        parts.append(cache.indexer_budget(bytes))
+    }
+    catch err {
+        return parts
+    }
+    return parts
+}
+
+fn v4_flash_layers() → list<cache.LayerSet> {
+    var list<cache.LayerSet> layers ← vacua
+    do {
+        layers.append(cache.construct_layer_set([0, 1], cache.dense_structure(), 1, 512))
+        layers.append(cache.construct_layer_set([2, 3], cache.compressed_hca_structure(4), 1, 512))
+        layers.append(cache.construct_layer_set([4, 5], cache.compressed_hca_structure(128), 1, 512))
+        layers.append(cache.construct_layer_set([0, 1, 2, 3, 4, 5], cache.indexer_structure(), 64, 128))
+        return layers
+    }
+    catch err {
+        return layers
+    }
+}
+
+fn one_hca(int ratio, int kv_heads, int head_dim) → list<cache.LayerSet> {
+    var list<cache.LayerSet> layers ← vacua
+    var cache.LayerSet layer ← cache.default_layer_set()
+    do {
+        layer ← cache.construct_layer_set([0], cache.compressed_hca_structure(ratio), kv_heads, head_dim)
+        layers.append(layer)
+    }
+    catch err {
+        return layers
+    }
+    return layers
+}
+
+fn one_indexer(int kv_heads, int head_dim) → list<cache.LayerSet> {
+    var list<cache.LayerSet> layers ← vacua
+    var cache.LayerSet layer ← cache.default_layer_set()
+    do {
+        layer ← cache.construct_layer_set([0], cache.indexer_structure(), kv_heads, head_dim)
+        layers.append(layer)
+    }
+    catch err {
+        return layers
+    }
+    return layers
+}
+
+test "KVStructure admits a v4-flash-shaped heterogeneous class assignment with an indexer partition" {
+    do {
+        const cache.KVStructure s ← structure_ok_p(v4_flash_layers(), cache.kv_dtype_f16(), cache.kv_dtype_f16(), cache.v_layout_transposed(), cache.sharing_gqa(), cache.attention_classic(), 64, 1, 1024, one_budget(22000000000))
+        assert s.layers().length() ≡ 4
+        const cache.LayerSet early ← s.layers().get(0) coalesce cache.default_layer_set()
+        const cache.LayerSet hca4 ← s.layers().get(1) coalesce cache.default_layer_set()
+        const cache.LayerSet hca128 ← s.layers().get(2) coalesce cache.default_layer_set()
+        const cache.LayerSet indexer ← s.layers().get(3) coalesce cache.default_layer_set()
+        assert early.indices() ≡ [0, 1]
+        assert cache.layer_structure_name(early.structure()) ≡ "dense"
+        assert cache.layer_structure_name(hca4.structure()) ≡ "compressed-hca"
+        assert cache.hca_ratio(hca4.structure()) ≡ 4
+        assert cache.layer_structure_name(hca128.structure()) ≡ "compressed-hca"
+        assert cache.hca_ratio(hca128.structure()) ≡ 128
+        assert cache.layer_structure_name(indexer.structure()) ≡ "indexer"
+        assert s.partitions().length() ≡ 1
+        const cache.CachePartition part ← s.partitions().get(0) coalesce cache.default_cache_partition()
+        assert cache.partition_class_name(part) ≡ "indexer"
+        assert cache.partition_bytes(part) ≡ 22000000000
+        assert cache.serialize_structure(s) ≡ "cache/structure/1.1.0/0+1:dense:1:512;2+3:hca:4:1:512;4+5:hca:128:1:512;0+1+2+3+4+5:indexer:64:128/f16/f16/transposed/gqa/classic/64/1/1024/gi4-reserve/indexer:22000000000"
+        const cache.KVStructure t ← cache.deserialize_structure(cache.serialize_structure(s))
+        assert cache.kv_structure_equal(s, t)
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "KVStructure 1.0.0 Dense/SWA wires stay byte-identical; HCA-only bumps to 1.1.0" {
+    do {
+        const cache.KVStructure dense ← dense_f16()
+        assert cache.serialize_structure(dense) ≡ "cache/structure/1.0.0/0:dense:8:64/f16/f16/transposed/single/classic/8/1/2048/gi4-reserve"
+        const cache.KVStructure hca ← structure_ok(one_hca(4, 8, 64), cache.kv_dtype_f16(), cache.kv_dtype_f16(), cache.v_layout_transposed(), cache.sharing_single(), cache.attention_classic(), 8, 1, 2048)
+        assert cache.layer_structure_name((hca.layers().get(0) coalesce cache.default_layer_set()).structure()) ≡ "compressed-hca"
+        assert cache.serialize_structure(hca) ≡ "cache/structure/1.1.0/0:hca:4:8:64/f16/f16/transposed/single/classic/8/1/2048/gi4-reserve/-"
+        const cache.KVStructure back ← cache.deserialize_structure(cache.serialize_structure(hca))
+        assert cache.kv_structure_equal(hca, back)
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "KVStructure rejects invalid cache-class combinations fail-closed" {
+    assert structure_detail(one_indexer(64, 128), cache.kv_dtype_f16(), cache.kv_dtype_f16(), cache.v_layout_transposed(), cache.sharing_single(), cache.attention_classic(), 64, 1, 1024) ≡ "indexer class requires an indexer partition budget"
+    var list<cache.CachePartition> empty_parts ← vacua
+    assert structure_detail_p(one_indexer(64, 128), cache.kv_dtype_f16(), cache.kv_dtype_f16(), cache.v_layout_transposed(), cache.sharing_single(), cache.attention_classic(), 64, 1, 1024, empty_parts) ≡ "indexer class requires an indexer partition budget"
+    assert structure_detail_p(one_dense(8, 64), cache.kv_dtype_f16(), cache.kv_dtype_f16(), cache.v_layout_transposed(), cache.sharing_single(), cache.attention_classic(), 8, 1, 2048, one_budget(22000000000)) ≡ "indexer partition requires an indexer class"
+    do {
+        cache.compressed_hca_structure(8)
+        assert false
+    }
+    catch err {
+        assert cache.message(err) ≡ "unadmitted hca compression ratio"
+    }
+    do {
+        cache.compressed_hca_structure(0)
+        assert false
+    }
+    catch err {
+        assert cache.message(err) ≡ "hca compression ratio must be at least one"
+    }
+    do {
+        cache.indexer_budget(0)
+        assert false
+    }
+    catch err {
+        assert cache.message(err) ≡ "indexer partition budget must be at least one"
+    }
+    var list<cache.CachePartition> twice ← vacua
+    do {
+        twice.append(cache.indexer_budget(8))
+        twice.append(cache.indexer_budget(16))
+    }
+    catch err {
+        twice ← vacua
+    }
+    assert structure_detail_p(one_indexer(64, 128), cache.kv_dtype_f16(), cache.kv_dtype_f16(), cache.v_layout_transposed(), cache.sharing_single(), cache.attention_classic(), 64, 1, 1024, twice) ≡ "duplicate indexer partition"
+    assert structure_wire_detail("cache/structure/1.1.0/0:dense:8:64/f16/f16/transposed/single/classic/8/1/2048/gi4-reserve/kv:8") ≡ "unknown partition class"
+    assert structure_wire_detail("cache/structure/1.1.0/0:indexer:64:128/f16/f16/transposed/single/classic/64/1/1024/gi4-reserve/-") ≡ "indexer class requires an indexer partition budget"
+}
