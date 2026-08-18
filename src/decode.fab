@@ -33,8 +33,9 @@ locale = "en"
 # position equals the single-token decode at position 0 (probed). The
 # decode's single-token causal self-score is position-invariant under RoPE
 # (the rotation of q and k by the same angles cancels in the dot product)
-# — the position enters through the multi-token causal path (and the
-# KV-cache of U2).
+# — the position enters through the multi-token causal path. decode_cached
+# is the one-token incremental step: attention reads/writes the layer
+# KVCache so later tokens attend to the stored prefix.
 #
 # --- Reset / context-limit behavior (explicit) ---------------------------
 # The Decodere declares its context length (contextus); the decode op and
@@ -91,6 +92,8 @@ locale = "en"
 # This module holds no device handle, no server, no HTTP/batching
 # surface — only logical state (sessions, cancellation tokens, the replay
 # composition). No performance claims.
+import from "gradus:cache" kv
+
 import from "gradus:dtype" dtype
 
 import from "gradus:tensor" tensor
@@ -499,6 +502,71 @@ fn decodere_datum(int token_id, int position, Decoder m) → tensor.Tensor ⇥ D
     const tensor.Tensor logits ← _project(m, h)
     # The [1, V] projection flattens to the full-vocab logits [V].
     return _tensor(logits.data, [m.vocabulary()])
+}
+
+# -------------------------------------------------------------------------
+# decode_cached — ONE incremental decode step over the layer KVCache.
+# Token id + position + cache in → full-vocab logits + updated cache.
+# The new token's K/V are appended; later steps attend to the stored
+# prefix. Fail-closed on the same token/position domain as decodere_datum.
+# -------------------------------------------------------------------------
+
+@ public { }
+class DecodeStep {
+    tensor.Tensor logits
+    kv.KVCache state
+
+    fn logits() → tensor.Tensor {
+        return self.logits
+    }
+
+    fn state() → kv.KVCache {
+        return self.state
+    }
+}
+
+@ public { }
+fn default_step() → DecodeStep {
+    return DecodeStep {logits = tensor.default(), state = kv.default()}
+}
+
+@ private { }
+fn _block_cached(Decoder m, tensor.Tensor x, list<int> positions, kv.KVCache layer, list<int> tokens) → transformer.CachedBlock ⇥ DecodeError {
+    const Weights p ← m.weights()
+    do {
+        return transformer.transformer_block_cached(x, p.ln1_s(), p.ln1_o(), p.wq(), p.bq(), p.wk(), p.bk(), p.wv(), p.bv(), p.wo(), p.bo(), p.ln2_s(), p.ln2_o(), p.wf1(), p.bf1(), p.wf2(), p.bf2(), p.ln3_s(), p.ln3_o(), m.scale(), positions, m.dimension(), layer, tokens)
+    }
+    catch err {
+        const string c ← transformer.message(err)
+        if c ≡ "inner dimensions mismatch" {
+            throw variant Incompatibilis {message = c}
+        }
+        if c ≡ "dtype mismatch" {
+            throw variant TypoMismatch {message = c}
+        }
+        if c ≡ "bias does not match output width" {
+            throw variant FormaMismatch {message = c}
+        }
+        throw variant FormaMismatch {message = c}
+    }
+}
+
+@ public { }
+fn decode_cached(int token_id, int position, Decoder m, kv.KVCache layer) → DecodeStep ⇥ DecodeError {
+    if token_id ≺ 0 or token_id ≥ m.vocabulary() {
+        throw variant IdExtra {message = "token id out of vocabulary range"}
+    }
+    if position ≺ 0 or position ≥ m.context() {
+        throw variant PositioInvalida {message = "position out of context"}
+    }
+    if layer.dimension() ≠ m.dimension() {
+        throw variant FormaMismatch {message = "cache dimension must equal the decoder dimension"}
+    }
+    const list<f32> row ← _embedding(m.table(), token_id, m.dimension())
+    const tensor.Tensor x ← _tensor(row, [1, m.dimension()])
+    const transformer.CachedBlock block ← _block_cached(m, x, [position], layer, [token_id])
+    const tensor.Tensor projected ← _project(m, block.output())
+    return DecodeStep {logits = _tensor(projected.data, [m.vocabulary()]), state = block.state()}
 }
 
 # -------------------------------------------------------------------------
