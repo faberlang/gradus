@@ -17,10 +17,12 @@ locale = "en"
 # (model.embed_tokens, model.layers.{N}.input_layernorm,
 # .self_attn.{q,k,v,o}_proj, .post_attention_layernorm, .mlp.{gate,up,down}_proj,
 # model.norm, lm_head) plus a layer index — the GGUF/A1b descriptor layout
-# (token_embd.weight is [D, V]). The assembly transposes the embedding for
-# the token-major gather and reuses it directly for a TIED lm_head; an
-# UNTIED row resolves lm_head separately. Zero per-row special-case
-# constants: every shape derives from the config and the runtime tensors.
+# (token_embd.weight is [D, V] in the GGUF/ggml descriptor — dim0 = D
+# innermost, so the stored f32 buffer is already token-major). The
+# assembly gathers at index [token * D + d] without a data transpose, and
+# materializes a true row-major [D, V] only for a TIED lm_head; an UNTIED
+# row resolves lm_head separately. Zero per-row special-case constants:
+# every shape derives from the config and the runtime tensors.
 #
 # Fails closed with typed diagnostics on: an unknown/missing canonical
 # tensor (resolver successus = falsum → TensorAbsens), an invalid
@@ -153,8 +155,27 @@ fn _shape(tensor.Tensor t, string nomen, list<int> expectata) → tensor.Tensor 
     return t
 }
 
-# Rank-2 transpose [rows, cols] → [cols, rows] (math has no transpose; the
-# embedding gather needs the token-major view).
+# Reinterpret a stored [D, V] ggml embedding as token-major [V, D] without
+# permuting data. GGUF dim0 = D is innermost, so the flat buffer is already
+# data[token * D + d].
+@ private { }
+fn _token_major_view(tensor.Tensor t) → tensor.Tensor ⇥ DenseError {
+    const list<int> f ← t.shape()
+    if f.length() ≠ 2 {
+        throw variant FormaMala {message = "embedding must be rank 2"}
+    }
+    const int hidden ← f.get(0) coalesce 1
+    const int vocab ← f.get(1) coalesce 1
+    do {
+        return tensor.construct(t.data, [vocab, hidden])
+    }
+    catch err {
+        throw variant FormaMala {message = tensor.message(err)}
+    }
+}
+
+# Rank-2 transpose [rows, cols] → [cols, rows] (math has no transpose; a
+# TIED lm_head needs the true row-major [D, V] from the token-major view).
 @ private { }
 fn _transpose(tensor.Tensor t) → tensor.Tensor ⇥ DenseError {
     const list<int> f ← t.shape()
@@ -314,12 +335,13 @@ fn forward(DenseConfig cfg, (string, int) → Lookup fons, list<int> tokens, f32
         throw variant ConfiguraMala {message = "positions must match the token count"}
     }
 
-    # Embedding: the resolver returns the stored [D, V] view (the GGUF/A1b
-    # descriptor layout); transpose for the token-major gather. A TIED
-    # lm_head later reuses this stored view directly.
+    # Embedding: the resolver returns the stored [D, V] GGUF/A1b descriptor
+    # (ggml dim0 = D innermost). The buffer is already token-major — gather
+    # at [token * D + d], no data transpose. A TIED lm_head later transposes
+    # this view into true row-major [D, V] for the output linear.
     const tensor.Tensor embed ← _source(fons, "model.embed_tokens", 0)
     _shape(embed, "model.embed_tokens", [cfg.hidden_dim, cfg.vocab])
-    const tensor.Tensor embed_v ← _transpose(embed)
+    const tensor.Tensor embed_v ← _token_major_view(embed)
     const tensor.Tensor x ← _collect(embed_v, tokens)
 
     # N ordered U1.5 blocks. Every weight is resolved by its canonical name
@@ -370,10 +392,10 @@ fn forward(DenseConfig cfg, (string, int) → Lookup fons, list<int> tokens, f32
     _shape(norm_s, "model.norm", [cfg.hidden_dim])
     const tensor.Tensor hn ← _rmsnorm(h, norm_s, epsilon)
 
-    # Output projection. A TIED lm_head reuses the stored embedding view
-    # (already [D, V] — the linear [in, out] layout); an UNTIED row resolves
-    # lm_head as its own canonical tensor.
-    var tensor.Tensor w_head ← embed
+    # Output projection. A TIED lm_head transposes the token-major embed
+    # view into true row-major [D, V] (the linear [in, out] layout); an
+    # UNTIED row resolves lm_head as its own canonical tensor.
+    var tensor.Tensor w_head ← _transpose(embed_v)
     if not cfg.tied {
         w_head ← _source(fons, "lm_head", 0)
         _shape(w_head, "lm_head", [cfg.hidden_dim, cfg.vocab])

@@ -28,6 +28,8 @@ const int PINNED_BYTES ← 270590880
 const int PINNED_DATA ← 1787040
 const string PINNED_PROMPT ← "The quick brown fox jumps over the lazy dog"
 const list<int> PINNED_TOKENS ← [504, 2365, 6354, 16438, 27003, 690, 260, 23790, 2767]
+const string GOLDEN_X_PATH ← "/Users/ianzepp/work/faberlang/worktrees/hand-12/gradus/exempla/dense-prefill-smollm2/gi2-2-rms-norm-x.txt"
+const f32 GATHER_BAND ← 0.000001 ∷ f32
 const int GOLDEN_TOP1 ← 30
 const list<int> GOLDEN_TOP5 ← [30, 28, 1270, 365, 198]
 const int VOCAB ← 49152
@@ -447,6 +449,80 @@ fn _gather(tensor.Tensor embed, list<int> tokens) → tensor.Tensor ⇥ PrefillE
     return _tensor(out, [tokens.length(), d])
 }
 
+# GGUF stored [D, V] is already token-major: data[token * D + d].
+fn _gather_ggml(tensor.Tensor embed, list<int> tokens) → tensor.Tensor ⇥ PrefillError {
+    const list<int> fe ← embed.shape()
+    const int d ← fe.get(0) coalesce 1
+    const int v ← fe.get(1) coalesce 1
+    var list<f32> out ← vacua
+    for from tokens const tok {
+        if tok ≺ 0 or tok ≥ v {
+            throw variant AdapterMala {message = "trace token id out of range"}
+        }
+        var int j ← 0
+        while j ≺ d {
+            out.append(embed.data.get(tok * d + j) coalesce 0.0 ∷ f32)
+            j ← j + 1
+        }
+    }
+    return _tensor(out, [tokens.length(), d])
+}
+
+fn _list_max_delta(list<f32> a, list<f32> b) → f32 {
+    var f32 maxd ← 0.0 ∷ f32
+    var int n ← a.length()
+    if b.length() ≺ n {
+        n ← b.length()
+    }
+    var int i ← 0
+    while i ≺ n {
+        var f32 d ← (a.get(i) coalesce 0.0 ∷ f32) - (b.get(i) coalesce 0.0 ∷ f32)
+        if d ≺ 0.0 {
+            d ← 0.0 - d
+        }
+        if d ≻ maxd {
+            maxd ← d
+        }
+        i ← i + 1
+    }
+    return maxd
+}
+
+fn _load_floats(string via, int expectata) → list<f32> ⇥ PrefillError {
+    var bool present ← false
+    do {
+        present ← solum.exists(via)
+    }
+    catch err {
+        throw variant ArgumentaMala {message = "float file missing: " + via}
+    }
+    if not present {
+        throw variant ArgumentaMala {message = "float file missing: " + via}
+    }
+    var list<string> lines ← vacua
+    do {
+        lines ← solum.read_lines(via)
+    }
+    catch err {
+        throw variant ArgumentaMala {message = "float file unreadable: " + via}
+    }
+    if lines.length() ≠ expectata {
+        throw variant ArgumentaMala {message = "float line count is not " + (expectata ↦ string) + ": " + (lines.length() ↦ string)}
+    }
+    var list<f32> out ← vacua
+    var int i ← 0
+    while i ≺ expectata {
+        do {
+            out.append((lines.get(i) coalesce "0") ↦ f32)
+        }
+        catch err {
+            throw variant ArgumentaMala {message = "float parse failed at " + (i ↦ string)}
+        }
+        i ← i + 1
+    }
+    return out
+}
+
 fn _row_major(tensor.Tensor t, int row) → list<f32> {
     const list<int> f ← t.shape()
     const int d ← f.get(1) coalesce 0
@@ -652,25 +728,36 @@ main {
         _dump_head("embed_raw_token_major", raw_token_major)
         _write_floats("/tmp/hand-12-u19-embed-raw-token-major.txt", raw_token_major)
 
-        var tensor.Tensor embed_v ← tensor.default()
-        do {
-            embed_v ← _transpose_dv(embed)
-        }
-        catch err {
-            panic "trace transpose failed: " + message(err)
-        }
-        print "transposed_embed_shape=[" + ((embed_v.shape().get(0) coalesce 0) ↦ string) + "," + ((embed_v.shape().get(1) coalesce 0) ↦ string) + "]"
-
         var tensor.Tensor gathered ← tensor.default()
         do {
-            gathered ← _gather(embed_v, tokens)
+            gathered ← _gather_ggml(embed, tokens)
         }
         catch err {
             panic "trace gather failed: " + message(err)
         }
+        print "gathered_shape=[" + ((gathered.shape().get(0) coalesce 0) ↦ string) + "," + ((gathered.shape().get(1) coalesce 0) ↦ string) + "]"
         const list<f32> gathered_row ← _row_major(gathered, tokens.length() - 1)
         _dump_head("embed_gathered_pos8", gathered_row)
         _write_floats("/tmp/hand-12-u19-embed-gathered-pos8.txt", gathered_row)
+
+        const f32 vs_raw ← _list_max_delta(gathered_row, raw_token_major)
+        print "gather_vs_raw max_delta=" + (vs_raw ↦ string)
+        var f32 vs_golden ← 1.0 ∷ f32
+        var string gather_row ← "gather: FAIL golden-x unreadable"
+        do {
+            const list<f32> golden_x ← _load_floats(GOLDEN_X_PATH, 960)
+            vs_golden ← _list_max_delta(gathered_row, golden_x)
+            if vs_golden ≺ GATHER_BAND {
+                gather_row ← "gather: PASS max_delta=" + (vs_golden ↦ string) + " band=" + (GATHER_BAND ↦ string)
+            }
+            else {
+                gather_row ← "gather: FAIL max_delta=" + (vs_golden ↦ string) + " band=" + (GATHER_BAND ↦ string)
+            }
+        }
+        catch err {
+            gather_row ← "gather: FAIL " + message(err)
+        }
+        print gather_row
 
         var tensor.Tensor ln1_s ← tensor.default()
         do {
