@@ -372,8 +372,8 @@ execution, logits, or device execution; CTO8-1 stays the named gate.
 | `dtype` | F32 staged carrier through the U1.8 `forward` surface (not executed) |
 | `legal fixture ref` | operator-local `Qwen2.5-0.5B-Instruct-Q4_K_M.gguf` — 397,808,192 bytes, SHA-256 `6eb923e7d26e9cea28811e1a8e852009b21242fb157b26149d3b188f3a8c8653` |
 | `oracle ref` | gi0-numeric-contract v1.0.0 (finite / top-1 exact / top-5 overlap ≥ 4/5 / Δ=1e-5) on positions 0..16; comparator llama.cpp 10150 `dee2a846b` binary SHA-256 `e5c153a1…4952a` |
-| `evidence links` | `exempla/dense-prefill-qwen2/` (consumer + README resume-stop receipt) |
-| `executed proof` | **not executed.** Resume at readable radix `b919052f0`: `cargo build -p faber` (and `--no-default-features --features hir-rust`) stops with `E0432` unresolved import `faber_hir_rust::ImportedEnumVariantInfo` in `radix-program` `rust_target.rs:17`. No same-revision `faber` binary; rust-target emit not reached. Prior attempt (`31df6a9`, radix `7863624e2`) was `CODEGEN001` def-id 4127 in `dense_qwen2.fab`. No Gradus logits, no first-divergence. |
+| `evidence links` | `exempla/dense-prefill-qwen2/` (consumer + README resume-2 stop receipt) |
+| `executed proof` | **not executed.** Resume-2 at readable radix `3853d4b8f`: packet `cargo build -p faber` green (E0432 closed by `7f0c7de51`). `faber build --target rust` first stops `PKG001:package_host_selection_required`; consumer added `[target.rust] host = "native"` (`target = "fmir"` kept). Second emit stops `PKG001:host_provider_selection_invalid` — `norma:processus` emits `processus:exi`, `hosts/crates/processus/src/manifest.json` does not export it. No rust binary, no Gradus logits, no first-divergence. Prior stops: E0432 at `b919052f0`; `CODEGEN001` def-id 4127 at `7863624e2`. |
 | `compatibility policy` | no executed-tier claim. The compiled-route stop is recorded in the exemplum README. No Metal/CUDA or payload-residency claim. |
 
 ### Row 14 — MODEL-01 qwen35moe architecture admission row (structural tier, facts only)
