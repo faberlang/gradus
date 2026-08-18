@@ -18,7 +18,133 @@ in independent f64.
 | residual-2 `r1 + h` | GI2-1 | 0 | 0/960 |
 | residual-2 `ln2 + h` (old block) | GI2-1 `r1 + h` | **2.6446362** | **960/960** |
 
-No whole-model rerun (GATE 13 waits).
+GATE 13 is the whole-model rerun after that residual-2 fix plus the
+already-landed MHA `[K,N]` wo / U1.5 re-pins.
+
+## GATE 13 (2026-08-18)
+
+**Verdict: PASS — PREFILL PASS (top-1 exact, top-5 5/5).** Handle
+`f2513397` / packet `merge`. Gradus merged tip `03f3c42` (hand-48
+residual-2 `c2d42fb` + already-landed MHA `05555b1` / U1.5 `84a4005`;
+hand-49 Qwen2 QKV bias `42edb18`; hand-55 SG-3D `1eb9469`). Packet
+radix `b53b2eb7b`. Hosts `a6c8129` (64 MiB `solum` range cap) via
+`FABER_SUPPORT_PATH_OVERRIDE=/Users/ianzepp/work/faberlang`.
+`FABER_LIBRARY_HOME=/Users/ianzepp/work/faberlang/worktrees/merge`
+(full-membership packet: `gradus` + `norma`). Packet
+`cargo build -p faber` green. Packet-radix `faber build --target rust`
+printed the binary (`Finished dev` in 6.13s, 0 rustc errors, 711
+warnings). Execution of the printed binary **passed**
+`solum.read_range` of the 1_787_040-byte table prefix, admitted the
+GGUF, matched the pinned tokenizer ids, loaded all 32 layers, printed
+`forward start T=9`, and returned `forward done shape=[9,49152]`. gi0
+at prompt-end / position 0 (last prefill row 8): `all_finite=true`,
+observed top-1 `30` vs golden `30`, top-5 overlap `5/5`
+(`[30, 28, 1270, 365, 198]` exact). `first_divergence=none`.
+`PREFILL: PASS`. Exit 0.
+
+Top-1 history: GATE 10 (wrong gather) `40983` → GATE 11 (gather
+fixed) `45361` → GATE 12 (gather + all linear K-major) `5762` →
+GATE 13 (MHA wo `[K,N]` + residual-2 `r1 + h`) `30` = golden `30`.
+Every named cause on this row is closed. Numerics were not tuned.
+TARGETLANE001 was not weakened (`[build] target` is still `"fmir"`).
+
+### Packet faber rebuild (green)
+
+From the merge packet:
+
+```text
+cd /Users/ianzepp/work/faberlang/worktrees/merge/radix
+cargo build -p faber
+```
+
+`cargo build -p faber` at packet radix `b53b2eb7b` exits 0
+(Finished `dev` profile in 18.01s). Packet binary:
+`/Users/ianzepp/work/faberlang/worktrees/merge/radix/target/debug/faber`
+(`faber 1.7.0`, rustc 1.97.1 Homebrew, mtime 2026-08-18 12:20,
+95,158,136 bytes).
+
+### Rust-target emit (clean)
+
+```text
+cd /Users/ianzepp/work/faberlang/worktrees/merge/gradus
+env FABER_SUPPORT_PATH_OVERRIDE=/Users/ianzepp/work/faberlang \
+  FABER_LIBRARY_HOME=/Users/ianzepp/work/faberlang/worktrees/merge \
+  /Users/ianzepp/work/faberlang/worktrees/merge/radix/target/debug/faber \
+  build --target rust exempla/dense-prefill-smollm2
+```
+
+```text
+warning: `dense-prefill-smollm2` (bin "dense-prefill-smollm2") generated 711 warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 6.13s
+/Users/ianzepp/work/faberlang/worktrees/merge/gradus/exempla/dense-prefill-smollm2/target/debug/dense-prefill-smollm2
+```
+
+Exit 0. Printed binary present (4,073,176 bytes, mtime 2026-08-18 12:21).
+Zero rustc errors.
+
+### Observed execution (2026-08-18 GATE 13)
+
+```text
+/Users/ianzepp/work/faberlang/worktrees/merge/gradus/exempla/dense-prefill-smollm2/target/debug/dense-prefill-smollm2 \
+  /Users/ianzepp/ai/models/SmolLM2-360M-Instruct-Q4_K_M.gguf \
+  1787040 \
+  2fa3f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2
+```
+
+Start `2026-08-18T16:22:03Z`. End `2026-08-18T16:29:34Z`. Exit 0.
+`/usr/bin/time -l`: 450.95 real, 345.76 user, 124.84 sys, max RSS
+3,865,214,976 bytes (~3.60 GiB).
+
+Stdout (verbatim, layer-load rows elided as `...`):
+
+```text
+policy: gi0-numeric-contract v1.0.0 + faber-prefill-oracle compare_gpu_logits (prompt-end / position 0)
+engine: compiled rust (faber build --target rust; execute the printed binary)
+backend: CPU/reference
+model.path=/Users/ianzepp/ai/models/SmolLM2-360M-Instruct-Q4_K_M.gguf
+model.digest=2fa3f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2
+model.bytes=270590880
+admit: PASS version=3 data=1787040 tensors=290 architecture=llama
+tokenizer: PASS ids=[504, 2365, 6354, 16438, 27003, 690, 260, 23790, 2767]
+prompt_tokens=[504, 2365, 6354, 16438, 27003, 690, 260, 23790, 2767]
+loading stored-weight views...
+loaded embed+norm
+model_shape layers=32 heads=15 kv_heads=5 head_dim=64 hidden=960 vocab=49152
+stored_embed_shape=[960,49152]
+loaded layer 0
+...
+loaded layer 31
+forward start T=9
+forward done shape=[9,49152]
+position=0 (prompt end, last prefill row 8)
+observed_top1_non_eog=30
+golden_top1_non_eog=30
+top1_matches=true
+observed_top5=[30, 28, 1270, 365, 198]
+golden_top5=[30, 28, 1270, 365, 198]
+top5_overlap=5/5
+all_finite=true
+band: not_compared (no golden file)
+first_divergence=none
+PREFILL: PASS
+```
+
+Stop rule: record exactly. No Metal/CUDA or payload-residency claim.
+
+Toolchain: rustc 1.97.1 (8bab26f4f 2026-07-14) Homebrew, cargo 1.97.1
+(c980f4866 2026-06-30). Host: Darwin 25.5.0 arm64
+(`burgus.local`, `RELEASE_ARM64_T6050`, Apple M5 Max).
+
+### GATE 13 revisions
+
+| Surface | Revision |
+| --- | --- |
+| packet gradus | this commit (GATE 13 receipt; parent `03f3c42`) |
+| packet radix | `b53b2eb7b` |
+| faber binary used | packet `target/debug/faber` 1.7.0 at `b53b2eb7b` |
+| workspace faber | `0fe3a00` (via `FABER_SUPPORT_PATH_OVERRIDE`; not written) |
+| workspace / packet hosts | `a6c8129` (64 MiB `solum` cap; via override; not written) |
+| packet norma | `7d71daf` (read via `FABER_LIBRARY_HOME`; not written) |
 
 **Verdict: PASS — remaining linear families are the same GGUF K-major
 layout as `attn_q`.** Handle `8da95e6c` / packet `hand-25`. The Q adapter

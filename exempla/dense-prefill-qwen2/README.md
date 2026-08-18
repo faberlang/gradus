@@ -41,7 +41,296 @@ Stored head ≠ linear row0 on every 2-D weight (K-major). The adapter
 now transposes those families after materialize. No GI2-2 activation
 golden exists for this row. GATE 12 re-ran the full prefill binary
 after that sweep: observed position-0 top-1 `7` vs comparator `304`.
-U1.10 is not CLOSE.
+U1.10 is not CLOSE. GATE 13 re-ran after the named residual-2 /
+MHA wo / QKV-bias landings: position-0 top-1 moved to `2701` and
+still misses comparator `304`.
+
+## GATE 13 (2026-08-18)
+
+**Verdict: ORACLE REACHED — finite PASS; first-divergence vs comparator
+top-1. U1.10 not CLOSE.** Handle `f2513397` / packet `merge`. Gradus
+merged tip `03f3c42` (hand-48 residual-2 `c2d42fb` + already-landed
+MHA `05555b1` / U1.5 `84a4005`; hand-49 Qwen2 QKV bias `42edb18`;
+hand-55 SG-3D `1eb9469`). Packet radix `b53b2eb7b`. Workspace hosts
+`a6c8129` (64 MiB `solum` range cap) via
+`FABER_SUPPORT_PATH_OVERRIDE=/Users/ianzepp/work/faberlang`.
+`FABER_LIBRARY_HOME=/Users/ianzepp/work/faberlang/worktrees/merge`
+(full-membership packet: `gradus` + `norma`). Packet
+`cargo build -p faber` green. `faber build --target rust` printed the
+binary (`Finished dev` in 5.61s, 0 rustc errors, 661 warnings).
+Execution of the printed binary **passed** `solum.read_range` of the
+5_948_480-byte table prefix, printed architecture facts, matched the
+pinned tokenizer ids, loaded all 24 layers, completed `dense.forward`
+(`logits_shape=[17,151936]`), and printed top-1 / top-5 for window
+positions 0..16. `finite_gate=PASS`. Observed position-0 top-1 `2701`
+vs the GATE 9 pinned-comparator observation `304` (` in`). GATE 10
+post-transpose was `86331`; GATE 11 gather `89`; GATE 12 K-major
+adapter `7`; GATE 13 (MHA wo + residual-2 + real QKV bias) `2701`.
+Still not `304`. Observed top-5 at position 0 `[2701, 220, 330, 2790, 364]`
+does not contain `304`. Later window positions look prompt-coherent
+(pos 4 top-1 `12095` Paris; pos 11 `26194` Tokyo; pos 16 top-1 `304`).
+That is recorded; it does not close the gi0 pos-0 oracle.
+
+Every named cause on this row (K-major linears, MHA wo `[K,N]`,
+residual-2 `r1 + h`, QKV bias consumption) is landed. The remaining
+delta is **position-0 top-1 `2701` vs comparator `304`**; this gate
+does not name a next op. No in-binary `PREFILL:` line (this consumer
+does not call the golden file). Exit 0. Numerics were not tuned.
+TARGETLANE001 was not weakened (`[build] target = "fmir"` stays).
+
+### Packet faber rebuild (green)
+
+From the merge packet:
+
+```text
+cd /Users/ianzepp/work/faberlang/worktrees/merge/radix
+cargo build -p faber
+```
+
+Exit 0 in 18.01s. Binary
+`/Users/ianzepp/work/faberlang/worktrees/merge/radix/target/debug/faber`
+(`faber 1.7.0`, mtime 2026-08-18 12:20, 95,158,136 bytes) at radix
+`b53b2eb7b`.
+
+### Rust-target emit (clean)
+
+```text
+cd /Users/ianzepp/work/faberlang/worktrees/merge/gradus
+env FABER_SUPPORT_PATH_OVERRIDE=/Users/ianzepp/work/faberlang \
+  FABER_LIBRARY_HOME=/Users/ianzepp/work/faberlang/worktrees/merge \
+  /Users/ianzepp/work/faberlang/worktrees/merge/radix/target/debug/faber \
+  build --target rust exempla/dense-prefill-qwen2
+```
+
+```text
+warning: `dense-prefill-qwen2` (bin "dense-prefill-qwen2") generated 661 warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.61s
+/Users/ianzepp/work/faberlang/worktrees/merge/gradus/exempla/dense-prefill-qwen2/target/debug/dense-prefill-qwen2
+```
+
+Exit 0. Printed binary present (3,974,840 bytes, mtime 2026-08-18 12:21).
+Zero rustc errors.
+
+### Observed execution
+
+```text
+/Users/ianzepp/work/faberlang/worktrees/merge/gradus/exempla/dense-prefill-qwen2/target/debug/dense-prefill-qwen2 \
+  /Users/ianzepp/ai/models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf \
+  5948480 \
+  6eb923e7d26e9cea28811e1a8e852009b21242fb157b26149d3b188f3a8c8653
+```
+
+Start `2026-08-18T16:22:03Z`. End `2026-08-18T16:56:41Z`. Exit 0.
+`/usr/bin/time -l`: 2078.38 real, 1894.29 user, 220.20 sys, max RSS
+8,891,531,264 bytes (~8.28 GiB).
+
+Stdout (verbatim, layer-load rows elided as `...`):
+
+```text
+policy=gi0-numeric-contract v1.0.0 finite/top-1-exact/top-5-overlap>=4/5/delta=1e-5 window=0..16
+backend=CPU/reference
+model=Qwen2.5-0.5B-Instruct-Q4_K_M.gguf
+bytes=397808192
+sha256=6eb923e7d26e9cea28811e1a8e852009b21242fb157b26149d3b188f3a8c8653
+prompt=The capital of France is Paris and the capital of Japan is Tokyo. The next city
+admitting manifest...
+admit done
+architecture=qwen2
+tensors=290
+layers=24
+heads=14
+kv_heads=2
+head_dim=64
+hidden_dim=896
+vocab=151936
+tied=true
+observed_token_ids=[785,6722,315,9625,374,12095,323,279,6722,315,6323,374,26194,13,576,1790,3283]
+tokenizer_ids=PASS
+loading stored-weight views through the U1.8 resolver
+loaded_layer=0
+...
+loaded_layer=23
+logits_shape=[17,151936]
+pos=0
+top1=2701
+top1_logit_u6=14826916
+top5_0=2701
+top5_1=220
+top5_2=330
+top5_3=2790
+top5_4=364
+finite=PASS
+pos=1
+top1=315
+top1_logit_u6=19340162
+top5_0=315
+top5_1=3283
+top5_2=374
+top5_3=323
+top5_4=3081
+finite=PASS
+pos=2
+top1=279
+top1_logit_u6=13349335
+top5_0=279
+top5_1=264
+top5_2=8907
+top5_3=8359
+top5_4=6323
+finite=PASS
+pos=3
+top1=374
+top1_logit_u6=18750762
+top5_0=374
+top5_1=11
+top5_2=323
+top5_3=702
+top5_4=572
+finite=PASS
+pos=4
+top1=12095
+top1_logit_u6=16795730
+top5_0=12095
+top5_1=32671
+top5_2=7407
+top5_3=510
+top5_4=279
+finite=PASS
+pos=5
+top1=13
+top1_logit_u6=20798256
+top5_0=13
+top5_1=11
+top5_2=624
+top5_3=382
+top5_4=323
+finite=PASS
+pos=6
+top1=432
+top1_logit_u6=18116454
+top5_0=432
+top5_1=279
+top5_2=374
+top5_3=1181
+top5_4=702
+finite=PASS
+pos=7
+top1=6722
+top1_logit_u6=16368633
+top5_0=6722
+top5_1=7772
+top5_2=1429
+top5_3=10723
+top5_4=1887
+finite=PASS
+pos=8
+top1=315
+top1_logit_u6=22895000
+top5_0=315
+top5_1=3283
+top5_2=374
+top5_3=323
+top5_4=304
+finite=PASS
+pos=9
+top1=279
+top1_logit_u6=17541416
+top5_0=279
+top5_1=9625
+top5_2=9856
+top5_3=15344
+top5_4=17689
+finite=PASS
+pos=10
+top1=374
+top1_logit_u6=23223892
+top5_0=374
+top5_1=11
+top5_2=323
+top5_3=525
+top5_4=702
+finite=PASS
+pos=11
+top1=26194
+top1_logit_u6=18330942
+top5_0=26194
+top5_1=1304
+top5_2=30743
+top5_3=21447
+top5_4=2130
+finite=PASS
+pos=12
+top1=13
+top1_logit_u6=21430214
+top5_0=13
+top5_1=624
+top5_2=382
+top5_3=11
+top5_4=271
+finite=PASS
+pos=13
+top1=576
+top1_logit_u6=15460680
+top5_0=576
+top5_1=26194
+top5_2=12095
+top5_3=15920
+top5_4=6323
+finite=PASS
+pos=14
+top1=6722
+top1_logit_u6=17733262
+top5_0=6722
+top5_1=1378
+top5_2=92999
+top5_3=7042
+top5_4=6672
+finite=PASS
+pos=15
+top1=6722
+top1_logit_u6=18808590
+top5_0=6722
+top5_1=7772
+top5_2=1899
+top5_3=1378
+top5_4=1429
+finite=PASS
+pos=16
+top1=304
+top1_logit_u6=19693656
+top5_0=304
+top5_1=1283
+top5_2=448
+top5_3=311
+top5_4=429
+finite=PASS
+finite_gate=PASS
+no Metal/CUDA execution claim
+no full-model payload-residency claim
+```
+
+`solum.read_range` of 5_948_480 bytes **passed**. Admit, tokenizer, all
+24 layer materializations, and `dense.forward` completed. Finite gate
+holds on every window position. First failing oracle under gi0 vs the
+pinned llama.cpp comparator (GATE 9 probe, not re-run): position 0
+top-1 `2701` vs comparator `304` (` in`). Observed top-5 at position 0
+`[2701, 220, 330, 2790, 364]` does not contain `304`. Stop rule: record
+exactly, do not chase. No Metal/CUDA or payload-residency claim.
+
+Toolchain: rustc 1.97.1 (8bab26f4f 2026-07-14) Homebrew, cargo 1.97.1
+(c980f4866 2026-06-30). Host: Darwin 25.5.0 arm64
+(`burgus.local`, `RELEASE_ARM64_T6050`, Apple M5 Max).
+
+### GATE 13 revisions
+
+| Surface | Revision |
+| --- | --- |
+| packet gradus | this commit (GATE 13 receipt; parent `03f3c42`) |
+| packet radix | `b53b2eb7b` |
+| faber binary used | packet `target/debug/faber` 1.7.0 at `b53b2eb7b` |
+| workspace faber | `0fe3a00` (via `FABER_SUPPORT_PATH_OVERRIDE`; not written) |
+| workspace / packet hosts | `a6c8129` (64 MiB `solum` cap; via override; not written) |
+| packet norma | `7d71daf` (read via `FABER_LIBRARY_HOME`; not written) |
 
 ## GATE 12 (2026-08-18)
 
