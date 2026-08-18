@@ -15,7 +15,8 @@ locale = "en"
 # views via canonical names. The caller supplies a resolver (`fons`) that
 # returns the materialized STORED-weight view for one canonical tensor name
 # (model.embed_tokens, model.layers.{N}.input_layernorm,
-# .self_attn.{q,k,v,o}_proj, .post_attention_layernorm, .mlp.{gate,up,down}_proj,
+# .self_attn.{q,k,v,o}_proj, optional .self_attn.{q,k,v}_proj.bias,
+# .post_attention_layernorm, .mlp.{gate,up,down}_proj,
 # model.norm, lm_head) plus a layer index — the GGUF/A1b descriptor layout
 # (token_embd.weight is [D, V] in the GGUF/ggml descriptor — dim0 = D
 # innermost, so the stored f32 buffer is already token-major). The
@@ -253,6 +254,61 @@ fn _no_bias(tensor.Tensor x, tensor.Tensor w) → tensor.Tensor ⇥ DenseError {
     }
 }
 
+# Tile a per-channel bias [N] across T rows into the same-shape [T, N]
+# contract nn.linear actually executes (broadcast of [N] onto [T, N] is
+# rejected — see _no_bias). A already-shaped [T, N] view is passed through.
+@ private { }
+fn _channel_to_rows(tensor.Tensor x, tensor.Tensor w, tensor.Tensor b) → tensor.Tensor ⇥ DenseError {
+    const list<int> fx ← x.shape()
+    const list<int> fw ← w.shape()
+    if fx.length() ≠ 2 {
+        throw variant FormaMala {message = "block input must be rank 2"}
+    }
+    if fw.length() ≠ 2 {
+        throw variant FormaMala {message = "block weight must be rank 2"}
+    }
+    const int t ← fx.get(0) coalesce 1
+    const int n ← fw.get(1) coalesce 1
+    const list<int> fb ← b.shape()
+    if fb.length() ≡ 2 {
+        if (fb.get(0) coalesce 0) ≡ t and (fb.get(1) coalesce 0) ≡ n {
+            return b
+        }
+        throw variant FormaMala {message = "attention bias does not match output shape"}
+    }
+    if fb.length() ≠ 1 or (fb.get(0) coalesce 0) ≠ n {
+        throw variant FormaMala {message = "attention bias must be per-channel [N] or [T, N]"}
+    }
+    var list<f32> out ← vacua
+    var int i ← 0
+    while i ≺ t {
+        var int j ← 0
+        while j ≺ n {
+            out.append(b.data.get(j) coalesce 0.0 ∷ f32)
+            j ← j + 1
+        }
+        i ← i + 1
+    }
+    do {
+        return tensor.construct(out, [t, n])
+    }
+    catch err {
+        throw variant FormaMala {message = tensor.message(err)}
+    }
+}
+
+# Optional Q/K/V bias: a resolver miss (SmolLM2 / U1.8 synthetic rows)
+# stays on the verified zero-bias contract. A hit (Qwen2.5 attn_{q,k,v}.bias)
+# is applied after the linear and before RoPE (q/k) or cache-write (v).
+@ private { }
+fn _attn_bias((string, int) → Lookup fons, string nomen, int stratum, tensor.Tensor x, tensor.Tensor w) → tensor.Tensor ⇥ DenseError {
+    const Lookup r ← fons(nomen, stratum)
+    if not r.successus {
+        return _no_bias(x, w)
+    }
+    return _channel_to_rows(x, w, r.tensorem)
+}
+
 # rmsnorm wrapper — nn.rmsnorm → DenseError (causa text preserved).
 @ private { }
 fn _rmsnorm(tensor.Tensor x, tensor.Tensor s, f32 epsilon) → tensor.Tensor ⇥ DenseError {
@@ -347,8 +403,10 @@ fn forward(DenseConfig cfg, (string, int) → Lookup fons, list<int> tokens, f32
     # N ordered U1.5 blocks. Every weight is resolved by its canonical name
     # at the current layer index; every shape is validated against the
     # config (the MLP hidden width derives from the gate/up width at
-    # runtime). The biases are synthesized zero same-shape tensors (the
-    # composed rows carry no bias weights).
+    # runtime). Q/K/V bias is optional: present Qwen2 tensors are tiled
+    # onto [T, N] and added after the linear (before RoPE for q/k, before
+    # cache-write for v). A resolver miss keeps the U1.8 zero-bias
+    # contract. MLP / output biases stay synthesized zeros.
     const int qwidth ← cfg.heads * cfg.head_dim
     const int kwidth ← cfg.kv_heads * cfg.head_dim
     var tensor.Tensor h ← x
@@ -377,9 +435,9 @@ fn forward(DenseConfig cfg, (string, int) → Lookup fons, list<int> tokens, f32
         const int f ← fwg.get(1) coalesce 1
         _shape(wu, prefix + ".mlp.up_proj", [cfg.hidden_dim, f])
         _shape(wd, prefix + ".mlp.down_proj", [f, cfg.hidden_dim])
-        const tensor.Tensor bq ← _no_bias(h, wq)
-        const tensor.Tensor bk ← _no_bias(h, wk)
-        const tensor.Tensor bv ← _no_bias(h, wv)
+        const tensor.Tensor bq ← _attn_bias(fons, prefix + ".self_attn.q_proj.bias", stratum, h, wq)
+        const tensor.Tensor bk ← _attn_bias(fons, prefix + ".self_attn.k_proj.bias", stratum, h, wk)
+        const tensor.Tensor bv ← _attn_bias(fons, prefix + ".self_attn.v_proj.bias", stratum, h, wv)
         const tensor.Tensor bg ← _no_bias(h, wg)
         const tensor.Tensor bu ← _no_bias(h, wu)
         const tensor.Tensor bd ← _no_bias(h, wd)
