@@ -1,0 +1,781 @@
++++
+locale = "en"
++++
+# Residual-energy calibration bake — W5d-U1 (§17).
+#
+# Public import: importa ex "gradus:calibration" privata calibration
+# Depends on: gradus:dtype (finite gate).
+#
+# This is a MEASUREMENT artifact, not a weight transform — the same role
+# the ablation direction search plays for §13. Per expert, it records the
+# fraction of routing-weighted expert-output energy that the first K
+# candidate shared bases cannot represent. The bake emits per-expert
+# scores, the K-recommendation curve the merge/basis families consume,
+# the overlap-census cosine matrix, and 75e4ab98 provenance-digest fields.
+# No tensor is rewritten here.
+#
+# Schema: residual-energy/1.0.0. A schema change is a bump; consumers
+# reject an unknown schema. Digest VALUES are host-computed (no language
+# crypto primitive — the capsule/artifact rule); this module form-validates
+# them and fail-closes on a mismatch at verify/load.
+#
+# Residual at K against orthonormalized prefix B_1..B_K:
+#   E_tot(e) = Σ_t mass_{t,e} · ||y_{t,e}||²
+#   E_res(e, K) = Σ_t mass_{t,e} · (||y_{t,e}||² − Σ_{k<K} <y_{t,e}, b_k>²)
+#   score(e, K) = E_res / E_tot
+# Corpus curve[K] is the mass-energy-weighted mean of those scores.
+# recommended_k is the smallest K whose curve residual is ≤ threshold.
+#
+# Fail-closed negatives (typed CalibrationError): empty corpus,
+# zero-routing expert, malformed/mismatched provenance digest, invalid
+# threshold, linearly dependent candidate basis, non-finite values.
+import from "gradus:dtype" dtype
+
+const string SCHEMA ← "residual-energy/1.0.0"
+
+# -------------------------------------------------------------------------
+# CalibrationError — typed vocabulary of the residual-energy bake.
+# Every variant carries a textus message (render via message).
+# -------------------------------------------------------------------------
+
+
+@ public { }
+union CalibrationError {
+    EmptyCorpus {
+        string message
+    },
+    ZeroRouting {
+        string message
+    },
+    DigestMismatch {
+        string message
+    },
+    DigestMalformed {
+        string message
+    },
+    ThresholdInvalid {
+        string message
+    },
+    DimensionMismatch {
+        string message
+    },
+    ExpertRange {
+        string message
+    },
+    BasisInvalid {
+        string message
+    },
+    NonFinite {
+        string message
+    },
+    Invalid {
+        string message
+    }
+}
+
+@ public { }
+fn message(CalibrationError e) → string {
+    match e {
+        case EmptyCorpus const message {
+            return message
+        }
+        case ZeroRouting const message {
+            return message
+        }
+        case DigestMismatch const message {
+            return message
+        }
+        case DigestMalformed const message {
+            return message
+        }
+        case ThresholdInvalid const message {
+            return message
+        }
+        case DimensionMismatch const message {
+            return message
+        }
+        case ExpertRange const message {
+            return message
+        }
+        case BasisInvalid const message {
+            return message
+        }
+        case NonFinite const message {
+            return message
+        }
+        case Invalid const message {
+            return message
+        }
+    }
+}
+
+# -------------------------------------------------------------------------
+# RoutingActivation — one calibration-corpus row: a routed expert output.
+# -------------------------------------------------------------------------
+
+
+@ public { }
+class RoutingActivation {
+    int layer
+    int expert
+    f32 mass
+    list<f32> output
+
+    fn layer() → int {
+        return self.layer
+    }
+
+    fn expert() → int {
+        return self.expert
+    }
+
+    fn mass() → f32 {
+        return self.mass
+    }
+
+    fn output() → list<f32> {
+        return self.output
+    }
+}
+
+# Pack one routing activation. Mass and output are checked at corpus/bake.
+@ public { }
+fn activation(int layer, int expert, f32 mass, list<f32> output) → RoutingActivation {
+    return RoutingActivation {layer = layer, expert = expert, mass = mass, output = output}
+}
+
+# -------------------------------------------------------------------------
+# CalibrationCorpus — declared layer/expert/dimension counts plus the
+# routing-activation rows the bake measures.
+# -------------------------------------------------------------------------
+
+
+@ public { }
+class CalibrationCorpus {
+    list<RoutingActivation> activations
+    int layers
+    int experts
+    int dimension
+
+    fn activations() → list<RoutingActivation> {
+        return self.activations
+    }
+
+    fn layers() → int {
+        return self.layers
+    }
+
+    fn experts() → int {
+        return self.experts
+    }
+
+    fn dimension() → int {
+        return self.dimension
+    }
+}
+
+# Build a calibration corpus. Fails closed on an empty row set, non-positive
+# counts, out-of-range ids, dimension mismatch, non-finite/non-positive
+# mass, or a declared (layer, expert) slot that never routed.
+@ public { }
+fn corpus(list<RoutingActivation> activations, int layers, int experts, int dimension) → CalibrationCorpus ⇥ CalibrationError {
+    const bool ok ← _validate_corpus(activations, layers, experts, dimension)
+    if not ok {
+        throw variant Invalid {message = "corpus counts must be positive"}
+    }
+    return CalibrationCorpus {activations = activations, layers = layers, experts = experts, dimension = dimension}
+}
+
+# -------------------------------------------------------------------------
+# ExpertEnergy — per-expert residual-energy score at the recommended K.
+# residual is the unrepresentable fraction in [0, 1]; mass is the routed
+# mass that produced the score.
+# -------------------------------------------------------------------------
+
+
+@ public { }
+class ExpertEnergy {
+    int layer
+    int expert
+    f32 residual
+    f32 mass
+
+    fn layer() → int {
+        return self.layer
+    }
+
+    fn expert() → int {
+        return self.expert
+    }
+
+    fn residual() → f32 {
+        return self.residual
+    }
+
+    fn mass() → f32 {
+        return self.mass
+    }
+}
+
+# -------------------------------------------------------------------------
+# CurvePoint — one (K, r=0) residual-energy sample. r is 0 because this
+# bake measures shared-basis output energy; per-expert rank-r deltas are
+# a later transform gated on this curve.
+# -------------------------------------------------------------------------
+
+
+@ public { }
+class CurvePoint {
+    int bases
+    int rank
+    f32 residual
+
+    fn bases() → int {
+        return self.bases
+    }
+
+    fn rank() → int {
+        return self.rank
+    }
+
+    fn residual() → f32 {
+        return self.residual
+    }
+}
+
+# -------------------------------------------------------------------------
+# SimilarityCell — one overlap-census cosine (routing-weighted mean
+# outputs) for a (layer, expert_a, expert_b) pair.
+# -------------------------------------------------------------------------
+
+
+@ public { }
+class SimilarityCell {
+    int layer
+    int expert_a
+    int expert_b
+    f32 cosine
+
+    fn layer() → int {
+        return self.layer
+    }
+
+    fn expert_a() → int {
+        return self.expert_a
+    }
+
+    fn expert_b() → int {
+        return self.expert_b
+    }
+
+    fn cosine() → f32 {
+        return self.cosine
+    }
+}
+
+# -------------------------------------------------------------------------
+# Provenance — 75e4ab98 admission-manifest fields: named sha-256 digest
+# of this artifact, content length, and sibling corpus/base digests.
+# Authority is the bake inputs; the manifest is a derived verification
+# record and is never trusted without verify.
+# -------------------------------------------------------------------------
+
+
+@ public { }
+class Provenance {
+    string algorithm
+    string digest
+    int length
+    string corpus_digest
+    string base_digest
+
+    fn algorithm() → string {
+        return self.algorithm
+    }
+
+    fn digest() → string {
+        return self.digest
+    }
+
+    fn length() → int {
+        return self.length
+    }
+
+    fn corpus_digest() → string {
+        return self.corpus_digest
+    }
+
+    fn base_digest() → string {
+        return self.base_digest
+    }
+}
+
+# -------------------------------------------------------------------------
+# ResidualEnergyArtifact — the pinned measurement: per-expert scores,
+# K-recommendation curve, overlap census, fitted K, and provenance.
+# -------------------------------------------------------------------------
+
+
+@ public { }
+class ResidualEnergyArtifact {
+    string schema
+    list<ExpertEnergy> scores
+    list<CurvePoint> curve
+    list<SimilarityCell> similarities
+    int recommended_k
+    f32 threshold
+    bool below_threshold
+    Provenance provenance
+
+    fn schema() → string {
+        return self.schema
+    }
+
+    fn scores() → list<ExpertEnergy> {
+        return self.scores
+    }
+
+    fn curve() → list<CurvePoint> {
+        return self.curve
+    }
+
+    fn similarities() → list<SimilarityCell> {
+        return self.similarities
+    }
+
+    fn recommended_k() → int {
+        return self.recommended_k
+    }
+
+    fn threshold() → f32 {
+        return self.threshold
+    }
+
+    fn below_threshold() → bool {
+        return self.below_threshold
+    }
+
+    fn provenance() → Provenance {
+        return self.provenance
+    }
+}
+
+# Placeholder Default for `var ResidualEnergyArtifact` bindings.
+@ public { }
+fn default() → ResidualEnergyArtifact {
+    return ResidualEnergyArtifact {schema = SCHEMA, scores = vacua, curve = vacua, similarities = vacua, recommended_k = 0, threshold = 0.0, below_threshold = false, provenance = Provenance {algorithm = "", digest = "", length = 0, corpus_digest = "", base_digest = ""}}
+}
+
+# Bake the residual-energy artifact from a calibration corpus and candidate
+# shared bases. Bases are Gram-Schmidt orthonormalized in listed order so
+# curve[K] is residual against the span of the first K candidates. Provenance
+# claims are form-validated (sha-256 + 64 lowercase hex + positive length).
+@ public { }
+fn bake(CalibrationCorpus corpus, list<list<f32>> bases, f32 threshold, string algorithm, string digest, int length, string corpus_digest, string base_digest) → ResidualEnergyArtifact ⇥ CalibrationError {
+    const bool ok ← _validate_corpus(corpus.activations, corpus.layers, corpus.experts, corpus.dimension)
+    if not ok {
+        throw variant Invalid {message = "corpus counts must be positive"}
+    }
+    if not dtype.finite(threshold) {
+        throw variant NonFinite {message = "non-finite calibration value"}
+    }
+    if threshold ≤ 0.0 or threshold ≻ 1.0 {
+        throw variant ThresholdInvalid {message = "threshold must be in (0, 1]"}
+    }
+    const Provenance proven ← _provenance(algorithm, digest, length, corpus_digest, base_digest)
+    const list<list<f32>> qs ← _orthonormal(bases, corpus.dimension)
+    const int k_max ← qs.length()
+    const int slots ← corpus.layers * corpus.experts
+    const int dim ← corpus.dimension
+    var list<f32> mass ← _zeros(slots)
+    var list<f32> energy ← _zeros(slots)
+    var list<f32> weighted ← _zeros(slots * dim)
+    var list<f32> residual_k ← _zeros((k_max + 1) * slots)
+    for from corpus.activations const row {
+        const int slot ← _slot(row.layer, row.expert, corpus.experts)
+        const f32 n2 ← _norm2(row.output)
+        mass ← _put_f32(mass, slot, (mass.get(slot) coalesce 0.0 ∷ f32) + row.mass)
+        energy ← _put_f32(energy, slot, (energy.get(slot) coalesce 0.0 ∷ f32) + row.mass * n2)
+        var int d ← 0
+        while d ≺ dim {
+            const int wi ← slot * dim + d
+            const f32 y ← row.output.get(d) coalesce 0.0 ∷ f32
+            weighted ← _put_f32(weighted, wi, (weighted.get(wi) coalesce 0.0 ∷ f32) + row.mass * y)
+            d ← d + 1
+        }
+        var int k ← 0
+        while k ≤ k_max {
+            const f32 r2 ← _residual2(row.output, qs, k)
+            const int ri ← k * slots + slot
+            residual_k ← _put_f32(residual_k, ri, (residual_k.get(ri) coalesce 0.0 ∷ f32) + row.mass * r2)
+            k ← k + 1
+        }
+    }
+    var list<CurvePoint> curve ← vacua
+    var f32 tot ← 0.0
+    var int s ← 0
+    while s ≺ slots {
+        tot ← tot + (energy.get(s) coalesce 0.0 ∷ f32)
+        s ← s + 1
+    }
+    var int ck ← 0
+    while ck ≤ k_max {
+        var f32 res ← 0.0
+        var int i ← 0
+        while i ≺ slots {
+            res ← res + (residual_k.get(ck * slots + i) coalesce 0.0 ∷ f32)
+            i ← i + 1
+        }
+        var f32 frac ← 0.0
+        if tot ≻ 0.0 {
+            frac ← res / tot
+        }
+        curve.append(CurvePoint {bases = ck, rank = 0, residual = frac})
+        ck ← ck + 1
+    }
+    var int recommended ← k_max
+    var bool below ← false
+    var int rk ← 0
+    while rk ≤ k_max {
+        const f32 frac ← (curve.get(rk) coalesce CurvePoint {bases = rk, rank = 0, residual = 1.0}).residual
+        if not below {
+            if not (frac ≻ threshold) {
+                recommended ← rk
+                below ← true
+            }
+        }
+        rk ← rk + 1
+    }
+    var list<ExpertEnergy> scores ← vacua
+    var int layer ← 0
+    while layer ≺ corpus.layers {
+        var int expert ← 0
+        while expert ≺ corpus.experts {
+            const int slot ← _slot(layer, expert, corpus.experts)
+            const f32 e_tot ← energy.get(slot) coalesce 0.0 ∷ f32
+            const f32 e_res ← residual_k.get(recommended * slots + slot) coalesce 0.0 ∷ f32
+            var f32 score ← 0.0
+            if e_tot ≻ 0.0 {
+                score ← e_res / e_tot
+            }
+            scores.append(ExpertEnergy {layer = layer, expert = expert, residual = score, mass = mass.get(slot) coalesce 0.0 ∷ f32})
+            expert ← expert + 1
+        }
+        layer ← layer + 1
+    }
+    const list<SimilarityCell> census ← _census(weighted, mass, corpus.layers, corpus.experts, dim)
+    return ResidualEnergyArtifact {schema = SCHEMA, scores = scores, curve = curve, similarities = census, recommended_k = recommended, threshold = threshold, below_threshold = below, provenance = proven}
+}
+
+# Artifact list lengths — probes cannot type `.length()` on a
+# cross-module `list<Class>` return, so these stay int-valued.
+@ public { }
+fn score_count(ResidualEnergyArtifact artifact) → int {
+    return artifact.scores.length()
+}
+
+@ public { }
+fn curve_count(ResidualEnergyArtifact artifact) → int {
+    return artifact.curve.length()
+}
+
+@ public { }
+fn similarity_count(ResidualEnergyArtifact artifact) → int {
+    return artifact.similarities.length()
+}
+
+# Curve residual at K (0 if K is out of range). Used by probes so they
+# never construct CurvePoint across the module boundary.
+@ public { }
+fn curve_residual(ResidualEnergyArtifact artifact, int k) → f32 {
+    if k ≺ 0 or k ≥ artifact.curve.length() then return 0.0
+    const CurvePoint p ← artifact.curve.get(k) coalesce CurvePoint {bases = k, rank = 0, residual = 0.0}
+    return p.residual
+}
+
+# Per-expert residual at the recommended K, by score-list index.
+@ public { }
+fn score_residual(ResidualEnergyArtifact artifact, int i) → f32 {
+    if i ≺ 0 or i ≥ artifact.scores.length() then return 0.0
+    const ExpertEnergy e ← artifact.scores.get(i) coalesce ExpertEnergy {layer = 0, expert = 0, residual = 0.0, mass = 0.0}
+    return e.residual
+}
+
+# Overlap-census cosine by cell index (upper-triangle order).
+@ public { }
+fn similarity_cosine(ResidualEnergyArtifact artifact, int i) → f32 {
+    if i ≺ 0 or i ≥ artifact.similarities.length() then return 0.0
+    const SimilarityCell c ← artifact.similarities.get(i) coalesce SimilarityCell {layer = 0, expert_a = 0, expert_b = 0, cosine = 0.0}
+    return c.cosine
+}
+
+# Load-time provenance check: the claimed digest must equal the independently
+# known expected digest. Tampered claims fail closed.
+@ public { }
+fn verify(ResidualEnergyArtifact artifact, string expected) → ResidualEnergyArtifact ⇥ CalibrationError {
+    if not _digest_ok(expected) {
+        throw variant DigestMalformed {message = "content digest must be 64 lower-case hexadecimal digits"}
+    }
+    if artifact.provenance.digest ≠ expected {
+        throw variant DigestMismatch {message = "digest mismatch — residual-energy artifact does not match the expected digest"}
+    }
+    return artifact
+}
+
+# -------------------------------------------------------------------------
+# Private helpers.
+# -------------------------------------------------------------------------
+
+@ private { }
+fn _hex(string c) → bool {
+    if ((((((((c ≡ "0" or c ≡ "1") or c ≡ "2") or c ≡ "3") or c ≡ "4") or c ≡ "5") or c ≡ "6") or c ≡ "7") or c ≡ "8") or c ≡ "9" then return true
+    if ((((c ≡ "a" or c ≡ "b") or c ≡ "c") or c ≡ "d") or c ≡ "e") or c ≡ "f" then return true
+    return false
+}
+
+@ private { }
+fn _digest_ok(string digest) → bool {
+    if digest.length() ≠ 64 then return false
+    var int i ← 0
+    while i ≺ digest.length() {
+        if not _hex(digest.slice(i, i + 1)) then return false
+        i ← i + 1
+    }
+    return true
+}
+
+@ private { }
+fn _provenance(string algorithm, string digest, int length, string corpus_digest, string base_digest) → Provenance ⇥ CalibrationError {
+    if algorithm ≠ "sha-256" {
+        throw variant DigestMalformed {message = "unknown digest algorithm: " + algorithm}
+    }
+    if not _digest_ok(digest) {
+        throw variant DigestMalformed {message = "content digest must be 64 lower-case hexadecimal digits"}
+    }
+    if not _digest_ok(corpus_digest) {
+        throw variant DigestMalformed {message = "content digest must be 64 lower-case hexadecimal digits"}
+    }
+    if not _digest_ok(base_digest) {
+        throw variant DigestMalformed {message = "content digest must be 64 lower-case hexadecimal digits"}
+    }
+    if length ≤ 0 {
+        throw variant Invalid {message = "content length must be positive"}
+    }
+    return Provenance {algorithm = algorithm, digest = digest, length = length, corpus_digest = corpus_digest, base_digest = base_digest}
+}
+
+@ private { }
+fn _validate_corpus(list<RoutingActivation> activations, int layers, int experts, int dimension) → bool ⇥ CalibrationError {
+    if activations.length() ≡ 0 {
+        throw variant EmptyCorpus {message = "empty calibration corpus"}
+    }
+    if layers ≤ 0 or experts ≤ 0 or dimension ≤ 0 {
+        throw variant Invalid {message = "corpus counts must be positive"}
+    }
+    const int slots ← layers * experts
+    var list<f32> mass ← _zeros(slots)
+    for from activations const row {
+        if row.layer ≺ 0 or row.layer ≥ layers {
+            throw variant ExpertRange {message = "layer id out of range"}
+        }
+        if row.expert ≺ 0 or row.expert ≥ experts {
+            throw variant ExpertRange {message = "expert id out of range"}
+        }
+        if not dtype.finite(row.mass) {
+            throw variant NonFinite {message = "non-finite calibration value"}
+        }
+        if not (row.mass ≻ 0.0) {
+            throw variant Invalid {message = "routing mass must be positive"}
+        }
+        if row.output.length() ≠ dimension {
+            throw variant DimensionMismatch {message = "output dimension does not match corpus"}
+        }
+        if not _finite_vec(row.output) {
+            throw variant NonFinite {message = "non-finite calibration value"}
+        }
+        const int slot ← _slot(row.layer, row.expert, experts)
+        mass ← _put_f32(mass, slot, (mass.get(slot) coalesce 0.0 ∷ f32) + row.mass)
+    }
+    var int slot ← 0
+    while slot ≺ slots {
+        if not ((mass.get(slot) coalesce 0.0 ∷ f32) ≻ 0.0) {
+            throw variant ZeroRouting {message = "zero-routing expert"}
+        }
+        slot ← slot + 1
+    }
+    return true
+}
+
+@ private { }
+fn _finite_vec(list<f32> xs) → bool {
+    for from xs const v {
+        if not dtype.finite(v) then return false
+    }
+    return true
+}
+
+@ private { }
+fn _slot(int layer, int expert, int experts) → int {
+    return layer * experts + expert
+}
+
+@ private { }
+fn _zeros(int n) → list<f32> {
+    var list<f32> out ← vacua
+    var int i ← 0
+    while i ≺ n {
+        out.append(0.0)
+        i ← i + 1
+    }
+    return out
+}
+
+@ private { }
+fn _put_f32(list<f32> xs, int i, f32 v) → list<f32> {
+    var list<f32> out ← vacua
+    for range 0‥xs.length() const j {
+        if j ≡ i {
+            out.append(v)
+        }
+        else {
+            out.append(xs.get(j) coalesce 0.0 ∷ f32)
+        }
+    }
+    return out
+}
+
+@ private { }
+fn _dot(list<f32> a, list<f32> b) → f32 {
+    var f32 s ← 0.0
+    var int i ← 0
+    while i ≺ a.length() {
+        s ← s + (a.get(i) coalesce 0.0 ∷ f32) * (b.get(i) coalesce 0.0 ∷ f32)
+        i ← i + 1
+    }
+    return s
+}
+
+@ private { }
+fn _norm2(list<f32> xs) → f32 {
+    return _dot(xs, xs)
+}
+
+@ private { }
+fn _sqrt(f32 x) → f32 {
+    if x ≤ 0.0 then return 0.0
+    var f32 guess ← x / 2.0
+    if guess ≤ 0.0 {
+        guess ← x
+    }
+    var int i ← 0
+    while i ≺ 12 {
+        guess ← (guess + x / guess) / 2.0
+        i ← i + 1
+    }
+    return guess
+}
+
+@ private { }
+fn _scale(list<f32> xs, f32 s) → list<f32> {
+    var list<f32> out ← vacua
+    for from xs const v {
+        out.append(v * s)
+    }
+    return out
+}
+
+@ private { }
+fn _sub_scale(list<f32> xs, list<f32> ys, f32 s) → list<f32> {
+    var list<f32> out ← vacua
+    var int i ← 0
+    while i ≺ xs.length() {
+        out.append((xs.get(i) coalesce 0.0 ∷ f32) - s * (ys.get(i) coalesce 0.0 ∷ f32))
+        i ← i + 1
+    }
+    return out
+}
+
+@ private { }
+fn _orthonormal(list<list<f32>> bases, int dimension) → list<list<f32>> ⇥ CalibrationError {
+    var list<list<f32>> qs ← vacua
+    for from bases const raw {
+        if raw.length() ≠ dimension {
+            throw variant DimensionMismatch {message = "output dimension does not match corpus"}
+        }
+        if not _finite_vec(raw) {
+            throw variant NonFinite {message = "non-finite calibration value"}
+        }
+        var list<f32> v ← raw
+        for from qs const q {
+            v ← _sub_scale(v, q, _dot(v, q))
+        }
+        const f32 n2 ← _norm2(v)
+        if not (n2 ≻ 0.0) {
+            throw variant BasisInvalid {message = "candidate basis is empty or linearly dependent"}
+        }
+        const f32 n ← _sqrt(n2)
+        qs.append(_scale(v, 1.0 / n))
+    }
+    return qs
+}
+
+@ private { }
+fn _residual2(list<f32> y, list<list<f32>> qs, int k) → f32 {
+    var f32 captured ← 0.0
+    var int i ← 0
+    while i ≺ k {
+        var list<f32> empty ← vacua
+        const list<f32> q ← qs.get(i) coalesce empty
+        const f32 proj ← _dot(y, q)
+        captured ← captured + proj * proj
+        i ← i + 1
+    }
+    const f32 n2 ← _norm2(y)
+    const f32 left ← n2 - captured
+    if left ≺ 0.0 then return 0.0
+    return left
+}
+
+@ private { }
+fn _census(list<f32> weighted, list<f32> mass, int layers, int experts, int dim) → list<SimilarityCell> {
+    var list<SimilarityCell> out ← vacua
+    var int layer ← 0
+    while layer ≺ layers {
+        var int a ← 0
+        while a ≺ experts {
+            var int b ← a
+            while b ≺ experts {
+                out.append(SimilarityCell {layer = layer, expert_a = a, expert_b = b, cosine = _cosine(weighted, mass, layer, a, b, experts, dim)})
+                b ← b + 1
+            }
+            a ← a + 1
+        }
+        layer ← layer + 1
+    }
+    return out
+}
+
+@ private { }
+fn _cosine(list<f32> weighted, list<f32> mass, int layer, int a, int b, int experts, int dim) → f32 {
+    const int sa ← _slot(layer, a, experts)
+    const int sb ← _slot(layer, b, experts)
+    const f32 ma ← mass.get(sa) coalesce 0.0 ∷ f32
+    const f32 mb ← mass.get(sb) coalesce 0.0 ∷ f32
+    if not (ma ≻ 0.0) then return 0.0
+    if not (mb ≻ 0.0) then return 0.0
+    var f32 dot ← 0.0
+    var f32 na ← 0.0
+    var f32 nb ← 0.0
+    var int d ← 0
+    while d ≺ dim {
+        const f32 va ← (weighted.get(sa * dim + d) coalesce 0.0 ∷ f32) / ma
+        const f32 vb ← (weighted.get(sb * dim + d) coalesce 0.0 ∷ f32) / mb
+        dot ← dot + va * vb
+        na ← na + va * va
+        nb ← nb + vb * vb
+        d ← d + 1
+    }
+    const f32 denom ← _sqrt(na) * _sqrt(nb)
+    if not (denom ≻ 0.0) then return 0.0
+    return dot / denom
+}
