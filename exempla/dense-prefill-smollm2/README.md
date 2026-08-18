@@ -3,27 +3,30 @@
 Consumer for the U1.8 dense forward graph against the pinned SmolLM2-360M
 row on the **compiled rust** receipt tier. This README is the unit receipt.
 
-**Verdict: FIXED — layer-0 Q linear reads GGUF K-major `attn_q` as `[K, N]`
-row-major.** Handle `4cf6820b` / packet `hand-14`. Gather (token-major, no
-transpose) still holds. The Q failure was the same layout class on the
-other axis: `blk.0.attn_q.weight` is Q5_0 K-major (`stored[n*K+k] = W[k,n]`),
-and `nn.linear` wants `[K, N]` row-major (`out[k*N+n] = W[k,n]`). Slice
-name and Q5_0 dequant match the GI2-2 weight head (max_delta `0`); zero
-bias is correct. The GGUF adapter now transposes linear families
-(q/k/v/o/gate/up/down) after materialize. `dense.forward` keeps the
-`[K, N]` row-major contract used by the synthetic pins.
+**Verdict: PASS — remaining linear families are the same GGUF K-major
+layout as `attn_q`.** Handle `8da95e6c` / packet `hand-25`. The Q adapter
+transpose already named q/k/v/o/gate/up/down; compiled-rust probes confirm
+every remaining consumer. Without the transpose, V/O/gate/up fail GI2-2
+by `0.25`–`3.13` (100% of elements). With it, every GI2-2 activation
+probe is `< 1e-6`. `ffn_down` and tied `lm_head` have no per-op golden;
+GI2-1 dequant + first-row slice pass at `0`.
 
-Oracle (compiled rust `trace`):
+Oracle (compiled rust `trace`, packet `hand-25`):
 
-| probe | vs GI2-2 | max_delta | n > 1e-6 |
-| --- | --- | --- | --- |
-| gather | `rms_norm.x` | 0 | 0 / 960 |
-| `nn.rmsnorm` | `rms_norm.y` | 1.19e-7 | 0 / 960 |
-| `wq` first 32 | `dense` weight head | 0 | 0 / 32 |
-| `nn.linear` Q head-0 pos 8 | `dense.y` | **3.58e-7** | **0 / 64** |
+| tensor | stored | adapter → nn.linear | method | max_delta | n > 1e-6 |
+| --- | --- | --- | --- | --- | --- |
+| gather | Q8_0 `[960,49152]` token-major | n/a | GI2-2 `rms_norm.x` | 0 | 0 / 960 |
+| `nn.rmsnorm` | F32 `[960]` | n/a | GI2-2 `rms_norm.y` | 1.19e-7 | 0 / 960 |
+| `attn_q` | Q5_0 `[960,960]` K-major | `[960,960]` row-major | GI2-2 `dense.y` | **3.58e-7** | **0 / 64** |
+| `attn_k` | Q5_0 `[960,320]` K-major | `[960,320]` row-major | GI2-1 dequant+row0 | **0** | **0 / 32** |
+| `attn_v` | Q8_0 `[960,320]` K-major | `[960,320]` row-major | GI2-2 `attention.v` pos8 | **5.96e-8** | **0 / 320** |
+| `attn_output` | Q5_0 `[960,960]` K-major | `[960,960]` row-major | GI2-2 `residual.b` | **0** | **0 / 960** |
+| `ffn_gate` | Q5_0 `[960,2560]` K-major | `[960,2560]` row-major | GI2-2 `swiglu.gate` | **7.15e-7** | **0 / 2560** |
+| `ffn_up` | Q5_0 `[960,2560]` K-major | `[960,2560]` row-major | GI2-2 `swiglu.up` | **4.77e-7** | **0 / 2560** |
+| `ffn_down` | Q6_K `[2560,960]` K-major | `[2560,960]` row-major | GI2-1 dequant+row0 | **0** | **0 / 32** |
+| `lm_head` | tied `token_embd` Q8_0 | `dense.forward` `[D,V]` transpose | GI2-1 embed head | **0** | **0 / 32** |
 
-Red (same probe, stored `wq` passed to `nn.linear` unconverted): `q_linear`
-`max_delta = 1.2385719`, 64 / 64. Full prefill binary re-run is the next gate.
+No-transpose reds (Python GI2-1 matmul vs the same goldens): V `0.251`, O `3.025`, gate `3.126`, up `1.990`. K has no pre-rope GI2-2; rust `nn.linear` vs independent GI2-1 matmul is `2.15e-6` (accumulation, not layout). Full prefill binary re-run is the next gate.
 
 Prior diagnosis (handle `21b59246`) fixed gather. Layer-0 Q was the next
 divergence after that landing.
