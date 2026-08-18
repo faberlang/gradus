@@ -18,9 +18,9 @@ sharing over the staged f32 carrier:
   columns `j ≤ i`, diagonal included; no mask-tensor input);
 - **v accumulation** — `ctx_h = softmax(scores_h) · v_g`;
 - **head concatenation** — the per-head contexts joined along the last axis;
-- **output projection** — `out = concat · woᵀ` with the `[H·D, H·D]`
-  output weight in the `[in, out]` linear layout (the nn.fab `linear`
-  posture);
+- **output projection** — `out = concat · wo` with the `[H·D, H·D]`
+  output weight in the `[K, N]` row-major adapter contract (the nn.fab
+  `linear` posture; do not transpose);
 - **RoPE** — q and k are rotated at their positions first via the U1.3
   configurable RoPE row (`RopeConfigura`: frequency base, scale, pair
   policy). The row is the inference composition: causal + RoPE. The shape
