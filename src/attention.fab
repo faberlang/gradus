@@ -39,6 +39,8 @@ locale = "en"
 #   row 12 — bert-tiny-fragment train.fab:366 (+oracle capture.fab:398);
 #            bert-gradus-probe train.fab:364
 
+import from "gradus:cache" kv
+
 import from "gradus:dtype" dtype
 
 import from "gradus:math" math
@@ -944,4 +946,270 @@ fn multi_head_attention(tensor.Tensor q, tensor.Tensor k, tensor.Tensor v, tenso
     }
     const tensor.Tensor concat ← _reconcile(capitas)
     return _attention_matmul(concat, wo)
+}
+
+# =========================================================================
+# GGUF-A5 wiring — attention reads/writes one layer's KVCache.
+# Cached K is stored already-RoPE'd. New q/k are rotated at their positions,
+# concatenated onto the cached K/V, then the query attends with a causal
+# prefix of cache_len (row i sees columns j ≤ cache_len + i). The updated
+# cache is returned with the new K/V rows appended (extend).
+# =========================================================================
+
+@ public { }
+class CachedAttention {
+    tensor.Tensor context
+    kv.KVCache state
+
+    fn context() → tensor.Tensor {
+        return self.context
+    }
+
+    fn state() → kv.KVCache {
+        return self.state
+    }
+}
+
+@ public { }
+fn default_cached() → CachedAttention {
+    return CachedAttention {context = tensor.default(), state = kv.default()}
+}
+
+# Causal row softmax with a cache-length prefix: row i attends to columns
+# j ≤ prefix + i (clamped to the score width). prefix = 0 is the no-cache
+# causal recipe.
+@ private { }
+fn _softmax_prefix(tensor.Tensor x, int prefix) → tensor.Tensor {
+    const list<int> f ← x.shape()
+    const int rows ← f.get(0) coalesce 1
+    const int cols ← f.get(1) coalesce 1
+    var list<f32> out ← vacua
+    var int i ← 0
+    while i ≺ rows {
+        var int finis ← prefix + i + 1
+        if finis ≻ cols {
+            finis ← cols
+        }
+        if finis ≺ 1 {
+            finis ← 1
+        }
+        var f32 maximus ← x.data.get(i * cols) coalesce 0.0 ∷ f32
+        var int j ← 0
+        while j ≺ finis {
+            const f32 v ← x.data.get(i * cols + j) coalesce 0.0 ∷ f32
+            if v ≻ maximus {
+                maximus ← v
+            }
+            j ← j + 1
+        }
+        var list<f32> exps ← vacua
+        var f32 total ← 0.0 ∷ f32
+        var int j2 ← 0
+        while j2 ≺ finis {
+            const f32 v ← x.data.get(i * cols + j2) coalesce 0.0 ∷ f32
+            const f32 e ← _exp(v - maximus)
+            exps.append(e)
+            total ← total + e
+            j2 ← j2 + 1
+        }
+        for from exps const e {
+            out.append(e / total)
+        }
+        var int j3 ← finis
+        while j3 ≺ cols {
+            out.append(0.0 ∷ f32)
+            j3 ← j3 + 1
+        }
+        i ← i + 1
+    }
+    return tensor.Tensor {dtype = x.dtype(), shape = f, data = out}
+}
+
+# Attention core for q [Tq, D] against k/v [Tk, D]. prefix is the cached
+# token count already in k/v (the new rows follow).
+@ private { }
+fn _attention_core_offset(tensor.Tensor q, tensor.Tensor k, tensor.Tensor v, f32 scale, int prefix) → tensor.Tensor ⇥ AttentionError {
+    const list<int> fq ← q.shape()
+    const list<int> fk ← k.shape()
+    const int tq ← fq.get(0) coalesce 1
+    const int tk ← fk.get(0) coalesce 1
+    const tensor.Tensor kt ← _transpose(k)
+    const tensor.Tensor scale_t ← _fill([tq, tk], scale)
+    do {
+        const tensor.Tensor scores ← math.matmul(q, kt)
+        const tensor.Tensor scaled ← math.mul(scores, scale_t)
+        const tensor.Tensor attn ← _softmax_prefix(scaled, prefix)
+        const tensor.Tensor context ← math.matmul(attn, v)
+        return context
+    }
+    catch err {
+        const string c ← math.message(err)
+        if c ≡ "matmul requires rank-2 operands" {
+            throw variant GradusMismatch {message = c}
+        }
+        if c ≡ "inner dimensions mismatch" {
+            throw variant Incompatibilis {message = c}
+        }
+        if c ≡ "dtype mismatch" {
+            throw variant TypoMismatch {message = c}
+        }
+        if c ≡ "element count above ceiling" {
+            throw variant ProductumSupraLimitem {message = c}
+        }
+        if c ≡ "dimension above ceiling" {
+            throw variant DimensioSupraLimitem {message = c}
+        }
+        if c ≡ "negative dimension" {
+            throw variant DimensioNegativa {message = c}
+        }
+        if c ≡ "shapes not broadcastable" {
+            throw variant FormaMismatch {message = c}
+        }
+        throw variant FormaMismatch {message = c}
+    }
+}
+
+@ private { }
+fn _concat_rows(tensor.Tensor a, tensor.Tensor b) → tensor.Tensor ⇥ AttentionError {
+    const int ta ← a.shape().get(0) coalesce 0
+    if ta ≡ 0 then return b
+    const int tb ← b.shape().get(0) coalesce 0
+    if tb ≡ 0 then return a
+    do {
+        return math.concatenate([a, b], 0)
+    }
+    catch err {
+        throw variant FormaMismatch {message = math.message(err)}
+    }
+}
+
+@ private { }
+fn _write_cache(kv.KVCache layer, list<int> tokens, tensor.Tensor key, tensor.Tensor payload) → kv.KVCache ⇥ AttentionError {
+    do {
+        return kv.extend(layer, tokens, key, payload)
+    }
+    catch err {
+        throw variant FormaMismatch {message = kv.message(err)}
+    }
+}
+
+@ private { }
+fn _validate_cached_triplet(tensor.Tensor q, tensor.Tensor k, tensor.Tensor v, kv.KVCache layer, list<int> tokens) → int ⇥ AttentionError {
+    _dtype_triple(q, k, v)
+    const list<int> fq ← q.shape()
+    const list<int> fk ← k.shape()
+    const list<int> fv ← v.shape()
+    if fq.length() ≠ 2 or fk.length() ≠ 2 or fv.length() ≠ 2 {
+        throw variant GradusMismatch {message = "attention requires rank-2 tensors"}
+    }
+    const int t ← fq.get(0) coalesce 1
+    const int d ← fq.get(1) coalesce 1
+    if fk.get(0) coalesce 1 ≠ t or fk.get(1) coalesce 1 ≠ d {
+        throw variant FormaMismatch {message = "query, key, value must share shape"}
+    }
+    if fv.get(0) coalesce 1 ≠ t or fv.get(1) coalesce 1 ≠ d {
+        throw variant FormaMismatch {message = "query, key, value must share shape"}
+    }
+    if t ≡ 0 or d ≡ 0 {
+        throw variant ElementaMismatch {message = "empty attention input"}
+    }
+    if tokens.length() ≠ t {
+        throw variant FormaMismatch {message = "tokens must match the token count"}
+    }
+    if layer.dimension() ≠ d {
+        throw variant FormaMismatch {message = "cache dimension must equal the head width"}
+    }
+    const list<int> fc ← layer.key().shape()
+    if fc.length() ≠ 2 {
+        throw variant GradusMismatch {message = "cache key must be rank-2"}
+    }
+    if fc.get(1) coalesce 1 ≠ d {
+        throw variant FormaMismatch {message = "cache key width must equal the head width"}
+    }
+    return fc.get(0) coalesce 0
+}
+
+# -------------------------------------------------------------------------
+# scaled_dot_product_causal_rope_cached — single-head incremental decode.
+# q/k/v are the NEW rows [T, D]; the layer cache holds already-RoPE'd K
+# and V. tokens are the new history ids written with the new K/V.
+# -------------------------------------------------------------------------
+
+@ public { }
+fn scaled_dot_product_causal_rope_cached(tensor.Tensor q, tensor.Tensor k, tensor.Tensor v, f32 scale, list<int> positions, int dim, kv.KVCache layer, list<int> tokens) → CachedAttention ⇥ AttentionError {
+    const int prefix ← _validate_cached_triplet(q, k, v, layer, tokens)
+    _validate_rope(q, positions, dim)
+    const tensor.Tensor qr ← _rope(q, positions, dim, ROPE_FREQ_BASE, 1.0 ∷ f32, false)
+    const tensor.Tensor kr ← _rope(k, positions, dim, ROPE_FREQ_BASE, 1.0 ∷ f32, false)
+    const tensor.Tensor full_k ← _concat_rows(layer.key(), kr)
+    const tensor.Tensor full_v ← _concat_rows(layer.payload(), v)
+    const tensor.Tensor context ← _attention_core_offset(qr, full_k, full_v, scale, prefix)
+    return CachedAttention {context = context, state = _write_cache(layer, tokens, kr, v)}
+}
+
+@ private { }
+fn _validate_cached_multi(tensor.Tensor q, tensor.Tensor k, tensor.Tensor v, tensor.Tensor wo, kv.KVCache layer, int num_heads, int num_kv_heads, list<int> positions, int rope_dim, list<int> tokens) → int ⇥ AttentionError {
+    const int d ← _validate_multi(q, k, v, wo, num_heads, num_kv_heads, positions, rope_dim)
+    if tokens.length() ≠ (q.shape().get(0) coalesce 0) {
+        throw variant FormaMismatch {message = "tokens must match the token count"}
+    }
+    const int kv_width ← num_kv_heads * d
+    if layer.dimension() ≠ kv_width {
+        throw variant FormaMismatch {message = "cache dimension must equal num_kv_heads * head dim"}
+    }
+    const list<int> fc ← layer.key().shape()
+    if fc.length() ≠ 2 {
+        throw variant GradusMismatch {message = "cache key must be rank-2"}
+    }
+    if fc.get(1) coalesce 1 ≠ kv_width {
+        throw variant FormaMismatch {message = "cache key width must equal num_kv_heads * head dim"}
+    }
+    const list<int> fv ← layer.payload().shape()
+    if fv.length() ≠ 2 or fv.get(1) coalesce 1 ≠ kv_width {
+        throw variant FormaMismatch {message = "cache value width must equal num_kv_heads * head dim"}
+    }
+    if (fc.get(0) coalesce 0) ≠ (fv.get(0) coalesce 0) {
+        throw variant FormaMismatch {message = "cache key and value must share the token count"}
+    }
+    return d
+}
+
+# -------------------------------------------------------------------------
+# multi_head_attention_cached — GQA incremental decode. q/k/v are the NEW
+# packed rows; the layer cache holds already-RoPE'd packed K/V. The new
+# K/V (K after RoPE) are appended via extend.
+# -------------------------------------------------------------------------
+
+@ public { }
+fn multi_head_attention_cached(tensor.Tensor q, tensor.Tensor k, tensor.Tensor v, tensor.Tensor wo, kv.KVCache layer, int num_heads, int num_kv_heads, f32 scale, list<int> positions, int rope_dim, RopeConfig rope_configura, list<int> tokens) → CachedAttention ⇥ AttentionError {
+    const int d ← _validate_cached_multi(q, k, v, wo, layer, num_heads, num_kv_heads, positions, rope_dim, tokens)
+    const int prefix ← layer.key().shape().get(0) coalesce 0
+    const int ratio ← num_heads / num_kv_heads
+    const f32 base ← rope_configura.base()
+    const f32 rope_scale ← rope_configura.scale()
+    const bool interposita ← _interleaved(rope_configura.policy())
+    var list<tensor.Tensor> new_ks ← vacua
+    var int g ← 0
+    while g ≺ num_kv_heads {
+        const tensor.Tensor kg ← _head(k, g * d, d)
+        new_ks.append(_rope(kg, positions, rope_dim, base, rope_scale, interposita))
+        g ← g + 1
+    }
+    const tensor.Tensor new_k ← _reconcile(new_ks)
+    const tensor.Tensor full_k ← _concat_rows(layer.key(), new_k)
+    const tensor.Tensor full_v ← _concat_rows(layer.payload(), v)
+    var list<tensor.Tensor> capitas ← vacua
+    var int h ← 0
+    while h ≺ num_heads {
+        const int group ← h / ratio
+        const tensor.Tensor qh ← _head(q, h * d, d)
+        const tensor.Tensor qr ← _rope(qh, positions, rope_dim, base, rope_scale, interposita)
+        const tensor.Tensor kg_all ← _head(full_k, group * d, d)
+        const tensor.Tensor vg_all ← _head(full_v, group * d, d)
+        capitas.append(_attention_core_offset(qr, kg_all, vg_all, scale, prefix))
+        h ← h + 1
+    }
+    const tensor.Tensor concat ← _reconcile(capitas)
+    const tensor.Tensor context ← _attention_matmul(concat, wo)
+    return CachedAttention {context = context, state = _write_cache(layer, tokens, new_k, v)}
 }
