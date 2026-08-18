@@ -16,6 +16,7 @@ import from "gradus:model/dense" dense
 import from "gradus:model/gguf_manifest" manifestum
 import from "gradus:model/tensor_payload" tensor_payload
 import from "gradus:model/tensor_view" tensor_view
+import from "gradus:nn" nn
 import from "gradus:tensor" tensor
 import from "gradus:tokenizer" tokenizator
 import from "norma:processus" processus
@@ -408,11 +409,109 @@ fn _max_delta(tensor.Tensor logits, int pos, list<f32> golden) → f32 {
     return maxd
 }
 
+fn _transpose_dv(tensor.Tensor t) → tensor.Tensor ⇥ PrefillError {
+    const list<int> f ← t.shape()
+    if f.length() ≠ 2 {
+        throw variant AdapterMala {message = "trace transpose requires rank 2"}
+    }
+    const int rows ← f.get(0) coalesce 1
+    const int cols ← f.get(1) coalesce 1
+    var list<f32> out ← vacua
+    var int j ← 0
+    while j ≺ cols {
+        var int i ← 0
+        while i ≺ rows {
+            out.append(t.data.get(i * cols + j) coalesce 0.0 ∷ f32)
+            i ← i + 1
+        }
+        j ← j + 1
+    }
+    return _tensor(out, [cols, rows])
+}
+
+fn _gather(tensor.Tensor embed, list<int> tokens) → tensor.Tensor ⇥ PrefillError {
+    const list<int> fe ← embed.shape()
+    const int d ← fe.get(1) coalesce 1
+    const int v ← fe.get(0) coalesce 1
+    var list<f32> out ← vacua
+    for from tokens const tok {
+        if tok ≺ 0 or tok ≥ v {
+            throw variant AdapterMala {message = "trace token id out of range"}
+        }
+        var int j ← 0
+        while j ≺ d {
+            out.append(embed.data.get(tok * d + j) coalesce 0.0 ∷ f32)
+            j ← j + 1
+        }
+    }
+    return _tensor(out, [tokens.length(), d])
+}
+
+fn _row_major(tensor.Tensor t, int row) → list<f32> {
+    const list<int> f ← t.shape()
+    const int d ← f.get(1) coalesce 0
+    var list<f32> out ← vacua
+    var int j ← 0
+    while j ≺ d {
+        out.append(t.data.get(row * d + j) coalesce 0.0 ∷ f32)
+        j ← j + 1
+    }
+    return out
+}
+
+fn _flat_slice(tensor.Tensor t, int off, int n) → list<f32> {
+    var list<f32> out ← vacua
+    var int i ← 0
+    while i ≺ n {
+        out.append(t.data.get(off + i) coalesce 0.0 ∷ f32)
+        i ← i + 1
+    }
+    return out
+}
+
+fn _dump_head(string tag, list<f32> xs) {
+    print "trace." + tag + ".n=" + (xs.length() ↦ string)
+    var int i ← 0
+    while i ≺ xs.length() and i ≺ 8 {
+        print (("trace." + tag + ".") + (i ↦ string)) + "=" + ((xs.get(i) coalesce 0.0 ∷ f32) ↦ string)
+        i ← i + 1
+    }
+}
+
+fn _write_floats(string via, list<f32> xs) {
+    var string out ← ""
+    var int i ← 0
+    while i ≺ xs.length() {
+        out ← out + ((xs.get(i) coalesce 0.0 ∷ f32) ↦ string)
+        out ← out + "\n"
+        i ← i + 1
+    }
+    do {
+        solum.write_file(via, out)
+    }
+    catch err {
+        panic "trace write failed: " + via
+    }
+}
+
 fn _load_golden(string via) → list<f32> ⇥ PrefillError {
-    if not solum.exists(via) {
+    var bool present ← false
+    do {
+        present ← solum.exists(via)
+    }
+    catch err {
+        throw variant ArgumentaMala {message = "golden exists check failed: " + via}
+    }
+    if not present {
         throw variant ArgumentaMala {message = "golden file missing: " + via}
     }
-    const list<string> lines ← solum.read_lines(via)
+    var list<string> lines ← vacua
+    do {
+        lines ← solum.read_lines(via)
+    }
+    catch err {
+        throw variant ArgumentaMala {message = "golden read failed: " + via}
+    }
     if lines.length() ≠ VOCAB {
         throw variant ArgumentaMala {message = "golden line count is not 49152: " + (lines.length() ↦ string)}
     }
@@ -436,6 +535,7 @@ main {
     var int data_expectata ← PINNED_DATA
     var string digestio ← PINNED_DIGEST
     var string golden_via ← ""
+    var bool trace ← false
     if args.length() ≥ 3 {
         via ← args.get(0) coalesce PINNED_PATH
         do {
@@ -443,11 +543,17 @@ main {
             digestio ← args.get(2) coalesce PINNED_DIGEST
         }
         catch err {
-            panic "usage: dense-prefill-smollm2 <path> <data-offset> <sha256> [golden-pos0.txt]"
+            panic "usage: dense-prefill-smollm2 <path> <data-offset> <sha256> [golden-pos0.txt|trace]"
         }
     }
     if args.length() ≥ 4 {
-        golden_via ← args.get(3) coalesce ""
+        const string extra ← args.get(3) coalesce ""
+        if extra ≡ "trace" {
+            trace ← true
+        }
+        else {
+            golden_via ← extra
+        }
     }
 
     print "policy: gi0-numeric-contract v1.0.0 + faber-prefill-oracle compare_gpu_logits (prompt-end / position 0)"
@@ -537,6 +643,93 @@ main {
         panic message(err)
     }
     print "loaded embed+norm"
+    print "model_shape layers=32 heads=15 kv_heads=5 head_dim=64 hidden=960 vocab=49152"
+    print "stored_embed_shape=[" + ((embed.shape().get(0) coalesce 0) ↦ string) + "," + ((embed.shape().get(1) coalesce 0) ↦ string) + "]"
+
+    if trace {
+        print "trace: layer-0 prompt-end (position 8 / token 2767) vs GI2-2 goldens"
+        const list<f32> raw_token_major ← _flat_slice(embed, 2767 * 960, 960)
+        _dump_head("embed_raw_token_major", raw_token_major)
+        _write_floats("/tmp/hand-12-u19-embed-raw-token-major.txt", raw_token_major)
+
+        var tensor.Tensor embed_v ← tensor.default()
+        do {
+            embed_v ← _transpose_dv(embed)
+        }
+        catch err {
+            panic "trace transpose failed: " + message(err)
+        }
+        print "transposed_embed_shape=[" + ((embed_v.shape().get(0) coalesce 0) ↦ string) + "," + ((embed_v.shape().get(1) coalesce 0) ↦ string) + "]"
+
+        var tensor.Tensor gathered ← tensor.default()
+        do {
+            gathered ← _gather(embed_v, tokens)
+        }
+        catch err {
+            panic "trace gather failed: " + message(err)
+        }
+        const list<f32> gathered_row ← _row_major(gathered, tokens.length() - 1)
+        _dump_head("embed_gathered_pos8", gathered_row)
+        _write_floats("/tmp/hand-12-u19-embed-gathered-pos8.txt", gathered_row)
+
+        var tensor.Tensor ln1_s ← tensor.default()
+        do {
+            ln1_s ← _load_one(via, total, admitted, "model.layers.input_layernorm", 0)
+        }
+        catch err {
+            panic "trace attn_norm load failed: " + message(err)
+        }
+        const list<f32> ln1_w ← _flat_slice(ln1_s, 0, 960)
+        _dump_head("blk0_attn_norm_weight", ln1_w)
+        _write_floats("/tmp/hand-12-u19-blk0-attn-norm-weight.txt", ln1_w)
+
+        var tensor.Tensor ln1 ← tensor.default()
+        do {
+            ln1 ← nn.rmsnorm(gathered, ln1_s, 0.00001 ∷ f32)
+        }
+        catch err {
+            panic "trace rmsnorm failed: " + nn.message(err)
+        }
+        const list<f32> ln1_row ← _row_major(ln1, tokens.length() - 1)
+        _dump_head("layer0_rms_norm_pos8", ln1_row)
+        _write_floats("/tmp/hand-12-u19-layer0-rms-norm-pos8.txt", ln1_row)
+
+        var tensor.Tensor wq ← tensor.default()
+        do {
+            wq ← _load_one(via, total, admitted, "model.layers.self_attn.q_proj", 0)
+        }
+        catch err {
+            panic "trace q_proj load failed: " + message(err)
+        }
+        print "stored_wq_shape=[" + ((wq.shape().get(0) coalesce 0) ↦ string) + "," + ((wq.shape().get(1) coalesce 0) ↦ string) + "]"
+        var tensor.Tensor bq ← tensor.default()
+        do {
+            bq ← tensor.fill([tokens.length(), 960], 0.0 ∷ f32)
+        }
+        catch err {
+            panic "trace q bias failed: " + tensor.message(err)
+        }
+        var tensor.Tensor qb ← tensor.default()
+        do {
+            qb ← nn.linear(ln1, wq, bq)
+        }
+        catch err {
+            panic "trace q linear failed: " + nn.message(err)
+        }
+        const list<f32> q_row ← _row_major(qb, tokens.length() - 1)
+        var list<f32> q_head0 ← vacua
+        var int qh ← 0
+        while qh ≺ 64 {
+            q_head0.append(q_row.get(qh) coalesce 0.0 ∷ f32)
+            qh ← qh + 1
+        }
+        _dump_head("layer0_q_head0_pos8", q_head0)
+        _write_floats("/tmp/hand-12-u19-layer0-q-head0-pos8.txt", q_head0)
+        print "trace: dumps written under /tmp/hand-12-u19-*"
+        print "TRACE: STOP after layer-0 rms_norm + q head-0"
+    }
+
+    if not trace {
 
     const list<string> families ← [
         "model.layers.input_layernorm",
@@ -671,5 +864,6 @@ main {
     }
     else {
         print "PREFILL: FAIL"
+    }
     }
 }

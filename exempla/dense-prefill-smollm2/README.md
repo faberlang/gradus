@@ -3,13 +3,96 @@
 Consumer for the U1.8 dense forward graph against the pinned SmolLM2-360M
 row on the **compiled rust** receipt tier. This README is the unit receipt.
 
-**Verdict: STOP — not executed.** FINAL run at radix `2ed9914e4` / faber
-`b1adfc9` produced a packet `faber` binary. Prior gates cleared: CODEGEN001
-(`d66e1f93e`), E0432 (`7f0c7de51`), PKG001 `processus:exi` (`9f828b2b6` +
-`6e13687`). `faber build --target rust` emitted the crate and cargo compiled
-host crates, then rustc failed the generated crate. TARGETLANE001 was not
-weakened (`[build] target` is still `"fmir"`). Numerics were not tuned.
-The GGUF file was not executed.
+**Verdict: LOCALIZED — wiring, layer 0 embedding gather (`dense.forward`
+`_transpose`).** Handle `5830c444` / packet `hand-12`. GATE 10 (receipt
+`dfa4fce`) reached gi0 and failed top-1 `40983` vs golden `30`. This unit
+does not fix. It names the first GI2-2 divergence and stops.
+
+The compiled stored view of `token_embd.weight` is already the ggml-order
+Q8_0 buffer (dim0 = 960 innermost = token-major `[V, D]` linearized).
+`dense.forward` treats the GGUF descriptor shape `[960, 49152]` as
+row-major `[D, V]` and transposes before gather. Prompt-end token `2767`
+then reads `data[d * 49152 + 2767]` instead of `data[2767 * 960 + d]`.
+Layer 0 `rms_norm` / `dense` / later ops inherit that wrong `x`.
+
+Not comparison-side: tokenizer PASS, pinned ids
+`[504, 2365, 6354, 16438, 27003, 690, 260, 23790, 2767]`, dump row is
+position 8. Not emit: the raw token-major slice and `blk.0.attn_norm.weight`
+match the GI2-2 fixtures (print-round max_delta `7.4e-9` / `5e-9`).
+Mind routes the fix (skip the transpose, or materialize a true row-major
+`[D, V]` before it).
+
+## TRACE (2026-08-18, handle 5830c444)
+
+Packet `faber` rebuilt at radix `017546a12`. Exemplum accepts a `trace`
+4th argument, loads embed + layer-0 `attn_norm` + `attn_q` only, and
+dumps prompt-end activations. Goldens:
+`radix/crates/faber-prefill-oracle/testdata/gi2-2-op-goldens/`
+(`rms_norm.json` / `dense.json`; pinned pos 8 / token 2767 / window 0).
+
+Model-shape check (GGUF KV + exemplum `DenseConfig`): SmolLM2-360M-Instruct
+(not 135M). `llama.block_count=32`, `llama.embedding_length=960`,
+`llama.attention.head_count=15`, `head_count_kv=5`,
+`llama.vocab_size=49152`, `llama.rope.freq_base=100000`,
+`llama.attention.layer_norm_rms_epsilon=1e-5`. Admit: version=3,
+data=1787040, tensors=290, architecture=llama. SHA-256
+`2fa3f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2`.
+
+```text
+stored_embed_shape=[960,49152]
+transposed_embed_shape=[49152,960]
+```
+
+| probe | vs GI2-2 | max_delta | n > 1e-6 |
+| --- | --- | --- | --- |
+| raw token-major `data[2767*960 : +960]` | `rms_norm` input `x` | 7.4e-9 | 0 / 960 |
+| **forward gather after `_transpose`** | **`rms_norm` input `x`** | **0.483** | **960 / 960** |
+| `blk.0.attn_norm.weight` | `rms_norm` input `weight` | 5e-9 | 0 / 960 |
+| `nn.rmsnorm(gathered)` pos 8 | `rms_norm` expected `y` | 1.314 | 959 / 960 |
+| `nn.linear` Q head-0 pos 8 | `dense` expected `y` | 1.076 | 64 / 64 |
+
+First four (raw matches golden `x`; gather matches the independent wrong
+`[D, V]` row-major read):
+
+```text
+golden x / raw:  -0.09676552 -0.091389656  0.103933334  0.001791954
+gathered pos8:   -0.07588482 -0.022281647  0.060310364  0.03855896
+```
+
+**First diverging layer + op:** layer 0 / embedding gather
+(`gradus:model/dense` `_transpose` + `_collect`), before `rms_norm`.
+**Class:** wiring bug (stored-layout / transpose). Not emit. Not
+comparison (ids, position, non-EOG filter).
+
+Command:
+
+```text
+.../dense-prefill-smollm2 \
+  /Users/ianzepp/ai/models/SmolLM2-360M-Instruct-Q4_K_M.gguf \
+  1787040 \
+  2fa3f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2 \
+  trace
+```
+
+83.6s real, ~1.7 GiB RSS, exit 0. Numerics were not tuned. TARGETLANE001
+was not weakened.
+
+## Prior receipt (GATE 10 / dfa4fce) — oracle reached, not localized
+
+**Verdict: ORACLE REACHED — PREFILL FAIL (first-divergence top-1).** GATE 10
+(handle `6c0fc2cb` / packet `test-1`) at radix `693d74e3e` (carries
+`234d44edf` / `1bc63c590` borrow field access + lazy ranges, plus the
+kernel batches). Hosts `a6c8129` (64 MiB `solum` range cap). Packet
+`faber` rebuilt green. Both exempla rebuilt + executed. Generated
+`_transpose` now borrows `t.data` (no per-element `t.data.clone()`). The
+printed binary passed `solum.read_range` of the 1_787_040-byte table
+prefix, admitted the GGUF, matched the pinned tokenizer ids, loaded all
+32 layers, printed `forward start T=9`, and returned
+`forward done shape=[9,49152]`. gi0 at prompt-end / position 0:
+`all_finite=true`, observed top-1 `40983` vs golden `30`, top-5 overlap
+`0/5`. `first_divergence=position 0: top-1 40983 vs golden 30`.
+`PREFILL: FAIL`. Exit 0. Numerics were not tuned. TARGETLANE001 was not
+weakened (`[build] target` is still `"fmir"`).
 
 ## Comparison policy (intended)
 
