@@ -23,7 +23,7 @@ and U1.4 (multi-head GQA attention) rows:
 4. **post-attn RMSNorm** — `ln2 = rmsnorm(r1, ln2_s, ε)` (U1.1);
 5. **SwiGLU MLP** — `h = swiglu(linear(ln2, wg, bg), linear(ln2, wu, bu),
    wd, bd)` — `silu(gate) ⊙ up → linear(down)` (U1.2);
-6. **residual** — `r2 = ln2 + h` — the block output `[T, D]`.
+6. **residual** — `r2 = r1 + h` — the block output `[T, D]`.
 
 No fixed-shape constants: every shape derives from the runtime tensors and
 the head counts (num_heads, num_kv_heads, head_dim from the q width, the
@@ -35,7 +35,7 @@ row (the composed rows' contract).
 One synthetic dim config is pinned to independent f64 reference values
 (external Python/numpy evaluation of the documented block formulas — the
 PML3 `transformer_block` pin precedent — with the corrected U1.4
-O-projection `concat · wo`). No GI2-2 golden exists for this synthetic
+O-projection `concat · wo`, residual-2 `r1 + h`). No GI2-2 golden exists for this synthetic
 draw. Compared within the documented 5e-4 absolute tolerance:
 
 - `T=2, D=16, F=16` (MLP hidden), `num_heads=4, num_kv_heads=2`,
