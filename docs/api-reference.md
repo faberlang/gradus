@@ -475,7 +475,7 @@ Ordered dense-model forward assembly over canonical architecture descriptors and
 
 REF-01-U1.9 consumer: `exempla/dense-prefill-smollm2` (SmolLM2-360M real-file prefill through this `forward`). Compiled rust receipt is **not** recorded: FINAL at radix `2ed9914e4` / faber `b1adfc9` rebuilt packet `faber` (CODEGEN001/E0432/PKG001 `processus:exi` cleared), then rustc failed the emitted crate (258 errors; first: `cast cannot be followed by a method call` at `src/main.rs:766`). See the exemplum README.
 
-REF-01-U1.10 consumer: `exempla/dense-prefill-qwen2` (Qwen2.5-0.5B real-file prefill through this `forward`). Compiled rust receipt is **not** recorded: resume-2 at radix `3853d4b8f` rebuilds packet `faber` (E0432 closed) then stops `PKG001:host_provider_selection_invalid` (`processus:exi` missing from the hosts processus manifest). No binary, no logits. Prior stops: E0432 at `b919052f0`; `CODEGEN001` in `dense_qwen2.fab` (definition id 4127). See the exemplum README.
+REF-01-U1.10 consumer: `exempla/dense-prefill-qwen2` (Qwen2.5-0.5B real-file prefill through this `forward`). Compiled rust receipt is **not** recorded: FINAL at radix `2ed9914e4` rebuilt packet `faber` (PKG001 `processus:exi` closed) then `faber build --target rust` emitted a crate and cargo failed rustc 248 errors (first `E0015` const `vec!` for `PINNED_TOKENS`). No binary, no logits. Prior stops: PKG001 at `3853d4b8f`; E0432 at `b919052f0`; `CODEGEN001` in `dense_qwen2.fab` (definition id 4127). See the exemplum README.
 
 
 ## gradus:model/dense_llama
