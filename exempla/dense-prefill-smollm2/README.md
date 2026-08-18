@@ -3,10 +3,22 @@
 Consumer for the U1.8 dense forward graph against the pinned SmolLM2-360M
 row on the **compiled rust** receipt tier. This README is the unit receipt.
 
-**Verdict: LOCALIZED — wiring, layer 0 embedding gather (`dense.forward`
-`_transpose`).** Handle `5830c444` / packet `hand-12`. GATE 10 (receipt
-`dfa4fce`) reached gi0 and failed top-1 `40983` vs golden `30`. This unit
-does not fix. It names the first GI2-2 divergence and stops.
+**Verdict: FIXED — gather reads the ggml token-major buffer (no transpose).**
+Handle `21b59246` / packet `hand-12`. `dense.forward` now reinterprets
+stored `[D, V]` as token-major `[V, D]` without permuting data and gathers
+at `[token * D + d]`. A tied `lm_head` transposes that view into true
+row-major `[D, V]` for the output linear. U1.10 shares this function
+(Qwen `[896, 151936]` embed, same descriptor pattern) — one fix covers both.
+
+Oracle (compiled rust `trace`, 88.3s): gather vs GI2-2 `rms_norm.x` at
+pos 8 / token 2767 is `max_delta = 7.4e-9` (0 / 960 above `1e-6`).
+`nn.rmsnorm` of that gather now matches GI2-2 `rms_norm.y` at
+`9.2e-8`. Next divergence is layer-0 Q `nn.linear` vs GI2-2 `dense.y`
+(`max_delta = 1.24`, 64 / 64). Full prefill binary re-run is the next gate.
+
+Prior diagnosis (handle `5830c444`) localized the first GI2-2 divergence to
+this wiring. GATE 10 (receipt `dfa4fce`) had reached gi0 and failed top-1
+`40983` vs golden `30`.
 
 The compiled stored view of `token_embd.weight` is already the ggml-order
 Q8_0 buffer (dim0 = 960 innermost = token-major `[V, D]` linearized).
