@@ -1635,8 +1635,240 @@ goes through the explicit reviewable-change door (`plan.rs:44-50`); F16
 per-expert formats ride W1 admission; residency default preserves today's
 behavior byte-for-byte.
 
+### 16.6 Re-evaluation — DeepSeek-V4-Flash-0731 as the local-viability model (operator instruction; replaces Kimi K2 as the evaluation case)
+
+**Status**: DRAFT (uncommitted working-tree edit on committed §16 @ `5b46a77`;
+mind routes the commit)
+**Author**: head-cto (Vivi handle `d68a0ac4`), 2026-08-18
+**Ask**: operator — re-run the §16 Part-3 local-viability analysis with
+**DeepSeek-V4-Flash-0731** replacing Kimi K2: it is the natural local-running
+target, the model someone actually deploys on a MacBook. §16.3's K2 analysis
+stands unamended as the 1T *ceiling* case; this section is the deployment-class
+case and supersedes K2 (and the §16.3 closing note's Qwen3-235B-A22B) as the
+named W5c evaluation model.
+**Evidence pins**: all public-model numbers web-verified 2026-08-18 (wv) from
+first-hand fetches: HF card `deepseek-ai/DeepSeek-V4-Flash-0731` + its
+`config.json`, HF card `deepseek-ai/DeepSeek-V4-Flash` (collection table),
+tech report arXiv:2606.19348 (abstract), Unsloth guide
+`unsloth.ai/docs/models/deepseek-v4` (quant table, measured), antirez/ds4
+README (`github.com/antirez/ds4`, M5 Max benchmarks, streaming design).
+Hardware frame reused from §16.3 (M5 Max: 614 GB/s unified, ≈13.6 GB/s SSD).
+Every number below is tagged **(wv)** fetched, **(derived)** arithmetic from
+verified config, or **(inferred)** reasoned-but-not-directly-verified.
+
+#### 16.6.0 What changed with this model
+
+The operator's premise is itself verified: v4-flash-0731 is not a hypothetical
+local target. A dedicated native engine exists for exactly it — ds4
+("DwarfStar", antirez): "optimized first for DeepSeek V4 Flash… Metal, the
+primary target, on Macs with 96 GB or more. Smaller machines can use SSD
+streaming" (wv, ds4 README) — and Unsloth ships Mac-targeted dynamic GGUFs
+with a hardware table starting at 92 GB total memory (wv, Unsloth guide).
+§16.3's K2 question ("does a frontier MoE fit at all?") becomes three live
+regimes on the same §2 bar machine class: **resident**, **boundary**, and
+**streaming** — with a published measured reference on the exact M5 Max 128 GB
+hardware (§16.6.2).
+
+#### 16.6.1 Architecture facts — verified vs derived vs inferred
+
+| Fact | Value | Status / source |
+| --- | --- | --- |
+| Total params | **284B** core model; 0731 repo reports 304B safetensors **including** the attached DSpark speculative module (preview+DSpark repo: 291B) | wv: V4-Flash card collection table; 0731 card; HF repo counters. DSpark mass unresolved beyond the 5.6 GiB support GGUF (wv, ds4) — **inferred** ≈7–20B |
+| Active params/token | **13B** (card) | wv; **derived** cross-check: 6×25.17M×43 (routed) + 1.08B (shared) + ~4.5B (attn+indexer) ≈ 12.1–12.6B ✓ |
+| Layers | **43**, all MoE — **derived**: routed mass 43×6.4425B = 277.0B and 284−277.0 = 7.0B non-routed close the identity exactly; any dense-FFN layer would break it by ~6.2B. (V3's first-k-dense pattern is gone.) | config `num_hidden_layers: 43` (wv); mix derived |
+| Routed experts / layer | **256**, each 3 matrices × 4096 × 2048 = 25.17M elems (≈13.4 MB @ MXFP4, 7.1 MB @ 2.25 bpw) | wv config; sizes derived |
+| Top-k | **6** (`num_experts_per_tok`), `norm_topk_prob`, `routed_scaling_factor` 1.5 — selectivity 2.34% of experts/token/layer | wv config |
+| Shared expert | **1**, intermediate 2048 (same size as one routed expert) — 1.08B elems total ≈ 1.15 GB @Q8_0 | wv config; bytes derived |
+| Router | `ffn_gate_inp`-class [4096×256] F32 per layer ≈ 45M elems, 0.18 GB/token read; scoring `sqrtsoftplus`, `topk_method noaux_tc` (V3 aux-loss-free lineage) | wv config; bytes derived |
+| Expert storage | **native MXFP4** (`expert_dtype: fp4`); model is quantization-aware-trained; Unsloth repack is bit-identical (1,328 tensors, 0% weight error, KLD ~0); everything else FP8/BF16 (block 128×128, ue8m0 scales) | wv config + Unsloth quant analysis |
+| Attention | **MLA-descendant, not plain GQA/MLA**: `q_lora_rank` 1024, `o_lora_rank` 1024, `o_groups` 8, 64 heads, `head_dim` 512, `qk_rope_head_dim` 64, **`num_key_value_heads: 1`** | wv config |
+| KV compression (HCA) | per-layer `compress_ratios`: **19 layers ×4, 18 layers ×128, 5 uncompressed** (2 head + 3 tail) — array has 42 entries vs 43 layers; the untyped layer and the semantics of `num_hash_layers: 3` are **not public beyond the config keys** (honest catch) | wv config; per-tier census derived |
+| Sparse selection (CSA) | indexer: 64 heads × 128 dims, **top-512** token selection (`index_topk`), `sliding_window` 128 raw window | wv config |
+| Residual stream | mHC hyper-connections, **4 streams** (`hc_mult` 4, sinkhorn iters 20) | wv config |
+| Context | **1,048,576** (yarn ×16 from 65536) | wv config + card |
+| Speculative | **DSpark** in-checkpoint (block 5, markov_rank 256, targets layers 40–42); support GGUF 5.6 GiB; measured 1.5–1.9× local in llama.cpp, up to 2× / 120 t/s on B200 | wv config, ds4, Unsloth |
+| Vocab / lm_head | 129,280; untied — 529.5M elems ≈ 0.56 GB @Q8_0 full read per token | wv config; bytes derived |
+| Released quantizations (measured GB) | official MXFP4/FP8 **156.4**; Unsloth UD-Q8_K_XL **161.9** (lossless), UD-Q4_K_XL **155.1** (experts stay MXFP4), UD-IQ3_XXS **103** (recommended 128 GB tier); antirez Q4KExperts-F16 **164.6**, mixed L37-42-Q4K **97.6**, IQ2XXS **86.7**; ds4 2-bit routed (up/gate IQ2_XXS + down Q2_K) **81**; DSpark support +~10 GB headroom | wv Unsloth table + ds4 README |
+
+**Derived byte cross-checks** (all hang together): MXFP4 4.25 bpw × 277.0B
+elems = 147.2 GB + ~7.3 GB FP8 non-expert ≈ 154.5 ≈ official 156.4 (wv);
+2.25 bpw avg (2×2.0625 + 2.625)/3 × 277.0B = 77.9 GB + Q8 floor ≈ 85 ≈
+measured 81–86.7 (wv). Routed experts are 277.0/284 = **97.5% of the model**
+(derived; Unsloth's "~96%" agrees within rounding).
+
+#### 16.6.2 Working-set arithmetic (hardware frame stated)
+
+Same frame as §16.3: **burgus-class M5 Max, 128 GB unified, 614 GB/s
+nominal, internal SSD ≈13.6 GB/s** (§16.3 pins). Nominal-bandwidth rooflines
+are ceilings, not targets — sustained achievable is ~70–80% of nominal
+(inferred); every regime below is paired with a **measured** reference where
+one exists.
+
+**Resident floor (never streamable), Q8-attn/Q8-shared/Q8-out class with F16
+compressor/indexer (ds4's own mix, wv tensor naming):**
+
+| Mass | Bytes | Read/token |
+| --- | ---: | ---: |
+| Attention + indexer + compressor (≈4.5–5B elems, **inferred** from config dims; exact inventory not public) | ≈4.8–5.5 GB | same (GEMV reads all) |
+| Shared experts @Q8_0 | 1.15 GB | 1.15 GB |
+| lm_head @Q8_0 (vocab 129,280) | 0.56 GB | **0.56 GB — full read/token** |
+| Routers F32 | 0.18 GB | 0.18 GB |
+| Embedding | 0.56 GB | ~4 KB (row gather) |
+| **Floor read/token** | — | **≈7 GB** |
+| KV (this arch): **26 GB @1M ctx measured** (indexer ≈22 GB of it) | 26 GB | scales ~linearly (inferred): ≈0.8 GB @32k, 2.6 @100k, 7.8 @300k |
+
+**Fit on 128 GB:** 2-bit routed (78 GB experts) + ~7.4 GB floor + KV fits
+resident — **≈90–95 GB @100k ctx** (derived), proven by ds4 running it. 3-bit
+(103 GB) is the boundary tier (Unsloth: ≥110 GB total; 300k ctx ≈118 GB —
+tight). MXFP4 (147 GB experts) and Q8 (162 GB) **do not fit** — that is the
+streaming tier, exactly like Unsloth's ≥169 GB line (wv).
+
+**Per-token expert stream (top-6 × 43 layers = 6.49B elems/token):**
+**3.45 GB** @MXFP4, **1.83 GB** @2.25 bpw, 3.65 GB @Q4_K-experts. (K2 was
+11.9 GB @Q4 — this model streams 3.3–6.5× less per token; expert mass is
+571→147/78 GB.)
+
+**Regimes (per-token time, M5 Max):**
+
+| Regime | Arithmetic | tok/s |
+| --- | --- | ---: |
+| Resident 2-bit — roofline | (7.0+1.83) GB ÷ 614 GB/s = 14.4 ms | **~70 ceiling** |
+| Resident 2-bit — **measured** (ds4, q2, M5 Max 128 GB) | 39.35 t/s @2k, 36.14 @16k, 34.36 @32k, 27.64 @64k ctx | **39.4–27.6 real** |
+| Pure streaming MXFP4 | 7.0÷614 + 3.45÷13.6 = 11.4 + 253.7 ms | **3.8** |
+| Hot-set p=0.90 @MXFP4 | 11.4 + 5.1 + 25.4 ms | 23.9 |
+| Hot-set p=0.99 @MXFP4 | 11.4 + 5.6 + 2.5 ms | 51.3 |
+| Pure streaming 2-bit | 11.4 + 134.6 ms | 6.9 |
+| Hot-set p=0.90 @2-bit | 11.4 + 2.7 + 13.5 ms | 36.3 (≈ resident) |
+
+The measured engine runs at ~57% of the nominal roofline; the gap is
+attributable (inferred) to mHC's 4-stream residual traffic, the
+indexer+compressor passes, launch overheads (§15 M9/M10), and sub-nominal
+sustained bandwidth. Roofline ≠ acceptance bar.
+
+**Hot-set solve (the GB question).** For 20 t/s (50 ms budget): MXFP4
+streaming needs hit rate **p ≥ 0.87**; 2-bit needs **p ≥ 0.73**. For 30 t/s:
+p ≥ 0.93 (MXFP4) / 0.86 (2-bit). Cache GB = p only if routing is
+concentrated: at 32 GB of 78 GB 2-bit expert mass (41% of mass) the top-41%
+experts per layer must hold 73% of routing mass — a **1.8× concentration
+factor**; at 40 GB of 147 GB MXFP4 (27% mass) the required factor is 3.2×.
+V3-lineage `noaux_tc` keeps experts domain-specialized (§16.3's Fig-9
+evidence carries by family — inferred), and this model uses the same
+mechanism (wv config), but **the p(cache) curve for v4-flash-0731 is
+unmeasured anywhere public** — producing exactly that curve on a calibration
+corpus is W5c-U2's bake artifact, and it is the acceptance-band receipt, not
+a hope (§13.4 discipline). Each 1% of routing mass that misses costs ~2.5 ms
+@MXFP4 (~6% throughput at the p=0.9 point) — far gentler than K2's ~8.7
+ms/1% because the resident floor is a larger fraction of the token budget.
+
+**First-token latency shape.** Resident prefill is measured (ds4, q2):
+790 t/s @2k → 557 @32k → 398.5 @64k — a 2k prompt ≈ **2.6 s**, 25k ≈ 45 s,
+64k ≈ 165 s; prefill, not decode, dominates interactive first-token on long
+agentic prompts. Streaming adds a one-time expert-warmup pass ≈ expert mass ÷
+13.6 GB/s = **10.8 s** (MXFP4) / 5.7 s (2-bit), partially overlappable (ds4
+reserves two full routed layers for overlapped streaming prefill — wv), and
+practically mitigated by KV disk-cache prefix reuse (ds4 ships it) or a
+bake-time hot-set preload. Prefill routing diversity still approaches the
+full expert union over long prompts (§16.3 catch 1, unchanged).
+
+#### 16.6.3 The §16 knob set on this exact architecture
+
+1. **Shared experts always-resident** — unchanged, and the market converged
+   on our default: ds4/antirez 2-bit quants quantize *only* routed experts
+   and leave "shared experts, projections, routing… untouched" (wv). Our
+   `Resident` tier default is byte-identical in spirit; 1.15 GB/token floor.
+2. **Hot-expert admission at 256 experts, top-6** — same machinery as §16.2,
+   finer grain: per-expert byte quantum 13.4 MB (MXFP4) / 7.1 MB (2-bit);
+   97.7% of expert mass is cold. Router is trivially resident (0.18 GB,
+   F32); `sqrtsoftplus` + `noaux_tc` stats accumulate exactly like the W5c-U2
+   bake design.
+3. **Per-expert format mix — with a real catch.** The quality/size frontier
+   is now *published calibration*: MXFP4 experts are bit-identical (0% error,
+   KLD ~0); requantizing experts to Q4_K costs 5.2% RMSE / KLD 0.029; 2-bit
+   (IQ2_XXS/Q2_K routed-only, imatrix) costs 22% weight error / KLD 0.42 /
+   PPL 4.5319→6.15 / 77.9% same-top-token (all wv, Unsloth measured table).
+   **MXFP4 is not in our closed storage set** (`PackedStorageLayout` =
+   {F32, Bf16, Q8_0, Q4_K, Q5_K, Q6_K, Q5_0}, §3.1) — the natural target's
+   native expert format is outside our admitted set. Amendment need #1.
+4. **KV/attention — the KV-slimming story changes materially.** This is not
+   plain MLA: an MLA-descendant projection stack (q/o LoRA 1024, one 512-dim
+   KV latent + 64 rope) plus *trained* per-layer KV compression (HCA tiers
+   4×/128×) plus sparse top-512 selection (CSA indexer) plus a 128-token raw
+   window. For KVStructure (§4.3): **(a)** KV slimness is now architectural
+   and *per-layer heterogeneous* — the abstraction needs per-layer cache
+   classes (raw-window / compressed-4× / compressed-128× / indexer), not one
+   per-model KV dtype; **(b)** the dominant long-context KV mass is the
+   **indexer cache (~22 GB of 26 GB @1M, measured)** — a mass K2/V3-family
+   MLA models do not have; if the indexer is not its own partition class,
+   long-context accounting is simply wrong (sharpens W5c-U4); **(c)** the
+   inference-side KV dials survive but multiply per class — vLLM's official
+   recipe ships `--kv-cache-dtype fp8` *and* `use_fp4_indexer_cache` (wv,
+   0731 card); **(d)** the tech report's 10%-of-V3.2-KV @1M claim (Pro,
+   wv abstract) is the class evidence. The §4.3 tripartite
+   semantic→plan→physical split survives; its class inventory does not.
+5. **mHC (4 residual streams)** — activation traffic and state ×4 in the
+   residual path; rooflines and §15 M9/M10 launch work should account it
+   (inferred attribution for the 70→39 roofline gap).
+6. **DSpark** — a trained draft artifact shipped *in* the checkpoint, 1.5–1.9×
+   measured locally (wv). Maps onto §15.3's loadable-artifact story; composes
+   with W5c, not part of it.
+7. **Honest competitive catch.** §16.2's "llama.cpp has no seam for hot-set"
+   is now incomplete *for this model*: ds4 ships `--ssd-streaming` with a
+   runtime routed-expert cache (`--ssd-streaming-cache-experts 32GB`), a
+   hot-expert preload list (`ds4_streaming_hotlist.inc`,
+   `--ssd-streaming-preload-experts N`), and overlapped streaming prefill
+   (wv, ds4 README). Our differentiation is the **declarative discipline** —
+   bake-time hot-set manifests with acceptance bands, provenance digests,
+   per-expert format mix, partition admission proofs — not the existence of
+   an expert cache. W5c's value claim should be restated against ds4, not
+   only llama.cpp.
+
+#### 16.6.4 Verdict + first-rung acceptance band
+
+**Yes — v4-flash-0731 is the right FIRST target for W5c**, and a better one
+than both prior candidates: (1) unlike K2 it has live regimes on the §2 bar
+machine class with a published measured reference on the exact hardware
+(M5 Max 128 GB: 39.35 t/s decode, 790 t/s prefill, wv ds4); (2) unlike
+gpt-oss-120b (§16.3's fits-resident case) it exercises *all* of §16's
+machinery — shared expert, streaming tier, hot-set admission, per-expert
+formats — at 284B scale; (3) its quality/size frontier is measured, so
+acceptance bands have ground truth; (4) the expert mechanics are the same
+kind as §16's design (256×3 rank-3 tensors per layer), so W5c-U1..U6 keep
+their shape. **Sequencing**: the admitted Qwen3.6-35B-A3B rung (§16.1)
+remains the machinery-proving rung — v4-flash-0731 is the W5c *target*
+after that rung lands ExpertPlan; `deepseek_v4` model-config admission is
+the named producer fact.
+
+**First-rung acceptance band (v4-flash-0731, M5 Max 128 GB, 2-bit routed
+quant class):**
+
+| Axis | Band | Anchor |
+| --- | --- | --- |
+| Decode @32k ctx | floor **20 t/s**, parity **34 t/s**, stretch 39+ | ds4 measured 34.36 @32k; roofline ~70 stated as ceiling-not-target |
+| Prefill | ≥600 t/s @2k, ≥300 t/s @64k | ds4 measured 790 / 398.5 |
+| Quality | bands recorded vs the **declared quant baseline** (2-bit routed = PPL 6.15 / KLD 0.42 vs official; MXFP4 = bit-identical), never vs FP16; hot-set manifests carry the corpus-shift band (§13.4) | Unsloth measured table (wv) |
+| Residency | resident-default byte accounting identity unchanged (W5c-U4 negative); streaming only where an ExpertPlan declares + partition proves budget | §16.2-1 |
+| Hot-set | the p(cache) curve is the rung's deliverable artifact with digest, not a throughput claim | §16.6.2 solve |
+
+#### 16.6.5 Amendment needs (routed to mind with this report)
+
+1. **NEED — contract**: admit **MXFP4** into `PackedStorageLayout`
+   (`radix/crates/radix-mir/src/abi/contract.rs:162-192`) or declare an
+   explicit expert-requant band policy. Blocks per-expert format mix on the
+   natural target; machinery provable on existing formats meanwhile. This is
+   a hosts/radix contract widening, same class as §12-9.
+2. **NEED — design**: §4.3 KVStructure class inventory extension — per-layer
+   heterogeneous KV (raw window / compressed-4× / compressed-128× /
+   **indexer**) + per-class format dials (incl. FP4 indexer cache); W5c-U4's
+   partition ledger gains the indexer cache as a budget class (~22 GB @1M,
+   measured). Not a GI4 KV revision; new classes beside the existing ones.
+3. **NOTE**: mHC 4-stream residual traffic belongs in §15.0/M9–M10 rooflines.
+4. **NOTE**: DSpark draft = §15.3 loadable artifact; composes, no new W5c row.
+5. **NOTE**: §16.2's competitive framing should name ds4's runtime streaming
+   hotlist; our claim is declarative bake/band/provenance, not cache
+   existence.
+
 ---
 
 *Addendum 4 ends. §13 (`c7174a33`), §14 (`cbea0c29`), and §15 (`1f58bbbc`)
-untouched above. This section is head-cto `d19f84dc`'s only working-tree
-edit; mind routes the commit.*
+untouched above. §16 body committed at `5b46a77`; §16.6 is head-cto
+`d68a0ac4`'s working-tree edit on top — mind routes the commit.*
