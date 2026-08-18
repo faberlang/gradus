@@ -3,9 +3,10 @@
 Consumer for the U1.8 dense forward graph against the pinned SmolLM2-360M
 row on the **compiled rust** receipt tier. This README is the unit receipt.
 
-**Verdict: STOP — not executed.** The compiled-route emit failed with an
-unknown codegen diagnostic. Per the unit stop rule that diagnostic is
-recorded exactly and is not chased.
+**Verdict: STOP — not executed.** Resume at radix `b919052f0` (CODEGEN001
+union-variant DefId registration, `d66e1f93e`) could not produce a packet
+faber binary. The new diagnostic is recorded exactly and is not chased.
+TARGETLANE001 was not weakened (`faber.toml` still `target = "fmir"`).
 
 ## Comparison policy (intended)
 
@@ -18,67 +19,70 @@ recorded exactly and is not chased.
   golden top-1 non-EOG `30`, golden top-5 `[30, 28, 1270, 365, 198]`).
 - Engine: `faber build --target rust` then execute the printed binary.
   MIR stepper is not the receipt-tier engine. llvm-host is the documented
-  fallback and was not chased after CODEGEN001.
+  fallback and was not chased: no packet faber exists at this revision.
 
 ## Command (from the Hand packet)
 
 ```text
+cd /Users/ianzepp/work/faberlang/worktrees/hand-12/radix
+cargo build -p faber
+```
+
+Intended follow-on (not reached):
+
+```text
 cd /Users/ianzepp/work/faberlang/worktrees/hand-12/gradus
 env FABER_SUPPORT_PATH_OVERRIDE=/Users/ianzepp/work/faberlang \
-  FABER_LIBRARY_HOME=/Users/ianzepp/work/faberlang \
+  FABER_LIBRARY_HOME=/Users/ianzepp/work/faberlang/worktrees/hand-12 \
   /Users/ianzepp/work/faberlang/worktrees/hand-12/radix/target/debug/faber \
   build --target rust exempla/dense-prefill-smollm2
 ```
 
-`FABER_LIBRARY_HOME` is the workspace root (not the packet root) because
-the packet has no `norma/` member and this consumer needs `norma:solum` /
-`norma:processus` to own the file adapter. Packet `gradus` src at this
-refresh equals workspace `gradus` (`5bf3c04`).
+## Observed packet faber rebuild (2026-08-17 resume)
 
-## Observed emit (2026-08-17)
-
-`faber check exempla/dense-prefill-smollm2` exits 0.
-
-`faber build --target rust` exits 1. Exact diagnostics:
+`cargo build -p faber` at readable radix `b919052f0` exits 101. Exact
+diagnostic (captured twice; same text):
 
 ```text
-error[CODEGEN001]: exempla/dense-prefill-smollm2/src/main.fab: code generation failed: internal: definition id 4200 could not be resolved during code generation
-error[CODEGEN001]: /Users/ianzepp/work/faberlang/gradus/src/model/tensor_view.fab: code generation failed: internal: definition id 4131 could not be resolved during code generation
-compilation failed
+error[E0432]: unresolved import `faber_hir_rust::ImportedEnumVariantInfo`
+  --> crates/radix-program/src/rust_target.rs:17:76
+   |
+17 |     remap_function_param_info, remap_type_id_with_nominal_defs, FxHashMap, ImportedEnumVariantInfo,
+   |                                                                            ^^^^^^^^^^^^^^^^^^^^^^^ no `ImportedEnumVariantInfo` in the root
+
+error: could not compile `radix-program` (lib) due to 1 previous error
 ```
 
-First emit (consumer imported `gradus:model/dense_llama`) failed with the
-same CODEGEN001 class on `dense_llama.fab` definition id 4111. The adapter
-import was removed and the frozen llama GGUF-name map inlined in the
-consumer. The retry failed on `tensor_view.fab` as above. No further
-reduction: the U1.8 receipt needs windowed materialization.
+Recorded source facts (readable tree only; not patched):
 
-No binary was printed. The GGUF file was not executed. No logits, no
-first-divergence field, no Metal/CUDA or payload-residency claim.
+- `d66e1f93e` uses `faber_hir_rust::ImportedEnumVariantInfo` in
+  `crates/radix-program/src/rust_target.rs`.
+- The type lives in `crates/radix-hir-rust/src/import_params.rs` and is
+  re-exported from `radix-hir-rust`.
+- `crates/radix-module/src/codegen/rust/mod.rs` re-exports
+  `ImportedEnumVariantExport` and does **not** re-export
+  `ImportedEnumVariantInfo`.
+- `crates/faber-hir-rust/src/lib.rs` was not touched by `d66e1f93e` and
+  does **not** re-export `ImportedEnumVariantInfo`.
+
+The prior EXEC-02 non-exhaustive `MirCollectionOp` match-arm residual did
+**not** reproduce at this revision. The prior CODEGEN001 (`tensor_view.fab`
+definition id 4131 / 4200) was **not** re-exercised: no new faber binary
+exists to emit rust. The stale packet binary (mtime 2026-08-17 19:39,
+built at `7863624e2`) was not used.
+
+No rust binary was printed. The GGUF file was not executed. No logits, no
+observed token ids, no first-divergence field, no Metal/CUDA or
+payload-residency claim.
 
 ## Revisions
 
 | Surface | Revision |
 | --- | --- |
-| packet gradus | `5bf3c04` (`factory/hand-12`) |
-| packet radix (readable) | `7863624e2` |
-| faber binary used | packet `target/debug/faber` 1.7.0 (mtime 2026-08-17 19:39) |
+| packet gradus | `57404ea` (`factory/hand-12`) |
+| packet radix (readable) | `b919052f0` (includes `d66e1f93e`) |
+| faber binary used | none — `cargo build -p faber` failed |
 | workspace faber/hosts | not written |
-
-## Packet faber rebuild residual
-
-`cd radix && cargo build -p faber` (default `full-targets`) failed on
-pre-existing unread EXEC-02 match arms in readable radix. Exact class:
-
-```text
-error[E0004]: non-exhaustive patterns: `MirCollectionOp::TensorQuantizedMatMul`,
-`TensorGroupedMatMul`, `TensorSsmConv1d`, `TensorSsmScan`
-```
-
-in `radix-mir-wasm`, `radix-air`, `radix-mir-runner`. Feature-limited
-`--no-default-features --features hir-rust` still pulled `radix-mir-runner`
-and failed the same way. Radix is readable-only in this packet; those
-arms were not patched. TARGETLANE001 was not touched.
 
 ## Model identity (not executed)
 
@@ -92,11 +96,14 @@ arms were not patched. TARGETLANE001 was not touched.
 | prompt | `The quick brown fox jumps over the lazy dog` |
 | prompt tokens | `[504, 2365, 6354, 16438, 27003, 690, 260, 23790, 2767]` |
 
-Hardware/OS/backend for an executed run would have been CPU/reference.
-No run occurred.
+Hardware/OS for an executed run would have been CPU/reference on
+`Darwin burgus.local 25.5.0 arm64` (`RELEASE_ARM64_T6050`). No run
+occurred.
 
 ## Evidence boundary
 
 This is a compiled-route **stop receipt**, not a prefill-logit pass.
-Repair belongs to rust codegen of `gradus:model/tensor_view` (and
-`dense_llama` on the first emit), not to this consumer.
+Repair belongs to the radix rust-emit façade (`faber-hir-rust` /
+`radix-module` re-export of `ImportedEnumVariantInfo` so `radix-program`
+can build at `b919052f0`), not to this consumer. Radix is readable-only
+in this packet; the import was not patched.
