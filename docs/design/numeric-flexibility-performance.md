@@ -1,6 +1,6 @@
 # Gradus numeric flexibility + performance architecture — the llama.cpp-parity bar
 
-**Status**: DRAFT (uncommitted; mind routes the commit)
+**Status**: committed `4004e32`; GI4 dtype amendment operator-accepted 2026-08-18 (need `1d3967ed`)
 **Author**: head-cto (Vivi handle `904d57dd`)
 **Date**: 2026-08-18
 **Operator bar**: "The stated goal is to run Qwen, but the real goal is to run Qwen AT
@@ -188,8 +188,10 @@ exactly — a `NativeF16Convert` class, not a new algorithm family.
   `layers` is an identity field, not storage shape).
 - **Radix/Hosts**: physical KV is frozen as GI4's `KvCacheLayout` — five facts
   (`slots, context_length, layer_count, kv_head_count, head_dim`) plus `dtype`
-  (closed **f32** for GI4) and `reserve_policy`; byte accounting single-sourced
-  (`gi4-contract.md:93-108`; `hosts/…/partition.rs:119-122`).
+  (opened **`{F32, F16, Q8_0, Q4_K}`**, F16 default — operator-accepted
+  2026-08-18, need `1d3967ed`; revision record
+  `docs/design/gi4-contract.md`) and `reserve_policy`; byte accounting
+  single-sourced (`gi4-contract.md:93-108`; `hosts/…/partition.rs:119-122`).
 - **Attention compute**: `CausalMaskedSoftmax` recipe materializes the score
   matrix then row-softmaxes (`plan.rs:93-96,217+`). No flash-attention recipe
   exists.
@@ -259,8 +261,9 @@ Knob set (each has default + cost in §7):
 **Locked-contract constraints honored**: `KvCacheLayout` five facts stay; the
 `dtype` field opening from closed-f32 to `{F32, F16, Q8_0, Q4_K}` is a **GI4
 contract revision** — the freeze itself says "a dtype change is a contract
-revision, never a silent widening" (`gi4-contract.md:105-106`). Amendment need
-filed (§9). Context-shift on quantized K requires dequant→rotate→requant
+revision, never a silent widening" (`gi4-contract.md:105-106`). Operator
+accepted 2026-08-18 (need `1d3967ed`); revision record
+`docs/design/gi4-contract.md`. Context-shift on quantized K requires dequant→rotate→requant
 (lessons §12.4, `:759-777`); we keep the lessons' guidance — prefer explicit
 stop-at-capacity over a generic shift until a shift policy is measured.
 
@@ -424,8 +427,9 @@ run — `benchmark-method.md` + lessons §2.2 evidence labels).
    (MMVQ) kernel families selected by prompt-vs-decode shape (lessons §9.2).
    We have one `TiledMatMul`/`QuantizedMatMul` for both regimes.
 3. **Quantized KV + SWA + unified streams + paged cells** (§4.2) — we have
-   dense f32 append-only (`cache.fab`), physical layout frozen f32-closed
-   (`gi4-contract.md:105-106`).
+   dense f32 append-only (`cache.fab`) plus the W2-U1 `KVStructure`
+   descriptor; physical `KvCacheLayout.dtype` is opened to
+   `{F32, F16, Q8_0, Q4_K}` (`docs/design/gi4-contract.md`).
 4. **Graph reservation and reuse** — reserve prompt+decode graph shapes once,
    reuse across steps (lessons §10.1, `:565-581`). Ours is EXEC-03 (persistent
    prepared sessions) — pending, correctly sequenced after EXEC-02.
@@ -487,7 +491,7 @@ is in §10 wave 6. **No perf claim in this doc is evidence** — every gain in
 | GGUF-A7 "quantized means native"; declared-f32 is bring-up only | `gguf-a7-…-delivery.md:22-30` | **HONORED** |
 | OF operator boundary (compiler-internal fusion only) + schedule (OF-3..5 behind R-PACK-05) | `operation-fusion/goal.md:53-59` | **HONORED** — no wave touches backend emitters before R-PACK-05 |
 | Fragments rulings (manual annotation; inline guarantee, not perf claim) | `nucleum-fragments/goal.md:32-46` | **HONORED** — perf comes from kernels, not annotation |
-| GI4 `KvCacheLayout` dtype closed f32 | `gi4-contract.md:105-106` | **AMENDED — need to mind**: open dtype to `{F32, F16, Q8_0, Q4_K}` per §4.3; five facts + single byte authority unchanged |
+| GI4 `KvCacheLayout` dtype closed f32 | `gi4-contract.md:105-106` | **AMENDED — operator-accepted 2026-08-18, need `1d3967ed`**: dtype opened to `{F32, F16, Q8_0, Q4_K}`, F16 default; five facts + single byte authority unchanged. Revision record: `docs/design/gi4-contract.md` |
 | GI0 numeric contract (greedy top-1 exact, frozen envelope) | `gi0-numeric-contract.md`; exec02 decision 5 | **HONORED for unmodified execution**; layer-sliced runs need a **new acceptance policy — need to mind** (§5.2), never a silent weakening |
 | llama.cpp comparator-only, never in the execution path | exec02 decision 5 | **HONORED** — perf harness runs it offline as the reference bar |
 
@@ -556,8 +560,9 @@ OF-3..5, each with fail-closed negatives and a first failing oracle. Estimated
 
 ### 12. Open decisions routed to mind (with defaults)
 
-1. **GI4 KV-dtype amendment** (§9): open `KvCacheLayout.dtype` to
-   `{F32, F16, Q8_0, Q4_K}`. Default: F16. Cost: envelope derivations.
+1. **GI4 KV-dtype amendment** (§9): **settled 2026-08-18** — `KvCacheLayout.dtype`
+   opened to `{F32, F16, Q8_0, Q4_K}`, F16 default (need `1d3967ed`). Cost:
+   envelope derivations.
 2. **Layer-sliced acceptance policy** (§5.2): default = sliced runs carry their
    own recorded band (logit-band vs pinned sliced reference), never inheriting
    the GI0 exact-top-1 contract.
