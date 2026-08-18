@@ -9,7 +9,7 @@ One `.fab` file → one import path. Nested dirs for packages.
 
 ## Live modules (post-PML1–5 + correctness wave)
 
-The live tree has 33 modules and 750 declared functions. This post-S2
+The live tree has 34 modules (the W5d-U1 `gradus:calibration` bake added to the prior 33). This post-S2
 inventory is re-baselined from the final source tree after the English
 identifier clean break; it does not reuse the pre-S2 name map. The source
 surface includes the A1C capsule-schema-2.0.0 surface, LIB-02 tokenizer
@@ -53,6 +53,7 @@ evidence and boundaries are recorded in
 | `gradus:model/qwen35moe` | `src/model/qwen35moe.fab` | qwen35moe architecture admission: frozen config + canonical 753-tensor map + dimension/storage cross-reference validation + identity-precondition admission (MODEL-01, read through the `gguf_manifest` typed accessors) |
 | `gradus:tokenizer` | `src/tokenizer.fab` | Tokenizer identity + probe parity + `est_eog` (PML2/PML5) + artifact-backed byte-level BPE runtime with the composed qwen35 pre-tokenizer and special/EOG/BOS/chat policy surface (LIB-02-U2/U3; completion oracle pinned in `fixtures/tokenizer/pinned-probe-oracle.md`); capstone tokenizer phase run by `exempla/qwen36-35b-inference` (LIB-02-U4-1) |
 | `gradus:cache` | `src/cache.fab` | KV-cache values + mutation rules (PML5) |
+| `gradus:calibration` | `src/calibration.fab` | Residual-energy calibration bake (W5d-U1) — per-expert output-energy scores, K-recommendation curve, overlap census, 75e4ab98 provenance; measurement artifact, not a weight transform |
 | `gradus:decode` | `src/decode.fab` | Decode/prefill/session/cancel + replica loop (PML5) |
 | `gradus:sampling` | `src/sampling.fab` | Sampling pipeline: greedy + filters + draw (PML5) |
 | `gradus:generation` | `src/generation.fab` | Generation config + cursor (PML5) |
@@ -82,6 +83,7 @@ admission (specific)    architecture-specific admission over the
 PML2 Tokenizer identity gradus:tokenizer
 PML5 Inference          gradus:decode, gradus:cache, gradus:sampling,
                         gradus:generation
+W5d Calibration         gradus:calibration — residual-energy bake (W5d-U1)
 SC  Shared contracts    gradus:parameter, gradus:serialize
 ```
 

@@ -92,6 +92,80 @@ KV-cache values, mutation rules, cache identity, and identity serialization.
 - `fn deserialize_identity(string wire) → CacheIdentity ⇥ CacheError {`
 
 
+## gradus:calibration
+
+Expert residual-energy calibration bake (W5d-U1). Measurement artifact: per-expert unrepresentable-energy scores, fitted base-count/K curve, overlap census, and 75e4ab98 provenance-digest fields. Not a weight transform.
+
+**Source**: `src/calibration.fab`
+
+### Public types
+
+- `union CalibrationError` — EmptyCorpus, ZeroRouting, DigestMismatch, DigestMalformed, ThresholdInvalid, DimensionMismatch, ExpertRange, BasisInvalid, NonFinite, Invalid
+- `class RoutingActivation`
+  - fields: `int layer`, `int expert`, `f32 mass`, `list<f32> output`
+  - methods:
+    - `fn layer() → int {`
+    - `fn expert() → int {`
+    - `fn mass() → f32 {`
+    - `fn output() → list<f32> {`
+- `class CalibrationCorpus`
+  - fields: `list<RoutingActivation> activations`, `int layers`, `int experts`, `int dimension`
+  - methods:
+    - `fn activations() → list<RoutingActivation> {`
+    - `fn layers() → int {`
+    - `fn experts() → int {`
+    - `fn dimension() → int {`
+- `class ExpertEnergy`
+  - fields: `int layer`, `int expert`, `f32 residual`, `f32 mass`
+  - methods:
+    - `fn residual() → f32 {`
+- `class CurvePoint`
+  - fields: `int bases`, `int rank`, `f32 residual`
+  - methods:
+    - `fn bases() → int {`
+    - `fn rank() → int {`
+- `class SimilarityCell`
+  - fields: `int layer`, `int expert_a`, `int expert_b`, `f32 cosine`
+  - methods:
+    - `fn expert_a() → int {`
+    - `fn expert_b() → int {`
+    - `fn cosine() → f32 {`
+- `class Provenance`
+  - fields: `string algorithm`, `string digest`, `int length`, `string corpus_digest`, `string base_digest`
+  - methods:
+    - `fn algorithm() → string {`
+    - `fn digest() → string {`
+    - `fn length() → int {`
+    - `fn corpus_digest() → string {`
+    - `fn base_digest() → string {`
+- `class ResidualEnergyArtifact`
+  - fields: `string schema`, `list<ExpertEnergy> scores`, `list<CurvePoint> curve`, `list<SimilarityCell> similarities`, `int recommended_k`, `f32 threshold`, `bool below_threshold`, `Provenance provenance`
+  - methods:
+    - `fn schema() → string {`
+    - `fn scores() → list<ExpertEnergy> {`
+    - `fn curve() → list<CurvePoint> {`
+    - `fn similarities() → list<SimilarityCell> {`
+    - `fn recommended_k() → int {`
+    - `fn threshold() → f32 {`
+    - `fn below_threshold() → bool {`
+    - `fn provenance() → Provenance {`
+
+### Public functions
+
+- `fn message(CalibrationError e) → string {`
+- `fn activation(int layer, int expert, f32 mass, list<f32> output) → RoutingActivation {`
+- `fn corpus(list<RoutingActivation> activations, int layers, int experts, int dimension) → CalibrationCorpus ⇥ CalibrationError {`
+- `fn default() → ResidualEnergyArtifact {`
+- `fn bake(CalibrationCorpus corpus, list<list<f32>> bases, f32 threshold, string algorithm, string digest, int length, string corpus_digest, string base_digest) → ResidualEnergyArtifact ⇥ CalibrationError {`
+- `fn score_count(ResidualEnergyArtifact artifact) → int {`
+- `fn curve_count(ResidualEnergyArtifact artifact) → int {`
+- `fn similarity_count(ResidualEnergyArtifact artifact) → int {`
+- `fn curve_residual(ResidualEnergyArtifact artifact, int k) → f32 {`
+- `fn score_residual(ResidualEnergyArtifact artifact, int i) → f32 {`
+- `fn similarity_cosine(ResidualEnergyArtifact artifact, int i) → f32 {`
+- `fn verify(ResidualEnergyArtifact artifact, string expected) → ResidualEnergyArtifact ⇥ CalibrationError {`
+
+
 ## gradus:data
 
 Reserved data-module import surface; no public functions are currently declared.
