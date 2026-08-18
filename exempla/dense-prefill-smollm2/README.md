@@ -3,6 +3,23 @@
 Consumer for the U1.8 dense forward graph against the pinned SmolLM2-360M
 row on the **compiled rust** receipt tier. This README is the unit receipt.
 
+**TRACE 2026-08-18 (handle `1265695e` / packet `hand-48`)** — post-attn
+families at layer-0 pos 8 / token 2767, compiled rust. Isolated ops
+through `ffn_down` are green. First red was `dense_block` residual-2
+wiring (`ln2 + h` vs llama/GI2-1 `r1 + h`) at max_delta `2.6446362`
+(960/960). Fixed in `transformer.dense_block`; U1.5 pins re-evaluated
+in independent f64.
+
+| probe | vs | max_delta | n>1e-6 |
+| --- | --- | --- | --- |
+| post-attn RMSNorm | GI2-1 `ffn-normed` (no GI2-2 `ffn_norm.y`) | 3.58e-7 | 0/960 |
+| SwiGLU activation `silu(gate)·up` | GI2-2 `swiglu.y` | 4.77e-7 | 0/2560 |
+| `ffn_down` | GI2-1 naive-f32 `swiglu.y · wd` | 0 | 0/960 |
+| residual-2 `r1 + h` | GI2-1 | 0 | 0/960 |
+| residual-2 `ln2 + h` (old block) | GI2-1 `r1 + h` | **2.6446362** | **960/960** |
+
+No whole-model rerun (GATE 13 waits).
+
 **Verdict: PASS — remaining linear families are the same GGUF K-major
 layout as `attn_q`.** Handle `8da95e6c` / packet `hand-25`. The Q adapter
 transpose already named q/k/v/o/gate/up/down; compiled-rust probes confirm
