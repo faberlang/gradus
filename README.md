@@ -80,6 +80,7 @@ The gradient seam consumers live under `exempla/`:
 | `exempla/dense-qwen2-adapter` | Typed `qwen2` architecture adapter executed proof — every canonical resolution + fail-closed rejection row over the pinned Qwen2.5-0.5B descriptor facts (REF-01-U1.7) | **Executed** — package-MIR run, 23 PASS / 0 FAIL, exit 0; receipt in the exemplum README |
 | `exempla/dense-block` | Generic dense transformer block executed proof — input RMSNorm → GQA attention (causal + RoPE) → residual → post-attn RMSNorm → SwiGLU MLP → residual over a synthetic T=2/D=16 config, composing the U1.1/U1.2/U1.4 rows (REF-01-U1.5) | **Executed** — package-MIR run, 32 PASS / 0 FAIL, exit 0; receipt in the exemplum README |
 | `exempla/dense-model` | Dense model assembly executed proof — the complete ordered dense forward graph (embedding gather → 2 ordered U1.5 blocks → final RMSNorm → output projection) over a synthetic T=2/D=16/vocab-8 config with tied + untied embedding rows + the fail-closed rejection row (REF-01-U1.8) | **Executed** — package-MIR run, 37 PASS / 0 FAIL, exit 0; receipt in the exemplum README |
+| `exempla/dense-prefill-qwen2` | REF-01-U1.10 Qwen2.5-0.5B real-file prefill consumer through `gradus:model/dense` `forward` | **Stop** — `faber check` green; compiled rust `CODEGEN001` (`dense_qwen2.fab` definition id 4127); llvm-host `PKG001:llvm_emission_failed`; no executed logits |
 
 Pinned oracle (f64 arithmetic of the documented loss): forward loss `2.25`,
 companion `grad_w = [0.25, 0.5, 0.75, 1.0]`, FD diffs ~`1e-11`. See each
