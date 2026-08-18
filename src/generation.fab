@@ -90,6 +90,11 @@ locale = "en"
 # The decoder/engine is an argument (M03: admitted model = generated
 # model). Cancellation is observed at entry, during prefill, and before
 # every sampled token. The cursor rejects rather than truncates.
+# StopPolicy is additive: the existing generate / generate_cancelled /
+# generate_dense signatures keep EOG-stop. The *_with_stop entry points
+# accept Eog (emit first EOG then halt) or IgnoreEos (llama.cpp
+# ignore_eos: EOG ids are suppressed from sampling and the loop runs to
+# the max_tokens ceiling).
 import from "gradus:attention" attention
 
 import from "gradus:cache" kv
@@ -589,6 +594,83 @@ fn cursor_reset(GenerationCursor c) → GenerationCursor {
     return GenerationCursor {session = decode.Session {position = 0, context = c.session().context()}, emitted = 0}
 }
 
+# -------------------------------------------------------------------------
+# StopPolicy — the generate-route stop binding. Additive: existing
+# generate / generate_cancelled / generate_dense keep Eog. IgnoreEos is
+# the llama.cpp ignore_eos row (U5 golden capture): admitted EOG ids
+# {0, 2} are suppressed from the sampled logits (finite large-negative
+# mask, never -inf — the sampling finite gate) and the loop does not
+# halt on EOG, so generation proceeds to the max_tokens ceiling.
+# Cross-module callers use the factories; they cannot finge imported
+# variants (the RopePolicy precedent).
+# -------------------------------------------------------------------------
+
+@ public { }
+union StopPolicy {
+    Eog,
+    IgnoreEos
+}
+
+@ public { }
+fn eog_stop() → StopPolicy {
+    return variant Eog
+}
+
+@ public { }
+fn ignore_eos() → StopPolicy {
+    return variant IgnoreEos
+}
+
+@ public { }
+fn stop_policy_name(StopPolicy p) → string {
+    match p {
+        case Eog {
+            return "eog"
+        }
+        case IgnoreEos {
+            return "ignore_eos"
+        }
+    }
+}
+
+@ public { }
+fn stops_on_eog(StopPolicy p) → bool {
+    match p {
+        case Eog {
+            return true
+        }
+        case IgnoreEos {
+            return false
+        }
+    }
+}
+
+# Finite EOG mask. Sampling rejects non-finite logits, so this is a
+# large negative rather than -inf. Any real vocab logit wins over it.
+@ private { }
+fn _suppress_eog(list<f32> logits) → list<f32> {
+    var list<f32> out ← vacua
+    var int i ← 0
+    while i ≺ logits.length() {
+        if tokenizator.est_eog(i) {
+            out.append((0.0 - 1000000000.0) ∷ f32)
+        }
+        else {
+            out.append(logits.get(i) coalesce 0.0 ∷ f32)
+        }
+        i ← i + 1
+    }
+    return out
+}
+
+@ private { }
+fn _sample_logits(list<f32> logits, StopPolicy stop) → list<f32> {
+    if stops_on_eog(stop) {
+        return logits
+    }
+    return _suppress_eog(logits)
+}
+
 # Cursor sitting just after a prompt of length prompt_len: next decode
 # position is the prompt length, generated count is 0. Rejects an empty
 # prompt and a prompt that leaves no room in the context.
@@ -688,16 +770,27 @@ fn _dense_one(DenseEngine engine, (string, int) → dense.Lookup source, int tok
 
 # Public generate: config + prompt ids + the admitted decoder.
 # Prefill produces the last-row logits; each later step is
-# decodere_datum + sampling.sample. Stops after the first EOG token
-# (tokenizator.est_eog — set {0, 2}) or at the cursor ceiling.
-# The KV-wired loop is generate_dense (dense.decode_step).
+# decodere_datum + sampling.sample. Default stop is Eog: halt after the
+# first EOG token (tokenizator.est_eog — set {0, 2}) or at the cursor
+# ceiling. generate_with_stop / generate_cancelled_with_stop take an
+# explicit StopPolicy. The KV-wired loop is generate_dense.
 @ public { }
 fn generate(GenerationConfig g, list<int> prompt_ids, decode.Decoder m) → list<int> ⇥ GeneratioError {
     return generate_cancelled(g, prompt_ids, m, decode.fresh_cancellation())
 }
 
 @ public { }
+fn generate_with_stop(GenerationConfig g, list<int> prompt_ids, decode.Decoder m, StopPolicy stop) → list<int> ⇥ GeneratioError {
+    return generate_cancelled_with_stop(g, prompt_ids, m, decode.fresh_cancellation(), stop)
+}
+
+@ public { }
 fn generate_cancelled(GenerationConfig g, list<int> prompt_ids, decode.Decoder m, decode.Cancellation cancel) → list<int> ⇥ GeneratioError {
+    return generate_cancelled_with_stop(g, prompt_ids, m, cancel, eog_stop())
+}
+
+@ public { }
+fn generate_cancelled_with_stop(GenerationConfig g, list<int> prompt_ids, decode.Decoder m, decode.Cancellation cancel, StopPolicy stop) → list<int> ⇥ GeneratioError {
     _observe(cancel)
     if prompt_ids.length() ≺ 1 {
         throw variant ConfiguraInvalida {message = "needs at least one prompt token"}
@@ -718,13 +811,13 @@ fn generate_cancelled(GenerationConfig g, list<int> prompt_ids, decode.Decoder m
     var bool finis ← false
     while token_allowed(g, cursor) and not finis {
         _observe(cancel)
-        const sampling.Sampler outcome ← _sample(last, drawn, history, rng)
+        const sampling.Sampler outcome ← _sample(_sample_logits(last, stop), drawn, history, rng)
         const int token ← outcome.token_id()
         tokens.append(token)
         history.append(token)
         rng ← outcome.seed()
         cursor ← cursor_advance(g, cursor)
-        if tokenizator.est_eog(token) {
+        if tokenizator.est_eog(token) and stops_on_eog(stop) {
             finis ← true
         }
         else {
@@ -761,11 +854,18 @@ fn default_dense_engine() → DenseEngine {
 }
 
 # Same loop as generate, over dense.decode_step and a per-layer KV cache.
-# Used by the SmolLM2 oracle exemplum. EOG-stop applies: SmolLM2 EOS=2
-# is in the admitted set {0, 2}, so a greedy continuation that would
-# have been G1's unrestrained [30, 2, 198] becomes [30, 2].
+# Used by the SmolLM2 oracle exemplum. Default EOG-stop applies: SmolLM2
+# EOS=2 is in the admitted set {0, 2}, so a greedy continuation that
+# would have been G1's unrestrained [30, 2, 198] becomes [30, 2].
+# generate_dense_with_stop(IgnoreEos) suppresses EOG from sampling and
+# runs to max_tokens — the U5 / llama.cpp ignore_eos row.
 @ public { }
 fn generate_dense(GenerationConfig g, list<int> prompt_ids, DenseEngine engine, (string, int) → dense.Lookup source, list<kv.KVCache> layers, decode.Cancellation cancel) → list<int> ⇥ GeneratioError {
+    return generate_dense_with_stop(g, prompt_ids, engine, source, layers, cancel, eog_stop())
+}
+
+@ public { }
+fn generate_dense_with_stop(GenerationConfig g, list<int> prompt_ids, DenseEngine engine, (string, int) → dense.Lookup source, list<kv.KVCache> layers, decode.Cancellation cancel, StopPolicy stop) → list<int> ⇥ GeneratioError {
     _observe(cancel)
     if prompt_ids.length() ≺ 1 {
         throw variant ConfiguraInvalida {message = "needs at least one prompt token"}
@@ -792,13 +892,13 @@ fn generate_dense(GenerationConfig g, list<int> prompt_ids, DenseEngine engine, 
     var bool finis ← false
     while token_allowed(g, cursor) and not finis {
         _observe(cancel)
-        const sampling.Sampler outcome ← _sample(last.data, drawn, history, rng)
+        const sampling.Sampler outcome ← _sample(_sample_logits(last.data, stop), drawn, history, rng)
         const int token ← outcome.token_id()
         tokens.append(token)
         history.append(token)
         rng ← outcome.seed()
         cursor ← cursor_advance(g, cursor)
-        if tokenizator.est_eog(token) {
+        if tokenizator.est_eog(token) and stops_on_eog(stop) {
             finis ← true
         }
         else {
