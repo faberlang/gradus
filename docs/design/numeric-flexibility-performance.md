@@ -1872,3 +1872,442 @@ quant class):**
 *Addendum 4 ends. §13 (`c7174a33`), §14 (`cbea0c29`), and §15 (`1f58bbbc`)
 untouched above. §16 body committed at `5b46a77`; §16.6 is head-cto
 `d68a0ac4`'s working-tree edit on top — mind routes the commit.*
+
+---
+
+## 17. Addendum 5 — the MoE inverse-census: bake-time weight transforms that eliminate the swap
+
+**Status**: DRAFT (uncommitted working-tree edit on the doc committed at
+`f92e476`; mind routes the commit)
+**Author**: head-cto (Vivi handle `fd087622`), 2026-08-18
+**Ask**: operator pushback on §16/§16.6 — those sections mapped
+*established* MoE practice (residency, streaming, placement: what ds4 does)
+onto our seams. This addendum centers the INVERSE question the other census
+sections answer: **what can OUR architecture do for MoE that theirs
+structurally cannot?** Operator hypothesis chain: the local bottleneck is
+expert disk-swap; if bake-time weight modification REDUCES the need to swap,
+we stay fully memory-resident. Analysis is from the **compiler's side** —
+transforms our admission pipeline can express over a base checkpoint — not
+from the checkpoint's side.
+**Placement**: appended after §16.6; no earlier section edited. One stale
+fact corrected by pin: §16.6's header still says "uncommitted working-tree
+edit" — §16/§16.6 are committed at `f92e476`; this §17 is the only
+uncommitted layer.
+**Evidence pins**: doc base `f92e476`; §16.6's v4-flash-0731 facts
+(config-derived arithmetic, Unsloth measured quality table, ds4 measured
+throughput) reused without re-derivation; gradus `tensor_view.fab`
+materializers and radix `kernel_plan/plan.rs` GroupedMatMul re-verified at
+the working tree today. External literature web-verified 2026-08-18 (wv),
+cited per claim. **One pointer corrected up front**: no paper named
+"SLmerge" exists (searched 2026-08-18, multiple spellings); the operator's
+reference resolves to the retraining-free expert-merge family — the actual
+named techniques are **MC-SMoE** (arXiv:2310.01334, ICLR 2024), **HC-SMoE**
+(arXiv:2410.08589, ICML 2025), **Sub-MoE** (arXiv:2506.23266), **EEP**
+(arXiv:2407.00945), **MEO** (arXiv:2310.09832, EMNLP 2023), **SMEAR**
+(arXiv:2306.03745) — all verified below with their measured costs.
+
+### 17.0 The reframing, and the hypothesis chain answered
+
+§16's levers are **placement** — they decide *where expert bytes live*
+(hot-set residency, streamed windows, per-expert formats) but never change
+how many bytes exist. The inverse question is **deletion**: a bake-time
+transform over the expert tensors can make the *resident mass itself*
+smaller, which is the only move that eliminates the swap rather than
+managing it. Placement moves bytes; transforms delete them.
+
+**Link 1 — "the local bottleneck is expert disk-swap" — confirmed for the
+above-RAM tiers.** §16.6: MXFP4 experts are 147 GB against a 128 GB
+machine; pure streaming measures 3.8 t/s; each 1% of routing mass that
+misses a hot set costs ~2.5 ms. The bottleneck is real and it is bandwidth.
+
+**Link 2 — "bake-time weight modification can reduce the need to swap" —
+confirmed, with the price named.** Families (a) merge, (b) shared-basis
+factorization, and (d) router admission each shrink the *resident* expert
+mass below the RAM ceiling at v4-flash-0731 scale (arithmetic in §17.4),
+which makes every byte a RAM byte — the hot-set solve (hit-rate thresholds
+p ≥ 0.87/0.73, concentration factors 1.8–3.2×) **vanishes as a problem**:
+nothing streams, so there is no p curve to solve. The cost does not
+disappear; it *migrates from bandwidth to quality*, where our machinery is
+stronger than the competition's: the transform's divergence becomes a
+**recorded acceptance band on a provenance-pinned effective model** (§13.4
+discipline), not a silent checkpoint fork.
+
+**The honest competitive line (sharper than §16.2-5's).** llama.cpp's
+ecosystem *can* do linear algebra offline: `llama-quantize`, imatrix quants,
+Unsloth's UD series, and antirez's Q4KExperts-F16 are all producer-side
+checkpoint rewrites. So "no one else can merge experts" is FALSE, and §17
+does not claim it. What ds4 and llama.cpp **structurally** cannot do is the
+*pipeline shape* around the transform: their engines accept only finished
+checkpoints — every transform is a **fork that ships as a new artifact**
+with no base linkage, no band, no per-slice granularity (a ggml rank-3
+expert tensor carries **one** type id for all 256 experts; per-expert format
+mix requires splitting the tensor and rewriting the builder, B2/B4), and no
+way to re-specialize per user, corpus, or budget at load. Ours: the
+**recipe travels beside the base GGUF** (§13.3), specializes at admission,
+records its band, composes with ExpertPlan residency and per-expert
+formats, and fails closed on any inconsistency. The inverse claim is:
+**merging/factorization becomes a dial at admission, not a checkpoint
+fork.** That claim survives the pushback; the weaker "they lack the math"
+claim is retired here.
+
+### 17.1 Why our machinery expresses these transforms (the seam recap)
+
+Everything in this addendum rides seams §13/§16 already established; nothing
+new is invented below the transform *types*:
+
+- **Bake seam**: transforms execute once at weight materialization in the
+  `fons` resolver (§13.1 pattern) — dequant to F32 → transform → re-encode
+  per declared storage policy (§12-5) → downstream sees ordinary tensors.
+  The bounded block readers `materialize_slice` / `materialize_block`
+  (`gradus/src/model/tensor_view.fab:204,266`) already address expert
+  slices; an expert is a rank-3 slice, a cluster merge is a fold over
+  slices, a factorization is an SVD over dequantized slices.
+- **Authoring + provenance**: typed spec beside LayerPlan/ExpertPlan
+  (§16.2-3), digests into the admission manifest (NEED `75e4ab98`
+  composes), fail-closed at load (§12-6). A transform that touches experts
+  but not their router entries **fails closed** (§17.2 rule).
+- **Acceptance**: the §12-2/e52dd09a fold extends one more level —
+  expert-transform-modified execution is pinned as its own reference with
+  its own band; identity (empty plan) stays GI0-exact.
+- **Kernel seam**: `GroupedMatMulPlan` carries `groups` as the rank-3
+  expert axis with admission pending R-PACK-03A
+  (`radix/crates/radix-mir/src/kernel_plan/plan.rs:255-268`); the composed
+  base+delta body (§17.2-b) is a reviewable variant through the
+  `plan.rs:44-50` door — no §9 lock touched.
+
+### 17.2 Family dossiers
+
+#### (a) Expert merging — bake-time collapse into fewer, denser experts
+
+**Mechanism.** Cluster experts per layer (by routing co-activation or by
+output cosine similarity — both statistics are W5c-U2 bake products), then
+fold each cluster into one expert by routing-weight-weighted averaging
+(MC-SMoE's frequency-weighted merge), and fold the router correspondingly
+(sum gate weights over the group, renormalize). Output: K experts per layer,
+same tensor shapes, ids remapped (W5c-U3's remap machinery), one rank-3
+tensor of extent K.
+
+**Why ours vs theirs.** Not the linear algebra (offline forks are possible
+for anyone — §17.0). Ours: the cluster assignment comes from the *same
+admission-time calibration* that produces the hot-set manifest (one bake,
+two consumers); K is a **per-load dial** (different K per user RAM budget
+from one base checkpoint); the merge carries a recorded band and
+provenance; and per-cluster storage format composes (hot clusters F16, cold
+clusters Q4_K — impossible in ggml's one-type-per-rank-3-tensor). ds4's
+runtime cache never transforms bytes at all.
+
+**Quality — cited where measured.** MC-SMoE: up to **80% memory reduction
+and 20% FLOPs savings with minimal loss** across 8 benchmarks on Mixtral
+8×7B + Switch (wv, arXiv:2310.01334). HC-SMoE: **retraining-free**,
+output-similarity hierarchical clustering, beats routing-guided merging on
+Mixtral and Qwen (wv, arXiv:2410.08589). Sub-MoE: **96%|86% of original
+zero-shot performance at 25%|50% expert reduction** on Mixtral-8x7B (wv,
+arXiv:2506.23266) — the sharpest published cliff datum: the 50% point costs
+~14 points. EEP: prune **75%** of Mixtral experts with minimal average loss
+*and task-specific gains* (SQuAD 53.4→75.4 after pruning half; wv,
+arXiv:2407.00945) — evidence that the cliff is domain-shaped. **Bounded
+where not measured**: every datum above is on 8–16-expert coarse-grained
+models; v4-flash-0731 is 256 fine-grained experts with `noaux_tc`
+domain-specialized routing (§16.3 Fig-9 evidence carries by family —
+inferred). Merge behavior at 256-way granularity is **unmeasured anywhere
+public** — the band-first bake (W5d rows) produces it. Raw weight-space
+similarity is LOW (Mixtral inter-expert cosine 0.1–0.3, wv Sub-MoE's
+motivation) — naive averaging is known-bad; the literature's fix is
+neuron/permutation alignment or subspace decomposition, which is exactly
+family (b).
+
+**Memory arithmetic (§16.6 numbers).** Routed mass 277.0B elems; merge to
+K experts/layer ⇒ K×13.4 MB×43 layers @MXFP4: **K=128 → 73.6 GB**
+(resident; ~84 GB total @100k ctx, ~107 GB @1M — both fit 128 GB);
+**K=64 → 36.8 GB** (~70 GB total @1M). Per-token stream is *unchanged*
+(top-6 × 13.4 MB × 43 = 3.45 GB) but now entirely from RAM — roofline
+~17 ms/token ≈ 58 t/s ceiling, i.e. resident-2-bit-class throughput
+(measured engine runs ~57% of roofline, so project ~30–35 t/s) **at full
+MXFP4 fidelity instead of KLD-0.42 2-bit** — merge error replaces requant
+error at *lower* resident mass (36.8 GB @K=64 vs 78 GB @2-bit).
+
+**Hot-set effect.** Solve vanishes — nothing streams.
+
+**Verdict: VALID-AND-VALUABLE.** Training-free, immediate, literature-
+anchored with the cliff measured on the adjacent model class; the band is
+the product.
+
+#### (b) Low-rank / shared-basis expert reparameterization — the strongest "stay fully resident" candidate
+
+**Mechanism.** Per layer, factor the expert set as W_e ≈ B_{c(e)} +
+U_e·V_eᵀ: K **cluster bases** (Sub-MoE's shared-U shape: joint SVD over
+concatenated cluster members extracts the shared subspace) plus a **rank-r
+per-expert residual delta**. K=0 is the global-base variant (one base,
+deltas only); r=0 is family (a). Deltas are tiny: r×(4096+2048)×3 elems per
+expert = 18,432r — **1.2% of one expert's mass at r=16, 2.3% at r=32, 4.7%
+at r=64**.
+Execution body: base GEMV (shared, CSE-able across co-selected experts —
+§17.3-G3) + two rank-r GEMVs per selected expert per matrix.
+
+**Is expert overlap real, and how much?** The honest split: raw parameter
+overlap is LOW (0.1–0.3 cosine, wv) — a global base will leave large
+residuals; **shared-subspace overlap is real and measured** — Sub-MoE
+demonstrates joint-SVD shared bases recover 96%|86% at 25%|50% with *zero*
+residual, and **Compress-then-Serve serves thousands of adapters over one
+shared SVD basis with little overhead** (wv, arXiv:2407.00066 — the same
+base+deltas shape at adapter granularity). At train time the architecture
+family is proven to parity: LoRAMoE (shared base + low-rank experts, wv
+arXiv:2312.09979) and HydraLoRA (shared A + per-task B matrices, wv
+arXiv:2404.19245). **What is unmeasured**: post-hoc factorization of an
+already-trained 256-expert set, and the (r, retained-energy) curve is the
+quantity that decides it — our bake can produce that curve exactly (SVD of
+43×256×3 = 33K matrices, one-time hours-scale on M5 Max, subsample-able per
+layer) and **fail closed above a declared residual-energy threshold**. No
+runtime engine anywhere produces this artifact.
+
+**Memory arithmetic.** K=64 bases @MXFP4 (36.8 GB) + all-256 deltas @F16:
+r=16 → 6.5 GB, r=32 → 13.0 GB, r=64 → 26.0 GB. Totals with floor+KV:
+**K=64/r=32 ≈ 60 GB @100k, 83 GB @1M — fully resident at every context**.
+Global-base extreme: base 2.2 GB + r=16 deltas 6.5 GB ≈ **8.7 GB routed
+mass** — resident even on 96 GB-class machines (the ds4 minimum-spec
+class), quality-gated by the energy curve. Per-token stream: ≤6 bases
+(13.4 MB each @MXFP4, deduplicated when co-selected) + 6×1.18 MB deltas
+@r=32 ⇒ ≤3.76 GB/token, comparable to unmerged MXFP4, all from RAM.
+
+**Why ours vs theirs.** The factored body needs a composed kernel (base +
+delta with CSE across selected experts) — a codegen variant, B1/B3 for
+them; the factorization itself needs the calibration statistics + SVD bake
+with band/provenance — admission-time, not fork-time. ds4/llama.cpp have
+neither a transform stage nor an IR to CSE over.
+
+**Hot-set effect.** Solve vanishes at every K/r tier; even the delta store
+is too small to need a policy.
+
+**Verdict: VALID-AND-VALUABLE — measurement-gated.** Highest ceiling of the
+census (resident at MXFP4-fidelity on the smallest machines) and the only
+family whose enabling fact (the energy curve) is itself a cheap bake
+artifact. Gate W5d-U1 before any kernel work.
+
+#### (c) Hot-set expansion by distillation — bake-time fold of cold into hot
+
+**Split into two honestly different sub-families.**
+
+**(c1) KD-recovered distillation** (select K, fold cold into hot, then
+distill 0.3–4B tokens from the full model): the recovery is measured and
+strong — KRAFTON/KAIST's MoE→dense framework reports routing-statistics
+expert scoring (scoring method dominates at **5.7 pp**), +**6.3 pp** over
+matched dense pruning after ~4B KD tokens, on Qwen3-30B-A3B-class models
+(wv, arXiv:2605.28207); "Every Expert Matters" shows KD quality improves
+when the teacher's *non-activated* experts are sampled (wv,
+arXiv:2502.12947). But this is **training compute owned by a producer**, and
+the resulting artifact is consumable by any engine — a Unsloth-style fork.
+Not structurally exclusive to us; our value is the **consumption shape**:
+distilled weights as a §15.3 serving-profile artifact with band + draft
+linkage, composed with residency plans. **Verdict: VALID-BUT-COSTLY** —
+real, literature-anchored, but the structural claim is consumption +
+verification only, and honesty requires saying the production is not ours.
+
+**(c2) Training-free cold→hot folding** — fold cold experts into hot/shared
+by routing-weight-weighted averaging, zero the sources (§13 machinery
+applies, exactly as the operator framed it): this is family (a) with the
+hot-set manifest as the clustering signal. Zero training; band-first; **the
+hot set expands at merge time and the miss-path disappears**. **Verdict:
+VALID-AND-VALUABLE** (rides (a)'s rows; no separate wave unit).
+
+#### (d) Router-side admission — the pruned router, renormalized and *calibration-fitted*
+
+**Mechanism.** W5c-U3 already gestures (Zero = router-column mask +
+renormalize). §17 adds three refinements: **(i)** for merged clusters the
+fold is *sum gate weights, renormalize* — affine in the gate distribution,
+exact for top-k invariance within the admitted set; **(ii)**
+calibration-fitted renormalization — fit a temperature τ and per-expert bias
+δ over the calibration corpus so the admitted-set softmax **matches the
+full softmax's expected gate distribution** (moment/KL matching; a
+minutes-scale bake fit), instead of plain renormalization; **(iii)** the
+`noaux_tc` trap named — this router family carries a learned per-expert
+*bias* added before top-k (V3 lineage; v4-flash config `norm_topk_prob` +
+`routed_scaling_factor` 1.5, wv §16.6.1), so plain renormalization silently
+mis-compounds the bias; the fit must operate on biased logits, and the
+scaling factor re-fits with it. The whole fold is a **tensor edit at bake**
+(mask/bias/τ folded into `ffn_gate_inp` and the bias vector) — zero runtime
+cost, no engine branch.
+
+**Quality.** Renormalized-subset pruning is the best-measured datum in this
+space: Lu et al. — −0.1 avg points at 25% expert removal, −3.7 at 50% on
+Mixtral 8×7B, with task-calibrated selection recovering domain performance
+(wv, arXiv:2402.14800, cited §16.3). Calibration-fit vs plain renorm:
+**unmeasured; our bake measures it** (both variants are one manifest field
+apart). Bounded inference: the fit can only move mass the mask already
+stranded, so its band lies between plain-renorm and the unpruned model.
+
+**Hot-set effect.** With admission-only routing, effective hit rate is 100%
+by construction — the router *cannot* select non-admitted experts, so
+streaming misses cease to exist as a runtime event; the entire cost is the
+quality band. This is the composition that makes §16.6's streaming tier
+declaratively resident.
+
+**Why ours vs theirs.** Their router executes from the checkpoint as-stored
+(B2/B4); masking/renormalizing requires engine code (runtime branch) or a
+forked checkpoint. A *fitted* router (τ, δ) is not even a thing in their
+design space — there is no calibration stage to fit against.
+
+**Verdict: VALID-AND-VALUABLE** — smallest unit in the census (S), composes
+with (a)/(b)/§16 residency, immediate.
+
+#### (e) KV / indexer interplay for v4-flash — where the compiler-side lever does NOT reach
+
+**The honest category error first.** The 22 GB indexer cache @1M ctx is
+**runtime-derived state, not weights** — the bake/transform pipeline owns
+parameters, and this mass is not parameters. No weight transform can
+directly shrink it. Split the reachable from the unreachable:
+
+- **(e1) Format dials — valid, already filed.** Per-class indexer-cache
+  format (F16→FP8/FP4) rides §16.6.5-need-2's per-layer heterogeneous KV
+  classes; vLLM ships `use_fp4_indexer_cache` (wv §16.6.3) — 22→~5.5 GB at
+  @1M. Ours as a declared class dial with derived envelope (I9); near-miss
+  for them (format-only, no admission proof).
+- **(e2) Weight surgery on the indexer projections — INVALID as a bake
+  transform.** The CSA indexer is trained machinery (NSA lineage: the
+  compression map φ is a learnable MLP, selection trained end-to-end, wv
+  arXiv:2502.11089). Pruning its 64 heads or halving its 128 dims changes
+  *which blocks attention sees* — a selection-behavior change with no
+  published post-hoc evidence and a compounding (not graceful) failure
+  mode. The honest route is §15.3's training-derived artifact (a finetuned
+  smaller indexer with its own band), not admission-time surgery. Parking
+  it as a bake transform would be exactly the silent-quality-loss pattern
+  §12-2 exists to prevent.
+- **(e3) Recompute-from-KV — valid but evidence-gated.** If the indexer's
+  cached vectors are a projection of the *cached compressed KV* (NSA's
+  φ(k_t) shape), the cache is recomputable on demand — 22 GB of residency
+  becomes a recompute-bandwidth decision, which is precisely a partition-
+  class/admission-budget trade (§16.2-1 machinery, the ledger's native
+  shape; llama.cpp has no admission budgeting at all, B1/B4). If instead
+  the indexer projects from the *hidden stream* (V3.2-DSA "lightning
+  indexer" shape), it is not recomputable and (e3) dies. **The deciding
+  fact is readable, not research**: ds4 is open source — its indexer
+  implementation names the input. Producer fact: *read ds4's indexer path;
+  record whether cached indexer K derives from the compressed KV cache or
+  from h*. Verdict: **VALID-BUT-COSTLY, gated on that fact.**
+
+**Hot-set effect.** None directly — this family governs long-context
+residency (KV), not expert streaming; it composes with everything above at
+the partition ledger.
+
+### 17.3 The general inverse-census for MoE (derived, not copied)
+
+Beyond swap-reduction, compiler-in-the-loop + owned-transform-pipeline buys:
+
+- **G1 — Fused router→gather→dequant→expert-GEMV decode body.** One
+  emitted kernel per MoE layer per specialization: gate GEMV + sqrtsoftplus
+  + top-6 + gather + dequant + gate/up GEMVs + SiLU-mul + down GEMV +
+  weighted combine + shared expert + residual, with the top-6 slots unrolled
+  and block geometry burned in. Kills per-expert launch round-trips — at
+  ~34 t/s measured, 43 layers × ~8 dispatches/token is a real term (W8-U1's
+  per-step batching is the host half of the same win). Theirs: MMVF/MMVQ
+  fuse *within* prebuilt families only (B1/B3); ds4 hand-fuses fixed
+  kernels, not per-specialization variants. Rides wave 4 + R-PACK-03A.
+- **G2 — Per-expert kernel variants.** With per-expert format mix
+  (§16.2-5), each emitted expert slice gets its own dequant body and tile
+  constants. Structurally impossible in ggml — a rank-3 expert tensor
+  carries one type id for all experts (B2); ds4's mixed 2-bit splits by
+  *matrix family* only, never per expert. Ours: the ExpertPlan entry
+  *declares* the body variant; admission budgets it.
+- **G3 — Graph CSE across shared experts.** The shared expert's activations
+  and (in family (b)) cluster bases are computed once and reused across
+  co-selected experts; the compiler proves the sharing through the typed
+  graph. Theirs: no IR between builder and kernel table (B3) — `MUL_MAT_ID`
+  gathers 6 opaque matrices and nothing recognizes common structure.
+- **G4 — Whole-MoE-block decode-shape specialization.** The block is
+  emitted twice — decode body (batch-1 GEMV shapes, top-k constants) and
+  prefill body (tiled GEMM) — with mHC's 4-stream residual traffic
+  accounted in the launch/buffer plan (§16.6.3-5). Regime split is wave 4's
+  declared shape; llama.cpp selects among prebuilt families by heuristic at
+  runtime (B1).
+- **G5 — Expert-id remap + contiguous mass packing.** Reorder the rank-3
+  expert axis by routing mass at bake (ids remapped — W5c-U3's remap
+  generalized from Prune to Reorder) so any residual streaming reads
+  *contiguous* SSD ranges and hot-list preloads are sequential. Impossible
+  at runtime for them: ids arrive from the router over the tensor as-stored;
+  reordering means jointly rewriting tensor + router = a fork (B2).
+- **G6 — Importance-guided per-expert precision allocation — NEAR-MISS,
+  honestly.** The imatrix ecosystem already does importance-weighted
+  requant offline; only the per-slice granularity (one type per expert
+  inside one tensor) stays structurally ours. Claimed as granularity, not
+  as invention.
+
+### 17.4 Consolidated memory arithmetic (v4-flash-0731, M5 Max 128 GB; §16.6 facts)
+
+Routed-mass tiers with floor ≈7.4 GB and KV ≈2.6 GB @100k / 26 GB @1M
+(indexer 22 GB of it):
+
+| Tier | Routed mass | Total @100k / @1M | Resident? | Per-token expert stream | Quality anchor |
+| --- | ---: | ---: | --- | ---: | --- |
+| as-stored MXFP4 (today) | 147 GB | 157 / 180 GB | **no — streams** | 3.45 GB (SSD on miss) | bit-identical (KLD ~0) |
+| as-stored 2-bit (today) | 78 GB | ≈88 / 111 GB | yes (tight) | 1.83 GB (RAM) | KLD 0.42, PPL 4.53→6.15 (wv) |
+| **(a) merge K=128 @MXFP4** | 73.6 GB | 84 / 107 GB | **yes** | 3.45 GB (RAM) | Sub-MoE 86% @50% (8-expert anchor; 256-way unmeasured → band) |
+| **(a) merge K=64 @MXFP4** | 36.8 GB | 47 / 70 GB | **yes** | 3.45 GB (RAM) | EEP 75%-prune adjacent; unmeasured → band |
+| **(b) bases K=64 @MXFP4 + deltas r=32 @F16** | 49.8 GB | 60 / 83 GB | **yes** | ≤3.76 GB (RAM, CSE-dedupable) | deltas buy back merge identity loss; gated on (r, energy) curve |
+| **(b) global base + deltas r=16 @F16** | 8.7 GB | 19 / 42 GB | **yes — even 96 GB machines** | ≈0.73 GB (base computed once/layer + 6 deltas) | raw cosine 0.1–0.3 ⇒ high residual risk; W5d-U1 gate |
+| (c2) hot-set-folded K=96 @2-bit | 29.3 GB | 39 / 63 GB | yes | 1.83 GB (RAM) | Lu −0.1@25%-class + band; no KD |
+
+Every transform tier turns the §16.6 streaming regime (3.8 t/s pure, or
+hit-rate-managed 24–51 t/s) into a **resident** regime (roofline ~58 t/s;
+projected realized ~30–35 t/s at the measured engine's 57%-of-roofline) —
+and **deletes the hot-set solve** rather than raising its thresholds. The
+transform tiers also open a *new* quality/size point the market does not
+have: merge@MXFP4 trades merge error against *zero* quantization error at
+*less* mass than 2-bit requant (36.8 vs 78 GB at K=64).
+
+### 17.5 Verdicts and wave rows (W5d; ranked by value-per-cost)
+
+| Family | Verdict | Reason |
+| --- | --- | --- |
+| (a) expert merging | **VALID-AND-VALUABLE** | training-free, immediate resident tier; cliff measured on adjacent class, band-first at 256-way |
+| (b) shared-basis + deltas | **VALID-AND-VALUABLE** (measurement-gated) | strongest stay-resident candidate; enabling fact is itself a cheap bake artifact |
+| (c1) KD-recovered distillation | **VALID-BUT-COSTLY** | training-scale production, not structurally exclusive; our claim = consumption + band |
+| (c2) training-free cold→hot fold | **VALID-AND-VALUABLE** | subsumed by (a) with the hot-set manifest as clustering signal |
+| (d) router admission + fitted renorm | **VALID-AND-VALUABLE** | smallest cost, composes with everything, kills the miss-path by construction |
+| (e1) indexer format dial | valid (already filed §16.6.5-2) | format-only; near-miss for them |
+| (e2) indexer weight surgery | **INVALID** (as bake transform) | derived runtime state + trained selection machinery; route via §15.3 finetune artifact instead |
+| (e3) indexer recompute class | **VALID-BUT-COSTLY** (evidence-gated) | partition-ledger native; gated on the ds4-source provenance fact |
+
+**W5d — MoE bake-time transforms** (after W5c; U1 gates U4; U2/U3 ride
+W5c-U3; U5 rides R-PACK-03A; U6 rides wave 4 + W8-U1):
+
+| Rank | Unit | Repo/scope | Done-when |
+| --- | --- | --- | --- |
+| 1 | W5d-U1 overlap census + residual-energy bake | gradus bake seam (per-layer: expert similarity matrix from W5c-U2 stats; joint-SVD shared-basis residual-energy curves (K, r) → pinned manifest artifact; declared threshold fail-closed) | synthetic-rung curve pins exact energies; tampered-digest load rejected; **the (K, r) quality-gate artifact exists on the 256-expert rung** |
+| 2 | W5d-U2 calibration-fitted router renormalization | gradus bake (τ/δ fit on biased `noaux_tc` logits over admitted/merged set; folded into router tensors at bake) | fit-vs-plain-renorm band row pair recorded on calibration corpus; noaux_tc bias-compounding negative (plain renorm on biased logits) rejected at validation |
+| 3 | W5d-U3 `Merge{clusters}` transform + id remap + contiguous mass packing | gradus ExpertPlan extension + `tensor_view` slice fold at materialization (router-consistent fold mandatory — expert-touching transform without router fold fails closed) | merged-rung band row recorded vs pinned merged reference; id-remap byte receipt; unaligned expert/router fold rejected (negative) |
+| 4 | W5d-U4 `Factorize{K bases, rank r}` transform | gradus ExpertPlan extension (bases + delta store as plan facts; per-entry storage policy; gated on W5d-U1 curve) | reconstructed-expert Frobenius residual within declared band on the rung; delta-store byte accounting exact |
+| 5 | W5d-U5 composed base+delta expert body (CSE-able) | radix `kernel_plan` reviewable variant beside `GroupedMatMul` (R-PACK-03A) | kernel tests: base computed once per co-selected cluster; equivalence vs materialized-sum reference within band; explicit variant record |
+| 6 | W5d-U6 fused MoE-block decode body (G1) | radix decode-regime rider (wave 4) + hosts W8-U1 | per-step launch-count receipt on an MoE rung; step-equivalence pins green |
+| — | parked: (e3) indexer recompute partition class | hosts partition (admission-budgeted recompute-vs-store for the indexer class) | gated on ds4-source indexer-provenance fact; no work before it |
+| — | parked: (c1) distilled-artifact consumption | §15.3 serving-profile shape | band + linkage consumed; production out of tree |
+
+### 17.6 Amendment needs (routed to mind with this report)
+
+1. **NEED — design (transforms)**: admit the expert transform family
+   {`Merge{clusters}`, `Factorize{bases, rank}`, `Reorder`} into the
+   ExpertPlan beside Keep/Zero/Prune — typed admission, fail-closed each
+   (cluster ids in range; router-consistent fold mandatory; per-entry
+   storage policy per §12-5; one transform per (layer, expert-set) — no
+   ordered composition). This generalizes §13.2 beyond the refusal family,
+   exactly as §15.3(b) anticipated.
+2. **NEED — design (kernel)**: composed additive expert body (base GEMV +
+   per-expert rank-r deltas with CSE) as an explicit reviewable
+   `kernel_plan` variant through the `plan.rs:44-50` door; no §9 lock
+   touched.
+3. **NEED — carried and sharpened (§16.6.5-1)**: MXFP4 admission. The
+   merge/factorize tiers' quality anchor is *MXFP4 experts at bit-identical
+   fidelity* — without it, transforms stack on Q4_K requant error (5.2%
+   RMSE, wv) and the clean "merge error instead of quant error" trade is
+   lost. Merge/Factorize prove machinery on existing formats; the target
+   tier wants MXFP4.
+4. **NOTE**: (e2) indexer weight surgery is out of bake scope by verdict;
+   the finetune route is §15.3's artifact class, not an admission
+   transform.
+5. **NOTE**: (c1) production is not structurally exclusive — §16.2/W5c
+   competitive framing should claim *admission-time dial + band +
+   provenance + per-slice granularity*, never "others can't merge".
+
+---
+
+*Addendum 5 ends. §13–§16 untouched above (doc base `f92e476`); this
+section is head-cto `fd087622`'s only working-tree edit — mind routes the
+commit.*
