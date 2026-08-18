@@ -78,13 +78,35 @@ locale = "en"
 # the explicit policy predicate. cursor_redintegra resets to the fresh
 # session state (the U1 redintegra precedent) with the count cleared.
 # No server or device handle enters this module.
+#
+# =========================================================================
+# G2 — public generate route
+# =========================================================================
+#
+# generate(config, prompt_ids, admitted decoder) is the canonical loop
+# over the tiny Decoder: prefill → sample → decodere_datum feed-back
+# until max_tokens or the first EOG token {0, 2}.
+# generate_dense is the KV-wired loop over dense.decode_step (SmolLM2).
+# The decoder/engine is an argument (M03: admitted model = generated
+# model). Cancellation is observed at entry, during prefill, and before
+# every sampled token. The cursor rejects rather than truncates.
+import from "gradus:attention" attention
+
+import from "gradus:cache" kv
+
+import from "gradus:decode" decode
+
 import from "gradus:dtype" dtype
+
+import from "gradus:model/dense" dense
 
 import from "gradus:sampling" sampling
 
-import from "gradus:train" train
+import from "gradus:tensor" tensor
 
-import from "gradus:decode" decode
+import from "gradus:tokenizer" tokenizator
+
+import from "gradus:train" train
 
 # -------------------------------------------------------------------------
 # GeneratioError — typed error vocabulary of the generation-config
@@ -113,6 +135,12 @@ union GeneratioError {
     },
     Terminus {
         string message
+    },
+    Cancelata {
+        string message
+    },
+    DecodeDefecta {
+        string message
     }
 }
 
@@ -138,6 +166,12 @@ fn message(GeneratioError e) → string {
             return message
         }
         case Terminus const message {
+            return message
+        }
+        case Cancelata const message {
+            return message
+        }
+        case DecodeDefecta const message {
             return message
         }
     }
@@ -552,5 +586,231 @@ fn cursor_advance(GenerationConfig g, GenerationCursor c) → GenerationCursor �
 # redintegra precedent, context preserved) with the count cleared.
 @ public { }
 fn cursor_reset(GenerationCursor c) → GenerationCursor {
-    return GenerationCursor {session = decode.reset(c.session()), emitted = 0}
+    return GenerationCursor {session = decode.Session {position = 0, context = c.session().context()}, emitted = 0}
+}
+
+# Cursor sitting just after a prompt of length prompt_len: next decode
+# position is the prompt length, generated count is 0. Rejects an empty
+# prompt and a prompt that leaves no room in the context.
+@ public { }
+fn cursor_after_prompt(GenerationConfig g, int prompt_len) → GenerationCursor ⇥ GeneratioError {
+    if prompt_len ≺ 1 {
+        throw variant ConfiguraInvalida {message = "needs at least one prompt token"}
+    }
+    if prompt_len ≥ g.context() {
+        throw variant ConfiguraInvalida {message = "prompt length does not fit context"}
+    }
+    return GenerationCursor {session = decode.Session {position = prompt_len, context = g.context()}, emitted = 0}
+}
+
+# -------------------------------------------------------------------------
+# generate — the public generation loop.
+# -------------------------------------------------------------------------
+
+@ private { }
+fn _observe(decode.Cancellation cancel) → void ⇥ GeneratioError {
+    do {
+        const decode.Cancellation _ ← decode.observe_cancellation(cancel)
+        return
+    }
+    catch err {
+        throw variant Cancelata {message = decode.message(err)}
+    }
+}
+
+@ private { }
+fn _sample(list<f32> logits, sampling.Config c, list<int> history, train.Seed seed) → sampling.Sampler ⇥ GeneratioError {
+    do {
+        return sampling.sample(logits, c, history, seed)
+    }
+    catch err {
+        throw variant DecodeDefecta {message = sampling.message(err)}
+    }
+}
+
+@ private { }
+fn _prefill(list<int> prompt_ids, decode.Decoder m) → tensor.Tensor ⇥ GeneratioError {
+    do {
+        return decode.prefill(prompt_ids, m)
+    }
+    catch err {
+        throw variant DecodeDefecta {message = decode.message(err)}
+    }
+}
+
+@ private { }
+fn _decode_one(int token_id, int position, decode.Decoder m) → tensor.Tensor ⇥ GeneratioError {
+    do {
+        return decode.decodere_datum(token_id, position, m)
+    }
+    catch err {
+        throw variant DecodeDefecta {message = decode.message(err)}
+    }
+}
+
+@ private { }
+fn _last_logits(tensor.Tensor logits, int vocab) → list<f32> ⇥ GeneratioError {
+    const list<int> forma ← logits.shape()
+    if forma.length() ≡ 1 {
+        return logits.data
+    }
+    if forma.length() ≠ 2 {
+        throw variant DecodeDefecta {message = "decode logits must be rank-1 or rank-2"}
+    }
+    const int rows ← forma.get(0) coalesce 0
+    const int cols ← forma.get(1) coalesce 0
+    if rows ≺ 1 or cols ≠ vocab {
+        throw variant DecodeDefecta {message = "decode logits shape does not match the vocabulary"}
+    }
+    var list<f32> row ← vacua
+    var int i ← 0
+    while i ≺ vocab {
+        do {
+            row.append(logits.get([rows - 1, i]))
+        }
+        catch err {
+            throw variant DecodeDefecta {message = tensor.message(err)}
+        }
+        i ← i + 1
+    }
+    return row
+}
+
+@ private { }
+fn _dense_one(DenseEngine engine, (string, int) → dense.Lookup source, int token_id, int position, list<kv.KVCache> layers) → dense.DenseStep ⇥ GeneratioError {
+    do {
+        return dense.decode_step(engine.architecture, source, token_id, position, engine.epsilon, engine.scale, engine.rope_dim, engine.rope, layers)
+    }
+    catch err {
+        throw variant DecodeDefecta {message = dense.message(err)}
+    }
+}
+
+# Public generate: config + prompt ids + the admitted decoder.
+# Prefill produces the last-row logits; each later step is
+# decodere_datum + sampling.sample. Stops after the first EOG token
+# (tokenizator.est_eog — set {0, 2}) or at the cursor ceiling.
+# The KV-wired loop is generate_dense (dense.decode_step).
+@ public { }
+fn generate(GenerationConfig g, list<int> prompt_ids, decode.Decoder m) → list<int> ⇥ GeneratioError {
+    return generate_cancelled(g, prompt_ids, m, decode.fresh_cancellation())
+}
+
+@ public { }
+fn generate_cancelled(GenerationConfig g, list<int> prompt_ids, decode.Decoder m, decode.Cancellation cancel) → list<int> ⇥ GeneratioError {
+    _observe(cancel)
+    if prompt_ids.length() ≺ 1 {
+        throw variant ConfiguraInvalida {message = "needs at least one prompt token"}
+    }
+    if prompt_ids.length() ≥ g.context() {
+        throw variant ConfiguraInvalida {message = "prompt length does not fit context"}
+    }
+    if prompt_ids.length() ≻ m.context() {
+        throw variant ConfiguraInvalida {message = "prompt length does not fit context"}
+    }
+    const sampling.Config drawn ← config(g)
+    var train.Seed rng ← seed(g)
+    const tensor.Tensor pref ← _prefill(prompt_ids, m)
+    var list<f32> last ← _last_logits(pref, m.vocabulary())
+    var GenerationCursor cursor ← cursor_after_prompt(g, prompt_ids.length())
+    var list<int> tokens ← vacua
+    var list<int> history ← vacua
+    var bool finis ← false
+    while token_allowed(g, cursor) and not finis {
+        _observe(cancel)
+        const sampling.Sampler outcome ← _sample(last, drawn, history, rng)
+        const int token ← outcome.token_id()
+        tokens.append(token)
+        history.append(token)
+        rng ← outcome.seed()
+        cursor ← cursor_advance(g, cursor)
+        if tokenizator.est_eog(token) {
+            finis ← true
+        }
+        else {
+            if token_allowed(g, cursor) {
+                const tensor.Tensor step ← _decode_one(token, cursor.session().position() - 1, m)
+                last ← _last_logits(step, m.vocabulary())
+            }
+            else {
+                finis ← true
+            }
+        }
+    }
+    return tokens
+}
+
+# Dense-engine carrier for generate_dense (the SmolLM2 / G1 path).
+@ public { }
+class DenseEngine {
+    dense.DenseConfig architecture
+    f32 epsilon
+    f32 scale
+    int rope_dim
+    attention.RopeConfig rope
+}
+
+@ public { }
+fn construct_dense_engine(dense.DenseConfig architecture, f32 epsilon, f32 scale, int rope_dim, attention.RopeConfig rope) → DenseEngine {
+    return DenseEngine {architecture = architecture, epsilon = epsilon, scale = scale, rope_dim = rope_dim, rope = rope}
+}
+
+@ public { }
+fn default_dense_engine() → DenseEngine {
+    return DenseEngine {architecture = dense.DenseConfig {layers = 0, heads = 0, kv_heads = 0, head_dim = 0, hidden_dim = 0, vocab = 0, tied = false}, epsilon = 0.0, scale = 0.0, rope_dim = 0, rope = attention.default()}
+}
+
+# Same loop as generate, over dense.decode_step and a per-layer KV cache.
+# Used by the SmolLM2 oracle exemplum. EOG-stop applies: SmolLM2 EOS=2
+# is in the admitted set {0, 2}, so a greedy continuation that would
+# have been G1's unrestrained [30, 2, 198] becomes [30, 2].
+@ public { }
+fn generate_dense(GenerationConfig g, list<int> prompt_ids, DenseEngine engine, (string, int) → dense.Lookup source, list<kv.KVCache> layers, decode.Cancellation cancel) → list<int> ⇥ GeneratioError {
+    _observe(cancel)
+    if prompt_ids.length() ≺ 1 {
+        throw variant ConfiguraInvalida {message = "needs at least one prompt token"}
+    }
+    if prompt_ids.length() ≥ g.context() {
+        throw variant ConfiguraInvalida {message = "prompt length does not fit context"}
+    }
+    const sampling.Config drawn ← config(g)
+    var train.Seed rng ← seed(g)
+    var list<kv.KVCache> state ← layers
+    var tensor.Tensor last ← tensor.default()
+    var int i ← 0
+    while i ≺ prompt_ids.length() {
+        _observe(cancel)
+        const int tok ← prompt_ids.get(i) coalesce 0
+        const dense.DenseStep step ← _dense_one(engine, source, tok, i, state)
+        last ← step.logits()
+        state ← step.layers()
+        i ← i + 1
+    }
+    var GenerationCursor cursor ← cursor_after_prompt(g, prompt_ids.length())
+    var list<int> tokens ← vacua
+    var list<int> history ← vacua
+    var bool finis ← false
+    while token_allowed(g, cursor) and not finis {
+        _observe(cancel)
+        const sampling.Sampler outcome ← _sample(last.data, drawn, history, rng)
+        const int token ← outcome.token_id()
+        tokens.append(token)
+        history.append(token)
+        rng ← outcome.seed()
+        cursor ← cursor_advance(g, cursor)
+        if tokenizator.est_eog(token) {
+            finis ← true
+        }
+        else {
+            if token_allowed(g, cursor) {
+                const dense.DenseStep step ← _dense_one(engine, source, token, cursor.session().position() - 1, state)
+                last ← step.logits()
+                state ← step.layers()
+            }
+            else {
+                finis ← true
+            }
+        }
+    }
+    return tokens
 }
