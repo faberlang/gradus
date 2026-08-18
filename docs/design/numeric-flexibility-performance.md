@@ -375,6 +375,8 @@ kernel-code branches.
 | Compute class per cell | Radix plan resolution (fail-closed) | per §3.2 |
 | KV structure + dtypes + v_layout | `KVStructure` (Gradus) → plan bundle | Dense / F16 / family-linked |
 | LayerPlan | Gradus model config | all-Normal |
+| AblationSpec (recipe — §13) | Gradus model config, beside LayerPlan | empty (no transforms; model is base-as-stored) |
+| Ablation delivery mode (§13.1) | derived from transform type — not a user knob | bake for weight/bias transforms, runtime for activation projection |
 | Batch / ubatch | execution session admission (Faber) | prefill 2048/512 (llama.cpp parity, `common.h:443-444`), decode 1 |
 | Tile/workgroup per shape class | lowering specialization | 8×8 today; per-class after measurement |
 | Fusion | compiler-internal (locked boundary) | on for elementwise-only chains |
@@ -408,6 +410,9 @@ run — `benchmark-method.md` + lessons §2.2 evidence labels).
 | Tile/workgroup per shape class | 8×8 | prefill compute-bound: larger tiles raise arithmetic intensity (llama.cpp CUDA MMQ tiles are much larger than 8) | shared-memory limit is conservative 32 KiB (`plan.rs:4-8`) — needs the per-device limit channel the constant already anticipates |
 | F16 activations on elementwise chains | off until measured | elementwise chains are bandwidth-bound; F16 IO halves bytes while accumulation stays f32 | envelope derivation; OF plan must carry dtype facts (typed plans make this safe) |
 | Layer Skip/SkipAttention/Obliterate | all-Normal | drops whole GEMM families — gain ∝ share of removed FLOPs/bandwidth; uniquely ours | quality divergence by construction → **separate acceptance policy** (§9); per-layer oracles |
+| Ablation bake — weight orthogonalization (§13.2) | off (empty AblationSpec) | zero runtime cost: weights transformed once at materialization; effective tensors are ordinary tensors, no new plan variants | load-time CPU O(2·D²) per target matrix; storage policy per quantized target — declared requant band or F32-promote bytes (§12-5); admission digest verification |
+| Ablation runtime — activation projection (§13.2) | off | one fused elementwise projection per site per token (OF-1/OF-2 carrier, identical shape to §5.2 Obliterate); enables direction search without re-bake | one extra elementwise op per site per decode step; divergence band per NEED `e52dd09a` (§13.4); direction tensor resident (D floats per site) |
+| Ablation bake — bias edit (§13.2) | off | bias folded at materialization (today's biases are synthesized zero — `dense.fab:380-385`), zero runtime cost | none beyond the divergence band |
 | Batch/ubatch (prefill) | 2048/512 | fills the device; too-large ubatch spills workspace | workspace sizing vs partition ledger class budgets (`partition.rs:95-122`) |
 | Repack to backend-native layout | off (direct-consume) | llama.cpp Metal repacks some formats for vectorized loads (lessons §9.3) | setup time + peak memory; must be declared repack, never "direct" (anti-pattern list, lessons §7.4 `:384-397`) |
 | int8 activation dot (CPU regime) | **not admitted** | would be the CPU throughput lever (llama.cpp CPU `vec_dot_type`) | **amendment to f32-accumulation lock** — need to mind; GPU waves never depend on it |
@@ -538,6 +543,18 @@ improves vs tiled path on the dense rung, tokens identical.
 specialization; per-mode acceptance rows). Done-when: skip/obliterate proba
 rows green; sliced-run acceptance policy decided (§9 need).
 
+**Wave 5b — ablation layer** (§13 addendum; after wave 5 — builds on LayerPlan
+config + acceptance rows; W5b-U4's manifest fields land with wave 6's
+admission manifest).
+
+| Unit | Repo/scope | Done-when |
+| --- | --- | --- |
+| W5b-U1 `AblationSpec` type + admission validation | gradus `src/model/` (spec type beside LayerPlan: transform list, backward-only reference rule, unit-direction check, duplicate-target rejection — §13.3) | proba: empty-spec identity pin (spec-absent ≡ base-as-stored) + validation negatives (forward reference, wrong-length direction, duplicate target, zero vector) green |
+| W5b-U2 weight bake at materialization | gradus `src/model/dense.fab` resolver seam + `dequant.fab` (orthogonalize after dequant, before adapter handoff; storage policy per §12-5; per-target digest computed at bake) | proba: baked f32 tensor pinned against a reference-implementation golden; requant path carries a declared band row; non-admitted GGML id on a target still fails closed (`packed.rs:122-130` pattern) |
+| W5b-U3 runtime activation projection + Obliterate unification | gradus `forward` + LayerPlan (`ProjectActivation` at a site ≡ §5.2 `Obliterate { direction }` with α=1 at that block; duplicate-site entries across LayerPlan and AblationSpec rejected) | forward proba: projection pins at each site + duplicate-site negative green |
+| W5b-U4 admission provenance + digest verification | gradus manifest/digest helpers (base-GGUF digest + AblationSpec digest + per-target baked-tensor digests; load verifies, mismatch fails closed); wave-6 manifest schema consumes the fields (§12-6) | negative test: tampered base file or tampered recipe digest → load rejected; digest helper unit pins |
+| W5b-U5 acceptance rows + coverage oracle | gradus proba/docs extending NEED `e52dd09a` to layer-plan-modified execution (§13.4); one coverage probe expressing a published abliterated recipe as base+spec on a small dense rung (§13.5) | pinned effective-model band rows green; band receipt committed |
+
 **Wave 6 — knob surface + perf harness** (admission manifest for §6.2 dials;
 `faber run` flags parse-only fail-closed; benchmark protocol harness reporting
 prefill/decode separately vs pinned llama.cpp). Done-when: one dense-rung
@@ -563,10 +580,1063 @@ OF-3..5, each with fail-closed negatives and a first failing oracle. Estimated
 1. **GI4 KV-dtype amendment** (§9): **settled 2026-08-18** — `KvCacheLayout.dtype`
    opened to `{F32, F16, Q8_0, Q4_K}`, F16 default (need `1d3967ed`). Cost:
    envelope derivations.
-2. **Layer-sliced acceptance policy** (§5.2): default = sliced runs carry their
+2. **Layer-sliced acceptance policy** (§5.2, §13.4): default = sliced runs carry their
    own recorded band (logit-band vs pinned sliced reference), never inheriting
-   the GI0 exact-top-1 contract.
+   the GI0 exact-top-1 contract. NEED `e52dd09a` carries this; the §13 addendum
+   recommends folding it to **layer-plan-modified execution** (slice OR ablation
+   recipe) — one policy, one acceptance shape, effective model pinned as its own
+   reference.
 3. **Int8 activation dot (CPU regime)**: default = not admitted; revisit only
    if a CPU route becomes a product goal.
 4. **Perf-harness ownership**: default = one faber-side benchmark unit (wave 6)
    using gradus `benchmark-method.md`; llama.cpp runs offline as comparator.
+5. **Baked-tensor storage policy for quantized ablation targets** (§13.2):
+   orthogonalizing a Q4_K/Q5_K/Q6_K/Q8_0 tensor means dequant → f32 transform →
+   re-encode, which is a *declared* transformation, not as-stored loading
+   (§6.2 row 1). Default = same-format re-encode (byte-parity of the model
+   footprint, requant band recorded); explicit per-target F32/BF16 promotion is
+   the override (bytes cost, tighter band). Never silent — the AblationSpec
+   names the policy per entry.
+6. **Admission-manifest recipe provenance** (§13.3, wave 6): add base-GGUF
+   digest + AblationSpec digest + per-target baked-tensor digests to the
+   admission manifest schema; load verification fails closed on mismatch.
+   Default = adopt. This is what makes "base + recipe" a *checkable* claim
+   rather than a hope — the manifest is derived, never an authority.
+
+---
+
+## 13. Addendum — Ablation layer (inline layer that modifies earlier layers)
+
+**Status**: UNCOMMITTED DRAFT addendum to the design committed at `4004e32`
+(mind routes the commit). Operator ask: an inline layer construct whose
+semantics are a *transformation of earlier layers*, motivated by the
+abliteration technique — refusal-direction orthogonalization of weights;
+the HF "abliterated" corpus is pre-baked checkpoints of exactly this
+(failspy/Llama-3-8B-Instruct-abliterated model card: "orthogonalized bfloat16
+safetensors weights … the strongest refusal direction orthogonalized out";
+Arditi et al., *Refusal in Language Models Is Mediated by a Single Direction*).
+Section numbers §1–§12 refer to the committed doc; gradus/radix citations are
+live main as of `012d411`/`8c5c6a3a8`.
+
+### 13.0 Mind's hypothesis, validated with one correction
+
+**Hypothesis**: the structural play is lowering-time baking — base GGUF +
+ablation recipe → orthogonalized weights materialized at specialization, zero
+runtime cost, no checkpoint fork; runtime projection is the other fork.
+
+**Verdict: confirmed, with the two forks serving different *workflow roles*, not
+just different delivery.** The published abliteration pipeline itself runs
+inference-time direction projection first (a `direction_ablation_hook` on every
+residual site, evaluated over candidate directions), then bakes the selected
+direction into weights once (mlabonne, *Uncensor any LLM with abliteration*,
+HF blog 2024 — the tutorial the huihui-ai cards cite). So:
+
+- **Runtime projection is the authoring loop** — cheap to attach/detach per
+  candidate direction, per site, per α; this is how directions are *searched*.
+- **Baking is the product form** — zero runtime cost, and (unlike HF) we get it
+  **without forking a checkpoint**: the recipe travels beside the base GGUF,
+  the transform is applied once at weight materialization, and the effective
+  tensors are ordinary tensors from the plan's point of view.
+
+**Correction to carry**: the two forks are *not numerically equivalent* —
+baked weight orthogonalization also removes the direction from the embedding
+write and every writer's output rows, while runtime projection acts only at
+its declared sites (Arditi et al. note intervention and orthogonalization as
+distinct operators). They therefore need distinct acceptance rows under the
+band policy (§13.4); one is not a drop-in approximation of the other.
+
+### 13.1 Semantics and delivery
+
+Delivery mode is **derived from transform type, not chosen** (no free knob,
+§6.2 discipline):
+
+| Transform | Delivery | Mechanism | Runtime cost |
+| --- | --- | --- | --- |
+| Weight orthogonalization (§13.2) | **bake** at materialization | applied once in the `fons` resolver seam — dequant → f32 transform → re-encode/promote → hand the adapter an ordinary stored-layout tensor (`dense.fab:125` `_source` seam; K-major load contract, design §1 item 2, unchanged — the transform is layout-blind, it happens in f32 after dequant) | **zero** — a downstream kernel/plan cannot distinguish a baked tensor from a native one; no new recipe variants (kernel_plan closed set HONORED, §9 row 1) |
+| Activation projection (§13.2) | **runtime** at the entry's site | one fused elementwise projection `a ← a − α(a·d)d` per site per token — exactly the OF-1/OF-2 typed elementwise carrier §5.2 names for `Obliterate` | one elementwise op per site per step; D-length direction resident |
+| Bias edit (§13.2) | **bake** (V1) | folded into the materialized bias; today's rows synthesize zero biases (`dense.fab:380-385` `_no_bias`), so bake = replace the zero with δ | **zero** |
+
+Cost entries added to §7 (three rows after the LayerPlan row). Locks honored, none
+amended by this addendum: storage authority (a baked tensor is a *declared*
+transform with per-entry storage policy §12-5, never a silent requant);
+EXEC-02 decision 4 (F32 promotion is per-tensor, bounded to the target set,
+ledger-counted by the partition budget classes — not whole-model expansion);
+GI4 `KvCacheLayout` untouched (§13.4).
+
+### 13.2 V1 transformation set (typed admission, fail-closed each)
+
+```text
+AblationTransform =
+  OrthogonalizeWeight { targets: [(layer, matrix)], direction: vec[D],
+                        alpha: f32 ∈ (0,1], storage: SameFormat | Promote(F32|Bf16) }
+      # matrix ∈ { OProj, DownProj, EmbedTokens } — the residual-stream writers
+      # (Arditi set: attn.o_proj, mlp.down_proj, W_E). W ← W − α·d(dᵀW) in the
+      # residual-side row space, computed in f32 after dequant.
+  | EditBias { target: (layer, bias), delta: vec }      # bias ∈ {Q,K,V,Gate,Up,Down}
+  | ProjectActivation { site: BlockOut(layer) | FinalPreNorm,
+                        direction: vec[D], alpha ∈ (0,1] }
+```
+
+Fail-closed admission, each rule testable as a negative (W5b-U1):
+
+- **`OrthogonalizeWeight`**: layer indices in bounds; `direction.length ==`
+  target residual dim (`hidden_dim` for OProj/DownProj rows and embed rows);
+  direction non-zero and normalized at admission (the normalized bytes are
+  what the spec digest records — determinism); α in (0,1] (α=1 = full
+  orthogonalization, α<1 = scaled/"projected" variant as in grimjim's
+  projected abliteration); one transform per `(layer, matrix)` — re-targeting
+  a transformed tensor fails closed, composition is expressed as one entry
+  with pre-composed parameters; GGML storage id of the target must be in the
+  admitted set (unknown id → reject, `packed.rs:122-130` pattern); `storage`
+  policy mandatory on quantized targets (§12-5).
+- **`EditBias`**: length must equal the projection width (`qwidth`/`kwidth`
+  for Q/K/V per `dense.fab:368-371`, MLP width `f` per `dense.fab:375-379`);
+  unknown bias name → reject.
+- **`ProjectActivation`**: site in bounds; duplicate site across LayerPlan
+  `Obliterate` and AblationSpec fails closed (they are the same construct —
+  `Obliterate { d }` ≡ `ProjectActivation { BlockOut(l), d, α=1 }`; wave
+  W5b-U3 unifies them rather than carrying two spellings).
+
+Deliberately **not** in V1: rank-k subspace rejection (Heretic-style —
+direction is a single vector; a `basis: mat` variant is a typed-admission
+extension), norm-preserving/biprojected variants (transform fixed to the
+subtractive projection), LoRA-style additive weight deltas (different family;
+belongs to fine-tune-artifact loading if ever admitted). Named, not silent.
+
+### 13.3 Representation and the reference discipline
+
+**Where the spec lives — both, with one authority.** The `AblationSpec` is
+authored **inline in Gradus model config**, beside the LayerPlan (§5.2): it is
+semantic surface (it changes the computed function), so it belongs where the
+LayerPlan lives, consumed by `forward` (interpreted: bake at first
+materialization; runtime entries emit their projection at their site) and by
+lowering (bake at specialization). The **model manifest** (wave 6 admission
+manifest, §6.2) records *derived provenance*: base-GGUF digest + AblationSpec
+digest + per-target baked-tensor digests, verified fail-closed at load
+(§12-6). Authority split: the inline spec is the single authoring truth; the
+manifest is a derived verification record — a manifest without a matching spec
+digest is rejected, never silently trusted.
+
+**Reference discipline for a sequential executor.** `forward` today is a
+strict `while stratum ≺ cfg.layers` loop with per-layer canonical-name
+resolution (`dense.fab:355-366`) — no layer sees another. The ablation entry
+is the first *graph-level* construct, and the discipline that keeps sequential
+execution sound is:
+
+1. **Backward reference only** — every entry has a `position ∈ [0,
+   cfg.layers]` and every named target layer satisfies `target < position`.
+   This is the operator's definition made structural ("modifies *earlier*
+   layers") and it is exactly what makes the runtime form well-ordered: by the
+   time an entry's position executes, every target it names has executed.
+2. **A bake entry emits nothing at its position** — it is a compile-time-only
+   node; the transform has already happened at materialization. A runtime
+   entry (`ProjectActivation`) emits its one projection at its position.
+3. **No re-transformation** — a tensor may appear in exactly one transform
+   entry (§13.2); ordered composition is rejected, not silently applied.
+4. **Validation order** — the AblationSpec validates against the *resolved*
+   LayerPlan (after Skip/SkipAttention resolution), not the authored one
+   (§13.4).
+
+This gives graph-level semantics without graph-level execution: the entry list
+plus the backward rule is a DAG whose only crossing edges are
+backward-in-position, so the sequential loop with materialization-time bakes
+computes exactly the composed graph.
+
+### 13.4 Interactions (LayerPlan, KV, acceptance band)
+
+- **LayerPlan on the ablation entry itself**: `Skip`/`SkipAttention`/
+  `Obliterate` are per-block modes; an AblationSpec entry is not a block, so
+  those modes do not apply to it. A bake entry has no position-time behavior
+  to skip; a `ProjectActivation` entry at position p with `Obliterate` on
+  block p is a duplicate-site rejection (§13.2), not a composition.
+- **LayerPlan on the targets** (validated against the *resolved* plan):
+  - target block `Skip` → its weights never execute → the transform is dead →
+    **admission fails closed** (config error: remove the entry or unskip).
+  - target block `SkipAttention` → `OProj` is dead (reject `OProj` on it),
+    `DownProj`/bias entries on the surviving MLP remain live (admitted).
+  - `Obliterate { d₁ }` on a block that also receives `OrthogonalizeWeight {
+    d₂ }`: legal in both orders d₁=d₂ (redundant — the writer already writes
+    ⊥d, the projection is ≈identity; validator notes, does not reject) and
+    d₁≠d₂ (both apply; baked transform first, runtime projection second —
+    order is fixed by construction, §13.3).
+- **KV structure**: every V1 transform preserves all `KVStructure` facts
+  (§4.3) — head counts, head_dim, slots, dtypes are untouched; `EditBias` on
+  K/V and any transform upstream change K/V *values*, never structure. No GI4
+  amendment arises from this addendum; the §4 KV-dtype need is unrelated.
+- **Acceptance band — fold into NEED `e52dd09a`**: that need already proposes
+  "sliced runs carry their own recorded band, never inheriting GI0". The
+  addendum recommends renaming its scope to **layer-plan-modified execution**
+  (LayerPlan slice OR ablation recipe) with one acceptance shape: the
+  *effective model* (base + LayerPlan + AblationSpec, identified by the
+  manifest digests of §12-6) is pinned as its own reference and carries a
+  recorded band; identity mode (all-Normal + empty AblationSpec) remains
+  GI0-exact, byte-identical to base-as-stored. Two forks, two bands (§13.0
+  correction): baked runs are compared against the pinned effective model;
+  runtime-projection runs carry their own band rows. Where a published
+  abliterated checkpoint exists for the same base, it is *also* an admissible
+  comparator oracle (§13.5) — band, not exact, because their baking pipeline
+  ran on BF16/F16 sources and ours on the GGUF-as-stored.
+
+### 13.5 Coverage — the HF abliterated corpus as base + recipe
+
+**Construct coverage: full for the refusal-direction family.** The entire
+published technique is `OrthogonalizeWeight` entries with α=1 plus (optionally)
+runtime probes during direction search:
+
+1. **`failspy/Llama-3-8B-Instruct-abliterated`** (card read 2026-08-18): base
+   `meta-llama/Llama-3-8B-Instruct`, "orthogonalized bfloat16 safetensor
+   weights" per Arditi et al., generated by `ortho_cookbook.ipynb`; GGUF quants
+   published separately. The notebook's bake step orthogonalizes the embedding
+   and every block's `o_proj` + `down_proj` — i.e. **one `AblationSpec` with
+   1 + 2·L `OrthogonalizeWeight` entries (α=1, matrices `EmbedTokens` +
+   per-layer `OProj`/`DownProj`)** against the *original* Llama-3-8B-Instruct
+   GGUF. Expressed exactly; zero runtime cost; no 8B checkpoint fork.
+2. **`huihui-ai/Qwen2.5-7B-Instruct-abliterated-v2`** (card read 2026-08-18):
+   card credits FailSpy for "original code and technique" and cites the
+   mlabonne article; "-v2" is an "improvement over the previous one" — the
+   family's refinements are subset/scaled applications (fewer matrices, α<1)
+   of the same transform, which the per-entry α and per-matrix targeting of
+   §13.2 covers directly. Maps as base `Qwen/Qwen2.5-7B-Instruct` GGUF +
+   spec; the direction must be re-mined (below).
+
+**Bit-exact reproduction honestly bounded**: the cards publish *checkpoints*,
+not *recipes* — neither the direction vector nor the prompt sets are part of
+the artifact. Reproduction therefore re-derives the direction externally
+(diff-in-means over harmful/harmless activations, last-token position, per
+Arditi/mlabonne — mining runs on Gradus's runtime projection mode with
+activation capture, or out-of-tree exactly as the HF authors' notebooks do)
+and lands **within a recorded band** of the published checkpoint's behavior,
+never claimed equal. Tensor-space verification is stronger than logit-space
+where sources align: if we bake from a BF16/F16 GGUF of the same base and
+possess the direction, baked tensors compare elementwise against the published
+safetensors up to the declared storage policy (§12-5) — that comparison is a
+W5b-U5 coverage-oracle row, not a guarantee.
+
+**Not covered by V1** (named, §13.2): Heretic-style rank-k subspace rejection,
+norm-preserving biprojection, DPO-"healed" variants (`mlabonne/
+NeuralDaredevil-8B-abliterated` is abliteration *plus* a DPO fine-tune — the
+fine-tune half is not a recipe over the base and is out of scope by
+construction).
+
+---
+
+*Addendum ends. §1–§12 are the committed design (`4004e32`); this section is
+the uncommitted draft layer. Amendment needs §12-5/§12-6 and the NEED
+`e52dd09a` fold are filed to mind with this report.*
+
+---
+
+## 14. Addendum 2 — the inverse census: what llama.cpp structurally cannot express
+
+**Status**: DRAFT (uncommitted; mind routes the commit)
+**Author**: head-cto (Vivi handle `cbea0c29`), 2026-08-18
+**Ask**: operator — a systematic census of tuning knobs/concepts that are
+**structurally impossible** in llama.cpp but natural here. This systematizes
+§8.2's six one-off bullets into a ranked census and extends it with four new
+items (I5–I7, I9). §13 (ablation layer, sibling seat `c7174a33`) is left
+untouched; I5's LayerPlan item cross-references it rather than restating.
+**Evidence pins**: `~/work/llama.cpp` @ `c8e03ce81` (same pin as §1; every
+line below re-verified today), gradus @ `012d411` + design commit `4004e32`
++ uncommitted addenda (§13, §14), radix main and hosts partition contract
+(citations re-verified 2026-08-18).
+
+### 14.1 The five blockers, re-verified at file:line
+
+Every "impossible" claim below reduces to one of five structural facts. Each
+is architectural — a property of what the shipped artifact *is*, not a TODO:
+
+| # | Blocker | Evidence (`~/work/llama.cpp`) |
+| --- | --- | --- |
+| B1 | **The kernel set is a build artifact.** Kernels are static function-pointer tables and precompiled pipelines inside libggml; the model does not exist when the binary is built, and no runtime codegen path exists anywhere in the tree (device "compilation" is pipeline instantiation from a fixed embedded library). | traits `ggml/src/ggml.c:631`; static CPU kernel table `ggml/src/ggml-cpu/ggml-cpu.c:214`; runtime op dispatch `ggml-cpu.c:1836,2330`; CUDA *selection among* prebuilt families by heuristic `ggml/src/ggml-cuda/ggml-cuda.cu:1783-1809`; Metal pipelines from fixed embedded source `ggml/src/ggml-metal/ggml-metal-device.m:415`, runtime mul_mat dispatch `ggml-metal/ggml-metal-ops.cpp:360-364` |
+| B2 | **The checkpoint carries data, never code.** GGUF is tensors + hparams; the model *program* is a per-arch C++ subclass compiled into the binary. Unknown type ids and unknown arches fail at load. | per-arch pure-virtual builder `src/llama-model.h:697,749`; unknown tensor type hard-fails `ggml/src/gguf.cpp:705-707`; arch names are a closed compile-time map `src/llama-arch.cpp:8` |
+| B3 | **No compiler in the loop.** The graph is built at runtime by hand-written C++ builders; "specialization" is graph *reuse* keyed on topology, never code emission. | builders `src/llama-graph.cpp:1480+`; reuse contract "full topology has to be uniquely determined by these parameters" `src/llama-context.cpp:1332-1335` |
+| B4 | **Topology and policy are runtime cparams over a fixed builder.** | flash-attn branch at graph build `src/llama-graph.cpp:37`; placement heuristic `src/llama-model.cpp:1318-1333`; batch knobs `common/common.h:443-444` |
+| B5 | **CPU execution is one generic thread pool.** Work partition is runtime chunking, not per-op/per-shape constants. | pool `ggml-cpu.c:480-514`, barrier `:575` |
+
+**Class rule**: an item is `IMPOSSIBLE` only if expressing it requires
+changing B1–B5 (a new engine artifact), not merely writing more code inside
+the existing shape. Items llama.cpp could converge on with effort are
+`NEAR-MISS` (§14.4).
+
+### 14.2 Census, ranked by value-per-cost
+
+| # | Knob / concept | Class | Blocked by | What it buys | Our seam | Cost | vs wave plan |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| I1 | Whole-graph typed elementwise fusion | IMPOSSIBLE | B1+B3 | kills bandwidth-bound intermediate round-trips systematically | OF plans | S (mostly paid) | rides OF-3..5 (behind R-PACK-05) |
+| I2 | Per-specialization kernel codegen (constants burned in; regime depth; work partition) | IMPOSSIBLE | B1 (+B5) | constant-folded dequant, baked GQA/head_dim/rope, per-shape tiles, per-regime bodies | kernel_plan + device programs | M | wave 4 is the first rider |
+| I3 | Authored per-layer-set KV structure | IMPOSSIBLE | B2+B4 | SWA memory bounds, per-layer-set KV dtype/layout mixes, fail-closed bundles | `KVStructure` (wave 2) | M | wave 2 filed |
+| I4 | Semantic layer surgery (LayerPlan + ablation recipes) | IMPOSSIBLE | B2+B4 | verified skip/streamline/obliterate/ablate with per-mode acceptance | LayerPlan (§5) + §13 AblationSpec | S–M | waves 5 + 5b filed |
+| I5 | Model-as-program architecture admission | IMPOSSIBLE | B2 | new/mutated architectures as source, stock runtime | gradus adapters + reserved recipes | L per family | new; W7-U3 parked |
+| I6 | Plan-layer format extension (runtime contract never moves) | IMPOSSIBLE | B1+B2 | new storage formats without a runtime release; model-carried recipes possible | abi/packed plans + host ABI | S–M per format | new; W7-U4 parked behind OD |
+| I7 | Plan-fact admission budgeting (byte-exact, frozen) | IMPOSSIBLE (facts) / near-miss (ledger mechanics) | B1 | per-emitted-kernel workspace/scratch facts → admission as proof | partition ledger (exists) | S | enabler; waves 2–6 consume |
+| I8 | Guaranteed-inline device fragments, compiler-enforced | IMPOSSIBLE (guarantee) | B1 | one dequant/unpack body spliced into every emitted kernel | NucleumRole Fragment | S–M | fragments goal, landing |
+| I9 | Per-specialization derived numeric envelopes | IMPOSSIBLE (derivative) | B1 (no specialization axis ⇒ no per-specialization contract) | every emitted specialization carries a machine-checked band | numeric policy + ORACLE | S–M | per-wave envelope derivations |
+
+### 14.3 Dossiers
+
+**I1 — Whole-graph typed elementwise fusion.** (a) ggml ops are opaque
+precompiled entries; a *general* fusion pass would need kernel source to
+recombine at or before runtime, and none exists (B1: traits at
+`ggml.c:631`; CUDA fusion is hand-enumerated at specific sites —
+`ggml-cuda.cu:3480-3642` GLU+MMVQ, `fattn.cu` — each a bespoke C++/CUDA
+artifact; B3: the graph has no IR between builder and kernel table). (b)
+removes whole classes of global-memory round-trips on bandwidth-bound
+elementwise chains (norm/rope/residual/activation); fusion decisions are
+typed and checked, not heuristic. (c) `radix/crates/radix-mir/src/elementwise_plan.rs:1-10`
+(typed plan; never a silent `Elementwise` fallback). (d) S — OF-1/OF-2
+landed; remaining cost is OF-3..5 emitter migration, already scheduled
+behind R-PACK-05. (e) rank 1: highest value-per-cost because the seam is
+paid; strictly beyond llama.cpp by construction.
+
+**I2 — Per-specialization kernel codegen.** (a) the kernel set is compiled
+before any model exists (B1: static tables `ggml-cpu.c:214`, precompiled
+pipelines `ggml-metal-device.m:415`); runtime "specialization" is selection
+among 2–3 prebuilt families by heuristic (`ggml-cuda.cu:1783-1809`), and
+work partition is generic runtime chunking (B5: `ggml-cpu.c:480-514,575`).
+llama.cpp *cannot* burn per-model constants — the code does not exist to
+burn them into. (b) constant-folded block geometry, unrolled dequant, baked
+GQA ratio/head_dim/rope policy, per-shape-class tiles, per-regime bodies
+(GEMV-shaped decode vs GEMM prefill), per-shape work-partition constants —
+each removes runtime branches and improves register/occupancy choices. (c)
+plan constants are named precisely so backends never hardcode
+(`radix/crates/radix-mir/src/kernel_plan/plan.rs:12-24`); closed recipe set
+with explicit reviewable additions (`plan.rs:44-50`); emitted artifacts are
+device programs (`radix/crates/radix-mir/src/device_program/program.rs:16-22`).
+(d) M — the recipe families are the cost; wave 4 (decode regime) is the
+first rider. (e) rank 2: the mechanism every later perf knob multiplies.
+
+**I3 — Authored per-layer-set KV structure.** (a) cache classes are C++
+types selected per architecture at admission
+(`src/llama-model.cpp:2057-2300` `create_memory` switch; §4.2); a
+user-authored mix (per-layer-set dtype, custom windows, mixed dense/SWA in
+one model) means writing a new C++ cache class + builder — checkpoint
+carries no code (B2) and the builder is fixed (B4). (b) SWA bounds KV bytes
+by window; per-layer-set KV dtype halves-or-quarters the decode-bandwidth
+stream where it matters; infeasible bundles rejected at plan validation.
+(c) `KVStructure` design §4.3 on `gradus/src/cache.fab:20-45` (semantic
+contract already proven as the mutation-rule surface). (d) M. (e) rank 3:
+wave 2 already filed; biggest long-context lever after flash attention.
+
+**I4 — Semantic layer surgery.** (a) llama.cpp's graph builders hardcode
+the layer loop; its layer *filters* are memory-structure facts wired in C++
+(`llama-model.cpp:2080-2121` MSA/MTP), not an authoring surface — skip,
+streamline, obliterate, or ablate requires patching the engine (B2+B4).
+(b) drops whole GEMM families (gain ∝ removed FLOPs/bandwidth) and enables
+model-editing as a *verified* capability with per-mode acceptance. (c)
+LayerPlan §5.2 + the §13 AblationSpec (bake/projection) — this census adds
+nothing; it confirms the class and notes both spellings are already
+unified by W5b-U3. (d) S–M. (e) rank 4: waves 5 + 5b carry it.
+
+**I5 — Model-as-program architecture admission.** (a) each architecture is
+a C++ subclass with a pure-virtual graph builder
+(`src/llama-model.h:697,749`); the arch string must exist in a closed
+compile-time map (`src/llama-arch.cpp:8`). A new or mutated architecture
+(new attention family, MoE routing variant, SSM hybrid, custom rope) cannot
+be expressed by any artifact a user ships — only by an engine release or
+fork (B2). (b) capability, not perf: run models upstream does not know,
+with zero upstream latency, on a stock runtime; adapter source is public
+Faber, not engine C++. (c) gradus adapters (`gradus/src/model/dense.fab`
+is the pattern) + reserved recipes `GroupedMatMul`/`SsmConv1d`/`SsmScan`
+(`kernel_plan/plan.rs:105-112`, admission pending R-PACK-03/04 — honest:
+the MoE/SSM arms are reserved, not landed); host ABI unchanged
+(`radix/crates/radix-host-abi/src/lib.rs:1-28`). (d) L per family.
+(e) rank 5: highest strategic value, highest unit cost — park as
+campaign-level (W7-U3), do not inline into waves 1–6.
+
+**I6 — Plan-layer format extension.** (a) format knowledge is compiled into
+the runtime: traits frozen in the binary (`ggml.c:631`), the loader
+hard-fails unknown tensor types (`gguf.cpp:705-707`) — an old llama.cpp
+binary cannot run a model in a newer quant format at all; formats are added
+by libggml releases (MXFP4/NVFP4 rows in `ggml-cpu.c:214` are the release
+artifact of that process). For us the dequant lives in *lowering*: a new
+format is a plan admission (explicit reviewable change, fail-closed set
+`kernel_plan/packed.rs:122-130`) plus emitted per-model kernels, and the
+runtime contract (`__faber_rt_v1_*`) never moves. Because kernels are
+admitted artifacts (partition class 4 budgets module/kernel storage,
+`hosts/crates/host-coordinator/src/partition.rs:104-106`), model-carried
+dequant recipes are *structurally possible* here and impossible there (B1+B2).
+(b) ecosystem capability: formats (including private/3P encodings and
+per-model repack layouts) deploy with the model package, not the engine.
+(c) `radix/crates/radix-mir/src/abi/contract.rs:162-192` + `packed.rs`
++ host ABI. (d) S–M per format (R-PACK-02 pattern). (e) rank 6; the
+model-carried variant is gated on OD §12-7 below — today recipes remain a
+closed reviewed set (correctly).
+
+**I7 — Plan-fact admission budgeting.** (a) honest split: a *budget check*
+is bookkeeping llama.cpp could add (near-miss); what it cannot produce is
+**per-emitted-kernel facts** — workspace, scratch, occupancy, launch shape —
+because no kernel exists until ours are emitted per specialization (B1).
+Their scheduler estimates from tensor shapes at runtime; our ledger
+consumes plan facts and is **frozen at admission** with all eight byte
+classes (`partition.rs:90-125`, incl. KV bytes consumed-not-rederived).
+(b) admission becomes a proof (the workload fits, immutably) instead of a
+best-effort placement (`llama-model.cpp:1318-1333` is exactly that
+heuristic); this is the serving/SLA enabler. (c) exists; waves 2–6 feed it
+finer facts. (d) S. (e) rank 7: enabler, already paid.
+
+**I8 — Guaranteed-inline fragments.** (a) C++ sharing across the kernel
+zoo is convention (macros/headers); there is no compiler-enforced inline
+guarantee, and a helper cannot be spliced into an already-compiled
+CUDA/Metal kernel at all (B1). (b) one dequant/unpack body reused across
+every emitted kernel family (MMQ-like, MMVQ-like, fattn-like as waves land)
+— dedup + uniform numeric behavior. (c) `NucleumRole { Entry, Fragment }`
+(`radix/crates/radix-hir/src/nodes.rs:288-296`) + device-safe effect-subset
+check (commit `1adda171c`); operator ruling honored: inline guarantee, not
+a perf claim. (d) S–M, landing. (e) rank 8: pays out as waves 3–4 multiply
+kernel families.
+
+**I9 — Per-specialization derived numeric envelopes.** (a) derivative
+impossibility: with no specialization axis there is nothing to attach a
+per-specialization contract *to*; their accuracy posture is ad-hoc checks
+in kernel code. Ours: every emitted specialization (format, KV dtype,
+fusion shape) carries a derived band, never an inherited one (precedent:
+the Q2 envelope is SmolLM2-only — `exec02-…-delivery.md:75`). (b) makes the
+knob space §6.2 *safe to turn*: any dial change has a machine-checked
+acceptance row. (c) `gradus/docs/numeric-tolerances.md:28-36` + ORACLE
+harness + wave envelope derivations. (d) S–M ongoing. (e) rank 9.
+
+### 14.4 Near-miss flags (merely-not-built, high value)
+
+Strictly outside the operator's asked class, flagged because value is high
+and the block for llama.cpp is effort, not structure:
+
+- **N1 — Emit-time autotuning.** Ours: search plan constants per shape
+  class at lowering, pin results (receipts, no runtime JIT — keeps the
+  closed-set discipline). Theirs: approximable by shipping a grid of
+  prebuilt variants + profile-driven selection (they already select among
+  MMQ/MMVQ heuristically, `ggml-cuda.cu:1783-1809`); the *unbounded
+  per-model space* stays ours (I2), the tuning loop does not.
+- **N2 — Static vocab-subset lm_head / whole-program DCE.** llama.cpp
+  builders always emit the full-vocab head; a graph pruning pass is addable
+  upstream (graph-level utilities exist and are growing — `ggml.c:7203`
+  `ggml_build_forward_order` landed in the pinned tip commit). For us it is
+  a lowering-time N-specialization (exact on the subset, identity on full).
+- **N3 — Speculative decoding as authored composition.** theirs is one
+  fixed C++ implementation; a typed draft+target composition with shared
+  fragments and its own acceptance band is natural here but not impossible
+  there. Park until serving goals.
+- **N4 — Backend addition.** theirs is possible via dynamic loading
+  (`ggml/src/ggml-backend-dl.cpp`) but fork-grade C++; ours is a lowering
+  target switch, fail-closed (`radix/crates/faber/src/cli/mod.rs:359-391`).
+
+### 14.5 Wave-plan row additions (proposed; §10 not edited by this addendum)
+
+Splices after wave 6 (and after the sibling's W5b rows) at commit time.
+Nothing here preempts R-PACK-05 or renumbers waves 1–6.
+
+| Unit | Repo/scope | Done-when |
+| --- | --- | --- |
+| W7-U1 static vocab-subset lm_head (N2) | gradus `dense.fab` head tail + radix lowering N-specialization | proba: subset rungs exact on subset + identity vs full head; receipt shows FLOP/byte delta on a dense rung |
+| W7-U2 emit-time tile/workgroup autotune receipts (N1, I2 rider) | radix plan-constant selection per shape class + per-device limit channel (already anticipated by `plan.rs:4-8`); offline search, committed receipts | one dense-rung decode receipt where the searched constants beat the defaults; no runtime search path exists in code |
+| W7-U3 arch-adapter exemplar (I5) — **parked, campaign-level** | gradus second-architecture adapter riding reserved `GroupedMatMul`/`Ssm*` recipes (admission gated on R-PACK-03/04) | a non-llama-family architecture runs end-to-end from source on a stock runtime; no host-ABI change |
+| W7-U4 model-carried recipe packaging probe (I6) — **parked behind OD §12-7** | packaging/lowering probe only | decision receipt; no format ships out-of-band before the trust policy is settled |
+
+### 14.6 Amendment and open-decision needs
+
+**No §9 lock is amended by this census.** Waves 1–6 and all W7 rows are
+additive; W7-U2 mutates plan constants only through the existing
+explicit-reviewable-change door (`plan.rs:44-50`).
+
+Proposed additions to §12 (numbered to follow the sibling's §12-5/§12-6):
+
+7. **Model-carried device code trust policy** (I6/W7-U4): default = recipes
+   stay a closed reviewed set lowered from Faber source; model packages
+   carry source + plan recipes + digests (§12-6 pattern), never prebuilt
+   device binaries. Revisit only when a format must ship out-of-band.
+8. **Autotune governance** (N1/W7-U2): default = offline search at
+   lowering, committed receipts, fail-closed on missing receipts; runtime
+   never searches or JITs (keeps the closed-set discipline and the
+   deterministic-execution posture).
+
+---
+
+*Addendum 2 ends. §13 is the sibling seat's uncommitted addendum
+(`c7174a33`) — untouched. This section is head-cto `cbea0c29`'s only
+working-tree edit; mind routes the commit.*
+
+---
+
+## 15. Addendum 3 — Metal-targeted inference optimization census (finetune-for-inference)
+
+**Status**: DRAFT (uncommitted; mind routes the commit)
+**Author**: head-cto (Vivi handle `1f58bbbc`), 2026-08-18
+**Ask**: operator — Metal-targeted optimizations, expressible as
+knobs/recipes/lowering-time specializations, that improve **inference** —
+motivated by operator-reported Qwen-3.8 numbers (~20 tok/s default →
+70–100 tok/s in undisclosed closed fine-tuning trials). The numbers are an
+**existence proof of a 3.5–5× gain class, not a spec**. This addendum
+enumerates what could compose into that class. §13 (`c7174a33`) and §14
+(`cbea0c29`) are untouched; this section cross-references both rather than
+restating.
+**Evidence pins**: gradus @ `012d411` + design `4004e32` + uncommitted
+addenda; radix main (radix-mir-metal emitter read at the working tree);
+hosts macos-arm64 read at the working tree; `~/work/llama.cpp` @
+`c8e03ce81` (same pin as §1/§14). External sources read 2026-08-18, named
+per claim. **No perf number below is our measurement** — wave-6 harness is
+the arbiter (§8.3 discipline).
+
+### 15.0 Framing: how a 3.5–5× decode class composes (and what it cannot be)
+
+Decode is weight+KV bandwidth-bound (§7 roofline). No *single* published
+knob in the census below yields 3.5–5× on the same model+hardware; the
+class composes multiplicatively from independent factors:
+
+1. **Speculative decoding: 2–3× published, output-identical** — Leviathan,
+   Kalman & Matias, *Fast Inference from Transformers via Speculative
+   Decoding* (arXiv:2211.17192, ICML 2023): 2–3× on T5-XXL with a small
+   draft model, exactly matching the target distribution. This is the only
+   *published* ≥2× inference lever that requires a **trained artifact**
+   (the draft model) — the most likely single ingredient of an undisclosed
+   "fine-tuning trial" that triples tok/s.
+2. **Bandwidth/stream class: ~1.2–2× mechanism-only** — KV F16 (÷2 KV
+   bytes), Q8_0 KV (÷4 vs f32, published ≈f16 speed when fused — see
+   M2), plus launch/tile/simdgroup efficiency (M9–M10). Individual factors
+   are modest; their product on a bandwidth-bound step is not.
+3. **Baseline pathology removal** — a "default ~20 tok/s" on Apple silicon
+   is often an *unbatched or per-launch-synchronized* configuration, not
+   the hardware's ceiling (M10 documents our equivalent hazard: one
+   command buffer + blocking wait per kernel today). A trial that merely
+   fixes launch discipline can look like a fine-tune win.
+
+Honest conclusion: treat 70–100 tok/s as achievable **composition**
+(speculative × bandwidth × launch efficiency), with §15.3 as the reason
+our stack can carry the trained half of that composition as a *loadable
+artifact* rather than a runtime capability.
+
+**Competitor frame (web-verified 2026-08-18).** MLX is the local
+competitor: lazy evaluation with runtime graph scheduling, arrays in
+unified memory, a **fixed precompiled kernel zoo dispatched at runtime by
+shape/dtype** (stream/encoder-level dispatch; JIT compile + cache for
+custom kernels; `mx.compile` traces a Python function and fuses
+elementwise/reduction chains — ml-explore.github.io `usage/lazy_evaluation`,
+`usage/unified_memory`, `dev/custom_metal_kernels`). Its attention kernel
+adapts block sizes by context length at **runtime** (MLX 0.22-era
+refactor; community M5-Ultra comparisons vs llama.cpp Metal FA2 show MLX
+matching/beating MFA2 at long-context prefill). So the MLX contrast is
+*not* "they lack knobs" — it is: MLX specializes a framework-owned kernel
+zoo plus runtime dispatch and graph-level JIT fusion; **we specialize the
+emitted kernel set per model+config at lowering time**, with declared
+grid/block facts, fail-closed bundles, and recipes that carry semantics
+(not just shapes). llama.cpp's position is strictly weaker (§14 B1–B5).
+
+### 15.1 Census (M1–M11), seam-mapped
+
+| # | Lever | Class | Seam | Cost | Gain class (evidence) |
+| --- | --- | --- | --- | --- | --- |
+| M1 | Flash-attention Metal path | lowering specialization | new recipe variant (wave 3) + Metal body | M | long-ctx prefill workspace + decode; enabler of M2's Q-KV. Published: MLX PR #735 (Mar 2024) fused inference SDPA, GQA-native + 4× KV compression, up to ~2.5× tok/s Mistral-7B @ ~8k ctx on M3 Max |
+| M2 | KV dtype slimming (F16 / Q8_0 / Q4_K) | knob (KVStructure) | `KVStructure` + GI4 dtype amendment (§9, filed) | S–M | footprint first, speed second: published q8_0 ≈ f16 within ~5%, ~2× KV memory vs f16; q4_0 **can be slower** without fused in-attention dequant (DGX-Spark 128k-ctx benchmark: 92% slower pp @64k) — the lever is real only as a bundle with M1 |
+| M3 | Batch/ubatch geometry | admission knob | session admission + partition ledger workspace class (`partition.rs:90-125`) | S | prefill compute-bound fill; decode batch>1 only matters with M7; llama.cpp defaults 2048/512 (`common.h:443-444`) are the parity reference |
+| M4 | Threadgroup/tile per shape class | lowering specialization | plan constants (`plan.rs:4-24`) + per-device limit channel + W7-U2 receipts | S–M | prefill arithmetic intensity; mechanism (llama.cpp CUDA MMQ tiles ≫ 8×8); our constants are named precisely so this is a plan fact, not a rewrite |
+| M5 | Dequant-in-register | lowering specialization (mostly paid) | R-PACK-02 bodies + fragments (§14 I8) | S | in-kernel dequant is landed posture (EXEC-02 §2); extension = keep the dequantized tile in registers across K-tiles, never staging f32 globally; wave 4's GEMV family is the rider |
+| M6 | Fused rope+attention+residual chains | lowering specialization | OF-3..5 emitter migration (locked behind R-PACK-05) + M1 | M | kills bandwidth-bound round-trips (I1 mechanism) — RoPE into attention Q/K load, residual add into the attention epilogue; fusion boundary ruling honored (compiler-internal only) |
+| M7 | Speculative/draft decoding | authored composition (§14 N3) | draft model as loadable (§15.3) + batched decode (wave 4) + band rows | M–L | **published 2–3×, output-identical** (Leviathan ICML 2023); llama.cpp ships draft/MTP/Eagle3 (`common/arg.h:172,323-331,372`, `n_max=3` default) — parity requires the *composition* be expressible, which §15.3 supplies |
+| M8 | Prompt-cache reuse | session capability | `DeviceBufferLifetime::PerProgram` + EXEC-03 persistent sessions + KVStructure `slots` | S–M | eliminates re-prefill for repeated prefixes entirely (mechanism; whole prefill cost removed) — serving-shaped, not single-shot |
+| M9 | simdgroup matrix ops + Apple-friendly layouts | lowering specialization | Metal arm of TiledMatMul/QuantizedMatMul behind plan constants + device-family gate | M | Apple GPU Family 7+ (M1+) has official `simdgroup_matrix<T,8,8>` + `simdgroup_multiply_accumulate` (MSL spec); our 8×8 tile constant matches the 8×8 hardware fragment exactly; prefill compute-bound gain (community GEMM work reaches MPS-class throughput with these; undocumented async-copy instructions exist but stay out of scope — risk named below) |
+| M10 | Buffer-pool/residency + per-step command-buffer batching | host-session policy | descriptor launch sequence + `data_flow`/`roots` + lifetime classes; `metal_host.rs` | S–M | **launch/sync overhead elimination**: today every kernel = one command buffer + blocking `wait_until_completed` (`metal_host.rs:996-1027`); a decode step is L layers × several kernels of serialized round-trips; mechanism-only (no published number), highest value-per-cost candidate |
+| M11 | Power/thermal-aware scheduling | admission/cadence policy | session admission + descriptor lifetime facts | S | mechanism-only, no published per-knob evidence: Apple silicon sustained-clock behavior means decode cadence and prefill-burst placement affect sustained tok/s; parked until measurement exists |
+
+### 15.2 Dossiers (per lever: mechanism / why ours / seam / cost / gain)
+
+**M1 — Flash-attention Metal path.** Mechanism: tiled online-softmax
+attention — Q·Kᵀ, softmax, ·V computed in K/V tiles held in threadgroup
+memory, never materializing the T×n_kv score matrix (today:
+`CausalMaskedSoftmax` materializes scores, §4.1). Why ours: the recipe set
+is closed and reviewable (`plan.rs:44-50`) — flash attention lands as an
+explicit variant carrying the *bundle* facts (KV dtype, v_layout, head
+dims, window), validated fail-closed at plan time (§4.3), then **baked per
+model** with GQA ratio and head_dim as constants — vs MLX's one shared
+kernel dispatched by shape at runtime, and llama.cpp's prebuilt pipelines
+(§14 B1). Evidence: MLX PR #735 (Feb–Mar 2024, bpkeene) measured up to
+~2.5× tok/s (Mistral-7B, ~8k ctx, M3 Max), largely from GQA-native
+storage + KV compression + fusion — i.e. the *bundle*, exactly the shape
+of our wave-3 recipe. Seam: wave 3 (already planned); Metal arm uses M9's
+simdgroup path. Cost: M. Gain class: long-context decode bandwidth +
+prefill workspace; prerequisite for M2's aggressive arms.
+
+**M2 — KV dtype slimming.** Mechanism: KV is a pure read stream during
+decode; halving/quartering its bytes cuts that stream directly and shrinks
+footprint (longer context fits). Why ours: `kv_dtype_k/v` is a typed
+`KVStructure` fact (§4.3) lowered into the attention bundle, not a runtime
+`-ctk/-ctv` flag; the GI4 amendment is already filed (§9). Evidence
+discipline (this is where naive expectations die): published benchmarks
+(DGX-Spark, Nemotron-30B, 128k ctx, read 2026-08-18) put q8_0 within ~5%
+of f16 speed with ~2× memory saving, while q4_0 was 92% slower at 64k pp /
+35% slower generation — dequant *outside* the attention kernel eats the
+win. Therefore: **KV quantization is admitted only as a bundle with the
+M1 fused-dequant arm** (fail-closed combination, exactly §4.3's rule).
+Seam: waves 2–4 + M1. Cost: S–M. Gain: footprint/context headroom first;
+speed only in the fused bundle.
+
+**M3 — Batch/ubatch geometry.** Mechanism: prefill is compute-bound —
+ubatch sizes how much work fills the device before workspace spills
+(ledger class 3, `partition.rs`). Decode batch>1 exists only for M7's
+verification passes and continuous batching (serving). Why ours: sizes are
+**admission facts** selecting between regime-specialized executables
+(workload modes frozen `Prefill | ScalarDecode`, `gi4-contract.md:111-123`)
+— no kernel-code branch, vs llama.cpp's runtime cparams and MLX's runtime
+scheduler. Seam: wave-6 admission manifest. Cost: S. Gain: mechanism
+(llama.cpp parity defaults); measured by wave-6 harness.
+
+**M4 — Threadgroup/tile per shape class.** Mechanism: 8×8 scalar tiles
+today (`MATMUL_TILE`, `plan.rs:12-17`); 32 KiB threadgroup budget is a
+*conservative* portability constant (`plan.rs:4-8` — the comment already
+anticipates the per-device limit channel). Why ours: tiles are **plan
+constants per shape class**, searchable at lowering with committed
+receipts (W7-U2), vs MLX's framework-build-time tuning + runtime adaptive
+block sizes, and llama.cpp's fixed per-family tiles. Seam: plan constants
++ device limits channel; W7-U2. Cost: S–M. Gain: prefill
+compute-boundness (mechanism); no number claimed.
+
+**M5 — Dequant-in-register.** Mechanism: EXEC-02's locked posture is
+already in-kernel block-wise dequant (§9 row 2) with landed bodies
+(`quantized_matmul.rs:3,87`); the *residual* cost is f32 staging through
+threadgroup tiles with two barriers per K-tile
+(`quantized_matmul.rs:119-121,166-174`). Lever: dequant once into
+registers/simdgroup fragments (M9) and keep the accumulator there across
+the whole K loop; shared dequant body = fragment (§14 I8, inline
+guarantee). Why ours: the body is *emitted per model* — block geometry is
+a plan constant folded in — vs llama.cpp's MMVQ family (runtime-selected)
+and MLX's precompiled kernels. Seam: M9 + wave 4. Cost: S (posture paid;
+body work rides M9). Gain: bandwidth + ALU efficiency on both regimes;
+mechanism.
+
+**M6 — Fused rope+attention+residual chains.** Mechanism: RoPE, residual
+adds, and normalization around attention are bandwidth-bound elementwise
+chains; OF-1/OF-2 typed fusion is landed for elementwise, and M1's
+attention arm can absorb RoPE into its Q/K loads and the residual add into
+its epilogue. Why ours: typed fusion plans with no runtime fusion checks
+(§6.1), honoring the operator boundary (compiler-internal only, §9);
+llama.cpp hand-fuses at fixed sites (fattn.cu), MLX fuses at graph level
+via `mx.compile`. Seam: OF-3..5 (locked behind R-PACK-05 — M6 does not
+jump the queue) + wave 3. Cost: M. Gain: removes whole classes of global
+round-trips per step (mechanism; I1's general case applied to the
+attention neighborhood).
+
+**M7 — Speculative/draft decoding.** Mechanism: a small draft model
+proposes γ tokens; the target verifies all γ in **one batched forward**
+and accepts the longest consistent prefix; rejection sampling keeps the
+output distribution exactly the target's. Published: 2–3× (arXiv:2211.17192,
+ICML 2023, T5-XXL/T5-small; identical outputs). llama.cpp ships it
+(draft/MTP/Eagle3, `common/arg.h:172,323-331,372`); MLX-lm has it
+(mlx-lm speculative generation, 2024+). Why ours: the draft model, its
+tokenizer/linkage, γ, and the acceptance loop are **an authored
+composition** with its own acceptance band (§14 N3) — not a hidden runtime
+mode; and the draft itself is a trained artifact our loading machinery can
+carry first-class (§15.3). Prereqs: batched decode path (wave 4), M10
+batching (verification passes must not pay per-launch round-trips). Cost:
+M–L. Gain: the only *published* 2–3×; acceptance-rate-dependent.
+
+**M8 — Prompt-cache reuse.** Mechanism: KV for a fixed prefix is computed
+once and reused across invocations (session save/restore; branch forks).
+Why ours: `DeviceBufferLifetime::PerProgram` +
+`ObservationPoint`/`PerStep` lifetimes are *declared descriptor facts*
+(`device_descriptor.rs:142-149`) and KV structure is typed — a restore is
+a buffer-version fact, not a heuristic; llama.cpp has session
+save/restore; MLX caches lazily but with no declared provenance. Seam:
+EXEC-03 persistent sessions (pending, correctly sequenced §8.1-4) +
+`slots`. Cost: S–M. Gain: eliminates re-prefill entirely for repeated
+prefixes (mechanism — whole prefill cost removed); serving-shaped.
+
+**M9 — simdgroup matrix ops + Apple-friendly layouts.** Mechanism: Apple
+GPUs (Family 7+, i.e. M1/A14 onward) expose official
+`simdgroup_matrix<T,8,8>` with `simdgroup_load/store` and
+`simdgroup_multiply_accumulate` (Metal Shading Language Specification) —
+the hardware's matrix path; our `MATMUL_TILE = 8` matches the 8×8 hardware
+fragment with zero re-tiling. Live gap: the emitter today emits **scalar
+threadgroup f32 tiles with barriers** (`matmul.rs:57-95`;
+`quantized_matmul.rs:119-174`); no `simdgroup`/matrix construct appears
+anywhere in `radix-mir-metal/src/emit/**` (grep-verified 2026-08-18).
+Why ours: it is a *body-level Metal arm* behind the same plan constants —
+the closed-recipe-set and backend-neutral-plan locks are untouched (§14
+I2's discipline); llama.cpp ships prebuilt simdgroup GEMMs, MLX's STEEL
+GEMM infra is framework-owned — both tune for *all* models, we emit for
+*the* model. Layout side: threadgroup/register layouts chosen at lowering
+per shape class (M4's receipts). **AMX honesty**: AMX is the *CPU* matrix
+ISA, not reachable from Metal; an AMX-friendly layout only matters if the
+CPU fallback route becomes a product goal (§12-3 already parks int8/CPU
+regime work). Risk note: high-end community GEMMs use undocumented
+`simdgroup_async_copy` instructions (leaked headers, UB risk across OS
+versions) — out of scope; official APIs only, and Metal 4's
+`cooperative_tensor`/MPP `matmul2d` is the forward-compatible successor to
+watch. Seam: `radix-mir-metal` emit arms + device-family gate (fail-closed
+below Family 7). Cost: M. Gain: prefill compute-bound; mechanism + Apple
+ISA documentation (no per-model number claimed).
+
+**M10 — Buffer-pool/residency + per-step command-buffer batching.**
+Mechanism (two parts): (a) residency — buffers already allocate
+`StorageModeShared` on unified memory (`metal_host.rs:866`), so there is
+no blit-transfer tax to remove; the remaining discipline is **pooling by
+lifetime class** (PerProgram weights/KV, PerStep scratch,
+ObservationPoint readbacks — the classes are declared facts,
+`device_descriptor.rs:142-149`) instead of today's per-token
+alloc/free. (b) launch batching — today every launch creates a command
+buffer, encodes one kernel, commits, and **blocks** on completion
+(`metal_host.rs:996-1027`); a decode step is dozens-to-hundreds of
+serialized round-trips. The descriptor already carries exactly the facts
+needed to batch safely: the ordered launch sequence, the inter-kernel
+`data_flow` edges, declared `roots`, and per-step observation points
+(`device_descriptor.rs:274-283,372-397`) — the host can encode a whole
+step's kernels into one command buffer ordered by the declared graph and
+read back only observation points. Why ours: the dependency graph is a
+*verified plan fact*, not a runtime afterthought — MLX's scheduler does
+this internally (framework-owned), llama.cpp encodes per-graph-build, we
+can do it per-model with a proof. Seam: hosts/macos-arm64 session + trait
+(one step-batch entry beside `launch_kernel`); no radix change, no lock
+touched. Cost: S–M. Gain: launch/sync overhead elimination —
+mechanism-only, but plausibly the largest *cheap* decode lever we have
+given the per-launch blocking today; wave-6 harness decides.
+
+**M11 — Power/thermal-aware scheduling.** Mechanism: Apple silicon
+sustained clocks; dense prefill bursts heat the package and can depress
+subsequent decode clocks; admission/cadence policy (defer prefill, cap
+burst size, pace decode) trades prompt latency for sustained generation
+rate. No published per-knob evidence; purely mechanism + hardware
+behavior. Why ours: cadence is a session-admission policy riding the same
+descriptor lifetime facts. Cost: S. Gain: unknown until measured — parked
+behind wave-6 receipts; no wave depends on it.
+
+### 15.3 Training-derived-but-inference-serving artifacts — the likely Qwen shape, as a first-class loadable
+
+The undisclosed trials most plausibly *fine-tuned artifacts* so inference
+gets faster with no runtime training. Four families, mapped to our
+machinery:
+
+| Family | What the finetune produced | Our expression | Delta needed |
+| --- | --- | --- | --- |
+| (a) Distilled attention patterns (effective locality; windowed attention behaving like full) | weights whose quality survives a shorter window | `KVStructure` per-layer-set `SlidingWindow` **authored from a recipe**, lowering bounds KV reads to the window (§4.3; I3) | window facts carried by the artifact's serving profile (below) |
+| (b) Pruned KV heads (deeper GQA) | smaller K/V projections + masks | a bake transform: row-slice K/V projections at materialization (§13.2 pattern) + reduced `kv_heads` fact in `KVStructure` | generalize §13.2's transform set beyond the refusal family (`Slice/Mask` beside `OrthogonalizeWeight`) |
+| (c) QAT weights that dequant cleaner (lower bit at same quality) | a better GGUF | **nothing new** — the format matrix (§3) admits it; per-format envelopes already derive per rung (I9); provenance records it was QAT-derived | manifest fields only (§12-6 pattern) |
+| (d) Layout-specialized checkpoints | tensors pre-arranged for a target's fast path | the **second representation** `repack_plan.rs` explicitly reserved: "every descriptor field a second representation would determine (selected backend, persistence policy, executable compatibility)" is `PendingSecondRepresentation` (`repack_plan.rs:19-23`) — designed for exactly this | populate the pending fields in a second-representation unit |
+| (e) Draft model (M7) | a small model trained to track the target | draft checkpoint + typed composition spec (N3) + its own band | composition spec type + session wiring |
+
+**Answer: yes, as a recipe — not as a new engine capability.** The §13
+machinery already establishes the loadable shape: base GGUF + typed recipe
+spec authored beside LayerPlan, transforms **baked once at
+materialization** (zero runtime cost), digest provenance verified
+fail-closed at load (§12-6 / NEED `75e4ab98`), acceptance band pinned to
+the *effective model* (NEED `e52dd09a` fold). What §15.3 adds is one
+generalization: the recipe is not only *behavioral surgery* (refusal) but
+can carry **inference-serving metadata** — KV-structure overrides
+(window, kv_heads), layout/repack descriptors, draft linkage — with the
+same three guarantees (typed admission, bake-not-train, checkable
+provenance). Nothing here amends a §9 lock: baked tensors remain ordinary
+tensors under EXEC-02 decision 4 (bounded, ledger-counted); the runtime
+never trains anything; infeasible bundles fail closed at plan validation.
+
+**Amendment need filed with this report (one, decision-only):** generalize
+`75e4ab98`'s manifest fields to a *serving profile* block
+`{kv_structure_override, repack_descriptor, draft_linkage, provenance}` —
+default = adopt with W8-U6 below, authoring stays inline Gradus model
+config, manifest stays derived/verification-only.
+
+### 15.4 Metal-first wave rows (W8; ranked by value-per-cost, dependencies explicit)
+
+Splices after §14.5's W7 rows at commit time; nothing preempts R-PACK-05
+or renumbers waves 1–6/5b/7. Ranked **for Metal decode throughput**, the
+operator's actual bar (§2).
+
+| Rank | Unit | Scope | Cost | Depends on | Done-when |
+| --- | --- | --- | --- | --- | --- |
+| 1 | W8-U1 per-step command-buffer batching + observation-point-only readback | hosts macos-arm64 session (trait step-batch entry; encode launches ordered by declared `data_flow`/`roots`) | S | existing descriptor facts only | decode-step receipt: batched encoding passes step-equivalence pins AND a per-step launch-count of 1 (vs L×k round-trips); no lock touched |
+| 2 | W8-U2 lifetime-class buffer pool | hosts macos-arm64 session (pool PerProgram/PerStep/ObservationPoint) | S | W8-U1 (same session surface) | pooled session runs leak bars (S2-2 counters) green; alloc/free churn per step → 0 |
+| 3 | W8-U3 simdgroup 8×8 bodies for TiledMatMul/QuantizedMatMul | radix-mir-metal emit arms behind plan constants + Family-7 fail-closed gate | M | W7-U2 receipts (tile constants) desirable, not blocking | per-format kernel tests green on simdgroup arm; pre-Family-7 devices fail closed to scalar arm; decode+prefill receipts vs scalar arm on the dense rung |
+| 4 | W8-U4 fused-dequant FA Metal arm + F16/Q8_0 KV execution | wave-3 recipe + KV bundle (M1+M2 as one bundle) | M | waves 2–3, GI4 amendment (§9), W8-U3 for the body | infeasible bundles (Q4_K V without fused arm) still fail closed at plan validation; long-ctx decode receipt vs f32-KV baseline; envelope rows derived |
+| 5 | W8-U5 prompt-cache/session KV restore | session + buffer-version facts (M8) | S–M | EXEC-03 persistent sessions | restore-then-extend run pins identity vs continuous run (byte-exact KV); re-prefill measured at 0 for restored prefix |
+| 6 | W8-U6 serving-profile recipe + manifest block | gradus recipe generalization (§15.3) + W5b-U4 digest helpers | M | W5b-U4 / `75e4ab98` fields (extend per above need) | one coverage probe: a QAT-requantized or window-override artifact loads as base+recipe, provenance verifies, band row pinned |
+| 7 | W8-U7 speculative draft composition | gradus composition spec + batched decode | M–L | wave 4 (batched decode), W8-U1 (verification passes), W8-U6 (draft linkage) | output distribution pins vs greedy target on a small rung (rejection-sampling exactness); acceptance-rate receipt on dense rung — **parked until serving is a goal** (N3 posture) |
+| 8 | W8-U8 power/thermal cadence policy | session admission policy | S | wave-6 measurement harness | parked until a receipt shows sustained-clock effect on this hardware; no wave depends on it |
+
+Ranking rationale: rows 1–2 are hosts-only, touch no locks, and attack the
+one *measured-in-code* pathology (per-launch blocking commit); rows 3–4
+are the compute/bandwidth class that needs the recipe work already
+sequenced by waves 2–4; rows 5–6 make the *trained-artifact* half of the
+3.5–5× class loadable; rows 7–8 are real but sequenced by serving goals,
+not by this design.
+
+### 15.5 Locks and amendments
+
+No §9 lock is amended by this addendum. M9/M5 are body-level Metal arms
+behind existing plan constants (I2 discipline); M10 is hosts-session
+internal (descriptor contract already declares the graph being consumed);
+M2 rides the already-filed GI4 amendment; §15.3 rides §12-6/`75e4ab98`.
+One decision need is filed (serving-profile manifest block, §15.3).
+**Every external number cited is labeled published/community; every
+unmeasured claim is mechanism-only; the wave-6 harness remains the sole
+arbiter of any throughput claim (§8.3).**
+
+---
+
+*Addendum 3 ends. §13 (`c7174a33`) and §14 (`cbea0c29`) untouched. This
+section is head-cto `1f58bbbc`'s only working-tree edit; mind routes the
+commit.*
+
+## 16. Addendum 4 — MoE structural sparsity: expert residency, hot-expert admission, per-expert modes
+
+**Status**: DRAFT (uncommitted; mind routes the commit)
+**Author**: head-cto (Vivi handle `d19f84dc`), 2026-08-18
+**Ask**: operator — MoE models have small ACTIVE parameter sets per token
+(1T total, ~50B active observed at the frontier); can a frontier MoE fit and
+run fast on a local MacBook, and can ablation-style zeroing of
+generally-inactive weights optimize a large model for local running?
+**Placement**: appended after sibling addenda §13 (ablation, `c7174a33`),
+§14 (census, `cbea0c29`), and §15 (Metal census, `1f58bbbc`, landed
+concurrently before this append) — none touched. Numbered §16 to avoid the
+§15 collision. §6.2/§7/§10 row splices proposed in §16.5, not
+edited in place.
+**Evidence pins**: `~/work/llama.cpp` @ `c8e03ce81` (same pin as §1/§14;
+MoE path re-verified today at file:line), gradus @ `012d411` + uncommitted
+addenda, radix main. Public-model numbers web-verified 2026-08-18 (sources
+named inline; marked wv).
+
+### 16.0 Mind's hypothesis chain, split into its two links
+
+- **(a) "active set is what matters at inference, not total" — half-true,
+  and the half that is false is the interesting one.** The active set bounds
+  per-token FLOPs and per-token expert *reads*; it does not bound what must
+  sit in memory. The resident floor (embeddings, lm_head, router, shared
+  experts, attention, dense layers, KV) is *not* sparse, and the routed-expert
+  mass is 96–98% of a frontier MoE's bytes — 1.0T of Kimi K2's 1.04T params
+  (§16.3 arithmetic). Decode speed is set by **where each token's selected
+  experts' bytes come from**, per token, not by the total. This is a
+  residency/bandwidth question, not a parameter-count question.
+- **(b) "ablate the inactive experts, keep the hot ones" — confirmed, and it
+  is not a new mechanism: it is §13's machinery applied at expert
+  granularity.** Ablation orthogonalizes a *direction* out of weight
+  matrices; expert pruning ablates *whole cold weight tensors*. Same
+  bake → manifest → provenance surfaces (§13.3, §12-6, NEED `75e4ab98`
+  composes), same acceptance-band discipline (NEED `e52dd09a` folding,
+  §12-2). The §15 contribution is the *routing-statistics producer* and the
+  *residency consumer* llama.cpp has no seam for (§16.2).
+
+### 16.1 Grounded mechanics — what touches memory at MoE decode (llama.cpp @ c8e03ce81)
+
+Per token, batch-1 decode, one MoE layer (every claim file:line at the pin):
+
+| Component | What is read per token | Evidence |
+| --- | --- | --- |
+| **Router/gate** | the full `ffn_gate_inp` matrix `[n_embd, n_expert]` — one GEMV every token, resident, format as stored (F32 in our rung) | `build_moe_ffn` → `build_lora_mm(gate_inp, cur)` → `[n_expert, n_tokens]` logits `src/llama-graph.cpp:1947-1949`; tensor shape from builders, e.g. `src/models/qwen3moe.cpp` (`{n_embd, n_expert}`) |
+| Gating + top-k | elementwise softmax/sigmoid/√softplus over n_expert logits; DeepSeek-style group-limited selection; `argsort_top_k` picks `n_expert_used` | `llama-graph.cpp:1959-1980` (gating switch), `:2003-2027` (grouped selection, DeepSeek V3 ref), `:2030` (top-k) |
+| **Selected experts' weights** | exactly the `n_expert_used` selected experts' matrices, gathered by id from one rank-3 tensor per family | tensors `{n_embd, n_ff, n_expert}` `src/llama-model.cpp:2881-2886` (`create_tensor_gate_up_exps`); op class `GGML_OP_MUL_MAT_ID` `src/llama-arch.cpp:794-796`; `ggml_mul_mat_id(as=[cols,rows,n_expert], b, ids=[n_expert_used,n_tokens])` "one matrix per expert" `ggml/src/ggml.c:3317-3347`; CUDA fuses MMVF/MMVQ only when `dst->ne[2]==1` (decode shape) `ggml/src/ggml-cuda/ggml-cuda.cu:1755-1812` |
+| Combine | weighted sum of per-expert output views | `llama-graph.cpp:2226-2251` |
+| **Shared experts** | always active, plain dense MUL_MAT, added outside routing — a per-token floor independent of the hot set | `src/models/deepseek2.cpp:151-153` (tensors), `:378-381` (`build_ffn` on shexp); Qwen3-MoE has none (`src/models/qwen3moe.cpp` MoE-only block) |
+| **KV cache** | independent of expert count — attention path and cache class never see n_expert | cache classes per arch §4.2; MoE touches only the FFN sublayer |
+| Embed / lm_head | one gathered embedding row; **the full-vocab head is read every token** | `llama-graph.cpp:2266+` (`build_inp_embd`); full-vocab head = census N2 (§14.4) |
+
+**The honest memory model.** Resident-always, no residency policy can touch
+these: embedding table (random gather), lm_head (full read per token),
+routers, shared experts, attention + dense weights, norms, KV. Streamable /
+lazy — the *only* large mass: routed-expert weights, whose per-token read set
+is `n_expert_used × 3 matrices × n_ff × n_embd` bytes per MoE layer, at
+whatever precision each expert is stored.
+
+**llama.cpp's actual knob is placement-only.** `--cpu-moe` /
+`--n-cpu-moe N` push the expert tensors' *whole rank-3 tensors* into a CPU
+buffer via the regex `\.ffn_(up|down|gate|gate_up)_(ch|)exps`
+(`common/common.h:1088-1098`, `common/arg.cpp:2661-2680`), generalizing
+`--override-tensor` (`arg.cpp:2655`). All-or-nothing per layer range; no
+hot-set, no per-expert modes, no admission statistics, no format mix per
+expert. Its streaming behavior on Mac is accidental (mmap paging), which the
+Unsloth K2 guide describes exactly: the 621 GB Q4_K_M "will page to the
+(fast) SSD and be noticeably slower" (wv, unsloth.ai K2 guide).
+
+**Our admitted rung is already an MoE with exact tensor facts.** The
+Qwen3.6-35B-A3B row (753 tensors, §2) is `qwen35moe`: 41 blocks (19 hybrid
+SSM/attention + 16 full-attention + nextn blk.40), **256 experts, top-8**,
+expert FFN 512, **one shared expert** FFN 512
+(`gradus/src/model/qwen35moe.fab:315-336`). Per MoE block the canonical map
+pins exactly the shapes above: `ffn_gate_exps [2048,512,256] Q4_K`,
+`ffn_up_exps [2048,512,256] Q4_K`, `ffn_down_exps [512,2048,256] Q5_K`
+(Q6_K in blk.34/38/39), router `ffn_gate_inp [2048,256] F32`,
+`ffn_*_shexp` Q8_0 (`qwen35moe.fab:483-490,518-524`). Arithmetic at stored
+formats: one expert ≈ 0.59 (gate) + 0.59 (up) + 0.72 (down) ≈ **1.9 MB**;
+per-token expert stream = 8 × 1.9 MB × 35 MoE blocks ≈ **0.53 GB**; routers
++ shared + head ≈ 0.61 GB/token resident stream; experts are
+35×256×3×2048×512 = 28.2B of 35.5B elements — **79% of the 22.66 GB file**.
+The seam we own is therefore already admitted as typed facts, not a
+hypothetical.
+
+### 16.2 Our levers, mapped to seams
+
+1. **Expert residency / lazy-load policy** (host-ABI + KVStructure-adjacent).
+   A semantic `ExpertResidency` fact in the Gradus model config (same
+   tripartite split as §4.3: Gradus semantic → Radix plan fact → Hosts
+   physical), consumed by the hosts partition ledger, which already budgets
+   per-class bytes and single-sources KV accounting
+   (`hosts/crates/host-coordinator/src/partition.rs:95-122`). Experts become
+   a partition class with per-expert granularity (today's contract is
+   per-tensor, all-or-nothing). The lazy-load primitive already exists:
+   bounded windowed materializers `materialize_slice` / `materialize_block`
+   (`gradus/src/model/tensor_view.fab:204,266`) — an expert is a rank-3
+   slice, materializable on demand. Default unchanged: resident as-stored.
+2. **Hot-expert admission — a bake-time artifact** (generalizes §13). Bake
+   pipeline: run a *calibration corpus* through the admitted model →
+   accumulate per-(layer, expert) routing statistics (selection mass + gate
+   weight mass) → importance scores → **hot-set manifest** (per layer:
+   ordered admit list + acceptance band receipt). Same surfaces as §13:
+   bake at materialization, manifest + digests into the admission manifest
+   (NEED `75e4ab98` composes — add routing-stats digest + hot-set digest as
+   sibling fields of the base-GGUF/AblationSpec digests), provenance
+   fail-closed at load (§12-6 pattern).
+3. **Per-expert modes — LayerPlan-style** (`ExpertPlan`, beside LayerPlan
+   and AblationSpec): per-(layer, expert) `Keep | Zero | Prune |
+   Resident{tier} | Streamed`. `Zero` masks the router column and
+   renormalizes admitted weights (changes the computed function → recorded
+   band, §12-2 fold; never inherits GI0). `Prune` bakes the rank-3 tensor
+   down and remaps ids — byte shrink at materialization, zero runtime cost.
+   Hot-set manifests turn Keep/Streamed into an *admission decision*, not a
+   runtime guess — placement is declared, checkable, and provenance-pinned.
+4. **Fused router + gather kernels** (kernel_plan). `GroupedMatMul` is a
+   reserved closed-set recipe whose plan already carries `groups` as
+   "Expert / group count (the leading rank-3 axis)"
+   (`radix/crates/radix-mir/src/kernel_plan/plan.rs:105-106,260-268`) — the
+   selected-experts batched body is its intended home. A fused
+   router(softmax+top-k)→ids→gather body is a wave-4 decode-regime rider
+   (llama.cpp's analogue is the MMVF/MMVQ decode fusion,
+   `ggml-cuda.cu:1755-1812` — selection among prebuilt families there,
+   emitted code here). Any new variant goes through the explicit
+   reviewable-change door (`plan.rs:44-50`); no §9 lock touched.
+5. **Mixed residency + quantization-per-expert** (format matrix composes).
+   Hot experts at F16/BF16 (wave 1 admission), cold at Q4_K/Q2-class —
+   per-expert format is the §3.2/§6.2 per-tensor storage dial applied at
+   rank-3-slice granularity: declared per entry in the manifest, never
+   silent (§6.2 row 1 rule), each cell carrying its derived envelope
+   (census I9).
+
+### 16.3 The MacBook-frontier question, answered honestly
+
+Chosen model: **Kimi K2** — the public 1T-class MoE (model card + config,
+wv 2026-08-18: HF `moonshotai/Kimi-K2-Instruct`, tech report arXiv:2507.20534):
+**1.04T total, 32.6B active**, 61 layers (1 dense + 60 MoE), **384 routed
+experts, top-8**, 1 shared expert (intermediate 1024), hidden 7168, expert
+intermediate 2048, MLA (`kv_lora_rank 512 + rope 64` = 576 elems/token/layer),
+vocab 160K, 64 heads. Hardware frame: burgus-class M5 Max (§2 bar machine) —
+614 GB/s unified memory, 128 GB ceiling, internal SSD ≈ 13.6 GB/s read
+(4TB); M4 Max reference 546 GB/s / 7.3 GB/s (wv, Apple specs + The Verge
+M5 benchmark suite).
+
+**Working-set arithmetic (decode, batch 1):**
+
+| Mass | Bytes | Resident? | Read per token |
+| --- | ---: | --- | ---: |
+| Routed experts (60×384×3×7168×2048 = 1.015T elems) | **571 GB** @Q4_K (0.5625 B/elem); 337 GB @2-bit (wv, Unsloth dynamic quants) | **no — the streamable mass** | 8×3×7168×2048×60 = 21.1B elems ≈ **11.9 GB** @Q4 |
+| Embedding [160K × 7168] @Q8_0 | 1.22 GB | yes (random gather) | ~7 KB (one row) |
+| lm_head [7168 × 160K] @Q6_K | 0.94 GB | yes | **0.94 GB — full read, every token** |
+| Routers 60 × [7168×384] F32 | 0.66 GB | yes | 0.66 GB |
+| Shared experts 60 × 3×7168×1024 @Q8_0 | 1.40 GB | yes | 1.40 GB |
+| MLA attention ≈101M×61 elems @Q8_0 | ≈6.6 GB (≈3.5 GB @Q4_K) | yes | same (all weights touched by GEMV) |
+| KV (MLA-compressed) | 70 KB/token/layer-set → 0.57 GB @8k ctx, 9.2 GB @128k (F16) | yes | grows with ctx |
+| **Resident floor total** | **≈11 GB + KV** (Q6/Q8 mixes; Q4 attention halves it) | — | **≈9.6 GB** |
+
+The floor fits trivially in 128 GB. The experts do not: 571 GB @Q4 is 4.5×
+the machine. What fits is a ~100 GB expert slice — **17.5% of the expert
+mass**, ≈67 of 384 experts/layer average — plus floor + KV + OS headroom.
+
+**Ceilings (per-token time = floor from RAM + expert reads from wherever
+they live; M5 Max):**
+
+| Regime | Arithmetic | tok/s |
+| --- | --- | ---: |
+| All-experts-resident (impossible here; the gpt-oss-120b regime) | (9.6+11.9) GB ÷ 614 GB/s = 35 ms | ~28 |
+| Pure streaming (every expert read from SSD) | 9.6 GB ÷ 614 + 11.9 GB ÷ 13.6 = 15.6 + 874 ms | **1.1** |
+| Hot-set hit rate p=0.90 | 15.6 + 0.9×19.4 + 0.1×874 ms | 8.3 |
+| Hot-set hit rate p=0.99 | 15.6 + 19.2 + 8.7 ms | 23 |
+
+**Verdict (link (a)): no — a 1T-class MoE is not a fast local MacBook model
+via active-set discipline alone.** The active set bounds the per-token read
+stream, but 11.9 GB/token still has to come from somewhere: RAM-resident it
+is bandwidth-capped ~28 tok/s *best case*; SSD-streamed it is ~1 tok/s; and
+realistic hot-set hit rates put you between ~5 and ~25 tok/s where **each
+1% of routing mass that misses the hot set costs ~8.7 ms (~20–35%
+throughput)**. Disk bandwidth, not parameter count, is the ceiling.
+
+**Verdict (link (b): pruning to raise p) — possible, with measured,
+non-free quality cost.** Lu et al., *Not All Experts are Equal*
+(arXiv:2402.14800, wv): Mixtral 8×7B, pruning 2 of 8 experts per layer
+(~25% of expert mass) ≈ −0.1 avg points across 8 tasks; pruning 4 of 8
+(~50%) ≈ −3.7 points; *task-specific calibration* (MATH-set) substantially
+recovers domain performance vs generic C4 calibration. DeepSeek V3's
+auxiliary-loss-free balancing deliberately keeps experts specialized by
+domain (tech report Fig. 9, arXiv:2412.19437, wv) — which cuts both ways:
+hot sets *are* concentrated per domain, but a hot-set manifest is a bake-time
+bet on the corpus, and domain shift silently invalidates it. Hence the
+acceptance band is a recorded artifact, not a hope (§13.4 discipline).
+
+**The catches, named:** (1) *first-token latency* — prefill across a long
+prompt touches a large union of experts per layer (routing diversity over
+prompt tokens approaches the full set), so cold-start prefill streams a
+large fraction of the 571 GB once: tens of seconds of pure SSD time at Q4.
+(2) *Disk bandwidth as the real ceiling* — shown above; also the practical
+experience with llama.cpp mmap paging on Mac (Unsloth guide, wv). (3)
+*Router overhead is in the floor* — 0.66 GB/token F32 reads, 0.66 GB
+resident; a real but second-order cost (Q8 router would quarter it).
+(4) *Pruning quality loss* — measured evidence above; band per §12-2 fold.
+
+**What the honest positive answers are:** our admitted Qwen3.6-35B-A3B
+(22.66 GB, 3B active) fits fully resident — no residency machinery needed;
+its decode is a ~1.2 GB/token stream (§16.1) whose ceiling on M5 Max is
+bandwidth, and the bar stays llama.cpp parity. The tier where our knobs
+genuinely beat llama.cpp's all-or-nothing `--cpu-moe` is **120–235B total**:
+gpt-oss-120b (117B total, 5.1B active, ~60–63 GB MXFP4) already runs
+30–50 tok/s on 128 GB M4 Max in llama.cpp (wv, llama.cpp discussion #15396 +
+user reports) — it fits, no streaming needed; **Qwen3-235B-A22B** (235B/22B
+active, 128 experts, top-8; wv HF card) @Q4 ≈ 132 GB does *not* fit
+as-stored, and is exactly the composition case: hot-set residency +
+per-expert format mix (hot Q6_K/F16, cold Q4/Q2 streamed or pruned) +
+prune-to-fit, each band recorded.
+
+### 16.4 Wave-plan rows (proposed; §10 not edited by this addendum)
+
+**Wave 5c — MoE expert plan** (after W5b — reuses the AblationSpec bake/
+manifest/provenance machinery; U1/U3 ride W5 LayerPlan acceptance rows;
+U4 rides W2's KVStructure tripartite pattern; U2's manifest fields land with
+wave 6 admission manifest; U5 rides wave 4 decode regime and W1 F16).
+
+| Unit | Repo/scope | Done-when |
+| --- | --- | --- |
+| W5c-U1 `ExpertPlan` type + admission validation | gradus `src/model/` (beside LayerPlan/AblationSpec: per-(layer,expert) `Keep/Zero/Prune/Resident{tier}/Streamed`, hot-set manifest reference; validation negatives: expert id out of range, Zero/Prune on shared experts, empty admitted set, duplicate entries, mode on non-MoE layer) | proba: empty-plan identity pin (plan-absent ≡ base-as-stored) + all validation negatives green |
+| W5c-U2 routing-statistics bake → hot-set manifest | gradus bake seam from W5b-U2 (calibration corpus through admitted forward; per-(layer,expert) selection + weight-mass accumulation; importance scores; hot-set manifest + digest — NEED `75e4ab98` fields compose) | synthetic-corpus bake pins exact statistics; manifest digest verified; tampered-digest load rejected (negative) |
+| W5c-U3 Zero / Prune execution + id remap | gradus `forward` + lowering (Zero: router-column mask + renormalization over admitted experts; Prune: rank-3 tensor shrink at materialization via `tensor_view.fab:204,266` bounded materializers, ids remapped at bake) | proba: Zero band row recorded vs pinned pruned reference; Prune byte-shrink receipt; token-stream equivalence for Prune-with-renormalize-off negative rejected |
+| W5c-U4 expert residency in the host contract | hosts partition class for expert windows (resident hot-set admission budget + streamed cold windows; default unchanged — experts resident as-stored unless `Streamed` entries present) | partition ledger rejects an infeasible residency bundle at admission (negative); resident-default byte accounting byte-identical to today |
+| W5c-U5 fused router + selected-experts decode body | radix `kernel_plan` `GroupedMatMul` body (`plan.rs:105-106,260-268` — `groups` is the expert axis; ids-driven gather; wave-4 decode-regime rider) | kernel tests for the gather body; explicit reviewable variant record; no runtime dispatch table added |
+| W5c-U6 acceptance rows + coverage probe | gradus proba/docs extending the §12-2 fold to **expert-plan-modified execution**; one probe on the admitted 753-tensor rung: synthetic routing stats → hot-set → Zero band row | band receipt committed; hot-set-vs-full-model divergence band recorded per corpus |
+
+### 16.5 Dial/cost row splices + amendment needs (proposed; splice at commit time)
+
+§6.2/§7 row additions (spliced beside the Ablation rows):
+
+| Dial | Home | Default |
+| --- | --- | --- |
+| `ExpertPlan` (per-expert modes) | Gradus model config, beside LayerPlan/AblationSpec | empty (all experts Keep, resident as-stored) |
+| Expert residency tier (Resident{F16,Q4_K,…} / Streamed) | Gradus semantic → plan fact → hosts partition | resident as-stored; `Streamed` requires an ExpertPlan |
+| Hot-set manifest (bake artifact) | admission manifest (NEED `75e4ab98` sibling fields) | absent (no hot-set claim without provenance) |
+
+| Knob | Default | Expected gain (mechanism) | Cost / risk |
+| --- | --- | --- | --- |
+| Expert Zero (renormalize) | off | removes routed-expert read bytes ∝ pruned routing mass; enables prune-to-fit on 128 GB tier | quality divergence by construction → recorded band (§12-2 fold; Lu et al. evidence: ~25% mild, ~50% real loss); domain shift invalidates the bake |
+| Expert Prune (bake shrink) | off | byte shrink at materialization, zero runtime cost | id remap correctness; requant band per §12-5 rule applied per expert |
+| Hot-set residency | resident as-stored | cold experts stop competing for unified memory on >RAM models | miss-path streams from disk — bandwidth-bound; partition admission proof required |
+| Per-expert format mix | as-stored | hot experts compute-friendly (F16), cold byte-minimal (Q4/Q2) | per-expert envelope derivations (I9); declared, never silent |
+
+**§12 additions** (numbered after the sibling's §12-8):
+
+9. **Expert partition granularity + streamed residency in the host
+   contract** (§16.2-1, W5c-U4): default = experts are resident as-stored
+   (byte accounting unchanged); streamed/lazy residency is admitted only
+   when an ExpertPlan declares it and the partition ledger proves the
+   budget at admission. This is a hosts-contract widening, not a GI4 KV
+   revision — KV facts untouched.
+10. **Zero-renormalization acceptance policy** (§16.2-3, W5c-U3): default =
+    expert-plan-modified execution carries its own recorded band vs a pinned
+    expert-plan-modified reference (the §12-2 fold extended one level);
+    never inherits the GI0 exact-top-1 contract.
+
+**No §9 lock is amended by this addendum.** `GroupedMatMul` variant work
+goes through the explicit reviewable-change door (`plan.rs:44-50`); F16
+per-expert formats ride W1 admission; residency default preserves today's
+behavior byte-for-byte.
+
+---
+
+*Addendum 4 ends. §13 (`c7174a33`), §14 (`cbea0c29`), and §15 (`1f58bbbc`)
+untouched above. This section is head-cto `d19f84dc`'s only working-tree
+edit; mind routes the commit.*
