@@ -20,7 +20,7 @@ pinned value (0 FAIL, exit 0).
 2. **2 ordered U1.5 blocks** — each resolved by its canonical
    `model.layers.{N}.*` names and shape-validated against the config
    (`dense_block`: input RMSNorm → GQA causal+RoPE attention → residual →
-   post-attn RMSNorm → SwiGLU MLP → residual);
+   post-attn RMSNorm → SwiGLU MLP → residual `r2 = r1 + h`);
 3. **final RMSNorm** — `model.norm` over the block stack;
 4. **output projection** — a **tied** `lm_head` reuses the stored embedding
    view directly; an **untied** row resolves `lm_head` as its own canonical
@@ -36,8 +36,9 @@ the runtime tensors; the row-pinned grep over the assembly stays clean.
 One synthetic dim config, pinned to independent f64 reference values
 (external Python/numpy evaluation of the documented formulas — the PML3
 `transformer_block` pin precedent; the block transcription is first
-validated against the pinned dense-block values in `src/transformer.proba`),
-compared within the documented 5e-4 absolute tolerance:
+validated against the pinned dense-block values in `src/transformer.proba`)
+with residual-2 `r2 = r1 + h` (not `ln2 + h`), compared within the
+documented 5e-4 absolute tolerance:
 
 - `T=2, D=16, F=16` (MLP hidden), `num_heads=4, num_kv_heads=2`,
   `head_dim=4`, `vocab 8`, tokens `[0, 7]`, positions `[0, 1]`;
