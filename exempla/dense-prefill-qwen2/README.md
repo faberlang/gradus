@@ -11,6 +11,36 @@ The receipt tier is the compiled route (`faber build --target rust`,
 then execute the printed binary). llvm-host is the named fallback. The
 MIR stepper is not the receipt-tier engine.
 
+## Layout sweep (2026-08-18, handle 8da95e6c)
+
+**Verdict: FIXED — layer-0 linear families were GGUF K-major and were
+fed to `nn.linear` unconverted.** Packet `hand-25`. Same class as the
+SmolLM2 Q fix (`012d411`). There is no GI2-2 per-op golden for this
+row; probes use GI2-1 dequant + first-row slice. Stored first-32
+matches GI2-1 bit-exact. First row after the adapter transpose is
+`stored[n*K]` and does **not** equal the stored head (K-major, not
+already `[K,N]` row-major). `load_layer` now runs `_kmajor_to_linear`
+on q/k/v/o/gate/up/down. Tied `lm_head` stays the token-major embed
+path (`dense.forward` transposes to `[D,V]`). Q/K/V biases exist on
+the file and are still not consumed (zero-bias U1.8 contract).
+
+Compiled rust `trace` (GI2-1, all PASS max_delta `0`):
+
+| tensor | stored | adapter → nn.linear | method | max_delta |
+| --- | --- | --- | --- | --- |
+| `attn_q` | Q5_0 `[896,896]` K-major | `[896,896]` row-major | GI2-1 dequant+row0 | **0** |
+| `attn_k` | Q5_0 `[896,128]` K-major | `[896,128]` row-major | GI2-1 dequant+row0 | **0** |
+| `attn_v` | Q8_0 `[896,128]` K-major | `[896,128]` row-major | GI2-1 dequant+row0 | **0** |
+| `attn_output` | Q5_0 `[896,896]` K-major | `[896,896]` row-major | GI2-1 dequant+row0 | **0** |
+| `ffn_gate` | Q5_0 `[896,4864]` K-major | `[896,4864]` row-major | GI2-1 dequant+row0 | **0** |
+| `ffn_up` | Q5_0 `[896,4864]` K-major | `[896,4864]` row-major | GI2-1 dequant+row0 | **0** |
+| `ffn_down` | Q6_K `[4864,896]` K-major | `[4864,896]` row-major | GI2-1 dequant+row0 | **0** |
+| `lm_head` | tied `token_embd` Q8_0 `[896,151936]` token-major | `dense.forward` `[D,V]` | GI2-1 embed head | **0** |
+
+Stored head ≠ linear row0 on every 2-D weight (K-major). The adapter
+now transposes those families after materialize. No GI2-2 activation
+golden exists for this row.
+
 ## GATE 10 (2026-08-18)
 
 **Verdict: ORACLE REACHED — finite PASS; first-divergence vs comparator
