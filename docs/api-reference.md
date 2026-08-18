@@ -473,6 +473,8 @@ Ordered dense-model forward assembly over canonical architecture descriptors and
 - `fn message(DenseError e) → string {`
 - `fn forward(DenseConfig cfg, (string, int) → Lookup fons, list<int> tokens, f32 epsilon, f32 scale, list<int> positions, int rope_dim, attention.RopeConfig rope_cfg) → tensor.Tensor ⇥ DenseError {`
 
+REF-01-U1.9 consumer: `exempla/dense-prefill-smollm2` (SmolLM2-360M real-file prefill through this `forward`). Compiled rust receipt is **not** recorded: resume-2 at radix `3853d4b8f` rebuilt packet `faber`, then `faber build --target rust` stopped at the runtime plan (`PKG001:host_provider_selection_invalid`; `processus:exi` absent from the hosts `processus` manifest). See the exemplum README.
+
 REF-01-U1.10 consumer: `exempla/dense-prefill-qwen2` (Qwen2.5-0.5B real-file prefill through this `forward`). Compiled rust receipt is **not** recorded: resume at radix `b919052f0` cannot rebuild packet `faber` (`E0432` `faber_hir_rust::ImportedEnumVariantInfo`). Rust-target emit not reached. Prior stop was `CODEGEN001` in `dense_qwen2.fab` (definition id 4127). See the exemplum README.
 
 

@@ -3,10 +3,11 @@
 Consumer for the U1.8 dense forward graph against the pinned SmolLM2-360M
 row on the **compiled rust** receipt tier. This README is the unit receipt.
 
-**Verdict: STOP — not executed.** Resume at radix `b919052f0` (CODEGEN001
-union-variant DefId registration, `d66e1f93e`) could not produce a packet
-faber binary. The new diagnostic is recorded exactly and is not chased.
-TARGETLANE001 was not weakened (`faber.toml` still `target = "fmir"`).
+**Verdict: STOP — not executed.** Resume-2 at radix `3853d4b8f` produced a
+packet `faber` binary. `faber build --target rust` reached the rust
+runtime plan and stopped on a new diagnostic. TARGETLANE001 was not
+weakened (`[build] target` is still `"fmir"`). Numerics were not tuned.
+The GGUF file was not executed.
 
 ## Comparison policy (intended)
 
@@ -19,7 +20,7 @@ TARGETLANE001 was not weakened (`faber.toml` still `target = "fmir"`).
   golden top-1 non-EOG `30`, golden top-5 `[30, 28, 1270, 365, 198]`).
 - Engine: `faber build --target rust` then execute the printed binary.
   MIR stepper is not the receipt-tier engine. llvm-host is the documented
-  fallback and was not chased: no packet faber exists at this revision.
+  fallback and was tried after the rust plan failed.
 
 ## Command (from the Hand packet)
 
@@ -28,48 +29,74 @@ cd /Users/ianzepp/work/faberlang/worktrees/hand-12/radix
 cargo build -p faber
 ```
 
-Intended follow-on (not reached):
+`cargo build -p faber` at readable radix `3853d4b8f` exits 0
+(Finished `dev` profile in 7.41s). Packet binary:
+`/Users/ianzepp/work/faberlang/worktrees/hand-12/radix/target/debug/faber`
+(`faber 1.7.0`, rustc 1.97.1 Homebrew). Prior E0432
+(`faber_hir_rust::ImportedEnumVariantInfo`) did not reproduce.
+
+Packet root is not a library home (`norma` is not a packet member). The
+rust emit used the established symlink home:
+
+```text
+/tmp/faber-hand-12-libhome/gradus -> packet/gradus
+/tmp/faber-hand-12-libhome/norma  -> /Users/ianzepp/work/faberlang/norma
+```
 
 ```text
 cd /Users/ianzepp/work/faberlang/worktrees/hand-12/gradus
 env FABER_SUPPORT_PATH_OVERRIDE=/Users/ianzepp/work/faberlang \
-  FABER_LIBRARY_HOME=/Users/ianzepp/work/faberlang/worktrees/hand-12 \
+  FABER_LIBRARY_HOME=/tmp/faber-hand-12-libhome \
   /Users/ianzepp/work/faberlang/worktrees/hand-12/radix/target/debug/faber \
   build --target rust exempla/dense-prefill-smollm2
 ```
 
-## Observed packet faber rebuild (2026-08-17 resume)
+## Observed rust runtime plan (2026-08-17 resume-2)
 
-`cargo build -p faber` at readable radix `b919052f0` exits 101. Exact
-diagnostic (captured twice; same text):
+First attempt against `FABER_LIBRARY_HOME=<packet>` (no `norma`) failed
+before the rust plan with compact:
 
 ```text
-error[E0432]: unresolved import `faber_hir_rust::ImportedEnumVariantInfo`
-  --> crates/radix-program/src/rust_target.rs:17:76
-   |
-17 |     remap_function_param_info, remap_type_id_with_nominal_defs, FxHashMap, ImportedEnumVariantInfo,
-   |                                                                            ^^^^^^^^^^^^^^^^^^^^^^^ no `ImportedEnumVariantInfo` in the root
-
-error: could not compile `radix-program` (lib) due to 1 previous error
+error[PKG001:unknown_library_provider]: exempla/dense-prefill-smollm2/src/main.fab:813
+error[PKG001:unknown_library_provider]: exempla/dense-prefill-smollm2/src/main.fab:853
+compilation failed
 ```
 
-Recorded source facts (readable tree only; not patched):
+Those byte offsets are the `norma:processus` / `norma:solum` imports.
+Retry used the symlink home above. `faber.toml` then needed rust host
+selection (still `target = "fmir"`). Exact first rust-plan diagnostic:
 
-- `d66e1f93e` uses `faber_hir_rust::ImportedEnumVariantInfo` in
-  `crates/radix-program/src/rust_target.rs`.
-- The type lives in `crates/radix-hir-rust/src/import_params.rs` and is
-  re-exported from `radix-hir-rust`.
-- `crates/radix-module/src/codegen/rust/mod.rs` re-exports
-  `ImportedEnumVariantExport` and does **not** re-export
-  `ImportedEnumVariantInfo`.
-- `crates/faber-hir-rust/src/lib.rs` was not touched by `d66e1f93e` and
-  does **not** re-export `ImportedEnumVariantInfo`.
+```text
+error[PKG001:package_host_selection_required]: /Users/ianzepp/work/faberlang/worktrees/hand-12/gradus/exempla/dense-prefill-smollm2/faber.toml
+runtime plan failed
+```
 
-The prior EXEC-02 non-exhaustive `MirCollectionOp` match-arm residual did
-**not** reproduce at this revision. The prior CODEGEN001 (`tensor_view.fab`
-definition id 4131 / 4200) was **not** re-exercised: no new faber binary
-exists to emit rust. The stale packet binary (mtime 2026-08-17 19:39,
-built at `7863624e2`) was not used.
+`[target.rust] host = "native"` was added (inferentia pattern). The next
+diagnostic, compact identity only (coded PKG001 hides the message):
+
+```text
+error[PKG001:host_provider_selection_invalid]: /Users/ianzepp/work/faberlang/worktrees/hand-12/gradus/exempla/dense-prefill-smollm2/faber.toml
+runtime plan failed
+```
+
+Grounded cause, not chased: with `host = native`, the rust planner
+collects every `call '…'` in expanded library bodies. `norma:processus`
+emits `processus:exi`. Live hosts manifest
+`/Users/ianzepp/work/faberlang/hosts/crates/processus/src/manifest.json`
+exports 10 processus routes and does **not** export `processus:exi`.
+`load_provider_manifests` then sets `provider_error` (issue
+`host_provider_route_missing`). Hosts is not a packet member. The
+manifest was not patched.
+
+Prior CODEGEN001 (`tensor_view.fab` definition id 4131 / 4200) was **not**
+re-exercised: rust emit stopped at the runtime plan, before codegen.
+
+Documented llvm-host fallback, same env:
+
+```text
+error[PKG001:llvm_emission_failed]: exempla/dense-prefill-smollm2/src/main.fab
+llvm-host build failed
+```
 
 No rust binary was printed. The GGUF file was not executed. No logits, no
 observed token ids, no first-divergence field, no Metal/CUDA or
@@ -79,10 +106,12 @@ payload-residency claim.
 
 | Surface | Revision |
 | --- | --- |
-| packet gradus | `57404ea` (`factory/hand-12`) |
-| packet radix (readable) | `b919052f0` (includes `d66e1f93e`) |
-| faber binary used | none — `cargo build -p faber` failed |
-| workspace faber/hosts | not written |
+| packet gradus | `a0d78a5` base; this commit records the resume-2 stop |
+| packet radix (readable) | `3853d4b8f` (includes `7f0c7de51` + `d66e1f93e`) |
+| faber binary used | packet `target/debug/faber` 1.7.0 at `3853d4b8f` |
+| workspace faber | `525d68bf8` (support-path override only; not written) |
+| workspace hosts | `24687cda4` (solum/processus manifests; not written) |
+| workspace norma | `7d71dafdb` (read via libhome; not written) |
 
 ## Model identity (not executed)
 
@@ -103,7 +132,8 @@ occurred.
 ## Evidence boundary
 
 This is a compiled-route **stop receipt**, not a prefill-logit pass.
-Repair belongs to the radix rust-emit façade (`faber-hir-rust` /
-`radix-module` re-export of `ImportedEnumVariantInfo` so `radix-program`
-can build at `b919052f0`), not to this consumer. Radix is readable-only
-in this packet; the import was not patched.
+Repair belongs to the hosts `processus` provider manifest (`processus:exi`
+is in `norma/src/processus.fab` and absent from
+`hosts/crates/processus/src/manifest.json`). That surface is outside this
+packet. The rust host selection in `faber.toml` is the rust-receipt
+wiring; it does not change the FMIR lane target.

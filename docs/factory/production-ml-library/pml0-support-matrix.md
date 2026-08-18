@@ -364,6 +364,18 @@ execution, logits, or device execution; CTO8-1 stays the named gate.
 | `executed proof` | `exempla/dense-model` runs through package MIR (hand-11 Radix binary) — exit 0, **37 PASS / 0 FAIL** on the pinned f64 references, including the fail-closed rejection row (2026-08-14 receipt) |
 | `compatibility policy` | exact admitted combination: the complete ordered dense forward graph over the F32 staged carrier — embedding gather → N ordered U1.5 blocks → final RMSNorm → output projection — assembled from `ConfiguraDensa` and materialized stored-weight views via canonical names, with tied/untied embedding handling and zero per-row constants. Non-goals: no real-model payload execution, logits against a real file, or device execution (that is the U1.9/U1.10 receipt rows); no KV-cache state (that is the U2 wave); no non-f32 dtypes |
 
+### Row 13a — SmolLM2-360M prefill logit receipt, compiled-route stop (REF-01-U1.9)
+
+| Field | Value |
+| --- | --- |
+| `family` | REF-01 dense reference — SmolLM2-360M full-prefill logits vs pinned llama.cpp, compiled rust receipt tier |
+| `dtype` | F32 staged carrier through the U1.8 `forward` surface (not executed) |
+| `legal fixture ref` | operator-local `SmolLM2-360M-Instruct-Q4_K_M.gguf` — 270,590,880 bytes, SHA-256 `2fa3f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2` |
+| `oracle ref` | gi0-numeric-contract v1.0.0 (finite / top-1 exact / top-5 overlap ≥ 4/5 / Δ=1e-5) on prompt-end / position 0; comparator llama.cpp 10150 `dee2a846b` binary SHA-256 `e5c153a1…4952a` |
+| `evidence links` | `exempla/dense-prefill-smollm2/` (consumer + README resume-2 stop receipt) |
+| `executed proof` | **not executed.** Resume-2 at readable radix `3853d4b8f`: `cargo build -p faber` exits 0. `faber build --target rust` stops at the runtime plan with `PKG001:host_provider_selection_invalid` after `[target.rust] host = "native"`. Hosts `processus` manifest does not export `processus:exi` (present in `norma/src/processus.fab`). llvm-host fallback is `PKG001:llvm_emission_failed`. No rust binary, no Gradus logits, no first-divergence. |
+| `compatibility policy` | no executed-tier claim. The compiled-route stop is recorded in the exemplum README. No Metal/CUDA or payload-residency claim. |
+
 ### Row 13b — Qwen2.5-0.5B prefill logit receipt, compiled-route stop (REF-01-U1.10)
 
 | Field | Value |
