@@ -3,13 +3,15 @@
 Consumer for the U1.8 dense forward graph against the pinned SmolLM2-360M
 row on the **compiled rust** receipt tier. This README is the unit receipt.
 
-**Verdict: STOP — not executed.** FINAL run at radix `2ed9914e4` / faber
-`b1adfc9` produced a packet `faber` binary. Prior gates cleared: CODEGEN001
-(`d66e1f93e`), E0432 (`7f0c7de51`), PKG001 `processus:exi` (`9f828b2b6` +
-`6e13687`). `faber build --target rust` emitted the crate and cargo compiled
-host crates, then rustc failed the generated crate. TARGETLANE001 was not
-weakened (`[build] target` is still `"fmir"`). Numerics were not tuned.
-The GGUF file was not executed.
+**Verdict: COMPILE CLEAN — execution STOP.** GATE 8 empty-classification
+run (handle `0530f8bf` / packet `test-1`) at radix `5088c4397`. Packet
+`faber` rebuilt green. `faber build --target rust` printed the binary
+(`Finished dev` in 1.10s, 0 rustc errors, 607 warnings). Classified
+families (258/248, 65, N4, N5, E0275) did not reproduce. Execution of
+the printed binary panicked on the first `solum.read_range` of the GGUF
+table prefix: `failable call failed: "sermo materialization failed"`.
+No logits. No first-divergence field. TARGETLANE001 was not weakened
+(`[build] target` is still `"fmir"`). Numerics were not tuned.
 
 ## Comparison policy (intended)
 
@@ -22,135 +24,131 @@ The GGUF file was not executed.
   golden top-1 non-EOG `30`, golden top-5 `[30, 28, 1270, 365, 198]`).
 - Engine: `faber build --target rust` then execute the printed binary.
   MIR stepper is not the receipt-tier engine. llvm-host is the documented
-  fallback and was tried after rustc failed.
+  fallback and was not chased after rust compile succeeded.
 
-## Command (from the Hand packet)
+## GATE 8 command (from the test packet)
 
 ```text
-cd /Users/ianzepp/work/faberlang/worktrees/hand-12/radix
+cd /Users/ianzepp/work/faberlang/worktrees/test-1/radix
 cargo build -p faber
 ```
 
-`cargo build -p faber` at readable radix `2ed9914e4` exits 0
-(Finished `dev` profile in 19.51s). Packet binary:
-`/Users/ianzepp/work/faberlang/worktrees/hand-12/radix/target/debug/faber`
-(`faber 1.7.0`, rustc 1.97.1 Homebrew). Prior E0432
-(`faber_hir_rust::ImportedEnumVariantInfo`) did not reproduce.
-
-Packet root is not a library home (`norma` is not a packet member). The
-rust emit used the established symlink home:
+`cargo build -p faber` at writable radix `5088c4397` exits 0
+(Finished `dev` profile in 4.21s). Packet binary:
+`/Users/ianzepp/work/faberlang/worktrees/test-1/radix/target/debug/faber`
+(`faber 1.7.0`, rustc 1.97.1 Homebrew, mtime 2026-08-18 02:49,
+94,743,704 bytes).
 
 ```text
-/tmp/faber-hand-12-libhome/gradus -> packet/gradus
-/tmp/faber-hand-12-libhome/norma  -> /Users/ianzepp/work/faberlang/norma
-```
-
-```text
-cd /Users/ianzepp/work/faberlang/worktrees/hand-12/gradus
+cd /Users/ianzepp/work/faberlang/worktrees/test-1/gradus
 env FABER_SUPPORT_PATH_OVERRIDE=/Users/ianzepp/work/faberlang \
-  FABER_LIBRARY_HOME=/tmp/faber-hand-12-libhome \
-  /Users/ianzepp/work/faberlang/worktrees/hand-12/radix/target/debug/faber \
+  FABER_LIBRARY_HOME=/Users/ianzepp/work/faberlang/worktrees/test-1 \
+  /Users/ianzepp/work/faberlang/worktrees/test-1/radix/target/debug/faber \
   build --target rust exempla/dense-prefill-smollm2
 ```
 
-## Observed rust emit (2026-08-17 FINAL)
+## Observed rust emit (2026-08-18 GATE 8)
 
-First attempt against `FABER_LIBRARY_HOME=<packet>` (no `norma`) failed
-before the rust plan with the known compact:
-
-```text
-error[PKG001:unknown_library_provider]: exempla/dense-prefill-smollm2/src/main.fab:813
-error[PKG001:unknown_library_provider]: exempla/dense-prefill-smollm2/src/main.fab:853
-compilation failed
-```
-
-Those byte offsets are the `norma:processus` / `norma:solum` imports.
-Retry used the symlink home above. Prior runtime-plan stops did **not**
-reproduce:
-
-- `PKG001:package_host_selection_required` — already wired (`[target.rust] host = "native"`)
-- `PKG001:host_provider_selection_invalid` / `processus:exi` — accepted at `9f828b2b6` + `6e13687`
-- `CODEGEN001` — rust emit completed; crate written to
-  `exempla/dense-prefill-smollm2/target/faber`
-- E0432 — not reproduced
-
-Cargo compiled `host-kernel`, `processus`, `host-native`, `solum`, then
-`dense-prefill-smollm2`. rustc 1.97.1 then failed the generated crate:
+Faber compiled the package, emitted
+`exempla/dense-prefill-smollm2/target/faber`, and invoked Cargo.
+Cargo compiled `dense-prefill-smollm2` and finished:
 
 ```text
-error: could not compile `dense-prefill-smollm2` (bin "dense-prefill-smollm2") due to 258 previous errors; 337 warnings emitted
-error: cargo build exited with status exit status: 101
+warning: `dense-prefill-smollm2` (bin "dense-prefill-smollm2") generated 607 warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.10s
+/Users/ianzepp/work/faberlang/worktrees/test-1/gradus/exempla/dense-prefill-smollm2/target/debug/dense-prefill-smollm2
 ```
 
-First exact diagnostic:
+Exit 0. Printed binary present (3,876,440 bytes, mtime 2026-08-18 02:49).
+Zero rustc errors. Every previously classified family is absent from this
+stream.
+
+## Observed execution (2026-08-18 GATE 8)
 
 ```text
-error: cast cannot be followed by a method call
-   --> src/main.rs:766:74
-    |
-766 |             message: format!("{}{}", "golden line count is not 49152: ", lines.len() as i64.to_string()),
+/Users/ianzepp/work/faberlang/worktrees/test-1/gradus/exempla/dense-prefill-smollm2/target/debug/dense-prefill-smollm2 \
+  /Users/ianzepp/ai/models/SmolLM2-360M-Instruct-Q4_K_M.gguf \
+  1787040 \
+  2fa3f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2
 ```
 
-First coded diagnostic:
+Stdout then panic (verbatim):
 
 ```text
-error[E0015]: cannot call non-const associated function `Box::<[i64; 9]>::new_uninit` in constants
-  --> src/main.rs:25:37
-   |
-25 | pub const PINNED_TOKENS: Vec<i64> = vec![504, 2365, 6354, 16438, 27003, 690, 260, 23790, 2767];
+policy: gi0-numeric-contract v1.0.0 + faber-prefill-oracle compare_gpu_logits (prompt-end / position 0)
+engine: compiled rust (faber build --target rust; execute the printed binary)
+backend: CPU/reference
+model.path=/Users/ianzepp/ai/models/SmolLM2-360M-Instruct-Q4_K_M.gguf
+model.digest=2fa3f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2
+model.bytes=270590880
+
+thread 'main' (39631034) panicked at src/main.rs:938:66:
+failable call failed: "sermo materialization failed"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
 ```
 
-Error-code family counts on the rustc stream (260 `error` lines observed;
-rustc reports 258): E0015 173, E0493 37, E0308 29, E0599 9, E0277 3,
-bare "cast cannot be followed by a method call" 5, E0605 1
-(`Vec<i64> as Vec<u8>`), E0061 1, E0609 1 (`no field dtype` on
-`Option<GgufMetadata>`), E0382 1. Representative later identities:
-`transpone` / `activatio_softmax` missing on `faber::Tensor<T>`;
-`accipe` missing on `String`.
-
-Documented llvm-host fallback, same env:
+Generated site (`target/faber/src/main.rs:937-938`):
 
 ```text
-error[PKG001:llvm_emission_failed]: exempla/dense-prefill-smollm2/src/main.fab
-llvm-host build failed
+let prefix_bytes: Vec<u8> =
+    crate::solum::read_range(via.clone(), 0, data_expectata).expect("failable call failed");
 ```
 
-No rust binary was printed. The GGUF file was not executed. No logits, no
-observed token ids, no first-divergence field, no Metal/CUDA or
-payload-residency claim.
+`data_expectata` is the pinned table-prefix length `1787040`. Admit,
+tokenizer, weight load, and `dense.forward` were not reached. No logits,
+no observed token ids, no first-divergence field, no Metal/CUDA or
+payload-residency claim. Stop rule: record exactly, do not chase.
+
+Repair belongs to the compiled `solum.read_range` / sermo materialization
+path on a 1_787_040-byte prefix. That surface is outside this test
+packet. TARGETLANE001 was not weakened. The generated crate under
+`exempla/dense-prefill-smollm2/target/faber` is build output and is not
+committed.
+
+Toolchain: rustc 1.97.1 (8bab26f4f 2026-07-14) Homebrew, cargo 1.97.1
+(c980f4866 2026-06-30). Host: Darwin 25.5.0 arm64
+(`burgus.local`, `RELEASE_ARM64_T6050`).
 
 ## Revisions
 
 | Surface | Revision |
 | --- | --- |
-| packet gradus | `1baaaa6` base; this commit records the FINAL stop |
-| packet radix (readable) | `2ed9914e4` (includes `9f828b2b6`, `7f0c7de51`, `d66e1f93e`) |
-| faber binary used | packet `target/debug/faber` 1.7.0 at `2ed9914e4` |
-| workspace faber | `b1adfc9` (`6e13687` processus:exi via `process::exit`; not written) |
-| workspace hosts | `24687cd` (solum/processus manifests; not written) |
-| workspace norma | `7d71daf` (read via libhome; not written) |
+| packet gradus | `69d1808` (this commit records the GATE 8 receipt) |
+| packet radix (writable) | `5088c4397` (ER-23 reborrow; ff from `86470672a`) |
+| faber binary used | packet `target/debug/faber` 1.7.0 at `5088c4397` |
+| workspace faber | `afd2a96` (via `FABER_SUPPORT_PATH_OVERRIDE`; not written) |
+| workspace hosts | `bf11418` (via override; not written) |
+| packet/workspace norma | `7d71daf` (read via `FABER_LIBRARY_HOME`; not written) |
 
-## Model identity (not executed)
+## Model identity (admit not reached)
 
 | Field | Pinned value |
 | --- | --- |
 | filename | `SmolLM2-360M-Instruct-Q4_K_M.gguf` |
 | path | `/Users/ianzepp/ai/models/SmolLM2-360M-Instruct-Q4_K_M.gguf` |
-| bytes | 270,590,880 |
+| bytes | 270,590,880 (printed by the binary before the panic) |
 | SHA-256 | `2fa3f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2` |
 | data offset | 1,787,040 |
 | prompt | `The quick brown fox jumps over the lazy dog` |
 | prompt tokens | `[504, 2365, 6354, 16438, 27003, 690, 260, 23790, 2767]` |
 
-Hardware/OS for an executed run would have been CPU/reference on
-`Darwin burgus.local 25.5.0 arm64` (`RELEASE_ARM64_T6050`). No run
-occurred.
+Hardware/OS: CPU/reference on `Darwin burgus.local 25.5.0 arm64`
+(`RELEASE_ARM64_T6050`). The GGUF file was opened far enough to report
+byte length; the table-prefix read failed.
 
 ## Evidence boundary
 
-This is a compiled-route **stop receipt**, not a prefill-logit pass.
-Repair belongs to radix rust codegen (HIR-rust emit of Faber `const`
-lists / `as`+method chains / captured closures). That surface is
-outside this packet. TARGETLANE001 was not weakened. The generated
-crate under `exempla/dense-prefill-smollm2/target/faber` is build
-output and is not committed.
+This is a compiled-route **compile-clean + execution-stop receipt**, not
+a prefill-logit pass. GATE 8's empty-classification compile is the
+campaign first. The first executed line after identity prints is the
+stop.
+
+## Prior stops
+
+### 2026-08-17 FINAL — rustc 258 (radix `2ed9914e4` / faber `b1adfc9`)
+
+Packet `faber` green. Prior gates cleared: CODEGEN001 (`d66e1f93e`),
+E0432 (`7f0c7de51`), PKG001 `processus:exi` (`9f828b2b6` + `6e13687`).
+`faber build --target rust` emitted the crate; rustc failed 258 errors
+(first: `cast cannot be followed by a method call` at `src/main.rs:766`).
+No rust binary. Did not reproduce on GATE 8.
