@@ -64,7 +64,7 @@ Live co-located suites (32 files):
 | `src/model/capsule.proba` | capsule admission (schema 2) | Schema-2 admission (identity + manifest) + **schema-1 rejection** (`SchemaVetus`) + identity wire |
 | `src/model/safetensors.proba` | Safetensors row | Fixture bytes + digest + tokenizer mismatch |
 | `src/model/gguf.proba` | GGUF row | Builder + digest + row facts |
-| `src/model/dequant.proba` | CPU dequant — union set | Block layout pins + fail-closed gates for the A3 union set {F32, BF16, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K}; NaN bf16 rejects |
+| `src/model/dequant.proba` | CPU dequant — union set | Block layout pins + fail-closed gates for the union set {F32, F16, BF16, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K}; F16 f64-oracle pins (1.0 / 65504.0); NaN half/bf16 rejects |
 | `src/model/tensor_payload.proba` | `gradus:model/tensor_payload` (GGUF-A3 C2-U2) | TensorPayload carries the exact stored range facts (name, absolute start, length) + bounded byte list; PayloadError → causa render path type-checks |
 | `src/model/tensor_view.proba` | `gradus:model/tensor_view` (GGUF-A3 C2-U3/U4/U5) | `vincula` fail-closed bind (NomineIgnota / RangeMala / LongitudoMala / LayoutIgnota / TypoIgnotum); windowed `materializa_slicem` + single-block `materializa_glomulum` fail-closed rows |
 | `src/model/artifact.proba` | pathless content identity | Algorithm, digest, and positive-length validation |

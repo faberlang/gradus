@@ -303,12 +303,14 @@ absent from the manifest, and unknown GGML layouts.
 
 Source: `src/model/dequant.fab`. Render with module `causa(e)`.
 
-Admitted physical set (GGUF-A3 C1): **{F32, BF16, Q5_0, Q8_0, Q4_K, Q5_K,
-Q6_K}** — the Qwen3.6 completion-row union set. The two A3 additions are
-**BF16** (`GGML_BF16`, id 30; 1 element/block, 2 bytes/block — bf16→f32
-value arithmetic, bit-exact for every finite bf16) and **Q5_K**
-(`GGML_Q5_K`, id 13; 256 elements/block, 176 bytes/block —
-`dequantize_row_q5_K`). The layout constants are cross-checked against
+Admitted physical set (GGUF-A3 C1 + W1-U3): **{F32, F16, BF16, Q5_0, Q8_0,
+Q4_K, Q5_K, Q6_K}** — the Qwen3.6 completion-row union set plus F16 native
+convert. The A3 additions are **BF16** (`GGML_BF16`, id 30; 1 element/block,
+2 bytes/block — bf16→f32 value arithmetic, bit-exact for every finite
+bf16) and **Q5_K** (`GGML_Q5_K`, id 13; 256 elements/block, 176
+bytes/block — `dequantize_row_q5_K`). W1-U3 adds **F16** (`GGML_F16`, id
+1; 1 element/block, 2 bytes/block — IEEE binary16→f32 via `_half`, same
+NativeF16Convert pattern as BF16). The layout constants are cross-checked against
 `LayoutGgml.Cognita` at the `tensor_view.vincula` view-binding boundary —
 the manifest is the single layout authority, dequant validates admission
 and never re-derives layout.
