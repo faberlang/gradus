@@ -26,7 +26,7 @@ identity lives in `gradus:tokenizer` (`TokenizerError.EogMala`) and in the
 per-format admission entries' own tokenizer checks; it does not surface as
 an `AdmissionError` variant.
 
-Generation stop-policy binds the same identity via `tokenizator.est_eog` (admitted EOG tokens `{0, 2}`): generation terminates after the **first** admitted EOG token; `maxima_verborum` is a ceiling, never a promise to emit that many tokens (`0d50d60`).
+Generation stop-policy binds the same identity via `tokenizator.est_eog` (admitted EOG tokens `{0, 2}`): the default generate / generate_cancelled / generate_dense routes terminate after the **first** admitted EOG token; `max_tokens` is a ceiling, never a promise to emit that many tokens (`0d50d60`). The additive `StopPolicy` argument on `generate_with_stop` / `generate_cancelled_with_stop` / `generate_dense_with_stop` keeps that default as `Eog`. `IgnoreEos` is the llama.cpp `ignore_eos` row: admitted EOG ids are suppressed from sampling (finite large-negative mask) and the loop runs to the `max_tokens` ceiling.
 
 Pinned proba messages (do not drift):
 

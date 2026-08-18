@@ -299,6 +299,8 @@ Generation configuration, sampling projection, serialized config, and cursor lim
   - methods:
     - `fn session() → decode.Session {`
     - `fn emitted() → int {`
+- `union StopPolicy` — `Eog` (default: emit first admitted EOG `{0, 2}` then halt), `IgnoreEos` (llama.cpp `ignore_eos`: suppress EOG ids from sampling and run to the `max_tokens` ceiling)
+- `class DenseEngine` — dense-engine carrier for `generate_dense` (`architecture`, `epsilon`, `scale`, `rope_dim`, `rope`)
 
 ### Public functions
 
@@ -316,6 +318,21 @@ Generation configuration, sampling projection, serialized config, and cursor lim
 - `fn token_allowed(GenerationConfig g, GenerationCursor c) → bool {`
 - `fn cursor_advance(GenerationConfig g, GenerationCursor c) → GenerationCursor ⇥ GeneratioError {`
 - `fn cursor_reset(GenerationCursor c) → GenerationCursor {`
+- `fn cursor_after_prompt(GenerationConfig g, int prompt_len) → GenerationCursor ⇥ GeneratioError {`
+- `fn default() → GenerationConfig {`
+- `fn default_cursor() → GenerationCursor {`
+- `fn eog_stop() → StopPolicy {`
+- `fn ignore_eos() → StopPolicy {`
+- `fn stop_policy_name(StopPolicy p) → string {`
+- `fn stops_on_eog(StopPolicy p) → bool {`
+- `fn generate(GenerationConfig g, list<int> prompt_ids, decode.Decoder m) → list<int> ⇥ GeneratioError {` — EOG-stop default
+- `fn generate_with_stop(GenerationConfig g, list<int> prompt_ids, decode.Decoder m, StopPolicy stop) → list<int> ⇥ GeneratioError {`
+- `fn generate_cancelled(GenerationConfig g, list<int> prompt_ids, decode.Decoder m, decode.Cancellation cancel) → list<int> ⇥ GeneratioError {` — EOG-stop default
+- `fn generate_cancelled_with_stop(GenerationConfig g, list<int> prompt_ids, decode.Decoder m, decode.Cancellation cancel, StopPolicy stop) → list<int> ⇥ GeneratioError {`
+- `fn construct_dense_engine(dense.DenseConfig architecture, f32 epsilon, f32 scale, int rope_dim, attention.RopeConfig rope) → DenseEngine {`
+- `fn default_dense_engine() → DenseEngine {`
+- `fn generate_dense(GenerationConfig g, list<int> prompt_ids, DenseEngine engine, (string, int) → dense.Lookup source, list<kv.KVCache> layers, decode.Cancellation cancel) → list<int> ⇥ GeneratioError {` — EOG-stop default
+- `fn generate_dense_with_stop(GenerationConfig g, list<int> prompt_ids, DenseEngine engine, (string, int) → dense.Lookup source, list<kv.KVCache> layers, decode.Cancellation cancel, StopPolicy stop) → list<int> ⇥ GeneratioError {`
 
 
 ## gradus:gradient

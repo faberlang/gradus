@@ -5,10 +5,15 @@ locale = "en"
 #
 # Same admitted weights and pinned prompt as G1 (dense-decode-smollm2).
 # G1's unrestrained greedy continuation was [30, 2, 198] — it deliberately
-# skipped EOG-stop. This exemplum calls generation.generate_dense, which
-# applies EOG-stop: SmolLM2 EOS=2 is in the admitted set {0, 2}, so the
-# run must halt at [30, 2] (the EOS token is emitted, then the loop
-# stops). First token remains the GATE 13 / GI2 golden 30.
+# skipped EOG-stop. The default generate_dense path applies EOG-stop:
+# SmolLM2 EOS=2 is in the admitted set {0, 2}, so the run must halt at
+# [30, 2] (the EOS token is emitted, then the loop stops). First token
+# remains the GATE 13 / GI2 golden 30.
+#
+# A second run uses generate_dense_with_stop(IgnoreEos): EOG ids are
+# suppressed from sampling (llama.cpp ignore_eos) and the loop runs to
+# max_tokens=16. The U5 golden is
+# [30, 198, 198, 504, 808, 6330, 314, 253, 2232, 4814, 282, 1027, 28, 979, 260, 1796].
 
 import from "gradus:attention" attention
 import from "gradus:cache" kv
@@ -30,9 +35,11 @@ const int PINNED_BYTES ← 270590880
 const int PINNED_DATA ← 1787040
 const list<int> PINNED_TOKENS ← [504, 2365, 6354, 16438, 27003, 690, 260, 23790, 2767]
 const int GOLDEN_TOP1 ← 30
+const list<int> GOLDEN_CONTINUE ← [30, 198, 198, 504, 808, 6330, 314, 253, 2232, 4814, 282, 1027, 28, 979, 260, 1796]
 const int VOCAB ← 49152
 const int SLICE_CAP ← 16777216
 const int GENERATE ← 3
+const int GENERATE_CONTINUE ← 16
 const int EOG_SMOLLM2 ← 2
 
 union DecodeRunError {
@@ -103,6 +110,17 @@ fn _slot(string nomen) → int {
     if _ends(nomen, ".mlp.up_proj") then return 7
     if _ends(nomen, ".mlp.down_proj") then return 8
     return -1
+}
+
+fn _first_divergence(list<int> expectata, list<int> actualia) → int {
+    var int i ← 0
+    while i ≺ expectata.length() or i ≺ actualia.length() {
+        if (expectata.get(i) coalesce (0 - 1)) ≠ (actualia.get(i) coalesce (0 - 1)) {
+            return i
+        }
+        i ← i + 1
+    }
+    return 0 - 1
 }
 
 fn _ids_text(list<int> ids) → string {
@@ -517,5 +535,59 @@ main {
     }
     else {
         print "GENERATE: FAIL"
+    }
+
+    var list<kv.KVCache> continue_layers ← vacua
+    do {
+        continue_layers ← dense.empty_caches(structure, "smollm2", "360m", "f32-staged", "smollm")
+    }
+    catch err {
+        panic "empty caches (ignore_eos) failed: " + dense.message(err)
+    }
+    var generatio.GenerationConfig gen_continue ← generatio.default()
+    do {
+        gen_continue ← generatio.construct_generation(8192, 1, GENERATE_CONTINUE, 1, 0.0 ∷ f32, 0, 1.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32)
+    }
+    catch err {
+        panic "generation config (ignore_eos) failed: " + generatio.message(err)
+    }
+    print "policy: generate_dense_with_stop IgnoreEos (llama.cpp ignore_eos)"
+    var list<int> continued ← vacua
+    do {
+        continued ← generatio.generate_dense_with_stop(
+            gen_continue,
+            PINNED_TOKENS,
+            engine,
+            (string n, int s) → dense.Lookup ∴ _lookup(n, s, embed, norm_s, strata),
+            continue_layers,
+            decode.fresh_cancellation(),
+            generatio.ignore_eos()
+        )
+    }
+    catch err {
+        panic "generate_dense_with_stop failed: " + generatio.message(err)
+    }
+    print "continued=" + _ids_text(continued)
+    print "continued_n=" + (continued.length() ↦ string)
+    print "golden_continue=" + _ids_text(GOLDEN_CONTINUE)
+    const int continue_div ← _first_divergence(GOLDEN_CONTINUE, continued)
+    if continue_div ≺ 0 {
+        print "continue_first_divergence=none"
+        print "CONTINUE: PASS"
+    }
+    else {
+        const int got ← continued.get(continue_div) coalesce (0 - 1)
+        const int want ← GOLDEN_CONTINUE.get(continue_div) coalesce (0 - 1)
+        print "continue_first_divergence=position " + (continue_div ↦ string) + " got " + (got ↦ string) + " want " + (want ↦ string)
+        print "CONTINUE: FAIL"
+        if divergence ≡ "none" {
+            divergence ← "ignore_eos diverged at position " + (continue_div ↦ string)
+        }
+    }
+    if divergence ≡ "none" and continue_div ≺ 0 {
+        print "GENERATE+CONTINUE: PASS"
+    }
+    else {
+        print "GENERATE+CONTINUE: FAIL"
     }
 }
