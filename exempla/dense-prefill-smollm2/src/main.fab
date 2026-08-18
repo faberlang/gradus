@@ -28,8 +28,12 @@ const int PINNED_BYTES ← 270590880
 const int PINNED_DATA ← 1787040
 const string PINNED_PROMPT ← "The quick brown fox jumps over the lazy dog"
 const list<int> PINNED_TOKENS ← [504, 2365, 6354, 16438, 27003, 690, 260, 23790, 2767]
-const string GOLDEN_X_PATH ← "/Users/ianzepp/work/faberlang/worktrees/hand-12/gradus/exempla/dense-prefill-smollm2/gi2-2-rms-norm-x.txt"
+const string GOLDEN_X_PATH ← "/Users/ianzepp/work/faberlang/worktrees/hand-14/gradus/exempla/dense-prefill-smollm2/gi2-2-rms-norm-x.txt"
+const string GOLDEN_RMS_Y_PATH ← "/Users/ianzepp/work/faberlang/worktrees/hand-14/gradus/exempla/dense-prefill-smollm2/gi2-2-rms-norm-y.txt"
+const string GOLDEN_DENSE_Y_PATH ← "/Users/ianzepp/work/faberlang/worktrees/hand-14/gradus/exempla/dense-prefill-smollm2/gi2-2-dense-y.txt"
+const string GOLDEN_WQ_HEAD_PATH ← "/Users/ianzepp/work/faberlang/worktrees/hand-14/gradus/exempla/dense-prefill-smollm2/gi2-2-dense-weight-head.txt"
 const f32 GATHER_BAND ← 0.000001 ∷ f32
+const f32 DENSE_BAND ← 0.000001 ∷ f32
 const int GOLDEN_TOP1 ← 30
 const list<int> GOLDEN_TOP5 ← [30, 28, 1270, 365, 198]
 const int VOCAB ← 49152
@@ -249,7 +253,41 @@ fn _gguf_name(string family, int stratum) → string ⇥ PrefillError {
     throw variant AdapterMala {message = "unknown canonical tensor name: " + family}
 }
 
-fn _load_one(
+# GGUF linear weights are K-major: stored[n * K + k] = W[k, n].
+# nn.linear wants [K, N] row-major: out[k * N + n] = W[k, n].
+fn _kmajor_to_linear(tensor.Tensor t) → tensor.Tensor ⇥ PrefillError {
+    const list<int> f ← t.shape()
+    if f.length() ≠ 2 {
+        throw variant AdapterMala {message = "linear weight must be rank 2"}
+    }
+    const int k ← f.get(0) coalesce 1
+    const int n ← f.get(1) coalesce 1
+    var list<f32> out ← vacua
+    var int i ← 0
+    while i ≺ k {
+        var int j ← 0
+        while j ≺ n {
+            out.append(t.data.get(j * k + i) coalesce 0.0 ∷ f32)
+            j ← j + 1
+        }
+        i ← i + 1
+    }
+    return _tensor(out, [k, n])
+}
+
+fn _linear_family(string family) → bool {
+    if family ≡ "lm_head" then return true
+    if _ends(family, ".self_attn.q_proj") then return true
+    if _ends(family, ".self_attn.k_proj") then return true
+    if _ends(family, ".self_attn.v_proj") then return true
+    if _ends(family, ".self_attn.o_proj") then return true
+    if _ends(family, ".mlp.gate_proj") then return true
+    if _ends(family, ".mlp.up_proj") then return true
+    if _ends(family, ".mlp.down_proj") then return true
+    return false
+}
+
+fn _load_stored(
     string via,
     int total,
     manifestum.GgufManifest m,
@@ -258,6 +296,20 @@ fn _load_one(
 ) → tensor.Tensor ⇥ PrefillError {
     const string gguf_name ← _gguf_name(family, stratum)
     return _materialize(via, total, m, gguf_name)
+}
+
+fn _load_one(
+    string via,
+    int total,
+    manifestum.GgufManifest m,
+    string family,
+    int stratum
+) → tensor.Tensor ⇥ PrefillError {
+    const tensor.Tensor stored ← _load_stored(via, total, m, family, stratum)
+    if _linear_family(family) {
+        return _kmajor_to_linear(stored)
+    }
+    return stored
 }
 
 fn _lookup(
@@ -486,6 +538,42 @@ fn _list_max_delta(list<f32> a, list<f32> b) → f32 {
         i ← i + 1
     }
     return maxd
+}
+
+fn _list_n_above(list<f32> a, list<f32> b, f32 band) → int {
+    var int n ← a.length()
+    if b.length() ≺ n {
+        n ← b.length()
+    }
+    var int above ← 0
+    var int i ← 0
+    while i ≺ n {
+        var f32 d ← (a.get(i) coalesce 0.0 ∷ f32) - (b.get(i) coalesce 0.0 ∷ f32)
+        if d ≺ 0.0 {
+            d ← 0.0 - d
+        }
+        if d ≻ band {
+            above ← above + 1
+        }
+        i ← i + 1
+    }
+    return above
+}
+
+fn _band_row(string tag, list<f32> observed, string via, int expectata, f32 band) → string {
+    do {
+        const list<f32> golden ← _load_floats(via, expectata)
+        const f32 maxd ← _list_max_delta(observed, golden)
+        const int above ← _list_n_above(observed, golden, band)
+        const int n ← observed.length()
+        if maxd ≺ band {
+            return (((((tag + ": PASS max_delta=") + (maxd ↦ string)) + " n_above=") + (above ↦ string)) + "/") + (n ↦ string)
+        }
+        return (((((tag + ": FAIL max_delta=") + (maxd ↦ string)) + " n_above=") + (above ↦ string)) + "/") + (n ↦ string)
+    }
+    catch err {
+        return tag + ": FAIL " + message(err)
+    }
 }
 
 fn _load_floats(string via, int expectata) → list<f32> ⇥ PrefillError {
@@ -742,22 +830,7 @@ main {
 
         const f32 vs_raw ← _list_max_delta(gathered_row, raw_token_major)
         print "gather_vs_raw max_delta=" + (vs_raw ↦ string)
-        var f32 vs_golden ← 1.0 ∷ f32
-        var string gather_row ← "gather: FAIL golden-x unreadable"
-        do {
-            const list<f32> golden_x ← _load_floats(GOLDEN_X_PATH, 960)
-            vs_golden ← _list_max_delta(gathered_row, golden_x)
-            if vs_golden ≺ GATHER_BAND {
-                gather_row ← "gather: PASS max_delta=" + (vs_golden ↦ string) + " band=" + (GATHER_BAND ↦ string)
-            }
-            else {
-                gather_row ← "gather: FAIL max_delta=" + (vs_golden ↦ string) + " band=" + (GATHER_BAND ↦ string)
-            }
-        }
-        catch err {
-            gather_row ← "gather: FAIL " + message(err)
-        }
-        print gather_row
+        print _band_row("gather", gathered_row, GOLDEN_X_PATH, 960, GATHER_BAND)
 
         var tensor.Tensor ln1_s ← tensor.default()
         do {
@@ -779,16 +852,30 @@ main {
         }
         const list<f32> ln1_row ← _row_major(ln1, tokens.length() - 1)
         _dump_head("layer0_rms_norm_pos8", ln1_row)
-        _write_floats("/tmp/hand-12-u19-layer0-rms-norm-pos8.txt", ln1_row)
+        _write_floats("/tmp/hand-14-u19-layer0-rms-norm-pos8.txt", ln1_row)
+        print _band_row("rmsnorm", ln1_row, GOLDEN_RMS_Y_PATH, 960, DENSE_BAND)
 
-        var tensor.Tensor wq ← tensor.default()
+        var tensor.Tensor wq_stored ← tensor.default()
         do {
-            wq ← _load_one(via, total, admitted, "model.layers.self_attn.q_proj", 0)
+            wq_stored ← _load_stored(via, total, admitted, "model.layers.self_attn.q_proj", 0)
         }
         catch err {
             panic "trace q_proj load failed: " + message(err)
         }
-        print "stored_wq_shape=[" + ((wq.shape().get(0) coalesce 0) ↦ string) + "," + ((wq.shape().get(1) coalesce 0) ↦ string) + "]"
+        print "stored_wq_shape=[" + ((wq_stored.shape().get(0) coalesce 0) ↦ string) + "," + ((wq_stored.shape().get(1) coalesce 0) ↦ string) + "]"
+        const list<f32> wq_kmajor_head ← _flat_slice(wq_stored, 0, 32)
+        _dump_head("wq_kmajor_head", wq_kmajor_head)
+        print _band_row("wq_dequant_head", wq_kmajor_head, GOLDEN_WQ_HEAD_PATH, 32, DENSE_BAND)
+
+        var tensor.Tensor wq ← tensor.default()
+        do {
+            wq ← _kmajor_to_linear(wq_stored)
+        }
+        catch err {
+            panic "trace q_proj k-major convert failed: " + message(err)
+        }
+        print "linear_wq_shape=[" + ((wq.shape().get(0) coalesce 0) ↦ string) + "," + ((wq.shape().get(1) coalesce 0) ↦ string) + "]"
+
         var tensor.Tensor bq ← tensor.default()
         do {
             bq ← tensor.fill([tokens.length(), 960], 0.0 ∷ f32)
@@ -811,9 +898,10 @@ main {
             qh ← qh + 1
         }
         _dump_head("layer0_q_head0_pos8", q_head0)
-        _write_floats("/tmp/hand-12-u19-layer0-q-head0-pos8.txt", q_head0)
-        print "trace: dumps written under /tmp/hand-12-u19-*"
-        print "TRACE: STOP after layer-0 rms_norm + q head-0"
+        _write_floats("/tmp/hand-14-u19-layer0-q-head0-pos8.txt", q_head0)
+        print _band_row("q_linear", q_head0, GOLDEN_DENSE_Y_PATH, 64, DENSE_BAND)
+        print "trace: dumps written under /tmp/hand-14-u19-*"
+        print "TRACE: STOP after layer-0 Q head-0 vs GI2-2 dense.y"
     }
 
     if not trace {

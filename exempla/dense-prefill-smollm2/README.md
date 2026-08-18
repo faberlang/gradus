@@ -3,29 +3,34 @@
 Consumer for the U1.8 dense forward graph against the pinned SmolLM2-360M
 row on the **compiled rust** receipt tier. This README is the unit receipt.
 
-**Verdict: FIXED — gather reads the ggml token-major buffer (no transpose).**
-Handle `21b59246` / packet `hand-12`. `dense.forward` now reinterprets
-stored `[D, V]` as token-major `[V, D]` without permuting data and gathers
-at `[token * D + d]`. A tied `lm_head` transposes that view into true
-row-major `[D, V]` for the output linear. U1.10 shares this function
-(Qwen `[896, 151936]` embed, same descriptor pattern) — one fix covers both.
+**Verdict: FIXED — layer-0 Q linear reads GGUF K-major `attn_q` as `[K, N]`
+row-major.** Handle `4cf6820b` / packet `hand-14`. Gather (token-major, no
+transpose) still holds. The Q failure was the same layout class on the
+other axis: `blk.0.attn_q.weight` is Q5_0 K-major (`stored[n*K+k] = W[k,n]`),
+and `nn.linear` wants `[K, N]` row-major (`out[k*N+n] = W[k,n]`). Slice
+name and Q5_0 dequant match the GI2-2 weight head (max_delta `0`); zero
+bias is correct. The GGUF adapter now transposes linear families
+(q/k/v/o/gate/up/down) after materialize. `dense.forward` keeps the
+`[K, N]` row-major contract used by the synthetic pins.
 
-Oracle (compiled rust `trace`, 88.3s): gather vs GI2-2 `rms_norm.x` at
-pos 8 / token 2767 is `max_delta = 7.4e-9` (0 / 960 above `1e-6`).
-`nn.rmsnorm` of that gather now matches GI2-2 `rms_norm.y` at
-`9.2e-8`. Next divergence is layer-0 Q `nn.linear` vs GI2-2 `dense.y`
-(`max_delta = 1.24`, 64 / 64). Full prefill binary re-run is the next gate.
+Oracle (compiled rust `trace`):
+
+| probe | vs GI2-2 | max_delta | n > 1e-6 |
+| --- | --- | --- | --- |
+| gather | `rms_norm.x` | 0 | 0 / 960 |
+| `nn.rmsnorm` | `rms_norm.y` | 1.19e-7 | 0 / 960 |
+| `wq` first 32 | `dense` weight head | 0 | 0 / 32 |
+| `nn.linear` Q head-0 pos 8 | `dense.y` | **3.58e-7** | **0 / 64** |
+
+Red (same probe, stored `wq` passed to `nn.linear` unconverted): `q_linear`
+`max_delta = 1.2385719`, 64 / 64. Full prefill binary re-run is the next gate.
+
+Prior diagnosis (handle `21b59246`) fixed gather. Layer-0 Q was the next
+divergence after that landing.
 
 Prior diagnosis (handle `5830c444`) localized the first GI2-2 divergence to
-this wiring. GATE 10 (receipt `dfa4fce`) had reached gi0 and failed top-1
-`40983` vs golden `30`.
-
-The compiled stored view of `token_embd.weight` is already the ggml-order
-Q8_0 buffer (dim0 = 960 innermost = token-major `[V, D]` linearized).
-`dense.forward` treats the GGUF descriptor shape `[960, 49152]` as
-row-major `[D, V]` and transposes before gather. Prompt-end token `2767`
-then reads `data[d * 49152 + 2767]` instead of `data[2767 * 960 + d]`.
-Layer 0 `rms_norm` / `dense` / later ops inherit that wrong `x`.
+the embedding gather. GATE 10 (receipt `dfa4fce`) had reached gi0 and failed
+top-1 `40983` vs golden `30`. The gather-era notes below are historical.
 
 Not comparison-side: tokenizer PASS, pinned ids
 `[504, 2365, 6354, 16438, 27003, 690, 260, 23790, 2767]`, dump row is
