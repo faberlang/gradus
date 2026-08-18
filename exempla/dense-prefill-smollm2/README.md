@@ -3,6 +3,12 @@
 Consumer for the U1.8 dense forward graph against the pinned SmolLM2-360M
 row on the **compiled rust** receipt tier. This README is the unit receipt.
 
+**MEASURE 2026-08-18 (handle `f8fce797` / packet `hand-67`)** — first
+llama.cpp comparison, baseline only, no tuning. Release-tier 9-token
+`dense.forward` (no trace) is **39.130 s / 0.230 t/s** vs llama.cpp
+`pp9` 11.4 ms Metal / 107 ms CPU t=1 (**3436× / 365×**). Table,
+method, gap, and §8.1 cost list: [`bench/RECEIPT.md`](bench/RECEIPT.md).
+
 **TRACE 2026-08-18 (handle `1265695e` / packet `hand-48`)** — post-attn
 families at layer-0 pos 8 / token 2767, compiled rust. Isolated ops
 through `ffn_down` are green. First red was `dense_block` residual-2
