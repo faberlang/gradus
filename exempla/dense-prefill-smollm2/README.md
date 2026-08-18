@@ -14,7 +14,137 @@ Oracle (compiled rust `trace`, 88.3s): gather vs GI2-2 `rms_norm.x` at
 pos 8 / token 2767 is `max_delta = 7.4e-9` (0 / 960 above `1e-6`).
 `nn.rmsnorm` of that gather now matches GI2-2 `rms_norm.y` at
 `9.2e-8`. Next divergence is layer-0 Q `nn.linear` vs GI2-2 `dense.y`
-(`max_delta = 1.24`, 64 / 64). Full prefill binary re-run is the next gate.
+(`max_delta = 1.24`, 64 / 64). GATE 11 re-ran the full prefill binary
+after that gather fix: observed top-1 `45361` vs GI2-3 golden `30`.
+
+## GATE 11 (2026-08-18)
+
+**Verdict: ORACLE REACHED — PREFILL FAIL (first-divergence top-1).**
+Handle `f95dd328` / packet `hand-15`. Gradus main `b52f7d8` (commit
+`37cdf7c` token-major gather, no transpose; tied `lm_head` transposes
+the view). Readable radix `8da2f4966`. Hosts `a6c8129` (64 MiB `solum`
+range cap) via `FABER_SUPPORT_PATH_OVERRIDE`. Packet `faber` rebuilt
+green. Both exempla rebuilt + executed. The printed binary passed
+`solum.read_range` of the 1_787_040-byte table prefix, admitted the
+GGUF, matched the pinned tokenizer ids, loaded all 32 layers, printed
+`forward start T=9`, and returned `forward done shape=[9,49152]`. gi0
+at prompt-end / position 0 (last prefill row 8): `all_finite=true`,
+observed top-1 `45361` vs golden `30`, top-5 overlap `0/5`.
+`first_divergence=position 0: top-1 45361 vs golden 30`.
+`PREFILL: FAIL`. Exit 0. GATE 10's post-transpose top-1 was `40983`;
+the gather fix moved the observed token and did not match the golden.
+Existing probe evidence (U1.9 TRACE / handle `21b59246`) already names
+the next first-divergence op as layer-0 Q `nn.linear` vs GI2-2
+`dense.y`. This gate did not chase or retune that op. Numerics were
+not tuned. TARGETLANE001 was not weakened (`[build] target` is still
+`"fmir"`).
+
+### Packet faber rebuild (green)
+
+From the hand packet:
+
+```text
+cd /Users/ianzepp/work/faberlang/worktrees/hand-15/radix
+cargo build -p faber
+```
+
+`cargo build -p faber` at readable radix `8da2f4966` exits 0
+(Finished `dev` profile in 12.75s). Packet binary:
+`/Users/ianzepp/work/faberlang/worktrees/hand-15/radix/target/debug/faber`
+(`faber 1.7.0`, rustc 1.97.1 Homebrew, mtime 2026-08-18 07:50,
+94,986,680 bytes).
+
+### Rust-target emit (clean)
+
+```text
+cd /Users/ianzepp/work/faberlang/worktrees/hand-15/gradus
+env FABER_SUPPORT_PATH_OVERRIDE=/Users/ianzepp/work/faberlang \
+  FABER_LIBRARY_HOME=/Users/ianzepp/work/faberlang \
+  /Users/ianzepp/work/faberlang/worktrees/hand-15/radix/target/debug/faber \
+  build --target rust exempla/dense-prefill-smollm2
+```
+
+`FABER_LIBRARY_HOME` is the workspace container (has `gradus/` +
+`norma/`). Packet `hand-15` has no `norma` member; workspace `gradus`
+is the same commit as the packet member (`b52f7d8`). Faber compiled
+the package, emitted `exempla/dense-prefill-smollm2/target/faber`, and
+invoked Cargo. Cargo compiled `dense-prefill-smollm2` against
+workspace `solum` (`/Users/ianzepp/work/faberlang/hosts/crates/solum`,
+`MAX_RANGE_READ_BYTES = 64 MiB`):
+
+```text
+warning: `dense-prefill-smollm2` (bin "dense-prefill-smollm2") generated 640 warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.85s
+/Users/ianzepp/work/faberlang/worktrees/hand-15/gradus/exempla/dense-prefill-smollm2/target/debug/dense-prefill-smollm2
+```
+
+Exit 0. Printed binary present (3,936,552 bytes, mtime 2026-08-18 07:52).
+Zero rustc errors.
+
+### Observed execution (2026-08-18 GATE 11)
+
+```text
+/Users/ianzepp/work/faberlang/worktrees/hand-15/gradus/exempla/dense-prefill-smollm2/target/debug/dense-prefill-smollm2 \
+  /Users/ianzepp/ai/models/SmolLM2-360M-Instruct-Q4_K_M.gguf \
+  1787040 \
+  2fa3f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2
+```
+
+Start `2026-08-18T11:53:17Z`. End `2026-08-18T12:00:48Z`. Exit 0.
+`/usr/bin/time -l`: 450.23 real, 333.41 user, 130.36 sys, max RSS
+3,886,399,488 bytes (~3.62 GiB).
+
+Stdout (verbatim):
+
+```text
+policy: gi0-numeric-contract v1.0.0 + faber-prefill-oracle compare_gpu_logits (prompt-end / position 0)
+engine: compiled rust (faber build --target rust; execute the printed binary)
+backend: CPU/reference
+model.path=/Users/ianzepp/ai/models/SmolLM2-360M-Instruct-Q4_K_M.gguf
+model.digest=2fa3f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2
+model.bytes=270590880
+admit: PASS version=3 data=1787040 tensors=290 architecture=llama
+tokenizer: PASS ids=[504, 2365, 6354, 16438, 27003, 690, 260, 23790, 2767]
+prompt_tokens=[504, 2365, 6354, 16438, 27003, 690, 260, 23790, 2767]
+loading stored-weight views...
+loaded embed+norm
+model_shape layers=32 heads=15 kv_heads=5 head_dim=64 hidden=960 vocab=49152
+stored_embed_shape=[960,49152]
+loaded layer 0
+...
+loaded layer 31
+forward start T=9
+forward done shape=[9,49152]
+position=0 (prompt end, last prefill row 8)
+observed_top1_non_eog=45361
+golden_top1_non_eog=30
+top1_matches=false
+observed_top5=[45361, 5118, 4471, 44492, 38310]
+golden_top5=[30, 28, 1270, 365, 198]
+top5_overlap=0/5
+all_finite=true
+band: not_compared (no golden file)
+first_divergence=position 0: top-1 45361 vs golden 30
+PREFILL: FAIL
+```
+
+Stop rule: record exactly, do not chase. No Metal/CUDA or
+payload-residency claim.
+
+Toolchain: rustc 1.97.1 (8bab26f4f 2026-07-14) Homebrew, cargo 1.97.1
+(c980f4866 2026-06-30). Host: Darwin 25.5.0 arm64
+(`burgus.local`, `RELEASE_ARM64_T6050`, Apple M5 Max).
+
+### GATE 11 revisions
+
+| Surface | Revision |
+| --- | --- |
+| packet gradus | this commit (GATE 11 receipt; parent `b52f7d8`) |
+| packet radix (readable) | `8da2f4966` |
+| faber binary used | packet `target/debug/faber` 1.7.0 at `8da2f4966` |
+| workspace faber | `afd2a96` (via `FABER_SUPPORT_PATH_OVERRIDE`; not written) |
+| workspace / packet hosts | `a6c8129` (64 MiB `solum` cap; via override; not written) |
+| workspace norma | `7d71daf` (read via `FABER_LIBRARY_HOME`; not written) |
 
 Prior diagnosis (handle `5830c444`) localized the first GI2-2 divergence to
 this wiring. GATE 10 (receipt `dfa4fce`) had reached gi0 and failed top-1

@@ -11,6 +11,290 @@ The receipt tier is the compiled route (`faber build --target rust`,
 then execute the printed binary). llvm-host is the named fallback. The
 MIR stepper is not the receipt-tier engine.
 
+## GATE 11 (2026-08-18)
+
+**Verdict: ORACLE REACHED — finite PASS; first-divergence vs comparator
+top-1.** Handle `f95dd328` / packet `hand-15`. Gradus main `b52f7d8`
+(commit `37cdf7c` token-major gather, no transpose; tied `lm_head`
+transposes the view). Readable radix `8da2f4966`. Workspace hosts
+`a6c8129` (64 MiB `solum` range cap) via `FABER_SUPPORT_PATH_OVERRIDE`.
+Packet `cargo build -p faber` green. `faber build --target rust`
+printed the binary (`Finished dev` in 4.13s, 0 rustc errors, 616
+warnings). Execution of the printed binary **passed**
+`solum.read_range` of the 5_948_480-byte table prefix, printed
+architecture facts, matched the pinned tokenizer ids, loaded all 24
+layers, completed `dense.forward` (`logits_shape=[17,151936]`), and
+printed top-1 / top-5 for window positions 0..16. `finite_gate=PASS`.
+Observed position-0 top-1 `89` vs the GATE 9 pinned-comparator
+observation `304` (` in`). GATE 10's post-transpose top-1 was `86331`;
+the gather fix moved the observed token and did not match the
+comparator. Existing probe evidence (U1.9 TRACE on the shared
+`dense.forward` gather / layer-0 Q path) names the next first-divergence
+op as layer-0 Q `nn.linear`. This gate did not chase or retune that op.
+No in-binary `PREFILL:` line (this consumer does not call the golden
+file). Exit 0. Numerics were not tuned. TARGETLANE001 was not weakened
+(`[build] target = "fmir"` stays).
+
+### Packet faber rebuild (green)
+
+From the hand packet:
+
+```text
+cd /Users/ianzepp/work/faberlang/worktrees/hand-15/radix
+cargo build -p faber
+```
+
+Exit 0 in 12.75s. Binary
+`/Users/ianzepp/work/faberlang/worktrees/hand-15/radix/target/debug/faber`
+(`faber 1.7.0`, mtime 2026-08-18 07:50, 94,986,680 bytes) at radix
+`8da2f4966`.
+
+### Rust-target emit (clean)
+
+```text
+cd /Users/ianzepp/work/faberlang/worktrees/hand-15/gradus
+env FABER_SUPPORT_PATH_OVERRIDE=/Users/ianzepp/work/faberlang \
+  FABER_LIBRARY_HOME=/Users/ianzepp/work/faberlang \
+  /Users/ianzepp/work/faberlang/worktrees/hand-15/radix/target/debug/faber \
+  build --target rust exempla/dense-prefill-qwen2
+```
+
+`FABER_LIBRARY_HOME` is the workspace container (has `gradus/` +
+`norma/`). Packet `hand-15` has no `norma` member; workspace `gradus`
+is the same commit as the packet member (`b52f7d8`). Faber compiled
+the package, emitted `exempla/dense-prefill-qwen2/target/faber`, and
+invoked Cargo.
+
+```text
+warning: `dense-prefill-qwen2` (bin "dense-prefill-qwen2") generated 616 warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.13s
+/Users/ianzepp/work/faberlang/worktrees/hand-15/gradus/exempla/dense-prefill-qwen2/target/debug/dense-prefill-qwen2
+```
+
+Exit 0. Printed binary present (3,841,768 bytes, mtime 2026-08-18 07:53).
+Zero rustc errors.
+
+### Observed execution
+
+```text
+/Users/ianzepp/work/faberlang/worktrees/hand-15/gradus/exempla/dense-prefill-qwen2/target/debug/dense-prefill-qwen2 \
+  /Users/ianzepp/ai/models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf \
+  5948480 \
+  6eb923e7d26e9cea28811e1a8e852009b21242fb157b26149d3b188f3a8c8653
+```
+
+Start `2026-08-18T12:01:11Z`. End `2026-08-18T12:27:19Z`. Exit 0.
+`/usr/bin/time -l`: 1567.78 real, 1424.10 user, 160.65 sys, max RSS
+9,449,521,152 bytes (~8.80 GiB).
+
+Stdout (verbatim, layer-load rows elided as `...`):
+
+```text
+policy=gi0-numeric-contract v1.0.0 finite/top-1-exact/top-5-overlap>=4/5/delta=1e-5 window=0..16
+backend=CPU/reference
+model=Qwen2.5-0.5B-Instruct-Q4_K_M.gguf
+bytes=397808192
+sha256=6eb923e7d26e9cea28811e1a8e852009b21242fb157b26149d3b188f3a8c8653
+prompt=The capital of France is Paris and the capital of Japan is Tokyo. The next city
+architecture=qwen2
+tensors=290
+layers=24
+heads=14
+kv_heads=2
+head_dim=64
+hidden_dim=896
+vocab=151936
+tied=true
+observed_token_ids=[785,6722,315,9625,374,12095,323,279,6722,315,6323,374,26194,13,576,1790,3283]
+tokenizer_ids=PASS
+loading stored-weight views through the U1.8 resolver
+loaded_layer=0
+...
+loaded_layer=23
+logits_shape=[17,151936]
+pos=0
+top1=89
+top1_logit_u6=13743888
+top5_0=89
+top5_1=126318
+top5_2=118150
+top5_3=1579
+top5_4=145768
+finite=PASS
+pos=1
+top1=126318
+top1_logit_u6=14343148
+top5_0=126318
+top5_1=94553
+top5_2=147747
+top5_3=42413
+top5_4=12108
+finite=PASS
+pos=2
+top1=1003
+top1_logit_u6=13784768
+top5_0=1003
+top5_1=92320
+top5_2=86249
+top5_3=133919
+top5_4=3314
+finite=PASS
+pos=3
+top1=103140
+top1_logit_u6=13248098
+top5_0=103140
+top5_1=376
+top5_2=1282
+top5_3=111414
+top5_4=89
+finite=PASS
+pos=4
+top1=86260
+top1_logit_u6=12481638
+top5_0=86260
+top5_1=524
+top5_2=21625
+top5_3=37056
+top5_4=55
+finite=PASS
+pos=5
+top1=63945
+top1_logit_u6=13927048
+top5_0=63945
+top5_1=12108
+top5_2=70613
+top5_3=72328
+top5_4=11275
+finite=PASS
+pos=6
+top1=38907
+top1_logit_u6=12745317
+top5_0=38907
+top5_1=74903
+top5_2=19506
+top5_3=110157
+top5_4=91586
+finite=PASS
+pos=7
+top1=117282
+top1_logit_u6=14596547
+top5_0=117282
+top5_1=78328
+top5_2=92320
+top5_3=104089
+top5_4=1003
+finite=PASS
+pos=8
+top1=79874
+top1_logit_u6=15861243
+top5_0=79874
+top5_1=95266
+top5_2=91413
+top5_3=98415
+top5_4=19251
+finite=PASS
+pos=9
+top1=92320
+top1_logit_u6=15117314
+top5_0=92320
+top5_1=70613
+top5_2=62917
+top5_3=52243
+top5_4=87478
+finite=PASS
+pos=10
+top1=99384
+top1_logit_u6=11910970
+top5_0=99384
+top5_1=3314
+top5_2=738
+top5_3=1599
+top5_4=55
+finite=PASS
+pos=11
+top1=117282
+top1_logit_u6=10908234
+top5_0=117282
+top5_1=36
+top5_2=580
+top5_3=404
+top5_4=55
+finite=PASS
+pos=12
+top1=91413
+top1_logit_u6=13841490
+top5_0=91413
+top5_1=33724
+top5_2=1473
+top5_3=37994
+top5_4=86224
+finite=PASS
+pos=13
+top1=101621
+top1_logit_u6=12566185
+top5_0=101621
+top5_1=60726
+top5_2=99148
+top5_3=101171
+top5_4=72109
+finite=PASS
+pos=14
+top1=92320
+top1_logit_u6=15058613
+top5_0=92320
+top5_1=113347
+top5_2=70613
+top5_3=94469
+top5_4=11844
+finite=PASS
+pos=15
+top1=285
+top1_logit_u6=14775967
+top5_0=285
+top5_1=71
+top5_2=75
+top5_3=66
+top5_4=44
+finite=PASS
+pos=16
+top1=97245
+top1_logit_u6=13277365
+top5_0=97245
+top5_1=122137
+top5_2=79360
+top5_3=87478
+top5_4=66454
+finite=PASS
+finite_gate=PASS
+no Metal/CUDA execution claim
+no full-model payload-residency claim
+```
+
+`solum.read_range` of 5_948_480 bytes **passed**. Admit, tokenizer, all
+24 layer materializations, and `dense.forward` completed. Finite gate
+holds on every window position. First failing oracle under gi0 vs the
+pinned llama.cpp comparator (GATE 9 probe, not re-run): position 0
+top-1 `89` vs comparator `304` (` in`). Observed top-5 at position 0
+`[89, 126318, 118150, 1579, 145768]` does not contain `304`. Position 8
+top-1 is `79874` (this consumer's 17-token manifest window; not the
+SmolLM2 GI2-3 9-token / pos-8 row). Stop rule: record exactly, do not
+chase. No Metal/CUDA or payload-residency claim.
+
+Toolchain: rustc 1.97.1 (8bab26f4f 2026-07-14) Homebrew, cargo 1.97.1
+(c980f4866 2026-06-30). Host: Darwin 25.5.0 arm64
+(`burgus.local`, `RELEASE_ARM64_T6050`, Apple M5 Max).
+
+### GATE 11 revisions
+
+| Surface | Revision |
+| --- | --- |
+| packet gradus | this commit (GATE 11 receipt; parent `b52f7d8`) |
+| packet radix (readable) | `8da2f4966` |
+| faber binary used | packet `target/debug/faber` 1.7.0 at `8da2f4966` |
+| workspace faber | `afd2a96` (via `FABER_SUPPORT_PATH_OVERRIDE`; not written) |
+| workspace / packet hosts | `a6c8129` (64 MiB `solum` cap; via override; not written) |
+| workspace norma | `7d71daf` (read via `FABER_LIBRARY_HOME`; not written) |
+
 ## GATE 10 (2026-08-18)
 
 **Verdict: ORACLE REACHED — finite PASS; first-divergence vs comparator
