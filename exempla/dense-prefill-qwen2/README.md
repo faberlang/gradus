@@ -39,7 +39,305 @@ Compiled rust `trace` (GI2-1, all PASS max_delta `0`):
 
 Stored head ≠ linear row0 on every 2-D weight (K-major). The adapter
 now transposes those families after materialize. No GI2-2 activation
-golden exists for this row.
+golden exists for this row. GATE 12 re-ran the full prefill binary
+after that sweep: observed position-0 top-1 `7` vs comparator `304`.
+U1.10 is not CLOSE.
+
+## GATE 12 (2026-08-18)
+
+**Verdict: ORACLE REACHED — finite PASS; first-divergence vs comparator
+top-1. U1.10 not CLOSE.** Handle `6d7c97dd` / packet `hand-34`. Gradus
+`factory/hand-34` fast-forwarded `factory/hand-25` tip `05f5a3a`
+(gather `37cdf7c`, Q/K-major SmolLM2 `012d411`, remaining-linear /
+Qwen2 K-major `05f5a3a`). Readable packet radix `1abb7c291`. Workspace
+hosts `a6c8129` (64 MiB `solum` range cap) via
+`FABER_SUPPORT_PATH_OVERRIDE=/Users/ianzepp/work/faberlang`.
+`FABER_LIBRARY_HOME=/Users/ianzepp/work/faberlang` (workspace
+container: packet has no `norma` member; `05f5a3a` is exempla-only so
+workspace `gradus` library src matches the packet). Packet
+`cargo build -p faber` green. `faber build --target rust` printed the
+binary (`Finished dev` in 5.64s, 0 rustc errors, 637 warnings).
+Execution of the printed binary **passed** `solum.read_range` of the
+5_948_480-byte table prefix, printed architecture facts, matched the
+pinned tokenizer ids, loaded all 24 layers, completed `dense.forward`
+(`logits_shape=[17,151936]`), and printed top-1 / top-5 for window
+positions 0..16. `finite_gate=PASS`. Observed position-0 top-1 `7` vs
+the GATE 9 pinned-comparator observation `304` (` in`). GATE 10's
+post-transpose top-1 was `86331`; GATE 11 after gather was `89`; the
+K-major adapter moved the observed token again and did not match the
+comparator. Observed top-5 at position 0 `[7, 220, 12, 103630, 320]`
+does not contain `304`.
+
+The sweep cleared gather / rmsnorm / rope / all linear *weights*.
+First remaining unprobed op in `dense_block` program order is
+**attention softmax/mask** inside `attention.multi_head_attention`.
+Existing probe evidence also still names the U1.8 zero-bias contract:
+the file carries `attn_q.bias` / `attn_k.bias` / `attn_v.bias` and
+those tensors are still not consumed (that sits on the Q/K/V
+activation path, before softmax). Next unprobed families: residual
+adds, swiglu activation, cache/prefill bookkeeping. This gate did not
+chase or retune those ops. No in-binary `PREFILL:` line (this consumer
+does not call the golden file). Exit 0. Numerics were not tuned.
+TARGETLANE001 was not weakened (`[build] target = "fmir"` stays).
+
+### Packet faber rebuild (green)
+
+From the hand packet:
+
+```text
+cd /Users/ianzepp/work/faberlang/worktrees/hand-34/radix
+cargo build -p faber
+```
+
+Exit 0 in 21.79s. Binary
+`/Users/ianzepp/work/faberlang/worktrees/hand-34/radix/target/debug/faber`
+(`faber 1.7.0`, mtime 2026-08-18 09:12, 95,042,760 bytes) at radix
+`1abb7c291`.
+
+### Rust-target emit (clean)
+
+```text
+cd /Users/ianzepp/work/faberlang/worktrees/hand-34/gradus
+env FABER_SUPPORT_PATH_OVERRIDE=/Users/ianzepp/work/faberlang \
+  FABER_LIBRARY_HOME=/Users/ianzepp/work/faberlang \
+  /Users/ianzepp/work/faberlang/worktrees/hand-34/radix/target/debug/faber \
+  build --target rust exempla/dense-prefill-qwen2
+```
+
+`FABER_LIBRARY_HOME` is the workspace container (has `gradus/` +
+`norma/`). Packet `hand-34` has no `norma` member. Faber compiled
+the package, emitted `exempla/dense-prefill-qwen2/target/faber`, and
+invoked Cargo.
+
+```text
+warning: `dense-prefill-qwen2` (bin "dense-prefill-qwen2") generated 637 warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.64s
+/Users/ianzepp/work/faberlang/worktrees/hand-34/gradus/exempla/dense-prefill-qwen2/target/debug/dense-prefill-qwen2
+```
+
+Exit 0. Printed binary present (3,924,232 bytes, mtime 2026-08-18 09:14).
+Zero rustc errors.
+
+### Observed execution
+
+```text
+/Users/ianzepp/work/faberlang/worktrees/hand-34/gradus/exempla/dense-prefill-qwen2/target/debug/dense-prefill-qwen2 \
+  /Users/ianzepp/ai/models/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf \
+  5948480 \
+  6eb923e7d26e9cea28811e1a8e852009b21242fb157b26149d3b188f3a8c8653
+```
+
+Start `2026-08-18T13:17:56Z`. End `2026-08-18T13:58:04Z`. Exit 0.
+`/usr/bin/time -l`: 2408.13 real, 2165.21 user, 223.70 sys, max RSS
+9,441,558,528 bytes (~8.79 GiB).
+
+Stdout (verbatim, layer-load rows elided as `...`):
+
+```text
+policy=gi0-numeric-contract v1.0.0 finite/top-1-exact/top-5-overlap>=4/5/delta=1e-5 window=0..16
+backend=CPU/reference
+model=Qwen2.5-0.5B-Instruct-Q4_K_M.gguf
+bytes=397808192
+sha256=6eb923e7d26e9cea28811e1a8e852009b21242fb157b26149d3b188f3a8c8653
+prompt=The capital of France is Paris and the capital of Japan is Tokyo. The next city
+admitting manifest...
+admit done
+architecture=qwen2
+tensors=290
+layers=24
+heads=14
+kv_heads=2
+head_dim=64
+hidden_dim=896
+vocab=151936
+tied=true
+observed_token_ids=[785,6722,315,9625,374,12095,323,279,6722,315,6323,374,26194,13,576,1790,3283]
+tokenizer_ids=PASS
+loading stored-weight views through the U1.8 resolver
+loaded_layer=0
+...
+loaded_layer=23
+logits_shape=[17,151936]
+pos=0
+top1=7
+top1_logit_u6=14433476
+top5_0=7
+top5_1=220
+top5_2=12
+top5_3=103630
+top5_4=320
+finite=PASS
+pos=1
+top1=220
+top1_logit_u6=13213157
+top5_0=220
+top5_1=1305
+top5_2=26381
+top5_3=121934
+top5_4=4567
+finite=PASS
+pos=2
+top1=12
+top1_logit_u6=15146055
+top5_0=12
+top5_1=220
+top5_2=7
+top5_3=76828
+top5_4=320
+finite=PASS
+pos=3
+top1=92465
+top1_logit_u6=13631810
+top5_0=92465
+top5_1=99630
+top5_2=57075
+top5_3=39743
+top5_4=70468
+finite=PASS
+pos=4
+top1=57075
+top1_logit_u6=12965773
+top5_0=57075
+top5_1=37445
+top5_2=121141
+top5_3=20754
+top5_4=99630
+finite=PASS
+pos=5
+top1=33235
+top1_logit_u6=13107370
+top5_0=33235
+top5_1=70468
+top5_2=121934
+top5_3=1305
+top5_4=70828
+finite=PASS
+pos=6
+top1=12
+top1_logit_u6=13402559
+top5_0=12
+top5_1=103630
+top5_2=76828
+top5_3=51517
+top5_4=115979
+finite=PASS
+pos=7
+top1=26381
+top1_logit_u6=12634911
+top5_0=26381
+top5_1=1305
+top5_2=121934
+top5_3=11534
+top5_4=220
+finite=PASS
+pos=8
+top1=1305
+top1_logit_u6=13100730
+top5_0=1305
+top5_1=79208
+top5_2=220
+top5_3=121934
+top5_4=4610
+finite=PASS
+pos=9
+top1=12
+top1_logit_u6=14436580
+top5_0=12
+top5_1=103630
+top5_2=732
+top5_3=220
+top5_4=115166
+finite=PASS
+pos=10
+top1=33235
+top1_logit_u6=13688050
+top5_0=33235
+top5_1=57075
+top5_2=49731
+top5_3=30741
+top5_4=17429
+finite=PASS
+pos=11
+top1=103630
+top1_logit_u6=13650019
+top5_0=103630
+top5_1=108809
+top5_2=5284
+top5_3=118971
+top5_4=115166
+finite=PASS
+pos=12
+top1=108809
+top1_logit_u6=13828630
+top5_0=108809
+top5_1=112580
+top5_2=45156
+top5_3=5284
+top5_4=118971
+finite=PASS
+pos=13
+top1=103630
+top1_logit_u6=13711439
+top5_0=103630
+top5_1=108809
+top5_2=5284
+top5_3=58496
+top5_4=51517
+finite=PASS
+pos=14
+top1=103630
+top1_logit_u6=13889061
+top5_0=103630
+top5_1=108809
+top5_2=5284
+top5_3=53385
+top5_4=118971
+finite=PASS
+pos=15
+top1=26381
+top1_logit_u6=12997713
+top5_0=26381
+top5_1=30741
+top5_2=17429
+top5_3=1305
+top5_4=121934
+finite=PASS
+pos=16
+top1=5215
+top1_logit_u6=14311237
+top5_0=5215
+top5_1=53741
+top5_2=82060
+top5_3=15215
+top5_4=82263
+finite=PASS
+finite_gate=PASS
+no Metal/CUDA execution claim
+no full-model payload-residency claim
+```
+
+`solum.read_range` of 5_948_480 bytes **passed**. Admit, tokenizer, all
+24 layer materializations, and `dense.forward` completed. Finite gate
+holds on every window position. First failing oracle under gi0 vs the
+pinned llama.cpp comparator (GATE 9 probe, not re-run): position 0
+top-1 `7` vs comparator `304` (` in`). Observed top-5 at position 0
+`[7, 220, 12, 103630, 320]` does not contain `304`. Stop rule: record
+exactly, do not chase. No Metal/CUDA or payload-residency claim.
+
+Toolchain: rustc 1.97.1 (8bab26f4f 2026-07-14) Homebrew, cargo 1.97.1
+(c980f4866 2026-06-30). Host: Darwin 25.5.0 arm64
+(`burgus.local`, `RELEASE_ARM64_T6050`, Apple M5 Max).
+
+### GATE 12 revisions
+
+| Surface | Revision |
+| --- | --- |
+| packet gradus | this commit (GATE 12 receipt; parent `05f5a3a`) |
+| packet radix (readable) | `1abb7c291` |
+| faber binary used | packet `target/debug/faber` 1.7.0 at `1abb7c291` |
+| workspace faber | `0fe3a00` (via `FABER_SUPPORT_PATH_OVERRIDE`; not written) |
+| workspace / packet hosts | `a6c8129` (64 MiB `solum` cap; via override; not written) |
+| workspace norma | `7d71daf` (read via `FABER_LIBRARY_HOME`; not written) |
 
 ## GATE 10 (2026-08-18)
 
