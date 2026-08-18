@@ -28,6 +28,42 @@ Oracle (compiled rust `trace`, packet `hand-25`):
 
 No-transpose reds (Python GI2-1 matmul vs the same goldens): V `0.251`, O `3.025`, gate `3.126`, up `1.990`. K has no pre-rope GI2-2; rust `nn.linear` vs independent GI2-1 matmul is `2.15e-6` (accumulation, not layout). GATE 12 re-ran the full prefill binary after that sweep: observed top-1 `5762` vs GI2-3 golden `30`. U1.9 is not CLOSE.
 
+## GATE 12.5 (2026-08-18) — attention softmax/mask probe
+
+Handle `52d14758` / packet `hand-46`. First unprobed family after the
+weight-path sweep. GI2-2 `attention.json` has **no softmax golden** —
+`expected_output` is the post-softmax × V **context** (960). The GI2-1
+CPU reference is the same recipe: consecutive GQA `g = h / (H/K)`,
+scale `0.125`, causal prefix `j ≤ i` (diagonal included), max-subtracted
+row softmax. Independent numpy of that recipe matches the GI2-2 context
+at `4.47e-8`. Off-by-one masks (`j < i`, last-key dropped, row-0-only)
+miss at `0.03`–`0.21`.
+
+Compiled-rust `trace` (packet faber `7485899bb`, 2026-08-18). Oracle
+**met** for the assigned family:
+
+| probe | method | max_delta | n > 1e-6 |
+| --- | --- | --- | --- |
+| `mask_construction` | zero scores, `v[:,0] = t+1` | row0=1, row7=4.5, row8=5 | **PASS** |
+| `attn_context_from_gi22_qkv` | GI2-2 q/k/v → `scaled_dot_product_causal` | **2.98e-8** | **0 / 960** |
+| `attn_context_live` | live Q/K/V + RoPE + causal × V | **7.45e-8** | **0 / 960** |
+| `live_rope_q_pos8` | live post-rope Q vs GI2-2 `q` | 2.38e-6 | 2 / 960 (rope f32, not mask) |
+| `o_linear` | golden context × `wo` (`nn.linear`) | **0** | **0 / 960** |
+| `o_linear_via_wo_T` | golden context × `woᵀ` (MHA extra transpose) | **3.025** | **960 / 960** |
+
+No softmax/mask off-by-one. No softmax numeric miss at the 1e-6
+oracle. The next local gradus surface is MHA's `out = concat · woᵀ`
+(`attention.fab:940`) against the already-green `nn.linear(ctx, wo)`
+layout. Not fixed here — that is the O-projection family, and changing
+it breaks the U1.4 GQA pins that were computed with the transpose.
+
+Qwen2 bias audit (same unit, not a SmolLM2 fix): the pinned
+`Qwen2.5-0.5B-Instruct-Q4_K_M.gguf` **does** carry QKV bias —
+24 × `{attn_q,attn_k,attn_v}.bias` (72 F32 tensors; q `[896]`, k/v
+`[128]`; no `attn_output.bias`). SmolLM2 has **zero** `.bias` tensors.
+`dense.forward` still synthesizes zeros; `dense_qwen2` only maps
+`.attn_*.weight`. Not a trivial local softmax fix.
+
 ## GATE 12 (2026-08-18)
 
 **Verdict: ORACLE REACHED — PREFILL FAIL (first-divergence top-1).
