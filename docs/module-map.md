@@ -87,7 +87,7 @@ SC  Shared contracts    gradus:parameter, gradus:serialize
 
 ## Pointers
 
-- REF-01-U1.9 compiled-route consumer: [`exempla/dense-prefill-smollm2/`](../exempla/dense-prefill-smollm2/) (resume-2 stop at radix `3853d4b8f`: packet faber green; rust runtime plan `PKG001:host_provider_selection_invalid`; no executed logits)
+- REF-01-U1.9 compiled-route consumer: [`exempla/dense-prefill-smollm2/`](../exempla/dense-prefill-smollm2/) (FINAL stop at radix `2ed9914e4`: packet faber green; rust emit reaches cargo; rustc 258 errors, first `cast cannot be followed by a method call`; no executed logits)
 - Per-symbol signatures, errors, and semantics: [`docs/api-reference.md`](api-reference.md)
 - Full import DAG + ownership table: [`docs/factory/production-ml-library/pml0-module-dag.md`](factory/production-ml-library/pml0-module-dag.md)
   (the DAG's §1 counts snapshot predates PML3–5 and the correctness wave;
