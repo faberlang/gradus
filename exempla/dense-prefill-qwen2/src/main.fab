@@ -22,6 +22,7 @@ import from "gradus:model/dense_qwen2" dense_qwen2
 import from "gradus:model/gguf_manifest" manifestum
 import from "gradus:model/tensor_payload" tensor_payload
 import from "gradus:model/tensor_view" tensor_view
+import from "gradus:nn" nn
 import from "gradus:tensor" tensor
 import from "gradus:tokenizer" tokenizer
 import from "norma:processus" processus
@@ -143,6 +144,9 @@ fn slot_of(string suffix) → int {
     if suffix ≡ ".mlp.gate_proj" then return 6
     if suffix ≡ ".mlp.up_proj" then return 7
     if suffix ≡ ".mlp.down_proj" then return 8
+    if suffix ≡ ".self_attn.q_proj.bias" then return 9
+    if suffix ≡ ".self_attn.k_proj.bias" then return 10
+    if suffix ≡ ".self_attn.v_proj.bias" then return 11
     return -1
 }
 
@@ -169,7 +173,7 @@ fn lookup_one(string name, int layer, tensor.Tensor embed, tensor.Tensor norm, l
     const string suffix ← layer_suffix(name)
     const int slot ← slot_of(suffix)
     if slot ≺ 0 then return dense.Lookup {successus = false, tensorem = embed, message = "unknown canonical tensor: " + name}
-    const int index ← (layer * 9) + slot
+    const int index ← (layer * 12) + slot
     if index ≺ 0 or index ≥ weights.length() {
         return dense.Lookup {successus = false, tensorem = embed, message = "layer index out of range for canonical tensor: " + name}
     }
@@ -353,7 +357,10 @@ fn load_layer(
         prefix + ".post_attention_layernorm",
         prefix + ".mlp.gate_proj",
         prefix + ".mlp.up_proj",
-        prefix + ".mlp.down_proj"
+        prefix + ".mlp.down_proj",
+        prefix + ".self_attn.q_proj.bias",
+        prefix + ".self_attn.k_proj.bias",
+        prefix + ".self_attn.v_proj.bias"
     ]
     for from names const name {
         const string gguf_name ← resolve_gguf(cfg, m, name)
@@ -669,6 +676,143 @@ fn _band_row(string tagged, list<f32> observed, string via, int expectata, f32 b
     }
 }
 
+fn _row_at(tensor.Tensor t, int row) → list<f32> {
+    const list<int> f ← t.shape()
+    const int cols ← f.get(1) coalesce 0
+    var list<f32> out ← vacua
+    var int j ← 0
+    while j ≺ cols {
+        out.append(t.data.get((row * cols) + j) coalesce 0.0 ∷ f32)
+        j ← j + 1
+    }
+    return out
+}
+
+fn _tile_bias(int rows, tensor.Tensor b) → tensor.Tensor ⇥ PrefillError {
+    const list<int> fb ← b.shape()
+    if fb.length() ≠ 1 {
+        throw variant AdapterError { message = "QKV bias must be rank 1" }
+    }
+    const int n ← fb.get(0) coalesce 0
+    var list<f32> out ← vacua
+    var int i ← 0
+    while i ≺ rows {
+        var int j ← 0
+        while j ≺ n {
+            out.append(b.data.get(j) coalesce 0.0 ∷ f32)
+            j ← j + 1
+        }
+        i ← i + 1
+    }
+    do {
+        return tensor.construct(out, [rows, n])
+    }
+    catch err {
+        throw variant MaterializeError { message = "bias tile construct failed" }
+    }
+}
+
+fn _zeros2(int rows, int cols) → tensor.Tensor ⇥ PrefillError {
+    do {
+        return tensor.fill([rows, cols], 0.0 ∷ f32)
+    }
+    catch err {
+        throw variant MaterializeError { message = tensor.message(err) }
+    }
+}
+
+# GI2-1 CPU linear: y[n] = (sum_k x[k] * W[k, n]) + b[n] over one token row.
+# Same textbook dense+add the GI2 decoder_ops row uses (matmul then add).
+fn _ref_linear_row(list<f32> x, tensor.Tensor w, tensor.Tensor b) → list<f32> ⇥ PrefillError {
+    const list<int> fw ← w.shape()
+    const list<int> fb ← b.shape()
+    if fw.length() ≠ 2 {
+        throw variant AdapterError { message = "reference weight must be rank 2" }
+    }
+    if fb.length() ≠ 1 {
+        throw variant AdapterError { message = "reference bias must be rank 1" }
+    }
+    const int k ← fw.get(0) coalesce 0
+    const int n ← fw.get(1) coalesce 0
+    if x.length() ≠ k or (fb.get(0) coalesce 0) ≠ n {
+        throw variant AdapterError { message = "reference linear inner dimensions mismatch" }
+    }
+    var list<f32> out ← vacua
+    var int j ← 0
+    while j ≺ n {
+        var f32 acc ← 0.0 ∷ f32
+        var int i ← 0
+        while i ≺ k {
+            acc ← acc + ((x.get(i) coalesce 0.0 ∷ f32) * (w.data.get((i * n) + j) coalesce 0.0 ∷ f32))
+            i ← i + 1
+        }
+        out.append(acc + (b.data.get(j) coalesce 0.0 ∷ f32))
+        j ← j + 1
+    }
+    return out
+}
+
+fn _probe_lists(string tagged, list<f32> observed, list<f32> expectata, f32 band) → string {
+    const f32 maxd ← _list_max_delta(observed, expectata)
+    const int above ← _list_n_above(observed, expectata, band)
+    const int n ← observed.length()
+    if maxd ≺ band {
+        return (((((tagged + ": PASS max_delta=") + (maxd ↦ string)) + " n_above=") + (above ↦ string)) + "/") + (n ↦ string)
+    }
+    return (((((tagged + ": FAIL max_delta=") + (maxd ↦ string)) + " n_above=") + (above ↦ string)) + "/") + (n ↦ string)
+}
+
+fn _rmsnorm_ok(tensor.Tensor x, tensor.Tensor s) → tensor.Tensor {
+    do {
+        return nn.rmsnorm(x, s, 0.00001 ∷ f32)
+    }
+    catch err {
+        panic "trace rmsnorm failed: " + nn.message(err)
+    }
+    return x
+}
+
+fn _linear_ok(tensor.Tensor x, tensor.Tensor w, tensor.Tensor b) → tensor.Tensor {
+    do {
+        return nn.linear(x, w, b)
+    }
+    catch err {
+        panic "trace qkv linear failed: " + nn.message(err)
+    }
+    return x
+}
+
+fn _tensor_from(list<f32> data, list<int> forma) → tensor.Tensor ⇥ PrefillError {
+    do {
+        return tensor.construct(data, forma)
+    }
+    catch err {
+        throw variant MaterializeError { message = "probe tensor construct failed" }
+    }
+}
+
+fn _stored_linear(int typo, int k, int n, int block_elems, int block_bytes, string path, int abs0) → tensor.Tensor ⇥ PrefillError {
+    const int elements ← k * n
+    const int nbytes ← (elements / block_elems) * block_bytes
+    const list<f32> stored ← _dequant_bytes(typo, path, abs0, nbytes)
+    const tensor.Tensor t ← _tensor_from(stored, [k, n])
+    return kmajor_to_linear(t)
+}
+
+fn _gather_prompt(string path) → tensor.Tensor ⇥ PrefillError {
+    var list<f32> out ← vacua
+    for from PINNED_TOKENS const tok {
+        const int abs0 ← 5948480 + ((tok * 896) / 32) * 34
+        const list<f32> row ← _dequant_bytes(8, path, abs0, 952)
+        var int j ← 0
+        while j ≺ 896 {
+            out.append(row.get(j) coalesce 0.0 ∷ f32)
+            j ← j + 1
+        }
+    }
+    return _tensor_from(out, [PINNED_TOKENS.length(), 896])
+}
+
 fn admit_manifest(list<int> prefix, int total, artifact.ContentIdentity identity) → manifestum.GgufManifest {
     do {
         return manifestum.inspect(
@@ -774,7 +918,50 @@ main {
             print _band_row("d_linear_row0", _row0_from_blocks(14, 4864, 256, 210, path, 150595136, 32), GOLDEN_D_ROW0, 32, TRACE_BAND)
             print _band_row("embed_dequant_head", _dequant_bytes(8, path, 5948480, 34), GOLDEN_E_HEAD, 32, TRACE_BAND)
             print "lm_head: tied=true — token-major embed, dense.forward transposes to [D,V]"
-            print "TRACE: STOP after Qwen2 layer-0 GI2-1 weight-slice"
+        }
+        catch err {
+            panic render(err)
+        }
+        print "trace: Qwen2 layer-0 Q/K/V activations vs GI2-1 CPU linear (no GI2-2 golden)"
+        do {
+            const tensor.Tensor gathered ← _gather_prompt(path)
+            const list<f32> ln1_w ← _dequant_bytes(0, path, 150591552, 3584)
+            const tensor.Tensor ln1_s ← _tensor_from(ln1_w, [896])
+            const tensor.Tensor wq ← _stored_linear(6, 896, 896, 32, 22, path, 160801088)
+            const tensor.Tensor wk ← _stored_linear(6, 896, 128, 32, 22, path, 160166720)
+            const tensor.Tensor wv ← _stored_linear(8, 896, 128, 32, 34, path, 161353536)
+            const tensor.Tensor bq_ch ← _tensor_from(_dequant_bytes(0, path, 160797504, 3584), [896])
+            const tensor.Tensor bk_ch ← _tensor_from(_dequant_bytes(0, path, 160166208, 512), [128])
+            const tensor.Tensor bv_ch ← _tensor_from(_dequant_bytes(0, path, 161353024, 512), [128])
+            print "bias_q_shape=" + ids_text(bq_ch.shape())
+            print "bias_k_shape=" + ids_text(bk_ch.shape())
+            print "bias_v_shape=" + ids_text(bv_ch.shape())
+            const tensor.Tensor ln1 ← _rmsnorm_ok(gathered, ln1_s)
+            const int last ← PINNED_TOKENS.length() - 1
+            const list<f32> x_row ← _row_at(ln1, last)
+            const tensor.Tensor bq ← _tile_bias(PINNED_TOKENS.length(), bq_ch)
+            const tensor.Tensor bk ← _tile_bias(PINNED_TOKENS.length(), bk_ch)
+            const tensor.Tensor bv ← _tile_bias(PINNED_TOKENS.length(), bv_ch)
+            const tensor.Tensor bq0 ← _zeros2(PINNED_TOKENS.length(), 896)
+            const tensor.Tensor bk0 ← _zeros2(PINNED_TOKENS.length(), 128)
+            const tensor.Tensor bv0 ← _zeros2(PINNED_TOKENS.length(), 128)
+            const tensor.Tensor qb ← _linear_ok(ln1, wq, bq)
+            const tensor.Tensor kb ← _linear_ok(ln1, wk, bk)
+            const tensor.Tensor vb ← _linear_ok(ln1, wv, bv)
+            const tensor.Tensor qb0 ← _linear_ok(ln1, wq, bq0)
+            const tensor.Tensor kb0 ← _linear_ok(ln1, wk, bk0)
+            const tensor.Tensor vb0 ← _linear_ok(ln1, wv, bv0)
+            const list<f32> q_ref ← _ref_linear_row(x_row, wq, bq_ch)
+            const list<f32> k_ref ← _ref_linear_row(x_row, wk, bk_ch)
+            const list<f32> v_ref ← _ref_linear_row(x_row, wv, bv_ch)
+            print _probe_lists("q_linear_zero_bias", _row_at(qb0, last), q_ref, TRACE_BAND)
+            print _probe_lists("k_linear_zero_bias", _row_at(kb0, last), k_ref, TRACE_BAND)
+            print _probe_lists("v_linear_zero_bias", _row_at(vb0, last), v_ref, TRACE_BAND)
+            print _probe_lists("q_linear_with_bias", _row_at(qb, last), q_ref, TRACE_BAND)
+            print _probe_lists("k_linear_with_bias", _row_at(kb, last), k_ref, TRACE_BAND)
+            print _probe_lists("v_linear_with_bias", _row_at(vb, last), v_ref, TRACE_BAND)
+            print "ordering: linear+bias then rope(q/k); v is not roped (transformer.fab:467-471, attention.fab:930-935, prefill_run.rs:1441-1520)"
+            print "TRACE: STOP after Qwen2 layer-0 Q/K/V bias probe"
         }
         catch err {
             panic render(err)
