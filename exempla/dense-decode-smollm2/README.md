@@ -35,3 +35,8 @@ DECODE: PASS
 
 Token `2` is the SmolLM2 EOS id; this slice does not apply EOG-stop
 (no full `generate()` API). Exit 0.
+
+**MEASURE 2026-08-18 (handle `f8fce797`)** — same binary family at
+Cargo `--release`. 11 `decode_step`s, mean **40.03 s/tok (0.025 t/s)**
+vs llama.cpp `tg128` 7.33 ms Metal / 15.0 ms CPU t=1. Receipt:
+[`../dense-prefill-smollm2/bench/RECEIPT.md`](../dense-prefill-smollm2/bench/RECEIPT.md).
