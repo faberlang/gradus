@@ -3,9 +3,11 @@
 Consumer for the U1.8 dense forward graph against the pinned SmolLM2-360M
 row on the **compiled rust** receipt tier. This README is the unit receipt.
 
-**Verdict: STOP — not executed.** Resume-2 at radix `3853d4b8f` produced a
-packet `faber` binary. `faber build --target rust` reached the rust
-runtime plan and stopped on a new diagnostic. TARGETLANE001 was not
+**Verdict: STOP — not executed.** FINAL run at radix `2ed9914e4` / faber
+`b1adfc9` produced a packet `faber` binary. Prior gates cleared: CODEGEN001
+(`d66e1f93e`), E0432 (`7f0c7de51`), PKG001 `processus:exi` (`9f828b2b6` +
+`6e13687`). `faber build --target rust` emitted the crate and cargo compiled
+host crates, then rustc failed the generated crate. TARGETLANE001 was not
 weakened (`[build] target` is still `"fmir"`). Numerics were not tuned.
 The GGUF file was not executed.
 
@@ -20,7 +22,7 @@ The GGUF file was not executed.
   golden top-1 non-EOG `30`, golden top-5 `[30, 28, 1270, 365, 198]`).
 - Engine: `faber build --target rust` then execute the printed binary.
   MIR stepper is not the receipt-tier engine. llvm-host is the documented
-  fallback and was tried after the rust plan failed.
+  fallback and was tried after rustc failed.
 
 ## Command (from the Hand packet)
 
@@ -29,8 +31,8 @@ cd /Users/ianzepp/work/faberlang/worktrees/hand-12/radix
 cargo build -p faber
 ```
 
-`cargo build -p faber` at readable radix `3853d4b8f` exits 0
-(Finished `dev` profile in 7.41s). Packet binary:
+`cargo build -p faber` at readable radix `2ed9914e4` exits 0
+(Finished `dev` profile in 19.51s). Packet binary:
 `/Users/ianzepp/work/faberlang/worktrees/hand-12/radix/target/debug/faber`
 (`faber 1.7.0`, rustc 1.97.1 Homebrew). Prior E0432
 (`faber_hir_rust::ImportedEnumVariantInfo`) did not reproduce.
@@ -51,10 +53,10 @@ env FABER_SUPPORT_PATH_OVERRIDE=/Users/ianzepp/work/faberlang \
   build --target rust exempla/dense-prefill-smollm2
 ```
 
-## Observed rust runtime plan (2026-08-17 resume-2)
+## Observed rust emit (2026-08-17 FINAL)
 
 First attempt against `FABER_LIBRARY_HOME=<packet>` (no `norma`) failed
-before the rust plan with compact:
+before the rust plan with the known compact:
 
 ```text
 error[PKG001:unknown_library_provider]: exempla/dense-prefill-smollm2/src/main.fab:813
@@ -63,33 +65,48 @@ compilation failed
 ```
 
 Those byte offsets are the `norma:processus` / `norma:solum` imports.
-Retry used the symlink home above. `faber.toml` then needed rust host
-selection (still `target = "fmir"`). Exact first rust-plan diagnostic:
+Retry used the symlink home above. Prior runtime-plan stops did **not**
+reproduce:
+
+- `PKG001:package_host_selection_required` — already wired (`[target.rust] host = "native"`)
+- `PKG001:host_provider_selection_invalid` / `processus:exi` — accepted at `9f828b2b6` + `6e13687`
+- `CODEGEN001` — rust emit completed; crate written to
+  `exempla/dense-prefill-smollm2/target/faber`
+- E0432 — not reproduced
+
+Cargo compiled `host-kernel`, `processus`, `host-native`, `solum`, then
+`dense-prefill-smollm2`. rustc 1.97.1 then failed the generated crate:
 
 ```text
-error[PKG001:package_host_selection_required]: /Users/ianzepp/work/faberlang/worktrees/hand-12/gradus/exempla/dense-prefill-smollm2/faber.toml
-runtime plan failed
+error: could not compile `dense-prefill-smollm2` (bin "dense-prefill-smollm2") due to 258 previous errors; 337 warnings emitted
+error: cargo build exited with status exit status: 101
 ```
 
-`[target.rust] host = "native"` was added (inferentia pattern). The next
-diagnostic, compact identity only (coded PKG001 hides the message):
+First exact diagnostic:
 
 ```text
-error[PKG001:host_provider_selection_invalid]: /Users/ianzepp/work/faberlang/worktrees/hand-12/gradus/exempla/dense-prefill-smollm2/faber.toml
-runtime plan failed
+error: cast cannot be followed by a method call
+   --> src/main.rs:766:74
+    |
+766 |             message: format!("{}{}", "golden line count is not 49152: ", lines.len() as i64.to_string()),
 ```
 
-Grounded cause, not chased: with `host = native`, the rust planner
-collects every `call '…'` in expanded library bodies. `norma:processus`
-emits `processus:exi`. Live hosts manifest
-`/Users/ianzepp/work/faberlang/hosts/crates/processus/src/manifest.json`
-exports 10 processus routes and does **not** export `processus:exi`.
-`load_provider_manifests` then sets `provider_error` (issue
-`host_provider_route_missing`). Hosts is not a packet member. The
-manifest was not patched.
+First coded diagnostic:
 
-Prior CODEGEN001 (`tensor_view.fab` definition id 4131 / 4200) was **not**
-re-exercised: rust emit stopped at the runtime plan, before codegen.
+```text
+error[E0015]: cannot call non-const associated function `Box::<[i64; 9]>::new_uninit` in constants
+  --> src/main.rs:25:37
+   |
+25 | pub const PINNED_TOKENS: Vec<i64> = vec![504, 2365, 6354, 16438, 27003, 690, 260, 23790, 2767];
+```
+
+Error-code family counts on the rustc stream (260 `error` lines observed;
+rustc reports 258): E0015 173, E0493 37, E0308 29, E0599 9, E0277 3,
+bare "cast cannot be followed by a method call" 5, E0605 1
+(`Vec<i64> as Vec<u8>`), E0061 1, E0609 1 (`no field dtype` on
+`Option<GgufMetadata>`), E0382 1. Representative later identities:
+`transpone` / `activatio_softmax` missing on `faber::Tensor<T>`;
+`accipe` missing on `String`.
 
 Documented llvm-host fallback, same env:
 
@@ -106,12 +123,12 @@ payload-residency claim.
 
 | Surface | Revision |
 | --- | --- |
-| packet gradus | `a0d78a5` base; this commit records the resume-2 stop |
-| packet radix (readable) | `3853d4b8f` (includes `7f0c7de51` + `d66e1f93e`) |
-| faber binary used | packet `target/debug/faber` 1.7.0 at `3853d4b8f` |
-| workspace faber | `525d68bf8` (support-path override only; not written) |
-| workspace hosts | `24687cda4` (solum/processus manifests; not written) |
-| workspace norma | `7d71dafdb` (read via libhome; not written) |
+| packet gradus | `1baaaa6` base; this commit records the FINAL stop |
+| packet radix (readable) | `2ed9914e4` (includes `9f828b2b6`, `7f0c7de51`, `d66e1f93e`) |
+| faber binary used | packet `target/debug/faber` 1.7.0 at `2ed9914e4` |
+| workspace faber | `b1adfc9` (`6e13687` processus:exi via `process::exit`; not written) |
+| workspace hosts | `24687cd` (solum/processus manifests; not written) |
+| workspace norma | `7d71daf` (read via libhome; not written) |
 
 ## Model identity (not executed)
 
@@ -132,8 +149,8 @@ occurred.
 ## Evidence boundary
 
 This is a compiled-route **stop receipt**, not a prefill-logit pass.
-Repair belongs to the hosts `processus` provider manifest (`processus:exi`
-is in `norma/src/processus.fab` and absent from
-`hosts/crates/processus/src/manifest.json`). That surface is outside this
-packet. The rust host selection in `faber.toml` is the rust-receipt
-wiring; it does not change the FMIR lane target.
+Repair belongs to radix rust codegen (HIR-rust emit of Faber `const`
+lists / `as`+method chains / captured closures). That surface is
+outside this packet. TARGETLANE001 was not weakened. The generated
+crate under `exempla/dense-prefill-smollm2/target/faber` is build
+output and is not committed.

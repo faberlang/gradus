@@ -372,8 +372,8 @@ execution, logits, or device execution; CTO8-1 stays the named gate.
 | `dtype` | F32 staged carrier through the U1.8 `forward` surface (not executed) |
 | `legal fixture ref` | operator-local `SmolLM2-360M-Instruct-Q4_K_M.gguf` — 270,590,880 bytes, SHA-256 `2fa3f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2` |
 | `oracle ref` | gi0-numeric-contract v1.0.0 (finite / top-1 exact / top-5 overlap ≥ 4/5 / Δ=1e-5) on prompt-end / position 0; comparator llama.cpp 10150 `dee2a846b` binary SHA-256 `e5c153a1…4952a` |
-| `evidence links` | `exempla/dense-prefill-smollm2/` (consumer + README resume-2 stop receipt) |
-| `executed proof` | **not executed.** Resume-2 at readable radix `3853d4b8f`: `cargo build -p faber` exits 0. `faber build --target rust` stops at the runtime plan with `PKG001:host_provider_selection_invalid` after `[target.rust] host = "native"`. Hosts `processus` manifest does not export `processus:exi` (present in `norma/src/processus.fab`). llvm-host fallback is `PKG001:llvm_emission_failed`. No rust binary, no Gradus logits, no first-divergence. |
+| `evidence links` | `exempla/dense-prefill-smollm2/` (consumer + README FINAL stop receipt) |
+| `executed proof` | **not executed.** FINAL at readable radix `2ed9914e4` / faber `b1adfc9`: `cargo build -p faber` exits 0. Prior CODEGEN001/E0432/PKG001 `processus:exi` cleared. `faber build --target rust` emits the crate; rustc 1.97.1 fails 258 errors (first: `cast cannot be followed by a method call` at `src/main.rs:766`; first coded E0015 `const PINNED_TOKENS: Vec<i64> = vec![…]`). llvm-host fallback remains `PKG001:llvm_emission_failed`. No rust binary, no Gradus logits, no first-divergence. |
 | `compatibility policy` | no executed-tier claim. The compiled-route stop is recorded in the exemplum README. No Metal/CUDA or payload-residency claim. |
 
 ### Row 13b — Qwen2.5-0.5B prefill logit receipt, compiled-route stop (REF-01-U1.10)
