@@ -35,7 +35,7 @@ Corrected receipts (method + deltas in `goal-check.md`):
 
 - 23 public Latin fns; 34 Latin class fields; 201 Latin union-case
   occurrences (95 distinct); 1 type (`GeneratioError`); Latin import aliases
-  (`manifestum` ×8 src files, `capsula` ×2, `tokenizator`, `parametrum`).
+  (`manifestum` ×7 src files, `capsula` ×2, `tokenizator`, `parametrum`).
 - Gate state: `check-source` exit 0 (blind to non-ledger Latin);
   `inventory-public-symbols` exit 1 (750 baseline vs 979 live; 97
   coverage-failed symbols — grew past the goal's 47).
@@ -87,7 +87,7 @@ U7 → U8. Max useful parallelism 4.
 | --- | --- |
 | id | `no-latin-U3` (ledger row 3) |
 | outcome | All Latin gone from tokenizer/calibration per U1 map, including the owned category wire literal (e.g. `aliud` → its English value per OQ3 default) with fixtures regenerated |
-| write_scope | `src/tokenizer.fab`, `src/calibration.fab`, `src/tokenizer.proba`, `src/calibration.proba`, `fixtures/tokenizer/**` (regenerated), `fixtures/gguf/**` + `fixtures/safetensors/**` only if a U1-mapped literal reaches them |
+| write_scope | `src/tokenizer.fab`, `src/calibration.fab`, `src/tokenizer.proba`, `src/calibration.proba`, `fixtures/gguf/**` + `fixtures/safetensors/**` only if a U1-mapped literal reaches them |
 | done_when | Zero ledger-Latin tokens in the two modules + proofs; fixture bytes regenerated via `scripta/gen-fixture-*` and consistent with the new wire values |
 | depends_on | U1 |
 | sanity | `"$FABER_BIN" check "$PWD/src/tokenizer.fab"` and `.../calibration.fab` green; regen diff reviewed |
@@ -129,13 +129,23 @@ U7 → U8. Max useful parallelism 4.
 | --- | --- |
 | id | `no-latin-U6` (ledger row 6) |
 | outcome | Every consumer of the renamed surface uses the new names: exempla, tests, scripta `.fab`, fixture generators |
-| write_scope | `exempla/**/*.fab`, `tests/*.fab`, `scripta/*.fab` (`check-compile.fab`, `check-factory-goal-status.fab`), `fixtures/*/gen_fixture.fab` |
-| done_when | `"$FABER_BIN" check "$ROOT"` green **and** `"$FABER_BIN" check "$ROOT/exempla/<slug>"` green for every exemplum whose files were touched; no old-name references repo-wide (`grep` for ledger old names returns only `docs/archived/` and this goal dir) |
+| write_scope | `exempla/**`, `tests/*.fab`, `scripta/*.fab` (`check-compile.fab`, `check-factory-goal-status.fab`), `fixtures/*/gen_fixture.fab`, plus the doc surfaces matched by the repo-wide old-name grep: `README.md`, `docs/diagnostics.md`, `docs/numeric-tolerances.md`, `docs/regression-corpus.md`, `docs/design/training-pipeline-review.md` |
+| done_when | `"$FABER_BIN" check "$ROOT"` green **and** `"$FABER_BIN" check "$ROOT/exempla/<slug>"` green for every exemplum whose files were touched; no old-name references repo-wide — `grep` for ledger old names returns **only** `docs/archived/` and this goal dir after the sweep (allowed residue = frozen history) |
 | depends_on | U2, U3, U4, U5 |
 | sanity | package-scoped `faber check` per touched consumer package |
 | non_goals | Sibling repos (`examples/training/*`, Inferentia docs — recorded follow-up); historical factory docs under `docs/factory/production-ml-library/`, `docs/archived/` |
 | risk | medium-high — largest grep surface; fixture regen coupling from U3 |
 | integrable | yes — restores whole-package compile coherence |
+
+**U6 amendment — audit revise (2026-08-19, task 933c452a):** the exempla
+write scope is reverted from `exempla/**/*.fab` to GOAL's `exempla/**` (option
+a): the non-`.fab` exempla files are not pure binary/assets — the exempla
+READMEs carry ledger old names (`decodere_datum`, `numerum`, `manifestum`,
+…) — so the narrowing was a silent scope cut and is removed rather than
+disclosed. Grep confirmed 4 exempla READMEs with old names
+(`token-generation`, `gguf-manifest`, `generate-route`,
+`gguf-admit-qwen35moe`), not the 2 tallied in the finding; `exempla/**` covers
+them all.
 
 ### U7 — docs regeneration
 
