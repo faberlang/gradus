@@ -87,8 +87,8 @@ U7 → U8. Max useful parallelism 4.
 | --- | --- |
 | id | `no-latin-U3` (ledger row 3) |
 | outcome | All Latin gone from tokenizer/calibration per U1 map, including the owned category wire literal (e.g. `aliud` → its English value per OQ3 default) with fixtures regenerated |
-| write_scope | `src/tokenizer.fab`, `src/calibration.fab`, `src/tokenizer.proba`, `src/calibration.proba`, `fixtures/gguf/**` + `fixtures/safetensors/**` only if a U1-mapped literal reaches them |
-| done_when | Zero ledger-Latin tokens in the two modules + proofs; fixture bytes regenerated via `scripta/gen-fixture-*` and consistent with the new wire values |
+| write_scope | `src/tokenizer.fab`, `src/calibration.fab`, `src/tokenizer.proba`, `src/calibration.proba`, `fixtures/tokenizer/chat-template-identity-oracle.md`, `fixtures/tokenizer/pinned-probe-oracle.md`, `fixtures/gguf/**` + `fixtures/safetensors/**` only if a U1-mapped literal reaches them |
+| done_when | Zero ledger-Latin tokens in the two modules + proofs; fixture bytes regenerated via `scripta/gen-fixture-*` and consistent with the new wire values; both tokenizer oracle docs' Latin identifiers updated to match the renamed public tokenizer surface (hand-edited — there is no generator) |
 | depends_on | U1 |
 | sanity | `"$FABER_BIN" check "$PWD/src/tokenizer.fab"` and `.../calibration.fab` green; regen diff reviewed |
 | non_goals | Model-family files (U2); consumer chase (U6); pinning wire values (operator OQ3 — if pinned, convert internals only and record the pin) |
@@ -129,7 +129,7 @@ U7 → U8. Max useful parallelism 4.
 | --- | --- |
 | id | `no-latin-U6` (ledger row 6) |
 | outcome | Every consumer of the renamed surface uses the new names: exempla, tests, scripta `.fab`, fixture generators |
-| write_scope | `exempla/**`, `tests/*.fab`, `scripta/*.fab` (`check-compile.fab`, `check-factory-goal-status.fab`), `fixtures/*/gen_fixture.fab`, plus the doc surfaces matched by the repo-wide old-name grep: `README.md`, `docs/diagnostics.md`, `docs/numeric-tolerances.md`, `docs/regression-corpus.md`, `docs/design/training-pipeline-review.md`, `docs/api-shape-policy.md` (shape.quantitas/broadcastum/reformanda/expansio/Tensor.forma/causa()/sponte references), `docs/design/numeric-flexibility-performance.md` (dimensio/fons/stratum references) |
+| write_scope | `exempla/**`, `tests/*.fab`, `scripta/*.fab` (`check-compile.fab`, `check-factory-goal-status.fab`), `fixtures/*/gen_fixture.fab`, plus the doc surfaces matched by the repo-wide old-name grep: `README.md`, `docs/diagnostics.md`, `docs/numeric-tolerances.md`, `docs/regression-corpus.md`, `docs/design/training-pipeline-review.md`, `docs/api-shape-policy.md` (shape.quantitas/broadcastum/reformanda/expansio/Tensor.forma/causa() references), `docs/design/numeric-flexibility-performance.md` (dimensio/fons/stratum references) |
 | done_when | `"$FABER_BIN" check "$ROOT"` green **and** `"$FABER_BIN" check "$ROOT/exempla/<slug>"` green for every exemplum whose files were touched; no old-name references repo-wide — `grep` for ledger old names returns **only** the allowed residue, reconciled with this unit's `non_goals`: `docs/archived/**`, this goal dir (`docs/factory/no-latin/`), `docs/factory/production-ml-library/**`, and regenerable `exempla/*/target/` build artifacts (deleted by the sweep, never hand-edited). Everything else in the repo-wide old-name grep must return zero hits. |
 | depends_on | U2, U3, U4, U5 |
 | sanity | package-scoped `faber check` per touched consumer package |
