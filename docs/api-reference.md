@@ -331,8 +331,8 @@ Generation configuration, sampling projection, serialized config, and cursor lim
 - `fn generate_cancelled_with_stop(GenerationConfig g, list<int> prompt_ids, decode.Decoder m, decode.Cancellation cancel, StopPolicy stop) → list<int> ⇥ GeneratioError {`
 - `fn construct_dense_engine(dense.DenseConfig architecture, f32 epsilon, f32 scale, int rope_dim, attention.RopeConfig rope) → DenseEngine {`
 - `fn default_dense_engine() → DenseEngine {`
-- `fn generate_dense(GenerationConfig g, list<int> prompt_ids, DenseEngine engine, (string, int) → dense.Lookup source, list<kv.KVCache> layers, decode.Cancellation cancel) → list<int> ⇥ GeneratioError {` — EOG-stop default
-- `fn generate_dense_with_stop(GenerationConfig g, list<int> prompt_ids, DenseEngine engine, (string, int) → dense.Lookup source, list<kv.KVCache> layers, decode.Cancellation cancel, StopPolicy stop) → list<int> ⇥ GeneratioError {`
+- `fn generate_dense(GenerationConfig g, list<int> prompt_ids, DenseEngine engine, (string, int) → tensor.Tensor ⇥ dense.DenseError source, list<kv.KVCache> layers, decode.Cancellation cancel) → list<int> ⇥ GeneratioError {` — EOG-stop default
+- `fn generate_dense_with_stop(GenerationConfig g, list<int> prompt_ids, DenseEngine engine, (string, int) → tensor.Tensor ⇥ dense.DenseError source, list<kv.KVCache> layers, decode.Cancellation cancel, StopPolicy stop) → list<int> ⇥ GeneratioError {`
 
 
 ## gradus:gradient
@@ -555,14 +555,12 @@ Ordered dense-model forward assembly over canonical architecture descriptors and
 
 - `class DenseConfig`
   - fields: `int layers`, `int heads`, `int kv_heads`, `int head_dim`, `int hidden_dim`, `int vocab`, `bool tied`
-- `class Lookup`
-  - fields: `bool successus`, `tensor.Tensor tensorem`, `string message`
 - `union DenseError` — TensorAbsens, ConfiguraMala, FormaMala, TerminusExcedit
 
 ### Public functions
 
 - `fn message(DenseError e) → string {`
-- `fn forward(DenseConfig cfg, (string, int) → Lookup fons, list<int> tokens, f32 epsilon, f32 scale, list<int> positions, int rope_dim, attention.RopeConfig rope_cfg) → tensor.Tensor ⇥ DenseError {`
+- `fn forward(DenseConfig cfg, (string, int) → tensor.Tensor ⇥ DenseError fons, list<int> tokens, f32 epsilon, f32 scale, list<int> positions, int rope_dim, attention.RopeConfig rope_cfg) → tensor.Tensor ⇥ DenseError {`
 
 REF-01-U1.9 consumer: `exempla/dense-prefill-smollm2` (SmolLM2-360M real-file prefill through this `forward`). Compiled rust receipt is **not** recorded: FINAL at radix `2ed9914e4` / faber `b1adfc9` rebuilt packet `faber` (CODEGEN001/E0432/PKG001 `processus:exi` cleared), then rustc failed the emitted crate (258 errors; first: `cast cannot be followed by a method call` at `src/main.rs:766`). See the exemplum README.
 
@@ -660,8 +658,6 @@ Bounded GGUF v3 parsing, range inspection, typed metadata, and tensor descriptor
 - `union GgufManifestError` — FormatMala, VersioIgnota, Truncata, WireMala, LimitesMala, Superfluitas, ClavisDuplicata, TensorDuplicatum, OffsetMala, LayoutIgnota, IdentitasMala, FonsMala
 - `class GgufCorpus`
   - fields: `bytes tabula`, `int artifact_length`, `artifact.ContentIdentity identitas`
-- `class SourceRead`
-  - fields: `bool successus`, `bytes bytes`, `string message`
 - `class GgufMetadata`
   - fields: `string key`, `int dtype`, `bytes valor_wire`
 - `union GgmlLayout` — Cognita, Ignota
@@ -685,8 +681,8 @@ Bounded GGUF v3 parsing, range inspection, typed metadata, and tensor descriptor
 - `fn inveni_tensorem(GgufManifest m, string nomen) → GgufTensorDescriptor ⇥ GgufManifestError {`
 - `fn limes_payloadis(GgufManifest m, string nomen) → tuple<int, int> ⇥ GgufManifestError {`
 - `fn parse(GgufCorpus corpus) → GgufManifest ⇥ GgufManifestError {`
-- `fn inspect((int, int) → SourceRead fons, int longitudo_artifacti, artifact.ContentIdentity identitas) → GgufManifest ⇥ GgufManifestError {`
-- `fn read_fragmentum(GgufManifest m, string nomen, int initium, int longitudo, (int, int) → SourceRead fons) → bytes ⇥ GgufManifestError {`
+- `fn inspect((int, int) → bytes ⇥ GgufManifestError fons, int longitudo_artifacti, artifact.ContentIdentity identitas) → GgufManifest ⇥ GgufManifestError {`
+- `fn read_fragmentum(GgufManifest m, string nomen, int initium, int longitudo, (int, int) → bytes ⇥ GgufManifestError fons) → bytes ⇥ GgufManifestError {`
 
 
 ## gradus:model/qwen35moe
@@ -785,8 +781,8 @@ Bounded typed views over tensor payloads and materialization windows.
 
 - `fn message(ViewError e) → string {`
 - `fn links(manifestum.GgufManifest m, tensor_payload.TensorPayload p) → TensorView ⇥ ViewError {`
-- `fn materialize_slice(TensorView v, int initium_elementum, int longitudo_elementum, (int, int) → manifestum.SourceRead fons) → list<f32> ⇥ ViewError {`
-- `fn materialize_block(TensorView v, int index_glomuli, (int, int) → manifestum.SourceRead fons) → list<f32> ⇥ ViewError {`
+- `fn materialize_slice(TensorView v, int initium_elementum, int longitudo_elementum, (int, int) → bytes ⇥ manifestum.GgufManifestError fons) → list<f32> ⇥ ViewError {`
+- `fn materialize_block(TensorView v, int index_glomuli, (int, int) → bytes ⇥ manifestum.GgufManifestError fons) → list<f32> ⇥ ViewError {`
 
 
 ## gradus:nn
