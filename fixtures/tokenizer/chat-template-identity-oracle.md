@@ -34,15 +34,15 @@ between the wrapper tokens.
 
 ## Public surface pinned by this unit
 
-- `chat_template(Tokenizator t) → textus` — the artifact's
+- `chat_template(Tokenizer t) → string` — the artifact's
   `tokenizer.chat_template` string; empty when the artifact declares none.
-- `redde_turnum_user(Tokenizator t, textus content) → textus ⇥
+- `render_user_turn(Tokenizer t, string content) → string ⇥
   TokenizerError` — the minimal Qwen3-ChatML user-turn render; fails closed
-  with `ArtificiumMala` ("artifact declares no chat template") when the
+  with `BadArtifact` ("artifact declares no chat template") when the
   artifact declares no template (no hard-coded fallback).
 
 The rendered text encodes through the existing U3-4 paths:
-`encoda_promptum_specialia` (parse-special on, R1) and `encoda_promptum`
+`encode_prompt_special` (parse-special on, R1) and `encode_prompt`
 (parse-special off, R1b literal).
 
 ## Fail-closed matrix (per U3-6 done_when)
