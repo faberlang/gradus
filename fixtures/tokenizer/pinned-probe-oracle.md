@@ -17,7 +17,7 @@ proven separately by the U3-6 rows R1/R1b/R2).
 | --- | --- |
 | Revision | U3-7 closeout (stack on cc92176 U3-6); delivery `pml5-lib02-tokenizer-delivery.md` re-split 0eca870 |
 | Model identity | Qwen3.6-35B-A3B (`general.architecture=qwen35moe`, `tokenizer.ggml.model=gpt2`, `tokenizer.ggml.pre=qwen35`) |
-| Tokenizer identity | `gradus:tokenizer` GGUF-A2 artifact-backed runtime (`fabricare` + `encoda_promptum` / `encoda_promptum_specialia` + `decoda`), full composed surface (specials cache, EOG set, BOS-free, chat template) |
+| Tokenizer identity | `gradus:tokenizer` GGUF-A2 artifact-backed runtime (`construct` + `encode_prompt` / `encode_prompt_special` + `decode`), full composed surface (specials cache, EOG set, BOS-free, chat template) |
 | Oracle | `llama-tokenize` 10150 (`dee2a846b`), target artifact `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf`, rows deterministic (re-ran identical) |
 | Command | `./scripta/check-source`; `./scripta/check-compile` (FABER_LIBRARY_HOME + FABER_BIN from the hand packet); `git diff --check`; probe rows bound in `gradus/src/tokenizer.proba` (cargo-backed harness) + throwaway fmir mechanics consumer |
 | Expected vs observed | Probe A `[34469, 168607, 153295, 173922, 153380, 22216, 151752, 172769]`; Probe B `[109266, 3709, 96748, 6115, 113128, 17, 15, 17, 21, 95859, 23, 96212, 16, 18, 95971, 10838, 236, 231]` — identical |
@@ -67,27 +67,27 @@ wraps the Probe B ids between `[248045, 846, 198, …]` and `[248046, 198]`).
 
 ## Public surface proven by this unit
 
-- `encoda_promptum(t, textum) → lista<numerus> ⇥ TokenizerError` — full-prompt
+- `encode_prompt(t, text) → list<int> ⇥ TokenizerError` — full-prompt
   encode, parse-special off (scanner + BPE core).
-- `encoda_promptum_specialia(t, textum) → lista<numerus> ⇥ TokenizerError` —
+- `encode_prompt_special(t, text) → list<int> ⇥ TokenizerError` —
   full-prompt encode, parse-special on (special split before the scanner;
   identical to the above when the prompt has no specials).
-- `decoda(t, ids) → textus ⇥ TokenizerError` — id list → exact prompt text
+- `decode(t, ids) → string ⇥ TokenizerError` — id list → exact prompt text
   (byte-level BPE round-trip).
-- `scanna_verba(textum) → lista<textus> ⇥ TokenizerError` — the qwen35
+- `scan_words(text) → list<string> ⇥ TokenizerError` — the qwen35
   pre-tokenizer word split (U3-2/U3-3).
-- Composed runtime state: `eog_artificii` (EOG set, U3-5), `add_bos`
+- Composed runtime state: `artifact_eog` (EOG set, U3-5), `add_bos`
   (BOS-free), `chat_template` (U3-6).
 
 ## Fixture corpus
 
-Probe A runs on its own structural fixture `_corpus_proba_a` (same approach
+Probe A runs on its own structural fixture `_corpus_probe_a` (same approach
 as U2/U3-2..U3-6): the pinned tokens sit at their pinned ids (max id 248046,
 248047 entries — eos 248046 in range) with the exact display strings, the
 merge table carries exactly the 38 ranked merge pairs the real BPE applies
 to the two Probe A words (re-derived against the oracle tool on the target
 artifact), `token_type` is NORMAL everywhere, and the artifact policy
-metadata (eos 248046, add_bos falsum, minimal ChatML template) is present so
+metadata (eos 248046, add_bos false, minimal ChatML template) is present so
 the probe runtime is the complete composed surface. Probe B reuses the U3-6
 chat fixture `_corpus_chat`, whose words already sit at the pinned ids. No
 artifact bytes are committed.
