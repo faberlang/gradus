@@ -480,6 +480,29 @@ fn _softmax(tensor.Tensor x, bool causalis) → tensor.Tensor {
     return tensor.Tensor {dtype = x.dtype(), shape = f, data = out}
 }
 
+# RoPE table with logical shape [positions, dim/2, 3]. Each reduced pair
+# stores [angle, cos(angle), sin(angle)] in that order. The table is built
+# once at the forward boundary and shared by every q/k/head application.
+@ private { }
+fn _rope_table(list<int> positions, int dim, f32 freq_base, f32 scale) → list<f32> {
+    const f32 dim_f ← dim ↦ f32
+    const int half ← dim / 2
+    var list<f32> table ← empty
+    for from positions const pos {
+        const f32 pos_f ← pos ↦ f32
+        var int pair ← 0
+        while pair ≺ half {
+            const f32 pair_f ← pair ↦ f32
+            const f32 angle ← (pos_f * scale) * freq_base.power((0.0 - 2.0 * pair_f) / dim_f)
+            table.append(angle)
+            table.append(_cos(angle))
+            table.append(_sin(angle))
+            pair ← pair + 1
+        }
+    }
+    return table
+}
+
 # RoPE rotation over the LAST axis of a rank-2 tensor (REF-01-U1.3
 # configurable row). With interposita = falsum it is the llama-arch NORM
 # consecutive-pair rotation (2k, 2k+1) for k < dim/2 with
@@ -489,17 +512,14 @@ fn _softmax(tensor.Tensor x, bool causalis) → tensor.Tensor {
 # beyond dim are untouched. Infallible — callers validate
 # shape/positions/dim first.
 @ private { }
-fn _rope(tensor.Tensor x, list<int> positions, int dim, f32 freq_base, f32 scale, bool interposita) → tensor.Tensor {
+fn _rope(tensor.Tensor x, int dim, list<f32> table, bool interposita) → tensor.Tensor {
     const list<int> f ← x.shape()
     const int t ← f.get(0) coalesce 1
     const int d ← f.get(1) coalesce 1
-    const f32 dim_f ← dim ↦ f32
     const int half ← dim / 2
     var list<f32> out ← empty
     var int row ← 0
     while row ≺ t {
-        const int pos ← positions.get(row) coalesce 0
-        const f32 pos_f ← pos ↦ f32
         const int base ← row * d
         var int col ← 0
         while col ≺ d {
@@ -509,10 +529,9 @@ fn _rope(tensor.Tensor x, list<int> positions, int dim, f32 freq_base, f32 scale
                     # pair k (0..half-1) and is its first (col < half) or
                     # second (col >= half) element.
                     const int k ← col % half
-                    const f32 kf ← k ↦ f32
-                    const f32 theta ← (pos_f * scale) * freq_base.power((0.0 - 2.0 * kf) / dim_f)
-                    const f32 c ← _cos(theta)
-                    const f32 s ← _sin(theta)
+                    const int table_base ← (row * half + k) * 3
+                    const f32 c ← table.get(table_base + 1) coalesce 0.0 ∷ f32
+                    const f32 s ← table.get(table_base + 2) coalesce 0.0 ∷ f32
                     if col ≺ half {
                         const f32 x0 ← x.data.get(base + k) coalesce 0.0 ∷ f32
                         const f32 x1 ← x.data.get((base + k) + half) coalesce 0.0 ∷ f32
@@ -528,10 +547,9 @@ fn _rope(tensor.Tensor x, list<int> positions, int dim, f32 freq_base, f32 scale
                 else {
                     # llama-arch NORM consecutive-pair (2k, 2k+1).
                     const int k ← col / 2
-                    const f32 kf ← k ↦ f32
-                    const f32 theta ← (pos_f * scale) * freq_base.power((0.0 - 2.0 * kf) / dim_f)
-                    const f32 c ← _cos(theta)
-                    const f32 s ← _sin(theta)
+                    const int table_base ← (row * half + k) * 3
+                    const f32 c ← table.get(table_base + 1) coalesce 0.0 ∷ f32
+                    const f32 s ← table.get(table_base + 2) coalesce 0.0 ∷ f32
                     const f32 x0 ← x.data.get(base + col) coalesce 0.0 ∷ f32
                     const f32 x1 ← x.data.get((base + col) + 1) coalesce 0.0 ∷ f32
                     out.append(x0 * c - x1 * s)
@@ -741,13 +759,15 @@ fn _validate_multi(tensor.Tensor q, tensor.Tensor k, tensor.Tensor v, tensor.Ten
 @ public { }
 fn rotary_position_embedding(tensor.Tensor x, list<int> positions, int dim) → tensor.Tensor ⇥ AttentionError {
     _validate_rope(x, positions, dim)
-    return _rope(x, positions, dim, ROPE_FREQ_BASE, 1.0 ∷ f32, false)
+    const list<f32> table ← _rope_table(positions, dim, ROPE_FREQ_BASE, 1.0 ∷ f32)
+    return _rope(x, dim, table, false)
 }
 
 @ public { }
 fn rotary_position_embedding_config(tensor.Tensor x, list<int> positions, int dim, RopeConfig config) → tensor.Tensor ⇥ AttentionError {
     _validate_rope(x, positions, dim)
-    return _rope(x, positions, dim, config.base(), config.scale(), _interleaved(config.policy()))
+    const list<f32> table ← _rope_table(positions, dim, config.base(), config.scale())
+    return _rope(x, dim, table, _interleaved(config.policy()))
 }
 
 # -------------------------------------------------------------------------
@@ -787,8 +807,9 @@ fn scaled_dot_product_causal(tensor.Tensor q, tensor.Tensor k, tensor.Tensor v, 
 fn scaled_dot_product_causal_rope(tensor.Tensor q, tensor.Tensor k, tensor.Tensor v, f32 scale, list<int> positions, int dim) → tensor.Tensor ⇥ AttentionError {
     _validate_triplet(q, k, v)
     _validate_rope(q, positions, dim)
-    const tensor.Tensor qr ← _rope(q, positions, dim, ROPE_FREQ_BASE, 1.0 ∷ f32, false)
-    const tensor.Tensor kr ← _rope(k, positions, dim, ROPE_FREQ_BASE, 1.0 ∷ f32, false)
+    const list<f32> table ← _rope_table(positions, dim, ROPE_FREQ_BASE, 1.0 ∷ f32)
+    const tensor.Tensor qr ← _rope(q, dim, table, false)
+    const tensor.Tensor kr ← _rope(k, dim, table, false)
     return _attention_core(qr, kr, v, scale, true)
 }
 
@@ -815,6 +836,7 @@ fn multi_head_attention(tensor.Tensor q, tensor.Tensor k, tensor.Tensor v, tenso
     const f32 base ← rope_config.base()
     const f32 rope_scale ← rope_config.scale()
     const bool interposita ← _interleaved(rope_config.policy())
+    const list<f32> table ← _rope_table(positions, rope_dim, base, rope_scale)
     var list<tensor.Tensor> heads ← empty
     var int h ← 0
     while h ≺ num_heads {
@@ -822,8 +844,8 @@ fn multi_head_attention(tensor.Tensor q, tensor.Tensor k, tensor.Tensor v, tenso
         const tensor.Tensor qh ← _head(q, h * d, d)
         const tensor.Tensor kg ← _head(k, g * d, d)
         const tensor.Tensor vg ← _head(v, g * d, d)
-        const tensor.Tensor qr ← _rope(qh, positions, rope_dim, base, rope_scale, interposita)
-        const tensor.Tensor kr ← _rope(kg, positions, rope_dim, base, rope_scale, interposita)
+        const tensor.Tensor qr ← _rope(qh, rope_dim, table, interposita)
+        const tensor.Tensor kr ← _rope(kg, rope_dim, table, interposita)
         const tensor.Tensor ctx ← _attention_core(qr, kr, vg, scale, true)
         heads.append(ctx)
         h ← h + 1
@@ -991,8 +1013,9 @@ fn _validate_cached_triplet(tensor.Tensor q, tensor.Tensor k, tensor.Tensor v, k
 fn scaled_dot_product_causal_rope_cached(tensor.Tensor q, tensor.Tensor k, tensor.Tensor v, f32 scale, list<int> positions, int dim, kv.KVCache layer, list<int> tokens) → CachedAttention ⇥ AttentionError {
     const int prefix ← _validate_cached_triplet(q, k, v, layer, tokens)
     _validate_rope(q, positions, dim)
-    const tensor.Tensor qr ← _rope(q, positions, dim, ROPE_FREQ_BASE, 1.0 ∷ f32, false)
-    const tensor.Tensor kr ← _rope(k, positions, dim, ROPE_FREQ_BASE, 1.0 ∷ f32, false)
+    const list<f32> table ← _rope_table(positions, dim, ROPE_FREQ_BASE, 1.0 ∷ f32)
+    const tensor.Tensor qr ← _rope(q, dim, table, false)
+    const tensor.Tensor kr ← _rope(k, dim, table, false)
     const tensor.Tensor full_k ← _concat_rows(layer.key(), kr)
     const tensor.Tensor full_v ← _concat_rows(layer.payload(), v)
     const tensor.Tensor context ← _attention_core_offset(qr, full_k, full_v, scale, prefix)
@@ -1028,11 +1051,12 @@ fn multi_head_attention_cached(tensor.Tensor q, tensor.Tensor k, tensor.Tensor v
     const f32 base ← rope_config.base()
     const f32 rope_scale ← rope_config.scale()
     const bool interposita ← _interleaved(rope_config.policy())
+    const list<f32> table ← _rope_table(positions, rope_dim, base, rope_scale)
     var list<tensor.Tensor> new_ks ← empty
     var int g ← 0
     while g ≺ num_kv_heads {
         const tensor.Tensor kg ← _head(k, g * d, d)
-        new_ks.append(_rope(kg, positions, rope_dim, base, rope_scale, interposita))
+        new_ks.append(_rope(kg, rope_dim, table, interposita))
         g ← g + 1
     }
     const tensor.Tensor new_k ← _reconcile(new_ks)
@@ -1043,7 +1067,7 @@ fn multi_head_attention_cached(tensor.Tensor q, tensor.Tensor k, tensor.Tensor v
     while h ≺ num_heads {
         const int group ← h / ratio
         const tensor.Tensor qh ← _head(q, h * d, d)
-        const tensor.Tensor qr ← _rope(qh, positions, rope_dim, base, rope_scale, interposita)
+        const tensor.Tensor qr ← _rope(qh, rope_dim, table, interposita)
         const tensor.Tensor kg_all ← _head(full_k, group * d, d)
         const tensor.Tensor vg_all ← _head(full_v, group * d, d)
         heads.append(_attention_core_offset(qr, kg_all, vg_all, scale, prefix))
