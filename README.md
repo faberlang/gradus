@@ -10,6 +10,25 @@ PyTorch-shaped: models are pure functions with explicit parameters, gradients
 are compiler-generated companion functions, and the backward pass is
 generated code — not a runtime tape replay.
 
+## Start here
+
+Gradus is a JAX-shaped autograd and ML library: models are pure functions
+with explicit parameters, reverse-mode gradients are compiler-generated
+companion functions rather than a runtime tape, and public types are
+device-neutral contracts. Foundation modules (`gradus:dtype`,
+`gradus:shape`, `gradus:tensor`, `gradus:math`) feed loss, optimizers, and
+neural-network primitives; those compose into attention and transformer
+blocks; model-admission modules bind GGUF and Safetensors artifacts into
+typed capsules without retaining paths or whole-model payloads; decode,
+cache, sampling, and generation sit on the same forward row. Import the
+leaf that owns the type you use — the façade does not re-export genera.
+
+The smallest useful program, a numbered learning path, and which demo to
+open first per capability are in
+[`docs/quickstart.md`](docs/quickstart.md). After that page's snippet, open
+[`exempla/dense-rmsnorm/`](exempla/dense-rmsnorm/) — an in-memory RMSNorm
+row that type-checks with `faber check`.
+
 ## Install
 
 Local `faber` resolves `gradus:*` from the shared library home:
@@ -79,7 +98,7 @@ locale = "en"
 import from "gradus:loss" loss
 
 main {
-    const tensor<f32, []> seed ← vacua
+    const tensor<f32, []> seed ← empty
     const list<int> shape_2x2 ← [2, 2]
     const tensor<f32, [2, 2]> prediction ← seed.from_flat([1.0, 2.0, 3.0, 4.0], shape_2x2)
     const tensor<f32, [2, 2]> target ← seed.from_flat([1.0, 2.0, 3.0, 3.0], shape_2x2)
@@ -96,9 +115,8 @@ faber check .
 inputs yield `0.25`. `faber check` is the standing proof that the import
 and call type-check. `faber run` of packages that import `gradus:*` is
 not claimed here — the compiler cannot yet execute library-to-library
-calls. Worked demos live under `exempla/` (start with
-`exempla/gradient-seam/` for the import shape, or
-`exempla/dense-rmsnorm/` for an in-memory executed row).
+calls. Worked demos live under `exempla/`; the first-open-per-capability
+tour is [`docs/quickstart.md`](docs/quickstart.md).
 
 ## Status
 
