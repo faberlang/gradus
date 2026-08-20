@@ -67,7 +67,7 @@ class DenseConfig {
 # Resolver: (string, int) → tensor.Tensor ⇥ DenseError. Success returns the
 # materialized stored-weight view; throw is MissingTensor (or another
 # DenseError). Optional Q/K/V bias lookups catch a throw and keep the
-# zero-bias contract.
+# absent-bias contract (rank-0 empty; nn.linear_carrier skips the add).
 
 # -------------------------------------------------------------------------
 # DenseError — typed error vocabulary of the dense assembly. Every variant
@@ -207,29 +207,16 @@ fn _collect(tensor.Tensor embed, list<int> tokens) → tensor.Tensor ⇥ DenseEr
     }
 }
 
-# Same-shape zero bias [T, N] for one linear row: the executed bias
-# contract of the composed surface (per-channel [N] against [M, N] needs
-# singleton broadcast, which shape.broadcast rejects at runtime — the
-# recorded broadcast rank-mismatch constraint, dense-swiglu precedent).
+# Absent bias: rank-0 empty carrier. nn.linear_carrier treats this as
+# y = x·w (no [T, N] zero fill, no full add).
 @ private { }
-fn _no_bias(tensor.Tensor x, tensor.Tensor w) → tensor.Tensor ⇥ DenseError {
-    const list<int> fx ← x.shape()
-    const list<int> fw ← w.shape()
-    require fx.length() ≡ 2 throw variant BadShape {message = "block input must be rank 2"}
-    require fw.length() ≡ 2 throw variant BadShape {message = "block weight must be rank 2"}
-    const int t ← fx.get(0) coalesce 1
-    const int n ← fw.get(1) coalesce 1
-    do {
-        return tensor.fill([t, n], 0.0 ∷ f32)
-    }
-    catch err {
-        throw variant BadShape {message = tensor.message(err)}
-    }
+fn _no_bias() → tensor.Tensor {
+    return tensor.default()
 }
 
-# Tile a per-channel bias [N] across T rows into the same-shape [T, N]
-# contract nn.linear actually executes (broadcast of [N] onto [T, N] is
-# rejected — see _no_bias). A already-shaped [T, N] view is passed through.
+# Pass a per-channel bias [N] through (nn.linear_carrier adds [N] against
+# [T, N] via right-aligned broadcast — no [T, N] tile). An already-shaped
+# [T, N] view is also passed through.
 @ private { }
 fn _channel_to_rows(tensor.Tensor x, tensor.Tensor w, tensor.Tensor b) → tensor.Tensor ⇥ DenseError {
     const list<int> fx ← x.shape()
@@ -246,24 +233,11 @@ fn _channel_to_rows(tensor.Tensor x, tensor.Tensor w, tensor.Tensor b) → tenso
         throw variant BadShape {message = "attention bias does not match output shape"}
     }
     require not (fb.length() ≠ 1 or (fb.get(0) coalesce 0) ≠ n) throw variant BadShape {message = "attention bias must be per-channel [N] or [T, N]"}
-    var list<f32> out ← empty
-    for range 0‥t const i {
-        var int j ← 0
-        while j ≺ n {
-            out.append(b.data.get(j) coalesce 0.0 ∷ f32)
-            j ← j + 1
-        }
-    }
-    do {
-        return tensor.construct(out, [t, n])
-    }
-    catch err {
-        throw variant BadShape {message = tensor.message(err)}
-    }
+    return b
 }
 
 # Optional Q/K/V bias: a resolver miss (SmolLM2 / U1.8 synthetic rows)
-# stays on the verified zero-bias contract. A hit (Qwen2.5 attn_{q,k,v}.bias)
+# stays on the verified absent-bias contract. A hit (Qwen2.5 attn_{q,k,v}.bias)
 # is applied after the linear and before RoPE (q/k) or cache-write (v).
 @ private { }
 fn _attn_bias((string, int) → tensor.Tensor ⇥ DenseError source, string name, int layer, tensor.Tensor x, tensor.Tensor w) → tensor.Tensor ⇥ DenseError {
@@ -277,7 +251,7 @@ fn _attn_bias((string, int) → tensor.Tensor ⇥ DenseError source, string name
         hit ← false
     }
     if not hit {
-        return _no_bias(x, w)
+        return _no_bias()
     }
     return _channel_to_rows(x, w, b)
 }
@@ -370,10 +344,10 @@ fn forward(DenseConfig cfg, (string, int) → tensor.Tensor ⇥ DenseError sourc
     # N ordered U1.5 blocks. Every weight is resolved by its canonical name
     # at the current layer index; every shape is validated against the
     # config (the MLP hidden width derives from the gate/up width at
-    # runtime). Q/K/V bias is optional: present Qwen2 tensors are tiled
-    # onto [T, N] and added after the linear (before RoPE for q/k, before
-    # cache-write for v). A resolver miss keeps the U1.8 zero-bias
-    # contract. MLP / output biases stay synthesized zeros.
+    # runtime). Q/K/V bias is optional: present Qwen2 tensors stay
+    # per-channel [N] and are added after the linear (before RoPE for
+    # q/k, before cache-write for v). A resolver miss keeps the U1.8
+    # absent-bias contract (no add). MLP / output biases stay absent.
     const int qwidth ← cfg.heads * cfg.head_dim
     const int kwidth ← cfg.kv_heads * cfg.head_dim
     var tensor.Tensor h ← x
@@ -403,9 +377,9 @@ fn forward(DenseConfig cfg, (string, int) → tensor.Tensor ⇥ DenseError sourc
         const tensor.Tensor bq ← _attn_bias(source, prefix + ".self_attn.q_proj.bias", layer, h, wq)
         const tensor.Tensor bk ← _attn_bias(source, prefix + ".self_attn.k_proj.bias", layer, h, wk)
         const tensor.Tensor bv ← _attn_bias(source, prefix + ".self_attn.v_proj.bias", layer, h, wv)
-        const tensor.Tensor bg ← _no_bias(h, wg)
-        const tensor.Tensor bu ← _no_bias(h, wu)
-        const tensor.Tensor bd ← _no_bias(h, wd)
+        const tensor.Tensor bg ← _no_bias()
+        const tensor.Tensor bu ← _no_bias()
+        const tensor.Tensor bd ← _no_bias()
         h ← _block(h, ln1_s, epsilon, wq, bq, wk, bk, wv, bv, wo, cfg.heads, cfg.kv_heads, scale, positions, rope_dim, rope_cfg, ln2_s, wg, bg, wu, bu, wd, bd)
         layer ← layer + 1
     }
@@ -423,7 +397,7 @@ fn forward(DenseConfig cfg, (string, int) → tensor.Tensor ⇥ DenseError sourc
         w_head ← _source(source, "lm_head", 0)
         _shape(w_head, "lm_head", [cfg.hidden_dim, cfg.vocab])
     }
-    const tensor.Tensor b_head ← _no_bias(hn, w_head)
+    const tensor.Tensor b_head ← _no_bias()
     return _linear(hn, w_head, b_head)
 }
 
@@ -514,9 +488,9 @@ fn decode_step(DenseConfig cfg, (string, int) → tensor.Tensor ⇥ DenseError s
         const tensor.Tensor bq ← _attn_bias(source, prefix + ".self_attn.q_proj.bias", layer, h, wq)
         const tensor.Tensor bk ← _attn_bias(source, prefix + ".self_attn.k_proj.bias", layer, h, wk)
         const tensor.Tensor bv ← _attn_bias(source, prefix + ".self_attn.v_proj.bias", layer, h, wv)
-        const tensor.Tensor bg ← _no_bias(h, wg)
-        const tensor.Tensor bu ← _no_bias(h, wu)
-        const tensor.Tensor bd ← _no_bias(h, wd)
+        const tensor.Tensor bg ← _no_bias()
+        const tensor.Tensor bu ← _no_bias()
+        const tensor.Tensor bd ← _no_bias()
         const kv.KVCache cache ← layers.get(layer) coalesce kv.default()
         const transformer.CachedBlock block ← _block_cached(h, ln1_s, epsilon, wq, bq, wk, bk, wv, bv, wo, cfg.heads, cfg.kv_heads, scale, positions, rope_dim, rope_cfg, ln2_s, wg, bg, wu, bu, wd, bd, cache, tokens)
         h ← block.output()
@@ -532,7 +506,7 @@ fn decode_step(DenseConfig cfg, (string, int) → tensor.Tensor ⇥ DenseError s
         w_head ← _source(source, "lm_head", 0)
         _shape(w_head, "lm_head", [cfg.hidden_dim, cfg.vocab])
     }
-    const tensor.Tensor b_head ← _no_bias(hn, w_head)
+    const tensor.Tensor b_head ← _no_bias()
     return DenseStep {logits = _linear(hn, w_head, b_head), layers = next}
 }
 
@@ -597,9 +571,9 @@ fn prefill_cached(DenseConfig cfg, (string, int) → tensor.Tensor ⇥ DenseErro
         const tensor.Tensor bq ← _attn_bias(source, prefix + ".self_attn.q_proj.bias", layer, h, wq)
         const tensor.Tensor bk ← _attn_bias(source, prefix + ".self_attn.k_proj.bias", layer, h, wk)
         const tensor.Tensor bv ← _attn_bias(source, prefix + ".self_attn.v_proj.bias", layer, h, wv)
-        const tensor.Tensor bg ← _no_bias(h, wg)
-        const tensor.Tensor bu ← _no_bias(h, wu)
-        const tensor.Tensor bd ← _no_bias(h, wd)
+        const tensor.Tensor bg ← _no_bias()
+        const tensor.Tensor bu ← _no_bias()
+        const tensor.Tensor bd ← _no_bias()
         const kv.KVCache cache ← layers.get(layer) coalesce kv.default()
         const transformer.CachedBlock block ← _block_cached(h, ln1_s, epsilon, wq, bq, wk, bk, wv, bv, wo, cfg.heads, cfg.kv_heads, scale, positions, rope_dim, rope_cfg, ln2_s, wg, bg, wu, bu, wd, bd, cache, tokens)
         h ← block.output()
@@ -615,6 +589,6 @@ fn prefill_cached(DenseConfig cfg, (string, int) → tensor.Tensor ⇥ DenseErro
         w_head ← _source(source, "lm_head", 0)
         _shape(w_head, "lm_head", [cfg.hidden_dim, cfg.vocab])
     }
-    const tensor.Tensor b_head ← _no_bias(hn, w_head)
+    const tensor.Tensor b_head ← _no_bias()
     return DenseStep {logits = _linear(hn, w_head, b_head), layers = next}
 }
