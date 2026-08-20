@@ -29,7 +29,7 @@ sampled-regex; planner re-spot-checked at `f70f02f`):
   Epicenter `src/transformer.fab:63-100`; same functions already use glyph `+`
   beside method calls (mixed idiom, `src/gradus.fab:239-246`).
 - **887 single-throw guard bodies** (`if cond { throw variant … }` with the
-  whole block one throw) that are the exact `requitur cond iace err` desugar
+  whole block one throw) that are the exact `requirit cond iace err` desugar
   target; 149 are direct positive-polarity maps, 28 are double-negation guards
   whose conversion deletes both the block and the double-not.
 - **~110 hole-eligible typed bindings** (`const tensor<…> x ← <already-typed
@@ -60,7 +60,7 @@ Presentability (audit `7d54686c`, verdict block_ship):
   `docs/diagnostics.md:314,344`, `docs/numeric-tolerances.md:28`), packaging
   hygiene (tracked bench/golden receipts, no internal markers, missing
   `exempla/nn-bridge/README.md`).
-- faber-side: `faber/docs/EBNF.md` is stale in three places (requitur/adfirma
+- faber-side: `faber/docs/EBNF.md` is stale in three places (requirit/adfirma
   particle "proposed (not shipped)" prose vs the shipped parser; comparison
   productions `<`/`>` vs canonical `≺`/`≻`; dead `docs/design/*-intrinsics.md`
   references at `EBNF.md:1087-1095`).
@@ -139,10 +139,11 @@ Planner verification at gradus `main` `f70f02f`, 2026-08-20:
   scale confirmed). `grep -rn '§(' src/` → zero. `while` counts:
   `src/tokenizer.fab` 38, `src/model/gguf_manifest.fab` 21 (audit scale).
 - `scripta/check-source` U8 guard read in full: live lexicon-based word-token
-  check; `staticum`/`addita`/`conversio` not in `LATIN_WORDS`; guard comment
-  cites `docs/factory/no-latin/rename-ledger.md` which `f70f02f` moved to
-  `docs/archived/no-latin/` (stale path in the comment).
-- `../faber/docs/EBNF.md` exists (1198 lines); `:610-613` requitur/adfirma
+  check; `staticum`/`addita`/`conversio` not in `LATIN_WORDS`; the guard
+  comment cites `docs/factory/no-latin/rename-ledger.md`, the ledger's current
+  location since no-latin re-opened (`f70f02f` archived it, `e2385b2` moved it
+  back) — the comment path resolves, so GLQ-10 no longer fixes it.
+- `../faber/docs/EBNF.md` exists (1198 lines); `:610-613` requirit/adfirma
   "proposed (not shipped)" particle prose and `:1087-1095` dead
   `docs/design/*-intrinsics.md` refs read directly.
 - `worktrees/hand-13/` checked: on `main` at `f70f02f`, no WIP (idle lane).
@@ -157,9 +158,9 @@ Before editing, inspect:
   (write scopes, done-when, deps, dispatch waves).
 - Vivi mails `57cb4713` / `7d54686c`: per-file:line evidence for every class
   and batch (`vivi mail show <id> --project /Users/ianzepp/work/faberlang`).
-- `docs/archived/no-latin/rename-ledger.md`: old→new name map for the exempla
+- `docs/factory/no-latin/rename-ledger.md`: old→new name map for the exempla
   sweep and the retained-exception list the U8 guard loads.
-- `../faber/docs/EBNF.md`: canonical forms — `:610-613` (requitur/adfirma),
+- `../faber/docs/EBNF.md`: canonical forms — `:610-613` (requirit/adfirma),
   `:637-641` (glyph products), `:795-801` (§ templates), `:866-869` (byte
   policy), applied/binding holes.
 - `scripta/check-source` (U8 lexicon), `scripta/check-compile`,
@@ -197,7 +198,7 @@ Before editing, inspect:
 
 - Phase 1 (public P1 + epicenter): README rewrite, exempla sweep, Latin-residue
   rename + guard hold, glyph fragments (`transformer`/`attention` epicenter).
-- Phase 2 (idiom waves): three `requitur` waves, train glyphs, string
+- Phase 2 (idiom waves): three `requirit` waves, train glyphs, string
   templates, for-range loops, train structural dedup, quickstart + residual
   docs + packaging hygiene + EBNF fix.
 - Phase 3 (externally sequenced): binding holes after the radix repair
@@ -218,7 +219,7 @@ Decision: release prep only (pre-1.0 clean-break library).
 
 Decision: included.
 
-- Every unit is a path-limited, revertible commit; glyph/requitur/template
+- Every unit is a path-limited, revertible commit; glyph/requirit/template
   conversions are mechanical inverses per site.
 - If a conversion class proves unsound mid-wave (e.g. a guard that must stay a
   block for control flow), that site is skipped and logged in the unit receipt;
@@ -233,7 +234,7 @@ Decision: included.
   excluded method families (`.softmax`, `.gelu`, `.mean`, `.transpose`,
   `.layer_norm`, `.added_bias`, `.scale`, scalar `.abs`) untouched.
 - Guard census: the audit's per-file single-throw counts drop to zero for pure
-  guards (residuals only where a receipt logs a skip reason); `requitur … iace`
+  guards (residuals only where a receipt logs a skip reason); `requirit … iace`
   present; the 28 double-not guards gone.
 - Binding holes: ~110 sites converted; the 5 `← vacua` annotations kept;
   conversion landed only after the radix type-args repair settles.
@@ -256,8 +257,9 @@ Decision: included.
 
 - `grep -nE 'Tabula|accuratezza|Metricum|praevideo|vincula|importa' README.md`
   → no hits (except historical prose the unit explicitly retains, if any).
-- `grep -rnE 'vincula|materializa|praevideo|maxima|sors\b|damnum|accuratezza|Metricum|Tabula' exempla/*/README.md exempla/*/src/main.fab`
-  → zero outside `target/` and retained exceptions.
+- `grep -rnE 'vincula|materializa|praevideo|maxima|sors\b|damnum|accuratezza|Metricum|Tabula' exempla/*/README.md`
+  → zero outside `target/` and retained exceptions. (Exempla `main.fab`
+  identifiers are out of this goal's scope — owned by no-latin R1.)
 - Per-wave: `grep -c 'requirit' src/<file>.fab` rises to the audit's converted
   count; `grep -n 'if not (not' src/math.fab` → zero.
 - `./scripta/check-source` / `./scripta/check-compile` /
@@ -287,13 +289,16 @@ Decision: included.
    operator has already ruled"; only the EBNF-staleness ruling was evidenced.
    If Mind knows of another ruling (e.g. on broadcast or carrier glyphs), name
    it and the findings list re-routes that item.
-6. **Exempla compile status post-U6** — presentability audit inferred it from
-   greps under a no-build order; the exempla sweep unit should confirm its
-   touched demos still `faber check` (lane-owned, not a child gate).
+6. **Compile sanity on .fab-converting units** — presentability audit inferred
+   it from greps under a no-build order. Resolved: every implementation unit
+   that converts `.fab` carries a unit-scoped `faber check` absolute-path
+   sanity (named in its delivery.md row, not just a §6 lane gate). GLQ-12,
+   now README-only after the boundary rewrite, carries no `.fab`; the exempla
+   mains' compile check belongs to no-latin R1, which owns their renames.
 
 ## Stop Conditions
 
-- Stop if any `requitur` conversion target lacks a `⇥ E`-declaring enclosing
+- Stop if any `requirit` conversion target lacks a `⇥ E`-declaring enclosing
   function (audit says zero such; a counterexample is a report, not a
   workaround).
 - Stop if the radix size-param type-args repair or parser fix has not settled
@@ -308,18 +313,18 @@ Decision: included.
 
 | Unit | Outcome | Depends on | Status | Receipt |
 | --- | --- | --- | --- | --- |
-| GLQ-01 | Glyph conversion, fragment files (49 sites) | GLQ-10 | pending | — |
+| GLQ-01 | Glyph conversion, fragment files (27 sites) | GLQ-10 | pending | — |
 | GLQ-02 | Glyph conversion, train.fab (48 sites) | GLQ-05 | pending | — |
 | GLQ-03 | requirit wave 1 (241 sites) | — | pending | — |
 | GLQ-04 | requirit wave 2 (263 sites) | GLQ-01 | pending | — |
-| GLQ-05 | requirit wave 3 (~383 sites, 28 double-not) | GLQ-01 | pending | — |
+| GLQ-05 | requirit wave 3 (14 files / 334 sites + 9 uncovered files = 23 files / 383 sites; 28 double-not) | GLQ-01 | pending | — |
 | GLQ-06 | Binding holes (~110 + mirrors) | GLQ-09 + external radix settle | pending | — |
 | GLQ-07 | `§` string templates (140 + mirrors) | GLQ-03, GLQ-04, GLQ-05 | pending | — |
 | GLQ-08 | for-range conversion (~75 loops) | GLQ-03, GLQ-04, GLQ-07 | pending | — |
 | GLQ-09 | train.fab structural dedup | GLQ-02, GLQ-05 | pending | — |
-| GLQ-10 | Latin residue + U8 guard hold | — | pending | — |
+| GLQ-10 | Latin residue + U8 guard hold | no-latin re-close (guard-hold sequencing) | pending | — |
 | GLQ-11 | README public rewrite | — | pending | — |
-| GLQ-12 | Exempla stale-symbol sweep | — | pending | — |
+| GLQ-12 | Exempla README stale-symbol sweep (prose only) | no-latin R1 re-close | pending | — |
 | GLQ-13 | LICENSE + root-file disposition | operator decision (pending) | decision-pending | — |
 | GLQ-14 | Quickstart / examples tour / architecture | GLQ-11, GLQ-12 | pending | — |
 | GLQ-15 | Residual docs Latin + cosmetics | GLQ-10 | pending | — |

@@ -33,12 +33,14 @@ plus one faber docs unit, under five standing constraints from the task:
 - Sites and file:line evidence: audit mails `57cb4713` / `7d54686c` (per-class
   tables); planner re-verified the headline claims at `f70f02f` (GOAL.md
   Ground Truth).
-- Precedent method for safe mechanical conversion: the archived no-latin
-  campaign — exact identifier-boundary replacements, first-file compile
-  confirmation, per-wave lane-gate closes (`docs/archived/no-latin/GOAL.md`).
-- Name map for prose sweeps: `docs/archived/no-latin/rename-ledger.md`.
+- Precedent method for safe mechanical conversion: the no-latin campaign
+  (re-opened 2026-08-20) — exact identifier-boundary replacements,
+  first-file compile confirmation, per-wave lane-gate closes
+  (`docs/factory/no-latin/GOAL.md`).
+- Name map for prose sweeps: `docs/factory/no-latin/rename-ledger.md`.
 - Enforcement: `scripta/check-source` U8 guard (lexicon-based; currently misses
-  `staticum`/`addita`/`conversio` and cites the archived ledger path).
+  `staticum`/`addita`/`conversio`; its ledger-path comment resolves to the
+  re-opened `docs/factory/no-latin/rename-ledger.md` — no GLQ-10 path fix).
 - Borrowed shapes: `../norma/README.md` (install section),
   `../triga/README.md` (Start-here quickstart).
 - Idle lane note: `worktrees/hand-13` sits on `main` at `f70f02f` with no WIP —
@@ -54,7 +56,7 @@ validation). Lane gates are named once in §6 and are **not** child checks.
 
 ### GLQ-01 — glyph conversion, fragment files
 
-- **outcome**: Convert the 49 glyph-eligible method sites on static core
+- **outcome**: Convert the 27 glyph-eligible method sites on static core
   tensors in `src/transformer.fab`, `src/attention.fab`, `src/gradus.fab`,
   `src/loss.fab`, `src/gradient.fab` (+ `src/attention.proba` mirror sites
   `:791-794`): `.matmul(w)` → `a · w`, `.multiply(x)` → `a ⊙ x`,
@@ -69,9 +71,10 @@ validation). Lane gates are named once in §6 and are **not** child checks.
   `:659,662,744,1039,1042`; nn `:497`); `·`/`⊙` forms present at the audit's
   site lines; proba mirrors updated.
 - **depends_on**: GLQ-10 (same-file sequencing on `attention.fab`).
-- **sanity**: diff site count matches the audit's per-file table; eyeball one
-  converted function end-to-end (e.g. `src/gradus.fab:239-246` becomes
-  single-idiom).
+- **sanity**: diff site count matches the audit's per-file table (27); eyeball
+  one converted function end-to-end (e.g. `src/gradus.fab:239-246` becomes
+  single-idiom); `"$FABER_BIN" check "$PWD/src/transformer.fab"` (absolute
+  path) green on a converted file.
 - **non_goals**: carrier `math.matmul` free calls; `.softmax/.gelu/.mean/
   .transpose/.layer_norm/.added_bias/.scale` and scalar `.abs` families;
   proba-only behavior changes.
@@ -86,7 +89,8 @@ validation). Lane gates are named once in §6 and are **not** child checks.
 - **done_when**: zero receiver `.multiply(`/`.subtract(` sites in train.fab;
   fill-tensor scaffolding (`:64-66` and parallels) unchanged.
 - **depends_on**: GLQ-05 (train.fab guard wave settles first; avoids churn).
-- **sanity**: converted-site count = 48; one update block read end-to-end.
+- **sanity**: converted-site count = 48; one update block read end-to-end;
+  `"$FABER_BIN" check "$PWD/src/train.fab"` (absolute path) green.
 - **non_goals**: removing `seed.create(lr, shape)` fill scaffolding (needs
   grammar gap 5); any numerics change.
 - **risk**: low-medium — training-loop numerics path; behavior-preserving
@@ -94,17 +98,19 @@ validation). Lane gates are named once in §6 and are **not** child checks.
 
 ### GLQ-03 — requirit wave 1
 
-- **outcome**: Convert single-throw guards to `requitur <cond> iace finge …` in
+- **outcome**: Convert single-throw guards to `requirit <cond> iace finge …` in
   `src/cache.fab` (83), `src/model/gguf_manifest.fab` (80),
   `src/model/safetensors.fab` (78) — 241 sites.
 - **write_scope**: `src/cache.fab` + `.proba`, `src/model/gguf_manifest.fab` +
   `.proba`, `src/model/safetensors.fab` + `.proba`.
 - **done_when**: zero pure single-throw guard blocks in the three files
-  (residuals only with a logged skip reason); `requitur … iace` present;
+  (residuals only with a logged skip reason); `requirit … iace` present;
   `⇥` declarations unchanged; double-not sites (none expected here) removed.
 - **depends_on**: none.
 - **sanity**: `requirit` count per file ≈ audit count (83/80/78 minus logged
-  skips); one converted guard read against EBNF:612 desugar.
+  skips); one converted guard read against EBNF:612 desugar;
+  `"$FABER_BIN" check "$PWD/src/cache.fab"` (absolute path) green on a
+  converted file.
 - **non_goals**: error-message remap wall (gap 3); variant-identity changes;
   `adfirma` (no panic-semantics site exists).
 - **risk**: medium — broad but mechanical; every site audited as
@@ -118,27 +124,41 @@ validation). Lane gates are named once in §6 and are **not** child checks.
 - **write_scope**: those five files + co-located `.proba`.
 - **done_when**: as GLQ-03 for the five files.
 - **depends_on**: GLQ-01 (attention.fab glyph pass lands first).
-- **sanity**: per-file `requirit` counts ≈ audit; one guard per file sampled.
+- **sanity**: per-file `requirit` counts ≈ audit; one guard per file sampled;
+  `"$FABER_BIN" check "$PWD/src/nn.fab"` (absolute path) green on a converted
+  file.
 - **non_goals**: prefix-slice remap hacks at `tokenizer.fab:856,1976` (gap 3 —
   leave the remap logic itself untouched); loop conversions (GLQ-07/08).
 - **risk**: medium.
 
 ### GLQ-05 — requirit wave 3 + double-not removal
 
-- **outcome**: Same conversion for the remaining ~13 files (~383 sites):
-  `model/dense`, `decode`, `model/qwen35moe`, `generation`, `train`, `optimize`,
+- **outcome**: Same conversion for the remaining guard-site files, 14 files /
+  334 sites actual (audit B5 list is authority; this is GLQ-05's honest
+  enumeration — the prior ~383 over-count is dropped): `model/dense`,
+  `decode`, `model/qwen35moe`, `generation`, `train`, `optimize`,
   `model/capsule`, `math`, `calibration`, `loss`, `shape`, `parameter`,
-  `metrics`, `sampling` (audit B5 list is authority); in the same pass remove
-  the 28 double-not guards (`if not (not X) { throw }` → `requitur X iace …`,
-  math.fab family `:478-487,521-530,571-577,…`).
-- **write_scope**: those files + co-located `.proba`.
+  `metrics`, `sampling`; in the same pass remove the 28 double-not guards
+  (`if not (not X) { throw }` → `requirit X iace …`, math.fab family
+  `:478-487,521-530,571-577,…`). Additionally, this amendment extends
+  coverage to the 9 guard-site files the audit showed sitting outside any
+  requirit wave — `tensor_view` (11), `gradient` (9), `dtype` (8), `tensor`
+  (6), `dense_qwen2` (6), `dequant` (4), `artifact` (3), `transformer` (1),
+  `dense_llama` (1) — so every guard-site file in the audit's list sits in
+  some unit (23 files / 383 sites total).
+- **write_scope**: the 14 files + co-located `.proba`, plus the 9 extended
+  files above + co-located `.proba`.
 - **done_when**: zero pure single-throw guards and zero `if not (not` in the
-  wave-3 file set; `requitur` counts ≈ audit per-file table.
-- **depends_on**: GLQ-01 (loss.fab glyph pass lands first).
+  full wave-3 file set; `requirit` counts ≈ the audit per-file table
+  (334 + 49 extended).
+- **depends_on**: GLQ-01 (loss.fab glyph pass lands first; also sequences
+  `gradient`/`transformer`, which GLQ-01 owns for glyphs, ahead of this
+  guard pass).
 - **sanity**: `grep -n 'if not (not' src/math.fab` → zero; sampled guards
-  across ≥3 files.
+  across ≥3 files; `"$FABER_BIN" check "$PWD/src/dtype.fab"` (absolute path)
+  green on a converted file.
 - **non_goals**: `train.fab` glyph sites (GLQ-02 owns them); structural dedup
-  (GLQ-09).
+  (GLQ-09); §-template sites in `dense_qwen2`/`dense_llama` (GLQ-07 owns them).
 - **risk**: medium.
 
 ### GLQ-06 — binding holes (externally sequenced)
@@ -154,7 +174,9 @@ validation). Lane gates are named once in §6 and are **not** child checks.
 - **depends_on**: GLQ-09 **and** the external gate — radix size-param type-args
   repair + parser fix settled on radix main. Do not dispatch before Mind
   confirms the settle.
-- **sanity**: converted count ≈ 110; one converted file read in full.
+- **sanity**: converted count ≈ 110; one converted file read in full;
+  `"$FABER_BIN" check "$PWD/src/train.fab"` (absolute path) green on a
+  converted file.
 - **non_goals**: applied call-site holes (no explicit call-site type args exist
   in gradus — feature has no remediation site); union holes.
 - **risk**: medium — touches type-inference surface against a freshly settled
@@ -173,7 +195,9 @@ validation). Lane gates are named once in §6 and are **not** child checks.
   byte-identical (proba assertions unchanged in expectation).
 - **depends_on**: GLQ-03, GLQ-04, GLQ-05 (guard waves settle the same files).
 - **sanity**: one template call compiled-shape read against EBNF:795-801;
-  message-equivalence spot diff on tokenizer.
+  message-equivalence spot diff on tokenizer;
+  `"$FABER_BIN" check "$PWD/src/tokenizer.fab"` (absolute path) green on a
+  converted file.
 - **non_goals**: changing message text; i18n; error remap wall structure.
 - **risk**: low-medium — mechanical; output equivalence is the watch item.
 
@@ -188,7 +212,8 @@ validation). Lane gates are named once in §6 and are **not** child checks.
   has a one-line reason in the receipt.
 - **depends_on**: GLQ-03, GLQ-04, GLQ-07 (same-file churn settles first).
 - **sanity**: two converted loops read for off-by-one boundaries
-  (`‥` inclusive semantics).
+  (`‥` inclusive semantics); `"$FABER_BIN" check "$PWD/src/cache.fab"`
+  (absolute path) green on a converted file.
 - **non_goals**: `↑`/`↓` inc/dec introduction (zero usage today; not required);
   algorithm changes.
 - **risk**: low-medium — boundary semantics are the defect class; proba
@@ -204,7 +229,7 @@ validation). Lane gates are named once in §6 and are **not** child checks.
 - **depends_on**: GLQ-02, GLQ-05 (glyph + guard passes land first so dedup
   rewrites final idiom, not transitional forms).
 - **sanity**: before/after proba run on the touched expectations; block count
-  diff.
+  diff; `"$FABER_BIN" check "$PWD/src/train.fab"` (absolute path) green.
 - **non_goals**: public API change to train surfaces; optimizer semantics.
 - **risk**: medium — numeric-path restructure; proba is the proof.
 
@@ -214,20 +239,25 @@ validation). Lane gates are named once in §6 and are **not** child checks.
   `scaled_dot_product_static`) with consumers chased (proba, api-reference
   regen, compatibility-policy break record); rewrite `addita_bias` /
   `conversio` Latin in live header comments; add `staticum`, `addita`,
-  `conversio` to the U8 lexicon in `scripta/check-source`; fix the guard's
-  stale ledger path comment (`docs/factory/no-latin/…` →
-  `docs/archived/no-latin/…`).
+  `conversio` to the U8 lexicon in `scripta/check-source`. The guard's
+  ledger-path comment is already correct — it resolves to the re-opened
+  `docs/factory/no-latin/rename-ledger.md` — so no path fix is needed
+  (the earlier factory→archived fix is inverted; no-latin re-opened).
 - **write_scope**: `src/attention.fab` (+`.proba`), header comments in
   `src/train.fab`, `src/transformer.fab`, `src/gradus.fab`, `src/shape.fab`,
   `scripta/check-source`, `docs/api-reference.md` (regen), 
   `docs/compatibility-policy.md` (break record).
 - **done_when**: `grep -rn 'staticum' src/ docs/api-reference.md` → zero (or
   ledgered retained-exception if the operator rules otherwise — see GOAL OQ4);
-  lexicon entries present; guard comment path resolves; api-reference
-  republishes the English name.
-- **depends_on**: none.
+  lexicon entries present; guard comment path resolves to the re-opened
+  ledger; api-reference republishes the English name.
+- **depends_on**: no-latin re-close — GLQ-10's `scripta/check-source` lexicon
+  additions (`staticum`/`addita`/`conversio`) are sequenced **after** no-latin
+  re-closes (reopened scope closes; its R2 guard-root restoration edits the
+  same file), so the two never edit `check-source` concurrently.
 - **sanity**: guard still green on the converted tree (lexicon addition is
-  additive); one consumer chase verified.
+  additive); one consumer chase verified; `"$FABER_BIN" check
+  "$PWD/src/attention.fab"` (absolute path) green.
 - **non_goals**: renaming retained technical terms; rewriting archived
   campaign docs that legitimately cite history.
 - **risk**: low — one symbol + comments + additive guard rows.
@@ -250,22 +280,25 @@ validation). Lane gates are named once in §6 and are **not** child checks.
 - **non_goals**: quickstart tour (GLQ-14); rewriting docs/*.md (GLQ-15).
 - **risk**: low — single file, truth-aligning.
 
-### GLQ-12 — exempla stale-symbol sweep
+### GLQ-12 — exempla stale-symbol sweep (README prose only)
 
 - **outcome**: Audit Batch B: sweep Latin from 12 exempla READMEs
   (token-generation, dense-model, gguf-materialize, gguf-inspect,
   dense-prefill-qwen2, dense-prefill-smollm2, training-loop-mlp,
   qwen36-35b-inference, gguf-admit-qwen35moe, dense-swiglu, dense-qwen2-adapter,
-  dense-block) + 4 mains' local helpers/comments (gguf-manifest
-  `_numerum_observa`; gguf-materialize `_vinculum`/`VinculumMala`/`SlicemMala`;
-  training-loop-mlp `metrica_p`/`damnum`/`accuratezza`; dense-model `praevideo`
-  comment), mapping via `docs/archived/no-latin/rename-ledger.md`.
-- **write_scope**: `exempla/*/README.md`, `exempla/*/src/main.fab`.
-- **done_when**: public-surface Latin grep zero under `exempla/` outside
-  `target/` and retained exceptions.
-- **depends_on**: none.
-- **sanity**: two swept demos' cited symbols checked live in src.
-- **non_goals**: writing the missing nn-bridge README (GLQ-15); exempla
+  dense-block), mapping via `docs/factory/no-latin/rename-ledger.md`.
+- **write_scope**: `exempla/*/README.md` **only** — no `.fab` write paths.
+  Exempla `main.fab` identifier renames (e.g. gguf-manifest `_numerum_observa`;
+  gguf-materialize `_vinculum`/`VinculumMala`/`SlicemMala`; training-loop-mlp
+  `metrica_p`/`damnum`/`accuratezza`; dense-model `praevideo`) are owned by
+  no-latin R1, not by this goal.
+- **done_when**: README Latin grep zero under `exempla/` outside `target/`
+  and retained exceptions (README prose only; mains excluded).
+- **depends_on**: no-latin R1 re-close (so R1's exempla renames land before
+  this README sweep reads final names).
+- **sanity**: two swept READMEs' cited symbols checked live in src.
+- **non_goals**: exempla `main.fab` identifier renames and edits (no-latin R1,
+  not GLQ-12); writing the missing nn-bridge README (GLQ-15); exempla
   behavioral changes.
 - **risk**: low — prose + local identifiers.
 
@@ -338,7 +371,7 @@ validation). Lane gates are named once in §6 and are **not** child checks.
 ### GLQ-17 — EBNF staleness ×3 (faber-side docs unit)
 
 - **outcome**: Correct the three staleness items in `faber/docs/EBNF.md`:
-  (a) requitur/adfirma particle "proposed (not shipped)" prose (≈`:610-613`) vs
+  (a) requirit/adfirma particle "proposed (not shipped)" prose (≈`:610-613`) vs
   the shipped parser (`radix-parser/src/stmt.rs:565-589`, tests
   `radix-parser/src/mod_test.rs:2308-2336`); (b) comparison productions listing
   `<`/`>` while canonical glyphs are `≺`/`≻`
@@ -376,14 +409,18 @@ settled) — Mind dispatch gates, not merge gates.
   after GLQ-10's rename).
 - **merge**: integration on main + build stability; compatibility-policy break
   record present for the GLQ-10 rename.
-- Child Hands carry only the per-unit `sanity` above (targeted greps + reads).
+- Child Hands carry only the per-unit `sanity` above: targeted greps + reads,
+  plus the unit-scoped `faber check` absolute-path sanity declared on each
+  `.fab`-converting unit in §4 (not a §6-only lane gate). The full-tree gates
+  (`check-source`, `check-compile`, `inventory-public-symbols`) stay lane-owned.
 
 ## 7. Dispatch waves (max safe parallelism)
 
 | Wave | Units | Gate to enter |
 | --- | --- | --- |
-| 1 | GLQ-03, GLQ-10, GLQ-11, GLQ-12, GLQ-16, GLQ-17 | none (disjoint surfaces) |
-| 2 | GLQ-01, GLQ-14, GLQ-15 | wave-1 deps done |
+| 1 | GLQ-03, GLQ-11, GLQ-16, GLQ-17 | none (disjoint surfaces) |
+| 1a | GLQ-10, GLQ-12 | no-latin re-close: GLQ-10 after no-latin R2 (both edit `scripta/check-source`); GLQ-12 after no-latin R1 (exempla renames land first) |
+| 2 | GLQ-01, GLQ-14, GLQ-15 | GLQ-10 done (GLQ-01 glyph, GLQ-15 api-reference); GLQ-11+12 done (GLQ-14) |
 | 3 | GLQ-04, GLQ-05 | GLQ-01 done (disjoint file sets between them) |
 | 4 | GLQ-02, GLQ-07 | GLQ-05 / waves 1-3 done |
 | 5 | GLQ-08, GLQ-09 | GLQ-07 / GLQ-02+05 done |
