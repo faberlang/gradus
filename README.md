@@ -261,3 +261,7 @@ Internal vs product paths: [`docs/internal-surfaces.md`](docs/internal-surfaces.
 ./scripta/check-source
 ./scripta/check-compile
 ```
+
+## License
+
+MIT. See [`LICENSE`](LICENSE).
