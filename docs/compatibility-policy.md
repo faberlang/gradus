@@ -1,6 +1,6 @@
 # Gradus Compatibility Policy
 
-**Version**: `compatibility-policy v1.2.1` (2026-08-20, no-latin remaining-identifier clean break; wire-hold truth)
+**Version**: `compatibility-policy v1.2.2` (2026-08-20, GLQ-10 `scaled_dot_product_staticum` → `scaled_dot_product_static` clean break)
 **Repo**: gradus. **Applies to**: the gradus library surface (version 0.1.0,
 pre-1.0) and every admitted support-matrix row
 (`docs/factory/production-ml-library/pml0-support-matrix.md`).
@@ -90,6 +90,18 @@ No `[[library_members]]` row was added. No locale-pack row was added. No Radix
 compiler change was required. Sibling-repository consumer migration
 (`examples/training/*`, Inferentia docs) is outside this break and remains a
 recorded follow-up.
+
+## 2.2 GLQ-10 static-shape attention rename
+
+`gradus:attention.scaled_dot_product_staticum` →
+`gradus:attention.scaled_dot_product_static`. Clean break, pre-1.0, no shim,
+no compatibility alias, no deprecation window. The English name is republished
+in `docs/api-reference.md`. Live header comments `addita_bias` /
+`conversio` are rewritten to `added_bias` / `conversion`. The U8
+`scripta/check-source` lexicon now includes `staticum`, `addita`, and
+`conversio` so recurrence fails closed.
+
+No forwarding wrapper. Callers migrate to `scaled_dot_product_static`.
 
 ## 3. Correctness corrections
 
