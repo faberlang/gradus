@@ -14,8 +14,8 @@ pinned value (0 FAIL, exit 0).
 - **frequency base (theta)** — `RopeConfigura.base`;
 - **scale** — `RopeConfigura.scale` (multiplies theta, 1.0 = no scaling);
 - **pair policy** — `RopePolitica`:
-  - `Consecutiva` (llama-arch NORM): pairs `(x[2k], x[2k+1])`;
-  - `Interposita` (qwen2): pairs `(x[k], x[k+n/2])` — the llama.cpp NEOX
+  - `Consecutive` (llama-arch NORM): pairs `(x[2k], x[2k+1])`;
+  - `Interleaved` (qwen2): pairs `(x[k], x[k+n/2])` — the llama.cpp NEOX
     half-split layout (pairs offset by `n_dims/2`).
 
 Both pair-policy rows are pinned: the consecutive-pair row at freq_base

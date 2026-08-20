@@ -10,7 +10,7 @@ record 1, and the live source headers.
 ## The posture: the staged carrier
 
 Gradus uses the **staged carrier**: shape is a runtime dimension list inside
-the value carrier (`Tensor.forma`), and the **static shape is pinned by the
+the value carrier (`Tensor.shape`), and the **static shape is pinned by the
 consumer at materialization** (boundary types stay `tensor<f32, [2,2]>`).
 
 - **Why**: the generic shape genus (`genus Tensor<magnitudo F>` type-argument
@@ -51,7 +51,7 @@ PML1). Consequences:
 
 - The `DType` tag lives in ONE module (`gradus:dtype`) and is consumed via
   factory functions (`dtype.f32()`), never cross-module variant matching.
-- Error types expose `causa()` accessors rather than cross-module variant
+- Error types expose `message()` accessors rather than cross-module variant
   matching; every public function's error vocabulary is the module's own
   typed `*Error` discretio.
 - The model module follows the same rule: gguf/safetensors consume
@@ -63,11 +63,11 @@ PML1). Consequences:
 - The 65536 per-dimension cap is the GI1 pinned-row **capsule/support-row
   admission ceiling** (`pml0-model-capsule-contract.md` §5 row 5), NOT a
   general math limit.
-- General checked shape arithmetic (`quantitas` / `broadcastum` /
-  `reformanda` / `expansio`) does not apply the per-dimension cap, so
+- General checked shape arithmetic (`numel` / `broadcast` /
+  `reshape` / `expand`) does not apply the per-dimension cap, so
   128k–152k vocab rows stay expressible. Tensor construction routes the
-  element product through ONE validator: `shape.quantitas`.
-- The serialize mirror was aligned to `shape.quantitas` (no per-dimension
+  element product through ONE validator: `shape.numel`.
+- The serialize mirror was aligned to `shape.numel` (no per-dimension
   cap; element ceiling 1_000_000_000 and negative-dim rejection retained;
   wire schema unchanged — `serialize-schema-1.0.0`).
 

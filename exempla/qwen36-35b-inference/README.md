@@ -34,7 +34,7 @@ closed.
 The application reads only the bounded table prefix `[0, oracle_offset)` once
 (`solum.partem`), then gives Gradus an operation-scoped range function over
 that application-owned buffer. Gradus never receives the path, file handle,
-or prefix. The run fails closed (nonzero exit + typed `causa`) on:
+or prefix. The run fails closed (nonzero exit + typed `message`) on:
 
 - **identity mismatch** — byte length differs from the pinned 22,663,387,424,
   or the `--sha256` operand is not a 64 lower-case hex digest;

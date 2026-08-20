@@ -5,7 +5,7 @@
 
 This document pins the LEGAL fixture + oracle for the one admitted
 Safetensors row. The module `gradus:model/safetensors` admits EXACTLY this
-row into the schema-2 `capsula.Capsula` (capsule-schema-2.0.0, A1C-M1): a
+row into the schema-2 `capsule.Capsula` (capsule-schema-2.0.0, A1C-M1): a
 pathless content identity plus the per-format Safetensors manifest, per
 the GGUF-A1c clean break.
 

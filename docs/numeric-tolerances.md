@@ -126,7 +126,7 @@ The optimize suite comments explicitly bind this band to
 | Location | Band | Role |
 | --- | ---: | --- |
 | `src/train.proba` RNG draws | `1e-6` absolute on documented `[0,1)` draws | xorshift64 / f64 recurrence pins — not a forward-math band |
-| Exact equality (`≡`) | 0 | Integer tokens, identities, wire round-trips, error `causa` strings, EOG membership |
+| Exact equality (`≡`) | 0 | Integer tokens, identities, wire round-trips, error `message` strings, EOG membership |
 
 A specialized tighter band never authorizes relaxing a looser family row
 on device or FD acceptance.
@@ -147,7 +147,7 @@ Token sequences are **exact** — no tolerance band.
 Live pins: `src/decode.proba` (PML5-U6 aggregate), documented for
 consumers in `exempla/token-generation/README.md`.
 
-Admitted EOG set: **`{0, 2}`** — `tokenizator.est_eog` is the stop-policy
+Admitted EOG set: **`{0, 2}`** — `tokenizer.is_eog` is the stop-policy
 binding. A different EOG set is a different tokenizer (identity, not a
 value error) — see §5 and `docs/compatibility-policy.md` §3.
 
@@ -186,8 +186,8 @@ Session `redintegra` resets position while preserving context
 
 | Pin | Expected | Location |
 | --- | --- | --- |
-| Pinned EOG set | `"0,2"` / membership `{0,2}` | `src/model/capsule.proba` (`F_EOG`), `src/tokenizer.proba` (`est_eog`) |
-| Well-formed-but-different EOG | reject (`invalid tokenizer identity` / `EogMala`) | `src/model/capsule.proba` `"rejects a well-formed-but-different EOG set (pinned EOG is {0, 2})"` with eog `"1,5"` |
+| Pinned EOG set | `"0,2"` / membership `{0,2}` | `src/model/capsule.proba` (`F_EOG`), `src/tokenizer.proba` (`is_eog`) |
+| Well-formed-but-different EOG | reject (`invalid tokenizer identity` / `BadEog`) | `src/model/capsule.proba` `"rejects a well-formed-but-different EOG set (pinned EOG is {0, 2})"` with eog `"1,5"` |
 | Non-sorted / empty / negative EOG | reject | same suite |
 | Tokenizer probe lists | exact id lists P1–P11 | `fixtures/tokenizer/tokenizer-identity-oracle.md` |
 

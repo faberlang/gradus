@@ -161,17 +161,17 @@ and a checkpoint artifact. That is the bar for "a training pipeline."
 | --- | --- | --- |
 | Reverse-mode AD, compile-time, from source annotation | `radix-air/src/reverse_ad/{transform,vjp,validate,replay}.rs`; driver `radix-module/src/driver/mod.rs:2084-2236` | **live**, with compile-time validation chain + companion fusion |
 | Backward companion ABI (`backward(args…, nil(), upstream) → iuncta`) | `gradus/src/gradient.fab:209-228`, `gradus/src/gradus.fab:220-247` | **live** (MLP 6-slot; BERT-tiny 21-slot) |
-| ONE gradient-call contract entry (identity + generation) | `gradient.fab:248-265` (`gradientes_simple_loss`); `Gradient` class `:115`, `Gradients` bundle `:169`, staleness `obsolete` `:202` | **live** |
-| Per-parameter gradient records: (possessor, nomen, versio) | `gradient.fab:110-134`; parameter identity `parameter.fab:190,243` | **live** |
+| ONE gradient-call contract entry (identity + generation) | `gradient.fab:248-265` (`gradients_simple_loss`); `Gradient` class `:115`, `Gradients` bundle `:169`, staleness `obsolete` `:202` | **live** |
+| Per-parameter gradient records: (owner, name, version) | `gradient.fab:110-134`; parameter identity `parameter.fab:190,243` | **live** |
 | SGD optimizer state, fail-closed freshness/shape/trainable rules | `optimize.fab:258` (`SgdState`), `:361` (`Sgd`), `step` `:467-493` (param' = param − lr·grad), validation `:310-333` | **live** — **SGD only; no momentum, no Adam family, no weight decay, no clipping** |
 | Optimizer wire: versioned schema, exact round-trip | `optimize.fab:505-570` (state), `:576-621` (whole optimizer), schema `"1.0.0"` `:116` | **live** |
 | Fixed-shape train steps (linear 2×2, MLP 4×4, BERT-tiny linear + LN) | `train.fab:62,80,110,152` | **live** (inline math; library-to-library call gap documented at `train.fab:30-39`) |
-| LR schedule: warmup→cosine (constant when vertex=finis) | `train.fab:307-430` (`Schedule`, `construct_schedule`, `scheduled_rate`) | **live** — one schedule family only |
+| LR schedule: warmup→cosine (constant when vertex=end) | `train.fab:307-430` (`Schedule`, `construct_schedule`, `scheduled_rate`) | **live** — one schedule family only |
 | Deterministic RNG + dropout mode | `train.fab:568-716` (`Seed`/`Draw`/`next_f32`, `dropout` `:684`, seed wire `:716`), Mode discipline/estimate `:433-495` | **live** |
 | Checkpoint: optimizer wire + RNG + epoch/step, exact round-trip | `train.fab:787-870` (`Checkpoint`, `serialize_checkpoint` `:825`, `deserialize_checkpoint` `:849`) | **live** — optimizer/RNG only; **no model-weights artifact** |
 | Losses: `mse`, `cross_entropy` + fixed-shape MSE rows | `loss.fab:264,306,379,389,399` | **live** |
 | Metrics: `accuracy`, `Metric` | `metrics.fab:121,193,211` | **live** |
-| Parameters: identity, mutation (versio bump), registry, wire | `parameter.fab:243,393,416,529` | **live** |
+| Parameters: identity, mutation (version bump), registry, wire | `parameter.fab:243,393,416,529` | **live** |
 | Device gradient handles (create/accumulate/read/zero) | MIR intrinsic `radix-mir/src/gradient.rs:5-10`; LLVM `radix-mir-llvm/src/gradient.rs:39-80`; host ABI `radix-host-abi/src/…:109-112`; runner `radix-mir-runner/src/runtime.rs:315-360` | **live**, **f32-only host restriction** (`runtime.rs:356-358`) |
 | Executed converging loop (stage 4b) | `radix-program/src/mir/lane_test.rs:526-568` over `gradus/exempla/training-loop-mlp` | **live** (CPU, FMIR interpreted, f64-pinned) |
 | FD gradient oracle methodology | `gradus/exempla/gradient-seam{,-nolib}/README.md` (central difference, eps 1e-5, per-element) | **live** methodology |
@@ -330,9 +330,9 @@ bands). Value-per-cost ranking at the end.
   older parameters — the classic DDP/accumulation footgun) are undetectable
   in the census tools at the type level; they surface as silent divergence.
   Ours is fail-closed by construction: gradients carry the parameter's
-  `versio` at computation (`gradient.fab:131-134,190-202`), `optimize.step`
+  `version` at computation (`gradient.fab:131-134,190-202`), `optimize.step`
   rejects stale gradients before touching the parameter
-  (`optimize.fab:473-475`, `GradusObsoletus`), and `parameter.mutate` bumps
+  (`optimize.fab:473-475`, `StaleGradient`), and `parameter.mutate` bumps
   the generation (`parameter.fab:393`).
 - **What it buys**: gradient accumulation (G5) becomes *safe by contract* —
   accumulate then apply with an explicit generation assertion, instead of
@@ -395,7 +395,7 @@ bands). Value-per-cost ranking at the end.
   an exact zero extent in the companion tuple, proven on devices with
   per-output bounds (`examples/training/hetero-backward/src/
   hetero_backward.fab:15-30`: grad_w[j] = 0 with no dispatch overrun).
-  Frozen parameters never step (`Gelida`, `optimize.fab:476-478`).
+  Frozen parameters never step (`Frozen`, `optimize.fab:476-478`).
 - **What it buys**: MoE/partial-finetuning where most parameters receive no
   gradient — the dispatch elision is free.
 - **Seam it rides**: companion selected-inputs facts (`driver/mod.rs:2105-2141`).
@@ -443,7 +443,7 @@ unique-knob leverage. Nothing below touches the sibling seats'
 | Unit | Repo/scope | Done-when |
 | --- | --- | --- |
 | T1-U1 AdamW state slot + wire bump | gradus `src/optimize.fab` (`AdamState`: m, v, step, β1/β2/eps; schema `"1.0.1"`; unknown-schema rejection preserved; per-slot wire) | proba: construction validation + round-trip `adam_aequus` + unknown-schema negative green |
-| T1-U2 AdamW step math (bias-corrected) | gradus `src/optimize.fab` (`step` overload; same fail-closed preconditions incl. `GradusObsoletus`) | proba: f64-oracle-pinned step pins (one parameter, one step); stale-gradient negative green |
+| T1-U2 AdamW step math (bias-corrected) | gradus `src/optimize.fab` (`step` overload; same fail-closed preconditions incl. `StaleGradient`) | proba: f64-oracle-pinned step pins (one parameter, one step); stale-gradient negative green |
 | T1-U3 gradient accumulation | gradus `src/gradient.fab` + `optimize.fab` (accumulate-on-freshness: sums gradient records at equal generation; apply-then-bump) | proba: accumulate-2-then-step pin; mixed-generation accumulation fails closed |
 | T1-U4 global-norm clipping | gradus `src/train.fab` or `optimize.fab` (clip over a `Gradients` bundle before step) | proba: clip pin vs f64 norm; empty-bundle negative |
 
@@ -459,7 +459,7 @@ unique-knob leverage. Nothing below touches the sibling seats'
 
 | Unit | Repo/scope | Done-when |
 | --- | --- | --- |
-| T3-U1 dense-model parameter bridge | gradus `src/model/dense.fab` + `src/parameter.fab` (materialized tensors exposed as `Parametrum` records with identity/versio; frozen/trainable admission) | proba: registry identity pins; frozen-tensor step negative |
+| T3-U1 dense-model parameter bridge | gradus `src/model/dense.fab` + `src/parameter.fab` (materialized tensors exposed as `Parametrum` records with identity/version; frozen/trainable admission) | proba: registry identity pins; frozen-tensor step negative |
 | T3-U2 differentiable training forward | gradus `src/model/` (a `@ radix lane "air"` training composition over the dense blocks — LM head + `loss.cross_entropy` — separate from the bare inference `forward`) | companion generates; `faber check` green; FD oracle rows on a 2-block tiny config |
 | T3-U3 finetune exemplum | gradus `exempla/` (load tiny dense rung → N steps on T2 data → per-step metrics → checkpoint) | executed FMIR-lane test with f64 pins (loss decreases; gradient norms finite) |
 | T3-U4 finetuned-model artifact (closes G4) | gradus `src/serialize.fab` + manifest (updated tensors written out beside optimizer wire; digests; fail-closed schema) | round-trip proba: artifact → reload → identical forward logits pin |
@@ -476,7 +476,7 @@ unique-knob leverage. Nothing below touches the sibling seats'
 | Unit | Repo/scope | Done-when |
 | --- | --- | --- |
 | T5-U1 gradient ABI kind widening | radix host ABI + runner + LLVM (f16/bf16 gradient carriers, f32 accumulation; **contract revision — amendment §7-2**) | ABI round-trip tests; derived envelope on the MLP fixture |
-| T5-U2 LoRA adapter parameters | gradus `src/parameter.fab` + model seam (A/B matrices as first-class parameters; frozen base weights — `Gelida` already supports it) | proba: LoRA-on-linear pin vs f64 oracle; base-weight mutation negative |
+| T5-U2 LoRA adapter parameters | gradus `src/parameter.fab` + model seam (A/B matrices as first-class parameters; frozen base weights — `Frozen` already supports it) | proba: LoRA-on-linear pin vs f64 oracle; base-weight mutation negative |
 
 Estimated first-filing envelope (T1 + T2-U1): ~15–25k tokens, write-disjoint
 from the sibling design-doc work and from R-PACK/OF waves (gradus-only

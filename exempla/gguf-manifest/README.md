@@ -31,8 +31,8 @@ env FABER_LIBRARY_HOME=/Users/ianzepp/work/faberlang/worktrees/hand-1 \
 
 Observed result (2026-08-12): exit `0`; 40 PASS lines and 0 FAIL lines. The
 package executes only deterministic bounded in-source corpora. It checks all
-thirteen metadata wire kinds, exact representative `valor_wire` bytes
-(including a nested array), signed integer access, the typed BOOL `numerum`
+thirteen metadata wire kinds, exact representative `payload_wire` bytes
+(including a nested array), signed integer access, the typed BOOL `number`
 rejection, default/custom data starts, descriptor ranges, and legal table-end
 boundaries. It does not parse the committed binary fixtures, read a real file
 or tensor payload, or claim model inference.
@@ -63,7 +63,7 @@ extra-data-region-byte: PASS observed=bounded GGUF corpus contains bytes from th
 identity-mismatch: PASS observed=content identity does not match the supplied artifact length
 metadata-13-wire-kinds: PASS observed=13-kinds/bytes
 nested-array-preservation: PASS observed=26-bytes
-bool-and-float-numerum-rejects: PASS observed=bool-preserved/numerum-rejected
+bool-and-float-number-rejects: PASS observed=bool-preserved/number-rejected
 descriptor-offset-elements-known-length: PASS observed=288/160/8/16
 custom-alignment-data-offset: PASS observed=384/192/4/16
 reordered-gapped-ranges: PASS observed=128/160/4/16

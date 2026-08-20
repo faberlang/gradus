@@ -180,7 +180,7 @@ exactly — a `NativeF16Convert` class, not a new algorithm family.
 ### 4.1 What exists today
 
 - **Gradus** (`src/cache.fab`): a *logical, dense, append-only, f32* cache —
-  one K and one V staged tensor `[positions, dimensio]` per session, exact
+  one K and one V staged tensor `[positions, dimension]` per session, exact
   history, `append` extends by exactly one position
   (`cache.fab:20-45` contract comment, `:332` f32/staged identity,
   `:352` append). Structural rules proven; **no paging, no windows, no
@@ -293,7 +293,7 @@ runtime.
 
 ### 5.1 Today
 
-`gradus/model/dense.fab:309` `forward` is a fixed `while stratum ≺ cfg.layers`
+`gradus/model/dense.fab:309` `forward` is a fixed `while layer ≺ cfg.layers`
 loop (`:356`) over all blocks, then final norm + head projection. Nothing can
 skip, replace, or redirect a layer. In the compiled route the same graph is
 emitted monolithically. llama.cpp has *no* authoring-level layer-skip knob at
@@ -652,7 +652,7 @@ Delivery mode is **derived from transform type, not chosen** (no free knob,
 
 | Transform | Delivery | Mechanism | Runtime cost |
 | --- | --- | --- | --- |
-| Weight orthogonalization (§13.2) | **bake** at materialization | applied once in the `fons` resolver seam — dequant → f32 transform → re-encode/promote → hand the adapter an ordinary stored-layout tensor (`dense.fab:125` `_source` seam; K-major load contract, design §1 item 2, unchanged — the transform is layout-blind, it happens in f32 after dequant) | **zero** — a downstream kernel/plan cannot distinguish a baked tensor from a native one; no new recipe variants (kernel_plan closed set HONORED, §9 row 1) |
+| Weight orthogonalization (§13.2) | **bake** at materialization | applied once in the `source` resolver seam — dequant → f32 transform → re-encode/promote → hand the adapter an ordinary stored-layout tensor (`dense.fab:125` `_source` seam; K-major load contract, design §1 item 2, unchanged — the transform is layout-blind, it happens in f32 after dequant) | **zero** — a downstream kernel/plan cannot distinguish a baked tensor from a native one; no new recipe variants (kernel_plan closed set HONORED, §9 row 1) |
 | Activation projection (§13.2) | **runtime** at the entry's site | one fused elementwise projection `a ← a − α(a·d)d` per site per token — exactly the OF-1/OF-2 typed elementwise carrier §5.2 names for `Obliterate` | one elementwise op per site per step; D-length direction resident |
 | Bias edit (§13.2) | **bake** (V1) | folded into the materialized bias; today's rows synthesize zero biases (`dense.fab:380-385` `_no_bias`), so bake = replace the zero with δ | **zero** |
 
@@ -718,7 +718,7 @@ manifest is a derived verification record — a manifest without a matching spec
 digest is rejected, never silently trusted.
 
 **Reference discipline for a sequential executor.** `forward` today is a
-strict `while stratum ≺ cfg.layers` loop with per-layer canonical-name
+strict `while layer ≺ cfg.layers` loop with per-layer canonical-name
 resolution (`dense.fab:355-366`) — no layer sees another. The ablation entry
 is the first *graph-level* construct, and the discipline that keeps sequential
 execution sound is:
@@ -1956,7 +1956,7 @@ Everything in this addendum rides seams §13/§16 already established; nothing
 new is invented below the transform *types*:
 
 - **Bake seam**: transforms execute once at weight materialization in the
-  `fons` resolver (§13.1 pattern) — dequant to F32 → transform → re-encode
+  `source` resolver (§13.1 pattern) — dequant to F32 → transform → re-encode
   per declared storage policy (§12-5) → downstream sees ordinary tensors.
   The bounded block readers `materialize_slice` / `materialize_block`
   (`gradus/src/model/tensor_view.fab:204,266`) already address expert

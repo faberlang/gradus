@@ -17,7 +17,7 @@ The adapter calls `solum.partem(path, 0, oracle_offset)` once and rejects a
 short prefix. Its captured callback returns exact subranges only from that
 prefix and rejects any request whose end exceeds it. A passing run therefore
 proves that manifest inspection did not read a tensor payload byte. The CLI
-also compares Gradus's independently computed `data_inceptum` with the oracle
+also compares Gradus's independently computed `data_start` with the oracle
 value.
 
 ## Independent inventory

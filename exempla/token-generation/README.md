@@ -2,7 +2,7 @@
 
 The oracle-matching token proof for the PML5 phase gate
 (`gradus/docs/factory/production-ml-library/pml5-delivery.md` PML5-U6):
-the composition flagged at U5 — `decodere_datum` → `sampling`
+the composition flagged at U5 — `decode_data` → `sampling`
 (`maxima` / `sors`) → the generation cursor — wired into a bounded
 generation run (greedy + one seeded stochastic config) whose expected
 token sequences are pinned against the documented arithmetic, with the
@@ -27,12 +27,12 @@ scale 1/√4, RoPE dim 4 — the oracle-pinned model), prompt `[0]`, config
 The greedy run emits **`[0]`** — not `[0, 0]` — because of the **EOG-stop
 policy** (the CTO9-4 correctness fix, binding generation to the admitted
 tokenizer identity): the first drawn token `0` is an admitted EOG token
-(EOG set `{0, 2}` — `tokenizer.fab`, `tokenizator.est_eog`), so
+(EOG set `{0, 2}` — `tokenizer.fab`, `tokenizer.is_eog`), so
 generation terminates after it. `maxima_verborum` is a **ceiling**, not a
 promise to emit exactly that many tokens. The seeded run draws `[1, 1]`
 (no EOG token), so it runs to the cursor ceiling.
 
-Identity failure for a non-pinned EOG set is `TokenizerError.EogMala`
+Identity failure for a non-pinned EOG set is `TokenizerError.BadEog`
 (see `docs/diagnostics.md`) — not a value error.
 
 Both runs are bounded by the generation cursor (`verbum_licet` — the U5
@@ -46,10 +46,10 @@ before every step (honored: a cancelled flag stops the run).
 
 | Step | Surface |
 | --- | --- |
-| Token decode | `decode.decodere_datum(prev, positio, m)` — one-token decode over the shared forward row (embedding gather → transformer block → output projection) |
+| Token decode | `decode.decode_data(prev, positio, m)` — one-token decode over the shared forward row (embedding gather → transformer block → output projection) |
 | Greedy selection | `sampling.maxima` — the exact argmax path (temperatura 0) |
 | Seeded draw | `sampling.sors` — the deterministic pipeline (rep-penalty → temperature → top-k → softmax → top-p → min-p) + one `train.proximus_f32` draw per step, walking the cumulative distribution (first-index rule) |
-| Bounded loop | `generation.cursor_fresh` / `verbum_licet` / `cursor_progredere` — the cursor limits (reject, never truncate) + the EOG-stop policy (`tokenizator.est_eog` — terminate at the first EOG token `0`/`2`) drive the loop |
+| Bounded loop | `generation.cursor_fresh` / `verbum_licet` / `cursor_progredere` — the cursor limits (reject, never truncate) + the EOG-stop policy (`tokenizer.is_eog` — terminate at the first EOG token `0`/`2`) drive the loop |
 | Cancellation | `decode.observa_cancellationem` per step — the cooperative checkpoint (fail closed) |
 | Determinism | pure composition: same model + config + seed → same tokens; the advanced `Semen` is carried explicitly |
 
@@ -136,5 +136,5 @@ first divergent token.
 ## Related
 
 - Training composition: `exempla/training-loop-mlp/`
-- Diagnostics (`EogMala`, decode/generation errors): `docs/diagnostics.md`
+- Diagnostics (`BadEog`, decode/generation errors): `docs/diagnostics.md`
 - API: `docs/api-reference.md` (`gradus:decode`, `gradus:generation`, `gradus:tokenizer`)

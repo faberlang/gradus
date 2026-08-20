@@ -22,15 +22,15 @@ auditor-owned gate, never claimed here.
 | --- | --- |
 | Foundation (dtype, shape, tensor, math) | **Shipped (PML1)** — staged-carrier tensor, shape rules, operation families |
 | Shared contracts (parameter, serialize) | **Shipped (PML1)** — identity + versioned wire forms |
-| Gradient wrapper | **Shipped (PML4)** — the ONE companion-call entry: `gradientes_simple_loss` |
+| Gradient wrapper | **Shipped (PML4)** — the ONE companion-call entry: `gradients_simple_loss` |
 | Loss functions | **Shipped (PML4)** — shape-generic `mse`, `cross_entropy` + fixed-shape MSE rows |
-| Optimizers | **Shipped (PML4)** — SGD state contract: slots, `passus`, serialization |
+| Optimizers | **Shipped (PML4)** — SGD state contract: slots, `step`, serialization |
 | NN primitives | **Shipped (PML3)** — shape-generic `linear`, `gelu`, `layernorm` + fixed-shape rows; **REF-01-U1.1** adds the generic `rmsnorm` row (llama-arch last-axis norm, no centering) with an executed `exempla/dense-rmsnorm` proof (32 PASS / 0 FAIL) |
 | Attention / transformer | **Shipped (PML3)** — SDPA/RoPE + transformer block on the staged carrier, plus the fixed-shape BERT-tiny rows |
 | Training (steps, schedules, mode, RNG, checkpoint) | **Shipped (PML4)** — `Tabula` checkpoint, LR schedules, mode, seeded RNG, dropout |
 | Metrics | **Shipped (PML4)** — `accuratezza` + `Metricum` record |
 | Model admission | **Shipped (PML2)** — `capsule-schema-2.0.0` capsule (A1C clean break: pathless identity + per-format manifest) + admitted rows; GGUF-A1b adds pathless range inspection proven against six operator-local GGUF v3 files; GGUF-A3 adds the `tensor_payload` / `tensor_view` typed-view surface (payload carrier, `vincula` bind, bounded windowed materializers) and widens the dequant union set to F32/BF16/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K; REF-01-U1.6 adds the typed `llama` (SmolLM2) architecture adapter (`gradus:model/dense_llama`, executed 19 PASS / 0 FAIL adapter proof in `exempla/dense-llama-adapter`); it does not admit those architectures or claim inference |
-| Tokenizer identity | **Shipped (PML2/PML5)** — pinned-row probe parity + `est_eog` stop binding |
+| Tokenizer identity | **Shipped (PML2/PML5)** — pinned-row probe parity + `is_eog` stop binding |
 | Inference (decode, cache, sampling, generation) | **Shipped (PML5)** — decode/prefill, KV-cache, sampling pipeline, generation config + cursor |
 | GPU training / executed runs | Blocked on the FMIR lever (CTO8-1) — structural tier only, no executed claim |
 
@@ -155,7 +155,7 @@ gate.
 | SGD optimizer state, loss (`mse`/`cross_entropy`), training (steps, schedules, mode, RNG, dropout, checkpoint `Tabula`) | **Shipped (PML4)** | Gradus |
 | NN primitives + attention/transformer (staged surface + fixed-shape rows) | **Shipped (PML3)**; configurable RoPE (freq base/scale/pair policy — consecutive-pair llama NORM vs interleaved-pair qwen2, REF-01-U1.3) with executed proof `exempla/dense-rope`; multi-head attention with GQA KV-head sharing — causal + RoPE + output projection (REF-01-U1.4) with executed proof `exempla/dense-gqa`; generic dense transformer block — input RMSNorm → GQA (causal + RoPE) → residual → post-attn RMSNorm → SwiGLU → residual, composing the U1.1/U1.2/U1.4 rows (REF-01-U1.5) with executed proof `exempla/dense-block` | Gradus |
 | Model admission (capsule + Safetensors + GGUF + dequant) | **Shipped (PML2)** — schema-2 capsule (pathless identity + per-format manifest); format-general GGUF manifest/range inspection has an **executed A1b proof** over six operator-local real files; GGUF-A3 adds the `tensor_payload`/`tensor_view` modules (pathless payload carrier, `vincula` bind, bounded windowed materializers) and the widened dequant union set, without architecture admission, tokenizer, or inference claims | Gradus |
-| Tokenizer identity + probe parity + `est_eog` | **Shipped (PML2/PML5)** | Gradus |
+| Tokenizer identity + probe parity + `is_eog` | **Shipped (PML2/PML5)** | Gradus |
 | Inference: decode, KV-cache, sampling, generation config | **Shipped (PML5)** | Gradus |
 | nanoGPT on Shakespeare (CPU) | **Planned** (forcing-function demo; corpus/ not yet in-tree) | Gradus |
 | Executed proba / e2e runs | **Auditor-owned** — env-blocked on the FMIR lever (CTO8-1); never a dev-loop claim | Auditor |
@@ -177,7 +177,7 @@ device/backend handle:
 
 The `sgd_step_*` fixed-shape helpers were retired at PML1-U6 (post-U6
 cleanup, ledger rows 10–11); the SGD surface today is the PML4 optimizer
-state contract (`gradus:optimize` — `SgdStatum` slots, `passus`, wires).
+state contract (`gradus:optimize` — `SgdStatum` slots, `step`, wires).
 The fixed-shape MSE rows and train steps above remain the admitted caller
 surface; their formula is exactly the shape-generic `loss.mse` /
 `optimize`-state update over the same element arithmetic.

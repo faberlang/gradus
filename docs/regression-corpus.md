@@ -55,7 +55,7 @@ Live co-located suites (32 files):
 | `src/optimize.proba` | `gradus:optimize` | SGD step pins @ **1e-4** absolute |
 | `src/train.proba` | `gradus:train` | Schedules @ **5e-4**; seeds; checkpoint; U6 trajectory |
 | `src/metrics.proba` | `gradus:metrics` | Accuracy / metric record |
-| `src/tokenizer.proba` | `gradus:tokenizer` | Identity + **`est_eog` {0,2}** + EOG admission rejects + **LIB-02-U2 byte-level BPE word oracle** (`transformers` → `[4549, 382]`, `สวัสดี` → `[34469, 168607]`, `人工智能` → `[109015]`, decode round-trips, typed error rows) + **LIB-02-U3 composed full-prompt oracle** (scanner + special/EOG/BOS/chat policy rows, Probe A/B exact id lists §4.8) |
+| `src/tokenizer.proba` | `gradus:tokenizer` | Identity + **`is_eog` {0,2}** + EOG admission rejects + **LIB-02-U2 byte-level BPE word oracle** (`transformers` → `[4549, 382]`, `สวัสดี` → `[34469, 168607]`, `人工智能` → `[109015]`, decode round-trips, typed error rows) + **LIB-02-U3 composed full-prompt oracle** (scanner + special/EOG/BOS/chat policy rows, Probe A/B exact id lists §4.8) |
 | `src/decode.proba` | `gradus:decode` | Logits @ **5e-4**; **tokens `[0]` / `[1,1]`**; reset/replay; first-token-divergence |
 | `src/cache.proba` | `gradus:cache` | KV identity + `redintegra` |
 | `src/sampling.proba` | `gradus:sampling` | Softmax / filters @ **5e-4** |
@@ -65,8 +65,8 @@ Live co-located suites (32 files):
 | `src/model/safetensors.proba` | Safetensors row | Fixture bytes + digest + tokenizer mismatch |
 | `src/model/gguf.proba` | GGUF row | Builder + digest + row facts |
 | `src/model/dequant.proba` | CPU dequant — union set | Block layout pins + fail-closed gates for the union set {F32, F16, BF16, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K}; F16 f64-oracle pins (1.0 / 65504.0); NaN half/bf16 rejects |
-| `src/model/tensor_payload.proba` | `gradus:model/tensor_payload` (GGUF-A3 C2-U2) | TensorPayload carries the exact stored range facts (name, absolute start, length) + bounded byte list; PayloadError → causa render path type-checks |
-| `src/model/tensor_view.proba` | `gradus:model/tensor_view` (GGUF-A3 C2-U3/U4/U5) | `vincula` fail-closed bind (NomineIgnota / RangeMala / LongitudoMala / LayoutIgnota / TypoIgnotum); windowed `materializa_slicem` + single-block `materializa_glomulum` fail-closed rows |
+| `src/model/tensor_payload.proba` | `gradus:model/tensor_payload` (GGUF-A3 C2-U2) | TensorPayload carries the exact stored range facts (name, absolute start, length) + bounded byte list; PayloadError → message render path type-checks |
+| `src/model/tensor_view.proba` | `gradus:model/tensor_view` (GGUF-A3 C2-U3/U4/U5) | `vincula` fail-closed bind (UnknownName / BadRange / BadLength / UnknownLayout / UnknownDtype); windowed `materializa_slicem` + single-block `materializa_glomulum` fail-closed rows |
 | `src/model/artifact.proba` | pathless content identity | Algorithm, digest, and positive-length validation |
 | `src/model/dense_llama.proba` | `gradus:model/dense_llama` (REF-01-U1.6) | Frozen SmolLM2-360M config facts; every canonical name resolves to the exact descriptor facts the A1b inspect surface reports for the real SmolLM2 file (name, shape, layout); fail-closed typed rejection rows (unknown canonical, out-of-range layer, missing tensor, unknown layout) |
 | `src/model/gguf_manifest.proba` | GGUF-A1b manifest and range seam | Unknown codec inspection, exact ranges, source failure, checked tensor fragments, and LIB-02-U1 tokenizer array pins (248320 tokens / 247587 merges / special ids) |
@@ -115,7 +115,7 @@ PML6-U4 / the correctness wave. Loss of any pin is a corpus defect.
 | --- | --- |
 | **Pin** | Greedy bounded generation emits **`[0]`** (length 1), not `[0,0]` |
 | **Why** | First drawn token `0` is an admitted EOG token; EOG-stop terminates (`0d50d60`) |
-| **EOG set** | `{0, 2}` via `tokenizator.est_eog` |
+| **EOG set** | `{0, 2}` via `tokenizer.is_eog` |
 | **Ceiling** | `maxima_verborum` is a ceiling, never a promise of exact length |
 | **Live** | `src/decode.proba` — `"the greedy bounded run (temp 0) draws the f64-oracle tokens [0] ..."` |
 | **Consumer doc** | `exempla/token-generation/README.md` |
@@ -140,7 +140,7 @@ PML6-U4 / the correctness wave. Loss of any pin is a corpus defect.
 | **Message class** | `schema 1 is retired — capsule schema is 2.0.0` (`AdmissionError.SchemaVetus`) |
 | **Why** | Schema 1 is retired at the schema-2 boundary; a schema-1 call site also fails to compile (the schema-2 constructor has no schema-1 signature) |
 | **Live** | `src/model/capsule.proba` — the `"capsule schema-1 rejection"` probandum (`structa_manifestum rejects a schema-1 stamp`, `verifica rejects a schema-1-stamped capsule`, `deserialization rejects a schema-1-stamped wire`) |
-| **Sibling** | `src/tokenizer.proba` rejects `"1,5"` / non-sorted / empty EOG; `est_eog` admits only `{0,2}` — EOG identity lives in `gradus:tokenizer`, not the schema-2 capsule |
+| **Sibling** | `src/tokenizer.proba` rejects `"1,5"` / non-sorted / empty EOG; `is_eog` admits only `{0,2}` — EOG identity lives in `gradus:tokenizer`, not the schema-2 capsule |
 
 ### 4.4 Reset / replay determinism
 
@@ -167,10 +167,10 @@ Tolerance policy detail: `docs/numeric-tolerances.md`.
 
 | Field | Value |
 | --- | --- |
-| **Pin** | `textorum(m, "tokenizer.ggml.tokens").longitudo()` = **248320**; `textorum(m, "tokenizer.ggml.merges").longitudo()` = **247587**; `numerorum(m, "tokenizer.ggml.token_type").longitudo()` = **248320** |
-| **Special ids** | `tokenizer.ggml.bos_token_id` = **248044** (`<|endoftext|>`), `tokenizer.ggml.eos_token_id` = **248046** (`<|im_end|>`), `tokenizer.ggml.padding_token_id` = **248055** via the scalar `numerum` surface |
+| **Pin** | `texts(m, "tokenizer.ggml.tokens").length()` = **248320**; `texts(m, "tokenizer.ggml.merges").length()` = **247587**; `numbers(m, "tokenizer.ggml.token_type").length()` = **248320** |
+| **Special ids** | `tokenizer.ggml.bos_token_id` = **248044** (`<|endoftext|>`), `tokenizer.ggml.eos_token_id` = **248046** (`<|im_end|>`), `tokenizer.ggml.padding_token_id` = **248055** via the scalar `number` surface |
 | **Why** | The counts/ids are the frozen target-prefix corpus facts (Qwen3.6-35B-A3B-UD-Q4_K_M.gguf metadata block) that LIB-02-U2/U3 encode/decode must consume |
-| **Errors** | Missing keys, non-array values, and wrong element kinds produce typed `GgufManifestError` (`WireMala` / `LimitesMala`) rows; duplicate tokenizer keys fail at parse (`ClavisDuplicata`) |
+| **Errors** | Missing keys, non-array values, and wrong element kinds produce typed `GgufManifestError` (`BadWire` / `BadBounds`) rows; duplicate tokenizer keys fail at parse (`DuplicateKey`) |
 | **Live** | `src/model/gguf_manifest.proba` — `"LIB-02-U1 tokenizer metadata accessors"` probandum |
 
 ### 4.7 Byte-level BPE word oracle (LIB-02-U2)
@@ -180,7 +180,7 @@ Tolerance policy detail: `docs/numeric-tolerances.md`.
 | **Pin** | `encoda(t, "transformers")` = **`[4549, 382]`**; `encoda(t, "สวัสดี")` = **`[34469, 168607]`**; `encoda(t, "人工智能")` = **`[109015]`**; `decoda` of each pinned id list reproduces the exact input text |
 | **Oracle** | llama-tokenize 10150 `dee2a846b` word-level rows on Qwen3.6-35B-A3B-UD-Q4_K_M.gguf (delivery `pml5-lib02-tokenizer-delivery.md`) |
 | **Why** | The word-level boundary proves the BPE core (display mapping, ranked merges, vocab lookup, decode) before the U3 pre-tokenizer composes to the full two-probe oracle |
-| **Errors** | Unknown/out-of-range ids → `IdIgnotum`; unmappable display characters → `VestigiumIgnotum`; invalid UTF-8 → `Utf8Mala`; malformed merge entries → `MergesMala`; non-byte-level manifest model → `ProgeniesIgnota` |
+| **Errors** | Unknown/out-of-range ids → `IdIgnotum`; unmappable display characters → `UnknownTrace`; invalid UTF-8 → `BadUtf8`; malformed merge entries → `BadMerges`; non-byte-level manifest model → `UnknownMergeKind` |
 | **No hard-coded tables** | The runtime consumes vocab/merges from the manifest; the proba fixture corpus models the pinned rows structurally (pinned tokens at pinned ids + the real merge sequences), committing no artifact bytes |
 | **Live** | `src/tokenizer.proba` — `"LIB-02-U2 artifact-backed byte-level BPE core"` probandum |
 
@@ -203,7 +203,7 @@ Tolerance policy detail: `docs/numeric-tolerances.md`.
 | --- | --- | --- |
 | Consecutive-pair (llama NORM) freq_base 100000, pos 1 & 2, dim 4 | `src/attention.proba` + `exempla/dense-rope` | **5e-4** absolute |
 | Interleaved-pair (qwen2) theta 1000000, pos 1 & 2, dim 4 | `src/attention.proba` + `exempla/dense-rope` | **5e-4** absolute |
-| Scale knob (scale 2.0) + beyond-dim untouched + fail-closed config | `src/attention.proba` + `exempla/dense-rope` | **5e-4** (config rows exact causa) |
+| Scale knob (scale 2.0) + beyond-dim untouched + fail-closed config | `src/attention.proba` + `exempla/dense-rope` | **5e-4** (config rows exact message) |
 
 Pin count: 22 executed PASS rows (`exempla/dense-rope`, 0 FAIL, exit 0) + the
 co-located compile-level proba pins.
@@ -214,7 +214,7 @@ co-located compile-level proba pins.
 | --- | --- | --- |
 | GQA config — n_h=14, n_kv=2, head_dim=4 (qwen2 head ratio 14:2 at a compact head_dim), positions [1, 2], rope_dim 4, interleaved-pair theta 1000000 | `src/attention.proba` + `exempla/dense-gqa` | **5e-4** absolute |
 | MHA config — n_kv = n_h = 14, positions [0, 0] (RoPE identity), consecutive-pair base 100000 | `src/attention.proba` + `exempla/dense-gqa` | **5e-4** absolute |
-| Typed error contract (head counts, packed widths, output projection, positions, rope dim, dtype) | `src/attention.proba` | exact causa identity |
+| Typed error contract (head counts, packed widths, output projection, positions, rope dim, dtype) | `src/attention.proba` | exact message identity |
 
 Pin count: 228 executed PASS rows (`exempla/dense-gqa` — 224 pinned output
 elements + shape/dtype rows, 0 FAIL, exit 0) + the co-located compile-level
@@ -227,7 +227,7 @@ numpy).
 | Pin family | Where | Band / rule |
 | --- | --- | --- |
 | Dense block output — synthetic config T=2, D=16, F=16 (MLP hidden), num_heads=4, num_kv_heads=2, head_dim=4, positions [0, 1], rope_dim 4, consecutive-pair (llama NORM) freq_base 100000, scale 1.0, RMSNorm ε=1e-5, dk scale 0.5 | `src/transformer.proba` + `exempla/dense-block` | **5e-4** absolute |
-| Typed error contract (dtype, rank, head counts, output projection width, RoPE position) | `src/transformer.proba` | exact causa identity |
+| Typed error contract (dtype, rank, head counts, output projection width, RoPE position) | `src/transformer.proba` | exact message identity |
 
 Pin count: 32 executed PASS rows (`exempla/dense-block` — the 32 pinned
 output elements + shape/dtype rows, 0 FAIL, exit 0) + the co-located
@@ -243,7 +243,7 @@ SwiGLU MLP → residual — via external Python/numpy (the PML3
 | --- | --- | --- |
 | Full-graph logits — tied embedding row (lm_head shares the embedding) — synthetic config T=2, D=16, F=16, num_heads=4, num_kv_heads=2, head_dim=4, vocab 8, tokens `[0, 7]`, positions `[0, 1]`, rope_dim 4, consecutive-pair (llama NORM) freq_base 100000, dk scale 0.5, RMSNorm ε=1e-5 | `src/model/dense.proba` + `exempla/dense-model` | **5e-4** absolute |
 | Full-graph logits — untied embedding row (lm_head is a separate canonical tensor) | `src/model/dense.proba` + `exempla/dense-model` | **5e-4** absolute |
-| Fail-closed typed-error contract (missing canonical tensor, token out of range, invalid config, shape contradiction, positions mismatch) | `src/model/dense.proba` + the executed rejection row in `exempla/dense-model` | exact causa identity |
+| Fail-closed typed-error contract (missing canonical tensor, token out of range, invalid config, shape contradiction, positions mismatch) | `src/model/dense.proba` + the executed rejection row in `exempla/dense-model` | exact message identity |
 
 Pin count: 37 executed PASS rows (`exempla/dense-model` — 16 tied logit
 pins + 16 untied logit pins + 2 shape/dtype rows + the fail-closed
@@ -312,8 +312,8 @@ rg -n '1,5' src/tokenizer.proba
 rg -n 'reset/replay determinism|prima_divergentia|first-token-divergence' \
   src/decode.proba
 
-# est_eog binding
-rg -n 'est_eog' src/tokenizer.proba src/tokenizer.fab
+# is_eog binding
+rg -n 'is_eog' src/tokenizer.proba src/tokenizer.fab
 
 # Fixture files present
 test -f fixtures/safetensors/smollm2-360m-scaled-row.safetensors
