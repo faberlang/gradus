@@ -281,22 +281,70 @@ fn _max_index(list<f32> xs) → int {
     return best
 }
 
-# The index of the largest value among positions not yet kept (the
-# incremental top-k / top-p selection; first-index ties).
+# Index a outranks b: strictly larger value, else smaller index (the
+# first-index tie used by greedy / top-k / top-p).
 @ private { }
-fn _max_index_pair(list<f32> xs, list<bool> keep) → int {
-    var int best ← 0
-    var bool init ← false
-    var f32 best_val ← 0.0
-    for range 0‥xs.length() const i {
-        if not (keep.get(i) coalesce false) {
-            const f32 v ← xs.get(i) coalesce 0.0 ∷ f32
-            if not init or v ≻ best_val {
-                best ← i
-                best_val ← v
-                init ← true
+fn _prefers(list<f32> xs, int a, int b) → bool {
+    const f32 va ← xs.get(a) coalesce 0.0 ∷ f32
+    const f32 vb ← xs.get(b) coalesce 0.0 ∷ f32
+    if va ≻ vb then return true
+    if vb ≻ va then return false
+    return a ≺ b
+}
+
+# Sift heap[i] down inside heap[0, size). The heap stores indices into xs.
+@ private { }
+fn _sift_down(mut list<int> heap, list<f32> xs, int i, int size) → void {
+    var int cur ← i
+    while true {
+        const int child ← 2 * cur + 1
+        if child ≥ size {
+            return
+        }
+        var int pick ← child
+        const int other ← child + 1
+        if other ≺ size {
+            if _prefers(xs, heap.get(other) coalesce 0, heap.get(pick) coalesce 0) {
+                pick ← other
             }
         }
+        if _prefers(xs, heap.get(pick) coalesce 0, heap.get(cur) coalesce 0) {
+            const int tmp ← heap.get(cur) coalesce 0
+            heap[cur] ← heap.get(pick) coalesce 0
+            heap[pick] ← tmp
+            cur ← pick
+        }
+        else {
+            return
+        }
+    }
+}
+
+# Max-heap of 0..n-1 over xs (first-index ties). Heapify is O(n).
+@ private { }
+fn _index_heap(list<f32> xs) → list<int> {
+    const int n ← xs.length()
+    var list<int> heap ← empty
+    for range 0‥n const j {
+        heap.append(j)
+    }
+    var int start ← n / 2
+    while start ≻ 0 {
+        start ← start - 1
+        _sift_down(heap, xs, start, n)
+    }
+    return heap
+}
+
+# Pop the current max index; restore a heap of the remaining size-1.
+# Caller must pass size > 0 and then decrement its own size.
+@ private { }
+fn _heap_pop(mut list<int> heap, list<f32> xs, int size) → int {
+    const int best ← heap.get(0) coalesce 0
+    const int last ← size - 1
+    if last ≻ 0 {
+        heap[0] ← heap.get(last) coalesce 0
+        _sift_down(heap, xs, 0, last)
     }
     return best
 }
@@ -320,21 +368,6 @@ fn _mask_false(int n) → list<bool> {
     return m
 }
 
-# The mask with position i replaced by v (pure rebuild).
-@ private { }
-fn _binary(list<bool> xs, int i, bool v) → list<bool> {
-    var list<bool> out ← empty
-    for range 0‥xs.length() const j {
-        if j ≡ i {
-            out.append(v)
-        }
-        else {
-            out.append(xs.get(j) coalesce false)
-        }
-    }
-    return out
-}
-
 # The list with position i replaced by v (pure rebuild).
 @ private { }
 fn _f32(list<f32> xs, int i, f32 v) → list<f32> {
@@ -352,24 +385,22 @@ fn _f32(list<f32> xs, int i, f32 v) → list<f32> {
 
 # Step 1 — repetition penalty over the history tokens (llama.cpp rule:
 # positive logits divide by penalty, non-positive multiply by penalty).
+# One vocab copy, then one in-place apply per history token (O(V + history);
+# a token listed twice is penalized twice, matching the nested-scan rule).
 @ private { }
 fn _repetition_penalty(list<f32> logits, list<int> history, f32 penalty) → list<f32> {
-    const int n ← logits.length()
     var list<f32> out ← empty
-    for range 0‥n const i {
-        const f32 v ← logits.get(i) coalesce 0.0 ∷ f32
-        var f32 w ← v
-        for from history const t {
-            if t ≡ i {
-                if w ≻ 0.0 {
-                    w ← w / penalty
-                }
-                else {
-                    w ← w * penalty
-                }
-            }
+    for from logits const v {
+        out.append(v)
+    }
+    for from history const t {
+        const f32 w ← out.get(t) coalesce 0.0 ∷ f32
+        if w ≻ 0.0 {
+            out[t] ← w / penalty
         }
-        out.append(w)
+        else {
+            out[t] ← w * penalty
+        }
     }
     return out
 }
@@ -385,15 +416,20 @@ fn _temperature_scale(list<f32> logits, f32 temperature) → list<f32> {
 }
 
 # Step 3 — top-k: keep the k largest logits (first-index ties, k <= 0 off).
+# Partial selection: heapify once, extract k (O(V + k log V)); no full sort.
 @ private { }
 fn _top_k(list<f32> xs, int k) → list<f32> {
     if k ≤ 0 then return xs
     const int n ← xs.length()
+    if k ≥ n then return xs
     var list<bool> keep ← _mask_false(n)
+    var list<int> heap ← _index_heap(xs)
+    var int size ← n
     var int count ← 0
-    while count ≺ k and count ≺ n {
-        const int best ← _max_index_pair(xs, keep)
-        keep ← _binary(keep, best, true)
+    while count ≺ k and size ≻ 0 {
+        const int best ← _heap_pop(heap, xs, size)
+        size ← size - 1
+        keep[best] ← true
         count ← count + 1
     }
     var list<f32> out ← empty
@@ -449,26 +485,35 @@ fn _renormalize_mask(list<f32> ps, list<bool> keep) → list<f32> {
     return out
 }
 
-# Step 5 — top-p (nucleus): the smallest descending-probability set whose
-# cumulative mass reaches p, renormalized (p <= 0 or p >= 1 off). When all
-# positive mass is kept and the cumulative is still below p, the kept set
-# stops growing (equivalent to keeping everything nonzero).
+# Step 5 — top-p (nucleus): heap-extract in descending-probability
+# first-index order until cumulative mass reaches p, then one renormalize
+# pass (p <= 0 or p >= 1 off). Stops on a non-positive remainder (keeps
+# every nonzero when the cumulative still sits below p). Avoids a full
+# sort: heapify once, extract only the nucleus (O(V + k log V)).
 @ private { }
 fn _top_p(list<f32> ps, f32 p) → list<f32> {
     if p ≤ 0.0 or p ≥ 1.0 then return ps
     const int n ← ps.length()
     var list<bool> keep ← _mask_false(n)
+    var list<int> heap ← _index_heap(ps)
+    var int size ← n
     var f32 cum ← 0.0
     var bool progress ← true
     while cum ≺ p and progress {
-        const int best ← _max_index_pair(ps, keep)
-        const f32 v ← ps.get(best) coalesce 0.0 ∷ f32
-        if v ≻ 0.0 {
-            keep ← _binary(keep, best, true)
-            cum ← cum + v
+        if size ≤ 0 {
+            progress ← false
         }
         else {
-            progress ← false
+            const int best ← _heap_pop(heap, ps, size)
+            size ← size - 1
+            const f32 v ← ps.get(best) coalesce 0.0 ∷ f32
+            if v ≻ 0.0 {
+                keep[best] ← true
+                cum ← cum + v
+            }
+            else {
+                progress ← false
+            }
         }
     }
     return _renormalize_mask(ps, keep)
