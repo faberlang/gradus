@@ -98,7 +98,7 @@ locale = "en"
 import from "gradus:loss" loss
 
 main {
-    const tensor<f32, []> seed ← vacua
+    const tensor<f32, []> seed ← empty
     const list<int> shape_2x2 ← [2, 2]
     const tensor<f32, [2, 2]> prediction ← seed.from_flat([1.0, 2.0, 3.0, 4.0], shape_2x2)
     const tensor<f32, [2, 2]> target ← seed.from_flat([1.0, 2.0, 3.0, 3.0], shape_2x2)
