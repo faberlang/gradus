@@ -36,11 +36,11 @@ plus one faber docs unit, under five standing constraints from the task:
 - Precedent method for safe mechanical conversion: the no-latin campaign
   (re-opened 2026-08-20) — exact identifier-boundary replacements,
   first-file compile confirmation, per-wave lane-gate closes
-  (`docs/factory/no-latin/GOAL.md`).
-- Name map for prose sweeps: `docs/factory/no-latin/rename-ledger.md`.
+  (`docs/archived/no-latin/GOAL.md`).
+- Name map for prose sweeps: `docs/archived/no-latin/rename-ledger.md`.
 - Enforcement: `scripta/check-source` U8 guard (lexicon-based; currently misses
   `staticum`/`addita`/`conversio`; its ledger-path comment resolves to the
-  re-opened `docs/factory/no-latin/rename-ledger.md` — no GLQ-10 path fix).
+  re-opened `docs/archived/no-latin/rename-ledger.md` — no GLQ-10 path fix).
 - Borrowed shapes: `../norma/README.md` (install section),
   `../triga/README.md` (Start-here quickstart).
 - Idle lane note: `worktrees/hand-13` sits on `main` at `f70f02f` with no WIP —
@@ -241,7 +241,7 @@ validation). Lane gates are named once in §6 and are **not** child checks.
   `conversio` Latin in live header comments; add `staticum`, `addita`,
   `conversio` to the U8 lexicon in `scripta/check-source`. The guard's
   ledger-path comment is already correct — it resolves to the re-opened
-  `docs/factory/no-latin/rename-ledger.md` — so no path fix is needed
+  `docs/archived/no-latin/rename-ledger.md` — so no path fix is needed
   (the earlier factory→archived fix is inverted; no-latin re-opened).
 - **write_scope**: `src/attention.fab` (+`.proba`), header comments in
   `src/train.fab`, `src/transformer.fab`, `src/gradus.fab`, `src/shape.fab`,
@@ -286,7 +286,7 @@ validation). Lane gates are named once in §6 and are **not** child checks.
   (token-generation, dense-model, gguf-materialize, gguf-inspect,
   dense-prefill-qwen2, dense-prefill-smollm2, training-loop-mlp,
   qwen36-35b-inference, gguf-admit-qwen35moe, dense-swiglu, dense-qwen2-adapter,
-  dense-block), mapping via `docs/factory/no-latin/rename-ledger.md`.
+  dense-block), mapping via `docs/archived/no-latin/rename-ledger.md`.
 - **write_scope**: `exempla/*/README.md` **only** — no `.fab` write paths.
   Exempla `main.fab` identifier renames (e.g. gguf-manifest `_numerum_observa`;
   gguf-materialize `_vinculum`/`VinculumMala`/`SlicemMala`; training-loop-mlp

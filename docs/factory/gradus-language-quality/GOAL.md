@@ -140,7 +140,7 @@ Planner verification at gradus `main` `f70f02f`, 2026-08-20:
   `src/tokenizer.fab` 38, `src/model/gguf_manifest.fab` 21 (audit scale).
 - `scripta/check-source` U8 guard read in full: live lexicon-based word-token
   check; `staticum`/`addita`/`conversio` not in `LATIN_WORDS`; the guard
-  comment cites `docs/factory/no-latin/rename-ledger.md`, the ledger's current
+  comment cites `docs/archived/no-latin/rename-ledger.md`, the ledger's current
   location since no-latin re-opened (`f70f02f` archived it, `e2385b2` moved it
   back) — the comment path resolves, so GLQ-10 no longer fixes it.
 - `../faber/docs/EBNF.md` exists (1198 lines); `:610-613` requirit/adfirma
@@ -158,7 +158,7 @@ Before editing, inspect:
   (write scopes, done-when, deps, dispatch waves).
 - Vivi mails `57cb4713` / `7d54686c`: per-file:line evidence for every class
   and batch (`vivi mail show <id> --project /Users/ianzepp/work/faberlang`).
-- `docs/factory/no-latin/rename-ledger.md`: old→new name map for the exempla
+- `docs/archived/no-latin/rename-ledger.md`: old→new name map for the exempla
   sweep and the retained-exception list the U8 guard loads.
 - `../faber/docs/EBNF.md`: canonical forms — `:610-613` (requirit/adfirma),
   `:637-641` (glyph products), `:795-801` (§ templates), `:866-869` (byte
