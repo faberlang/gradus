@@ -212,7 +212,8 @@ validation). Lane gates are named once in §6 and are **not** child checks.
   has a one-line reason in the receipt.
 - **depends_on**: GLQ-03, GLQ-04, GLQ-07 (same-file churn settles first).
 - **sanity**: two converted loops read for off-by-one boundaries
-  (`‥` inclusive semantics); `"$FABER_BIN" check "$PWD/src/cache.fab"`
+  (`‥` is EXCLUSIVE per RangeKind; `…`/`usque` are inclusive — corrected
+  2026-08-20 from compiler truth); `"$FABER_BIN" check "$PWD/src/cache.fab"`
   (absolute path) green on a converted file.
 - **non_goals**: `↑`/`↓` inc/dec introduction (zero usage today; not required);
   algorithm changes.
