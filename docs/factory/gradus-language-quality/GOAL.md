@@ -320,7 +320,7 @@ Decision: included.
 | GLQ-05 | requirit wave 3 (383 + 28 double-not → 0; Δ0 vs audit B5) | GLQ-01 | done | 9dfb6d5 → 1195feb |
 | GLQ-06 | Binding holes (~110 + mirrors) | GLQ-09 + external radix settle | pending | — |
 | GLQ-07 | `§` string templates (140 src + 113 proba; tokenizer joins byte-identical) | GLQ-03, GLQ-04, GLQ-05 | done | db178f3 → 36839a7 |
-| GLQ-08 | for-range conversion (~75 loops) | GLQ-03, GLQ-04, GLQ-07 | pending | — |
+| GLQ-08 | for-range conversion (131 conversions + 5 reasoned skips; ‥ is EXCLUSIVE per compiler — delivery spec line corrected) | GLQ-03, GLQ-04, GLQ-07 | done | a9621b2 → af2c0fa |
 | GLQ-09 | train.fab structural dedup (18 blocks → one _sgd_family loop; proba byte-identical) | GLQ-02, GLQ-05 | done | ebb36b1 → ac87da9 |
 | GLQ-10 | Latin residue + U8 guard hold | no-latin re-close (guard-hold sequencing) | done | 8c32b73 → 6214045 |
 | GLQ-11 | README public rewrite | — | done | 0991e21 → 4be7895 |
