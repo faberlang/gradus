@@ -316,8 +316,8 @@ Decision: included.
 | GLQ-01 | Glyph conversion, fragment files (23/27 sites; 4 `.subtract` gated on radix tensor-minus need 9facfd36) | GLQ-10 | active (partial) | b9b23e3 → 623f1a3 |
 | GLQ-02 | Glyph conversion, train.fab (48 sites) | GLQ-05 | pending | — |
 | GLQ-03 | requirit wave 1 (241 sites) | — | done | 62d6742 → 185bcd0 |
-| GLQ-04 | requirit wave 2 (263 sites) | GLQ-01 | pending | — |
-| GLQ-05 | requirit wave 3 (14 files / 334 sites + 9 uncovered files = 23 files / 383 sites; 28 double-not) | GLQ-01 | pending | — |
+| GLQ-04 | requirit wave 2 (263 sites, Δ0 vs audit) | GLQ-01 | done | 10c19ca → 194f4d7 |
+| GLQ-05 | requirit wave 3 (383 + 28 double-not → 0; Δ0 vs audit B5) | GLQ-01 | done | 9dfb6d5 → 1195feb |
 | GLQ-06 | Binding holes (~110 + mirrors) | GLQ-09 + external radix settle | pending | — |
 | GLQ-07 | `§` string templates (140 + mirrors) | GLQ-03, GLQ-04, GLQ-05 | pending | — |
 | GLQ-08 | for-range conversion (~75 loops) | GLQ-03, GLQ-04, GLQ-07 | pending | — |
