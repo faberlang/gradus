@@ -83,6 +83,7 @@ Undocumented public symbols fail the inventory coverage gate.
 | 1.8 | Regression corpus inventory | `docs/regression-corpus.md` | inventories admitted-row fixtures + proba pins |
 | 1.9 | README status tables | `README.md` | no shipped surface labeled planned/scaffold (or vice versa) |
 | 1.10 | Exempla READMEs | `exempla/*/README.md` | documented outputs match pinned oracles; structural/executed tier stated honestly |
+| 1.11 | LICENSE | `LICENSE` (MIT) | file present; README license heading present |
 
 **Batch structural validation** (always green at unit/closeout boundaries):
 
