@@ -1,10 +1,10 @@
 # dense-model — dense model assembly executed proof (REF-01-U1.8)
 
 This package is the executed proof for the REF-01-U1.8 dense model
-assembly in `gradus:model/dense` (`praevideo`): the complete ordered dense
+assembly in `gradus:model/dense` (`forward`): the complete ordered dense
 forward graph — embedding gather → 2 ordered U1.5 dense blocks → final
 RMSNorm → output projection — assembled from the typed architecture config
-(`ConfiguraDensa`) and materialized stored-weight views via canonical
+(`DenseConfig`) and materialized stored-weight views via canonical
 tensor names, for a small synthetic dense config with **TIED** and
 **UNTIED** embedding rows. It runs through package MIR
 (`faber run --target fmir exempla/dense-model`) and prints PASS for every
@@ -12,7 +12,7 @@ pinned value (0 FAIL, exit 0).
 
 ## What is proved
 
-`praevideo` composes the already-proven rows over the staged f32 carrier:
+`forward` composes the already-proven rows over the staged f32 carrier:
 
 1. **embedding gather** — the resolver returns the stored `[D, V]` view
    (the GGUF/A1b descriptor layout); the assembly transposes it and gathers
@@ -116,14 +116,14 @@ reject-missing: PASS
 
 The fail-closed row (`reject-missing`) proves the resolver-failure path:
 a canonical tensor that cannot be materialized fails closed with the typed
-`TensorAbsens` diagnostic. Structural gates (`./scripta/check-source`,
+`MissingTensor` diagnostic. Structural gates (`./scripta/check-source`,
 `./scripta/check-compile`) are green on the unit's changed-path list; the
 full-graph pins live at compile level in `src/model/dense.proba` (proba
 bodies remain provider-blocked — the executed proof is this package).
 
 ## Related
 
-- Rows: `src/model/dense.fab` (`praevideo`, `ConfiguraDensa`, `Repertum`,
+- Rows: `src/model/dense.fab` (`forward`, `DenseConfig`, resolver,
   `DenseError`) + pins in `src/model/dense.proba`
 - Composed rows: `gradus:transformer` `dense_block` (REF-01-U1.5),
   `gradus:nn` `rmsnorm`/`linear` (REF-01-U1.1 / the PML3 surface),

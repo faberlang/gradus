@@ -3,7 +3,7 @@
 This package is the application-owned file adapter for
 `gradus:model/qwen35moe`. It resolves one local path, reads the independently
 bounded header/table prefix once (the first `expected_data` bytes), calls the
-public admission entry (`qwen35moe.admitto`), and prints the ADMIT receipt: the
+public admission entry (`qwen35moe.admit`), and prints the ADMIT receipt: the
 frozen configuration + the 753-tensor receipt (block schedule + storage
 distribution). Gradus receives and retains no path, file handle, mapping,
 callback, or whole-model payload.
@@ -17,8 +17,8 @@ The second CLI operand is the data offset from the independent GGUF reader
 (10,991,392 for the pinned artifact). The adapter calls
 `solum.partem(path, 0, oracle_offset)` once and rejects a short prefix; the
 corpus it hands Gradus is exactly those bytes, so `gguf_manifest.parse` sees
-`corpus_longitudo == data_start` and its "bounded GGUF corpus contains
-bytes from the data region" rejection (`Superfluitas`) cannot trigger. The
+`corpus_length == data_start` and its "bounded GGUF corpus contains
+bytes from the data region" rejection (`Surplus`) cannot trigger. The
 adapter never requests a byte at or beyond the data offset, so a passing run
 proves that no tensor-payload byte was read. The CLI also feeds the operator-
 measured SHA-256 digest and byte length into the identity precondition, which
@@ -130,11 +130,11 @@ committed `0c28ca3`) — not by the adapter. The FMIR consumer analysis of
 `gradus:model/qwen35moe` fails closed before the exemplar's own code runs:
 
 - `faber check exempla/gguf-admit-qwen35moe` → `SEM004.unknown_struct_field`
-  at `corpus.identity.algorithmus` in `admitto`: the module reads fields of
-  `artifact.IdentitasContenuti` without importing `gradus:model/artifact`
+  at `corpus.identity.algorithm` in `admit`: the module reads fields of
+  `artifact.ContentIdentity` without importing `gradus:model/artifact`
   directly (only transitively through `gguf_manifest`).
 - With that import added temporarily, the FMIR run then fails at the package
-  MIR merge: `identity-bearing enum ErrorAdmissionisQwen35moe variant
+  MIR merge: `identity-bearing enum Qwen35moeAdmissionError variant
   DivergentReference is not resolvable in the consumer analysis`. The public
   error enum nests sibling public enums as variant payloads; the consumer
   import installs nominal shells in BTreeMap (alphabetical) order and imports
