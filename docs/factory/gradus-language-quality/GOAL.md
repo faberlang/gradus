@@ -313,7 +313,7 @@ Decision: included.
 
 | Unit | Outcome | Depends on | Status | Receipt |
 | --- | --- | --- | --- | --- |
-| GLQ-01 | Glyph conversion, fragment files (27 sites) | GLQ-10 | pending | — |
+| GLQ-01 | Glyph conversion, fragment files (23/27 sites; 4 `.subtract` gated on radix tensor-minus need 9facfd36) | GLQ-10 | active (partial) | b9b23e3 → 623f1a3 |
 | GLQ-02 | Glyph conversion, train.fab (48 sites) | GLQ-05 | pending | — |
 | GLQ-03 | requirit wave 1 (241 sites) | — | done | 62d6742 → 185bcd0 |
 | GLQ-04 | requirit wave 2 (263 sites) | GLQ-01 | pending | — |
@@ -329,6 +329,6 @@ Decision: included.
 | GLQ-14 | Quickstart / examples tour / architecture | GLQ-11, GLQ-12 | pending | — |
 | GLQ-15 | Residual docs Latin + cosmetics | GLQ-10 | pending | — |
 | GLQ-16 | Packaging hygiene | — | done | b56d34a → ca3a8a4 |
-| GLQ-17 | EBNF staleness ×3 (faber repo) | — | pending | — |
+| GLQ-17 | EBNF staleness ×3 (faber repo) | — | done | 5c191c4 → b38438d (residual: 3 private-only docs/design refs, thread 1338cb30) |
 
 Unit detail (write scopes, done-when, risk): `delivery.md` beside this file.
