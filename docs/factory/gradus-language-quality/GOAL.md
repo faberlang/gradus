@@ -318,7 +318,7 @@ Decision: included.
 | GLQ-03 | requirit wave 1 (241 sites) | — | done | 62d6742 → 185bcd0 |
 | GLQ-04 | requirit wave 2 (263 sites, Δ0 vs audit) | GLQ-01 | done | 10c19ca → 194f4d7 |
 | GLQ-05 | requirit wave 3 (383 + 28 double-not → 0; Δ0 vs audit B5) | GLQ-01 | done | 9dfb6d5 → 1195feb |
-| GLQ-06 | Binding holes (~110 + mirrors) | GLQ-09 + external radix settle | pending | — |
+| GLQ-06 | Binding holes (100 converted; 12 ←empty annotations + 7 proba seeds kept) | GLQ-09 + external radix settle | done | 86de1d0 → c82b8af |
 | GLQ-07 | `§` string templates (140 src + 113 proba; tokenizer joins byte-identical) | GLQ-03, GLQ-04, GLQ-05 | done | db178f3 → 36839a7 |
 | GLQ-08 | for-range conversion (131 conversions + 5 reasoned skips; ‥ is EXCLUSIVE per compiler — delivery spec line corrected) | GLQ-03, GLQ-04, GLQ-07 | done | a9621b2 → af2c0fa |
 | GLQ-09 | train.fab structural dedup (18 blocks → one _sgd_family loop; proba byte-identical) | GLQ-02, GLQ-05 | done | ebb36b1 → ac87da9 |
