@@ -5,7 +5,7 @@
 
 This document pins the LEGAL fixture + oracle for the one admitted
 Safetensors row. The module `gradus:model/safetensors` admits EXACTLY this
-row into the schema-2 `capsule.Capsula` (capsule-schema-2.0.0, A1C-M1): a
+row into the schema-2 `capsule.Capsule` (capsule-schema-2.0.0, A1C-M1): a
 pathless content identity plus the per-format Safetensors manifest, per
 the GGUF-A1c clean break.
 
@@ -60,7 +60,7 @@ exactly (no gaps, no overlaps). Every byte length is a multiple of 8.
 The conformance suite and `safetensors.proba` embed the same byte
 sequence (reconstructed from the same JSON string + pattern) and verify
 the schema-2 capsule's digest against this oracle via
-`verifica_contra` (capsule-schema-2.0.0). The digest VALUE is
+`verify_against` (capsule-schema-2.0.0). The digest VALUE is
 host-computed per the capsule boundary (capsule.fab header); the language
 surface has no digest primitive.
 
