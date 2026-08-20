@@ -744,7 +744,7 @@ Bounded GGUF v3 parsing, range inspection, typed metadata, and tensor descriptor
 
 ### Public types
 
-- `union GgufManifestError` — BadFormat, UnknownVersion, Truncated, BadWire, BadBounds, Surplus, DuplicateKey, DuplicateTensor, BadOffset, UnknownLayout, BadIdentity, BadSource
+- `union GgufManifestError` — BadFormat, UnknownVersion, Truncated, BadWire, BadBounds, Surplus, DuplicateKey, DuplicateTensor, BadOffset, UnknownLayout, BadIdentity, BadSource, NotFound
 - `union GgmlLayout` — Known, Unknown
 - `class GgufCorpus`
   - fields: bytes table, int artifact_length, artifact.ContentIdentity identity
