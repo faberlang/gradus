@@ -45,7 +45,7 @@ consumer is **Cargo `release`**:
    product change.
 
 Prefill rustc hit **E0382** in the G3 tokenizer table emit
-(`per_id.insert(id, token); vocabulum.insert(token, id);`). One-line
+(`per_id.insert(id, token); vocab.insert(token, id);`). One-line
 `token.clone()` in the **generated** crate only (not Gradus source).
 That path runs during tokenizer build, before `forward start`. Decode
 compiled clean (no tokenizer import).

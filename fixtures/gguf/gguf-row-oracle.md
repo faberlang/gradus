@@ -5,7 +5,7 @@
 
 This document pins the LEGAL fixture + oracle for the one admitted GGUF
 row. The module `gradus:model/gguf` admits EXACTLY this row into the
-schema-2 `capsula.Capsula` (capsule-schema-2.0.0, A1C-M1): a pathless
+schema-2 `capsule.Capsula` (capsule-schema-2.0.0, A1C-M1): a pathless
 content identity plus the per-format GGUF manifest, per the GGUF-A1c
 clean break.
 
@@ -73,7 +73,7 @@ in code (the `aedifica` builder) and admit it into the schema-2 capsule,
 whose pathless content identity carries the digest; the digest VALUE is
 host-computed per the capsule boundary (capsule.fab header — the language
 surface has no digest primitive) and re-verifiable via
-`capsula.verifica_contra` (capsule-schema-2.0.0).
+`capsule.verifica_contra` (capsule-schema-2.0.0).
 
 ## Row ceilings (admit-time caller limits)
 
@@ -98,26 +98,26 @@ identity; and each negative fails closed with the module's typed error
 before any allocation sized by a parsed count, across the full dimension
 set:
 
-- **format**: bad magic (FormatMala), truncated header (WireMala).
-- **version**: unsupported GGUF version (VersioIgnota), u64 field above
-  the integer carrier (WireMala).
+- **format**: bad magic (BadFormat), truncated header (BadWire).
+- **version**: unsupported GGUF version (UnknownVersion), u64 field above
+  the integer carrier (BadWire).
 - **counts/bounds**: kv-count and tensor-count mismatch, expected ceilings
-  outside the admitted range, per-type counts not summing (LimitesMala).
+  outside the admitted range, per-type counts not summing (BadBounds).
 - **metadata**: unknown key, duplicate key, missing required key, wrong
-  value type, key > 128 B, string > 4096 B (WireMala / ArchitecturaMala /
-  QuantizatioIgnota / TokenizerMala / LimitesMala).
+  value type, key > 128 B, string > 4096 B (BadWire / BadArchitecture /
+  UnknownQuantization / BadTokenizer / BadBounds).
 - **architecture**: arch id, layer count, context, vocab, embedding
-  mismatches (ArchitecturaMala).
+  mismatches (BadArchitecture).
 - **dtype/quantization**: file-type mismatch, quantization-version
   mismatch, unknown ggml type, non-block-multiple elements, byte size not
-  a 32-multiple, per-type count mismatch (QuantizatioIgnota).
+  a 32-multiple, per-type count mismatch (UnknownQuantization).
 - **offsets/coverage**: non-contiguous / overlapping / duplicate tensor
-  offsets, truncated data region, trailing bytes (OffsetMala).
+  offsets, truncated data region, trailing bytes (BadOffset).
 - **shapes**: unsupported rank, invalid/zero/oversized dims, total element
-  mismatch (FormaMala).
+  mismatch (BadShape).
 - **tokenizer**: model, pre-tokenizer, bos/eos/pad/unk ids, add_bos,
-  add_space_prefix mismatches (TokenizerMala).
-- **tensor names**: empty, duplicate, > 128 B (WireMala).
+  add_space_prefix mismatches (BadTokenizer).
+- **tensor names**: empty, duplicate, > 128 B (BadWire).
 
 ## Regeneration
 

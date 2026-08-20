@@ -53,7 +53,7 @@ the FMIR image).
 
 The SwiGLU workload uses the **same-shape bias** contract (b [2,3]) because
 the per-channel-bias path (`linear` bias [N] against [M,N] via
-`math.add`) requires singleton broadcast, and the current `forma.broadcastum`
+`math.add`) requires singleton broadcast, and the current `shape.broadcast`
 implementation rejects the singleton-with-non-singleton pair at runtime
 (`shapes not broadcastable` — latent defect, outside this unit's write
 scope; proba-pinned right-aligned broadcast rows in `src/shape.proba`

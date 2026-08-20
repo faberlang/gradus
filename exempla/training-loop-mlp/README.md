@@ -14,11 +14,11 @@ CPU/FMIR oracle).
 
 | Step | Surface |
 | --- | --- |
-| Schedule → optimizer-state binding | `train.lentus_schedulata` (U4) feeds `optimize.structa`'s `lentus` (U3) each step — the accepted constant lr 0.1 is the schedule `Schedula(0.1, 0, 1, 0.1)` (vertex == finis) |
+| Schedule → optimizer-state binding | `train.lentus_schedulata` (U4) feeds `optimize.structa`'s `rate` (U3) each step — the accepted constant lr 0.1 is the schedule `Schedula(0.1, 0, 1, 0.1)` (vertex == end) |
 | Shared-layer training path | `gradus.forward_mlp_loss` (loss) + the compiler-generated companion `forward_mlp_loss_backward` (gradients) |
-| Per-parameter gradients | `gradient.structa` records (U2): identity + generation = the parameter versio at the backward |
-| Optimizer steps | `optimize.passus` (U3): fresh-gradient rules, fail-closed; `parameter.muta` bumps versio |
-| Per-step metric log | `metricae.metricum` (U5): `damnum` = the loss (the accepted trajectory); `accuratezza` = the documented regression-match rate (`|pred − target| ≤ 0.1` over the 16 output elements, read from the bare shared forward `gradus.forward_mlp`) |
+| Per-parameter gradients | `gradient.structa` records (U2): identity + generation = the parameter version at the backward |
+| Optimizer steps | `optimize.step` (U3): fresh-gradient rules, fail-closed; `parameter.muta` bumps version |
+| Per-step metric log | `metrics.metricum` (U5): `damnum` = the loss (the accepted trajectory); `accuratezza` = the documented regression-match rate (`|pred − target| ≤ 0.1` over the 16 output elements, read from the bare shared forward `gradus.forward_mlp`) |
 | Checkpoint in/out | `train.structa_tabula` (U5): whole-optimizer state wire (U3 `serializa`) + RNG state + epoch/step; `serializa_tabula` → `deserializa_tabula` is the resume round-trip (`tabula_aequus`) |
 
 ## Convergence target (accepted oracle, f64 evaluations)

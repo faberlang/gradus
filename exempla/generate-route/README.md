@@ -2,7 +2,7 @@
 
 Compiled consumer of `gradus:generation.generate(config, ids, decoder)`.
 
-The loop lives in the library: prefill → sampling → `decodere_datum`
+The loop lives in the library: prefill → sampling → `decode_data`
 feed-back, with EOG-stop `{0, 2}` and the reject-not-truncate cursor.
 The decoder is an argument (M03: admitted model = generated model).
 The KV-wired SmolLM2 path is `generate_dense` (`exempla/generate-smollm2`).

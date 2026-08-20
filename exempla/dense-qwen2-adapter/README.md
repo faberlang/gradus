@@ -5,7 +5,7 @@ architecture adapter. Its source builds bounded synthetic GGUF v3 corpora in
 memory carrying the canonical tensor table of the pinned Qwen2.5-0.5B row
 (the GGUF-A1b inspect-surface facts: layer 0 full + layer 23 boundary, tied
 and untied variants), parses them through `gradus:model/gguf_manifest`, runs
-the adapter (`configura` + `resolve` + `descriptio_render`), and prints a
+the adapter (`config` + `resolve` + `descriptio_render`), and prints a
 PASS/FAIL line for every canonical resolution plus the fail-closed rejection
 rows. It performs no filesystem read, download, mmap, or model-payload
 allocation.
