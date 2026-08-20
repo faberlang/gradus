@@ -66,7 +66,7 @@ Live co-located suites (32 files):
 | `src/model/gguf.proba` | GGUF row | Builder + digest + row facts |
 | `src/model/dequant.proba` | CPU dequant — union set | Block layout pins + fail-closed gates for the union set {F32, F16, BF16, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K}; F16 f64-oracle pins (1.0 / 65504.0); NaN half/bf16 rejects |
 | `src/model/tensor_payload.proba` | `gradus:model/tensor_payload` (GGUF-A3 C2-U2) | TensorPayload carries the exact stored range facts (name, absolute start, length) + bounded byte list; PayloadError → message render path type-checks |
-| `src/model/tensor_view.proba` | `gradus:model/tensor_view` (GGUF-A3 C2-U3/U4/U5) | `vincula` fail-closed bind (UnknownName / BadRange / BadLength / UnknownLayout / UnknownDtype); windowed `materializa_slicem` + single-block `materializa_glomulum` fail-closed rows |
+| `src/model/tensor_view.proba` | `gradus:model/tensor_view` (GGUF-A3 C2-U3/U4/U5) | `links` fail-closed bind (UnknownName / BadRange / BadLength / UnknownLayout / UnknownDtype); windowed `materialize_slice` + single-block `materialize_block` fail-closed rows |
 | `src/model/artifact.proba` | pathless content identity | Algorithm, digest, and positive-length validation |
 | `src/model/dense_llama.proba` | `gradus:model/dense_llama` (REF-01-U1.6) | Frozen SmolLM2-360M config facts; every canonical name resolves to the exact descriptor facts the A1b inspect surface reports for the real SmolLM2 file (name, shape, layout); fail-closed typed rejection rows (unknown canonical, out-of-range layer, missing tensor, unknown layout) |
 | `src/model/gguf_manifest.proba` | GGUF-A1b manifest and range seam | Unknown codec inspection, exact ranges, source failure, checked tensor fragments, and LIB-02-U1 tokenizer array pins (248320 tokens / 247587 merges / special ids) |
@@ -135,11 +135,11 @@ PML6-U4 / the correctness wave. Loss of any pin is a corpus defect.
 
 | Field | Value |
 | --- | --- |
-| **Pin** | A **schema-1** stamp fails closed at the capsule boundary — the constructor (`structa_manifestum`), `verifica`, and the identity wire form all reject it |
+| **Pin** | A **schema-1** stamp fails closed at the capsule boundary — the constructor (`construct_manifest`), `verify`, and the identity wire form all reject it |
 | **Stamp** | `"1.0.0"` (`F_SCHEMA` is `"2.0.0"`; schema 1 is retired, A1C-M1) |
 | **Message class** | `schema 1 is retired — capsule schema is 2.0.0` (`AdmissionError.SchemaVetus`) |
 | **Why** | Schema 1 is retired at the schema-2 boundary; a schema-1 call site also fails to compile (the schema-2 constructor has no schema-1 signature) |
-| **Live** | `src/model/capsule.proba` — the `"capsule schema-1 rejection"` probandum (`structa_manifestum rejects a schema-1 stamp`, `verifica rejects a schema-1-stamped capsule`, `deserialization rejects a schema-1-stamped wire`) |
+| **Live** | `src/model/capsule.proba` — the `"capsule schema-1 rejection"` probandum (`construct_manifest rejects a schema-1 stamp`, `verify rejects a schema-1-stamped capsule`, `deserialization rejects a schema-1-stamped wire`) |
 | **Sibling** | `src/tokenizer.proba` rejects `"1,5"` / non-sorted / empty EOG; `is_eog` admits only `{0,2}` — EOG identity lives in `gradus:tokenizer`, not the schema-2 capsule |
 
 ### 4.4 Reset / replay determinism

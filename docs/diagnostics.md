@@ -278,7 +278,7 @@ every entry point rejects a schema-1 stamp with the typed `SchemaVetus`.
 | Code | Class / when | Live messages (representative) | Resolution |
 | --- | --- | --- | --- |
 | `AdmissionError.UnknownVersion` | Unknown capsule schema version (reject, no partial reads). | `unknown capsule schema version: …` | Re-emit with the current schema stamp; never guess an unknown version. |
-| `AdmissionError.SchemaVetus` | Retired schema-1 stamp at the schema-2 boundary (constructor, `verifica`, or wire form). | `schema 1 is retired — capsule schema is 2.0.0` | Re-admit with a `capsule-schema-2.0.0` capsule / identity wire. |
+| `AdmissionError.SchemaVetus` | Retired schema-1 stamp at the schema-2 boundary (constructor, `verify`, or wire form). | `schema 1 is retired — capsule schema is 2.0.0` | Re-admit with a `capsule-schema-2.0.0` capsule / identity wire. |
 | `AdmissionError.UnknownAlgorithm` | Un-admitted digest algorithm. | `unknown digest algorithm: …` | Supply the admitted lower-case `sha-256` algorithm. |
 | `AdmissionError.BadDigest` | Malformed digest value (format / length / charset) or a digest mismatch on verification. | `digest mismatch — capsule does not match the expected artifact`<br>`malformed digest value` | Supply the canonical 64-digit lower-case hexadecimal digest that matches the artifact. |
 | `AdmissionError.BadManifest` | Malformed per-format manifest: empty or non-matching format/version, artifact-length mismatch, invalid byte length, malformed tensor descriptor, or a manifest inconsistent with the carried identity. | `manifest is inconsistent with the artifact identity`<br>`invalid artifact byte length`<br>`capsule failed verification`<br>`metadata index out of bounds`<br>`tensor descriptor index out of bounds` | Supply a per-format manifest whose format/version, lengths, and tensor descriptors are consistent with the artifact identity. |
@@ -311,7 +311,7 @@ bf16) and **Q5_K** (`GGML_Q5_K`, id 13; 256 elements/block, 176
 bytes/block — `dequantize_row_q5_K`). W1-U3 adds **F16** (`GGML_F16`, id
 1; 1 element/block, 2 bytes/block — IEEE binary16→f32 via `_half`, same
 NativeF16Convert pattern as BF16). The layout constants are cross-checked against
-`LayoutGgml.Known` at the `tensor_view.vincula` view-binding boundary —
+`LayoutGgml.Known` at the `tensor_view.links` view-binding boundary —
 the manifest is the single layout authority, dequant validates admission
 and never re-derives layout.
 
@@ -341,9 +341,9 @@ bounded bytes. It carries no path, reader, handle, or whole-model byte list.
 Source: `src/model/tensor_view.fab`. Render with module `message(e)`.
 
 The typed view + bind + windowed materializers (GGUF-A3 C2-U3/C2-U4).
-`vincula` binds one descriptor + one validated payload; the manifest is the
+`links` binds one descriptor + one validated payload; the manifest is the
 single layout authority (dequant only cross-checks admission via
-`elementa_glomoris`). `materializa_slicem`/`materializa_glomulum`
+`elementa_glomoris`). `materialize_slice`/`materialize_block`
 dequantize bounded windows one block per source read; no whole-tensor or
 whole-model read path exists.
 
