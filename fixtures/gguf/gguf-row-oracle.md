@@ -5,7 +5,7 @@
 
 This document pins the LEGAL fixture + oracle for the one admitted GGUF
 row. The module `gradus:model/gguf` admits EXACTLY this row into the
-schema-2 `capsule.Capsula` (capsule-schema-2.0.0, A1C-M1): a pathless
+schema-2 `capsule.Capsule` (capsule-schema-2.0.0, A1C-M1): a pathless
 content identity plus the per-format GGUF manifest, per the GGUF-A1c
 clean break.
 
@@ -73,7 +73,7 @@ in code (the `aedifica` builder) and admit it into the schema-2 capsule,
 whose pathless content identity carries the digest; the digest VALUE is
 host-computed per the capsule boundary (capsule.fab header — the language
 surface has no digest primitive) and re-verifiable via
-`capsule.verifica_contra` (capsule-schema-2.0.0).
+`capsule.verify_against` (capsule-schema-2.0.0).
 
 ## Row ceilings (admit-time caller limits)
 

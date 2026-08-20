@@ -1,6 +1,6 @@
 # Gradus Compatibility Policy
 
-**Version**: `compatibility-policy v1.2.0` (2026-08-20, no-latin remaining-identifier clean break)
+**Version**: `compatibility-policy v1.2.1` (2026-08-20, no-latin remaining-identifier clean break; wire-hold truth)
 **Repo**: gradus. **Applies to**: the gradus library surface (version 0.1.0,
 pre-1.0) and every admitted support-matrix row
 (`docs/factory/production-ml-library/pml0-support-matrix.md`).
@@ -55,10 +55,12 @@ sibling-repository consumer migration is claimed by S2.
 ## 2.1 No-latin remaining-identifier break
 
 S2 converted the locked member-ledger subset and archived the rest as retained
-Latin. The no-latin campaign rejects that carve-out. U1–U6 converted every
+Latin. The no-latin campaign rejects that carve-out. U1–U5 converted every
 remaining Latin identifier, parameter, local, alias, comment, and owned string
-on owned surfaces. Clean break, pre-1.0, no shims, no compatibility aliases,
-no deprecation window.
+on `src/` owned surfaces. Clean break, pre-1.0, no shims, no compatibility
+aliases, no deprecation window. Exempla, tests, scripta `.fab`, and fixture
+generators remain an open conversion (R1); the U6 consumer-chase receipt
+below does not claim they are done.
 
 Retained only: the proper noun `gradus` (package name, `gradus:*` import
 coordinates, `gradus:gradus` facade, type `GradusError`); established technical
@@ -72,10 +74,10 @@ The ordered implementation receipts are:
 | --- | --- | --- |
 | `55b7a4b` | Rename ledger | Exhaustive old→new map (`docs/factory/no-latin/rename-ledger.md`) |
 | `e36f0c3` | Model family | Final capsule, manifest, descriptor, dequant, and model-admission English surface |
-| `e8fc07f` | Tokenizer + calibration | Final tokenizer/calibration English surface; owned category wire values converted and fixtures regenerated |
+| `e8fc07f` | Tokenizer + calibration | Final tokenizer/calibration English identifiers; owned category wire values HELD (not converted); fixtures byte-stable; OQ3 pin still pending per ledger §8 (`docs/factory/no-latin/rename-ledger.md`) |
 | `8a45263` | Decode / generation / nn | Final `GenerationError`, `decode_data`, `projection_bias`, and nn English surface |
 | `496b4f4` | Train / shape / tensor | Final training, shape, and tensor English surface |
-| `a52f1de` | Consumer chase | Exempla, tests, scripta, and fixture generators use the new names |
+| `a52f1de` | Consumer chase | Identifier chase in listed docs and some caller sites; exempla, tests, scripta, and fixture generators are not a completed no-Latin conversion (R1 remaining) |
 
 Public docs (`docs/api-reference.md`, `docs/module-map.md`, this policy) are
 regenerated from the live post-conversion tree (U7). The live inventory is 979
