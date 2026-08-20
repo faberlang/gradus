@@ -325,7 +325,7 @@ Decision: included.
 | GLQ-10 | Latin residue + U8 guard hold | no-latin re-close (guard-hold sequencing) | done | 8c32b73 → 6214045 |
 | GLQ-11 | README public rewrite | — | done | 0991e21 → 4be7895 |
 | GLQ-12 | Exempla README stale-symbol sweep (prose only) | no-latin R1 re-close | done | a612d4f → 51e6d6a |
-| GLQ-13 | LICENSE + root-file disposition | operator decision (pending) | decision-pending | — |
+| GLQ-13 | LICENSE + root-file disposition | operator decision (pending) | done | b347560 → 5da4544 (MIT ruled 2026-08-20) |
 | GLQ-14 | Quickstart / examples tour / architecture | GLQ-11, GLQ-12 | pending | — |
 | GLQ-15 | Residual docs Latin + cosmetics | GLQ-10 | pending | — |
 | GLQ-16 | Packaging hygiene | — | done | b56d34a → ca3a8a4 |
