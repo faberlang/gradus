@@ -7,6 +7,35 @@ The authoritative per-symbol surface is [`docs/api-reference.md`](api-reference.
 
 One `.fab` file → one import path. Nested dirs for packages.
 
+## Examples tour
+
+First-time path: [`docs/quickstart.md`](quickstart.md) (snippet →
+[`exempla/dense-rmsnorm/`](../exempla/dense-rmsnorm/)). Open this first
+for each live import that has a demo:
+
+| Import | Open first |
+| --- | --- |
+| `gradus:nn` | [`exempla/dense-rmsnorm/`](../exempla/dense-rmsnorm/) |
+| `gradus:attention` | [`exempla/dense-rope/`](../exempla/dense-rope/) |
+| `gradus:transformer` | [`exempla/dense-block/`](../exempla/dense-block/) |
+| `gradus:gradient` | [`exempla/gradient-seam/`](../exempla/gradient-seam/) |
+| `gradus:loss` | [`docs/quickstart.md`](quickstart.md) snippet; then [`exempla/training-loop-mlp/`](../exempla/training-loop-mlp/) |
+| `gradus:optimize`, `gradus:train`, `gradus:metrics` | [`exempla/training-loop-mlp/`](../exempla/training-loop-mlp/) |
+| `gradus:model/gguf_manifest` | [`exempla/gguf-manifest/`](../exempla/gguf-manifest/) |
+| `gradus:model/tensor_payload`, `gradus:model/tensor_view` | [`exempla/gguf-materialize/`](../exempla/gguf-materialize/) |
+| `gradus:model/dense_llama` | [`exempla/dense-llama-adapter/`](../exempla/dense-llama-adapter/) |
+| `gradus:model/dense_qwen2` | [`exempla/dense-qwen2-adapter/`](../exempla/dense-qwen2-adapter/) |
+| `gradus:model/dense` | [`exempla/dense-model/`](../exempla/dense-model/) |
+| `gradus:model/qwen35moe` | [`exempla/gguf-admit-qwen35moe/`](../exempla/gguf-admit-qwen35moe/) |
+| `gradus:tokenizer` | [`exempla/qwen36-35b-inference/`](../exempla/qwen36-35b-inference/) |
+| `gradus:generation` | [`exempla/generate-route/`](../exempla/generate-route/) |
+| `gradus:decode`, `gradus:sampling` | [`exempla/token-generation/`](../exempla/token-generation/) |
+| `gradus:cache` | [`exempla/dense-decode-smollm2/`](../exempla/dense-decode-smollm2/) |
+
+Real-file GGUF inspection starts at
+[`exempla/gguf-inspect/`](../exempla/gguf-inspect/). Real-model prefill
+starts at [`exempla/dense-prefill-smollm2/`](../exempla/dense-prefill-smollm2/).
+
 ## Live modules (post-PML1–5 + correctness wave)
 
 The live tree has 34 modules (the W5d-U1 `gradus:calibration` bake added to the prior 33). Module names
@@ -89,6 +118,7 @@ SC  Shared contracts    gradus:parameter, gradus:serialize
 
 ## Pointers
 
+- First-time path (snippet → first exemplum → capability tour): [`docs/quickstart.md`](quickstart.md)
 - REF-01-U1.9 compiled-route consumer: [`exempla/dense-prefill-smollm2/`](../exempla/dense-prefill-smollm2/) (FINAL stop at radix `2ed9914e4`: packet faber green; rust emit reaches cargo; rustc 258 errors, first `cast cannot be followed by a method call`; no executed logits)
 - Per-symbol signatures, errors, and semantics: [`docs/api-reference.md`](api-reference.md)
 - Full import DAG + ownership table: [`docs/factory/production-ml-library/pml0-module-dag.md`](factory/production-ml-library/pml0-module-dag.md)
