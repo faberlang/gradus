@@ -1,5 +1,10 @@
 # MEASURE 2026-08-18 — first llama.cpp comparison (tiny models)
 
+**Non-product.** This directory is a tracked development measurement
+receipt (n=1 laptop baseline). It is not a product speed claim and is
+not part of the public `gradus:*` install (`cista.toml` ships `src/`
+only).
+
 Handle `f8fce797` / packet `hand-67`. Measurement only. No kernel
 tuning. This is the **baseline**, not a win.
 
