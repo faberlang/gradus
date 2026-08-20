@@ -313,7 +313,7 @@ Decision: included.
 
 | Unit | Outcome | Depends on | Status | Receipt |
 | --- | --- | --- | --- | --- |
-| GLQ-01 | Glyph conversion, fragment files (23/27 sites; 4 `.subtract` gated on radix tensor-minus need 9facfd36) | GLQ-10 | active (partial) | b9b23e3 → 623f1a3 |
+| GLQ-01 | Glyph conversion, fragment files (27/27 sites; remainder completed post tensor-minus fix) | GLQ-10 | done | b9b23e3 → 623f1a3; 6bd9d1a → 0650302 |
 | GLQ-02 | Glyph conversion, train.fab (48 sites) | GLQ-05 | pending | — |
 | GLQ-03 | requirit wave 1 (241 sites) | — | done | 62d6742 → 185bcd0 |
 | GLQ-04 | requirit wave 2 (263 sites, Δ0 vs audit) | GLQ-01 | done | 10c19ca → 194f4d7 |
