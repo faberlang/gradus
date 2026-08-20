@@ -3,15 +3,15 @@
 **Entrypoint** (thin; the full module DAG + ownership table live in
 [`docs/factory/production-ml-library/pml0-module-dag.md`](factory/production-ml-library/pml0-module-dag.md)).
 The authoritative per-symbol surface is [`docs/api-reference.md`](api-reference.md)
-(`gradus-api-reference v1.0.0`).
+(post-no-latin English identifier surface).
 
 One `.fab` file → one import path. Nested dirs for packages.
 
 ## Live modules (post-PML1–5 + correctness wave)
 
-The live tree has 34 modules (the W5d-U1 `gradus:calibration` bake added to the prior 33). This post-S2
-inventory is re-baselined from the final source tree after the English
-identifier clean break; it does not reuse the pre-S2 name map. The source
+The live tree has 34 modules (the W5d-U1 `gradus:calibration` bake added to the prior 33). Module names
+are unchanged. This inventory is verified against the live `src/**/*.fab` tree after the no-latin
+conversion (U1–U6); it does not reuse a pre-conversion name map. The source
 surface includes the A1C capsule-schema-2.0.0 surface, LIB-02 tokenizer
 runtime, GGUF-A3 tensor payload/view and widened dequant rows, REF-01
 architecture adapters and dense assembly, and MODEL-01 qwen35moe admission.
@@ -42,7 +42,7 @@ evidence and boundaries are recorded in
 | `gradus:model/artifact` | `src/model/artifact.fab` | Pathless content identity for bounded model artifacts (GGUF-A1a) |
 | `gradus:model/capsule` | `src/model/capsule.fab` | Admitted-model capsule — the typed identity handoff (`capsule-schema-2.0.0`, PML2, C8; A1C-M1 clean break — schema 1 retired) |
 | `gradus:model/dense_llama` | `src/model/dense_llama.fab` | Typed `llama` (SmolLM2) architecture adapter — canonical tensor-name → manifest-descriptor mapping over the GGUF-A1b surface, frozen SmolLM2-360M config, fail-closed typed diagnostics (REF-01-U1.6) |
-| `gradus:model/gguf_manifest` | `src/model/gguf_manifest.fab` | Format-general GGUF v3 bounded-corpus parser plus pathless range inspection, checked tensor fragments, and typed tokenizer metadata array accessors (`textorum`/`numerorum`, LIB-02-U1) |
+| `gradus:model/gguf_manifest` | `src/model/gguf_manifest.fab` | Format-general GGUF v3 bounded-corpus parser plus pathless range inspection, checked tensor fragments, and typed tokenizer metadata array accessors (`texts`/`numbers`, LIB-02-U1) |
 | `gradus:model/gguf` | `src/model/gguf.fab` | GGUF row admission → capsule (PML2) |
 | `gradus:model/safetensors` | `src/model/safetensors.fab` | Safetensors row admission → capsule (PML2) |
 | `gradus:model/dequant` | `src/model/dequant.fab` | CPU dequant of the admitted GGML block types — union set F32/F16/BF16/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K (PML2; GGUF-A3 widens to BF16 + Q5_K; W1-U3 admits F16 via NativeF16Convert) |
@@ -51,7 +51,7 @@ evidence and boundaries are recorded in
 | `gradus:model/dense_qwen2` | `src/model/dense_qwen2.fab` | Typed `qwen2` (Qwen2.5) architecture adapter — canonical dense tensor-name → manifest-descriptor resolution (`config`/`resolve`/`render_description`) with the qwen2 deltas: tensor-set tie status, GQA head config, rope_theta 1000000 (REF-01-U1.7) |
 | `gradus:model/dense` | `src/model/dense.fab` | Dense model assembly — the complete ordered dense forward graph (`forward`): embedding gather → N ordered U1.5 `dense_block` rows → final RMSNorm → output projection, assembled from the typed architecture config (`DenseConfig`) and materialized stored-weight views via canonical names; tied/untied embedding handling; zero per-row constants (REF-01-U1.8). Real-file Qwen2.5-0.5B prefill consumer: `exempla/dense-prefill-qwen2` (REF-01-U1.10; FINAL stop at radix `2ed9914e4`: packet `faber` green; PKG001 closed; rustc cargo-101, first `E0015` const `vec!`) |
 | `gradus:model/qwen35moe` | `src/model/qwen35moe.fab` | qwen35moe architecture admission: frozen config + canonical 753-tensor map + dimension/storage cross-reference validation + identity-precondition admission (MODEL-01, read through the `gguf_manifest` typed accessors) |
-| `gradus:tokenizer` | `src/tokenizer.fab` | Tokenizer identity + probe parity + `est_eog` (PML2/PML5) + artifact-backed byte-level BPE runtime with the composed qwen35 pre-tokenizer and special/EOG/BOS/chat policy surface (LIB-02-U2/U3; completion oracle pinned in `fixtures/tokenizer/pinned-probe-oracle.md`); capstone tokenizer phase run by `exempla/qwen36-35b-inference` (LIB-02-U4-1) |
+| `gradus:tokenizer` | `src/tokenizer.fab` | Tokenizer identity + probe parity + `is_eog` (PML2/PML5) + artifact-backed byte-level BPE runtime with the composed qwen35 pre-tokenizer and special/EOG/BOS/chat policy surface (LIB-02-U2/U3; completion oracle pinned in `fixtures/tokenizer/pinned-probe-oracle.md`); capstone tokenizer phase run by `exempla/qwen36-35b-inference` (LIB-02-U4-1) |
 | `gradus:cache` | `src/cache.fab` | KV-cache values + mutation rules (PML5) |
 | `gradus:calibration` | `src/calibration.fab` | Residual-energy calibration bake (W5d-U1) — per-expert output-energy scores, K-recommendation curve, overlap census, 75e4ab98 provenance; measurement artifact, not a weight transform |
 | `gradus:decode` | `src/decode.fab` | Decode/prefill/session/cancel + replica loop (PML5) |
