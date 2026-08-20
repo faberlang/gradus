@@ -315,20 +315,20 @@ Decision: included.
 | --- | --- | --- | --- | --- |
 | GLQ-01 | Glyph conversion, fragment files (27 sites) | GLQ-10 | pending | — |
 | GLQ-02 | Glyph conversion, train.fab (48 sites) | GLQ-05 | pending | — |
-| GLQ-03 | requirit wave 1 (241 sites) | — | pending | — |
+| GLQ-03 | requirit wave 1 (241 sites) | — | done | 62d6742 → 185bcd0 |
 | GLQ-04 | requirit wave 2 (263 sites) | GLQ-01 | pending | — |
 | GLQ-05 | requirit wave 3 (14 files / 334 sites + 9 uncovered files = 23 files / 383 sites; 28 double-not) | GLQ-01 | pending | — |
 | GLQ-06 | Binding holes (~110 + mirrors) | GLQ-09 + external radix settle | pending | — |
 | GLQ-07 | `§` string templates (140 + mirrors) | GLQ-03, GLQ-04, GLQ-05 | pending | — |
 | GLQ-08 | for-range conversion (~75 loops) | GLQ-03, GLQ-04, GLQ-07 | pending | — |
 | GLQ-09 | train.fab structural dedup | GLQ-02, GLQ-05 | pending | — |
-| GLQ-10 | Latin residue + U8 guard hold | no-latin re-close (guard-hold sequencing) | pending | — |
-| GLQ-11 | README public rewrite | — | pending | — |
-| GLQ-12 | Exempla README stale-symbol sweep (prose only) | no-latin R1 re-close | pending | — |
+| GLQ-10 | Latin residue + U8 guard hold | no-latin re-close (guard-hold sequencing) | done | 8c32b73 → 6214045 |
+| GLQ-11 | README public rewrite | — | done | 0991e21 → 4be7895 |
+| GLQ-12 | Exempla README stale-symbol sweep (prose only) | no-latin R1 re-close | done | a612d4f → 51e6d6a |
 | GLQ-13 | LICENSE + root-file disposition | operator decision (pending) | decision-pending | — |
 | GLQ-14 | Quickstart / examples tour / architecture | GLQ-11, GLQ-12 | pending | — |
 | GLQ-15 | Residual docs Latin + cosmetics | GLQ-10 | pending | — |
-| GLQ-16 | Packaging hygiene | — | pending | — |
+| GLQ-16 | Packaging hygiene | — | done | b56d34a → ca3a8a4 |
 | GLQ-17 | EBNF staleness ×3 (faber repo) | — | pending | — |
 
 Unit detail (write scopes, done-when, risk): `delivery.md` beside this file.
