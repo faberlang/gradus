@@ -56,7 +56,7 @@ pinned row is space-prefix-free (add_space_prefix = false)
 | `gradus:model/dense_llama` | `DensumLlamaError` | 4 | `src/model/dense_llama.fab` |
 | `gradus:model/dequant` | `DequantError` | 4 | `src/model/dequant.fab` |
 | `gradus:model/gguf` | `GgufError` | 10 | `src/model/gguf.fab` |
-| `gradus:model/gguf_manifest` | `GgufManifestError` | 12 | `src/model/gguf_manifest.fab` |
+| `gradus:model/gguf_manifest` | `GgufManifestError` | 13 | `src/model/gguf_manifest.fab` |
 | `gradus:model/safetensors` | `SafetensorError` | 11 | `src/model/safetensors.fab` |
 | `gradus:model/tensor_payload` | `PayloadError` | 3 | `src/model/tensor_payload.fab` |
 | `gradus:model/tensor_view` | `VisioError` | 7 | `src/model/tensor_view.fab` |
@@ -101,8 +101,8 @@ six operator-local real files, matched independent offsets/counts, and rejected
 any attempted read into tensor data. Exact receipts are in
 `exempla/gguf-manifest/README.md` and `exempla/gguf-inspect/README.md`.
 The LIB-02-U1 array accessors (`texts`/`numbers`) additionally expose the
-tokenizer metadata arrays with typed `BadWire`/`BadBounds` rows for
-non-array values, wrong element kinds, and oversized counts.
+tokenizer metadata arrays with typed `NotFound`/`BadWire`/`BadBounds` rows for
+missing keys, non-array values, wrong element kinds, and oversized counts.
 
 | Code | Class / when | Resolution |
 | --- | --- | --- |
@@ -118,6 +118,7 @@ non-array values, wrong element kinds, and oversized counts.
 | `GgufManifestError.UnknownLayout` | A tensor fragment was requested for an unknown raw GGML layout. | Add and verify that layout before requesting payload bytes. |
 | `GgufManifestError.BadIdentity` | The pathless content identity does not match the supplied artifact length or canonical form. | Supply a valid `artifact.IdentitasContenuti`. |
 | `GgufManifestError.BadSource` | A range source failed or returned a byte count different from the exact requested range. | Repair the caller-owned source adapter and return exactly the requested bytes. |
+| `GgufManifestError.NotFound` | A metadata key or tensor name is absent from the manifest. | Look up a key or tensor the parsed table actually carries; optional lookups match this variant instead of diagnostic prose. |
 
 ## `gradus:attention` — `AttentionError`
 
