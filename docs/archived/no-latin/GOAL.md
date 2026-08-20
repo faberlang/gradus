@@ -1,6 +1,6 @@
 # GOAL: no-latin — finish the English conversion of Gradus
 
-**Status**: active — REOPENED 2026-08-20 per block_ship audit d83e1804: src conversion verified (0 violations, wire holds honored); REMAINING: exempla + tests + scripta/*.fab conversion, guard root restoration, compatibility-policy correction, residue cleanup. Wave-1 receipts stand.
+**Status**: done — 8/8 wave-1 units + R1-R3 reopen repairs landed (all five block_ship findings resolved per re-audit 91f29fda; two P2 residuals fixed in this commit); wire values held per OQ3 pending-pin.
 **Created**: 2026-08-19
 **Campaign:** `—` (standalone; supersedes the retained-Latin carve-outs of archived `docs/archived/english-locale/`)
 **Source:** operator ruling 2026-08-19 — "no Latin period"; the S2 campaign narrowed "English library" to "English keywords + member ledger" and archived itself done with Latin still live

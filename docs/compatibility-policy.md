@@ -58,9 +58,9 @@ S2 converted the locked member-ledger subset and archived the rest as retained
 Latin. The no-latin campaign rejects that carve-out. U1–U5 converted every
 remaining Latin identifier, parameter, local, alias, comment, and owned string
 on `src/` owned surfaces. Clean break, pre-1.0, no shims, no compatibility
-aliases, no deprecation window. Exempla, tests, scripta `.fab`, and fixture
-generators remain an open conversion (R1); the U6 consumer-chase receipt
-below does not claim they are done.
+aliases, no deprecation window. Exempla (c4ab93c) and tests + scripta `.fab`
+and fixture generators (a9d2d16) were converted to ledger English; the
+consumer-chase receipt below records the landing commits.
 
 Retained only: the proper noun `gradus` (package name, `gradus:*` import
 coordinates, `gradus:gradus` facade, type `GradusError`); established technical
@@ -72,12 +72,12 @@ The ordered implementation receipts are:
 
 | Commit | Surface | Receipt |
 | --- | --- | --- |
-| `55b7a4b` | Rename ledger | Exhaustive old→new map (`docs/factory/no-latin/rename-ledger.md`) |
+| `55b7a4b` | Rename ledger | Exhaustive old→new map (`docs/archived/no-latin/rename-ledger.md`) |
 | `e36f0c3` | Model family | Final capsule, manifest, descriptor, dequant, and model-admission English surface |
-| `e8fc07f` | Tokenizer + calibration | Final tokenizer/calibration English identifiers; owned category wire values HELD (not converted); fixtures byte-stable; OQ3 pin still pending per ledger §8 (`docs/factory/no-latin/rename-ledger.md`) |
+| `e8fc07f` | Tokenizer + calibration | Final tokenizer/calibration English identifiers; owned category wire values HELD (not converted); fixtures byte-stable; OQ3 pin still pending per ledger §8 (`docs/archived/no-latin/rename-ledger.md`) |
 | `8a45263` | Decode / generation / nn | Final `GenerationError`, `decode_data`, `projection_bias`, and nn English surface |
 | `496b4f4` | Train / shape / tensor | Final training, shape, and tensor English surface |
-| `a52f1de` | Consumer chase | Identifier chase in listed docs and some caller sites; exempla, tests, scripta, and fixture generators are not a completed no-Latin conversion (R1 remaining) |
+| `a52f1de` | Consumer chase | Identifier chase in listed docs and some caller sites; exempla (c4ab93c) and tests + scripta `.fab` and fixture generators (a9d2d16) converted to ledger English |
 
 Public docs (`docs/api-reference.md`, `docs/module-map.md`, this policy) are
 regenerated from the live post-conversion tree (U7). The live inventory is 979
