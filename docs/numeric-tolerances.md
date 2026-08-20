@@ -22,10 +22,10 @@ documented formulas; runtime value-identity is auditor-owned (CTO8-1).
 
 ## 1. Comparison primitives
 
-### 1.1 `approximata` (Gradus proba absolute band)
+### 1.1 `.approx` (Gradus proba absolute band)
 
 Co-located proba files compare f32 production-surface values to pinned
-oracles with Faber's `approximata(expected, tol)` — an **absolute**
+oracles with Faber's `.approx(expected, tol)` — an **absolute**
 band `|observed − expected| ≤ tol`. The default forward band on the
 self-hosted f32 surface is:
 
@@ -70,7 +70,7 @@ gradient/loss oracle under the GPU-training lane, the frozen rule is:
 - Any NaN / ±Inf on either side is FAIL
   (`numeric-policy v1.0.0` §5.1 NaN/Inf rule).
 
-Gradus structural pins that use absolute `approximata` are a **library
+Gradus structural pins that use absolute `.approx` are a **library
 proba convention** for the f32 self-hosted surface; they do not replace
 the policy rule for device or FD-oracle acceptance.
 
@@ -119,7 +119,7 @@ admitted tolerance until the policy is amended (policy §3.3).
 
 The optimize suite comments explicitly bind this band to
 `numeric-policy v1.0.0` (the `1e-4` gradient row) while remaining an
-**absolute** `approximata` check on the structural surface.
+**absolute** `.approx` check on the structural surface.
 
 ### 3.2 Tighter absolute pins (specialized, not general forward)
 
@@ -168,7 +168,7 @@ Live proof surface: `src/decode.proba` probandum
 `"decode — the first-token-divergence rule (PML5-U6)"`.
 
 Logits that feed the token choice still use the forward `5e-4`
-`approximata` band; the **token choice itself is exact** (and the
+`.approx` band; the **token choice itself is exact** (and the
 documented per-step boundaries place draws well inside their cumulative
 buckets — see the token-generation README).
 
@@ -191,7 +191,7 @@ Session `redintegra` resets position while preserving context
 | Non-sorted / empty / negative EOG | reject | same suite |
 | Tokenizer probe lists | exact id lists P1–P11 | `fixtures/tokenizer/tokenizer-identity-oracle.md` |
 
-These are **identity** pins. They never enter an `approximata` band.
+These are **identity** pins. They never enter an `.approx` band.
 
 ---
 
@@ -199,8 +199,8 @@ These are **identity** pins. They never enter an `approximata` band.
 
 | What you compare | Band / rule | Cite |
 | --- | --- | --- |
-| f32 forward / logits / sampling probs / LR schedule vs f64 oracle pin (structural proba) | absolute **`5e-4`** `approximata` | this doc §1.1 |
-| SGD step f32 values vs f64 oracle (structural proba) | absolute **`1e-4`** `approximata` | this doc §3.1 |
+| f32 forward / logits / sampling probs / LR schedule vs f64 oracle pin (structural proba) | absolute **`5e-4`** `.approx` | this doc §1.1 |
+| SGD step f32 values vs f64 oracle (structural proba) | absolute **`1e-4`** `.approx` | this doc §3.1 |
 | Gradient tensor vs FD / analytic oracle (runtime gate) | **`atol=1e-4`, `rtol=1e-4`** policy rule | `numeric-policy v1.0.0` gradient row |
 | Loss-trace scalars vs pinned trace (runtime gate) | reduction row **`1e-6` / `1e-6`** + per-step rule | `numeric-policy v1.0.0` §3.1 / §5.2 |
 | Token sequences | **exact** + first-token-divergence | this doc §4 |
@@ -213,7 +213,7 @@ These are **identity** pins. They never enter an `approximata` band.
 
 - No relaxation of any band to pass a device or executed run.
 - No GPU speed / performance tolerance (not a numeric-parity concept).
-- No claim that structural `approximata` pins have been executed green.
+- No claim that structural `.approx` pins have been executed green.
 - No amendment of `numeric-policy v1.0.0` from this repo.
 
 ---
