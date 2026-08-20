@@ -1,6 +1,6 @@
 # Gradus Compatibility Policy
 
-**Version**: `compatibility-policy v1.1.1` (2026-08-17, S2 member-ledger English amend)
+**Version**: `compatibility-policy v1.2.0` (2026-08-20, no-latin remaining-identifier clean break)
 **Repo**: gradus. **Applies to**: the gradus library surface (version 0.1.0,
 pre-1.0) and every admitted support-matrix row
 (`docs/factory/production-ml-library/pml0-support-matrix.md`).
@@ -44,13 +44,50 @@ The ordered implementation receipts are:
 | `12944bf` | Facade and in-repo callers | Final Gradus facade, exempla, and admission-test caller chase |
 
 S2-DOCS rebases this policy and the machine-checked API inventory from the
-live post-`12944bf` tree in the S2-DOCS closeout. The live inventory is 750 `fn `
-declarations across 33 modules. This count is a declaration count, not a
+live post-`12944bf` tree in the S2-DOCS closeout. The S2-era inventory was 750 `fn `
+declarations across 33 modules. That count is a declaration count, not a
 compatibility alias map.
 
 No `[[library_members]]` row was added. No locale-pack row was added. No Radix
 compiler change was required. No Norma, Tela, Triga, Inferentia, or other
 sibling-repository consumer migration is claimed by S2.
+
+## 2.1 No-latin remaining-identifier break
+
+S2 converted the locked member-ledger subset and archived the rest as retained
+Latin. The no-latin campaign rejects that carve-out. U1–U6 converted every
+remaining Latin identifier, parameter, local, alias, comment, and owned string
+on owned surfaces. Clean break, pre-1.0, no shims, no compatibility aliases,
+no deprecation window.
+
+Retained only: the proper noun `gradus` (package name, `gradus:*` import
+coordinates, `gradus:gradus` facade, type `GradusError`); established technical
+terms (`eog`, `silu`, `signum`, `fim`, `bpe`, `matmul`); dtype/model/format
+tokens; and external-format keys (GGUF/safetensors spec strings). Module names
+were already English and did not change.
+
+The ordered implementation receipts are:
+
+| Commit | Surface | Receipt |
+| --- | --- | --- |
+| `55b7a4b` | Rename ledger | Exhaustive old→new map (`docs/factory/no-latin/rename-ledger.md`) |
+| `e36f0c3` | Model family | Final capsule, manifest, descriptor, dequant, and model-admission English surface |
+| `e8fc07f` | Tokenizer + calibration | Final tokenizer/calibration English surface; owned category wire values converted and fixtures regenerated |
+| `8a45263` | Decode / generation / nn | Final `GenerationError`, `decode_data`, `projection_bias`, and nn English surface |
+| `496b4f4` | Train / shape / tensor | Final training, shape, and tensor English surface |
+| `a52f1de` | Consumer chase | Exempla, tests, scripta, and fixture generators use the new names |
+
+Public docs (`docs/api-reference.md`, `docs/module-map.md`, this policy) are
+regenerated from the live post-conversion tree (U7). The live inventory is 979
+`fn ` declarations across 34 modules; every public (non-`_`-prefixed) function
+name is documented under its `## gradus:<module>` section. Per-module count
+re-baseline of `scripta/inventory-public-symbols` is a separate enforcement
+unit.
+
+No `[[library_members]]` row was added. No locale-pack row was added. No Radix
+compiler change was required. Sibling-repository consumer migration
+(`examples/training/*`, Inferentia docs) is outside this break and remains a
+recorded follow-up.
 
 ## 3. Correctness corrections
 
@@ -81,7 +118,7 @@ and a well-formed-but-different set fails closed as an identity rejection. The
 Tokenizer identity is the tuple: model (`gpt2`, byte-level BPE) + pre-tokenizer
 (`smollm`) + special-token behavior (BOS-free, space-prefix-free) + vocab
 fingerprint (pinned id lists P1–P11). Any divergence fails closed with
-`ProbeDivergens` — identity is exact, never approximate
+`ProbeDivergent` — identity is exact, never approximate
 (`fixtures/tokenizer/tokenizer-identity-oracle.md`).
 
 ### KV-cache identity (MD-A9)
