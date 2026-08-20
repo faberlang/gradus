@@ -321,7 +321,7 @@ Decision: included.
 | GLQ-06 | Binding holes (~110 + mirrors) | GLQ-09 + external radix settle | pending | — |
 | GLQ-07 | `§` string templates (140 + mirrors) | GLQ-03, GLQ-04, GLQ-05 | pending | — |
 | GLQ-08 | for-range conversion (~75 loops) | GLQ-03, GLQ-04, GLQ-07 | pending | — |
-| GLQ-09 | train.fab structural dedup | GLQ-02, GLQ-05 | pending | — |
+| GLQ-09 | train.fab structural dedup (18 blocks → one _sgd_family loop; proba byte-identical) | GLQ-02, GLQ-05 | done | ebb36b1 → ac87da9 |
 | GLQ-10 | Latin residue + U8 guard hold | no-latin re-close (guard-hold sequencing) | done | 8c32b73 → 6214045 |
 | GLQ-11 | README public rewrite | — | done | 0991e21 → 4be7895 |
 | GLQ-12 | Exempla README stale-symbol sweep (prose only) | no-latin R1 re-close | done | a612d4f → 51e6d6a |
