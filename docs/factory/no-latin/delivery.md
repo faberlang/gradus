@@ -211,3 +211,45 @@ Per `GOAL.md` Validation, all green on `main` after U8:
    prefers an isolated gate.
 4. **Header-comment Latin (goal OQ1)** — default convert (live source is the
    surface); already inside every wave unit's write scope.
+
+---
+
+## 8. REOPEN — block_ship audit d83e1804 (2026-08-20)
+
+Range audit `d83e1804` returned verdict **block_ship**. The close at `f70f02f`
+was premature: the completion contract (normalized spec §2 and GOAL
+Validation) covers more than `src/`. This goal is REOPENED to active per the
+completion-contract rule; wave-1 receipts stand, but scope is incomplete.
+
+Audit findings:
+
+- **P1 — unconverted roots.** The core `src/**/*.fab{,.proba}` conversion is
+  verified (0 violations; owned wire holds honored), but the remaining
+  completion-contract roots are unconverted: `exempla/**`, `tests/`,
+  `scripta/*.fab`, fixture generators. `src` alone is not the whole contract.
+- **P2 — guard narrowed.** The no-Latin `check-source` guard was narrowed to
+  `src`; its coverage must be restored to every completion-contract root so
+  the enforcement matches the live surface it is meant to police.
+- **P2 — false break record (`docs/compatibility-policy.md:76`).** The §2.1
+  full-break claim and the `a52f1de` "Consumer chase" receipt assert exempla,
+  tests, scripta, and fixture generators were converted; the audit shows they
+  were not. The break record overstates what shipped.
+- **P2 — residue `Capsula`/`verifica_contra`.** Latin tokens remain in the
+  fixture oracle docs (`fixtures/gguf/gguf-row-oracle.md`,
+  `fixtures/safetensors/safetensors-row-oracle.md`:
+  `capsule.Capsula`, `verifica_contra`) and in the
+  `tests/admission_conformance.fab:1210` header comment.
+- **P2 — undisclosed oracle-doc scope extension.** Amendment #3 placed the
+  fixture oracle docs in U3's write scope; that extension was not disclosed as
+  a scope change in the delivery record. Correction recorded here.
+
+### Repair units
+
+| Unit | Finding | Scope | Receipt-to-be |
+| --- | --- | --- | --- |
+| **R1** | P1 unconverted roots | Convert `exempla/**`, `tests/`, `scripta/*.fab`, fixture generators to the English surface per the U1 ledger | `faber check` whole-package + per-touched exemplum green; repo-wide old-name grep returns zero hits outside the allowed residue |
+| **R2** | P2 guard narrowed | Restore the no-Latin `check-source` guard to cover all completion-contract roots (`src`, `exempla`, `tests`, `scripta`) | `./scripta/check-source` green on the converted tree; fails on a probe Latin identifier in each guarded root |
+| **R3** | P2 false break record + residue + scope extension | Correct `compatibility-policy.md:76` (§2.1 / Consumer-chase receipt); clear `Capsula`/`verifica_contra` residue from fixture oracle docs and `tests/admission_conformance.fab:1210`; record the amendment #3 scope extension | `compatibility-policy.md` §2.1/receipts table corrected and accurate; repo-wide grep for `Capsula`/`verifica_contra` zero hits; scope extension disclosed in the delivery record |
+
+Closeout for this reopened scope re-runs GOAL Validation against the full
+completion contract once R1–R3 land.
