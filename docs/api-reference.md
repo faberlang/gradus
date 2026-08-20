@@ -33,7 +33,7 @@ Scaled dot-product attention, causal masking, RoPE configuration, multi-head att
 ### Public functions
 
 - `fn scaled_dot_product_2x8(tensor<f32, [2, 8]> qb, tensor<f32, [2, 8]> kb, tensor<f32, [2, 8]> vb, tensor<f32, [2, 2]> scale) → tensor<f32, [2, 8]> {`
-- `fn scaled_dot_product_staticum<size B, size D>(tensor<f32, [B, D]> qb, tensor<f32, [B, D]> kb, tensor<f32, [B, D]> vb, tensor<f32, [B, B]> scale) → tensor<f32, [B, D]> {`
+- `fn scaled_dot_product_static<size B, size D>(tensor<f32, [B, D]> qb, tensor<f32, [B, D]> kb, tensor<f32, [B, D]> vb, tensor<f32, [B, B]> scale) → tensor<f32, [B, D]> {`
 - `fn message(AttentionError e) → string {`
 - `fn consecutive_policy() → RopePolicy {`
 - `fn interleaved_policy() → RopePolicy {`
