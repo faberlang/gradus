@@ -67,7 +67,7 @@ PASS dense-row Qwen2.5-1.5B tensors=338 types=F32:141 Q4_K:168 Q6_K:29
 ## Slice table (named at the unit boundary from the live manifest)
 
 Every slice materializes a bounded, block-aligned element window via
-`vincula` + `materializa_slicem`; every block read flows through the app-owned
+`links` + `materialize_slice`; every block read flows through the app-owned
 range source. The golden expected values are derived at the unit boundary from
 the local artifact with the same reference oracle as the committed
 `fixtures/gguf/gguf-dequant-goldens.json` (llama.cpp `ggml-quants.c` @
@@ -87,7 +87,7 @@ tolerance).
 | 8 | `blk.0.ffn_up_exps.weight` | Q4_K (rank-3 expert) | 256 |
 
 The rank-3 expert row is a bounded per-expert window (one block of expert 0).
-All windows are far below `MAXIMUM_SLICEM_ELEMENTA` and `CORPUS_LIMES`.
+All windows are far below `MAXIMUM_SLICE_ELEMENTS` and `CORPUS_LIMIT`.
 
 ## Observed receipt
 
