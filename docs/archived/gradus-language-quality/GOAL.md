@@ -1,6 +1,6 @@
 # GOAL: gradus-language-quality — canonical language idiom + public presentability
 
-**Status**: active — 17 units (1 decision-pending, 1 externally sequenced); see Ledger
+**Status**: done — 17/17 units landed 2026-08-20 (GLQ-13 MIT operator-ruled; GLQ-06 external gate met); archived same day
 **Created**: 2026-08-20
 **Campaign:** `—` (standalone; operator rule: individual tracking, no campaign)
 **Source:** two operator-ordered audits, 2026-08-20 — idiom audit (Vivi mail `57cb4713`, task `f6f4068b`, verdict residual) + presentability audit (Vivi mail `7d54686c`, task `bdbbb2f9`, verdict block_ship); lowered by planner task `59369675`
@@ -327,7 +327,7 @@ Decision: included.
 | GLQ-12 | Exempla README stale-symbol sweep (prose only) | no-latin R1 re-close | done | a612d4f → 51e6d6a |
 | GLQ-13 | LICENSE + root-file disposition | operator decision (pending) | done | b347560 → 5da4544 (MIT ruled 2026-08-20) |
 | GLQ-14 | Quickstart / examples tour / architecture (README → docs/quickstart.md → dense-rmsnorm) | GLQ-11, GLQ-12 | done | 9e1d60d + 0772bdf → ad24b49 |
-| GLQ-15 | Residual docs Latin + cosmetics | GLQ-10 | pending | — |
+| GLQ-15 | Residual docs Latin + cosmetics + nn-bridge README (honest status) | GLQ-10 | done | aba5c44 → 071f972 |
 | GLQ-16 | Packaging hygiene | — | done | b56d34a → ca3a8a4 |
 | GLQ-17 | EBNF staleness ×3 (faber repo) | — | done | 5c191c4 → b38438d (residual: 3 private-only docs/design refs, thread 1338cb30) |
 
