@@ -113,10 +113,12 @@ faber check .
 
 `loss.mse_2x2` is mean squared error over a 2×2 f32 pair; the snippet's
 inputs yield `0.25`. `faber check` is the standing proof that the import
-and call type-check. `faber run` of packages that import `gradus:*` is
-not claimed here — the compiler cannot yet execute library-to-library
-calls. Worked demos live under `exempla/`; the first-open-per-capability
-tour is [`docs/quickstart.md`](docs/quickstart.md).
+and call type-check. The training-loop exemplum is an executed package proof:
+`faber run` executes its library-to-library calls on the FMIR stepper (radix
+`43c0102ba`, regression-locked by `2e8042ae7`). Other package runs, GPU
+training, and executed model performance are not claimed here. Worked demos
+live under `exempla/`;
+the first-open-per-capability tour is [`docs/quickstart.md`](docs/quickstart.md).
 
 ## Status
 
@@ -124,22 +126,22 @@ Gradus is pre-1.0 with a clean-break posture; APIs may change. See
 [`docs/compatibility-policy.md`](docs/compatibility-policy.md).
 
 What ships today is the **structural** surface: compile-validated,
-proba-pinned source contracts. Executed value-identity — running a
-training loop or model forward and matching goldens — is blocked on the
-compiler's library-import execution gap. No GPU training or executed
-performance is claimed here.
+proba-pinned source contracts, plus an executed 100-step MLP training
+loop through `train_step_4x4` → `optimize.sgd_step_4x4` whose final loss
+matches the f64 oracle (`0.017928625511508454`). Broader model-forward
+identity, GPU training, and executed performance are not claimed here.
 
 | Layer | State |
 | --- | --- |
 | Foundation (dtype, shape, tensor, math) | Shipped |
 | Parameters and serialization | Shipped |
-| Gradient wrapper, loss, SGD, training, metrics | Shipped (structural) — `gradients_simple_loss`, `mse` / `cross_entropy`, `SgdState` / `step`, `Checkpoint`, `accuracy` / `Metric` |
+| Gradient wrapper, loss, SGD, training, metrics | Shipped (structural), with executed MLP training proof — `gradients_simple_loss`, `mse` / `cross_entropy`, `SgdState` / `step`, `Checkpoint`, `accuracy` / `Metric` |
 | NN primitives, attention, transformer | Shipped (structural); several `exempla/dense-*` packages have executed in-memory proofs |
 | Model admission (capsule, GGUF, Safetensors) | Shipped; GGUF inspection has executed real-file receipts. `tensor_view.links` binds a payload to a manifest. Architecture adapters do not claim inference |
 | Tokenizer identity | Shipped |
 | Inference (decode, cache, sampling, generation) | Shipped (structural) |
 | Dense forward (`gradus:model/dense` `forward`, `prefill_cached`, `decode_step`) | Shipped over synthetic graphs (compile-pinned prefill then decode matching full recompute); not a real-model inference claim |
-| GPU training / executed runs | Not claimed |
+| GPU training | Not claimed |
 
 KV-cache writes fail closed on gap and overflow against an immutable
 capacity; cached-attention positions are absolute and include the
@@ -194,9 +196,10 @@ range proofs live in `exempla/gguf-manifest/` and `exempla/gguf-inspect/`.
 - **Production deployment.** Gradus is pre-1.0 with a clean-break posture;
   APIs may change. The support matrix and compatibility policy define
   exactly what is admitted and what migrates.
-- **GPU-scale training or executed performance evidence.** Executed runs
-  are not claimed; speed figures, when they exist, are CPU-reference-level
-  at most and never precede the correctness gates.
+- **GPU-scale training or broad executed performance evidence.** Outside the
+  bounded training-loop proof, executed runs are not claimed; speed figures,
+  when they exist, are CPU-reference-level at most and never precede the
+  correctness gates.
 - **PyTorch users.** Gradus is JAX-shaped (pure functions, explicit params), not
   PyTorch-shaped (nn.Module class hierarchy). No object-oriented model
   registration.
@@ -207,7 +210,8 @@ range proofs live in `exempla/gguf-manifest/` and `exempla/gguf-inspect/`.
 ## What ships now vs what is planned
 
 "Shipped" = committed + compile-validated + proba-pinned. Executed runs
-are not a standing claim.
+are claim-specific and require a receipt; the MLP training receipt is listed
+below.
 
 | Capability | Status | Owner |
 | --- | --- | --- |
@@ -221,7 +225,8 @@ are not a standing claim.
 | Tokenizer identity + stop binding | Shipped | Gradus |
 | Inference: decode, KV-cache, sampling, generation config | Shipped — fail-closed capacity; absolute cache positions | Gradus |
 | nanoGPT on Shakespeare (CPU) | Planned (not in-tree) | Gradus |
-| Executed proba / e2e runs | Not claimed | — |
+| Executed training loop + train/optimize proba | Shipped — 100-step MLP; 90/90 cases | Gradus |
+| Other executed proba / e2e runs | Not claimed | — |
 | GPU training / executed performance | Planned — depends on Radix/hosts | Radix + hosts |
 
 ## Static-shape surface
@@ -237,18 +242,17 @@ device/backend handle:
   parameters + explicit trainable gradients + scalar lr → explicit tuple of
   updated parameters)
 
-The retired `sgd_step_*` helpers are gone; the SGD surface today is
-`gradus:optimize` (`SgdState` slots, `step`, wires). The fixed-shape MSE
-rows and train steps remain the admitted caller surface; their formula is
-exactly the shape-generic `loss.mse` / optimizer-state update over the
-same element arithmetic.
+The fixed-shape `sgd_step_2x2` / `sgd_step_4x4` helpers are part of
+`gradus:optimize` again, alongside `SgdState` slots, `step`, and wires.
+The fixed-shape MSE rows and train steps remain the admitted caller surface;
+`train_step_*` delegates its tensor update to the optimizer's SGD helpers.
 
 The seam proof for this surface is `exempla/gradient-seam/`. The
 `@ radix backward` annotation lives in `gradus:gradient`; that exemplum
-calls the generated companion through the import. The compiler cannot yet
-resolve library-to-library calls, so `train_step_*` currently carries the
-update math inline rather than calling the optimizer; revisit when that
-runtime gap closes.
+calls the generated companion through the import. Library-to-library calls
+execute on the FMIR stepper (radix `43c0102ba`, regression-locked by
+`2e8042ae7`). The BERT tuple call cases remain omitted from execution because
+of the named package-MIR call-argument-mismatch residual (E8/E10).
 
 ## Import
 

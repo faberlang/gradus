@@ -168,8 +168,9 @@ training path (`forward_mlp_loss`) requests gradient construction by the single
 `@ radix backward` annotation whose generated companion is compile-validated by
 `faber check`. **This row does NOT claim executed identity** of bare forward vs
 the generated companion, companion behavior, or a numerical bound at runtime —
-that claim is deferred to a runtime-evidence gate per CTO Q2 (proba execution
-is env-blocked tree-wide today).
+that claim is deferred to a runtime-evidence gate per CTO Q2. Selected
+training paths now execute on the FMIR stepper, but this row does not
+claim runtime identity of the generated backward companion.
 
 ### Row 4 — Selected inference architecture row: SmolLM2-360M scaled (llama/dense, Q4_K_M) (PML3-U5)
 
