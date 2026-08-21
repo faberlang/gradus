@@ -855,11 +855,17 @@ fn multi_head_attention(tensor.Tensor q, tensor.Tensor k, tensor.Tensor v, tenso
 }
 
 # =========================================================================
-# GGUF-A5 wiring — attention reads/writes one layer's KVCache.
-# Cached K is stored already-RoPE'd. New q/k are rotated at their positions,
-# concatenated onto the cached K/V, then the query attends with a causal
-# prefix of cache_len (row i sees columns j ≤ cache_len + i). The updated
-# cache is returned with the new K/V rows appended (extend).
+# KV-A A2 — cached attention prefix, GQA, K-after-RoPE, V rules.
+# Frozen coordinates (kv-cache-semantic-contract):
+#   absolute_position(i)     = prefix_before + i
+#   causal_end_exclusive(i)  = prefix_before + i + 1
+#   prefill:  prefix_before = 0, query_rows = T, row i attends [0, i+1)
+#   decode:   prefix_before = L, query_rows = 1, attends [0, L+1)
+# The just-written row at the absolute position is included. Positions are
+# absolute — local row zero is not a decode RoPE position. K is stored
+# after absolute-position RoPE; V is stored unchanged. GQA requires
+# query_heads % kv_heads == 0, with query head h mapped to KV head
+# h / (query_heads / kv_heads). The F32 row is the admitted row.
 # =========================================================================
 
 @ public { }
@@ -881,23 +887,18 @@ fn default_cached() → CachedAttention {
     return CachedAttention {context = tensor.default(), state = kv.default()}
 }
 
-# Causal row softmax with a cache-length prefix: row i attends to columns
-# j ≤ prefix + i (clamped to the score width). prefix = 0 is the no-cache
-# causal recipe.
+# Causal row softmax over the frozen prefix: query row i attends
+# [0, prefix_before + i + 1). The score width is prefix_before + query_rows
+# (cached rows plus the just-written rows). No clamp — a short K/V prefix
+# would exclude the new row and is rejected before this helper runs.
 @ private { }
-fn _softmax_prefix(tensor.Tensor x, int prefix) → tensor.Tensor {
+fn _softmax_prefix(tensor.Tensor x, int prefix_before) → tensor.Tensor {
     const list<int> f ← x.shape()
     const int rows ← f.get(0) coalesce 1
     const int cols ← f.get(1) coalesce 1
     var list<f32> out ← empty
     for range 0‥rows const i {
-        var int end ← prefix + i + 1
-        if end ≻ cols {
-            end ← cols
-        }
-        if end ≺ 1 {
-            end ← 1
-        }
+        const int end ← prefix_before + i + 1
         var f32 maximum ← x.data.get(i * cols) coalesce 0.0 ∷ f32
         var int j ← 0
         while j ≺ end {
@@ -929,20 +930,23 @@ fn _softmax_prefix(tensor.Tensor x, int prefix) → tensor.Tensor {
     return tensor.Tensor {dtype = x.dtype(), shape = f, data = out}
 }
 
-# Attention core for q [Tq, D] against k/v [Tk, D]. prefix is the cached
-# token count already in k/v (the new rows follow).
+# Attention core for q [Tq, D] against full k/v [prefix_before + Tq, D].
+# Query row i attends [0, prefix_before + i + 1), including the just-written
+# row at absolute position prefix_before + i.
 @ private { }
-fn _attention_core_offset(tensor.Tensor q, tensor.Tensor k, tensor.Tensor v, f32 scale, int prefix) → tensor.Tensor ⇥ AttentionError {
+fn _attention_core_offset(tensor.Tensor q, tensor.Tensor k, tensor.Tensor v, f32 scale, int prefix_before) → tensor.Tensor ⇥ AttentionError {
     const list<int> fq ← q.shape()
     const list<int> fk ← k.shape()
     const int tq ← fq.get(0) coalesce 1
     const int tk ← fk.get(0) coalesce 1
+    require prefix_before ≥ 0 throw variant InvalidPosition {message = "negative position"}
+    require tk ≡ prefix_before + tq throw variant ShapeMismatch {message = "attention prefix excludes the just-written row"}
     const tensor.Tensor kt ← _transpose(k)
     const tensor.Tensor scale_t ← _fill([tq, tk], scale)
     do {
         const tensor.Tensor scores ← math.matmul(q, kt)
         const tensor.Tensor scaled ← math.mul(scores, scale_t)
-        const tensor.Tensor attn ← _softmax_prefix(scaled, prefix)
+        const tensor.Tensor attn ← _softmax_prefix(scaled, prefix_before)
         const tensor.Tensor context ← math.matmul(attn, v)
         return context
     }
@@ -983,9 +987,23 @@ fn _write_cache(kv.KVCache layer, list<int> tokens, tensor.Tensor key, tensor.Te
     }
 }
 
+# Positions are absolute: query row i is at prefix_before + i. Local row
+# zero is rejected whenever prefix_before > 0 (decode RoPE must not reuse
+# the first cache slot's coordinate).
+@ private { }
+fn _validate_absolute_positions(int prefix_before, list<int> positions, int query_rows) → bool ⇥ AttentionError {
+    require positions.length() ≡ query_rows throw variant ShapeMismatch {message = "positions must match the token count"}
+    for range 0‥query_rows const i {
+        const int pos ← positions.get(i) coalesce (0 - 1)
+        require pos ≡ prefix_before + i throw variant InvalidPosition {message = "position must be the absolute prefix row"}
+    }
+    return true
+}
+
 @ private { }
 fn _validate_cached_triplet(tensor.Tensor q, tensor.Tensor k, tensor.Tensor v, kv.KVCache layer, list<int> tokens) → int ⇥ AttentionError {
     _dtype_triple(q, k, v)
+    require layer.dtype() ≡ "f32" throw variant DtypeMismatch {message = "unsupported dtype for attention primitive"}
     const list<int> fq ← q.shape()
     const list<int> fk ← k.shape()
     const list<int> fv ← v.shape()
@@ -997,56 +1015,70 @@ fn _validate_cached_triplet(tensor.Tensor q, tensor.Tensor k, tensor.Tensor v, k
     require not (t ≡ 0 or d ≡ 0) throw variant ElementMismatch {message = "empty attention input"}
     require tokens.length() ≡ t throw variant ShapeMismatch {message = "tokens must match the token count"}
     require layer.dimension() ≡ d throw variant ShapeMismatch {message = "cache dimension must equal the head width"}
+    const int prefix_before ← layer.length()
     const list<int> fc ← layer.key().shape()
+    const list<int> fp ← layer.payload().shape()
     require fc.length() ≡ 2 throw variant GradusMismatch {message = "cache key must be rank-2"}
+    require fp.length() ≡ 2 throw variant GradusMismatch {message = "cache value must be rank-2"}
     require fc.get(1) coalesce 1 ≡ d throw variant ShapeMismatch {message = "cache key width must equal the head width"}
-    return fc.get(0) coalesce 0
+    require fp.get(1) coalesce 1 ≡ d throw variant ShapeMismatch {message = "cache value width must equal the head width"}
+    require (fc.get(0) coalesce 0) ≡ prefix_before throw variant ShapeMismatch {message = "cache key rows must equal the prefix length"}
+    require (fp.get(0) coalesce 0) ≡ prefix_before throw variant ShapeMismatch {message = "cache value rows must equal the prefix length"}
+    return prefix_before
 }
 
 # -------------------------------------------------------------------------
-# scaled_dot_product_causal_rope_cached — single-head incremental decode.
-# q/k/v are the NEW rows [T, D]; the layer cache holds already-RoPE'd K
-# and V. tokens are the new history ids written with the new K/V.
+# scaled_dot_product_causal_rope_cached — single-head prefill / M=1 decode.
+# q/k/v are the NEW rows [T, D]. prefix_before is the logical cache length
+# L before this write. Q and K rotate at absolute positions L..L+T-1; K is
+# stored after that RoPE, V is stored raw. The query attends [0, L+i+1)
+# including the just-written row, then the new rows are extended.
 # -------------------------------------------------------------------------
 
 @ public { }
 fn scaled_dot_product_causal_rope_cached(tensor.Tensor q, tensor.Tensor k, tensor.Tensor v, f32 scale, list<int> positions, int dim, kv.KVCache layer, list<int> tokens) → CachedAttention ⇥ AttentionError {
-    const int prefix ← _validate_cached_triplet(q, k, v, layer, tokens)
+    const int prefix_before ← _validate_cached_triplet(q, k, v, layer, tokens)
     _validate_rope(q, positions, dim)
+    _validate_absolute_positions(prefix_before, positions, q.shape().get(0) coalesce 0)
     const list<f32> table ← _rope_table(positions, dim, ROPE_FREQ_BASE, 1.0 ∷ f32)
     const tensor.Tensor qr ← _rope(q, dim, table, false)
     const tensor.Tensor kr ← _rope(k, dim, table, false)
     const tensor.Tensor full_k ← _concat_rows(layer.key(), kr)
     const tensor.Tensor full_v ← _concat_rows(layer.payload(), v)
-    const tensor.Tensor context ← _attention_core_offset(qr, full_k, full_v, scale, prefix)
+    const tensor.Tensor context ← _attention_core_offset(qr, full_k, full_v, scale, prefix_before)
     return CachedAttention {context = context, state = _write_cache(layer, tokens, kr, v)}
 }
 
 @ private { }
 fn _validate_cached_multi(tensor.Tensor q, tensor.Tensor k, tensor.Tensor v, tensor.Tensor wo, kv.KVCache layer, int num_heads, int num_kv_heads, list<int> positions, int rope_dim, list<int> tokens) → int ⇥ AttentionError {
     const int d ← _validate_multi(q, k, v, wo, num_heads, num_kv_heads, positions, rope_dim)
+    require layer.dtype() ≡ "f32" throw variant DtypeMismatch {message = "unsupported dtype for attention primitive"}
     require tokens.length() ≡ (q.shape().get(0) coalesce 0) throw variant ShapeMismatch {message = "tokens must match the token count"}
     const int kv_width ← num_kv_heads * d
     require layer.dimension() ≡ kv_width throw variant ShapeMismatch {message = "cache dimension must equal num_kv_heads * head dim"}
+    const int prefix_before ← layer.length()
     const list<int> fc ← layer.key().shape()
     require fc.length() ≡ 2 throw variant GradusMismatch {message = "cache key must be rank-2"}
     require fc.get(1) coalesce 1 ≡ kv_width throw variant ShapeMismatch {message = "cache key width must equal num_kv_heads * head dim"}
     const list<int> fv ← layer.payload().shape()
     require not (fv.length() ≠ 2 or fv.get(1) coalesce 1 ≠ kv_width) throw variant ShapeMismatch {message = "cache value width must equal num_kv_heads * head dim"}
-    require (fc.get(0) coalesce 0) ≡ (fv.get(0) coalesce 0) throw variant ShapeMismatch {message = "cache key and value must share the token count"}
+    require (fc.get(0) coalesce 0) ≡ prefix_before throw variant ShapeMismatch {message = "cache key rows must equal the prefix length"}
+    require (fv.get(0) coalesce 0) ≡ prefix_before throw variant ShapeMismatch {message = "cache value rows must equal the prefix length"}
     return d
 }
 
 # -------------------------------------------------------------------------
-# multi_head_attention_cached — GQA incremental decode. q/k/v are the NEW
-# packed rows; the layer cache holds already-RoPE'd packed K/V. The new
-# K/V (K after RoPE) are appended via extend.
+# multi_head_attention_cached — GQA prefill / M=1 decode. q [T, H·D] and
+# k/v [T, K·D] are the NEW packed rows. GQA requires H % K == 0; query
+# head h attends KV head h / (H/K). Cached K is post-RoPE at absolute
+# positions; V is stored unchanged. Query row i attends [0, L+i+1).
 # -------------------------------------------------------------------------
 
 @ public { }
 fn multi_head_attention_cached(tensor.Tensor q, tensor.Tensor k, tensor.Tensor v, tensor.Tensor wo, kv.KVCache layer, int num_heads, int num_kv_heads, f32 scale, list<int> positions, int rope_dim, RopeConfig rope_config, list<int> tokens) → CachedAttention ⇥ AttentionError {
     const int d ← _validate_cached_multi(q, k, v, wo, layer, num_heads, num_kv_heads, positions, rope_dim, tokens)
-    const int prefix ← layer.key().shape().get(0) coalesce 0
+    const int prefix_before ← layer.length()
+    _validate_absolute_positions(prefix_before, positions, q.shape().get(0) coalesce 0)
     const int ratio ← num_heads / num_kv_heads
     const f32 base ← rope_config.base()
     const f32 rope_scale ← rope_config.scale()
@@ -1070,7 +1102,7 @@ fn multi_head_attention_cached(tensor.Tensor q, tensor.Tensor k, tensor.Tensor v
         const tensor.Tensor qr ← _rope(qh, rope_dim, table, interposita)
         const tensor.Tensor kg_all ← _head(full_k, group * d, d)
         const tensor.Tensor vg_all ← _head(full_v, group * d, d)
-        heads.append(_attention_core_offset(qr, kg_all, vg_all, scale, prefix))
+        heads.append(_attention_core_offset(qr, kg_all, vg_all, scale, prefix_before))
         h ← h + 1
     }
     const tensor.Tensor concat ← _reconcile(heads)

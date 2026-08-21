@@ -891,3 +891,165 @@ test "incremental cached attention matches the last full-row position" {
         assert false
     }
 }
+
+# -------------------------------------------------------------------------
+# KV-A A2 — cached prefix, absolute RoPE, K-after-RoPE, raw V, GQA mapping.
+# Prefill: prefix_before = 0, row i attends [0, i+1). Decode M=1: prefix_before
+# = L, attends [0, L+1) including the just-written row at absolute position L.
+# Positions are absolute; local row zero is rejected on a non-empty prefix.
+# Compile-level pin (proba execution is env-blocked tree-wide).
+# -------------------------------------------------------------------------
+
+fn sdp_cached_detail(tensor.Tensor q, tensor.Tensor k, tensor.Tensor v, f32 scale, list<int> positions, int dim, kv.KVCache layer, list<int> tokens) → string {
+    do {
+        attention.scaled_dot_product_causal_rope_cached(q, k, v, scale, positions, dim, layer, tokens)
+        return "no error"
+    }
+    catch err {
+        return attention.message(err)
+    }
+}
+
+fn mha_cached_detail(tensor.Tensor q, tensor.Tensor k, tensor.Tensor v, tensor.Tensor wo, kv.KVCache layer, int num_heads, int num_kv_heads, f32 scale, list<int> positions, int rope_dim, list<int> tokens) → string {
+    var attention.RopeConfig c ← attention.default()
+    do {
+        c ← attention.construct_rope_config(100000.0 ∷ f32, 1.0 ∷ f32, attention.consecutive_policy())
+    }
+    catch err {
+        return attention.message(err)
+    }
+    do {
+        attention.multi_head_attention_cached(q, k, v, wo, layer, num_heads, num_kv_heads, scale, positions, rope_dim, c, tokens)
+        return "no error"
+    }
+    catch err {
+        return attention.message(err)
+    }
+}
+
+test "cached prefill attends [0, i+1) and stores K after RoPE with V unchanged" {
+    do {
+        const tensor.Tensor q ← tene([1.0, 0.0, 0.0, 1.0], [2, 2])
+        const tensor.Tensor k ← tene([1.0, 0.0, 0.0, 1.0], [2, 2])
+        const tensor.Tensor v ← tene([1.0, 1.0, 2.0, 2.0], [2, 2])
+        const tensor.Tensor full ← attention.scaled_dot_product_causal_rope(q, k, v, 1.0 ∷ f32, [0, 1], 2)
+        const attention.CachedAttention step ← attention.scaled_dot_product_causal_rope_cached(q, k, v, 1.0 ∷ f32, [0, 1], 2, cache_p(2), [3, 4])
+        const tensor.Tensor stored_k ← attention.rotary_position_embedding(k, [0, 1], 2)
+        assert step.context().shape() ≡ full.shape()
+        assert e2(step.context(), 0, 0).approx(e2(full, 0, 0), TOLERANCE)
+        assert e2(step.context(), 1, 0).approx(e2(full, 1, 0), TOLERANCE)
+        assert step.state().length() ≡ 2
+        assert step.state().key().data ≡ stored_k.data
+        assert step.state().payload().data ≡ v.data
+        assert e2(step.state().key(), 1, 0) ≠ e2(k, 1, 0)
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "M=1 cached decode attends [0, L+1) including the just-written absolute row" {
+    do {
+        const tensor.Tensor q ← tene([1.0, 0.0, 0.0, 1.0], [2, 2])
+        const tensor.Tensor k ← tene([1.0, 0.0, 0.0, 1.0], [2, 2])
+        const tensor.Tensor v ← tene([1.0, 1.0, 2.0, 2.0], [2, 2])
+        const tensor.Tensor full ← attention.scaled_dot_product_causal_rope(q, k, v, 1.0 ∷ f32, [0, 1], 2)
+        const tensor.Tensor q0 ← tene([1.0, 0.0], [1, 2])
+        const tensor.Tensor k0 ← tene([1.0, 0.0], [1, 2])
+        const tensor.Tensor v0 ← tene([1.0, 1.0], [1, 2])
+        const attention.CachedAttention s0 ← attention.scaled_dot_product_causal_rope_cached(q0, k0, v0, 1.0 ∷ f32, [0], 2, cache_p(2), [3])
+        const tensor.Tensor q1 ← tene([0.0, 1.0], [1, 2])
+        const tensor.Tensor k1 ← tene([0.0, 1.0], [1, 2])
+        const tensor.Tensor v1 ← tene([2.0, 2.0], [1, 2])
+        const attention.CachedAttention s1 ← attention.scaled_dot_product_causal_rope_cached(q1, k1, v1, 1.0 ∷ f32, [1], 2, s0.state(), [4])
+        const tensor.Tensor stored_k ← attention.rotary_position_embedding(k1, [1], 2)
+        assert e2(s1.context(), 0, 0).approx(e2(full, 1, 0), TOLERANCE)
+        assert e2(s1.context(), 0, 1).approx(e2(full, 1, 1), TOLERANCE)
+        assert s1.state().length() ≡ 2
+        assert e2(s1.state().key(), 1, 0).approx(e2(stored_k, 0, 0), TOLERANCE)
+        assert e2(s1.state().key(), 1, 1).approx(e2(stored_k, 0, 1), TOLERANCE)
+        assert e2(s1.state().payload(), 1, 0) ≡ 2.0 ∷ f32
+        assert e2(s1.state().payload(), 1, 1) ≡ 2.0 ∷ f32
+        assert e2(s1.state().key(), 1, 0) ≠ e2(k1, 0, 0)
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "cached decode rejects a local row-zero RoPE position" {
+    do {
+        const tensor.Tensor q0 ← tene([1.0, 0.0], [1, 2])
+        const tensor.Tensor k0 ← tene([1.0, 0.0], [1, 2])
+        const tensor.Tensor v0 ← tene([1.0, 1.0], [1, 2])
+        const attention.CachedAttention s0 ← attention.scaled_dot_product_causal_rope_cached(q0, k0, v0, 1.0 ∷ f32, [0], 2, cache_p(2), [3])
+        const tensor.Tensor q1 ← tene([0.0, 1.0], [1, 2])
+        const tensor.Tensor k1 ← tene([0.0, 1.0], [1, 2])
+        const tensor.Tensor v1 ← tene([2.0, 2.0], [1, 2])
+        assert sdp_cached_detail(q1, k1, v1, 1.0 ∷ f32, [0], 2, s0.state(), [4]) ≡ "position must be the absolute prefix row"
+        assert sdp_cached_detail(q1, k1, v1, 1.0 ∷ f32, [1], 2, s0.state(), [4]) ≡ "no error"
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "GQA cached prefill and M=1 decode match the full row including the just-written position" {
+    do {
+        const attention.RopeConfig c ← attention.construct_rope_config(100000.0 ∷ f32, 1.0 ∷ f32, attention.consecutive_policy())
+        const tensor.Tensor q ← tene([1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0], [2, 4])
+        const tensor.Tensor k ← tene([1.0, 0.0, 0.0, 1.0], [2, 2])
+        const tensor.Tensor v ← tene([1.0, 2.0, 3.0, 4.0], [2, 2])
+        const tensor.Tensor wo ← tene([1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0], [4, 4])
+        const tensor.Tensor full ← attention.multi_head_attention(q, k, v, wo, 2, 1, 1.0 ∷ f32, [0, 1], 2, c)
+        const attention.CachedAttention prefill ← attention.multi_head_attention_cached(q, k, v, wo, cache_p(2), 2, 1, 1.0 ∷ f32, [0, 1], 2, c, [3, 4])
+        assert prefill.context().shape() ≡ full.shape()
+        assert e2(prefill.context(), 0, 0).approx(e2(full, 0, 0), TOLERANCE)
+        assert e2(prefill.context(), 1, 0).approx(e2(full, 1, 0), TOLERANCE)
+        assert prefill.state().length() ≡ 2
+        const tensor.Tensor stored_k ← attention.rotary_position_embedding(k, [0, 1], 2)
+        assert prefill.state().key().data ≡ stored_k.data
+        assert prefill.state().payload().data ≡ v.data
+        const tensor.Tensor q0 ← tene([1.0, 0.0, 0.0, 1.0], [1, 4])
+        const tensor.Tensor k0 ← tene([1.0, 0.0], [1, 2])
+        const tensor.Tensor v0 ← tene([1.0, 2.0], [1, 2])
+        const attention.CachedAttention s0 ← attention.multi_head_attention_cached(q0, k0, v0, wo, cache_p(2), 2, 1, 1.0 ∷ f32, [0], 2, c, [3])
+        const tensor.Tensor q1 ← tene([0.0, 1.0, 1.0, 0.0], [1, 4])
+        const tensor.Tensor k1 ← tene([0.0, 1.0], [1, 2])
+        const tensor.Tensor v1 ← tene([3.0, 4.0], [1, 2])
+        const attention.CachedAttention s1 ← attention.multi_head_attention_cached(q1, k1, v1, wo, s0.state(), 2, 1, 1.0 ∷ f32, [1], 2, c, [4])
+        assert e2(s1.context(), 0, 0).approx(e2(full, 1, 0), TOLERANCE)
+        assert e2(s1.context(), 0, 1).approx(e2(full, 1, 1), TOLERANCE)
+        assert e2(s1.context(), 0, 2).approx(e2(full, 1, 2), TOLERANCE)
+        assert e2(s1.context(), 0, 3).approx(e2(full, 1, 3), TOLERANCE)
+        assert s1.state().length() ≡ 2
+        assert e2(s1.state().payload(), 1, 0) ≡ 3.0 ∷ f32
+        assert e2(s1.state().payload(), 1, 1) ≡ 4.0 ∷ f32
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "cached GQA rejects a head count that does not divide query heads" {
+    assert mha_cached_detail(tene([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], [2, 4]), tene([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], [2, 4]), tene([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], [2, 4]), tene([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], [4, 4]), cache_p(4), 4, 3, 1.0 ∷ f32, [0, 1], 2, [3, 4]) ≡ "num_heads must be a multiple of num_kv_heads"
+}
+
+test "cached GQA rejects a local row-zero RoPE position" {
+    do {
+        const attention.RopeConfig c ← attention.construct_rope_config(100000.0 ∷ f32, 1.0 ∷ f32, attention.consecutive_policy())
+        const tensor.Tensor q0 ← tene([1.0, 0.0, 0.0, 1.0], [1, 4])
+        const tensor.Tensor k0 ← tene([1.0, 0.0], [1, 2])
+        const tensor.Tensor v0 ← tene([1.0, 2.0], [1, 2])
+        const tensor.Tensor wo ← tene([1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0], [4, 4])
+        const attention.CachedAttention s0 ← attention.multi_head_attention_cached(q0, k0, v0, wo, cache_p(2), 2, 1, 1.0 ∷ f32, [0], 2, c, [3])
+        const tensor.Tensor q1 ← tene([0.0, 1.0, 1.0, 0.0], [1, 4])
+        const tensor.Tensor k1 ← tene([0.0, 1.0], [1, 2])
+        const tensor.Tensor v1 ← tene([3.0, 4.0], [1, 2])
+        assert mha_cached_detail(q1, k1, v1, wo, s0.state(), 2, 1, 1.0 ∷ f32, [0], 2, [4]) ≡ "position must be the absolute prefix row"
+        assert mha_cached_detail(q1, k1, v1, wo, s0.state(), 2, 1, 1.0 ∷ f32, [1], 2, [4]) ≡ "no error"
+    }
+    catch err {
+        assert false
+    }
+}
