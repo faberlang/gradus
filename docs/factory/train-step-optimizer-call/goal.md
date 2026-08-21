@@ -1,6 +1,6 @@
 # GOAL: train-step-optimizer-call — delegate `train_step_*` to the optimizer now that library-to-library calls execute
 
-**Status**: active — units 1–4 done (`23d951b`, `601d2f5`, `c67f552`, `f51f299`+`d6138d5`); unit 5 (truth pass) unblocked
+**Status**: active — all 5 units landed (23d951b, 601d2f5, c67f552, f51f299+d6138d5, 7646ed7); goal-closeout audit is the remaining gate to done
 **Created**: 2026-08-21
 **Campaign:** `—` (standalone)
 **Source:** operator verification request (session 2026-08-21). A documentation session claimed that the compiler could not resolve library-to-library calls, so `train_step_*` carried the update math inline rather than calling the optimizer. Verification found the workaround real but its justification **stale**: the runtime gap closed in radix on 2026-08-09 and the revisit trigger this repo recorded ("revisit when that runtime gap closes") fired without anyone revisiting.
@@ -106,7 +106,7 @@ not move).
 | 2 | done | — | 601d2f5 | `_sgd_family` moved to `gradus:optimize` (OQ2 default); `train_step_2x2`/`_4x4` + BERT pair delegate via `sgd_step_*`; inline `param − lr·grad` copies deleted from `train.fab`; compile-level `train.proba` added (faber test execution rides unit 4) |
 | 3 | done | ddaedafa | c67f552 | E7 repaired (gguf.proba int parse; qwen35moe artifact import); faber check gradus GREEN |
 | 4 | done | f89e5f86 + ce7c70b4 | f51f299 + d6138d5 | trajectory through delegation matches PML4 pins exactly (final 0.017928625511508454); faber test train/optimize 90P/0F after U4b (`string.get(i)` returns `ascii`, not `textus` — `_digit` widens via `↦ textus`, `_contains_separator` uses `slice`); BERT 12-tuple cases remain omitted (E8/E10 radix residual, recorded) |
-| 5 | pending | — | — | — |
+| 5 | done | fa00add1 | 7646ed7 | truth pass: E6 headers + README + exemplum header refreshed; stale-claim scan clean (remaining env-blocked mentions are CTO8-1 named clauses, distinct); E8/E10 residuals preserved |
 
 ## Open questions
 
