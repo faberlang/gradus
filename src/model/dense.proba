@@ -27,6 +27,12 @@ locale = "en"
 #     (BadConfig).
 #   * forward-only / autograd independence: the surface composes bare (no
 #     autograd import, no gradient path).
+#   * KV-A A3 — dense logical prefill/decode composition: all layers start
+#     at one shared prefix and advance together; prefill then one decode
+#     step matches full recompute of the longer sequence on the synthetic
+#     fixture; decode rejects position ≠ cache.length() as Gap; Overflow
+#     and Gap reach the caller (not a shape mismatch). Compile-level pin
+#     only (library-import execution gap; E6 supplies the executed proof).
 #
 # assert assertions run under the cargo-backed `faber test` harness
 # (auditor-owned); `faber check` proves the whole surface type-checks.
@@ -310,13 +316,13 @@ describe "REF-01-U1.8 forward-only, autograd-independent" {
     }
 }
 
-fn structure_p() → kv.KVStructure {
+fn structure_cap(int context_length) → kv.KVStructure {
     var kv.KVStructure s ← kv.default_kv_structure()
     do {
         const kv.LayerSet set ← kv.construct_layer_set([0, 1], kv.dense_structure(), 2, 4)
         var list<kv.LayerSet> sets ← empty
         sets.append(set)
-        s ← kv.construct_kv_structure(sets, kv.kv_dtype_f32(), kv.kv_dtype_f32(), kv.v_layout_transposed(), kv.sharing_gqa(), kv.attention_classic(), 4, 8, 8)
+        s ← kv.construct_kv_structure(sets, kv.kv_dtype_f32(), kv.kv_dtype_f32(), kv.v_layout_transposed(), kv.sharing_gqa(), kv.attention_classic(), 4, 8, context_length)
         return s
     }
     catch err {
@@ -325,16 +331,20 @@ fn structure_p() → kv.KVStructure {
     return s
 }
 
-fn empty_p() → list<kv.KVCache> {
+fn empty_cap(int context_length) → list<kv.KVCache> {
     var list<kv.KVCache> layers ← empty
     do {
-        layers ← dense.empty_caches(structure_p(), "tiny-mlp", "1.0.0", "causal-rope-d4", "smollm")
+        layers ← dense.empty_caches(structure_cap(context_length), "tiny-mlp", "1.0.0", "causal-rope-d4", "smollm")
         return layers
     }
     catch err {
         return layers
     }
     return layers
+}
+
+fn empty_p() → list<kv.KVCache> {
+    return empty_cap(8)
 }
 
 fn step_p(dense.DenseConfig cfg, (string, int) → tensor.Tensor ⇥ dense.DenseError source, int token_id, int position, list<kv.KVCache> layers) → dense.DenseStep {
@@ -359,6 +369,30 @@ fn prefill_p(dense.DenseConfig cfg, (string, int) → tensor.Tensor ⇥ dense.De
         return s
     }
     return s
+}
+
+fn decode_text(dense.DenseConfig cfg, (string, int) → tensor.Tensor ⇥ dense.DenseError source, int token_id, int position, list<kv.KVCache> layers) → string {
+    do {
+        const dense.DenseStep _ ← dense.decode_step(cfg, source, token_id, position, (0.00001 ∷ f32), (0.5 ∷ f32), 4, rq, layers)
+        return "ok"
+    }
+    catch err {
+        return dense.message(err)
+    }
+}
+
+fn prefill_text(dense.DenseConfig cfg, (string, int) → tensor.Tensor ⇥ dense.DenseError source, list<int> tokens, list<kv.KVCache> layers) → string {
+    do {
+        const dense.DenseStep _ ← dense.prefill_cached(cfg, source, tokens, (0.00001 ∷ f32), (0.5 ∷ f32), 4, rq, layers)
+        return "ok"
+    }
+    catch err {
+        return dense.message(err)
+    }
+}
+
+fn layer_at(list<kv.KVCache> layers, int i) → kv.KVCache {
+    return layers.get(i) coalesce kv.default()
 }
 
 describe "GGUF-A5 — incremental decode_step vs full forward" {
@@ -393,5 +427,67 @@ describe "U6 — batched cached prefill composes with incremental decode" {
         assert second.length() ≡ TOKENS.length()
         assert first.history() ≡ TOKENS
         assert second.history() ≡ TOKENS
+    }
+}
+
+describe "KV-A A3 — dense logical prefill/decode composition" {
+    test "all layers start at one shared prefix and advance together" {
+        const dense.DenseConfig cfg ← dense.DenseConfig { layers = 2, heads = 4, kv_heads = 2, head_dim = 4, hidden_dim = 16, vocab = 8, tied = true }
+        const (string, int) → tensor.Tensor ⇥ dense.DenseError source ← (string n, int s) → tensor.Tensor ⇥ dense.DenseError ∴ _repertor(n, s, EMBED, NORM_S, W_HEAD, l0, l1, false, false)
+        const list<kv.KVCache> start ← empty_p()
+        assert layer_at(start, 0).length() ≡ 0
+        assert layer_at(start, 1).length() ≡ layer_at(start, 0).length()
+        const dense.DenseStep pref ← prefill_p(cfg, source, TOKENS, start)
+        assert layer_at(pref.layers(), 0).length() ≡ TOKENS.length()
+        assert layer_at(pref.layers(), 1).length() ≡ layer_at(pref.layers(), 0).length()
+        assert layer_at(pref.layers(), 0).history() ≡ TOKENS
+        assert layer_at(pref.layers(), 1).history() ≡ TOKENS
+        const dense.DenseStep step ← step_p(cfg, source, 1, 2, pref.layers())
+        assert layer_at(step.layers(), 0).length() ≡ 3
+        assert layer_at(step.layers(), 1).length() ≡ 3
+        assert layer_at(step.layers(), 0).history() ≡ [0, 7, 1]
+        assert layer_at(step.layers(), 1).history() ≡ [0, 7, 1]
+    }
+    test "prefill then one decode step matches full recompute of the longer sequence" {
+        const dense.DenseConfig cfg ← dense.DenseConfig { layers = 2, heads = 4, kv_heads = 2, head_dim = 4, hidden_dim = 16, vocab = 8, tied = true }
+        const (string, int) → tensor.Tensor ⇥ dense.DenseError source ← (string n, int s) → tensor.Tensor ⇥ dense.DenseError ∴ _repertor(n, s, EMBED, NORM_S, W_HEAD, l0, l1, false, false)
+        const list<int> longer ← [0, 7, 1]
+        const dense.DenseStep pref ← prefill_p(cfg, source, TOKENS, empty_p())
+        const dense.DenseStep step ← step_p(cfg, source, 1, 2, pref.layers())
+        const tensor.Tensor full ← model_p(cfg, source, longer, (0.00001 ∷ f32), (0.5 ∷ f32), [0, 1, 2], 4, rq)
+        assert pref.logits().shape() ≡ [2, 8]
+        assert e2(pref.logits(), 0, 0).approximata(e2(full, 0, 0), TOLERATIO)
+        assert e2(pref.logits(), 1, 7).approximata(e2(full, 1, 7), TOLERATIO)
+        assert step.logits().shape() ≡ [1, 8]
+        assert e2(step.logits(), 0, 0).approximata(e2(full, 2, 0), TOLERATIO)
+        assert e2(step.logits(), 0, 3).approximata(e2(full, 2, 3), TOLERATIO)
+        assert e2(step.logits(), 0, 7).approximata(e2(full, 2, 7), TOLERATIO)
+        assert layer_at(step.layers(), 0).length() ≡ longer.length()
+        assert layer_at(step.layers(), 1).length() ≡ longer.length()
+    }
+    test "decode rejects a position that is not the shared cache length" {
+        const dense.DenseConfig cfg ← dense.DenseConfig { layers = 2, heads = 4, kv_heads = 2, head_dim = 4, hidden_dim = 16, vocab = 8, tied = true }
+        const (string, int) → tensor.Tensor ⇥ dense.DenseError source ← (string n, int s) → tensor.Tensor ⇥ dense.DenseError ∴ _repertor(n, s, EMBED, NORM_S, W_HEAD, l0, l1, false, false)
+        assert decode_text(cfg, source, 7, 1, empty_p()) ≡ "position must equal the cache length"
+        const dense.DenseStep pref ← prefill_p(cfg, source, TOKENS, empty_p())
+        assert decode_text(cfg, source, 1, 0, pref.layers()) ≡ "position must equal the cache length"
+        assert decode_text(cfg, source, 1, 3, pref.layers()) ≡ "position must equal the cache length"
+        assert decode_text(cfg, source, 1, 2, pref.layers()) ≡ "ok"
+    }
+    test "overflow and gap reach the caller instead of a shape mismatch" {
+        const dense.DenseConfig cfg ← dense.DenseConfig { layers = 2, heads = 4, kv_heads = 2, head_dim = 4, hidden_dim = 16, vocab = 8, tied = true }
+        const (string, int) → tensor.Tensor ⇥ dense.DenseError source ← (string n, int s) → tensor.Tensor ⇥ dense.DenseError ∴ _repertor(n, s, EMBED, NORM_S, W_HEAD, l0, l1, false, false)
+        assert prefill_text(cfg, source, TOKENS, empty_cap(1)) ≡ "cache overflow"
+        const dense.DenseStep pref1 ← prefill_p(cfg, source, [0], empty_cap(1))
+        assert layer_at(pref1.layers(), 0).length() ≡ 1
+        assert decode_text(cfg, source, 7, 1, pref1.layers()) ≡ "cache overflow"
+        assert layer_at(pref1.layers(), 0).length() ≡ 1
+        const dense.DenseStep pref ← prefill_p(cfg, source, TOKENS, empty_p())
+        assert prefill_text(cfg, source, TOKENS, pref.layers()) ≡ "cache write leaves a gap"
+        var list<kv.KVCache> mixed ← empty
+        mixed.append(layer_at(pref.layers(), 0))
+        mixed.append(layer_at(empty_p(), 1))
+        assert decode_text(cfg, source, 1, 2, mixed) ≡ "cache write leaves a gap"
+        assert decode_text(cfg, source, 1, 0, mixed) ≡ "cache write leaves a gap"
     }
 }
