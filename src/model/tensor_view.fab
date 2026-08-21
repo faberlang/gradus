@@ -139,6 +139,20 @@ fn _limit(gguf_manifest.GgufManifest m, string name) → tuple<int, int> ⇥ Vie
     }
 }
 
+# Known-layout projection. Unknown layouts fail closed before any range
+# or decode work; both materializers share the same message.
+@ private { }
+fn _known(gguf_manifest.GgmlLayout layout) → tuple<int, int, int> ⇥ ViewError {
+    match layout {
+        case gguf_manifest.Unknown const kind {
+            throw variant UnknownLayout {message = "tensor layout is unknown; payload range is unavailable"}
+        }
+        case gguf_manifest.Known const elements_per_block, bytes_per_block, byte_length {
+            return tuple<int, int, int> [elements_per_block, bytes_per_block, byte_length]
+        }
+    }
+}
+
 # Bind one descriptor + one validated payload into the typed view. The payload
 # supplies only bounded bytes plus its own range facts; both facts must match
 # the manifest's validated tensor table exactly.
@@ -174,7 +188,8 @@ const int MAXIMUM_SLICE_ELEMENTS ← 16777216
 # short read fails closed as BadRange.
 @ private { }
 fn _read_source((int, int) → bytes ⇥ gguf_manifest.GgufManifestError source, int start, int length) → bytes ⇥ ViewError {
-    require not (start ≺ 0 or length ≺ 0) throw variant BadRange {message = "block sub-window range is negative"}
+    require start ≥ 0 throw variant BadRange {message = "block sub-window range is negative"}
+    require length ≥ 0 throw variant BadRange {message = "block sub-window range is negative"}
     var bytes chunk ← ||
     do {
         chunk ← source(start, length)
@@ -186,6 +201,40 @@ fn _read_source((int, int) → bytes ⇥ gguf_manifest.GgufManifestError source,
     return chunk
 }
 
+@ private { }
+fn _read_block(TensorView v, int bytes_per_block, int block, (int, int) → bytes ⇥ gguf_manifest.GgufManifestError source) → bytes ⇥ ViewError {
+    const int payload_off ← block * bytes_per_block
+    const int absolute ← v.absolute_start + payload_off
+    return _read_source(source, absolute, bytes_per_block)
+}
+
+@ private { }
+fn _block_bytes(bytes chunk) → list<int<u8>> {
+    var list<int<u8>> out ← empty
+    for range 0‥chunk.length() const j {
+        out.append(chunk.get(j) coalesce 0 ∷ int<u8>)
+    }
+    return out
+}
+
+@ private { }
+fn _dequantize_chunk(int dtype_ggml, bytes chunk) → list<f32> ⇥ ViewError {
+    do {
+        return dequant.dequantize_block(dtype_ggml, _block_bytes(chunk))
+    }
+    catch err {
+        match err {
+            case dequant.BadPayload const message {
+                throw variant BadRange {message = "block value decode failed: §"(message)}
+            }
+            case _ {
+                throw variant BadRange {message = "block decode failed"}
+            }
+        }
+    }
+    throw variant BadRange {message = "block decode failed"}
+}
+
 # Dequantize one element-aligned window of a bound view, one block per
 # source read, in GGUF block order. The window [element_start,
 # element_start + element_length) must be within the tensor and
@@ -194,49 +243,26 @@ fn _read_source((int, int) → bytes ⇥ gguf_manifest.GgufManifestError source,
 # read path exists.
 @ public { }
 fn materialize_slice(TensorView v, int element_start, int element_length, (int, int) → bytes ⇥ gguf_manifest.GgufManifestError source) → list<f32> ⇥ ViewError {
-    match v.layout {
-        case gguf_manifest.Unknown const kind {
-            throw variant UnknownLayout {message = "tensor layout is unknown; payload range is unavailable"}
-        }
-        case gguf_manifest.Known const elements_per_block, bytes_per_block, byte_length {
-            require not (element_start ≺ 0 or element_length ≺ 0) throw variant BadBounds {message = "element window is negative"}
-            require element_length ≤ MAXIMUM_SLICE_ELEMENTS throw variant BadBounds {message = "element window exceeds the bounded slice cap"}
-            require not (element_start ≻ v.elements or element_length ≻ v.elements - element_start) throw variant BadBounds {message = "element window exceeds the tensor"}
-            require not (element_start % elements_per_block ≠ 0 or element_length % elements_per_block ≠ 0) throw variant BadOrder {message = "element window is not aligned to the tensor block boundary"}
-            const int first_block ← element_start / elements_per_block
-            const int block_count ← element_length / elements_per_block
-            var list<f32> y ← empty
-            for range 0‥block_count const i {
-                const int block ← first_block + i
-                const int payload_off ← block * bytes_per_block
-                const int absolute ← v.absolute_start + payload_off
-                const bytes chunk ← _read_source(source, absolute, bytes_per_block)
-                var list<int<u8>> blocks ← empty
-                var int j ← 0
-                while j ≺ chunk.length() {
-                    blocks.append(chunk.get(j) coalesce 0 ∷ int<u8>)
-                    j ← j + 1
-                }
-                do {
-                    const list<f32> g ← dequant.dequantize_block(v.dtype_ggml, blocks)
-                    for from g const x {
-                        y.append(x)
-                    }
-                }
-                catch err {
-                    match err {
-                        case dequant.BadPayload const message {
-                            throw variant BadRange {message = "block value decode failed: §"(message)}
-                        }
-                        case _ {
-                            throw variant BadRange {message = "block decode failed"}
-                        }
-                    }
-                }
-            }
-            return y
+    const tuple<int, int, int> known ← _known(v.layout)
+    const int elements_per_block ← known[0]
+    const int bytes_per_block ← known[1]
+    require element_start ≥ 0 throw variant BadBounds {message = "element window is negative"}
+    require element_length ≥ 0 throw variant BadBounds {message = "element window is negative"}
+    require element_length ≤ MAXIMUM_SLICE_ELEMENTS throw variant BadBounds {message = "element window exceeds the bounded slice cap"}
+    require element_start ≤ v.elements throw variant BadBounds {message = "element window exceeds the tensor"}
+    require element_length ≤ v.elements - element_start throw variant BadBounds {message = "element window exceeds the tensor"}
+    require element_start % elements_per_block ≡ 0 throw variant BadOrder {message = "element window is not aligned to the tensor block boundary"}
+    require element_length % elements_per_block ≡ 0 throw variant BadOrder {message = "element window is not aligned to the tensor block boundary"}
+    const int first_block ← element_start / elements_per_block
+    const int block_count ← element_length / elements_per_block
+    var list<f32> y ← empty
+    for range 0‥block_count const i {
+        const list<f32> g ← _dequantize_chunk(v.dtype_ggml, _read_block(v, bytes_per_block, first_block + i, source))
+        for from g const x {
+            y.append(x)
         }
     }
+    return y
 }
 
 # Dequantize exactly one block of a bound view, addressed by block index —
@@ -246,36 +272,11 @@ fn materialize_slice(TensorView v, int element_start, int element_length, (int, 
 # decode. No whole-tensor or whole-model read path exists.
 @ public { }
 fn materialize_block(TensorView v, int block_index, (int, int) → bytes ⇥ gguf_manifest.GgufManifestError source) → list<f32> ⇥ ViewError {
-    match v.layout {
-        case gguf_manifest.Unknown const kind {
-            throw variant UnknownLayout {message = "tensor layout is unknown; payload range is unavailable"}
-        }
-        case gguf_manifest.Known const elements_per_block, bytes_per_block, byte_length {
-            require block_index ≥ 0 throw variant BadBounds {message = "block index is negative"}
-            const int blocks ← v.elements / elements_per_block
-            require block_index ≺ blocks throw variant BadBounds {message = "block index exceeds the tensor block count"}
-            const int payload_off ← block_index * bytes_per_block
-            const int absolute ← v.absolute_start + payload_off
-            const bytes chunk ← _read_source(source, absolute, bytes_per_block)
-            var list<int<u8>> block_bytes ← empty
-            var int j ← 0
-            while j ≺ chunk.length() {
-                block_bytes.append(chunk.get(j) coalesce 0 ∷ int<u8>)
-                j ← j + 1
-            }
-            do {
-                return dequant.dequantize_block(v.dtype_ggml, block_bytes)
-            }
-            catch err {
-                match err {
-                    case dequant.BadPayload const message {
-                        throw variant BadRange {message = "block value decode failed: §"(message)}
-                    }
-                    case _ {
-                        throw variant BadRange {message = "block decode failed"}
-                    }
-                }
-            }
-        }
-    }
+    const tuple<int, int, int> known ← _known(v.layout)
+    const int elements_per_block ← known[0]
+    const int bytes_per_block ← known[1]
+    require block_index ≥ 0 throw variant BadBounds {message = "block index is negative"}
+    const int blocks ← v.elements / elements_per_block
+    require block_index ≺ blocks throw variant BadBounds {message = "block index exceeds the tensor block count"}
+    return _dequantize_chunk(v.dtype_ggml, _read_block(v, bytes_per_block, block_index, source))
 }
