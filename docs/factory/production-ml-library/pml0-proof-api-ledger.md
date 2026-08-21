@@ -38,8 +38,8 @@ from package code admits a symbol.
 | 7 | loss | `mse_2x2` | 2×2 f32 | `examples/training/linear-regression/src/train.fab:94` | **admit** |
 | 8 | loss | `mse_4x4` | 4×4 f32 | `examples/training/mlp/src/train.fab:153` | **admit** |
 | 9 | loss | `mse_2x8` | 2×8 f32 | `examples/training/bert-tiny-fragment/src/train.fab:375`; `examples/training/bert-gradus-probe/src/train.fab:356,373` | **admit** |
-| 10 | optimize | `sgd_step_2x2` | 2×2 f32 | none — no call site anywhere in the container; the same update math is inlined in `train_step_2x2` (see `src/train.fab:28-29,41` stepper lib→lib gap) | **retire** |
-| 11 | optimize | `sgd_step_4x4` | 4×4 f32 | none — no call site anywhere in the container; the same update math is inlined in `train_step_4x4` (see `src/train.fab:28-29,102`) | **retire** |
+| 10 | optimize | `sgd_step_2x2` | 2×2 f32 | none — no call site anywhere in the container; the same update math is inlined in `train_step_2x2` (see `src/train.fab:28-29,41` stepper lib→lib gap) | **retire** — reversed, see below |
+| 11 | optimize | `sgd_step_4x4` | 4×4 f32 | none — no call site anywhere in the container; the same update math is inlined in `train_step_4x4` (see `src/train.fab:28-29,102`) | **retire** — reversed, see below |
 | 12 | attention | `scaled_dot_product_2x8` | 2×8 f32 | `examples/training/bert-tiny-fragment/src/train.fab:366` (+ oracle `examples/training/bert-tiny-fragment/oracle/capture.fab:398`); `examples/training/bert-gradus-probe/src/train.fab:364` | **admit** |
 | 13 | transformer | `attention_block_2x8` | 2×8 f32 | none — no call site anywhere in the container; `bert_tiny_block_2x8` inlines the same math instead of calling it (see `src/transformer.fab:28-30`) | **retire** |
 | 14 | transformer | `ffn_block_2x8` | 2×8 f32 | none — no call site anywhere in the container; `bert_tiny_block_2x8` inlines the same math instead of calling it (see `src/transformer.fab:28-30`) | **retire** |
@@ -78,6 +78,18 @@ from package code admits a symbol.
   evidence for PML0; the production tensor API shape posture (generic /
   generated / staged mix) is decided at PML1 per `pml0-delivery.md` Open
   Questions.
+
+## Reversal note (rows 10–11)
+
+`sgd_step_2x2` and `sgd_step_4x4` were retired for the toolchain gap
+(recorded 2026-08-04 in `cd3883d`; symbols removed at PML1-U6 `6e48a7f`,
+2026-08-08): the FMIR stepper could not resolve library-to-library calls, so
+`train_step_*` inlined `param − lr·grad` instead of calling the optimizer.
+The gap closed in radix `43c0102ba` (2026-08-09), regression-locked by
+`2e8042ae7` (2026-08-11). Restored here (`train-step-optimizer-call` unit 1)
+as the tensor-level `param − lr·grad` surface under `gradus:optimize` (OQ1
+default: per-tensor in/out, drop-in for `train_step_*` delegation). The
+PML0-U3 **retire** cells above are the historical snapshot.
 
 ## Validation
 
