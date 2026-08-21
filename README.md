@@ -138,8 +138,12 @@ performance is claimed here.
 | Model admission (capsule, GGUF, Safetensors) | Shipped; GGUF inspection has executed real-file receipts. `tensor_view.links` binds a payload to a manifest. Architecture adapters do not claim inference |
 | Tokenizer identity | Shipped |
 | Inference (decode, cache, sampling, generation) | Shipped (structural) |
-| Dense forward (`gradus:model/dense` `forward`) | Shipped over synthetic graphs; not a real-model inference claim |
+| Dense forward (`gradus:model/dense` `forward`, `prefill_cached`, `decode_step`) | Shipped over synthetic graphs (compile-pinned prefill then decode matching full recompute); not a real-model inference claim |
 | GPU training / executed runs | Not claimed |
+
+KV-cache writes fail closed on gap and overflow against an immutable
+capacity; cached-attention positions are absolute and include the
+just-written row.
 
 Campaign ledgers, unit receipts, and per-symbol coverage live in
 [`docs/api-reference.md`](docs/api-reference.md),
@@ -147,9 +151,8 @@ Campaign ledgers, unit receipts, and per-symbol coverage live in
 [`docs/factory/production-ml-library/`](docs/factory/production-ml-library/).
 Exemplum receipts sit next to each demo under `exempla/`.
 
-The compiler's reverse-mode AD transform covers 16 of 18 AIR tensor ops
-with VJPs; two ops (broadcast, reduce) have partial support. Gradus wraps
-that capability into a self-contained user library.
+Gradus wraps the compiler's reverse-mode AD transform (`radix-air`). The
+admitted VJP family and its gaps live in that crate, not here.
 
 GGUF metadata and tensor directories are capped at 4,096 entries and
 individual retained reads at 64 MiB. Gradus retains no path, URL, file
@@ -216,7 +219,7 @@ are not a standing claim.
 | NN primitives + attention/transformer | Shipped | Gradus |
 | Model admission (capsule + Safetensors + GGUF + dequant) | Shipped | Gradus |
 | Tokenizer identity + stop binding | Shipped | Gradus |
-| Inference: decode, KV-cache, sampling, generation config | Shipped | Gradus |
+| Inference: decode, KV-cache, sampling, generation config | Shipped — fail-closed capacity; absolute cache positions | Gradus |
 | nanoGPT on Shakespeare (CPU) | Planned (not in-tree) | Gradus |
 | Executed proba / e2e runs | Not claimed | — |
 | GPU training / executed performance | Planned — depends on Radix/hosts | Radix + hosts |
@@ -240,11 +243,12 @@ rows and train steps remain the admitted caller surface; their formula is
 exactly the shape-generic `loss.mse` / optimizer-state update over the
 same element arithmetic.
 
-The seam proof for this surface is `exempla/gradient-seam/`. Its
-package-owned model function retains a single explicit `@ radix backward`
-annotation. The compiler cannot yet resolve library-to-library calls, so
-`train_step_*` currently carries the update math inline rather than
-calling the optimizer; revisit when that runtime gap closes.
+The seam proof for this surface is `exempla/gradient-seam/`. The
+`@ radix backward` annotation lives in `gradus:gradient`; that exemplum
+calls the generated companion through the import. The compiler cannot yet
+resolve library-to-library calls, so `train_step_*` currently carries the
+update math inline rather than calling the optimizer; revisit when that
+runtime gap closes.
 
 ## Import
 
@@ -268,7 +272,7 @@ src/           public `gradus:*` Faber modules (`name.fab` + co-located `name.pr
 exempla/       instructional demos for gradus types
 scripta/       source-library checks (internal)
 fixtures/      test corpus (internal)
-docs/          policy + module map + factory history
+docs/          quickstart, policy, module map, API reference, factory history
 ```
 
 Internal vs product paths: [`docs/internal-surfaces.md`](docs/internal-surfaces.md).
