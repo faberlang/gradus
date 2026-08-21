@@ -1,6 +1,6 @@
 # GOAL: speculative-decode-contract — explicit, lossless acceleration policy over the dense baseline
 
-**Status**: planned — pre-implementation; ready for delivery (lowered to [delivery.md](delivery.md), 7 units, 2026-08-21)
+**Status**: active — 5/7 units landed (U1–U5 on gradus main); U6 next; U7 gated on U6. Lowered to [delivery.md](delivery.md), 7 units, 2026-08-21.
 **Created**: 2026-08-21
 **Campaign:** `speculative-decode`
 **Source:** speculative-decode campaign lowering and the 2026-08-21 live-code audit
@@ -123,12 +123,13 @@ execution paths and remain regime-labeled; this goal does not fabricate them.
 
 | Unit | Status | Seat | Receipt | Notes |
 | --- | --- | --- | --- | --- |
-| 1 | pending | — | — | — |
-| 2 | pending | — | — | — |
-| 3 | pending | — | — | — |
-| 4 | pending | — | — | — |
-| 5 | pending | — | — | — |
-| 6 | pending | — | — | — |
+| 1 | done | hand (a70d341f cycle-1) | `1147ede` | pinned dense baseline oracle |
+| 2 | done | hand | `ce08816` | versioned AccelerationPolicy wire |
+| 3 | done | hand | `9aeb6de` | candidate-provider seam (`gradus:speculative`) |
+| 4 | done | hand | `64513a9` | greedy acceptance contract + typed reject |
+| 5 | done | hand (a70d341f, resumed after drop) | `d5542fc` | `gradus:receipt` leaf; Mind re-ran closeout 2026-08-21: 8 passed, 0 failed |
+| 6 | pending | — | — | two-regime corpus + integrity check |
+| 7 | pending | — | — | disabled-policy regression + handoff + closeout (gated on 6) |
 
 ## Open questions
 
