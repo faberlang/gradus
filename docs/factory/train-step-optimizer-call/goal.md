@@ -102,7 +102,7 @@ not move).
 
 | Unit | Status | Seat | Receipt | Notes |
 | --- | --- | --- | --- | --- |
-| 1 | pending | — | — | — |
+| 1 | done | ac8e66ae | 23d951b | sgd_step_2x2/_4x4 restored + PML0 reversal note; red-green (SEM004 absent→present) |
 | 2 | pending | — | — | — |
 | 3 | pending | — | — | — |
 | 4 | pending | — | — | — |
