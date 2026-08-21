@@ -6,9 +6,10 @@ a 4×4 two-layer MLP (linear → GELU → linear → MSE), 100 steps, lr 0.1 —
 the accepted MLP training-proof shape (`examples/training/mlp`, the pinned
 CPU/FMIR oracle).
 
-**Tier**: structural (PML6). Oracle pins below match `src/train.proba`
-(PML4-U6). **No executed convergence is claimed** while the FMIR lever
-(CTO8-1) is open.
+**Tier**: executed (FMIR stepper). Oracle pins below match `src/train.proba`
+(PML4-U6). The 100-step loop runs through the delegating stepper
+(`train.train_step_4x4` → `optimize.sgd_step_4x4`); printed losses match
+the pins (final `0.017928625511508454`).
 
 ## What the loop composes (the U6 residual from PML4-U5)
 
@@ -17,7 +18,7 @@ CPU/FMIR oracle).
 | Schedule → optimizer-state binding | `train.scheduled_rate` (U4) feeds `optimize.construct`'s `rate` (U3) each step — the accepted constant lr 0.1 is the schedule `Schedule(0.1, 0, 1, 0.1)` (vertex == end) |
 | Shared-layer training path | `gradus.forward_mlp_loss` (loss) + the compiler-generated companion `forward_mlp_loss_backward` (gradients) |
 | Per-parameter gradients | `gradient.construct` records (U2): identity + generation = the parameter version at the backward |
-| Optimizer steps | `optimize.step` (U3): fresh-gradient rules, fail-closed; `parameter.mutate` bumps version |
+| Optimizer steps | Tensor SGD: `train.train_step_4x4` → `optimize.sgd_step_4x4` (the delegating stepper). Parameter/checkpoint: `optimize.step` (U3) fresh-gradient rules, fail-closed; `parameter.mutate` bumps version |
 | Per-step metric log | `metrics.metric` (U5): `loss` = the loss (the accepted trajectory); `accuracy` = the documented regression-match rate (`|pred − target| ≤ 0.1` over the 16 output elements, read from the bare shared forward `gradus.forward_mlp`) |
 | Checkpoint in/out | `train.construct_checkpoint` (U5): whole-optimizer state wire (U3 `serialize`) + RNG state + epoch/step; `serialize_checkpoint` → `deserialize_checkpoint` is the resume round-trip (`checkpoint_equal`) |
 
@@ -39,34 +40,17 @@ ratio checks):
 
 Convergence ratio `final/initial = 0.01137 < 0.1` (the accepted gate).
 
-## Execution record (honest — CTO Q2 / CTO8-1)
+## Execution record (train-step-optimizer-call unit 4)
 
-This library-backed composition is **compile-validated** by
-`faber check` on the package (the reverse-AD transform runs; every U1–U5
-call and the companion invocation type-check). **Executed training is
-env-blocked on both available lanes today**:
+The library-backed composition **executes** on the FMIR stepper.
+Library-to-library calls resolve (radix `43c0102ba`). The tensor SGD
+update is `train.train_step_4x4` → `optimize.sgd_step_4x4`. Printed
+per-step losses match the pins above (final `0.017928625511508454`);
+values did not move vs the pre-delegation oracle.
 
-1. **FMIR stepper** — the recorded library-import gap: `faber test` on a
-   library-importing surface fails with `unsupported MIR lowering: method
-   call before runtime/provider MIR lowering` (library-to-library calls
-   do not resolve in the stepper). Campaign name for the open gate:
-   **FMIR lever / CTO8-1**.
-2. **Rust emit lane** — `faber emit -t rust` on the training path fails
-   with `TARGETLANE001: lane_requires_mir_backed_target`: the AIR-lane
-   reverse-AD companion (`@ radix lane "air"` + `@ radix backward`) does
-   not lower to the Rust target lane.
-
-PML4-U6 is therefore **PARTIAL** per the standing bar: the convergence
-proof is structural (composition + oracle pins), and executed
-value-identity (the loop's loss trajectory vs the pins, the resumed
-trajectory, the deterministic-seed byte identity) is deferred to the
-auditor-owned runtime-evidence gate. **No executed convergence is
-claimed.**
-
-To run the gate once the lanes open: `faber run -t fmir .` (FMIR lane) or
-emit-to-Rust + scratch-crate `cargo run` (Tela double-build pattern) and
-compare the `loss_trace` against the pins above under numeric-policy
-v1.0.0.
+Run: `faber run src/main.fab` from this package (or
+`faber run gradus/exempla/training-loop-mlp/src/main.fab` from the
+container), with `FABER_LIBRARY_HOME` pointing at `faberlang/`.
 
 ## Related
 
