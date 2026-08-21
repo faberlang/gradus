@@ -1,338 +1,270 @@
-# Campaign: Speculative Decode And Prefix Reuse
+# Campaign: Speculative Decode And Prepared-Prefix Reuse
 
-**Status**: planned — drafted 2026-08-21 from the operator-forwarded RTX 3090 DFlash2 post; no stage lowered or implemented yet
+**Status**: planned — live-code review complete 2026-08-21; lowered into eight named factory goals; no delivery or implementation has started
 **Created**: 2026-08-21
-**Mode**: routing artifact — draft/maintain; does not implement code directly
+**Mode**: low-priority routing artifact — keep visible and execute incrementally when capacity is assigned
 **Control-plane repo**: `/Users/ianzepp/work/faberlang/gradus`
-**Participating repos**: `gradus` (decode, cache, sampling, generation semantics); `inferentia` (prefix-reuse consumer evidence); `radix` and `hosts` only through named compiler and device dependencies
-**Source**: operator-forwarded X post (2026-08-21) on `syv-ai/qwen38-27b-rtx3090`; GitHub repo verified live the same day
-**Related**: [`production-ml-library`](../production-ml-library/CAMPAIGN.md) (owns the decode/cache/generation contracts this campaign accelerates); [`inferentia`](../../../../inferentia/docs/factory/inferentia/CAMPAIGN.md) (serving consumer); radix `runpod-gpu-verification` (paid CUDA evidence lane)
-**Lowers to**: `delivery` then `factory`
-**Campaign readiness**: READY FOR ROUTING ONLY — SD0 is the entry stage when the operator starts this campaign
+**Participating repos**: `gradus` (logical decode, cache, sampling, and prepared-state contracts); `radix` and `hosts` (compiled device execution); `inferentia` (single-node retained-state consumer)
+**Source**: operator-forwarded RTX 3090 post; [current reproduction repository](https://github.com/syv-ai/qwen38-27b-rtx3090); [DFlash paper](https://arxiv.org/abs/2602.06036)
+**Related**: [`production-ml-library`](../production-ml-library/CAMPAIGN.md); [`radix device-executor`](../../../../radix/docs/factory/device-executor/goal.md); [`radix kv-cache-decode`](../../../../radix/docs/factory/kv-cache-decode/CAMPAIGN.md); [`Inferentia`](../../../../inferentia/docs/factory/inferentia/CAMPAIGN.md)
+**Campaign readiness**: READY FOR DELIVERY — [`speculative-decode-contract`](../speculative-decode-contract/goal.md) is the first mandatory goal when this campaign receives capacity
 
 ## Summary
 
-Accelerate Gradus decode by admitting multi-token verification, context-sourced
-drafting, and cross-request prefix reuse as lossless, device-neutral Gradus
-semantics — the techniques behind the RTX 3090 Qwen3.8-27B results — with
-Metal as the development backend and CUDA as a peer target qualified through
-RunPod enterprise-GPU mass testing.
+Add one explicit, lossless acceleration policy to the current dense generation
+surface. The first candidate provider is deterministic context lookup. Gradus
+owns reference semantics and complete prepared state; Radix/Hosts own compiled
+multi-row execution; Inferentia owns private retention and warm-request
+evidence. Metal is the development route and CUDA is a mandatory peer
+qualification before campaign close.
 
-## Source Post (claims, not repo truth)
+Low priority is a scheduling decision, not reduced scope. Every named goal
+below is part of the completion contract. Model drafters, quantized KV,
+continuous batching, and multi-device cache tiers are outside this campaign
+and require a separate campaign or an explicit amendment.
 
-The operator forwarded an X post (2026-08-21) describing a 24 GB RTX 3090
-running Qwen3.8-27B at ~381 tok/s single-request on document-reproduction
-tasks (~133 tok/s on ordinary chat), via: speculative decoding with a
-DFlash2 block-diffusion drafter, lookup-augmented drafting that fills extra
-draft positions from prompt context, 16-token verification blocks with 15/16
-acceptance, prefix caching (22.4 s → 0.56 s TTFT on a repeat question against
-a ~25K-token document), and quantized KV/weights/activations. The GitHub repo
-`syv-ai/qwen38-27b-rtx3090` was checked live on 2026-08-21 and its README
-matches these numbers and knobs (`SPEC=dflash2`, `DFLASH_TOKENS=15`,
-`PREFIX_CACHE=1`). The DFlash2 paper (arXiv:2602.06036) was not read directly;
-it is cited here only as reported.
+## Source Claims And Transferable Direction
 
-Durable transferable ideas — independent of NVIDIA/vLLM kernel work:
+The current reproduction repository reports about 133 tok/s for ordinary chat,
+up to 381 tok/s for context-reproduction workloads, 15.0 accepted tokens per
+target step in its reported run, and repeat-prefix prefill falling from 22.4 s
+to 0.56 s. It combines a DFlash2 draft model, context lookup, and complete
+prepared-state reuse. Hybrid-model reuse includes attention KV and recurrent
+state; it is not a KV-only cache.
 
-1. **Verification block length is a free parameter.** Scoring k draft tokens
-   costs roughly one target forward pass, so acceptance rate converts directly
-   into throughput.
-2. **Draft positions can come from anywhere cheap** — a draft model, or the
-   prompt itself when the answer quotes, edits, or extracts context.
-3. **Prefix reuse converts repeat-prompt prefill into near-zero TTFT.**
-4. **Regime honesty.** The headline number holds only when answers are
-   near-verbatim from context; ordinary chat is a different regime and must be
-   reported as one.
+Those figures are external technique evidence, not Gradus targets. The durable
+direction is:
 
-## Problem
+1. score a candidate block in one batched target invocation and commit only its
+   accepted prefix;
+2. use exact prompt/history matches as a weightless first candidate provider;
+3. retain complete state for an exact prepared prefix, including non-KV state;
+4. separate context-reproduction and ordinary-chat measurements; and
+5. gate every speed or TTFT claim on output/state equivalence.
 
-Gradus decode is strictly one token per step. `generation.fab` advances
-`generate`/`generate_with_stop`/`generate_cancelled*` (lines 691–706) through
-`_prefill` (622) and `_decode_one` (632); `decode.fab` exposes
-`construct_decoder` (365), `decode_data` (458), and `decode_cached` (511) —
-all single-token steps. A search of `gradus/src` on 2026-08-21 found no
-speculative decoding, drafting, or lookahead anywhere. No cross-request cache
-reuse exists in gradus or inferentia. Every generated token therefore pays a
-full forward pass, and every request re-prefills shared prompts from scratch —
-exactly the costs the source post removes.
+One batched invocation is not assumed to cost the same as one scalar decode.
+Acceptance, target work, transfer overhead, and throughput are measured
+separately.
 
-The building blocks exist: `cache.fab` already keys cache identity on the
-exact token prefix (lines 255, 543–558) and carries `KvDtype` Q8_0 (block 32)
-and Q4_K (block 256) rows; `sampling.fab` already has greedy argmax (`max`,
-line 201) and seeded `sample` (228) on which acceptance rules can be defined.
+## Verified Ground Truth
 
-## Desired End State
+Source snapshot: Gradus `cf82f70`, Inferentia `3c7211d`, Radix `04d8d5cc4`,
+Hosts `2097ffc` on 2026-08-21. Unrelated semantic work was present in Gradus
+and Radix during the documentation edit and was left untouched. Delivery must
+refresh these facts before implementation.
 
-1. The decode loop can verify k draft tokens in one target forward pass,
-   accept the matching prefix, and roll the KV cache back to the accepted
-   prefix on rejection — as public, device-neutral Gradus semantics.
-2. A lookup drafting policy fills draft positions from prompt/context tokens
-   with no new model weights, giving measured multi-x throughput on
-   context-reproduction workloads (quoting, editing, extraction) while never
-   regressing ordinary-chat decode beyond a bounded overhead.
-3. Cross-request prefix reuse, keyed by the existing cache identity, lets a
-   served second question against an already-prefilled document skip re-prefill,
-   with warm-cache TTFT receipts in inferentia.
-4. All of the above is lossless: under identical `GenerationConfig` and seed,
-   the emitted token stream matches the non-accelerated decode loop.
-5. Receipts exist on Metal (development backend) and CUDA (peer target),
-   including RunPod enterprise-GPU mass testing; the campaign cannot close
-   Metal-only.
-6. Acceleration is explicit `GenerationConfig` surface — supported values,
-   defaults, validation, and reject rows per the PML5 generation-configuration
-   contract — never a silent behavior change.
-
-## Non-Negotiable Correctness Invariant
-
-This campaign cannot complete while any accelerated path emits a token stream
-that differs from the plain decode loop under the same configuration. Greedy
-acceptance must match the plain loop's tokens exactly on the regression
-corpus; any sampled acceptance rule must be admitted only with an equivalence
-proof under pinned seeds. Prefix reuse must produce the same tokens a cold
-cache would. Every throughput or TTFT receipt is regime-labeled
-(context-reproduction vs ordinary chat); unlabeled headline numbers are a
-campaign defect.
-
-## Development Posture
-
-- **Metal develops, CUDA qualifies.** Metal is the current development and
-  test backend; CUDA is an admitted peer target with live host support
-  (`hosts` `cuda_host.rs`, `cuda_launch_adapter.rs`, `cuda-tier-f-proof`;
-  the PML Qwen3.6 invariant itself requires both backends). Full CUDA
-  qualification of this stack lands after core Gradus stability, through
-  SD5.
-- **RunPod is the mass-test lane.** Operator-confirmed RunPod accounts provide
-  enterprise-GPU mass testing. Every RunPod execution is operator-authorized
-  evidence, never a default gate.
-- **Semantics, not kernels.** Gradus owns verification/acceptance/rollback and
-  reuse semantics. CUDA graphs, int8 tensor-core GEMMs, fused verification
-  kernels, and power tuning are radix/hosts lowering work, routed out.
-- **Lossless before fast.** Token-stream equivalence gates every speed claim.
-- **One decode surface.** Acceleration extends `decode`/`generation`/`cache`
-  contracts owned by the PML campaign; no parallel fast-path API fork.
-
-## Implementation Workflow
-
-1. Lower each stage through `delivery` before implementation.
-2. Execute delivery-sized units through `factory` with red-green proofs and
-   `./scripta/check-source` / `./scripta/check-compile`.
-3. Route compiler or device gaps to the owning campaigns (radix MIR-GPU,
-   hosts, NGAB); do not work around them in Gradus.
-4. Update this campaign's stage statuses at every stage boundary.
-
-## Scope Routing
-
-### In campaign
-
-- Verification-block semantics, acceptance rules, KV rollback, and their
-  `decode`/`generation`/`cache` contracts and proofs.
-- Lookup/context drafting as a weightless drafting policy.
-- Cross-request prefix reuse semantics and the inferentia consumer receipt.
-- Regime-labeled measurement method, baseline, and receipts.
-- CUDA and RunPod qualification of the above.
-
-### Split out
-
-- Kernel-level acceleration (CUDA graphs, int8 GEMMs, fused verify kernels,
-  quantized activations) → radix/hosts lowering campaigns.
-- Quantized-KV long-context rows (KVarN-style 4-bit/2-bit) → PML5-GGUF
-  continuation; `cache.fab` already owns `KvDtype` and its flash-attention
-  blocker. Do not duplicate here.
-- Model-drafter speculative decoding (MTP / DFlash2 draft weights) → separate
-  future campaign once SD2/SD3 establish the drafting-policy seam and an
-  admissible draft-model row exists with a pinned legal fixture and oracle.
-- Continuous batching, request scheduling, HTTP serving → inferentia product
-  scope.
-- Multi-device placement → existing multi-device campaign.
-
-## Batching And Split Policy
-
-- **SD0: discovery-first.** Freeze contracts, acceptance rule, measurement
-  method, and baseline before implementation.
-- **SD1–SD3: split-on-boundary** — cache mutation, decode-loop semantics, and
-  drafting policy are separate risk boundaries; batch homogeneous proof rows
-  after each first accepted pattern.
-- **SD4–SD5: batch-by-default** after their first receipts.
-
-## Ground Truth Researched
-
-| Fact | Authority | Treatment |
+| Fact | Live authority | Consequence |
 | --- | --- | --- |
-| Decode is single-token-per-step; no speculative/draft/lookahead code exists | `src/generation.fab` 601–775, `src/decode.fab` 365–511; search 2026-08-21 | The gap this campaign fills |
-| Cache identity keys on exact token prefix; empty-prefix segment defined | `src/cache.fab` 47–71, 255, 543–558 | Reuse foundation; consume, do not fork |
-| `KvDtype` Q8_0/Q4_K rows exist; quantized-V blocked on flash-attention family | `src/cache.fab` 626–749 | Owned by PML5-GGUF; out of scope here |
-| Greedy argmax and seeded sampling exist | `src/sampling.fab` 144–328 | Acceptance-rule substrate |
-| Generation-config explicit contract (values, defaults, reject rows) | PML5 gate in `production-ml-library/CAMPAIGN.md` | Acceleration config must obey it |
-| Inferentia consumes `gradus:*` for admit/tokenize/generate (provider ruling 2615e6a9) | `inferentia/docs/factory/inferentia/CAMPAIGN.md` | SD4 consumer; no `faber-runtime` revival |
-| CUDA host support is live in hosts; Qwen3.6 invariant requires Metal and CUDA | `hosts` cuda sources; PML non-negotiable invariant | Peer-target posture, not aspiration |
-| RunPod accounts exist for enterprise-GPU mass testing | Operator statement 2026-08-21; radix `runpod-gpu-verification` goal | Authorization-gated evidence lane |
-| RTX 3090 recipe numbers and knobs | X post 2026-08-21; `syv-ai/qwen38-27b-rtx3090` README (web-checked 2026-08-21) | External claims — technique authority only, never a gradus receipt |
+| The cache-aware generation baseline is `generate_dense_with_stop`, which advances through scalar `dense.decode_step`. | `gradus/src/generation.fab:775-812`; `gradus/src/model/dense.fab:488-560` | Equivalence and k=1 behavior are pinned to this route, not the noncached toy generator. |
+| `prefill_cached` accepts several rows only when the prior prefix is empty. | `gradus/src/model/dense.fab:572-647` | Verification needs an explicit nonempty-prefix block operation. |
+| Lower attention/cache primitives can carry several rows. | `gradus/src/attention.fab:1071-1111`; `gradus/src/cache.fab:393-456` | Reference block verification is directionally implementable now. |
+| Cache supports append, extend, and reset, but no checkpoint, branch, commit, or rollback. | `gradus/src/cache.fab:393-468` | Candidate state must be private and atomically committed; shared-cache trimming is not the contract. |
+| `CacheIdentity` is metadata, not retained payload, lifecycle, scope, or authorization. | `gradus/src/cache.fab:480-607` | Reuse requires complete state, payload binding, and a product-owned private registry. |
+| `KVCache` stores staged f32 rows; Q8/Q4 values are descriptor rows, not quantized execution proof. | `gradus/src/cache.fab:393-456` and dtype declarations | Quantized KV remains outside this campaign. |
+| Greedy sampling is exact argmax; stochastic sampling advances explicit history/RNG state. | `gradus/src/sampling.fab:195-235` | Greedy is admitted first. Sampled acceleration requires pathwise proof or a typed reject. |
+| Inferentia keeps weights resident but constructs and discards fresh caches for every request. | `inferentia/src/main.fab:965-1007,1448-1462` | Warm-prefix reuse needs an explicit consumer lifecycle. |
+| Inferentia still has a frozen-prompt tokenizer fallback and emits SSE only after generation completes. | `inferentia/src/main.fab:727-750,874-887` | Arbitrary-prompt tokenization and a true first-token boundary precede honest warm TTFT evidence. |
+| Radix device execution has static prefill/scalar-decode modes; M4 device KV work is incomplete. | `radix/docs/factory/device-executor/goal.md`; `radix/docs/factory/kv-cache-decode/CAMPAIGN.md` | The device goal consumes these campaigns and does not duplicate them. |
+| CUDA has a real one-shot kernel proof, but rejects dynamic/nonzero/runtime KV bindings. | `hosts/macos-arm64/src/cuda_host.rs`; `hosts/macos-arm64/src/device_host.rs` | CUDA qualification includes the missing persistent dynamic-binding path before a speculative receipt. |
+| The old RunPod verification goal is archived and does not prove inference. | `radix/docs/archived/runpod-gpu-verification/goal.md` | Future paid evidence uses the live CAP-02 rails with a new speculative receipt and fresh authorization. |
 
-Source snapshot for this draft: gradus `c67f55231018`, inferentia
-`3c7211d35963`, radix `f9dd3c14563c` (all clean at snapshot). SD0 must refresh
-these revisions before lowering.
+## Non-Negotiable Invariants
 
-## Current State
+1. `generate_dense_with_stop` remains the plain semantic oracle.
+2. Acceleration is one versioned explicit policy and defaults to disabled.
+3. An admitted path emits the same tokens and logical state as the plain path
+   under the same model, prompt, configuration, stop policy, and seed.
+4. This campaign accelerates greedy generation only. Sampled acceleration
+   rejects before lookup, RNG consumption, or branch creation.
+5. A speculative branch cannot mutate its base. Commit is all-layer atomic.
+6. Prepared state includes every architecture-required KV, recurrent, SSM,
+   convolution, and position component.
+7. Identity verifies compatibility; it never grants authorization. Raw token
+   keys are not a public product surface.
+8. Receipts label context-reproduction versus ordinary chat and distinguish
+   reference, compiled, Metal, CUDA, cold, and warm evidence.
+9. No stage closes on a shaped fixture, fake driver, or prose claim when its
+   gate requires executed value identity.
 
-| Track | State | Next action |
-| --- | --- | --- |
-| Verification contracts and baseline | Absent | SD0 discovery |
-| KV rollback / prefix pin | Absent (identity keying exists) | SD1 after SD0 |
-| Batched verification loop | Absent | SD2 after SD1 |
-| Lookup drafting | Absent | SD3 after SD2 |
-| Cross-request prefix reuse | Absent | SD4 after SD1 (parallel with SD2/SD3) |
-| CUDA / RunPod qualification | CUDA target live; no decode-acceleration receipts | SD5 after SD2–SD4 |
+## Named Factory Goals
+
+| Goal | Repo | Owns | Mandatory dependency |
+| --- | --- | --- | --- |
+| [`speculative-decode-contract`](../speculative-decode-contract/goal.md) | Gradus | dense baseline, policy/version, acceptance and receipt contracts | PML generation/config authority |
+| [`kv-cache-branching`](../kv-cache-branching/goal.md) | Gradus | immutable checkpoint, private branch, atomic prefix commit | contract |
+| [`cached-block-verification`](../cached-block-verification/goal.md) | Gradus | nonempty-prefix k-row reference verification | branching |
+| [`context-lookup-drafting`](../context-lookup-drafting/goal.md) | Gradus | deterministic weightless candidate policy and transactional greedy generation integration | contract, cached block |
+| [`prepared-prefix-state`](../prepared-prefix-state/goal.md) | Gradus | canonical complete state, payload binding, exact-prefix continuation | branching; hybrid-state contract |
+| [`speculative-verification-execution`](../../../../radix/docs/factory/speculative-verification-execution/goal.md) | Radix/Hosts | versioned device ABI and compiled Metal block verification | cached block; device-executor M4; kv-cache-decode |
+| [`prefix-reuse-consumer`](../../../../inferentia/docs/factory/prefix-reuse-consumer/goal.md) | Inferentia | private bounded retention, attach lifecycle, real streaming/TTFT receipt | prepared state; tokenizer; clock/streaming |
+| [`speculative-decode-cuda-qualification`](../../../../radix/docs/factory/speculative-decode-cuda-qualification/goal.md) | Radix/Hosts | persistent CUDA binding/lifecycle and authorized RunPod qualification | all semantic/consumer goals and Metal execution |
+
+These goal files are planning artifacts. Their presence does not mean work is
+running, implemented, or validated.
 
 ## Campaign Path
 
-### SD0 — Contracts, acceptance rules, and measured baseline
+### SD0 — Contract and evidence schema
 
-**Status**: planned — entry stage
-**Owner**: Gradus.
-**Source**: this campaign, `src/decode.fab`, `src/generation.fab`,
-`src/cache.fab`, `src/sampling.fab`, `docs/benchmark-method.md`.
-**Gate**: accepted decode-acceleration contract — verification-block
-semantics, acceptance rule (greedy exact-match first; sampled rule only with
-an equivalence proof), rollback semantics, drafting-policy seam,
-`GenerationConfig` surface with defaults and reject rows; a regime-labeled
-measurement method with two corpora (context-reproduction and ordinary chat);
-and baseline tok/s + TTFT receipts for the current loop on Metal.
-**Batch posture**: discovery-first.
-**Lowers to**: `delivery` then `factory`.
+**Goal**: [`speculative-decode-contract`](../speculative-decode-contract/goal.md)
+**Gate**: named dense baseline; explicit disabled-by-default policy; greedy and
+sampled admission rules; context-reproduction and ordinary-chat corpora; one
+versioned receipt schema. No candidate implementation is part of SD0.
 
-### SD1 — KV rollback and prefix-pin primitives
+### SD1 — Transactional logical state
 
-**Status**: planned — after SD0
-**Owner**: Gradus.
-**Source**: SD0 contract; `src/cache.fab` identity keying.
-**Gate**: cache can be trimmed to an accepted prefix and pinned for reuse with
-exact identity round-trip preserved; proba proofs for rollback/rejection and
-pin/unpin paths.
-**Batch posture**: split-on-boundary.
-**Lowers to**: `delivery` then `factory`.
+**Goal**: [`kv-cache-branching`](../kv-cache-branching/goal.md)
+**Gate**: immutable all-layer checkpoint; private branch; zero/partial/full
+accepted-prefix commit; unchanged base on every failure; no device handles.
 
-### SD2 — Batched multi-token verification in the decode loop
+### SD2 — Reference cached-block verification
 
-**Status**: planned — after SD1
-**Owner**: Gradus.
-**Source**: SD0/SD1; `src/decode.fab`, `src/generation.fab`.
-**Gate**: the loop scores k draft tokens in one forward pass, accepts the
-matching prefix, rolls back on rejection, and emits tokens that match the
-plain loop exactly on the regression corpus under greedy acceptance with
-oracle drafts; no throughput regression at k=1. Speed gates arrive with SD3.
-**Batch posture**: split-on-boundary.
-**Lowers to**: `delivery` then `factory`.
+**Goal**: [`cached-block-verification`](../cached-block-verification/goal.md)
+**Gate**: nonempty prefix plus nonempty candidate block yields the pinned
+`[k,V]` row convention and complete staged state; all rows and final state
+match full recompute; failure is atomic. This is reference evidence only.
 
-### SD3 — Lookup-augmented drafting
+### SD3 — Compiled Metal execution
 
-**Status**: planned — after SD2
-**Owner**: Gradus.
-**Source**: SD2 seam; source-post technique 2.
-**Gate**: a weightless drafting policy fills draft positions from
-prompt/context; measured multi-x throughput on the context-reproduction
-corpus and bounded overhead on the chat corpus, both regime-labeled; greedy
-token-stream equivalence preserved; acceptance-rate receipts recorded.
-**Batch posture**: split-on-boundary, then batch policy variants.
-**Lowers to**: `delivery` then `factory`.
+**Goal**: [`speculative-verification-execution`](../../../../radix/docs/factory/speculative-verification-execution/goal.md)
+**Gate**: one versioned candidate-block device operation consumes the existing
+device-executor/KV-cache contracts, executes k rows on real Metal, commits only
+the accepted prefix, and matches SD2. Fake-backed or MIR-only receipts do not
+close this stage.
 
-### SD4 — Cross-request prefix reuse
+### SD4 — Context lookup integration
 
-**Status**: planned — after SD1; may run parallel with SD2/SD3
-**Owner**: Gradus semantics; inferentia consumer evidence.
-**Source**: SD1 pin primitive; inferentia campaign.
-**Gate**: a second question against an already-prefilled long document reuses
-pinned cache; warm-vs-cold TTFT receipt in inferentia; warm token stream
-identical to cold; no server or scheduler code enters Gradus.
-**Batch posture**: batch-by-default after first receipt.
-**Lowers to**: `delivery` then `factory`.
+**Goal**: [`context-lookup-drafting`](../context-lookup-drafting/goal.md)
+**Gate**: exact deterministic lookup feeds SD2/SD3, empty match falls back to a
+plain target step, greedy output/cache/history/cursor/stop state is exact,
+sampled acceleration rejects before work, and both regimes have honest
+acceptance/overhead receipts.
 
-### SD5 — Cross-backend qualification: Metal, CUDA, RunPod
+### SD5 — Complete prepared prefix and product consumer
 
-**Status**: planned — final; opens after SD2–SD4 land on Metal
-**Owner**: Gradus contracts; radix/hosts execution path; RunPod evidence
-operator-authorized.
-**Source**: SD2–SD4 receipts; PML Qwen3.6 dual-backend invariant; radix
-`runpod-gpu-verification`.
-**Gate**: the SD0 corpora and equivalence proofs are green on CUDA through the
-accepted execution path; RunPod enterprise-GPU mass-test receipts recorded
-(operator-authorized); campaign cannot close Metal-only.
-**Batch posture**: batch-by-default.
-**Lowers to**: `delivery` then `factory`.
+**Goals**: [`prepared-prefix-state`](../prepared-prefix-state/goal.md), then
+[`prefix-reuse-consumer`](../../../../inferentia/docs/factory/prefix-reuse-consumer/goal.md)
+**Gate**: Gradus can continue from a verified complete prefix state for every
+admitted architecture row. Inferentia retains it within a private bounded
+scope, skips the exact consumed prefix, streams the first generated token, and
+records cold/warm token/text equality plus true TTFT. No fixed speedup is
+promised.
+
+### SD6 — CUDA peer qualification
+
+**Goal**: [`speculative-decode-cuda-qualification`](../../../../radix/docs/factory/speculative-decode-cuda-qualification/goal.md)
+**Gate**: persistent CUDA sessions support the required dynamic KV/state
+bindings and explicit teardown; the SD0 corpora are equivalent on real CUDA;
+an operator-authorized RunPod receipt uses the live CAP-02 evidence rails.
+The campaign cannot close Metal-only.
 
 ## Dependency Rules
 
-1. SD0 freezes contracts and baseline before any implementation stage.
-2. SD1 rollback is a hard precondition for SD2 verification and SD4 reuse.
-3. SD4 depends only on SD1 and may proceed in parallel with SD2/SD3.
-4. SD3 establishes the drafting-policy seam before any model-drafter campaign
-   is drafted; that campaign is outside this one.
-5. Every implementation stage carries the losslessness gate; a stage cannot
-   close on throughput alone.
-6. Compiler or device limitations become sibling-campaign needs, never Gradus
-   workarounds.
-7. RunPod and any paid GPU execution requires operator authorization per use.
+```text
+SD0 contract
+  -> SD1 branching
+     -> SD2 reference block -> SD3 Metal execution -> SD4 lookup
+     -> SD5 prepared state -> SD5 Inferentia consumer
+
+SD3 + SD4 + SD5 -> SD6 CUDA qualification
+```
+
+- SD3 also waits for the exact interfaces delivered by device-executor M4 and
+  kv-cache-decode. It extends those authorities rather than forking them.
+- SD5's Inferentia consumer also waits for real arbitrary-prompt tokenization,
+  Inferentia I2's planned streaming host effect, and the live monotonic clock
+  seam. Its hybrid state row waits for PML MODEL-01–04 and LIB-02 receipts.
+- SD6 includes missing CUDA dynamic binding and lifecycle work. It is not only
+  a request to rerun the old one-shot proof.
+- Paid RunPod work requires fresh operator authorization for that run.
+
+## Scope Boundaries
+
+### In campaign
+
+- explicit policy and equivalence/receipt contracts;
+- logical branch/commit and reference k-row verification;
+- deterministic context lookup;
+- compiled Metal and CUDA execution for the admitted path;
+- complete logical prepared state and single-node private retention;
+- cold/warm and regime-labeled equality/performance evidence.
+
+### Outside campaign
+
+- DFlash, MTP, or other learned/model drafter artifacts and training;
+- quantized KV or activation implementation;
+- continuous batching, broad scheduler redesign, or deployment;
+- multi-device prefix tiers, migration, or routing (MD4D owns these);
+- general kernel/power tuning beyond the operation required for exact
+  candidate verification;
+- cross-tenant sharing or identity-as-authorization.
+
+These are excluded, not deferred campaign work. Adding any one changes the
+completion contract and requires an explicit campaign amendment.
 
 ## First Useful Milestones
 
-1. **Lossless fast decode (SD0–SD3)**: multi-x context-reproduction
-   throughput on Metal with token-exact greedy equivalence.
-2. **Warm-cache TTFT (SD4)**: repeat-question prefill collapse, evidenced in
-   inferentia.
-3. **Peer-target proof (SD5)**: same corpus green on CUDA plus RunPod
-   enterprise receipts.
+1. **Exact reference block** — SD0–SD2 establish implementable semantics.
+2. **Context-assisted decode** — SD4 produces exact lookup acceleration; SD3
+   supplies device speed evidence.
+3. **Warm prepared prefix** — SD5 proves cold/warm identity and measures TTFT.
+4. **Peer-target proof** — SD6 closes the same contracts on CUDA.
 
 ## Acceptance Criteria
 
-- [ ] Every stage has a source, gate, batching posture, and lowering route.
-- [ ] SD0 is the named entry stage and is grounded in live source.
-- [ ] The losslessness invariant is executed at every implementation stage,
-      not asserted.
-- [ ] All throughput/TTFT receipts are regime-labeled; the source post's
-      numbers never appear as Gradus claims.
-- [ ] CUDA and RunPod receipts exist; the campaign does not close Metal-only.
-- [ ] No stage authorizes serving, scheduling, deployment, paid GPU use
-      without operator authorization, or kernel work inside Gradus.
+- [ ] All eight named goals are `done`; no admitted unit remains optional,
+      deferred, or outside a commit.
+- [ ] Disabled policy preserves the named dense baseline.
+- [ ] Greedy accelerated runs are token- and state-exact; sampled acceleration
+      returns the declared typed reject before lookup/RNG/branch work.
+- [ ] Reference, Metal, and CUDA receipts prove the same row/state contract.
+- [ ] Context-reproduction and ordinary-chat receipts remain separate.
+- [ ] Complete prepared state, private scope, capacity, expiry/eviction,
+      release, and no-raw-key boundaries are exercised.
+- [ ] Cold/warm output equality and true first-token timing are executed in
+      Inferentia.
+- [ ] CUDA dynamic state bindings and teardown are real-device proven, and the
+      authorized RunPod receipt names its exact revisions and environment.
+- [ ] Factory audits and each goal's declared validation are green.
+
+## Settled Decisions
+
+- The initial candidate provider is context lookup only.
+- Learned/model drafters are outside this campaign.
+- `generate_dense_with_stop` is the semantic baseline.
+- One versioned policy defaults to disabled.
+- Greedy is the only accelerated acceptance mode in this campaign. Sampled
+  acceleration requires a future explicit amendment with generation/RNG
+  transaction ownership and pathwise proof.
+- Prepared state is complete architecture state, never KV-only.
+- Gradus owns logic, Radix/Hosts own compiled execution, and Inferentia owns
+  retention/authorization policy.
+- Metal develops; CUDA is a required peer closeout target.
+- External headline figures inform corpus design only.
 
 ## Validation
+
+Planning-artifact closeout:
 
 ```bash
 python3 ../radix/scripta/audit-factory-goal-status.py \
     --factory-root docs/factory --fail-on error
-./scripta/check-source
-./scripta/check-compile
+git diff --check
 ```
 
-(`./scripta/check-factory-goal-status` is the native launcher for the same
-audit; it requires the released faber binary.) Implementation stages add the
-measurement commands SD0 pins; cross-backend and RunPod commands are named by
-their delivery specs.
-
-## Settled Decisions
-
-- Metal is the development backend; CUDA is a peer target extended to full
-  support once core Gradus stability is in place (operator, 2026-08-21).
-- RunPod accounts exist and are the enterprise-GPU mass-test lane, always
-  operator-authorized (operator, 2026-08-21).
-- Model-drafter speculative decoding is out of this campaign's admitted
-  scope; SD3's drafting-policy seam is the handoff point.
-- The source post's absolute numbers are technique evidence, never Gradus
-  targets or receipts.
-
-## Open Questions
-
-1. **Sampled acceptance rule.** Default: greedy exact-match only in the first
-   contracts; a rejection-sampling rule is admitted only with a seeded
-   equivalence proof. Decider: SD0 delivery.
-2. **Verification block size default.** Default: measured by SD0 across k ∈
-   {4, 8, 16}; the post's 16 informs the sweep, not the answer. Decider: SD0
-   delivery.
-3. **Reuse pin scope.** Default: gradus owns pin/identity semantics, inferentia
-   owns request-to-pin matching. Decider: SD4 delivery.
+Implementation validation lives in each named goal. Broad product suites and
+paid GPU runs are not planning-doc gates.
 
 ## Stop Conditions
 
-Pause and route a need when: a public Gradus API would need a device handle;
-an acceptance or reuse semantic cannot be made lossless; measurement cannot
-separate regimes honestly; a CUDA execution gap is actually a compiler/host
-limitation; or any stage would trigger paid GPU use, deployment, or external
-effects without operator authorization.
+Pause and route a need when an accelerated path cannot preserve output/state;
+a public Gradus type would need a physical device handle; identity would be
+used as authorization; a receipt cannot distinguish regimes or evidence
+tiers; an existing device/KV campaign's contract conflicts with SD3; CUDA
+would still rely on fake or one-shot evidence; or external execution needs
+fresh authorization.
+
+---
+
+<!-- Created from radix/docs/factory/TEMPLATE.md. Status line is the audit
+     authority; named goals carry implementation ledgers. -->
