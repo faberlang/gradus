@@ -192,6 +192,9 @@ exactly — a `NativeF16Convert` class, not a new algorithm family.
   2026-08-18, need `1d3967ed`; revision record
   `docs/design/gi4-contract.md`) and `reserve_policy`; byte accounting
   single-sourced (`gi4-contract.md:93-108`; `hosts/…/partition.rs:119-122`).
+  The executed `KVCache` today is f32-staged (`dtype()` "f32",
+  `layout()` "staged"; `src/cache.fab:265-273, :362, :398-399`). Closing
+  that gap is `production-ml-library` execution-tier scope.
 - **Attention compute**: `CausalMaskedSoftmax` recipe materializes the score
   matrix then row-softmaxes (`plan.rs:93-96,217+`). No flash-attention recipe
   exists.

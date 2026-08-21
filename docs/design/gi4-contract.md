@@ -23,6 +23,11 @@ so later stages can admit more slots without a new vocabulary.
 | `KvCacheLayout.dtype` | `f32` only (declared-conversion representation) | `{F32, F16, Q8_0, Q4_K}` |
 | Default | f32 | **F16** |
 
+The opened set above is not today's executed representation: the executed
+`KVCache` today is f32-staged (`dtype()` "f32", `layout()` "staged";
+`src/cache.fab:265-273, :362, :398-399`). Closing that gap is
+`production-ml-library` execution-tier scope.
+
 The Gradus semantic carrier of the opened set is `KVStructure.kv_dtype_k` /
 `kv_dtype_v` in `src/cache.fab` (W2-U1). Infeasible combinations fail
 closed there (quantized-V requires the flash-attention family; block size
