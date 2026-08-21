@@ -104,7 +104,7 @@ not move).
 | --- | --- | --- | --- | --- |
 | 1 | done | ac8e66ae | 23d951b | sgd_step_2x2/_4x4 restored + PML0 reversal note; red-green (SEM004 absent→present) |
 | 2 | pending | — | — | — |
-| 3 | pending | — | — | — |
+| 3 | done | ddaedafa | c67f552 | E7 repaired (gguf.proba int parse; qwen35moe artifact import); faber check gradus GREEN |
 | 4 | pending | — | — | — |
 | 5 | pending | — | — | — |
 
