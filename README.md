@@ -131,6 +131,11 @@ loop through `train_step_4x4` → `optimize.sgd_step_4x4` whose final loss
 matches the f64 oracle (`0.017928625511508454`). Broader model-forward
 identity, GPU training, and executed performance are not claimed here.
 
+Gradus's executed tier of record is the CPU/reference tier — f32 host-list
+carrier (`src/tensor.fab` `class Tensor` `list<f32> data`), reference
+kernels, and FMIR stepper receipts. Device residency and emission are
+Radix and hosts scope.
+
 | Layer | State |
 | --- | --- |
 | Foundation (dtype, shape, tensor, math) | Shipped |

@@ -24,6 +24,13 @@ consumer at materialization** (boundary types stay `tensor<f32, [2,2]>`).
   `tensor<f32, [2,2]>` types. This is a representation decision, not a
   boundary revision.
 
+## Executed tier of record
+
+Gradus's executed tier of record is the CPU/reference tier — f32 host-list
+carrier (`src/tensor.fab` `class Tensor` `list<f32> data`), reference
+kernels, and FMIR stepper receipts. Device residency and emission are
+Radix and hosts scope.
+
 ## What it means for signatures
 
 | Surface | Signature form | Example |
