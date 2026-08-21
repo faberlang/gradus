@@ -1,6 +1,6 @@
 # GOAL: train-step-optimizer-call — delegate `train_step_*` to the optimizer now that library-to-library calls execute
 
-**Status**: active — all 5 units landed; closeout audit 7f322fe3 verdict residual (two P2s): truth-scan gaps at 6 sites + BERT omission misattribution; repair U5b (bf8ae399) in flight, radix defect need 0ef139c3 filed; goal flips to done when repair lands and re-verifies
+**Status**: done — all 5 units landed (23d951b, 601d2f5, c67f552, f51f299+d6138d5, 7646ed7); closeout audit 7f322fe3 residual fully repaired (8a9a351: six truth-scan sites swept, scan clean; BERT attribution corrected to radix need 0ef139c3); census/exit-law/evidence-honesty claims verified clean under audit
 **Created**: 2026-08-21
 **Campaign:** `—` (standalone)
 **Source:** operator verification request (session 2026-08-21). A documentation session claimed that the compiler could not resolve library-to-library calls, so `train_step_*` carried the update math inline rather than calling the optimizer. Verification found the workaround real but its justification **stale**: the runtime gap closed in radix on 2026-08-09 and the revisit trigger this repo recorded ("revisit when that runtime gap closes") fired without anyone revisiting.
