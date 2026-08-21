@@ -1,6 +1,6 @@
 # GOAL: device-neutrality-contract — Gradus states its tier and parameterizes backend-family law
 
-**Status**: planned — pre-implementation; drafted 2026-08-21 from campaign evidence F6.1–F6.3; not lowered
+**Status**: planned — pre-implementation; ready for delivery (lowered to [delivery.md](delivery.md), 6 units, 2026-08-21)
 **Created**: 2026-08-21
 **Campaign:** `emission-lane-parity` (radix: [`docs/factory/emission-lane-parity/CAMPAIGN.md`](../../../../radix/docs/factory/emission-lane-parity/CAMPAIGN.md))
 **Source:** operator architecture-audit session 2026-08-21 (campaign evidence F6.1–F6.3). Origin reminder: the foundation deliberately kept Gradus backend-neutral (`docs/archived/gradus-ml-foundation/gpu-dependency.md`: "The device-neutral boundary means Gradus source compiles identically for CPU and GPU; Radix chooses the lowering target").
