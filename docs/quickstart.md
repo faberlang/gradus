@@ -65,8 +65,10 @@ faber check .
 
 `loss.mse_2x2` is mean squared error over a 2×2 f32 pair; these inputs yield
 `0.25`. `faber check` is the standing proof that the import and call
-type-check. `faber run` of packages that import `gradus:*` is not a standing
-claim — the compiler cannot yet execute library-to-library calls.
+type-check. The training-loop package proof runs its library-to-library calls
+on the FMIR stepper (radix `43c0102ba`, regression-locked by `2e8042ae7`).
+This quickstart does not claim every package run, GPU training, or executed
+model performance.
 
 ## First runnable exemplum
 

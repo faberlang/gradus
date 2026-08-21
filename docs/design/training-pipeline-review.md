@@ -165,7 +165,7 @@ and a checkpoint artifact. That is the bar for "a training pipeline."
 | Per-parameter gradient records: (owner, name, version) | `gradient.fab:110-134`; parameter identity `parameter.fab:190,243` | **live** |
 | SGD optimizer state, fail-closed freshness/shape/trainable rules | `optimize.fab:258` (`SgdState`), `:361` (`Sgd`), `step` `:467-493` (param' = param − lr·grad), validation `:310-333` | **live** — **SGD only; no momentum, no Adam family, no weight decay, no clipping** |
 | Optimizer wire: versioned schema, exact round-trip | `optimize.fab:505-570` (state), `:576-621` (whole optimizer), schema `"1.0.0"` `:116` | **live** |
-| Fixed-shape train steps (linear 2×2, MLP 4×4, BERT-tiny linear + LN) | `train.fab:62,80,110,152` | **live** (inline math; library-to-library call gap documented at `train.fab:30-39`) |
+| Fixed-shape train steps (linear 2×2, MLP 4×4, BERT-tiny linear + LN) | `train.fab:62,80,110,152` | **live** (library-to-library calls execute on FMIR since radix `43c0102ba`; train/optimize proba executes 90/90; BERT-tiny 12-tuple calls remain deferred to radix need `0ef139c3`) |
 | LR schedule: warmup→cosine (constant when vertex=end) | `train.fab:307-430` (`Schedule`, `construct_schedule`, `scheduled_rate`) | **live** — one schedule family only |
 | Deterministic RNG + dropout mode | `train.fab:568-716` (`Seed`/`Draw`/`next_f32`, `dropout` `:684`, seed wire `:716`), Mode discipline/estimate `:433-495` | **live** |
 | Checkpoint: optimizer wire + RNG + epoch/step, exact round-trip | `train.fab:787-870` (`Checkpoint`, `serialize_checkpoint` `:825`, `deserialize_checkpoint` `:849`) | **live** — optimizer/RNG only; **no model-weights artifact** |

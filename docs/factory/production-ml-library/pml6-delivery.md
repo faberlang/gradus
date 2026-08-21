@@ -53,7 +53,7 @@ graph line 193 (PML6 → NGAB6 portability) is its first consumer.
 | 8 | **Regression corpus is the proba surface + fixtures** | `docs/regression-corpus.md` inventories the admitted rows' fixtures and proba pins (including the EOG-stop `[0]` pin and reset/replay determinism); structurally green at every unit boundary (fire-9 norm); executed runs are auditor-owned at the FMIR-lever gate (CTO8-1/CTO8-3). |
 | 9 | **Package metadata agrees with live behavior** | `faber.toml` + `cista.toml` (name `gradus`, version 0.1.0, provider `gradus`, target `fmir`, interfaces `src`) are re-verified against live behavior; no version bump in this phase. |
 | 10 | **Release checklist is a committed artifact** | `docs/release-checklist.md` is consumed by PML7-U3 and the faber release protocol; it records the CTO8-1 executed-oracle clause as a **named pre-release item** without gating PML6. |
-| 11 | **Batch norm (fire-9) is structural** | Gradus is faber-language; its consumers are the library provider surface (`faber check` on the repo root compiles `src/*.fab` + co-located `.proba`), the four exempla consumers (`gradient-seam`, `gradient-seam-nolib`, `training-loop-mlp`, `token-generation`), and the admission-conformance test (`tests/admission_conformance.fab`). Each unit boundary keeps `check-source` + `check-compile` green and the touched proba pins consistent — or flags honestly. Executed proba runs are env-blocked (FMIR lever) and are never claimed. |
+| 11 | **Batch norm (fire-9) is structural** | Gradus is faber-language; its consumers are the library provider surface (`faber check` on the repo root compiles `src/*.fab` + co-located `.proba`), the four exempla consumers (`gradient-seam`, `gradient-seam-nolib`, `training-loop-mlp`, `token-generation`), and the admission-conformance test (`tests/admission_conformance.fab`). Each unit boundary keeps `check-source` + `check-compile` green and the touched proba pins consistent — or flags honestly. The train/optimize proba suites execute 90/90 on FMIR (radix `43c0102ba`); other executed proba/e2e claims remain claim-specific and must name their actual boundary rather than treating execution as tree-wide env-blocked. |
 
 ## Repo-Aware Baseline
 
@@ -79,12 +79,14 @@ stage receipts → examples and historical plans.
 | `2cdc498` | Capsule admission enforces the **exact pinned EOG set `{0,2}`** — a well-formed-but-different set is a different tokenizer (contract §3.3; `src/model/capsule.fab` `EOG ← "0,2"`, `_tokenizator_recta`) + `capsule.proba` rejection pin + stale `_le4/_le8` doc refs fixed | **U1** API reference (EOG is tokenizer identity); **U2** diagnostics (`EogMala`); **U3** tokenizer-identity rows; **U4** regression corpus (rejection pin) |
 | `0d50d60` | EOG-stop generation: generation terminates after the **first admitted EOG token** `{0,2}`; `tokenizator.est_eog` is the stop-policy binding; greedy oracle emits `[0]` not `[0,0]`; `maxima_verborum` is a ceiling, never a promise; every EOG-affected pin/comment/doc reconciled (decode.proba, exemplum, README, CAMPAIGN, pml5-closeout) | **U1** API reference documents `tokenizator.est_eog` + generation-loop EOG-stop semantics; **U2** examples document the pinned `[0]` / `[1, 1]` outputs + per-step boundaries; **U4** regression corpus carries the token pins + first-token-divergence rule + reset/replay determinism |
 
-**Executed-tier boundary (recorded, not claimed)**: proba execution and the
-exempla e2e runs are env-blocked on the FMIR lever (CTO8-1; the PML4/PML5
-closeouts record the concrete errors). PML6's quality/release contract is
-structural-tier: every artifact agrees with the compiled surface and the
-pinned oracle values. Executed value-identity is the auditor-owned
-runtime-evidence gate; the release checklist names it as a pre-release item.
+**Executed-tier boundary (claim-specific)**: the train/optimize proba suites
+execute 90/90 on FMIR (radix `43c0102ba`). This document makes no blanket
+claim for other proba or exempla e2e runs; remaining environment-bound claims
+name their actual boundary (for example, the `generation::default` provider
+gap). PML6's quality/release contract is structural-tier: every artifact
+agrees with the compiled surface and the pinned oracle values. Executed
+value-identity is the auditor-owned runtime-evidence gate; the release
+checklist names it as a pre-release item.
 
 ## Stage Graph
 

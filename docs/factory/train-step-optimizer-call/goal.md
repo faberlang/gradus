@@ -94,7 +94,7 @@ not move).
 - `faber run gradus/exempla/training-loop-mlp/src/main.fab` → final loss
   `0.017928625511508454`, sampled trajectory matches pins, through the
   delegating steppers
-- `faber test` scoped to the train/optimize suites → executed cases pass
+- `faber test` scoped to the train/optimize suites → **90/90 executed cases pass**; BERT 12-tuple cases remain omitted because the package-MIR link reports a bare `call argument type mismatch` on those cases (radix need `0ef139c3`), not because of E8 or E10
 - `cd radix && cargo test -p radix-program package_mir_training_loop_mlp_runs_on_fmir_lane` → stays green (guard, no radix edits)
 - live-source truth scan for the retired FMIR/library-import-gap claims → no live hits
 
@@ -105,8 +105,8 @@ not move).
 | 1 | done | ac8e66ae | 23d951b | sgd_step_2x2/_4x4 restored + PML0 reversal note; red-green (SEM004 absent→present) |
 | 2 | done | — | 601d2f5 | `_sgd_family` moved to `gradus:optimize` (OQ2 default); `train_step_2x2`/`_4x4` + BERT pair delegate via `sgd_step_*`; inline `param − lr·grad` copies deleted from `train.fab`; compile-level `train.proba` added (faber test execution rides unit 4) |
 | 3 | done | ddaedafa | c67f552 | E7 repaired (gguf.proba int parse; qwen35moe artifact import); faber check gradus GREEN |
-| 4 | done | f89e5f86 + ce7c70b4 | f51f299 + d6138d5 | trajectory through delegation matches PML4 pins exactly (final 0.017928625511508454); faber test train/optimize 90P/0F after U4b (`string.get(i)` returns `ascii`, not `textus` — `_digit` widens via `↦ textus`, `_contains_separator` uses `slice`); BERT 12-tuple cases remain omitted (E8/E10 radix residual, recorded) |
-| 5 | done | fa00add1 | 7646ed7 | truth pass: E6 headers + README + exemplum header refreshed; stale-claim scan clean (remaining env-blocked mentions are CTO8-1 named clauses, distinct); E8/E10 residuals preserved |
+| 4 | done | f89e5f86 + ce7c70b4 | f51f299 + d6138d5 | trajectory through delegation matches PML4 pins exactly (final 0.017928625511508454); faber test train/optimize 90P/0F after U4b (`string.get(i)` returns `ascii`, not `textus` — `_digit` widens via `↦ textus`, `_contains_separator` uses `slice`); BERT 12-tuple cases remain omitted because the package-MIR link reports a bare `call argument type mismatch` on those cases (radix need `0ef139c3`), not E8 or E10 |
+| 5 | done | fa00add1 | 7646ed7 | truth pass: E6 headers + README + exemplum header refreshed; the closeout scan still found six missed sites; U5b corrects the BERT omission attribution to the package-MIR link defect filed as radix need `0ef139c3`; E8 remains a separate run-route residual |
 
 ## Open questions
 
