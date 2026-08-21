@@ -138,15 +138,21 @@ class Config {
 }
 
 # The validated Config constructor. Temperature may be 0 (the greedy
-# flag); top_k non-negative; top_p / min_p within [0, 1]; the repetition
-# penalty at least 1.0.
+# flag) and must be finite; top_k non-negative; top_p / min_p finite
+# within [0, 1]; the repetition penalty finite and at least 1.0.
 @ public { }
 fn construct_config(f32 temperature, int top_k, f32 top_p, f32 min_p, f32 repetition_penalty) → Config ⇥ SamplingError {
+    require dtype.finite(temperature) throw variant InvalidConfig {message = "temperature must be non-negative"}
     require temperature ≥ 0.0 throw variant InvalidConfig {message = "temperature must be non-negative"}
     require top_k ≥ 0 throw variant InvalidConfig {message = "top-k must be non-negative"}
-    require not ((not dtype.finite(top_p) or top_p ≺ 0.0) or top_p ≻ 1.0) throw variant InvalidConfig {message = "top-p must be within [0, 1]"}
-    require not ((not dtype.finite(min_p) or min_p ≺ 0.0) or min_p ≻ 1.0) throw variant InvalidConfig {message = "min-p must be within [0, 1]"}
-    require not (not dtype.finite(repetition_penalty) or repetition_penalty ≺ 1.0) throw variant InvalidConfig {message = "repetition penalty must be at least 1"}
+    require dtype.finite(top_p) throw variant InvalidConfig {message = "top-p must be within [0, 1]"}
+    require top_p ≥ 0.0 throw variant InvalidConfig {message = "top-p must be within [0, 1]"}
+    require top_p ≤ 1.0 throw variant InvalidConfig {message = "top-p must be within [0, 1]"}
+    require dtype.finite(min_p) throw variant InvalidConfig {message = "min-p must be within [0, 1]"}
+    require min_p ≥ 0.0 throw variant InvalidConfig {message = "min-p must be within [0, 1]"}
+    require min_p ≤ 1.0 throw variant InvalidConfig {message = "min-p must be within [0, 1]"}
+    require dtype.finite(repetition_penalty) throw variant InvalidConfig {message = "repetition penalty must be at least 1"}
+    require repetition_penalty ≥ 1.0 throw variant InvalidConfig {message = "repetition penalty must be at least 1"}
     return Config {temperature = temperature, top_k = top_k, top_p = top_p, min_p = min_p, repetition_penalty = repetition_penalty}
 }
 
@@ -168,12 +174,11 @@ class Sampler {
     int token_id
     train.Seed seed
 
-    # The chosen token id (the draw outcome).
     fn token_id() → int {
         return self.token_id
     }
 
-    # The advanced generator state (the explicit RNG continuation).
+    # Advanced generator state after the draw (explicit RNG continuation).
     fn seed() → train.Seed {
         return self.seed
     }
@@ -194,32 +199,68 @@ fn default() → Sampler {
 
 @ public { }
 fn max(list<f32> logits) → int ⇥ SamplingError {
-    require logits.length() ≠ 0 throw variant InvalidLogits {message = "logits must be non-empty"}
-    require _finite(logits) throw variant InvalidLogits {message = "logits must be finite"}
+    _require_logits(logits)
     return _max_index(logits)
 }
 
 # -------------------------------------------------------------------------
 # distribution — the PURE post-filter distribution: logits + config +
 # history in, the filtered probability vector out (steps 1–6 of the pinned
-# pipeline; no RNG). sample consumes it and adds the draw. Exposed so the
-# oracle pins can compare the per-knob distributions.
+# pipeline; no RNG). Exposed so the oracle pins can compare the per-knob
+# distributions.
 # -------------------------------------------------------------------------
 
 @ public { }
 fn distribution(list<f32> logits, Config c, list<int> history) → list<f32> ⇥ SamplingError {
+    _require_logits(logits)
+    _require_history(logits, history)
+    return _filtered(logits, c, history)
+}
+
+# -------------------------------------------------------------------------
+# sample — the STOCHASTIC path: pure function of logits + config + history +
+# RNG state. temperature <= 0 selects the greedy path (argmax, seed
+# unchanged). Otherwise the filtered distribution is drawn and the outcome
+# carries the advanced Seed.
+# -------------------------------------------------------------------------
+
+@ public { }
+fn sample(list<f32> logits, Config c, list<int> history, train.Seed seed) → Sampler ⇥ SamplingError {
+    _require_logits(logits)
+    _require_history(logits, history)
+    if c.temperature() ≤ 0.0 {
+        return Sampler {token_id = _max_index(logits), seed = seed}
+    }
+    return _draw(_filtered(logits, c, history), seed)
+}
+
+# -------------------------------------------------------------------------
+# Private helpers (the deterministic pipeline).
+# -------------------------------------------------------------------------
+
+@ private { }
+fn _require_logits(list<f32> logits) → void ⇥ SamplingError {
     require logits.length() ≠ 0 throw variant InvalidLogits {message = "logits must be non-empty"}
     require _finite(logits) throw variant InvalidLogits {message = "logits must be finite"}
+}
+
+@ private { }
+fn _require_history(list<f32> logits, list<int> history) → void ⇥ SamplingError {
     for from history const t {
-        require not (t ≺ 0 or t ≥ logits.length()) throw variant InvalidHistory {message = "history token out of vocabulary range"}
+        require t ≥ 0 throw variant InvalidHistory {message = "history token out of vocabulary range"}
+        require t ≺ logits.length() throw variant InvalidHistory {message = "history token out of vocabulary range"}
     }
+}
+
+# Steps 1–6 of the pinned pipeline (caller has already gated logits/history).
+@ private { }
+fn _filtered(list<f32> logits, Config c, list<int> history) → list<f32> {
     if c.temperature() ≤ 0.0 {
         var list<f32> degenerate ← empty
         for range 0‥logits.length() const i {
             degenerate.append(0.0)
         }
-        degenerate ← _f32(degenerate, _max_index(logits), 1.0)
-        return degenerate
+        return _replace_at(degenerate, _max_index(logits), 1.0)
     }
     const list<f32> penalized ← _repetition_penalty(logits, history, c.repetition_penalty())
     const list<f32> scaled ← _temperature_scale(penalized, c.temperature())
@@ -228,32 +269,6 @@ fn distribution(list<f32> logits, Config c, list<int> history) → list<f32> ⇥
     const list<f32> p_limited ← _top_p(probs, c.top_p())
     return _min_p(p_limited, c.min_p())
 }
-
-# -------------------------------------------------------------------------
-# sample — the STOCHASTIC path: pure function of logits + config + history +
-# RNG state. temperature <= 0 selects the greedy path (argmax, seed
-# unchanged). Otherwise distribution runs and the outcome carries the
-# advanced Seed.
-# -------------------------------------------------------------------------
-
-@ public { }
-fn sample(list<f32> logits, Config c, list<int> history, train.Seed seed) → Sampler ⇥ SamplingError {
-    require logits.length() ≠ 0 throw variant InvalidLogits {message = "logits must be non-empty"}
-    require _finite(logits) throw variant InvalidLogits {message = "logits must be finite"}
-    for from history const t {
-        require not (t ≺ 0 or t ≥ logits.length()) throw variant InvalidHistory {message = "history token out of vocabulary range"}
-    }
-    if c.temperature() ≤ 0.0 {
-        const int token ← max(logits)
-        return Sampler {token_id = token, seed = seed}
-    }
-    const list<f32> probs ← distribution(logits, c, history)
-    return _distribution(probs, seed)
-}
-
-# -------------------------------------------------------------------------
-# Private helpers (the deterministic pipeline).
-# -------------------------------------------------------------------------
 
 # e^x via the base-e exponentiation with a sign split: power is only
 # ever called with a non-negative exponent (1/e^{−x} for x < 0), matching
@@ -370,7 +385,7 @@ fn _mask_false(int n) → list<bool> {
 
 # The list with position i replaced by v (pure rebuild).
 @ private { }
-fn _f32(list<f32> xs, int i, f32 v) → list<f32> {
+fn _replace_at(list<f32> xs, int i, f32 v) → list<f32> {
     var list<f32> out ← empty
     for range 0‥xs.length() const j {
         if j ≡ i {
@@ -542,7 +557,7 @@ fn _min_p(list<f32> ps, f32 p) → list<f32> {
 # then the cumulative walk: the first index with cum >= u (the fallback for
 # the f32 rounding edge where cum never reaches u is the last index).
 @ private { }
-fn _distribution(list<f32> probs, train.Seed seed) → Sampler {
+fn _draw(list<f32> probs, train.Seed seed) → Sampler {
     const train.DrawF32 u_f ← train.next_f32(seed)
     const f32 u ← u_f.payload()
     var f32 cum ← 0.0
