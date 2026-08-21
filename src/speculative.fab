@@ -1,0 +1,305 @@
++++
+locale = "en"
++++
+# Candidate-provider seam — SD0-U3 (speculative-decode-contract).
+#
+# Public import: import from "gradus:speculative" speculative
+# Depends on: nothing (leaf module). AccelerationPolicy block-size bounds
+# (gradus:generation, SD0-U2) are the authority the request constructor
+# consumes as primitive min/max; this leaf does not import generation or
+# cache.
+#
+# --- Contract ------------------------------------------------------------
+#
+# The context-lookup goal implements one provider against this seam
+# without touching generation or cache contracts. SD0 freezes the types
+# and purity rules. It does not implement search, draft, or lookup.
+#
+# Provider request:
+#   prompt      — tokenized prompt context (token ids, each ≥ 0)
+#   history     — accepted generation history (token ids, each ≥ 0)
+#   block_size  — requested candidate block length, inside the policy
+#                  bounds [min_block, max_block] supplied by the caller
+#                  from AccelerationPolicy
+#
+# Provider result:
+#   candidates  — nonempty candidate token ids + provenance, with
+#                  1 ≤ ids.length() ≤ request.block_size
+#   no_draft    — typed no-candidate / no-draft; ordinary empty proposal
+#                  (plain target-step fallback). Not an error.
+#
+# Provenance (admitted source is context_lookup only):
+#   source         — "context_lookup"
+#   source_offset  — ≥ 0; earliest source position of the match
+#   match_length   — ≥ 1; suffix length that produced the candidates
+#
+# Purity: a provider is a pure function of a ProviderRequest. Equal
+# requests produce equal results. The function consumes no RNG, mutates
+# no cache, history, or generation state, and does not inspect unaccepted
+# candidate tokens. This module has no propose implementation.
+#
+# Malformed requests and out-of-policy block sizes reject through typed
+# SpeculativeError. Unknown provenance sources reject. Empty candidate
+# lists are constructed with no_draft(), not construct_candidates.
+#
+# --- Seams ---------------------------------------------------------------
+#   * greedy first-divergence acceptance and sampled typed reject — SD0-U4
+#   * context-lookup search policy and propose implementation — SD4
+#   * cache branch/commit — SD1 (kv-cache-branching)
+
+# The sole admitted candidate source for this campaign.
+const string SOURCE_CONTEXT_LOOKUP ← "context_lookup"
+
+# -------------------------------------------------------------------------
+# SpeculativeError — typed vocabulary of the candidate-provider seam.
+# Every variant carries a text message (render via message).
+# -------------------------------------------------------------------------
+
+@ public { }
+union SpeculativeError {
+    InvalidBlockSize {
+        string message
+    },
+    MalformedRequest {
+        string message
+    },
+    MalformedResult {
+        string message
+    },
+    InvalidProvenance {
+        string message
+    }
+}
+
+@ public { }
+fn message(SpeculativeError e) → string {
+    match e {
+        case InvalidBlockSize const message {
+            return message
+        }
+        case MalformedRequest const message {
+            return message
+        }
+        case MalformedResult const message {
+            return message
+        }
+        case InvalidProvenance const message {
+            return message
+        }
+    }
+}
+
+# -------------------------------------------------------------------------
+# ProviderRequest — tokenized prompt, accepted history, authorized block.
+# -------------------------------------------------------------------------
+
+@ public { }
+class ProviderRequest {
+    list<int> prompt
+    list<int> history
+    int block_size
+
+    fn prompt() → list<int> {
+        return self.prompt
+    }
+
+    fn history() → list<int> {
+        return self.history
+    }
+
+    fn block_size() → int {
+        return self.block_size
+    }
+}
+
+# Placeholder for `var ProviderRequest` bindings. Zero block size is not
+# a valid request; the caller overwrites it, or returns it from an
+# unreachable cape arm.
+@ public { }
+fn default() → ProviderRequest {
+    return ProviderRequest {prompt = empty, history = empty, block_size = 0}
+}
+
+@ public { }
+fn request_equal(ProviderRequest a, ProviderRequest b) → bool {
+    if not (a.prompt() ≡ b.prompt()) then return false
+    if not (a.history() ≡ b.history()) then return false
+    if a.block_size() ≠ b.block_size() then return false
+    return true
+}
+
+@ private { }
+fn _require_token_ids(list<int> ids) → void ⇥ SpeculativeError {
+    for from ids const t {
+        require t ≥ 0 throw variant MalformedRequest {message = "token id must be non-negative"}
+    }
+}
+
+# Construct a provider request. min_block / max_block are the
+# AccelerationPolicy bounds (SD0-U2). The requested block_size must lie
+# in that closed interval. Prompt and history may be empty; a later
+# provider returns no_draft for empty context.
+@ public { }
+fn construct_request(list<int> prompt, list<int> history, int block_size, int min_block, int max_block) → ProviderRequest ⇥ SpeculativeError {
+    require min_block ≥ 1 throw variant InvalidBlockSize {message = "policy block size must be at least one"}
+    require max_block ≥ 1 throw variant InvalidBlockSize {message = "policy block size must be at least one"}
+    require min_block ≤ max_block throw variant InvalidBlockSize {message = "policy block size minimum must not exceed the maximum"}
+    require block_size ≥ min_block throw variant InvalidBlockSize {message = "requested block size is outside the policy bounds"}
+    require block_size ≤ max_block throw variant InvalidBlockSize {message = "requested block size is outside the policy bounds"}
+    _require_token_ids(prompt)
+    _require_token_ids(history)
+    return ProviderRequest {prompt = prompt, history = history, block_size = block_size}
+}
+
+# -------------------------------------------------------------------------
+# CandidateProvenance — search metadata carried with a candidate block.
+# Lookup owns how these fields are chosen; the seam only admits the
+# context_lookup source and the non-negative offset / positive length.
+# -------------------------------------------------------------------------
+
+@ public { }
+class CandidateProvenance {
+    string source
+    int source_offset
+    int match_length
+
+    fn source() → string {
+        return self.source
+    }
+
+    fn source_offset() → int {
+        return self.source_offset
+    }
+
+    fn match_length() → int {
+        return self.match_length
+    }
+}
+
+@ public { }
+fn default_provenance() → CandidateProvenance {
+    return CandidateProvenance {source = "", source_offset = 0, match_length = 0}
+}
+
+@ public { }
+fn context_lookup_source() → string {
+    return SOURCE_CONTEXT_LOOKUP
+}
+
+@ public { }
+fn provenance_equal(CandidateProvenance a, CandidateProvenance b) → bool {
+    if a.source() ≠ b.source() then return false
+    if a.source_offset() ≠ b.source_offset() then return false
+    if a.match_length() ≠ b.match_length() then return false
+    return true
+}
+
+@ public { }
+fn construct_provenance(string source, int source_offset, int match_length) → CandidateProvenance ⇥ SpeculativeError {
+    require source ≡ SOURCE_CONTEXT_LOOKUP throw variant InvalidProvenance {message = "unknown candidate source"}
+    require source_offset ≥ 0 throw variant InvalidProvenance {message = "source offset must be non-negative"}
+    require match_length ≥ 1 throw variant InvalidProvenance {message = "match length must be at least one"}
+    return CandidateProvenance {source = source, source_offset = source_offset, match_length = match_length}
+}
+
+# -------------------------------------------------------------------------
+# ProviderResult — candidate ids + provenance, or a typed no-draft.
+# Cross-module consumers use the factories and accessors; they cannot
+# match imported variants (SEM001).
+# -------------------------------------------------------------------------
+
+@ public { }
+union ProviderResult {
+    Candidates {
+        list<int> ids
+        CandidateProvenance provenance
+    },
+    NoDraft
+}
+
+@ public { }
+fn no_draft() → ProviderResult {
+    return variant NoDraft
+}
+
+@ public { }
+fn is_no_draft(ProviderResult r) → bool {
+    match r {
+        case NoDraft {
+            return true
+        }
+        case Candidates const ids, provenance {
+            return false
+        }
+    }
+}
+
+@ public { }
+fn result_kind(ProviderResult r) → string {
+    match r {
+        case NoDraft {
+            return "no_draft"
+        }
+        case Candidates const ids, provenance {
+            return "candidates"
+        }
+    }
+}
+
+@ public { }
+fn candidate_ids(ProviderResult r) → list<int> {
+    match r {
+        case NoDraft {
+            return empty
+        }
+        case Candidates const ids, provenance {
+            return ids
+        }
+    }
+}
+
+@ public { }
+fn candidate_provenance(ProviderResult r) → CandidateProvenance ⇥ SpeculativeError {
+    match r {
+        case NoDraft {
+            throw variant MalformedResult {message = "no-draft result has no provenance"}
+        }
+        case Candidates const ids, provenance {
+            return provenance
+        }
+    }
+}
+
+@ public { }
+fn result_equal(ProviderResult a, ProviderResult b) → bool {
+    match a {
+        case NoDraft {
+            return is_no_draft(b)
+        }
+        case Candidates const ids_a, provenance_a {
+            match b {
+                case NoDraft {
+                    return false
+                }
+                case Candidates const ids_b, provenance_b {
+                    if not (ids_a ≡ ids_b) then return false
+                    return provenance_equal(provenance_a, provenance_b)
+                }
+            }
+        }
+    }
+}
+
+# Bind candidate ids to a request. Empty ids are a typed no-draft via
+# no_draft(), not this constructor. Length may be shorter than the
+# requested block (available context) but must not exceed it.
+@ public { }
+fn construct_candidates(ProviderRequest request, list<int> ids, CandidateProvenance provenance) → ProviderResult ⇥ SpeculativeError {
+    require ids.length() ≥ 1 throw variant MalformedResult {message = "candidate list must not be empty"}
+    require ids.length() ≤ request.block_size() throw variant MalformedResult {message = "candidate count exceeds the requested block size"}
+    for from ids const t {
+        require t ≥ 0 throw variant MalformedResult {message = "candidate token id must be non-negative"}
+    }
+    require provenance.source() ≡ SOURCE_CONTEXT_LOOKUP throw variant InvalidProvenance {message = "unknown candidate source"}
+    return variant Candidates {ids = ids, provenance = provenance}
+}
