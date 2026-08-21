@@ -117,6 +117,9 @@ union CacheError {
     },
     Gap {
         string message
+    },
+    ProfileUnavailable {
+        string message
     }
 }
 
@@ -154,6 +157,9 @@ fn message(CacheError e) → string {
             return message
         }
         case Gap const message {
+            return message
+        }
+        case ProfileUnavailable const message {
             return message
         }
     }
@@ -734,24 +740,6 @@ fn _kv_dtype_from_name(string s) → KvDtype ⇥ CacheError {
 }
 
 @ private { }
-fn _kv_dtype_block(KvDtype t) → int {
-    match t {
-        case F32 {
-            return 1
-        }
-        case F16 {
-            return 1
-        }
-        case Q8_0 {
-            return Q8_0_BLOCK
-        }
-        case Q4_K {
-            return Q4_K_BLOCK
-        }
-    }
-}
-
-@ private { }
 fn _kv_dtype_quantized(KvDtype t) → bool {
     match t {
         case F32 {
@@ -1047,6 +1035,125 @@ fn _sharing_is_gqa(KvSharing s) → bool {
 }
 
 # -------------------------------------------------------------------------
+# KVProfile — cache-local admission law. A profile carries the family
+# layout law, opened dtype set, dtype block rules, quantized-V rule, and
+# reserve tag. GI4 is today's admitted law; CUDA stays an empty slot until
+# device receipts exist.
+# -------------------------------------------------------------------------
+
+@ public { }
+class KVProfile {
+    string name
+    list<VLayout> classic_v_layouts
+    list<VLayout> flash_v_layouts
+    bool quantized_v_requires_flash
+    list<KvDtype> kv_dtypes
+    int f32_block
+    int f16_block
+    int q8_0_block
+    int q4_k_block
+    string reserve_policy
+    bool admitted
+
+    fn name() → string {
+        return self.name
+    }
+
+    fn classic_v_layouts() → list<VLayout> {
+        return self.classic_v_layouts
+    }
+
+    fn flash_v_layouts() → list<VLayout> {
+        return self.flash_v_layouts
+    }
+
+    fn quantized_v_requires_flash() → bool {
+        return self.quantized_v_requires_flash
+    }
+
+    fn kv_dtypes() → list<KvDtype> {
+        return self.kv_dtypes
+    }
+
+    fn f32_block() → int {
+        return self.f32_block
+    }
+
+    fn f16_block() → int {
+        return self.f16_block
+    }
+
+    fn q8_0_block() → int {
+        return self.q8_0_block
+    }
+
+    fn q4_k_block() → int {
+        return self.q4_k_block
+    }
+
+    fn reserve_policy() → string {
+        return self.reserve_policy
+    }
+
+    fn admitted() → bool {
+        return self.admitted
+    }
+}
+
+@ public { }
+fn profile_gi4() → KVProfile {
+    var list<VLayout> classic_v_layouts ← empty
+    classic_v_layouts.append(v_layout_transposed())
+    var list<VLayout> flash_v_layouts ← empty
+    flash_v_layouts.append(v_layout_straight())
+    var list<KvDtype> kv_dtypes ← empty
+    kv_dtypes.append(kv_dtype_f32())
+    kv_dtypes.append(kv_dtype_f16())
+    kv_dtypes.append(kv_dtype_q8_0())
+    kv_dtypes.append(kv_dtype_q4_k())
+    return KVProfile {name = "gi4", classic_v_layouts = classic_v_layouts, flash_v_layouts = flash_v_layouts, quantized_v_requires_flash = true, kv_dtypes = kv_dtypes, f32_block = 1, f16_block = 1, q8_0_block = Q8_0_BLOCK, q4_k_block = Q4_K_BLOCK, reserve_policy = RESERVE_GI4, admitted = true}
+}
+
+@ public { }
+fn profile_cuda() → KVProfile {
+    return KVProfile {name = "cuda", classic_v_layouts = empty, flash_v_layouts = empty, quantized_v_requires_flash = false, kv_dtypes = empty, f32_block = 0, f16_block = 0, q8_0_block = 0, q4_k_block = 0, reserve_policy = "", admitted = false}
+}
+
+@ private { }
+fn _profile_has_v_layout(list<VLayout> allowed, VLayout target) → bool {
+    for range 0‥allowed.length() const i {
+        if v_layout_eq(allowed.get(i) coalesce v_layout_transposed(), target) then return true
+    }
+    return false
+}
+
+@ private { }
+fn _profile_has_dtype(list<KvDtype> allowed, KvDtype target) → bool {
+    for range 0‥allowed.length() const i {
+        if kv_dtype_eq(allowed.get(i) coalesce kv_dtype_f32(), target) then return true
+    }
+    return false
+}
+
+@ private { }
+fn _profile_dtype_block(KVProfile profile, KvDtype t) → int {
+    match t {
+        case F32 {
+            return profile.f32_block()
+        }
+        case F16 {
+            return profile.f16_block()
+        }
+        case Q8_0 {
+            return profile.q8_0_block()
+        }
+        case Q4_K {
+            return profile.q4_k_block()
+        }
+    }
+}
+
+# -------------------------------------------------------------------------
 # LayerSet — one per-layer-set cache-class slice of the model.
 # Dense / SlidingWindow / CompressedHca are KV classes. Indexer is a
 # partition class assigned per layer set; it is not a KvDtype.
@@ -1278,8 +1385,8 @@ fn kv_structure_equal(KVStructure a, KVStructure b) → bool {
 }
 
 @ private { }
-fn _check_block(KvDtype t, int kv_heads, int head_dim) → bool ⇥ CacheError {
-    const int block ← _kv_dtype_block(t)
+fn _check_block(KVProfile profile, KvDtype t, int kv_heads, int head_dim) → bool ⇥ CacheError {
+    const int block ← _profile_dtype_block(profile, t)
     const int width ← kv_heads * head_dim
     require width % block ≡ 0 throw variant InvalidCombination {message = "block size does not divide head_dim"}
     return true
@@ -1352,26 +1459,30 @@ fn _check_class_partitions(list<LayerSet> layers, list<CachePartition> partition
     return true
 }
 
-@ public { }
-fn construct_kv_structure(list<LayerSet> layers, KvDtype kv_dtype_k, KvDtype kv_dtype_v, VLayout v_layout, KvSharing sharing, AttentionFamily attention_family, int query_heads, int slots, int context_length) → KVStructure ⇥ CacheError {
-    return construct_kv_structure_with_partitions(layers, kv_dtype_k, kv_dtype_v, v_layout, sharing, attention_family, query_heads, slots, context_length, empty)
+@ private { }
+fn _check_profile_law(KVProfile profile, KvDtype kv_dtype_k, KvDtype kv_dtype_v, VLayout v_layout, AttentionFamily attention_family) → bool ⇥ CacheError {
+    require _profile_has_dtype(profile.kv_dtypes(), kv_dtype_k) throw variant DtypeMismatch {message = "unadmitted kv dtype"}
+    require _profile_has_dtype(profile.kv_dtypes(), kv_dtype_v) throw variant DtypeMismatch {message = "unadmitted kv dtype"}
+    if profile.quantized_v_requires_flash() and _kv_dtype_quantized(kv_dtype_v) {
+        require _attention_is_flash(attention_family) throw variant InvalidCombination {message = "quantized V requires the flash-attention family"}
+    }
+    if _attention_is_flash(attention_family) {
+        require _profile_has_v_layout(profile.flash_v_layouts(), v_layout) throw variant InvalidCombination {message = "flash-attention family requires straight V layout"}
+    }
+    if not _attention_is_flash(attention_family) {
+        require _profile_has_v_layout(profile.classic_v_layouts(), v_layout) throw variant InvalidCombination {message = "classic attention family requires transposed V layout"}
+    }
+    return true
 }
 
-@ public { }
-fn construct_kv_structure_with_partitions(list<LayerSet> layers, KvDtype kv_dtype_k, KvDtype kv_dtype_v, VLayout v_layout, KvSharing sharing, AttentionFamily attention_family, int query_heads, int slots, int context_length, list<CachePartition> partitions) → KVStructure ⇥ CacheError {
+@ private { }
+fn _construct_kv_structure_with_profile_and_partitions(KVProfile profile, list<LayerSet> layers, KvDtype kv_dtype_k, KvDtype kv_dtype_v, VLayout v_layout, KvSharing sharing, AttentionFamily attention_family, int query_heads, int slots, int context_length, list<CachePartition> partitions) → KVStructure ⇥ CacheError {
+    require profile.admitted() throw variant ProfileUnavailable {message = "cuda profile has no admitted KV layout law; awaiting device receipts (ELP-06/EXEC-02)"}
     require layers.length() ≥ 1 throw variant InvalidDimension {message = "layer set must be at least one"}
     require query_heads ≥ 1 throw variant InvalidDimension {message = "query head count must be at least one"}
     require slots ≥ 1 throw variant InvalidDimension {message = "slots must be at least one"}
     require context_length ≥ 1 throw variant InvalidDimension {message = "context length must be at least one"}
-    if _kv_dtype_quantized(kv_dtype_v) {
-        require _attention_is_flash(attention_family) throw variant InvalidCombination {message = "quantized V requires the flash-attention family"}
-    }
-    if _attention_is_flash(attention_family) {
-        require _v_layout_is_straight(v_layout) throw variant InvalidCombination {message = "flash-attention family requires straight V layout"}
-    }
-    if not _attention_is_flash(attention_family) {
-        require not _v_layout_is_straight(v_layout) throw variant InvalidCombination {message = "classic attention family requires transposed V layout"}
-    }
+    _check_profile_law(profile, kv_dtype_k, kv_dtype_v, v_layout, attention_family)
     _check_class_partitions(layers, partitions)
     var list<int> kv_seen ← empty
     var list<int> indexer_seen ← empty
@@ -1389,8 +1500,8 @@ fn construct_kv_structure_with_partitions(list<LayerSet> layers, KvDtype kv_dtyp
             if not _sharing_is_gqa(sharing) {
                 require layer.kv_heads() ≡ query_heads throw variant InvalidCombination {message = "single sharing requires kv_heads = heads"}
             }
-            _check_block(kv_dtype_k, layer.kv_heads(), layer.head_dim())
-            _check_block(kv_dtype_v, layer.kv_heads(), layer.head_dim())
+            _check_block(profile, kv_dtype_k, layer.kv_heads(), layer.head_dim())
+            _check_block(profile, kv_dtype_v, layer.kv_heads(), layer.head_dim())
         }
         var int j ← 0
         while j ≺ layer.indices().length() {
@@ -1407,7 +1518,22 @@ fn construct_kv_structure_with_partitions(list<LayerSet> layers, KvDtype kv_dtyp
             j ← j + 1
         }
     }
-    return KVStructure {layers = layers, kv_dtype_k = kv_dtype_k, kv_dtype_v = kv_dtype_v, v_layout = v_layout, sharing = sharing, attention_family = attention_family, query_heads = query_heads, slots = slots, context_length = context_length, reserve_policy = "gi4-reserve", partitions = partitions}
+    return KVStructure {layers = layers, kv_dtype_k = kv_dtype_k, kv_dtype_v = kv_dtype_v, v_layout = v_layout, sharing = sharing, attention_family = attention_family, query_heads = query_heads, slots = slots, context_length = context_length, reserve_policy = profile.reserve_policy(), partitions = partitions}
+}
+
+@ public { }
+fn construct_kv_structure_with_profile(KVProfile profile, list<LayerSet> layers, KvDtype kv_dtype_k, KvDtype kv_dtype_v, VLayout v_layout, KvSharing sharing, AttentionFamily attention_family, int query_heads, int slots, int context_length) → KVStructure ⇥ CacheError {
+    return _construct_kv_structure_with_profile_and_partitions(profile, layers, kv_dtype_k, kv_dtype_v, v_layout, sharing, attention_family, query_heads, slots, context_length, empty)
+}
+
+@ public { }
+fn construct_kv_structure(list<LayerSet> layers, KvDtype kv_dtype_k, KvDtype kv_dtype_v, VLayout v_layout, KvSharing sharing, AttentionFamily attention_family, int query_heads, int slots, int context_length) → KVStructure ⇥ CacheError {
+    return construct_kv_structure_with_partitions(layers, kv_dtype_k, kv_dtype_v, v_layout, sharing, attention_family, query_heads, slots, context_length, empty)
+}
+
+@ public { }
+fn construct_kv_structure_with_partitions(list<LayerSet> layers, KvDtype kv_dtype_k, KvDtype kv_dtype_v, VLayout v_layout, KvSharing sharing, AttentionFamily attention_family, int query_heads, int slots, int context_length, list<CachePartition> partitions) → KVStructure ⇥ CacheError {
+    return _construct_kv_structure_with_profile_and_partitions(profile_gi4(), layers, kv_dtype_k, kv_dtype_v, v_layout, sharing, attention_family, query_heads, slots, context_length, partitions)
 }
 
 @ private { }
