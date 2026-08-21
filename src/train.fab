@@ -1,9 +1,16 @@
 +++
 locale = "en"
 +++
-# Training loop facade.
+# Training facade — SGD train steps, warmup+cosine schedule, train/eval
+# mode, RNG, dropout, and checkpoint envelope (PML4).
 #
 # Public import: import from "gradus:train" train
+# Depends on: gradus:dtype (finite), gradus:tensor (value carrier).
+#
+# This module does not own an epoch loop or metrics. Metrics live in
+# gradus:metrics. The admitted parameter update is SGD
+# (param' = param − lr·grad); optimizer state lives in gradus:optimize.
+# Learning-rate schedules live here.
 #
 # S4-A (gpu-training-lowering stage-4-delivery.md): first concrete
 # static-shape training-step calls, bounded to the first two callers
@@ -38,9 +45,9 @@ locale = "en"
 # recorded faber/radix runtime gap. Revisit when library cross-module calls
 # execute in the stepper.
 #
-# Architectural rule: the training loop is reusable across models. It must not
+# Architectural rule: the training step is reusable across models. It must not
 # import from a specific model definition. A model definition does not own its
-# training loop. No module owns a backend or device handle.
+# training step. No module owns a backend or device handle.
 #
 # PML0-U3 ledger disposition (pml0-proof-api-ledger.md, gradus 33df687) —
 # executed at PML1-U6: train_step_2x2 and train_step_4x4 are ADMITTED as
@@ -154,7 +161,7 @@ fn train_step_bert_layernorm(tensor<f32, [8]> ln1_s, tensor<f32, [8]> ln1_o, ten
 # =========================================================================
 #
 # --- Contract (pml4-delivery.md PML4-U4) ---------------------------------
-# Two explicit public controls for the training loop:
+# Two explicit public controls for a training run:
 #
 #   1. Schedule — the learning-rate schedule (warmup + cosine decay, the
 #      accepted training-proof default). A pure config + one pure
@@ -291,22 +298,18 @@ class Schedule {
     int total_steps
     f32 rate_end
 
-    # Peak learning rate (end of warmup).
     fn rate_vertex() → f32 {
         return self.rate_vertex
     }
 
-    # Warmup steps (linear ramp).
     fn warmup() → int {
         return self.warmup
     }
 
-    # Total scheduled steps (decay horizon).
     fn total_steps() → int {
         return self.total_steps
     }
 
-    # Final learning rate (post-decay).
     fn rate_end() → f32 {
         return self.rate_end
     }
@@ -411,8 +414,8 @@ fn mode_name(Mode m) → string {
     }
 }
 
-@ private { }
-fn _discipline(Mode m) → bool {
+@ public { }
+fn is_discipline(Mode m) → bool {
     match m {
         case Discipline {
             return true
@@ -423,16 +426,9 @@ fn _discipline(Mode m) → bool {
     }
 }
 
-# Train-mode predicate.
-@ public { }
-fn is_discipline(Mode m) → bool {
-    return _discipline(m)
-}
-
-# Eval-mode predicate (dropout identity).
 @ public { }
 fn is_estimate(Mode m) → bool {
-    return not _discipline(m)
+    return not is_discipline(m)
 }
 
 # Construct a mode from its canonical name — fail closed on an unknown
@@ -457,17 +453,19 @@ fn mode(string name) → Mode ⇥ TrainError {
 @ public { }
 fn dropout_probability(Mode m, f32 rate) → f32 ⇥ TrainError {
     require dtype.finite(rate) throw variant InvalidDropout {message = "dropout rate must be in [0, 1]"}
-    require not (rate ≺ 0.0 or rate ≻ 1.0) throw variant InvalidDropout {message = "dropout rate must be in [0, 1]"}
+    require rate ≥ 0.0 throw variant InvalidDropout {message = "dropout rate must be in [0, 1]"}
+    require rate ≤ 1.0 throw variant InvalidDropout {message = "dropout rate must be in [0, 1]"}
     if is_estimate(m) then return 0.0 ∷ f32
     return rate
 }
 
 # =========================================================================
-# PML4-U5 — Seeds (RNG), checkpoint resume, metrics (pml4-delivery.md U5)
+# PML4-U5 — Seeds (RNG) and checkpoint resume (pml4-delivery.md U5)
 # =========================================================================
 #
 # --- Contract ------------------------------------------------------------
-# Three pieces close the reproducibility contract:
+# Two pieces close this module's reproducibility contract (metrics live
+# in gradus:metrics, not here):
 #
 #   1. Seed — the seed/RNG state (this unit owns the machinery U4's
 #      dropout gate composes with). A xorshift64 generator (shifts + XOR
@@ -492,9 +490,6 @@ fn dropout_probability(Mode m, f32 rate) → f32 ⇥ TrainError {
 #      RNG state, or a missing state wire all fail closed at
 #      deserialization; a corrupt embedded state wire fails closed at
 #      optimize.deserialize (resume).
-#
-#   3. Metrics — see gradus:metrics (accuracy + the per-step Metric
-#      record); defined values with a deterministic contract.
 #
 # --- Shared with the GPU-training lane's accepted facts -----------------
 #   * checkpoint resume (state + RNG + epoch/step) versioned per the U3
@@ -527,7 +522,6 @@ const string schema_version ← "1.0.0"
 class Seed {
     int status
 
-    # The 64-bit generator state (nonzero — xorshift64 degenerates at 0).
     fn status() → int {
         return self.status
     }
@@ -555,12 +549,10 @@ class Draw {
     int payload
     Seed seed
 
-    # The drawn value.
     fn payload() → int {
         return self.payload
     }
 
-    # The advanced generator state.
     fn seed() → Seed {
         return self.seed
     }
@@ -592,12 +584,10 @@ class DrawF32 {
     f32 payload
     Seed seed
 
-    # The drawn value in [0, 1).
     fn payload() → f32 {
         return self.payload
     }
 
-    # The advanced generator state.
     fn seed() → Seed {
         return self.seed
     }
@@ -626,12 +616,10 @@ class Dropout {
     tensor.Tensor payload
     Seed seed
 
-    # The masked tensor.
     fn payload() → tensor.Tensor {
         return self.payload
     }
 
-    # The advanced RNG state.
     fn seed() → Seed {
         return self.seed
     }
@@ -717,12 +705,11 @@ class Checkpoint {
         return self.step
     }
 
-    # The RNG state (deterministic continuation after resume).
     fn rng() → Seed {
         return self.rng
     }
 
-    # The embedded U3 optimizer-state wire (verbatim).
+    # Embedded optimizer-state wire, carried verbatim.
     fn state_wire() → string {
         return self.state_wire
     }
@@ -764,8 +751,7 @@ fn checkpoint_equal(Checkpoint a, Checkpoint b) → bool {
 
 @ public { }
 fn serialize_checkpoint(Checkpoint c) → string {
-    var string out ← "train/checkpoint/§/§/§/§/§"(schema_version, c.age() ↦ string, c.step() ↦ string, c.rng().status() ↦ string, c.state_wire())
-    return out
+    return "train/checkpoint/§/§/§/§/§"(schema_version, c.age() ↦ string, c.step() ↦ string, c.rng().status() ↦ string, c.state_wire())
 }
 
 # All-digits predicate for wire integer fields (epoch, step).
