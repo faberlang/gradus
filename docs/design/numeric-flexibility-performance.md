@@ -16,7 +16,7 @@ disagrees with git, git wins and the doc is named as the defect. Reference repos
 
 ## 1. Grounding summary (what is actually on main)
 
-Verified 2026-08-18, in the order the task names:
+Verified 2026-08-18, in the order the task names. Refresh 2026-08-21: §3.2 splits emittable (recipe/emitter receipt) from executed (device receipt); R-PACK-05 packed device-run is still pending (`exec02-packed-kernels-delivery.md:9`).
 
 1. **Gradus live library** — 33 modules, 750 declared functions
    (`gradus/docs/module-map.md:11-60`). Numeric posture: f32 self-hosted
@@ -136,16 +136,36 @@ accumulation+output) is already locked guidance
 **f32** for packed GEMM (decision posture: in-kernel dequant, f32 accumulate —
 `plan.rs:99-104`).
 
+**Evidence classes** (one definition for every backend cell; a `✅` is never
+bare support):
+
+| Class | Meaning |
+| --- | --- |
+| **executed (R)** | Receipt R *ran* this cell (device run or CPU-oracle run). |
+| **emittable (R)** | Recipe/emitter receipt R exists (a backend emits a body). Not a device run. |
+| **not admitted** | No emitter receipt and no device receipt (`❌ → admit` / `❌ → later`). Uncited — do not read as support. |
+
+**Receipts cited in the cells:**
+
+- **GI3-6** (F32 Metal executed): `radix/docs/factory/gpu-inference-gguf/evidence/gi3-evidence-burgus-metal.md` — burgus Metal declared-f32 prefill.
+- **GI3-7** (F32 CUDA executed): `radix/docs/factory/gpu-inference-gguf/evidence/gi3-evidence-pharos-cuda.md` — pharos CUDA declared-f32 prefill.
+- **R-PACK-02** (packed Metal/CUDA emittable): radix `b199834f8` — Metal `crates/radix-mir-metal/src/emit/quantized_matmul.rs`, NVVM `crates/radix-mir-llvm/src/nvvm/quantized_matmul.rs`. Packed device-run was not attempted; reserved for **R-PACK-05** (`exec02-packed-kernels-delivery.md:9`).
+- **WGSL recipes** (F32 WGSL emittable): `radix/crates/radix-mir-wgsl/src/emit/recipe.rs` (f32 matmul). No WGSL device receipt.
+- **CPU dequant** (CPU executed): `gradus/src/model/dequant.fab` (classes in `radix/crates/radix-mir/src/kernel_plan/packed.rs:28-39`); numeric oracle `radix/docs/factory/gpu-inference-gguf/evidence/gi2-dequant-goldens.json`.
+
+Metal and CUDA/NVVM cells state emittable and executed separately. No packed
+cell is executed: R-PACK-05 has not run.
+
 | Storage | bytes/elem (Gradus `dequant.fab`) | Compute class | Metal | CUDA/NVVM | WGSL | CPU |
 | --- | ---: | --- | --- | --- | --- | --- |
-| F32 | 4.0 | passthrough → `TiledMatMul` | ✅ (GI3) | ✅ (GI3) | ✅ (recipes) | ✅ (dequant `PassthroughF32`) |
-| BF16 | 2.0 | native convert → f32 acc | ✅ (R-PACK-02) | ✅ (R-PACK-02) | ❌ → **admit** | ✅ (`NativeBf16Convert`) |
-| **F16 (new)** | 2.0 | native convert → f32 acc | ❌ → **admit** | ❌ → **admit** | ❌ → **admit** | ❌ → **admit** |
-| Q8_0 | 34/32 ≈ 1.06 | block dequant (32) | ✅ | ✅ | ❌ → later | ✅ |
-| Q5_0 | 22/32 ≈ 0.69 | block dequant (32) | ✅ | ✅ | ❌ → later | ✅ |
-| Q4_K | 144/256 ≈ 0.56 | superblock (256) | ✅ | ✅ | ❌ → later | ✅ |
-| Q5_K | 176/256 ≈ 0.69 | superblock (256) | ✅ | ✅ | ❌ → later | ✅ |
-| Q6_K | 210/256 ≈ 0.82 | superblock (256) | ✅ | ✅ | ❌ → later | ✅ |
+| F32 | 4.0 | passthrough → `TiledMatMul` | ✅ executed (GI3-6); emittable `TiledMatMul` | ✅ executed (GI3-7); emittable `TiledMatMul` | ✅ emittable (WGSL recipes); executed none | ✅ executed (CPU dequant `PassthroughF32`) |
+| BF16 | 2.0 | native convert → f32 acc | ✅ emittable (R-PACK-02 `b199834f8`); executed none (R-PACK-05 reserved) | ✅ emittable (R-PACK-02 `b199834f8`); executed none (R-PACK-05 reserved) | ❌ not admitted → **admit** (uncited; no emitter/device receipt) | ✅ executed (CPU dequant `NativeBf16Convert`) |
+| **F16 (new)** | 2.0 | native convert → f32 acc | ❌ not admitted → **admit** (uncited; no emitter/device receipt) | ❌ not admitted → **admit** (uncited; no emitter/device receipt) | ❌ not admitted → **admit** (uncited; no emitter/device receipt) | ❌ not admitted → **admit** (uncited; no emitter/device receipt) |
+| Q8_0 | 34/32 ≈ 1.06 | block dequant (32) | ✅ emittable (R-PACK-02 `b199834f8`); executed none (R-PACK-05 reserved) | ✅ emittable (R-PACK-02 `b199834f8`); executed none (R-PACK-05 reserved) | ❌ later (not admitted; uncited — no emitter/device receipt) | ✅ executed (CPU dequant Block, `dequant.fab` `_dequant_q8_0`) |
+| Q5_0 | 22/32 ≈ 0.69 | block dequant (32) | ✅ emittable (R-PACK-02 `b199834f8`); executed none (R-PACK-05 reserved) | ✅ emittable (R-PACK-02 `b199834f8`); executed none (R-PACK-05 reserved) | ❌ later (not admitted; uncited — no emitter/device receipt) | ✅ executed (CPU dequant Block, `dequant.fab` `_dequant_q5_0`) |
+| Q4_K | 144/256 ≈ 0.56 | superblock (256) | ✅ emittable (R-PACK-02 `b199834f8`); executed none (R-PACK-05 reserved) | ✅ emittable (R-PACK-02 `b199834f8`); executed none (R-PACK-05 reserved) | ❌ later (not admitted; uncited — no emitter/device receipt) | ✅ executed (CPU dequant Superblock, `dequant.fab` `_dequant_q4_k`) |
+| Q5_K | 176/256 ≈ 0.69 | superblock (256) | ✅ emittable (R-PACK-02 `b199834f8`); executed none (R-PACK-05 reserved) | ✅ emittable (R-PACK-02 `b199834f8`); executed none (R-PACK-05 reserved) | ❌ later (not admitted; uncited — no emitter/device receipt) | ✅ executed (CPU dequant Superblock, `dequant.fab` `_dequant_q5_k`) |
+| Q6_K | 210/256 ≈ 0.82 | superblock (256) | ✅ emittable (R-PACK-02 `b199834f8`); executed none (R-PACK-05 reserved) | ✅ emittable (R-PACK-02 `b199834f8`); executed none (R-PACK-05 reserved) | ❌ later (not admitted; uncited — no emitter/device receipt) | ✅ executed (CPU dequant Superblock, `dequant.fab` `_dequant_q6_k`) |
 
 Why F16 storage matters even though the Qwen GGUF stores no F16 weight tensors:
 (1) llama.cpp's **KV default is F16** (`common/common.h:340-341`); (2) many
