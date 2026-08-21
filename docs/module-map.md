@@ -19,6 +19,7 @@ for each live import that has a demo:
 | `gradus:attention` | [`exempla/dense-rope/`](../exempla/dense-rope/) |
 | `gradus:transformer` | [`exempla/dense-block/`](../exempla/dense-block/) |
 | `gradus:gradient` | [`exempla/gradient-seam/`](../exempla/gradient-seam/) |
+| `gradus:mlp` | [`exempla/training-loop-mlp/`](../exempla/training-loop-mlp/) |
 | `gradus:loss` | [`docs/quickstart.md`](quickstart.md) snippet; then [`exempla/training-loop-mlp/`](../exempla/training-loop-mlp/) |
 | `gradus:optimize`, `gradus:train`, `gradus:metrics` | [`exempla/training-loop-mlp/`](../exempla/training-loop-mlp/) |
 | `gradus:model/gguf_manifest` | [`exempla/gguf-manifest/`](../exempla/gguf-manifest/) |
@@ -38,7 +39,7 @@ starts at [`exempla/dense-prefill-smollm2/`](../exempla/dense-prefill-smollm2/).
 
 ## Live modules (post-PML1–5 + correctness wave)
 
-The live tree has 34 modules (the W5d-U1 `gradus:calibration` bake added to the prior 33). Module names
+The live tree has 35 modules (the U15 `gradus:mlp` leaf added to the prior 34). Module names
 are unchanged. This inventory is verified against the live `src/**/*.fab` tree after the no-latin
 conversion (U1–U6); it does not reuse a pre-conversion name map. The source
 surface includes the A1C capsule-schema-2.0.0 surface, LIB-02 tokenizer
@@ -65,6 +66,7 @@ evidence and boundaries are recorded in
 | `gradus:nn` | `src/nn.fab` | Primitives: `linear`, `gelu`, `layernorm`, `rmsnorm`, `silu`, `swiglu` + fixed-shape rows (PML3; RMSNorm REF-01-U1.1, SiLU/SwiGLU REF-01-U1.2) |
 | `gradus:attention` | `src/attention.fab` | SDPA + RoPE (fixed-shape row + staged surface, PML3); configurable RoPE — frequency base/scale/pair policy, consecutive-pair vs interleaved-pair (REF-01-U1.3); multi-head attention with GQA KV-head sharing, causal + RoPE, output projection (REF-01-U1.4) |
 | `gradus:transformer` | `src/transformer.fab` | Transformer block (fixed-shape row + staged surface, PML3); generic dense transformer block — input RMSNorm → GQA attention (causal + RoPE) → residual → post-attn RMSNorm → SwiGLU MLP → residual, composing the U1.1/U1.2/U1.4 rows (REF-01-U1.5) |
+| `gradus:mlp` | `src/mlp.fab` | Two-layer MLP: staged `forward_mlp` + annotated `forward_mlp_loss` companion (PML3-U4) |
 | `gradus:train` | `src/train.fab` | Train steps, schedules, mode, RNG, dropout, and checkpoint `Checkpoint` (PML4) |
 | `gradus:metrics` | `src/metrics.fab` | Defined metrics: `accuracy`, `Metric` (PML4) |
 | `gradus:data` | `src/data.fab` | Stub — batching/shuffling/tokenization declared future |
@@ -86,7 +88,7 @@ evidence and boundaries are recorded in
 | `gradus:decode` | `src/decode.fab` | Decode/prefill/session/cancel + replica loop (PML5) |
 | `gradus:sampling` | `src/sampling.fab` | Sampling pipeline: greedy + filters + draw (PML5) |
 | `gradus:generation` | `src/generation.fab` | Generation config + cursor (PML5) |
-| `gradus:gradus` | `src/gradus.fab` | Facade map — no genera; MLP forward convenience |
+| `gradus:gradus` | `src/gradus.fab` | Facade map — no genera |
 
 ## Layers
 
@@ -96,7 +98,7 @@ L2  Autograd core       gradus:gradient
 L3  Loss                gradus:loss
 L4  Optimization        gradus:optimize
 L5  NN primitives       gradus:nn
-L6  Architecture blocks gradus:attention, gradus:transformer
+L6  Architecture blocks gradus:attention, gradus:mlp, gradus:transformer
 L7  Training            gradus:train, gradus:metrics, gradus:data
 PML2 Model admission    gradus:model/artifact, gradus:model/capsule,
                         gradus:model/gguf_manifest, gradus:model/gguf,

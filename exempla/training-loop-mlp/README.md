@@ -16,10 +16,10 @@ the pins (final `0.017928625511508454`).
 | Step | Surface |
 | --- | --- |
 | Schedule → optimizer-state binding | `train.scheduled_rate` (U4) feeds `optimize.construct`'s `rate` (U3) each step — the accepted constant lr 0.1 is the schedule `Schedule(0.1, 0, 1, 0.1)` (vertex == end) |
-| Shared-layer training path | `gradus.forward_mlp_loss` (loss) + the compiler-generated companion `forward_mlp_loss_backward` (gradients) |
+| Shared-layer training path | `mlp.forward_mlp_loss` (loss) + the compiler-generated companion `forward_mlp_loss_backward` (gradients) |
 | Per-parameter gradients | `gradient.construct` records (U2): identity + generation = the parameter version at the backward |
 | Optimizer steps | Tensor SGD: `train.train_step_4x4` → `optimize.sgd_step_4x4` (the delegating stepper). Parameter/checkpoint: `optimize.step` (U3) fresh-gradient rules, fail-closed; `parameter.mutate` bumps version |
-| Per-step metric log | `metrics.metric` (U5): `loss` = the loss (the accepted trajectory); `accuracy` = the documented regression-match rate (`|pred − target| ≤ 0.1` over the 16 output elements, read from the bare shared forward `gradus.forward_mlp`) |
+| Per-step metric log | `metrics.metric` (U5): `loss` = the loss (the accepted trajectory); `accuracy` = the documented regression-match rate (`|pred − target| ≤ 0.1` over the 16 output elements, read from the bare shared forward `mlp.forward_mlp`) |
 | Checkpoint in/out | `train.construct_checkpoint` (U5): whole-optimizer state wire (U3 `serialize`) + RNG state + epoch/step; `serialize_checkpoint` → `deserialize_checkpoint` is the resume round-trip (`checkpoint_equal`) |
 
 ## Convergence target (accepted oracle, f64 evaluations)

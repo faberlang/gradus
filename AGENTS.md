@@ -30,9 +30,10 @@ One `.fab` file → one import path. Nested dirs for packages.
 | `gradus:tensor` | Tensor construction, shape/dtype, basic ops (plain values — not autograd-aware) |
 | `gradus:gradient` | `@ radix backward` wrapper ergonomics; forward + companion gradient calls |
 | `gradus:loss` | Loss functions (MSE, cross-entropy) |
-| `gradus:optimize` | Optimizers (SGD, Adam) and learning-rate schedules |
+| `gradus:optimize` | Optimizers (SGD) and learning-rate schedules |
 | `gradus:nn` | Differentiable primitives: Linear, activation, norm, embedding, dropout |
 | `gradus:attention` | Scaled dot-product attention, causal masking, multi-head |
+| `gradus:mlp` | Two-layer MLP forward + training-path companion |
 | `gradus:transformer` | Transformer block, positional encoding, output head |
 | `gradus:train` | Training loop, metrics, checkpointing |
 | `gradus:data` | Batching, shuffling, tokenization |
@@ -47,23 +48,17 @@ Full map: [`docs/module-map.md`](docs/module-map.md). API shape:
 [`docs/archived/gradus-ml-foundation/GOAL.md`](docs/archived/gradus-ml-foundation/GOAL.md)
 (archived); live ML work is under `docs/factory/production-ml-library/`.
 
-## Corpus
+## Demos
 
-`corpus/` holds training demos that exercise the public `gradus:*` surface.
-The primary forcing-function demo is `corpus/nanogpt-shakespeare/` — a
-minimal nanoGPT implementation trained on Shakespeare text. This demo runs on
-CPU (slowly) for correctness and forces the GPU gradient path to close for
-real iteration speed. Details and per-demo commands: `corpus/README.md`.
-
-Demos should exercise the public `gradus:*` surface and feed gaps back into
-the library or into Radix mir-swarm rungs, not grow workarounds.
+Instructional and training demos live under `exempla/`. They exercise the
+public `gradus:*` surface and feed gaps back into the library or into Radix
+mir-swarm rungs, not grow workarounds.
 
 ## Rules
 
 - Keep public modules under `src/**/*.fab`.
 - Keep package tests as co-located `src/**/*.proba` (`name.fab` + `name.proba`).
 - Keep instructional demos under `exempla/**/*.fab`.
-- Keep training demos under `corpus/<slug>/`.
 - Do not add `@ externa` or `@ subsidia`.
 - Optional genus fields use `sponte`.
 - Prefer leaf imports; do not grow genera on the `gradus:gradus` facade.

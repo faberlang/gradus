@@ -58,7 +58,7 @@ KV-cache values, mutation rules, cache identity, identity serialization, and KV 
 
 ### Public types
 
-- `union CacheError` — EmptyName, IdOutOfRange, ShapeMismatch, DtypeMismatch, InvalidDimension, ElementMismatch, UnknownVersion, BadWire, InvalidCombination
+- `union CacheError` — EmptyName, IdOutOfRange, ShapeMismatch, DtypeMismatch, InvalidDimension, ElementMismatch, UnknownVersion, BadWire, InvalidCombination, Overflow, Gap
 - `union KvDtype` — F32, F16, Q8_0, Q4_K
 - `union SwaType` — Standard, Chunked, Symmetric
 - `union LayerStructure` — Dense, SlidingWindow, CompressedHca, Indexer
@@ -67,7 +67,7 @@ KV-cache values, mutation rules, cache identity, identity serialization, and KV 
 - `union KvSharing` — Single, GqaShared
 - `union AttentionFamily` — Classic, Flash
 - `class KVCache`
-  - fields: string model, string model_version, string config, string tokenizer, list<int> history, int layers, string dtype, string layout, tensor.Tensor key, tensor.Tensor payload, int version, int dimension
+  - fields: string model, string model_version, string config, string tokenizer, list<int> history, int layers, string dtype, string layout, tensor.Tensor key, tensor.Tensor payload, int version, int dimension, int capacity
   - methods:
     - `fn model() → string`
     - `fn model_version() → string`
@@ -81,6 +81,7 @@ KV-cache values, mutation rules, cache identity, identity serialization, and KV 
     - `fn payload() → tensor.Tensor`
     - `fn version() → int`
     - `fn dimension() → int`
+    - `fn capacity() → int`
     - `fn length() → int`
 - `class CacheIdentity`
   - fields: string model, string model_version, string config, string tokenizer, string history, string position, int layers, string dtype, string layout
@@ -464,20 +465,13 @@ Gradient records and the forward/companion gradient wrapper surface.
 
 ## gradus:gradus
 
-Thin package facade for MLP forward and loss convenience functions.
+Package map facade. No genera.
 
 **Source**: `src/gradus.fab`
 
-### Public types
-
-- `union GradusError` — NegativeDimension, DimensionAboveLimit, ProductAboveLimit, GradusMismatch, ShapeMismatch, Incompatible, DtypeMismatch, ElementMismatch
-
 ### Public functions
 
-- `fn message(GradusError e) → string`
-- `fn forward_mlp(tensor.Tensor x, tensor.Tensor w1, tensor.Tensor b1, tensor.Tensor w2, tensor.Tensor b2) → tensor.Tensor ⇥ GradusError`
-- `fn nil() → void`
-- `fn forward_mlp_loss(tensor<f32, [4, 4]> input, tensor<f32, [4, 4]> weight1, tensor<f32, [4, 4]> bias1, tensor<f32, [4, 4]> weight2, tensor<f32, [4, 4]> bias2, tensor<f32, [4, 4]> target) → f32`
+- None declared.
 
 ## gradus:loss
 
@@ -549,6 +543,23 @@ Classification accuracy and validated loss/accuracy metric records.
 - `fn metric(f32 loss, f32 accuracy) → Metric ⇥ MetricError`
 - `fn default() → Metric`
 - `fn metric_equal(Metric a, Metric b) → bool`
+
+## gradus:mlp
+
+Two-layer MLP: staged `forward_mlp` over the nn carrier and the annotated training-path companion `forward_mlp_loss`.
+
+**Source**: `src/mlp.fab`
+
+### Public types
+
+- `union GradusError` — NegativeDimension, DimensionAboveLimit, ProductAboveLimit, GradusMismatch, ShapeMismatch, Incompatible, DtypeMismatch, ElementMismatch
+
+### Public functions
+
+- `fn message(GradusError e) → string`
+- `fn forward_mlp(tensor.Tensor x, tensor.Tensor w1, tensor.Tensor b1, tensor.Tensor w2, tensor.Tensor b2) → tensor.Tensor ⇥ GradusError`
+- `fn nil() → void`
+- `fn forward_mlp_loss(tensor<f32, [4, 4]> input, tensor<f32, [4, 4]> weight1, tensor<f32, [4, 4]> bias1, tensor<f32, [4, 4]> weight2, tensor<f32, [4, 4]> bias2, tensor<f32, [4, 4]> target) → f32`
 
 ## gradus:model/artifact
 
@@ -1259,6 +1270,14 @@ Fixed-shape and runtime-carrier transformer blocks, including cached block evalu
 ### Public types
 
 - `union TransformerError` — NegativeDimension, DimensionAboveLimit, ProductAboveLimit, GradusMismatch, ShapeMismatch, Incompatible, DtypeMismatch, ElementMismatch, EpsilonInvalida, InvalidPosition, InvalidDimension, InvalidMode
+- `class DenseAttentionWeights`
+  - fields: tensor.Tensor wq, tensor.Tensor bq, tensor.Tensor wk, tensor.Tensor bk, tensor.Tensor wv, tensor.Tensor bv, tensor.Tensor wo
+- `class DenseAttentionConfig`
+  - fields: int num_heads, int num_kv_heads, f32 scale, int rope_dim, attention.RopeConfig rope_config
+- `class DenseMlpWeights`
+  - fields: tensor.Tensor wg, tensor.Tensor bg, tensor.Tensor wu, tensor.Tensor bu, tensor.Tensor wd, tensor.Tensor bd
+- `class DenseNormConfig`
+  - fields: tensor.Tensor ln1_s, tensor.Tensor ln2_s, f32 epsilon
 - `class CachedBlock`
   - fields: tensor.Tensor output, kv.KVCache state
   - methods:
@@ -1270,10 +1289,10 @@ Fixed-shape and runtime-carrier transformer blocks, including cached block evalu
 - `fn bert_tiny_block_2x8(tensor<f32, [2, 8]> x, tensor<f32, [8]> ln1_s, tensor<f32, [8]> ln1_o, tensor<f32, [8, 8]> wq, tensor<f32, [8]> bq, tensor<f32, [8, 8]> wk, tensor<f32, [8]> bk, tensor<f32, [8, 8]> wv, tensor<f32, [8]> bv, tensor<f32, [8, 8]> wo, tensor<f32, [8]> bo, tensor<f32, [8]> ln2_s, tensor<f32, [8]> ln2_o, tensor<f32, [8, 8]> wf1, tensor<f32, [8]> bf1, tensor<f32, [8, 8]> wf2, tensor<f32, [8]> bf2, tensor<f32, [8]> ln3_s, tensor<f32, [8]> ln3_o, tensor<f32, [2, 2]> scale) → tensor<f32, [2, 8]>`
 - `fn message(TransformerError e) → string`
 - `fn transformer_block(tensor.Tensor x, tensor.Tensor ln1_s, tensor.Tensor ln1_o, tensor.Tensor wq, tensor.Tensor bq, tensor.Tensor wk, tensor.Tensor bk, tensor.Tensor wv, tensor.Tensor bv, tensor.Tensor wo, tensor.Tensor bo, tensor.Tensor ln2_s, tensor.Tensor ln2_o, tensor.Tensor wf1, tensor.Tensor bf1, tensor.Tensor wf2, tensor.Tensor bf2, tensor.Tensor ln3_s, tensor.Tensor ln3_o, f32 scale, int mode, list<int> positions, int dim) → tensor.Tensor ⇥ TransformerError`
-- `fn dense_block(tensor.Tensor x, tensor.Tensor ln1_s, f32 epsilon, tensor.Tensor wq, tensor.Tensor bq, tensor.Tensor wk, tensor.Tensor bk, tensor.Tensor wv, tensor.Tensor bv, tensor.Tensor wo, int num_heads, int num_kv_heads, f32 scale, list<int> positions, int rope_dim, attention.RopeConfig cfg, tensor.Tensor ln2_s, tensor.Tensor wg, tensor.Tensor bg, tensor.Tensor wu, tensor.Tensor bu, tensor.Tensor wd, tensor.Tensor bd) → tensor.Tensor ⇥ TransformerError`
+- `fn dense_block(tensor.Tensor x, list<int> positions, DenseAttentionWeights attention_weights, DenseAttentionConfig attention_config, DenseMlpWeights mlp_weights, DenseNormConfig norm_config) → tensor.Tensor ⇥ TransformerError`
 - `fn default_cached_block() → CachedBlock`
 - `fn transformer_block_cached(tensor.Tensor x, tensor.Tensor ln1_s, tensor.Tensor ln1_o, tensor.Tensor wq, tensor.Tensor bq, tensor.Tensor wk, tensor.Tensor bk, tensor.Tensor wv, tensor.Tensor bv, tensor.Tensor wo, tensor.Tensor bo, tensor.Tensor ln2_s, tensor.Tensor ln2_o, tensor.Tensor wf1, tensor.Tensor bf1, tensor.Tensor wf2, tensor.Tensor bf2, tensor.Tensor ln3_s, tensor.Tensor ln3_o, f32 scale, list<int> positions, int dim, kv.KVCache layer, list<int> tokens) → CachedBlock ⇥ TransformerError`
-- `fn dense_block_cached(tensor.Tensor x, tensor.Tensor ln1_s, f32 epsilon, tensor.Tensor wq, tensor.Tensor bq, tensor.Tensor wk, tensor.Tensor bk, tensor.Tensor wv, tensor.Tensor bv, tensor.Tensor wo, int num_heads, int num_kv_heads, f32 scale, list<int> positions, int rope_dim, attention.RopeConfig cfg, tensor.Tensor ln2_s, tensor.Tensor wg, tensor.Tensor bg, tensor.Tensor wu, tensor.Tensor bu, tensor.Tensor wd, tensor.Tensor bd, kv.KVCache layer, list<int> tokens) → CachedBlock ⇥ TransformerError`
+- `fn dense_block_cached(tensor.Tensor x, list<int> positions, kv.KVCache layer, list<int> tokens, DenseAttentionWeights attention_weights, DenseAttentionConfig attention_config, DenseMlpWeights mlp_weights, DenseNormConfig norm_config) → CachedBlock ⇥ TransformerError`
 
 ---
 
