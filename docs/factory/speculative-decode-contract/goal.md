@@ -128,7 +128,7 @@ execution paths and remain regime-labeled; this goal does not fabricate them.
 | 3 | done | hand | `9aeb6de` | candidate-provider seam (`gradus:speculative`) |
 | 4 | done | hand | `64513a9` | greedy acceptance contract + typed reject |
 | 5 | done | hand (a70d341f, resumed after drop) | `d5542fc` | `gradus:receipt` leaf; Mind re-ran closeout 2026-08-21: 8 passed, 0 failed |
-| 6 | pending | — | — | two-regime corpus + integrity check |
+| 6 | blocked | — | — | generation.proba BLOCKED at HEAD (0 passed, 33 blocked) on receiver-method MIR family (need fd83825f); dispatchable after that lowering lands |
 | 7 | pending | — | — | disabled-policy regression + handoff + closeout (gated on 6) |
 
 ## Open questions
