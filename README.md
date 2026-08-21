@@ -204,7 +204,8 @@ range proofs live in `exempla/gguf-manifest/` and `exempla/gguf-inspect/`.
 - **GPU-scale training or broad executed performance evidence.** Outside the
   bounded training-loop proof, executed runs are not claimed; speed figures,
   when they exist, are CPU-reference-level at most and never precede the
-  correctness gates.
+  correctness gates. Comparator benches to date pin llama.cpp Metal and CPU
+  rows on burgus; no CUDA comparator row exists yet (reserved).
 - **PyTorch users.** Gradus is JAX-shaped (pure functions, explicit params), not
   PyTorch-shaped (nn.Module class hierarchy). No object-oriented model
   registration.

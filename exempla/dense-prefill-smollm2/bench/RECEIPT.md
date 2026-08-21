@@ -125,6 +125,8 @@ the mean G1 `decode_step` (batch-1, already-loaded f32 weights).
 | Qwen2.5-0.5B Q4_K_M | llama.cpp CPU (`ngl=0`, t=1) | 179.4 ± 0.3 t/s (2.86 s) | 75.02 ± 0.07 t/s (120 ms) | 55.10 ± 0.06 t/s (18.1 ms/tok) |
 | Qwen2.5-0.5B Q4_K_M | faber-compiled | — | **not timed** | **not timed** |
 
+CUDA comparator lane — reserved (no run). See [`cuda-pending.md`](cuda-pending.md).
+
 ### Honest gap (SmolLM2)
 
 | Compare | Prefill pp9 | Decode |
