@@ -1,6 +1,6 @@
 # GOAL: speculative-decode-contract — explicit, lossless acceleration policy over the dense baseline
 
-**Status**: planned — pre-implementation
+**Status**: planned — pre-implementation; ready for delivery (lowered to [delivery.md](delivery.md), 7 units, 2026-08-21)
 **Created**: 2026-08-21
 **Campaign:** `speculative-decode`
 **Source:** speculative-decode campaign lowering and the 2026-08-21 live-code audit
