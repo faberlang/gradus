@@ -11,11 +11,11 @@ locale = "en"
 #     counter); construction fail-closed (empty or wire-unsafe identity
 #     fields, layer/dim below one) — message identity.
 #   * the declared mutation rules — append extends by exactly ONE
-#     position (strictly sequential: the K/V row count equals the history
-#     length) and bumps the generation; the append/readback arithmetic is
-#     exact concatenation (pins are EXACT — the K/V pass through
-#     bit-preserved); reset resets to a fresh cache (same identity
-#     fields, empty history + K/V, version 1).
+#     position (write position = current length) and bumps the
+#     generation; extend is the T-row form of the same rule; overflow
+#     and gaps reject before mutation; reset keeps capacity and advances
+#     generation. Construction copies KVStructure.context_length into
+#     immutable KVCache.capacity.
 #   * the cache identity key per the MD-A9 precedent (CacheIdentity:
 #     model, version, execution config, tokenizer, exact prefix, position
 #     span, layer count, dtype, layout) — exact field pins + the versioned
@@ -151,6 +151,7 @@ test "empty_cache builds a fresh cache with full identity and empty state" {
         assert c.dimension() ≡ 4
         assert c.length() ≡ 0
         assert c.version() ≡ 1
+        assert c.capacity() ≡ 2048
         assert c.key().shape() ≡ [0, 4]
         assert c.payload().shape() ≡ [0, 4]
     }
@@ -235,16 +236,18 @@ test "append rejects a non-f32 K/V (only the F32 row is admitted)" {
     }
 }
 
-test "reset resets to a fresh cache (same identity, empty state, version 1)" {
+test "reset keeps capacity and identity, clears rows, and advances generation" {
     do {
         const cache.KVCache c0 ← cache_p()
         const cache.KVCache c1 ← cache.append(c0, 5, hold([1.0, 0.5, 0.2, 0.0 - 0.5], [1, 4]), hold([0.1, 0.2, 0.3, 0.4], [1, 4]))
         const cache.KVCache c2 ← cache.reset(c1)
         assert c2.length() ≡ 0
-        assert c2.version() ≡ 1
+        assert c2.version() ≡ 3
         assert c2.key().shape() ≡ [0, 4]
         assert c2.model() ≡ c1.model()
         assert c2.dimension() ≡ c1.dimension()
+        assert c2.capacity() ≡ c1.capacity()
+        assert c2.capacity() ≡ 2048
     }
     catch err {
         assert false
@@ -681,7 +684,127 @@ test "empty_layers builds one empty cache per contiguous KV layer" {
         const cache.KVCache b ← layers.get(1) coalesce cache.default()
         assert a.length() ≡ 0
         assert a.dimension() ≡ 8
+        assert a.capacity() ≡ 8
+        assert a.version() ≡ 1
         assert b.dimension() ≡ 8
+        assert b.capacity() ≡ 8
+        assert b.version() ≡ 1
+    }
+    catch err {
+        assert false
+    }
+}
+
+# ---- KV-A A1: capacity copy, overflow, rejected writes, reset epoch
+
+fn extend_detail(cache.KVCache c, list<int> tokens, tensor.Tensor key, tensor.Tensor payload) → string {
+    do {
+        cache.extend(c, tokens, key, payload)
+        return "ok"
+    }
+    catch err {
+        return cache.message(err)
+    }
+}
+
+fn bounded_cache(int context_length) → cache.KVCache {
+    var cache.KVCache c ← cache.default()
+    do {
+        const cache.LayerSet set ← cache.construct_layer_set([0], cache.dense_structure(), 1, 4)
+        var list<cache.LayerSet> sets ← empty
+        sets.append(set)
+        const cache.KVStructure s ← cache.construct_kv_structure(sets, cache.kv_dtype_f32(), cache.kv_dtype_f32(), cache.v_layout_transposed(), cache.sharing_single(), cache.attention_classic(), 1, 1, context_length)
+        const list<cache.KVCache> layers ← cache.empty_layers(s, "tiny-mlp", "1.0.0", "causal-rope-d4", "smollm")
+        return layers.get(0) coalesce c
+    }
+    catch err {
+        return c
+    }
+}
+
+test "empty_layers copies KVStructure.context_length as immutable capacity" {
+    do {
+        const cache.KVCache c ← bounded_cache(2)
+        assert c.capacity() ≡ 2
+        assert c.length() ≡ 0
+        assert c.dimension() ≡ 4
+        assert c.version() ≡ 1
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "append admits the last in-capacity row and rejects capacity+1 before mutation" {
+    do {
+        const cache.KVCache c0 ← bounded_cache(1)
+        const tensor.Tensor k ← hold([1.0, 0.5, 0.2, 0.0 - 0.5], [1, 4])
+        const tensor.Tensor v ← hold([0.1, 0.2, 0.3, 0.4], [1, 4])
+        const cache.KVCache c1 ← cache.append(c0, 5, k, v)
+        assert c1.length() ≡ 1
+        assert c1.capacity() ≡ 1
+        assert c1.version() ≡ 2
+        assert append_detail(c1, 2, k, v) ≡ "cache overflow"
+        assert c1.length() ≡ 1
+        assert c1.capacity() ≡ 1
+        assert c1.version() ≡ 2
+        assert c1.history() ≡ [5]
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "extend rejects overflow before mutation and leaves rows, capacity, and generation unchanged" {
+    do {
+        const cache.KVCache c0 ← bounded_cache(2)
+        const tensor.Tensor k ← hold([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0], [3, 4])
+        const tensor.Tensor v ← hold([1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0, 3.0], [3, 4])
+        assert extend_detail(c0, [1, 2, 3], k, v) ≡ "cache overflow"
+        assert c0.length() ≡ 0
+        assert c0.capacity() ≡ 2
+        assert c0.version() ≡ 1
+        const cache.KVCache c1 ← cache.extend(c0, [1, 2], hold([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], [2, 4]), hold([8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0], [2, 4]))
+        assert c1.length() ≡ 2
+        assert c1.capacity() ≡ 2
+        assert c1.version() ≡ 2
+        assert append_detail(c1, 9, hold([1.0, 0.5, 0.2, 0.0 - 0.5], [1, 4]), hold([0.1, 0.2, 0.3, 0.4], [1, 4])) ≡ "cache overflow"
+        assert c1.length() ≡ 2
+        assert c1.capacity() ≡ 2
+        assert c1.version() ≡ 2
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "reset of a structure-built cache preserves capacity and advances generation" {
+    do {
+        const cache.KVCache c0 ← bounded_cache(2)
+        const cache.KVCache c1 ← cache.append(c0, 5, hold([1.0, 0.5, 0.2, 0.0 - 0.5], [1, 4]), hold([0.1, 0.2, 0.3, 0.4], [1, 4]))
+        const cache.KVCache c2 ← cache.reset(c1)
+        assert c2.length() ≡ 0
+        assert c2.capacity() ≡ 2
+        assert c2.version() ≡ 3
+        assert c2.history().length() ≡ 0
+        const cache.KVCache c3 ← cache.append(c2, 7, hold([0.0, 1.0, 1.0, 0.0], [1, 4]), hold([1.0, 0.0, 0.0, 1.0], [1, 4]))
+        assert c3.length() ≡ 1
+        assert c3.capacity() ≡ 2
+        assert c3.version() ≡ 4
+        assert c3.history() ≡ [7]
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "a rejected append on a helper cache leaves rows, capacity, and generation unchanged" {
+    do {
+        const cache.KVCache c0 ← cache_p()
+        assert append_detail(c0, 0 - 1, hold([1.0, 0.5, 0.2, 0.0 - 0.5], [1, 4]), hold([0.1, 0.2, 0.3, 0.4], [1, 4])) ≡ "token id must be non-negative"
+        assert c0.length() ≡ 0
+        assert c0.capacity() ≡ 2048
+        assert c0.version() ≡ 1
     }
     catch err {
         assert false

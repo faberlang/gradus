@@ -26,17 +26,20 @@ locale = "en"
 # identity fields (model / model version / execution config / tokenizer
 # identity). No device handle, no physical residency.
 #
-# --- Declared mutation rules ---------------------------------------------
+# --- Declared mutation rules (KV-A A1) -----------------------------------
+#   * Capacity: construction copies KVStructure.context_length into
+#     immutable KVCache.capacity. append/extend read that bound; they
+#     do not take the structure again or a write position.
 #   * Append per position (append): extends the K/V by exactly ONE
-#     position and the history by one token; strictly sequential — the
-#     appended position is always the current history length (no gaps,
-#     no duplicates, no reordering). Deterministic and pure.
-#   * Generation tracking: version is the cache's generation — the
-#     mutation counter, starts at 1, bumps by 1 on every successful
-#     append. Identity fields (model/version/config/tokenizer/layers/
-#     dimension) are stable across appends.
-#   * Reset (reset): a fresh cache — the same identity fields, an
-#     empty history and empty K/V, version 1.
+#     position and the history by one token. The write position is the
+#     current length. Gaps and overflow reject before mutation.
+#   * Extend (extend): the same sequential rule for T rows. Generation
+#     bumps by 1 on a successful write.
+#   * Generation: version starts at 1 and advances by 1 on every
+#     successful append, extend, or reset. A rejected write leaves
+#     rows, capacity, and generation unchanged.
+#   * Reset: empty history and empty K/V, same identity and capacity,
+#     generation advanced by 1 (logical prompt reset / sequence epoch).
 #
 # --- Cache identity key (MD-A9 precedent) --------------------------------
 # The cache's identity (CacheIdentity) is a typed record over the MD-A9
@@ -108,6 +111,12 @@ union CacheError {
     },
     InvalidCombination {
         string message
+    },
+    Overflow {
+        string message
+    },
+    Gap {
+        string message
     }
 }
 
@@ -139,6 +148,12 @@ fn message(CacheError e) → string {
             return message
         }
         case InvalidCombination const message {
+            return message
+        }
+        case Overflow const message {
+            return message
+        }
+        case Gap const message {
             return message
         }
     }
@@ -215,6 +230,7 @@ class KVCache {
     tensor.Tensor payload
     int version
     int dimension
+    int capacity
 
     # Model name (identity).
     fn model() → string {
@@ -266,7 +282,7 @@ class KVCache {
         return self.payload
     }
 
-    # Generation (mutation counter: starts 1, bumps per append).
+    # Generation (starts 1; bumps on successful append, extend, or reset).
     fn version() → int {
         return self.version
     }
@@ -276,7 +292,12 @@ class KVCache {
         return self.dimension
     }
 
-    # Cached position count (= the history length).
+    # Immutable admission bound copied from KVStructure.context_length.
+    fn capacity() → int {
+        return self.capacity
+    }
+
+    # Cached position count (= the history length). Distinct from capacity.
     fn length() → int {
         return self.history.length()
     }
@@ -297,17 +318,37 @@ fn cache_equal(KVCache a, KVCache b) → bool {
     if not _tensor_equal(a.payload(), b.payload()) then return false
     if a.version() ≠ b.version() then return false
     if a.dimension() ≠ b.dimension() then return false
+    if a.capacity() ≠ b.capacity() then return false
     return true
 }
 
-# -------------------------------------------------------------------------
-# empty_cache — a fresh cache: the identity fields, an empty history, an
-# empty K/V [0, dimension], version 1. Identity fields are non-empty and
-# wire-safe (fail closed); the layers/dimension are positive.
-# -------------------------------------------------------------------------
+# Unstructured empty_cache helper bound. Structure-aware construction
+# (empty_layers) copies KVStructure.context_length instead.
+const int HELPER_CAPACITY ← 2048
 
-@ public { }
-fn empty_cache(string model, string model_version, string config, string tokenizer, int layers, int dimension) → KVCache ⇥ CacheError {
+@ private { }
+fn _row_count(tensor.Tensor t) → int {
+    if t.shape().length() ≺ 1 then return 0
+    return t.shape().get(0) coalesce 0
+}
+
+# Gap and overflow reject before any new rows are assembled.
+@ private { }
+fn _admit_write(KVCache c, int added) → bool ⇥ CacheError {
+    const int write_position ← c.length()
+    require write_position ≡ _row_count(c.key()) throw variant Gap {message = "cache write leaves a gap"}
+    require write_position ≡ _row_count(c.payload()) throw variant Gap {message = "cache write leaves a gap"}
+    require write_position + added ≤ c.capacity() throw variant Overflow {message = "cache overflow"}
+    return true
+}
+
+@ private { }
+fn _keep(KVCache c, list<int> history, tensor.Tensor key, tensor.Tensor payload, int version) → KVCache {
+    return KVCache {model = c.model(), model_version = c.model_version(), config = c.config(), tokenizer = c.tokenizer(), history = history, layers = c.layers(), dtype = c.dtype(), layout = c.layout(), key = key, payload = payload, version = version, dimension = c.dimension(), capacity = c.capacity()}
+}
+
+@ private { }
+fn _empty_cache(string model, string model_version, string config, string tokenizer, int layers, int dimension, int capacity) → KVCache ⇥ CacheError {
     require model.length() ≠ 0 throw variant EmptyName {message = "empty model name"}
     require model_version.length() ≠ 0 throw variant EmptyName {message = "empty model version"}
     require config.length() ≠ 0 throw variant EmptyName {message = "empty execution config"}
@@ -315,9 +356,23 @@ fn empty_cache(string model, string model_version, string config, string tokeniz
     require not (((_has_no_separator(model) or _has_no_separator(model_version)) or _has_no_separator(config)) or _has_no_separator(tokenizer)) throw variant EmptyName {message = "reserved wire character in identity"}
     require layers ≥ 1 throw variant InvalidDimension {message = "layer count must be at least one"}
     require dimension ≥ 1 throw variant InvalidDimension {message = "embedding dimension must be at least one"}
+    require capacity ≥ 1 throw variant InvalidDimension {message = "capacity must be at least one"}
     const tensor.Tensor key ← _tensor([], [0, dimension])
     const tensor.Tensor payload ← _tensor([], [0, dimension])
-    return KVCache {model = model, model_version = model_version, config = config, tokenizer = tokenizer, history = empty, layers = layers, dtype = "f32", layout = "staged", key = key, payload = payload, version = 1, dimension = dimension}
+    return KVCache {model = model, model_version = model_version, config = config, tokenizer = tokenizer, history = empty, layers = layers, dtype = "f32", layout = "staged", key = key, payload = payload, version = 1, dimension = dimension, capacity = capacity}
+}
+
+# -------------------------------------------------------------------------
+# empty_cache — a fresh cache: the identity fields, an empty history, an
+# empty K/V [0, dimension], version 1. Identity fields are non-empty and
+# wire-safe (fail closed); the layers/dimension/capacity are positive.
+# The 6-arg helper uses HELPER_CAPACITY. empty_layers copies
+# KVStructure.context_length as the immutable admission bound.
+# -------------------------------------------------------------------------
+
+@ public { }
+fn empty_cache(string model, string model_version, string config, string tokenizer, int layers, int dimension) → KVCache ⇥ CacheError {
+    return _empty_cache(model, model_version, config, tokenizer, layers, dimension, HELPER_CAPACITY)
 }
 
 # Placeholder Default for `var KVCache` bindings (var on structs).
@@ -325,15 +380,14 @@ fn empty_cache(string model, string model_version, string config, string tokeniz
 @ public { }
 fn default() → KVCache {
     const tensor.Tensor t ← tensor.default()
-    return KVCache {model = "", model_version = "", config = "", tokenizer = "", history = empty, layers = 0, dtype = "", layout = "", key = t, payload = t, version = 0, dimension = 0}
+    return KVCache {model = "", model_version = "", config = "", tokenizer = "", history = empty, layers = 0, dtype = "", layout = "", key = t, payload = t, version = 0, dimension = 0, capacity = 0}
 }
 
 # -------------------------------------------------------------------------
 # append — the ONE mutation: extend the cache by exactly one position.
 # The token joins the exact history; the [1, dimension] f32 K/V extends
-# each cached tensor; the generation bumps by 1. Strictly sequential —
-# the appended position is always the current history length (no gaps,
-# no duplicates). Deterministic and pure.
+# each cached tensor; the generation bumps by 1. Write position is the
+# current length. Gaps and overflow reject before any new rows exist.
 # -------------------------------------------------------------------------
 
 @ public { }
@@ -343,6 +397,7 @@ fn append(KVCache c, int token_id, tensor.Tensor key, tensor.Tensor payload) →
     require payload.shape() ≡ [1, c.dimension()] throw variant ShapeMismatch {message = "V must be [1, dim]"}
     require dtype.name(key.dtype()) ≡ "f32" throw variant DtypeMismatch {message = "unsupported dtype for cache"}
     require dtype.name(payload.dtype()) ≡ "f32" throw variant DtypeMismatch {message = "unsupported dtype for cache"}
+    _admit_write(c, 1)
     var list<int> new_history ← c.history()
     new_history.append(token_id)
     var list<f32> new_key ← empty
@@ -360,14 +415,14 @@ fn append(KVCache c, int token_id, tensor.Tensor key, tensor.Tensor payload) →
         new_payload.append(v)
     }
     const int new_len ← c.length() + 1
-    return KVCache {model = c.model(), model_version = c.model_version(), config = c.config(), tokenizer = c.tokenizer(), history = new_history, layers = c.layers(), dtype = c.dtype(), layout = c.layout(), key = _tensor(new_key, [new_len, c.dimension()]), payload = _tensor(new_payload, [new_len, c.dimension()]), version = c.version() + 1, dimension = c.dimension()}
+    return _keep(c, new_history, _tensor(new_key, [new_len, c.dimension()]), _tensor(new_payload, [new_len, c.dimension()]), c.version() + 1)
 }
 
 # -------------------------------------------------------------------------
 # extend — append T new positions in one mutation (the prefill write).
 # tokens, key, and payload must share length T; each new K/V row is [T, dim].
-# Generation bumps by 1 (one write). Sequential: the new rows follow the
-# existing history with no gaps.
+# Generation bumps by 1 (one write). Write position is the current length.
+# Gaps and overflow reject before any new rows exist.
 # -------------------------------------------------------------------------
 
 @ public { }
@@ -377,6 +432,7 @@ fn extend(KVCache c, list<int> tokens, tensor.Tensor key, tensor.Tensor payload)
     require payload.shape() ≡ [tokens.length(), c.dimension()] throw variant ShapeMismatch {message = "V must be [T, dim]"}
     require dtype.name(key.dtype()) ≡ "f32" throw variant DtypeMismatch {message = "unsupported dtype for cache"}
     require dtype.name(payload.dtype()) ≡ "f32" throw variant DtypeMismatch {message = "unsupported dtype for cache"}
+    _admit_write(c, tokens.length())
     var list<int> new_history ← c.history()
     for from tokens const token_id {
         require token_id ≥ 0 throw variant IdOutOfRange {message = "token id must be non-negative"}
@@ -397,19 +453,19 @@ fn extend(KVCache c, list<int> tokens, tensor.Tensor key, tensor.Tensor payload)
         new_payload.append(v)
     }
     const int new_len ← c.length() + tokens.length()
-    return KVCache {model = c.model(), model_version = c.model_version(), config = c.config(), tokenizer = c.tokenizer(), history = new_history, layers = c.layers(), dtype = c.dtype(), layout = c.layout(), key = _tensor(new_key, [new_len, c.dimension()]), payload = _tensor(new_payload, [new_len, c.dimension()]), version = c.version() + 1, dimension = c.dimension()}
+    return _keep(c, new_history, _tensor(new_key, [new_len, c.dimension()]), _tensor(new_payload, [new_len, c.dimension()]), c.version() + 1)
 }
 
 # -------------------------------------------------------------------------
-# reset — the reset rule: a fresh cache with the same identity
-# fields, an empty history and empty K/V, version 1 (fresh state).
+# reset — logical prompt reset: empty history and empty K/V, same
+# identity fields and immutable capacity, generation advanced by 1.
 # -------------------------------------------------------------------------
 
 @ public { }
 fn reset(KVCache c) → KVCache ⇥ CacheError {
     const tensor.Tensor key ← _tensor([], [0, c.dimension()])
     const tensor.Tensor payload ← _tensor([], [0, c.dimension()])
-    return KVCache {model = c.model(), model_version = c.model_version(), config = c.config(), tokenizer = c.tokenizer(), history = empty, layers = c.layers(), dtype = c.dtype(), layout = c.layout(), key = key, payload = payload, version = 1, dimension = c.dimension()}
+    return _keep(c, empty, key, payload, c.version() + 1)
 }
 
 # -------------------------------------------------------------------------
@@ -1622,6 +1678,7 @@ fn deserialize_structure(string wire) → KVStructure ⇥ CacheError {
 # Indexer partitions are skipped (they are not a KvDtype). Indices must
 # be the contiguous range 0..N-1 so the returned list is layer-addressable.
 # Each cache is one-block (layers = 1) with width kv_heads * head_dim.
+# Copies KVStructure.context_length as immutable KVCache.capacity.
 # -------------------------------------------------------------------------
 
 @ private { }
@@ -1643,6 +1700,8 @@ fn _layer_width(KVStructure s, int idx) → int ⇥ CacheError {
 
 @ public { }
 fn empty_layers(KVStructure s, string model, string model_version, string config, string tokenizer) → list<KVCache> ⇥ CacheError {
+    const int capacity ← s.context_length()
+    require capacity ≥ 1 throw variant InvalidDimension {message = "capacity must be at least one"}
     var int count ← 0
     for range 0‥s.layers().length() const i {
         const LayerSet layer ← s.layers().get(i) coalesce default_layer_set()
@@ -1654,7 +1713,7 @@ fn empty_layers(KVStructure s, string model, string model_version, string config
     var list<KVCache> out ← empty
     var int idx ← 0
     while idx ≺ count {
-        out.append(empty_cache(model, model_version, config, tokenizer, 1, _layer_width(s, idx)))
+        out.append(_empty_cache(model, model_version, config, tokenizer, 1, _layer_width(s, idx), capacity))
         idx ← idx + 1
     }
     return out
