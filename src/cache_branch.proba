@@ -1,8 +1,9 @@
 +++
 locale = "en"
 +++
-# Co-located package test for cache_branch.fab (SD1-U1/U2 — checkpoint and
-# private branch). Not importable; discovered only by the faber test path.
+# Co-located package test for cache_branch.fab (SD1-U1/U2/U4 — checkpoint,
+# private branch, and atomic commit). Not importable; discovered only by the
+# faber test path.
 #
 # U1 proves:
 #   * equal multi-layer caches construct a checkpoint and compare equal;
@@ -89,6 +90,14 @@ fn three_equal_layers() → list<kv.KVCache> {
     layers.append(layer_1())
     layers.append(layer_2())
     layers.append(layer_3())
+    return layers
+}
+
+fn three_other_layers() → list<kv.KVCache> {
+    var list<kv.KVCache> layers ← empty
+    layers.append(filled_named("other-mlp", "1.0.0", "causal-rope-d4", "smollm", 5, [1.0, 0.5, 0.2, 0.0 - 0.5], [0.1, 0.2, 0.3, 0.4]))
+    layers.append(filled_named("other-mlp", "1.0.0", "causal-rope-d4", "smollm", 5, [0.0, 1.0, 1.0, 0.0], [1.0, 0.0, 0.0, 1.0]))
+    layers.append(filled_named("other-mlp", "1.0.0", "causal-rope-d4", "smollm", 5, [0.2, 0.1, 0.0, 0.3], [0.4, 0.5, 0.6, 0.7]))
     return layers
 }
 
@@ -536,5 +545,114 @@ describe "SD1-U3 — AcceptanceDecision" {
         assert decision_detail(branch, acceptance) ≡ "accepted prefix count is outside candidate block"
         assert branch.candidate_count() ≡ 2
         assert branch.provenance().target_positions() ≡ [1, 2]
+    }
+}
+
+fn commit_detail(cache_branch.KVCheckpoint checkpoint, cache_branch.SpeculativeBranch branch, int accepted_count) → string {
+    do {
+        const cache_branch.KVCheckpoint _ ← cache_branch.commit(checkpoint, branch, accepted_count)
+        return "ok"
+    }
+    catch err {
+        return cache_branch.message(err)
+    }
+}
+
+describe "SD1-U4 — atomic all-layer prefix commit" {
+    test "full acceptance commits all three layers once with shared identity" {
+        do {
+            const cache_branch.KVCheckpoint checkpoint ← cache_branch.construct_checkpoint(three_equal_layers())
+            const cache_branch.KVCheckpoint before ← checkpoint
+            const cache_branch.SpeculativeBranch branch ← cache_branch.construct_branch(checkpoint, [6, 7], candidate_keys_3(), candidate_values_3())
+            const cache_branch.KVCheckpoint committed ← cache_branch.commit(checkpoint, branch, 2)
+            assert committed.prefix_length() ≡ 3
+            assert committed.version() ≡ checkpoint.version() + 1
+            assert committed.identity().history() ≡ "5,6,7"
+            assert committed.identity().position() ≡ "0..3"
+            assert committed.layers().length() ≡ 3
+            for range 0‥committed.layers().length() const i {
+                const kv.KVCache layer ← layer_at(committed.layers(), i)
+                assert layer.length() ≡ 3
+                assert layer.history() ≡ [5, 6, 7]
+                assert layer.version() ≡ checkpoint.version() + 1
+                assert kv.cache_identity_equal(committed.identity(), kv.cache_identity(layer))
+            }
+            assert cache_branch.checkpoint_equal(checkpoint, before)
+        }
+        catch err {
+            assert false
+        }
+    }
+
+    test "partial acceptance discards the suffix from every layer" {
+        do {
+            const cache_branch.KVCheckpoint checkpoint ← cache_branch.construct_checkpoint(three_equal_layers())
+            const cache_branch.SpeculativeBranch branch ← cache_branch.construct_branch(checkpoint, [6, 7], candidate_keys_3(), candidate_values_3())
+            const cache_branch.KVCheckpoint committed ← cache_branch.commit(checkpoint, branch, 1)
+            assert committed.prefix_length() ≡ 2
+            assert committed.version() ≡ checkpoint.version() + 1
+            assert committed.identity().history() ≡ "5,6"
+            assert committed.identity().position() ≡ "0..2"
+            for range 0‥committed.layers().length() const i {
+                const kv.KVCache layer ← layer_at(committed.layers(), i)
+                assert layer.length() ≡ 2
+                assert layer.history() ≡ [5, 6]
+                assert layer.history() ≠ [5, 6, 7]
+                assert layer.key().shape() ≡ [2, 4]
+                assert layer.payload().shape() ≡ [2, 4]
+                assert layer.version() ≡ checkpoint.version() + 1
+            }
+        }
+        catch err {
+            assert false
+        }
+    }
+
+    test "zero acceptance returns an equal base with its version unchanged" {
+        do {
+            const cache_branch.KVCheckpoint checkpoint ← cache_branch.construct_checkpoint(three_equal_layers())
+            const cache_branch.KVCheckpoint before ← checkpoint
+            const cache_branch.SpeculativeBranch branch ← cache_branch.construct_branch(checkpoint, [6, 7], candidate_keys_3(), candidate_values_3())
+            const cache_branch.KVCheckpoint committed ← cache_branch.commit(checkpoint, branch, 0)
+            assert cache_branch.checkpoint_equal(committed, checkpoint)
+            assert committed.prefix_length() ≡ checkpoint.prefix_length()
+            assert committed.version() ≡ checkpoint.version()
+            assert cache_branch.checkpoint_equal(checkpoint, before)
+            for range 0‥committed.layers().length() const i {
+                assert layer_at(committed.layers(), i).version() ≡ 2
+                assert layer_at(committed.layers(), i).length() ≡ 1
+            }
+        }
+        catch err {
+            assert false
+        }
+    }
+
+    test "branch identity mismatch rejects without changing the checkpoint" {
+        do {
+            const cache_branch.KVCheckpoint checkpoint ← cache_branch.construct_checkpoint(three_equal_layers())
+            const cache_branch.KVCheckpoint before ← checkpoint
+            const cache_branch.KVCheckpoint other_checkpoint ← cache_branch.construct_checkpoint(three_other_layers())
+            const cache_branch.SpeculativeBranch other_branch ← cache_branch.construct_branch(other_checkpoint, [6, 7], candidate_keys_3(), candidate_values_3())
+            assert commit_detail(checkpoint, other_branch, 1) ≡ "branch identity does not match checkpoint identity"
+            assert cache_branch.checkpoint_equal(checkpoint, before)
+        }
+        catch err {
+            assert false
+        }
+    }
+
+    test "negative and above-k acceptance counts reject before any commit" {
+        do {
+            const cache_branch.KVCheckpoint checkpoint ← cache_branch.construct_checkpoint(three_equal_layers())
+            const cache_branch.KVCheckpoint before ← checkpoint
+            const cache_branch.SpeculativeBranch branch ← cache_branch.construct_branch(checkpoint, [6, 7], candidate_keys_3(), candidate_values_3())
+            assert commit_detail(checkpoint, branch, (0 - 1)) ≡ "accepted prefix count is outside candidate block"
+            assert commit_detail(checkpoint, branch, 3) ≡ "accepted prefix count is outside candidate block"
+            assert cache_branch.checkpoint_equal(checkpoint, before)
+        }
+        catch err {
+            assert false
+        }
     }
 }

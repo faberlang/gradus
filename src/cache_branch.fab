@@ -20,8 +20,9 @@ locale = "en"
 # before any checkpoint exists. Rejected construction does not write the
 # inputs.
 #
-# Atomic commit is a later unit. Branch values and decisions are logical
-# values only; no identity fields or identity wire are added here.
+# Atomic commit constructs a fresh all-layer state from the checkpoint and
+# an accepted branch prefix. Branch values and decisions are logical values
+# only; no identity fields or identity wire are added here.
 
 import from "gradus:cache" kv
 
@@ -512,4 +513,94 @@ fn construct_decision(SpeculativeBranch branch, speculative.GreedyAcceptance acc
     require accepted_count ≥ 0 and accepted_count ≤ candidate_count throw variant CandidateNumeric {message = "accepted prefix count is outside candidate block"}
     const int discarded_count ← candidate_count - accepted_count
     return AcceptanceDecision {acceptance = acceptance, candidate_count = candidate_count, accepted_count = accepted_count, discarded_count = discarded_count, identity = branch.identity(), base_prefix_length = branch.base_prefix_length(), base_version = branch.base_version(), target_positions = branch.provenance().target_positions()}
+}
+
+# -------------------------------------------------------------------------
+# Atomic all-layer prefix commit.
+# Every validation runs before a layer is extended. The committed values are
+# local functional values; the checkpoint and branch remain unchanged even
+# when a later construction step rejects.
+# -------------------------------------------------------------------------
+
+@ private { }
+fn _prefix_ids(list<int> ids, int count) → list<int> {
+    var list<int> out ← empty
+    for range 0‥count const i {
+        out.append(ids.get(i) coalesce 0)
+    }
+    return out
+}
+
+@ private { }
+fn _prefix_tensor(tensor.Tensor source, int rows, int dimension) → tensor.Tensor ⇥ BranchError {
+    var list<f32> data ← empty
+    for range 0‥(rows * dimension) const i {
+        data.append(source.data.get(i) coalesce 0.0 ∷ f32)
+    }
+    do {
+        return tensor.construct(data, [rows, dimension])
+    }
+    catch err {
+        throw variant CandidateShapeMismatch {message = "accepted candidate rows are not a valid f32 value"}
+    }
+}
+
+@ private { }
+fn _validate_commit(KVCheckpoint checkpoint, SpeculativeBranch branch, int accepted_count) → bool ⇥ BranchError {
+    # Read and range-check n before touching checkpoint state. This keeps an
+    # invalid caller count a typed reject with no state contact.
+    const int candidate_count ← branch.candidate_count()
+    require accepted_count ≥ 0 and accepted_count ≤ candidate_count throw variant CandidateNumeric {message = "accepted prefix count is outside candidate block"}
+
+    require checkpoint.layers().length() ≥ 1 throw variant EmptyLayers {message = "commit requires a non-empty checkpoint"}
+    require branch.layers().length() ≡ checkpoint.layers().length() throw variant LayerCountMismatch {message = "branch layers do not match checkpoint layers"}
+    require branch.candidate_keys().length() ≡ checkpoint.layers().length() throw variant LayerCountMismatch {message = "branch candidate K layers do not match checkpoint layers"}
+    require branch.candidate_payloads().length() ≡ checkpoint.layers().length() throw variant LayerCountMismatch {message = "branch candidate V layers do not match checkpoint layers"}
+    require kv.cache_identity_equal(branch.identity(), checkpoint.identity()) throw variant IdentityMismatch {message = "branch identity does not match checkpoint identity"}
+    require branch.base_prefix_length() ≡ checkpoint.prefix_length() throw variant PrefixMismatch {message = "branch base prefix does not match checkpoint"}
+    require branch.base_version() ≡ checkpoint.version() throw variant IdentityMismatch {message = "branch base generation does not match checkpoint"}
+    require branch.provenance().layer_count() ≡ checkpoint.layers().length() throw variant LayerCountMismatch {message = "branch provenance layers do not match checkpoint layers"}
+    require branch.provenance().candidate_count() ≡ candidate_count throw variant CandidateNumeric {message = "branch provenance does not match candidate block"}
+    require branch.provenance().target_rows() ≡ candidate_count throw variant CandidateNumeric {message = "branch target rows do not match candidate block"}
+
+    for range 0‥candidate_count const i {
+        const int token_id ← branch.candidate_ids().get(i) coalesce 0
+        require token_id ≥ 0 throw variant CandidateNumeric {message = "candidate token id must be non-negative"}
+    }
+
+    for range 0‥checkpoint.layers().length() const i {
+        const kv.KVCache base ← checkpoint.layers().get(i) coalesce kv.default()
+        require kv.cache_identity_equal(kv.cache_identity(base), checkpoint.identity()) throw variant IdentityMismatch {message = "checkpoint layer identity does not match checkpoint identity"}
+        require base.length() ≡ checkpoint.prefix_length() throw variant PrefixMismatch {message = "checkpoint layer prefix does not match checkpoint"}
+        require base.version() ≡ checkpoint.version() throw variant IdentityMismatch {message = "checkpoint layer generation does not match checkpoint"}
+        _admit_base(base, accepted_count)
+        const tensor.Tensor key ← branch.candidate_keys().get(i) coalesce tensor.default()
+        const tensor.Tensor payload ← branch.candidate_payloads().get(i) coalesce tensor.default()
+        _check_candidate_tensor(key, candidate_count, base.dimension())
+        _check_candidate_tensor(payload, candidate_count, base.dimension())
+    }
+    return true
+}
+
+@ public { }
+fn commit(KVCheckpoint checkpoint, SpeculativeBranch branch, int accepted_count) → KVCheckpoint ⇥ BranchError {
+    _validate_commit(checkpoint, branch, accepted_count)
+    if accepted_count ≡ 0 {
+        return checkpoint
+    }
+
+    const list<int> accepted_ids ← _prefix_ids(branch.candidate_ids(), accepted_count)
+    var list<kv.KVCache> committed_layers ← empty
+    for range 0‥checkpoint.layers().length() const i {
+        const kv.KVCache base ← checkpoint.layers().get(i) coalesce kv.default()
+        const tensor.Tensor candidate_key ← branch.candidate_keys().get(i) coalesce tensor.default()
+        const tensor.Tensor candidate_payload ← branch.candidate_payloads().get(i) coalesce tensor.default()
+        const tensor.Tensor accepted_key ← _prefix_tensor(candidate_key, accepted_count, base.dimension())
+        const tensor.Tensor accepted_payload ← _prefix_tensor(candidate_payload, accepted_count, base.dimension())
+        committed_layers.append(_extend_one(base, accepted_ids, accepted_key, accepted_payload))
+    }
+
+    # construct_checkpoint performs the final all-layer equality check and
+    # publishes no state until every fresh layer value exists.
+    return construct_checkpoint(committed_layers)
 }
