@@ -6,7 +6,7 @@
 **Control-plane repo**: `/Users/ianzepp/work/faberlang/gradus`
 **Participating repos**: `gradus` (logical decode, cache, sampling, and prepared-state contracts); `radix` and `hosts` (compiled device execution); `inferentia` (single-node retained-state consumer)
 **Source**: operator-forwarded RTX 3090 post; [current reproduction repository](https://github.com/syv-ai/qwen38-27b-rtx3090); [DFlash paper](https://arxiv.org/abs/2602.06036)
-**Related**: [`production-ml-library`](../production-ml-library/CAMPAIGN.md); [`radix device-executor`](../../../../radix/docs/factory/device-executor/goal.md); [`radix kv-cache-decode`](../../../../radix/docs/factory/kv-cache-decode/CAMPAIGN.md); [`Inferentia`](../../../../inferentia/docs/factory/inferentia/CAMPAIGN.md)
+**Related**: [`production-ml-library`](../production-ml-library/CAMPAIGN.md); [`radix device-executor`](../../../../radix/docs/factory/device-executor/goal.md); [`radix kv-cache-decode`](../../../../radix/docs/archived/kv-cache-decode/CAMPAIGN.md); [`Inferentia`](../../../../inferentia/docs/factory/inferentia/CAMPAIGN.md)
 **Campaign readiness**: SD0/SD1 DONE (archived). Current frontier: SD2 spine (U3 in flight, U4→U5 serial) and SD4 remainder (U3 gated on SD2-U5); SD3 waits on settled SD2 handoff + device-executor M4.
 
 ## Summary
@@ -91,7 +91,7 @@ refresh these facts before implementation.
 | Goal | Repo | Owns | Mandatory dependency |
 | --- | --- | --- | --- |
 | [`speculative-decode-contract`](../../archived/speculative-decode-contract/goal.md) | Gradus | dense baseline, policy/version, acceptance and receipt contracts | PML generation/config authority |
-| [`kv-cache-branching`](../kv-cache-branching/goal.md) | Gradus | immutable checkpoint, private branch, atomic prefix commit | contract |
+| [`kv-cache-branching`](../../archived/kv-cache-branching/goal.md) | Gradus | immutable checkpoint, private branch, atomic prefix commit | contract |
 | [`cached-block-verification`](../cached-block-verification/goal.md) | Gradus | nonempty-prefix k-row reference verification | branching |
 | [`context-lookup-drafting`](../context-lookup-drafting/goal.md) | Gradus | deterministic weightless candidate policy and transactional greedy generation integration | contract, cached block |
 | [`prepared-prefix-state`](../prepared-prefix-state/goal.md) | Gradus | canonical complete state, payload binding, exact-prefix continuation | branching; hybrid-state contract |
@@ -113,7 +113,7 @@ versioned receipt schema. No candidate implementation is part of SD0.
 
 ### SD1 — Transactional logical state
 
-**Goal**: [`kv-cache-branching`](../kv-cache-branching/goal.md)
+**Goal**: [`kv-cache-branching`](../../archived/kv-cache-branching/goal.md)
 **Gate**: immutable all-layer checkpoint; private branch; zero/partial/full
 accepted-prefix commit; unchanged base on every failure; no device handles.
 
