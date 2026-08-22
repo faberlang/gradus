@@ -1,6 +1,6 @@
 # GOAL: cached-block-verification — verify a candidate token block against the Gradus reference path
 
-**Status**: active — U1/U2 landed 2026-08-22 (`6754440` contract, `fad0d57` forward seam; proba green); U3 in flight; U4→U5 serial spine (U3∥U4 logically, same file → land serially)
+**Status**: done — all five units landed 2026-08-22: U1 `6754440` (contract 7/7), U2 `fad0d57` (forward seam 4/4), U3 `fbd81ea` (atomic staging 5/5), U4 `ebd5cb2` (recompute oracle 5/5), U5 `ca92fce` (consumer seam); archived pending (Mind archive pass)
 **Created**: 2026-08-21
 **Campaign:** `speculative-decode`
 **Source:** SD2 in [`../speculative-decode/CAMPAIGN.md`](../speculative-decode/CAMPAIGN.md); operator request to lower the cached verification block as a named Gradus goal
@@ -93,9 +93,9 @@ Every unit is required for this goal. No unit is deferred or optional.
 | --- | --- | --- | --- | --- |
 | 1 | done | hand | `6754440` | contract and reject rows (7/7 proba) |
 | 2 | done | hand | `fad0d57` | reference block/result carrier (4/4 proba) |
-| 3 | in flight | hand | task `94c72dfe` | all-layer atomicity |
-| 4 | pending | — | — | full-recompute oracle |
-| 5 | pending | — | — | speculative-loop consumer seam |
+| 3 | done | hand | `fbd81ea` (task `94c72dfe`) | all-layer atomicity (5/5 atomic proofs) |
+| 4 | done | hand | `ebd5cb2` (task `db0deb44`) | full-recompute oracle (5/5, 1e-5 bound) |
+| 5 | done | hand | `ca92fce` (task `1c194e0c`) | speculative-loop consumer seam |
 
 ## Open questions
 
