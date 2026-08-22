@@ -1,0 +1,216 @@
++++
+locale = "en"
++++
+# Co-located package test for cache_branch.fab (SD1-U1 — KVCheckpoint).
+# Not importable; discovered only by the faber test path.
+#
+# Proves:
+#   * equal multi-layer caches construct a checkpoint and compare equal;
+#   * one short layer is a typed prefix reject;
+#   * one layer with a different model, config, tokenizer, dtype, or layout
+#     is a typed identity reject;
+#   * reject leaves the input caches untouched.
+#
+# First-failing oracle: the mismatched-layers reject row (no checkpoint
+# API existed before this unit).
+#
+# Sanity filter: `faber test src/cache_branch.proba checkpoint`
+
+import from "gradus:cache" kv
+
+import from "gradus:cache_branch" cache_branch
+
+import from "gradus:tensor" tensor
+
+# Build a staged tensor, swallowing the never-firing construction errors.
+fn hold(list<f32> data, list<int> shape) → tensor.Tensor {
+    var tensor.Tensor t ← tensor.default()
+    do {
+        t ← tensor.construct(data, shape)
+    }
+    catch err {
+        return t
+    }
+    return t
+}
+
+fn empty_named(string model, string model_version, string config, string tokenizer) → kv.KVCache {
+    var kv.KVCache c ← kv.default()
+    do {
+        c ← kv.empty_cache(model, model_version, config, tokenizer, 1, 4)
+    }
+    catch err {
+        return c
+    }
+    return c
+}
+
+fn empty_p() → kv.KVCache {
+    return empty_named("tiny-mlp", "1.0.0", "causal-rope-d4", "smollm")
+}
+
+fn filled_named(string model, string model_version, string config, string tokenizer, int token_id, list<f32> key, list<f32> payload) → kv.KVCache {
+    var kv.KVCache c ← empty_named(model, model_version, config, tokenizer)
+    do {
+        c ← kv.append(c, token_id, hold(key, [1, 4]), hold(payload, [1, 4]))
+    }
+    catch err {
+        return c
+    }
+    return c
+}
+
+fn filled_p() → kv.KVCache {
+    return filled_named("tiny-mlp", "1.0.0", "causal-rope-d4", "smollm", 5, [1.0, 0.5, 0.2, 0.0 - 0.5], [0.1, 0.2, 0.3, 0.4])
+}
+
+fn layer_1() → kv.KVCache {
+    return filled_named("tiny-mlp", "1.0.0", "causal-rope-d4", "smollm", 5, [1.0, 0.5, 0.2, 0.0 - 0.5], [0.1, 0.2, 0.3, 0.4])
+}
+
+fn layer_2() → kv.KVCache {
+    return filled_named("tiny-mlp", "1.0.0", "causal-rope-d4", "smollm", 5, [0.0, 1.0, 1.0, 0.0], [1.0, 0.0, 0.0, 1.0])
+}
+
+fn layer_3() → kv.KVCache {
+    return filled_named("tiny-mlp", "1.0.0", "causal-rope-d4", "smollm", 5, [0.2, 0.1, 0.0, 0.3], [0.4, 0.5, 0.6, 0.7])
+}
+
+fn three_equal_layers() → list<kv.KVCache> {
+    var list<kv.KVCache> layers ← empty
+    layers.append(layer_1())
+    layers.append(layer_2())
+    layers.append(layer_3())
+    return layers
+}
+
+fn checkpoint_detail(list<kv.KVCache> layers) → string {
+    do {
+        const cache_branch.KVCheckpoint _ ← cache_branch.construct_checkpoint(layers)
+        return "ok"
+    }
+    catch err {
+        return cache_branch.message(err)
+    }
+}
+
+fn layer_at(list<kv.KVCache> layers, int i) → kv.KVCache {
+    return layers.get(i) coalesce kv.default()
+}
+
+describe "SD1-U1 — KVCheckpoint" {
+    test "equal multi-layer caches construct a checkpoint and equality holds" {
+        do {
+            const list<kv.KVCache> layers ← three_equal_layers()
+            const cache_branch.KVCheckpoint a ← cache_branch.construct_checkpoint(layers)
+            const cache_branch.KVCheckpoint b ← cache_branch.construct_checkpoint(layers)
+            assert a.prefix_length() ≡ 1
+            assert a.version() ≡ 2
+            assert a.layers().length() ≡ 3
+            assert a.identity().model() ≡ "tiny-mlp"
+            assert a.identity().model_version() ≡ "1.0.0"
+            assert a.identity().config() ≡ "causal-rope-d4"
+            assert a.identity().tokenizer() ≡ "smollm"
+            assert a.identity().dtype() ≡ "f32"
+            assert a.identity().layout() ≡ "staged"
+            assert kv.cache_identity_equal(a.identity(), kv.cache_identity(layer_at(layers, 0)))
+            assert cache_branch.checkpoint_equal(a, b)
+            assert kv.cache_equal(layer_at(a.layers(), 0), layer_1())
+            assert kv.cache_equal(layer_at(a.layers(), 1), layer_2())
+            assert kv.cache_equal(layer_at(a.layers(), 2), layer_3())
+            assert checkpoint_detail(layers) ≡ "ok"
+        }
+        catch err {
+            assert false
+        }
+    }
+
+    test "checkpoint construction leaves equal input caches untouched" {
+        do {
+            const kv.KVCache a0 ← layer_1()
+            const kv.KVCache b0 ← layer_2()
+            const kv.KVCache c0 ← layer_3()
+            var list<kv.KVCache> layers ← empty
+            layers.append(a0)
+            layers.append(b0)
+            layers.append(c0)
+            const cache_branch.KVCheckpoint cp ← cache_branch.construct_checkpoint(layers)
+            assert cp.prefix_length() ≡ 1
+            assert kv.cache_equal(layer_at(layers, 0), a0)
+            assert kv.cache_equal(layer_at(layers, 1), b0)
+            assert kv.cache_equal(layer_at(layers, 2), c0)
+        }
+        catch err {
+            assert false
+        }
+    }
+
+    test "one short layer is a typed checkpoint prefix reject" {
+        const kv.KVCache long_a ← layer_1()
+        const kv.KVCache short_b ← empty_p()
+        const kv.KVCache long_c ← layer_3()
+        var list<kv.KVCache> layers ← empty
+        layers.append(long_a)
+        layers.append(short_b)
+        layers.append(long_c)
+        assert checkpoint_detail(layers) ≡ "layers do not share one accepted prefix"
+        assert kv.cache_equal(layer_at(layers, 0), long_a)
+        assert kv.cache_equal(layer_at(layers, 1), short_b)
+        assert kv.cache_equal(layer_at(layers, 2), long_c)
+    }
+
+    test "a different-model layer is a typed checkpoint identity reject" {
+        const kv.KVCache a0 ← layer_1()
+        const kv.KVCache other ← filled_named("other-mlp", "1.0.0", "causal-rope-d4", "smollm", 5, [0.0, 1.0, 1.0, 0.0], [1.0, 0.0, 0.0, 1.0])
+        const kv.KVCache c0 ← layer_3()
+        var list<kv.KVCache> layers ← empty
+        layers.append(a0)
+        layers.append(other)
+        layers.append(c0)
+        assert checkpoint_detail(layers) ≡ "layers do not share one cache identity"
+        assert kv.cache_equal(layer_at(layers, 0), a0)
+        assert kv.cache_equal(layer_at(layers, 1), other)
+        assert kv.cache_equal(layer_at(layers, 2), c0)
+    }
+
+    test "a different-config layer is a typed checkpoint identity reject" {
+        const kv.KVCache a0 ← filled_p()
+        const kv.KVCache other ← filled_named("tiny-mlp", "1.0.0", "other-config", "smollm", 5, [0.0, 1.0, 1.0, 0.0], [1.0, 0.0, 0.0, 1.0])
+        var list<kv.KVCache> layers ← empty
+        layers.append(a0)
+        layers.append(other)
+        assert checkpoint_detail(layers) ≡ "layers do not share one cache identity"
+        assert kv.cache_equal(layer_at(layers, 0), a0)
+        assert kv.cache_equal(layer_at(layers, 1), other)
+    }
+
+    test "a different-tokenizer layer is a typed checkpoint identity reject" {
+        const kv.KVCache a0 ← filled_p()
+        const kv.KVCache other ← filled_named("tiny-mlp", "1.0.0", "causal-rope-d4", "other-tok", 5, [0.0, 1.0, 1.0, 0.0], [1.0, 0.0, 0.0, 1.0])
+        var list<kv.KVCache> layers ← empty
+        layers.append(a0)
+        layers.append(other)
+        assert checkpoint_detail(layers) ≡ "layers do not share one cache identity"
+        assert kv.cache_equal(layer_at(layers, 0), a0)
+        assert kv.cache_equal(layer_at(layers, 1), other)
+    }
+
+    test "a different-dtype-or-layout layer is a typed checkpoint identity reject" {
+        const kv.KVCache a0 ← empty_p()
+        const kv.KVCache other ← kv.default()
+        var list<kv.KVCache> layers ← empty
+        layers.append(a0)
+        layers.append(other)
+        assert checkpoint_detail(layers) ≡ "layers do not share one cache identity"
+        assert kv.cache_equal(layer_at(layers, 0), a0)
+        assert kv.cache_equal(layer_at(layers, 1), other)
+        assert other.dtype() ≠ a0.dtype()
+        assert other.layout() ≠ a0.layout()
+    }
+
+    test "an empty layer list is a typed checkpoint reject and leaves no value" {
+        var list<kv.KVCache> layers ← empty
+        assert checkpoint_detail(layers) ≡ "checkpoint requires at least one layer"
+        assert layers.length() ≡ 0
+    }
+}
