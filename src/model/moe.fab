@@ -1,0 +1,156 @@
++++
+locale = "en"
++++
+# MODEL-02-U3 — fail-closed MoE surface.
+#
+# This unit admits the carrier types, callback boundary, and validation
+# contract. Router and expert arithmetic are deliberately held for the
+# following chain units; valid arithmetic calls fail explicitly rather than
+# returning a fabricated result.
+
+import from "gradus:dtype" dtype
+import from "gradus:math" math
+import from "gradus:nn" nn
+import from "gradus:tensor" tensor
+
+@ public { }
+class MoeConfig {
+    int expert_count
+    int expert_used_count
+    int expert_ffn_length
+    int shared_ffn_length
+    int embedding_length
+}
+
+@ public { }
+union MoeError {
+    BadConfig {
+        string message
+    },
+    BadShape {
+        string message
+    },
+    BadWindow {
+        string message
+    },
+    NonFinite {
+        string message
+    }
+}
+
+@ public { }
+fn message(MoeError e) → string {
+    match e {
+        case BadConfig const message {
+            return message
+        }
+        case BadShape const message {
+            return message
+        }
+        case BadWindow const message {
+            return message
+        }
+        case NonFinite const message {
+            return message
+        }
+    }
+}
+
+@ public { }
+class MoeSelection {
+    list<int> indices
+    list<f32> weights
+    list<f32> logits
+    list<f32> probabilities
+}
+
+# Every tensor crossing the adapter boundary is checked before a future math
+# unit can consume it. A non-finite value is never treated as a zero default.
+@ private { }
+fn _finite_tensor(tensor.Tensor value) → bool {
+    for from value.data const item {
+        if not dtype.finite(item) then return false
+    }
+    return true
+}
+
+@ private { }
+fn _validate_config(MoeConfig cfg) → bool ⇥ MoeError {
+    require cfg.expert_count ≥ 1 throw variant BadConfig {message = "expert count must be at least one"}
+    require cfg.expert_used_count ≥ 1 throw variant BadConfig {message = "expert used count must be at least one"}
+    require cfg.expert_used_count ≤ cfg.expert_count throw variant BadConfig {message = "expert used count cannot exceed expert count"}
+    require cfg.expert_ffn_length ≥ 1 throw variant BadConfig {message = "expert FFN length must be at least one"}
+    require cfg.shared_ffn_length ≥ 1 throw variant BadConfig {message = "shared FFN length must be at least one"}
+    require cfg.embedding_length ≥ 1 throw variant BadConfig {message = "embedding length must be at least one"}
+    return true
+}
+
+@ private { }
+fn _validate_input(tensor.Tensor x, MoeConfig cfg) → tensor.Tensor ⇥ MoeError {
+    require x.valid() throw variant BadShape {message = "hidden state carrier is invalid"}
+    require x.shape() ≡ [1, cfg.embedding_length] throw variant BadShape {message = "hidden state must have shape [1, embedding_length]"}
+    require _finite_tensor(x) throw variant NonFinite {message = "hidden state contains a non-finite value"}
+    return x
+}
+
+# The adapter owns the read and returns a storage-order carrier. This helper
+# keeps the requested byte-free element window and returned carrier shape in
+# one fail-closed check for every public entry point.
+@ private { }
+fn _window((string, int, int) → tensor.Tensor ⇥ MoeError source, string name, int start, int length, list<int> expected) → tensor.Tensor ⇥ MoeError {
+    require start ≥ 0 throw variant BadWindow {message = "tensor window start must be non-negative"}
+    require length ≥ 1 throw variant BadWindow {message = "tensor window length must be positive"}
+    const tensor.Tensor value ← source(name, start, length)
+    require value.valid() throw variant BadShape {message = "tensor window carrier is invalid"}
+    require value.shape() ≡ expected throw variant BadShape {message = "tensor window carrier has the wrong shape"}
+    require value.data.length() ≡ length throw variant BadWindow {message = "tensor window length does not match the carrier"}
+    require _finite_tensor(value) throw variant NonFinite {message = "tensor window contains a non-finite value"}
+    return value
+}
+
+@ private { }
+fn _prefix(int layer) → string {
+    return "blk.§"(layer ↦ string)
+}
+
+# Router source: GGUF [embedding, experts] is exposed as [experts,
+# embedding] without copying the storage-order window.
+@ private { }
+fn _router_weights((string, int, int) → tensor.Tensor ⇥ MoeError source, int layer, MoeConfig cfg) → tensor.Tensor ⇥ MoeError {
+    const int length ← cfg.expert_count * cfg.embedding_length
+    return _window(source, _prefix(layer) + ".ffn_gate_inp", 0, length, [cfg.expert_count, cfg.embedding_length])
+}
+
+@ public { }
+fn route(tensor.Tensor x, int layer, (string, int, int) → tensor.Tensor ⇥ MoeError source, MoeConfig cfg) → MoeSelection ⇥ MoeError {
+    _validate_config(cfg)
+    require layer ≥ 0 throw variant BadConfig {message = "layer index must be non-negative"}
+    _validate_input(x, cfg)
+    _router_weights(source, layer, cfg)
+    throw variant BadConfig {message = "route arithmetic is not implemented"}
+}
+
+@ public { }
+fn expert_out(tensor.Tensor x, int layer, int expert_index, (string, int, int) → tensor.Tensor ⇥ MoeError source, MoeConfig cfg) → tensor.Tensor ⇥ MoeError {
+    _validate_config(cfg)
+    require layer ≥ 0 throw variant BadConfig {message = "layer index must be non-negative"}
+    require expert_index ≥ 0 and expert_index ≺ cfg.expert_count throw variant BadConfig {message = "expert index is outside the configured range"}
+    _validate_input(x, cfg)
+    const int length ← cfg.expert_ffn_length * cfg.embedding_length
+    const int start ← expert_index * length
+    const string prefix ← _prefix(layer)
+    _window(source, prefix + ".ffn_gate_exps", start, length, [cfg.expert_ffn_length, cfg.embedding_length])
+    _window(source, prefix + ".ffn_up_exps", start, length, [cfg.expert_ffn_length, cfg.embedding_length])
+    const int down_length ← cfg.embedding_length * cfg.expert_ffn_length
+    _window(source, prefix + ".ffn_down_exps", start, down_length, [cfg.embedding_length, cfg.expert_ffn_length])
+    throw variant BadConfig {message = "expert arithmetic is not implemented"}
+}
+
+@ public { }
+fn ffn_moe(tensor.Tensor x, int layer, (string, int, int) → tensor.Tensor ⇥ MoeError source, MoeConfig cfg) → tensor.Tensor ⇥ MoeError {
+    _validate_config(cfg)
+    require layer ≥ 0 throw variant BadConfig {message = "layer index must be non-negative"}
+    _validate_input(x, cfg)
+    const MoeSelection selection ← route(x, layer, source, cfg)
+    throw variant BadConfig {message = "FFN arithmetic is not implemented"}
+}
