@@ -1,12 +1,11 @@
 +++
 locale = "en"
 +++
-# MODEL-02-U3 — fail-closed MoE surface.
+# MODEL-02-U4 — MoE router arithmetic continuation.
 #
-# This unit admits the carrier types, callback boundary, and validation
-# contract. Router and expert arithmetic are deliberately held for the
-# following chain units; valid arithmetic calls fail explicitly rather than
-# returning a fabricated result.
+# The U3 carrier boundary remains fail-closed while this unit adds router
+# logits, stabilized softmax, deterministic top-k selection, and renormalized
+# selected weights. Expert and full-layer arithmetic remain in later units.
 
 import from "gradus:dtype" dtype
 import from "gradus:math" math
@@ -62,6 +61,22 @@ class MoeSelection {
     list<f32> weights
     list<f32> logits
     list<f32> probabilities
+
+    fn indices() → list<int> {
+        return self.indices
+    }
+
+    fn weights() → list<f32> {
+        return self.weights
+    }
+
+    fn logits() → list<f32> {
+        return self.logits
+    }
+
+    fn probabilities() → list<f32> {
+        return self.probabilities
+    }
 }
 
 # Every tensor crossing the adapter boundary is checked before a future math
@@ -121,13 +136,131 @@ fn _router_weights((string, int, int) → tensor.Tensor ⇥ MoeError source, int
     return _window(source, _prefix(layer) + ".ffn_gate_inp", 0, length, [cfg.expert_count, cfg.embedding_length])
 }
 
+const f32 ROUTER_WEIGHT_FLOOR ← 0.00006103515625 ∷ f32
+
+# The nn precedent self-hosts exponentiation rather than adding a public
+# scalar primitive. Route only supplies non-positive max-subtracted exponents.
+@ private { }
+fn _exp(f32 x) → f32 {
+    return (2.718281828459045 ∷ f32).power(x)
+}
+
+@ private { }
+fn _column(tensor.Tensor x, MoeConfig cfg) → tensor.Tensor {
+    var list<f32> data ← empty
+    for range 0‥cfg.embedding_length const i {
+        data.append(x.data.get(i) coalesce 0.0 ∷ f32)
+    }
+    return tensor.Tensor {dtype = x.dtype(), shape = [cfg.embedding_length, 1], data = data}
+}
+
+@ private { }
+fn _router_logits(tensor.Tensor weights, tensor.Tensor x_column) → tensor.Tensor ⇥ MoeError {
+    do {
+        return math.matmul(weights, x_column)
+    }
+    catch err {
+        throw variant BadShape {message = math.message(err)}
+    }
+}
+
+@ private { }
+fn _softmax(list<f32> logits) → list<f32> ⇥ MoeError {
+    require logits.length() ≥ 1 throw variant BadConfig {message = "router logits must be non-empty"}
+    for from logits const value {
+        require dtype.finite(value) throw variant NonFinite {message = "router logits contain a non-finite value"}
+    }
+    var f32 maximum ← logits.get(0) coalesce 0.0 ∷ f32
+    for range 1‥logits.length() const i {
+        const f32 value ← logits.get(i) coalesce 0.0 ∷ f32
+        if value ≻ maximum {
+            maximum ← value
+        }
+    }
+    var list<f32> exponents ← empty
+    var f32 total ← 0.0 ∷ f32
+    for from logits const value {
+        const f32 exponent ← _exp(value - maximum)
+        require dtype.finite(exponent) throw variant NonFinite {message = "router softmax produced a non-finite value"}
+        exponents.append(exponent)
+        total ← total + exponent
+    }
+    require dtype.finite(total) and total ≻ 0.0 throw variant NonFinite {message = "router softmax normalizer is non-finite"}
+    var list<f32> probabilities ← empty
+    for from exponents const exponent {
+        probabilities.append(exponent / total)
+    }
+    return probabilities
+}
+
+@ private { }
+fn _contains(list<int> values, int needle) → bool {
+    for from values const value {
+        if value ≡ needle {
+            return true
+        }
+    }
+    return false
+}
+
+# Select the largest probability, preserving the lowest index on exact ties.
+@ private { }
+fn _best_index(list<f32> probabilities, list<int> selected) → int {
+    var int best ← -1
+    for range 0‥probabilities.length() const i {
+        if not _contains(selected, i) {
+            if best ≺ 0 {
+                best ← i
+            }
+            else {
+                const f32 candidate ← probabilities.get(i) coalesce 0.0 ∷ f32
+                const f32 incumbent ← probabilities.get(best) coalesce 0.0 ∷ f32
+                if candidate ≻ incumbent or (candidate ≡ incumbent and i ≺ best) {
+                    best ← i
+                }
+            }
+        }
+    }
+    return best
+}
+
 @ public { }
 fn route(tensor.Tensor x, int layer, (string, int, int) → tensor.Tensor ⇥ MoeError source, MoeConfig cfg) → MoeSelection ⇥ MoeError {
     _validate_config(cfg)
     require layer ≥ 0 throw variant BadConfig {message = "layer index must be non-negative"}
     _validate_input(x, cfg)
-    _router_weights(source, layer, cfg)
-    throw variant BadConfig {message = "route arithmetic is not implemented"}
+    const tensor.Tensor weights ← _router_weights(source, layer, cfg)
+    const tensor.Tensor matrix ← _router_logits(weights, _column(x, cfg))
+    require matrix.valid() throw variant BadShape {message = "router logits carrier is invalid"}
+    require matrix.shape() ≡ [cfg.expert_count, 1] throw variant BadShape {message = "router logits carrier has the wrong shape"}
+    require _finite_tensor(matrix) throw variant NonFinite {message = "router logits contain a non-finite value"}
+
+    var list<f32> logits ← empty
+    for range 0‥cfg.expert_count const i {
+        logits.append(matrix.data.get(i) coalesce 0.0 ∷ f32)
+    }
+    const list<f32> probabilities ← _softmax(logits)
+    var list<int> indices ← empty
+    var list<f32> selected_probabilities ← empty
+    var f32 selected_total ← 0.0 ∷ f32
+    for range 0‥cfg.expert_used_count const _ {
+        const int index ← _best_index(probabilities, indices)
+        require index ≥ 0 throw variant BadConfig {message = "router selection index is unavailable"}
+        indices.append(index)
+        const f32 probability ← probabilities.get(index) coalesce 0.0 ∷ f32
+        selected_probabilities.append(probability)
+        selected_total ← selected_total + probability
+    }
+    require dtype.finite(selected_total) throw variant NonFinite {message = "router selection normalizer is non-finite"}
+    var f32 denominator ← ROUTER_WEIGHT_FLOOR
+    if selected_total ≻ denominator {
+        denominator ← selected_total
+    }
+    var list<f32> weights_out ← empty
+    for from selected_probabilities const probability {
+        weights_out.append(probability / denominator)
+    }
+    return MoeSelection {indices = indices, weights = weights_out, logits = logits, probabilities = probabilities}
 }
 
 @ public { }
