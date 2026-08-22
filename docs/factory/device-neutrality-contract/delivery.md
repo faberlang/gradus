@@ -266,6 +266,13 @@ caveat: `check-source` is green at HEAD `ce604b1` (verified 2026-08-21) —
 if a concurrent seat re-reddens it, U6 reports blocked on the handle
 rather than narrowing the gate.
 
+**U6 closeout input (cache.proba classification)**:
+[`cache-proba-classification.md`](cache-proba-classification.md), handle
+`9975f4a4`. Focused `--include cache` is 33 passed / 0 failed. Bare
+`faber test src/cache.proba` remains environment-red (package MIR link of
+`decode.proba`). No remaining cache-semantics defect. This pointer does
+not land U6 or rewrite ledger Status.
+
 **Release posture**: not-applicable — no package/release train; the
 profile record is additive library surface with no wire change.
 
