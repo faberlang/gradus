@@ -52,9 +52,9 @@ exactly (no gaps, no overlaps). Every byte length is a multiple of 8.
 | --- | --- |
 | File | `fixtures/safetensors/smollm2-360m-scaled-row.safetensors` |
 | Byte size | **1512** |
-| SHA-256 | **`424442296e97c261de42fd496cc6cdb4496f3f632835479de96a7ed76c5f75d8`** |
-| header_size (LE u64) | 840 (= 8-byte prefix + 832-byte padded header; 840 % 8 == 0) |
-| Data region | 672 bytes (bytes 840..1512), offset base = header_size |
+| SHA-256 | **`992426b54e8d7a1b7e24e4167a92a5e630bb79ef7e89efdd5fd2cb2b29d0a0bc`** |
+| header length N (LE u64) | 832 (= padded JSON header; 8-byte prefix excluded; 832 % 8 == 0) |
+| Data region | 672 bytes (bytes 840..1512), offset base = 8 + N |
 | Data pattern | byte i = `(i*13 + 7) mod 256` (deterministic; data content is not semantically inspected) |
 
 The conformance suite and `safetensors.proba` embed the same byte

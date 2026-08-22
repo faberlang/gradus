@@ -73,7 +73,7 @@ def build() -> bytes:
     n = len(header_bytes)
     aligned_n = ((n + 7) // 8) * 8
     padded = header_bytes + b" " * (aligned_n - n)
-    header_size = len(padded) + 8  # includes the 8-byte prefix
+    header_size = len(padded)  # JSON header length; excludes the 8-byte prefix
     assert header_size % 8 == 0
     data = data_pattern(672)
     return struct.pack("<Q", header_size) + padded + data

@@ -83,7 +83,7 @@ compile-level proof; executed value-identity deferred.
 
 | Fixture / oracle | SHA-256 (where pinned) | Support-matrix row |
 | --- | --- | --- |
-| `fixtures/safetensors/smollm2-360m-scaled-row.safetensors` | `424442296e97c261de42fd496cc6cdb4496f3f632835479de96a7ed76c5f75d8` | Row 1 — Safetensors admission |
+| `fixtures/safetensors/smollm2-360m-scaled-row.safetensors` | `992426b54e8d7a1b7e24e4167a92a5e630bb79ef7e89efdd5fd2cb2b29d0a0bc` | Row 1 — Safetensors admission |
 | `fixtures/safetensors/safetensors-row-oracle.md` | (doc) | Row 1 oracle |
 | `fixtures/gguf/smollm2-360m-scaled-row.gguf` | `d89c9ef917158bfb5600f417020479499c6c042f728e9a29c8457a6b1a8f0974` | Row 2 — GGUF admission; also feeds Row 4 |
 | `fixtures/gguf/gguf-row-oracle.md` | (doc) | Row 2 oracle |
