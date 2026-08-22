@@ -46,7 +46,7 @@ pinned row is space-prefix-free (add_space_prefix = false)
 | `gradus:decode` | `DecodeError` | 11 | `src/decode.fab` |
 | `gradus:dtype` | `DTypeError` | 4 | `src/dtype.fab` |
 | `gradus:generation` | `GenerationError` | 7 | `src/generation.fab` |
-| `gradus:gradient` | `GradienteError` | 2 | `src/gradient.fab` |
+| `gradus:gradient` | `GradientError` | 2 | `src/gradient.fab` |
 | `gradus:gradus` | `GradusError` | 8 | `src/gradus.fab` |
 | `gradus:loss` | `LossError` | 9 | `src/loss.fab` |
 | `gradus:math` | `MathError` | 11 | `src/math.fab` |
@@ -196,14 +196,14 @@ Source: `src/generation.fab`. Render with module `message(e)`.
 | `GenerationError.BadWire` | Malformed wire / bytes / marker / field encoding. | `malformed context length in generation wire`<br>`malformed generation config wire`<br>`malformed max tokens in generation wire`<br>`malformed min-p in generation wire`<br>`malformed prompt batch in generation wire`<br>`malformed repetition penalty in generation wire`<br>`malformed seed in generation wire`<br>`malformed temperature in generation wire`<br>`malformed top-k in generation wire`<br>`malformed top-p in generation wire`<br>`unknown generation marker` | Re-emit with the current schema stamp; never guess an unknown version. |
 | `GenerationError.Terminus` | A configured ceiling was reached (context, tokens, …). | `context limit reached`<br>`maximum generated tokens reached` | Reduce the request or fix indices so they stay within the configured ceiling. |
 
-## `gradus:gradient` — `GradienteError`
+## `gradus:gradient` — `GradientError`
 
 Source: `src/gradient.fab`. Render with module `message(e)`.
 
 | Code | Class / when | Live messages (representative) | Resolution |
 | --- | --- | --- | --- |
-| `GradienteError.UnknownGradient` | Unknown or empty gradient identity field. | `empty gradient name`<br>`empty gradient owner`<br>`no gradient for that parameter identity` | Supply a non-empty name/owner with no reserved wire characters. |
-| `GradienteError.GradientVersion` | Invalid gradient generation counter. | `invalid gradient generation` | Supply a non-empty gradient owner/name and a valid generation counter. |
+| `GradientError.UnknownGradient` | Unknown or empty gradient identity field. | `empty gradient name`<br>`empty gradient owner`<br>`no gradient for that parameter identity` | Supply a non-empty name/owner with no reserved wire characters. |
+| `GradientError.GradientVersion` | Invalid gradient generation counter. | `invalid gradient generation` | Supply a non-empty gradient owner/name and a valid generation counter. |
 
 ## `gradus:gradus` — `GradusError`
 
