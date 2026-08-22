@@ -1,6 +1,6 @@
 # GOAL: speculative-decode-contract — explicit, lossless acceleration policy over the dense baseline
 
-**Status**: active — 5/7 units landed (U1–U5 on gradus main); U6 next; U7 gated on U6. Lowered to [delivery.md](delivery.md), 7 units, 2026-08-21.
+**Status**: ready for closeout — 7/7 units landed (U1–U7 on gradus main). Lowered to [delivery.md](delivery.md), 7 units, 2026-08-21.
 **Created**: 2026-08-21
 **Campaign:** `speculative-decode`
 **Source:** speculative-decode campaign lowering and the 2026-08-21 live-code audit
@@ -128,8 +128,8 @@ execution paths and remain regime-labeled; this goal does not fabricate them.
 | 3 | done | hand | `9aeb6de` | candidate-provider seam (`gradus:speculative`) |
 | 4 | done | hand | `64513a9` | greedy acceptance contract + typed reject |
 | 5 | done | hand (a70d341f, resumed after drop) | `d5542fc` | `gradus:receipt` leaf; Mind re-ran closeout 2026-08-21: 8 passed, 0 failed |
-| 6 | blocked | — | — | generation.proba BLOCKED at HEAD (0 passed, 33 blocked) on receiver-method MIR family (need fd83825f); dispatchable after that lowering lands |
-| 7 | pending | — | — | disabled-policy regression + handoff + closeout (gated on 6) |
+| 6 | done | hand | `fb08fe0` | two-regime corpus + `scripta/check-corpus` |
+| 7 | done | hand | `handoff.md` | disabled-policy regression + contract handoff |
 
 ## Open questions
 
