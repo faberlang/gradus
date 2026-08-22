@@ -1,6 +1,6 @@
 # DELIVERY: cached-block-verification — k-row reference verification over an admitted prefix
 
-**Status**: lowered 2026-08-22 — ready for Mind to file Hands (SD2-U1 dispatchable now; U2→U5 serial spine; whole goal parallel-safe with every radix lane — gradus writes only, zero overlap with the blocked `mir-llvm` crate)
+**Status**: lowered 2026-08-22 — U1 (`6754440`) and U2 (`fad0d57`) landed; U3 in flight (task `94c72dfe`); U4→U5 serial spine; whole goal parallel-safe with every radix lane — gradus writes only
 **Goal:** [`goal.md`](goal.md) (goal-check verdict: **READY** — record below)
 **Campaign:** [`speculative-decode`](../speculative-decode/CAMPAIGN.md) stage SD2 (gate: nonempty prefix + nonempty candidate block → pinned `[k, V]` row convention and complete staged state; all rows and final state match full recompute; failure is atomic; reference evidence only)
 **Repos:** primary `gradus/` (this repo); evidence-only `radix/`, `hosts/` (no writes)

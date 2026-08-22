@@ -1,6 +1,6 @@
 # GOAL: context-lookup-drafting — deterministic context-sourced candidates for speculative verification
 
-**Status**: planned — pre-implementation; ready for delivery
+**Status**: active — U1/U2 landed 2026-08-22 (`43c6a75` search contract, `d1898cf` deterministic provider; proba green); U3 gated on SD2-U5 receipt; U4 after U3
 **Created**: 2026-08-21
 **Campaign:** `speculative-decode`
 **Source:** SD4 in [`../speculative-decode/CAMPAIGN.md`](../speculative-decode/CAMPAIGN.md); operator request to lower the lookup-drafting policy as a named Gradus goal
@@ -102,8 +102,8 @@ Every unit is required for this goal. No unit is deferred or optional.
 
 | Unit | Status | Seat | Receipt (commit/handle) | Notes |
 | --- | --- | --- | --- | --- |
-| 1 | pending | — | — | search and fallback contract |
-| 2 | pending | — | — | deterministic provider |
+| 1 | done | hand | `43c6a75` | search and fallback contract (7/7 proba) |
+| 2 | done | hand | `d1898cf` | deterministic provider (8/8 proba) |
 | 3 | pending | — | — | verification-loop and generation integration |
 | 4 | pending | — | — | disabled/no-match fallback and reject behavior |
 | 5 | pending | — | — | regime-labeled receipts |

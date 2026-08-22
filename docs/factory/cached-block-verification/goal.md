@@ -1,6 +1,6 @@
 # GOAL: cached-block-verification — verify a candidate token block against the Gradus reference path
 
-**Status**: planned — pre-implementation; ready for delivery
+**Status**: active — U1/U2 landed 2026-08-22 (`6754440` contract, `fad0d57` forward seam; proba green); U3 in flight; U4→U5 serial spine (U3∥U4 logically, same file → land serially)
 **Created**: 2026-08-21
 **Campaign:** `speculative-decode`
 **Source:** SD2 in [`../speculative-decode/CAMPAIGN.md`](../speculative-decode/CAMPAIGN.md); operator request to lower the cached verification block as a named Gradus goal
@@ -91,9 +91,9 @@ Every unit is required for this goal. No unit is deferred or optional.
 
 | Unit | Status | Seat | Receipt (commit/handle) | Notes |
 | --- | --- | --- | --- | --- |
-| 1 | pending | — | — | contract and reject rows |
-| 2 | pending | — | — | reference block/result carrier |
-| 3 | pending | — | — | all-layer atomicity |
+| 1 | done | hand | `6754440` | contract and reject rows (7/7 proba) |
+| 2 | done | hand | `fad0d57` | reference block/result carrier (4/4 proba) |
+| 3 | in flight | hand | task `94c72dfe` | all-layer atomicity |
 | 4 | pending | — | — | full-recompute oracle |
 | 5 | pending | — | — | speculative-loop consumer seam |
 

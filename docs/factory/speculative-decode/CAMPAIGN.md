@@ -1,13 +1,13 @@
 # Campaign: Speculative Decode And Prepared-Prefix Reuse
 
-**Status**: planned — live-code review complete 2026-08-21; lowered into eight named factory goals; no delivery or implementation has started
+**Status**: active — SD0 done+archived (7/7), SD1 done+archived (6/6); SD2 U1/U2 and SD4 U1/U2 landed (`6754440`/`fad0d57`; `43c6a75`/`d1898cf`); SD2 U3 in flight; SD3/SD5/SD6 correctly planned-and-gated (status verified by A3 audit 2026-08-22)
 **Created**: 2026-08-21
 **Mode**: low-priority routing artifact — keep visible and execute incrementally when capacity is assigned
 **Control-plane repo**: `/Users/ianzepp/work/faberlang/gradus`
 **Participating repos**: `gradus` (logical decode, cache, sampling, and prepared-state contracts); `radix` and `hosts` (compiled device execution); `inferentia` (single-node retained-state consumer)
 **Source**: operator-forwarded RTX 3090 post; [current reproduction repository](https://github.com/syv-ai/qwen38-27b-rtx3090); [DFlash paper](https://arxiv.org/abs/2602.06036)
 **Related**: [`production-ml-library`](../production-ml-library/CAMPAIGN.md); [`radix device-executor`](../../../../radix/docs/factory/device-executor/goal.md); [`radix kv-cache-decode`](../../../../radix/docs/factory/kv-cache-decode/CAMPAIGN.md); [`Inferentia`](../../../../inferentia/docs/factory/inferentia/CAMPAIGN.md)
-**Campaign readiness**: READY FOR DELIVERY — [`speculative-decode-contract`](../../archived/speculative-decode-contract/goal.md) is the first mandatory goal when this campaign receives capacity
+**Campaign readiness**: SD0/SD1 DONE (archived). Current frontier: SD2 spine (U3 in flight, U4→U5 serial) and SD4 remainder (U3 gated on SD2-U5); SD3 waits on settled SD2 handoff + device-executor M4.
 
 ## Summary
 

@@ -1,6 +1,6 @@
 # DELIVERY: context-lookup-drafting — deterministic context-sourced candidates and transactional greedy integration
 
-**Status**: lowered 2026-08-22 — ready for Mind to file Hands (SD4-U1/U2 dispatchable now, fully parallel with the SD2 spine and every radix lane; U3 gated on SD2-U5's receipt)
+**Status**: lowered 2026-08-22 — U1 (`43c6a75`) and U2 (`d1898cf`) landed; U3 gated on SD2-U5 receipt (per unit graph); no dispatchable unit until then
 **Goal:** [`goal.md`](goal.md) (goal-check verdict: **READY** — record below)
 **Campaign:** [`speculative-decode`](../speculative-decode/CAMPAIGN.md) stage SD4 — the Mind task and SD0 handoff label it "SD3"; the campaign path numbers it SD4 (radix Metal execution holds SD3). Unit ids here use the campaign number; the handoff records both spellings.
 **Repos:** primary `gradus/` (this repo); evidence-only `radix/`, `inferentia/` (no writes)
