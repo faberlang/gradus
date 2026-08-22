@@ -1,6 +1,6 @@
 # GOAL: speculative-decode-contract — explicit, lossless acceleration policy over the dense baseline
 
-**Status**: ready for closeout — 7/7 units landed (U1–U7 on gradus main). Lowered to [delivery.md](delivery.md), 7 units, 2026-08-21.
+**Status**: done — 7/7 units landed (U1–U7 on gradus main). Closeout 2026-08-21: generation.proba 37/37, speculative.proba 22/22, receipt.proba 8/8, check-source, check-compile, check-corpus both files, factory audit 0 findings.
 **Created**: 2026-08-21
 **Campaign:** `speculative-decode`
 **Source:** speculative-decode campaign lowering and the 2026-08-21 live-code audit
@@ -128,8 +128,8 @@ execution paths and remain regime-labeled; this goal does not fabricate them.
 | 3 | done | hand | `9aeb6de` | candidate-provider seam (`gradus:speculative`) |
 | 4 | done | hand | `64513a9` | greedy acceptance contract + typed reject |
 | 5 | done | hand (a70d341f, resumed after drop) | `d5542fc` | `gradus:receipt` leaf; Mind re-ran closeout 2026-08-21: 8 passed, 0 failed |
-| 6 | done | hand | `fb08fe0` | two-regime corpus + `scripta/check-corpus` |
-| 7 | done | hand | `handoff.md` | disabled-policy regression + contract handoff |
+| 6 | done | hand | `fb08fe0` | structural: `scripta/check-corpus` both files; measured: both regimes [1, 1] |
+| 7 | done | hand | `0154f21` | measured: 73ms disabled-policy stream equivalence |
 
 ## Open questions
 
