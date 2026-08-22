@@ -135,7 +135,7 @@ logical Gradus contract from any later device-residency implementation.
 | 3 | done | hand | `0530fee` | AcceptanceDecision wraps SD0-U4 `GreedyAcceptance`; validation re-proven on `9793720da` (filter 4/0; `--include cache_branch` 18/0). Sanity-string nit: delivery filter `decision` matches 1 of 4 titles — use `--filter AcceptanceDecision` |
 | 4 | done | hand | `dd385c1` | atomic all-layer prefix commit; zero/partial/full and failure-invariance rows landed |
 | 5 | done | hand | `5392885` | device-neutral begin/inspect/commit/abort lifecycle seam landed |
-| 6 | done | hand | `U6 closeout commit` | cache/dense rollback boundary and physical-ownership comments; truth scan and closeout gates recorded by task receipt |
+| 6 | done | hand | `edb8437` | cache/dense rollback boundary and physical-ownership comments; truth scan and closeout gates recorded by task receipt |
 
 Lowered to [`delivery.md`](delivery.md) as SD1-1..6 (2026-08-22). Delivery
 pins the goal's open questions against live code: epoch = the existing
