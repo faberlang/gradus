@@ -263,6 +263,74 @@ fn route(tensor.Tensor x, int layer, (string, int, int) → tensor.Tensor ⇥ Mo
     return MoeSelection {indices = indices, weights = weights_out, logits = logits, probabilities = probabilities}
 }
 
+@ private { }
+fn _project(tensor.Tensor weights, tensor.Tensor x_column) → tensor.Tensor ⇥ MoeError {
+    do {
+        return math.matmul(weights, x_column)
+    }
+    catch err {
+        throw variant BadShape {message = math.message(err)}
+    }
+}
+
+# The storage-order GEMV produces a column. nn.swiglu follows the dense
+# carrier convention and consumes a single row, so this is a checked carrier
+# view over the same values, not a second weight read.
+@ private { }
+fn _row(tensor.Tensor column, int width) → tensor.Tensor ⇥ MoeError {
+    require column.valid() throw variant BadShape {message = "projection carrier is invalid"}
+    require column.shape() ≡ [width, 1] throw variant BadShape {message = "projection carrier has the wrong shape"}
+    require column.data.length() ≡ width throw variant BadWindow {message = "projection carrier has the wrong length"}
+    var list<f32> data ← empty
+    for range 0‥width const i {
+        data.append(column.data.get(i) coalesce 0.0 ∷ f32)
+    }
+    return tensor.Tensor {dtype = column.dtype(), shape = [1, width], data = data}
+}
+
+# A stored down matrix is [embedding, expert_ffn]. The bias-free dense
+# SwiGLU call consumes [expert_ffn, embedding]; transpose only the bounded
+# materialized window, after its storage-order shape and length are checked.
+@ private { }
+fn _linear_weight(tensor.Tensor stored) → tensor.Tensor ⇥ MoeError {
+    require stored.valid() throw variant BadShape {message = "down projection carrier is invalid"}
+    const list<int> f ← stored.shape()
+    require f.length() ≡ 2 throw variant BadShape {message = "down projection must be rank 2"}
+    const int rows ← f.get(0) coalesce 0
+    const int cols ← f.get(1) coalesce 0
+    require rows ≥ 1 and cols ≥ 1 throw variant BadShape {message = "down projection must be non-empty"}
+    require stored.data.length() ≡ rows * cols throw variant BadWindow {message = "down projection has the wrong length"}
+    var list<f32> data ← empty
+    for range 0‥cols const j {
+        for range 0‥rows const i {
+            data.append(stored.data.get(i * cols + j) coalesce 0.0 ∷ f32)
+        }
+    }
+    return tensor.Tensor {dtype = stored.dtype(), shape = [cols, rows], data = data}
+}
+
+@ private { }
+fn _swiglu_no_bias(tensor.Tensor gate, tensor.Tensor up, tensor.Tensor down) → tensor.Tensor ⇥ MoeError {
+    do {
+        return nn.swiglu(gate, up, down, tensor.default())
+    }
+    catch err {
+        throw variant BadShape {message = nn.message(err)}
+    }
+}
+
+@ private { }
+fn _flatten_row(tensor.Tensor row, int width) → tensor.Tensor ⇥ MoeError {
+    require row.valid() throw variant BadShape {message = "expert output carrier is invalid"}
+    require row.shape() ≡ [1, width] throw variant BadShape {message = "expert output carrier has the wrong shape"}
+    require row.data.length() ≡ width throw variant BadWindow {message = "expert output has the wrong length"}
+    var list<f32> data ← empty
+    for range 0‥width const i {
+        data.append(row.data.get(i) coalesce 0.0 ∷ f32)
+    }
+    return tensor.Tensor {dtype = row.dtype(), shape = [width], data = data}
+}
+
 @ public { }
 fn expert_out(tensor.Tensor x, int layer, int expert_index, (string, int, int) → tensor.Tensor ⇥ MoeError source, MoeConfig cfg) → tensor.Tensor ⇥ MoeError {
     _validate_config(cfg)
@@ -272,11 +340,16 @@ fn expert_out(tensor.Tensor x, int layer, int expert_index, (string, int, int) �
     const int length ← cfg.expert_ffn_length * cfg.embedding_length
     const int start ← expert_index * length
     const string prefix ← _prefix(layer)
-    _window(source, prefix + ".ffn_gate_exps", start, length, [cfg.expert_ffn_length, cfg.embedding_length])
-    _window(source, prefix + ".ffn_up_exps", start, length, [cfg.expert_ffn_length, cfg.embedding_length])
-    const int down_length ← cfg.embedding_length * cfg.expert_ffn_length
-    _window(source, prefix + ".ffn_down_exps", start, down_length, [cfg.embedding_length, cfg.expert_ffn_length])
-    throw variant BadConfig {message = "expert arithmetic is not implemented"}
+    const tensor.Tensor gate_window ← _window(source, prefix + ".ffn_gate_exps", start, length, [cfg.expert_ffn_length, cfg.embedding_length])
+    const tensor.Tensor up_window ← _window(source, prefix + ".ffn_up_exps", start, length, [cfg.expert_ffn_length, cfg.embedding_length])
+    const tensor.Tensor down_window ← _window(source, prefix + ".ffn_down_exps", start, length, [cfg.embedding_length, cfg.expert_ffn_length])
+    const tensor.Tensor x_column ← _column(x, cfg)
+    const tensor.Tensor gate ← _row(_project(gate_window, x_column), cfg.expert_ffn_length)
+    const tensor.Tensor up ← _row(_project(up_window, x_column), cfg.expert_ffn_length)
+    const tensor.Tensor output_row ← _swiglu_no_bias(gate, up, _linear_weight(down_window))
+    const tensor.Tensor output ← _flatten_row(output_row, cfg.embedding_length)
+    require _finite_tensor(output) throw variant NonFinite {message = "expert output contains a non-finite value"}
+    return output
 }
 
 @ public { }
