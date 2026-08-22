@@ -1,6 +1,6 @@
 # Campaign: Production ML Library
 
-**Status**: active — PML5-GGUF Qwen3.6 invariant; GGUF-A1a/A1b implemented, GGUF-A1c integrated at main 2b3e41a, GGUF-A3 (checked packed storage + bounded tensor materialization, LIB-03) implemented at the output-checked slice tier, and MODEL-02 MoE router/expert/full-layer component surface implemented through U6 at gradus `b1ccfc8`; PML5 remains active until the Qwen3.6 invariant executes end to end
+**Status**: active — PML5-GGUF Qwen3.6 invariant; GGUF-A1a/A1b implemented, GGUF-A1c integrated at main 2b3e41a, GGUF-A3 (checked packed storage + bounded tensor materialization, LIB-03) implemented at the output-checked slice tier, and MODEL-02 MoE router/expert/full-layer component surface DONE 2026-08-22 (M2-G1 aggregate receipt `evidence/m2-g1-aggregate-receipt-6b2653a81.md`: 9 PASS / 0 FAIL at radix `6b2653a81`, max-dev 6.44e-08 ≪ Δ=1e-05); PML5 remains active until the Qwen3.6 invariant executes end to end
 **Created**: 2026-08-08
 **Mode**: routing artifact — draft/maintain; does not implement code directly
 **Control-plane repo**: `/Users/ianzepp/work/faberlang/gradus`

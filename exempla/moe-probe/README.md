@@ -59,7 +59,18 @@ Probe hashes (SHA-256 over the row's `u32_hex` join, first 16 hex):
 
 ¹ recorded from the committed fixture row.
 
-### Executed proof: BLOCKED (pre-existing runner debt, foreign owner)
+### Executed proof: GREEN (M2-G1, 2026-08-22, radix `6b2653a81`)
+
+The octeti-indexing MIR runner debt was fixed at radix `6b2653a81`
+("fix(mir): run windowed octeti reads"). Re-run at that tip (in-tree
+`cargo build -p faber`; `--target` dropped — current `faber run` has no such
+flag, `faber.toml` selects the target): **9 PASS lines, 0 FAIL**, all 8
+probe rows exact indices with `first-divergence=none`, max-dev
+`6.44e-08` ≪ Δ. Receipt:
+[`docs/factory/production-ml-library/evidence/m2-g1-aggregate-receipt-6b2653a81.md`](../docs/factory/production-ml-library/evidence/m2-g1-aggregate-receipt-6b2653a81.md).
+Historical block record follows.
+
+### Historical block (pre-`6b2653a81`, resolved)
 
 The real-file run was attempted twice (main-tree binary and a clean
 radix-HEAD temp-worktree binary) and fails before admission output with:

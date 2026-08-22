@@ -1,6 +1,10 @@
 # Delivery Lowering — GGUF-M2 (MODEL-02) Re-Lowered Against Live Main: MoE Router And Expert Execution
 
-**Status**: lowered 2026-08-22 by planner (task `3a7910d9`, Mind) — READY,
+**Status**: done 2026-08-22 — MODEL-02 complete (M2-G1 aggregate receipt
+[`evidence/m2-g1-aggregate-receipt-6b2653a81.md`](evidence/m2-g1-aggregate-receipt-6b2653a81.md):
+U7 closeout executed green at radix `6b2653a81`, 9 PASS / 0 FAIL, max-dev
+6.44e-08 ≪ Δ=1e-05, first-divergence none). Earlier planning note: lowered
+2026-08-22 by planner (task `3a7910d9`, Mind) — READY,
 **dispatchable now**. Supersedes the planner-26 lowering
 (`pml5-gguf-m2-moe-router-delivery.md`) and the planner-35 micro-unit re-split
 (`pml5-gguf-m2-moe-router-micro-units.md`): their frozen public surface used
