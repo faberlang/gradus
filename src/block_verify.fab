@@ -756,13 +756,90 @@ fn construct_verification(BlockRows rows, speculative.GreedyAcceptance acceptanc
 
     const cache_branch.KVCheckpoint base ← rows.request().checkpoint()
     require committed_checkpoint.layers().length() ≡ base.layers().length() throw variant ResultBounds {message = "committed checkpoint layer count does not match request"}
-    require kv.cache_identity_equal(committed_checkpoint.identity(), base.identity()) throw variant ResultBounds {message = "committed checkpoint identity does not match request"}
-    require committed_checkpoint.prefix_length() ≡ base.prefix_length() + accepted_count throw variant ResultBounds {message = "committed checkpoint prefix does not match acceptance"}
     if accepted_count ≡ 0 {
         require cache_branch.checkpoint_equal(committed_checkpoint, base) throw variant ResultBounds {message = "zero-acceptance checkpoint is not the request checkpoint"}
     }
     else {
+        # A commit extends the cache identity's exact token history and
+        # position range; every other identity field stays the base's.
+        var list<int> accepted_ids ← empty
+        for range 0‥accepted_count const i {
+            accepted_ids.append(rows.request().candidate_ids().get(i) coalesce 0)
+        }
+        require _committed_identity_matches(base.identity(), committed_checkpoint.identity(), accepted_ids, committed_checkpoint.prefix_length()) throw variant ResultBounds {message = "committed checkpoint identity does not extend the request identity"}
+        require committed_checkpoint.prefix_length() ≡ base.prefix_length() + accepted_count throw variant ResultBounds {message = "committed checkpoint prefix does not match acceptance"}
         require committed_checkpoint.version() ≡ base.version() + 1 throw variant ResultBounds {message = "accepted checkpoint version is not advanced once"}
     }
     return BlockVerification {rows = rows, acceptance = acceptance, committed_checkpoint = committed_checkpoint}
+}
+
+# The committed identity is the base identity with the accepted candidate ids
+# appended to the exact history and the position range grown to the new
+# prefix; model/version/config/tokenizer/layer-count/dtype/layout are fixed.
+@ private { }
+fn _committed_identity_matches(kv.CacheIdentity base, kv.CacheIdentity committed, list<int> accepted_ids, int committed_length) → bool {
+    if base.model() ≠ committed.model() then return false
+    if base.model_version() ≠ committed.model_version() then return false
+    if base.config() ≠ committed.config() then return false
+    if base.tokenizer() ≠ committed.tokenizer() then return false
+    if base.layers() ≠ committed.layers() then return false
+    if base.dtype() ≠ committed.dtype() then return false
+    if base.layout() ≠ committed.layout() then return false
+    var string expected_history ← base.history()
+    for range 0‥accepted_ids.length() const i {
+        expected_history ← expected_history + "," + (accepted_ids.get(i) coalesce 0 ↦ string)
+    }
+    if committed.history() ≠ expected_history then return false
+    return committed.position() ≡ "0..§"(committed_length ↦ string)
+}
+
+# -------------------------------------------------------------------------
+# Consumer verify seam — SD2-U5. One public compose over U1–U4: structural
+# admission (construct_request is the caller's gate), k-row forward, greedy
+# acceptance wrapped from speculative.first_divergence over the target rows,
+# and commit_transaction for the accepted prefix. The seam never produces a
+# candidate, contacts a provider, or runs a generation loop; SD4 consumes it.
+# -------------------------------------------------------------------------
+
+# Greedy target token per result row: argmax over that row's vocab width.
+@ private { }
+fn _greedy_targets(BlockRows rows) → list<int> ⇥ VerifyError {
+    const tensor.Tensor logits ← rows.logits()
+    require logits.rank() ≡ 2 and rows.row_count() ≥ 1 throw variant ResultBounds {message = "verify requires a non-empty result matrix"}
+    const list<int> shape ← logits.shape()
+    const int width ← shape.get(1) coalesce 0
+    require width ≥ 1 throw variant ResultBounds {message = "verify requires a positive vocabulary width"}
+    var list<int> targets ← empty
+    for range 0‥rows.row_count() const r {
+        var int best ← 0
+        var f32 best_value ← logits.data.get(r * width) coalesce 0.0 ∷ f32
+        for range 1‥width const c {
+            const f32 value ← logits.data.get(r * width + c) coalesce 0.0 ∷ f32
+            if value ≻ best_value then {
+                best ← c
+                best_value ← value
+            }
+        }
+        targets.append(best)
+    }
+    return targets
+}
+
+# Every failure path below throws before any caller state is eligible for
+# change: the caller's checkpoint is immutable throughout, and staging lives
+# only in the private branch until commit_transaction succeeds.
+@ public { }
+fn verify(BlockRequest request, dense.DenseConfig cfg, (string, int) → tensor.Tensor ⇥ dense.DenseError source, f32 epsilon, f32 scale, int rope_dim, attention.RopeConfig rope_cfg) → BlockVerification ⇥ VerifyError {
+    const BlockRows rows ← forward(request, cfg, source, epsilon, scale, rope_dim, rope_cfg)
+    const list<int> targets ← _greedy_targets(rows)
+    var speculative.GreedyAcceptance acceptance ← speculative.default_acceptance()
+    do {
+        acceptance ← speculative.first_divergence(targets, request.candidate_ids())
+    }
+    catch err {
+        throw variant ForwardFailure {message = speculative.message(err)}
+    }
+    const cache_branch.BranchHandle handle ← stage(rows)
+    const cache_branch.KVCheckpoint committed ← commit_staged(request.checkpoint(), handle, acceptance.accepted_prefix_length())
+    return construct_verification(rows, acceptance, committed)
 }
