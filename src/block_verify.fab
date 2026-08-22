@@ -438,6 +438,269 @@ fn abort_staged(cache_branch.BranchHandle handle) → cache_branch.KVCheckpoint 
 }
 
 # -------------------------------------------------------------------------
+# Full-recompute oracle — SD2-U4. From fresh empty caches the oracle
+# scalar-replays the same prefix (prefill), then the candidate block one
+# token at a time through the scalar cached seam, collecting the target
+# rows at L..L+k-1 and the final per-layer states. The replay is the
+# independent authority for the U2 row convention; oracle_equal compares
+# a block result against it within the pinned 1e-5 reference epsilon and
+# never widens the tolerance locally.
+# -------------------------------------------------------------------------
+
+@ public { }
+class OracleTrace {
+    BlockRows rows
+    list<kv.KVCache> final_layers
+
+    fn rows() → BlockRows {
+        return self.rows
+    }
+
+    fn final_layers() → list<kv.KVCache> {
+        return self.final_layers
+    }
+}
+
+@ public { }
+fn default_trace() → OracleTrace {
+    return OracleTrace {rows = default_rows(), final_layers = empty}
+}
+
+@ private { }
+fn _oracle_empty_layers(cache_branch.KVCheckpoint base) → list<kv.KVCache> ⇥ VerifyError {
+    const kv.KVCache first ← base.layers().get(0) coalesce kv.default()
+    var list<kv.KVCache> layers ← empty
+    for range 0‥base.layers().length() const i {
+        do {
+            const kv.KVCache layer ← kv.empty_cache(first.model(), first.model_version(), first.config(), first.tokenizer(), 1, first.dimension())
+            layers.append(layer)
+        }
+        catch err {
+            throw variant ForwardFailure {message = kv.message(err)}
+        }
+    }
+    return layers
+}
+
+@ public { }
+fn recompute(BlockRequest request, list<int> prefix_ids, dense.DenseConfig cfg, (string, int) → tensor.Tensor ⇥ dense.DenseError source, f32 epsilon, f32 scale, int rope_dim, attention.RopeConfig rope_cfg) → OracleTrace ⇥ VerifyError {
+    _admit_model(request, cfg)
+    require prefix_ids.length() ≥ 1 throw variant EmptyPrefix {message = "oracle replay prefix must be non-empty"}
+    require prefix_ids.length() ≡ request.prefix_length() throw variant ModelMismatch {message = "oracle replay prefix must match the request prefix length"}
+    for from prefix_ids const token_id {
+        require token_id ≥ 0 and token_id ≺ cfg.vocab throw variant ModelMismatch {message = "oracle replay token id is outside model vocabulary"}
+    }
+
+    const int prefix ← request.prefix_length()
+    const int rows ← request.candidate_count()
+    var list<kv.KVCache> layers ← _oracle_empty_layers(request.checkpoint())
+    var dense.DenseStep step ← dense.default_step()
+    do {
+        step ← dense.prefill_cached(cfg, source, prefix_ids, epsilon, scale, rope_dim, rope_cfg, layers)
+    }
+    catch err {
+        throw _map_dense(dense.message(err))
+    }
+    require step.layers().length() ≡ cfg.layers throw variant ForwardFailure {message = "oracle replay returned the wrong layer count"}
+    layers ← step.layers()
+
+    var list<f32> logits_data ← empty
+    var int i ← 0
+    while i ≺ rows {
+        const int token_id ← request.candidate_ids().get(i) coalesce 0
+        do {
+            step ← dense.decode_step(cfg, source, token_id, prefix + i, epsilon, scale, rope_dim, rope_cfg, layers)
+        }
+        catch err {
+            throw _map_dense(dense.message(err))
+        }
+        const tensor.Tensor row ← step.logits()
+        require row.valid() and row.rank() ≡ 2 throw variant ForwardFailure {message = "oracle replay returned an invalid logit row"}
+        require _finite_value(row) throw variant ModelMismatch {message = "oracle replay produced non-finite logits"}
+        for from row.data const value {
+            logits_data.append(value)
+        }
+        layers ← step.layers()
+        i ← i + 1
+    }
+
+    var tensor.Tensor logits ← tensor.default()
+    do {
+        logits ← tensor.construct(logits_data, [rows, cfg.vocab])
+    }
+    catch err {
+        throw variant ForwardFailure {message = "oracle replay logits are not a valid tensor"}
+    }
+    const int dimension ← cfg.kv_heads * cfg.head_dim
+    var list<tensor.Tensor> keys ← empty
+    var list<tensor.Tensor> payloads ← empty
+    for range 0‥cfg.layers const li {
+        const kv.KVCache state ← layers.get(li) coalesce kv.default()
+        require state.length() ≡ prefix + rows throw variant ForwardFailure {message = "oracle replay cache length does not cover the block"}
+        keys.append(_candidate_rows(state.key(), prefix, rows, dimension))
+        payloads.append(_candidate_rows(state.payload(), prefix, rows, dimension))
+    }
+    var list<int> positions ← empty
+    for range prefix‥(prefix + rows) const position {
+        positions.append(position)
+    }
+    return OracleTrace {rows = construct_rows(request, positions, logits, keys, payloads), final_layers = layers}
+}
+
+@ public { }
+class OracleReport {
+    bool equivalent
+    int first_divergence
+    string detail
+
+    fn equivalent() → bool {
+        return self.equivalent
+    }
+
+    fn first_divergence() → int {
+        return self.first_divergence
+    }
+
+    fn detail() → string {
+        return self.detail
+    }
+}
+
+@ public { }
+fn default_report() → OracleReport {
+    return OracleReport {equivalent = false, first_divergence = 0, detail = "placeholder"}
+}
+
+@ public { }
+fn construct_report(bool equivalent, int first_divergence, string detail) → OracleReport ⇥ VerifyError {
+    if equivalent {
+        require first_divergence ≡ (0 - 1) throw variant ResultBounds {message = "an equivalent report cannot carry a divergence index"}
+        require detail ≡ "equivalent" throw variant ResultBounds {message = "an equivalent report must carry the equivalent detail"}
+    }
+    else {
+        require first_divergence ≥ 0 throw variant ResultBounds {message = "a divergent report must record a non-negative first divergence index"}
+        require detail ≠ "" throw variant ResultBounds {message = "a divergent report must carry a detail"}
+    }
+    return OracleReport {equivalent = equivalent, first_divergence = first_divergence, detail = detail}
+}
+
+@ private { }
+fn _equivalent_report() → OracleReport ⇥ VerifyError {
+    return construct_report(true, 0 - 1, "equivalent")
+}
+
+@ private { }
+fn _divergent_report(int index, string detail) → OracleReport ⇥ VerifyError {
+    return construct_report(false, index, detail)
+}
+
+# Earliest flat row whose values differ by more than epsilon, or -1 when the
+# tensors agree within epsilon. Shapes are the caller's admission.
+@ private { }
+fn _first_row_delta(tensor.Tensor a, tensor.Tensor b, f32 epsilon) → int {
+    const list<int> shape ← a.shape()
+    const int width ← shape.get(shape.length() - 1) coalesce 1
+    var int i ← 0
+    while i ≺ a.data.length() {
+        const f32 left ← a.data.get(i) coalesce 0.0 ∷ f32
+        const f32 right ← b.data.get(i) coalesce 0.0 ∷ f32
+        if (left - right).abs() ≻ epsilon then return i / width
+        i ← i + 1
+    }
+    return 0 - 1
+}
+
+@ private { }
+fn _first_list_delta(list<int> a, list<int> b) → int {
+    var int i ← 0
+    while i ≺ a.length() and i ≺ b.length() {
+        const int left ← a.get(i) coalesce 0
+        const int right ← b.get(i) coalesce 0
+        if left ≠ right then return i
+        i ← i + 1
+    }
+    if a.length() ≠ b.length() then return 0
+    return 0 - 1
+}
+
+# The comparison authority: every [k, V] row, the position mapping, the
+# token history, and every layer's final staged tensors, within the
+# admitted epsilon. The first divergence index is the earliest candidate
+# row at which any compared surface disagrees; epsilon above the pinned
+# 1e-5 reference bound is refused, never widened.
+@ public { }
+fn oracle_equal(BlockRows block_rows, OracleTrace trace, f32 epsilon) → OracleReport ⇥ VerifyError {
+    require dtype.finite(epsilon) and epsilon ≻ 0.0 and not (epsilon ≻ 0.00001 ∷ f32) throw variant ResultBounds {message = "oracle epsilon cannot exceed the pinned 1e-5 reference bound"}
+    const BlockRows oracle_rows ← trace.rows()
+    require request_equal(block_rows.request(), oracle_rows.request()) throw variant ModelMismatch {message = "oracle replay request does not match the block request"}
+
+    const int rows ← block_rows.row_count()
+    if not (block_rows.target_positions() ≡ oracle_rows.target_positions()) {
+        const int position_delta ← _first_list_delta(block_rows.target_positions(), oracle_rows.target_positions())
+        var int index ← position_delta
+        if index ≺ 0 or index ≥ rows then index ← 0
+        return _divergent_report(index, "target positions diverge at candidate row §"(index ↦ string))
+    }
+    if not (block_rows.logits().shape() ≡ oracle_rows.logits().shape()) {
+        return _divergent_report(0, "logits shape diverges from the oracle replay")
+    }
+    const int logits_delta ← _first_row_delta(block_rows.logits(), oracle_rows.logits(), epsilon)
+    if logits_delta ≥ 0 {
+        return _divergent_report(logits_delta, "logits diverge at candidate row §"(logits_delta ↦ string))
+    }
+
+    const cache_branch.KVCheckpoint base ← block_rows.request().checkpoint()
+    const int prefix ← base.prefix_length()
+    require trace.final_layers().length() ≡ base.layers().length() throw variant ForwardFailure {message = "oracle replay layer count does not match the checkpoint"}
+    for range 0‥base.layers().length() const li {
+        const kv.KVCache replay ← trace.final_layers().get(li) coalesce kv.default()
+        const kv.KVCache origin ← base.layers().get(li) coalesce kv.default()
+        const tensor.Tensor staged_key ← block_rows.candidate_keys().get(li) coalesce tensor.default()
+        const tensor.Tensor staged_payload ← block_rows.candidate_payloads().get(li) coalesce tensor.default()
+        const int dimension ← origin.dimension()
+
+        var list<int> expected_history ← empty
+        for from origin.history() const prior {
+            expected_history.append(prior)
+        }
+        for from block_rows.request().candidate_ids() const token_id {
+            expected_history.append(token_id)
+        }
+        const int history_delta ← _first_list_delta(replay.history(), expected_history)
+        if history_delta ≥ 0 {
+            var int history_index ← history_delta - prefix
+            if history_index ≺ 0 or history_index ≥ rows then history_index ← 0
+            return _divergent_report(history_index, "token history diverges at candidate row §"(history_index ↦ string))
+        }
+
+        require replay.key().shape() ≡ [prefix + rows, dimension] throw variant ForwardFailure {message = "oracle replay staged key shape does not cover the block"}
+        require replay.payload().shape() ≡ [prefix + rows, dimension] throw variant ForwardFailure {message = "oracle replay staged payload shape does not cover the block"}
+        var int flat ← 0
+        while flat ≺ (prefix + rows) * dimension {
+            const f32 replay_key ← replay.key().data.get(flat) coalesce 0.0 ∷ f32
+            const f32 replay_payload ← replay.payload().data.get(flat) coalesce 0.0 ∷ f32
+            if flat ≺ prefix * dimension {
+                const f32 origin_key ← origin.key().data.get(flat) coalesce 0.0 ∷ f32
+                const f32 origin_payload ← origin.payload().data.get(flat) coalesce 0.0 ∷ f32
+                if (replay_key - origin_key).abs() ≻ epsilon or (replay_payload - origin_payload).abs() ≻ epsilon {
+                    return _divergent_report(0, "staged tensors diverge at candidate row §"(0 ↦ string))
+                }
+            }
+            else {
+                const f32 staged_key_value ← staged_key.data.get(flat - prefix * dimension) coalesce 0.0 ∷ f32
+                const f32 staged_payload_value ← staged_payload.data.get(flat - prefix * dimension) coalesce 0.0 ∷ f32
+                if (replay_key - staged_key_value).abs() ≻ epsilon or (replay_payload - staged_payload_value).abs() ≻ epsilon {
+                    const int row ← flat / dimension - prefix
+                    return _divergent_report(row, "staged tensors diverge at candidate row §"(row ↦ string))
+                }
+            }
+            flat ← flat + 1
+        }
+    }
+    return _equivalent_report()
+}
+
+# -------------------------------------------------------------------------
 # BlockVerification — final consumer result carrier, defined here so later
 # units compose one stable result type rather than inventing a second state
 # or identity carrier.

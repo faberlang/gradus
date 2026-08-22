@@ -580,3 +580,131 @@ describe "SD2-U3 — all-layer atomic staging and commit" {
         }
     }
 }
+
+fn oracle_trace_p() → block_verify.OracleTrace {
+    var block_verify.OracleTrace trace ← block_verify.default_trace()
+    do {
+        const block_verify.BlockRequest request ← block_verify.construct_request(block_prefix_checkpoint(), [1, 2])
+        trace ← block_verify.recompute(request, [0], block_cfg(), (string n, int s) → tensor.Tensor ⇥ dense.DenseError ∴ block_source(n, s), 0.00001 ∷ f32, 0.5 ∷ f32, 2, block_rope())
+    }
+    catch err {
+        return trace
+    }
+    return trace
+}
+
+fn oracle_trace_prefix(list<int> prefix_ids) → string {
+    do {
+        const block_verify.BlockRequest request ← block_verify.construct_request(block_prefix_checkpoint(), [1, 2])
+        const block_verify.OracleTrace _ ← block_verify.recompute(request, prefix_ids, block_cfg(), (string n, int s) → tensor.Tensor ⇥ dense.DenseError ∴ block_source(n, s), 0.00001 ∷ f32, 0.5 ∷ f32, 2, block_rope())
+        return "ok"
+    }
+    catch err {
+        return block_verify.message(err)
+    }
+}
+
+fn perturbed_rows() → block_verify.BlockRows {
+    const block_verify.BlockRows rows ← forward_rows()
+    const list<int> shape ← rows.logits().shape()
+    const int vocab ← shape.get(1) coalesce 4
+    var list<f32> data ← empty
+    var int i ← 0
+    while i ≺ rows.logits().data.length() {
+        var f32 value ← rows.logits().data.get(i) coalesce 0.0 ∷ f32
+        if i ≡ vocab {
+            value ← value + 0.001 ∷ f32
+        }
+        data.append(value)
+        i ← i + 1
+    }
+    var block_verify.BlockRows out ← block_verify.default_rows()
+    var tensor.Tensor logits ← tensor.default()
+    do {
+        logits ← tensor.construct(data, shape)
+    }
+    catch err {
+        return out
+    }
+    do {
+        out ← block_verify.construct_rows(rows.request(), rows.target_positions(), logits, rows.candidate_keys(), rows.candidate_payloads())
+    }
+    catch err {
+        return out
+    }
+    return out
+}
+
+fn report_text(block_verify.BlockRows rows, block_verify.OracleTrace trace, f32 epsilon) → string {
+    do {
+        const block_verify.OracleReport report ← block_verify.oracle_equal(rows, trace, epsilon)
+        if report.equivalent() {
+            return "equivalent"
+        }
+        return "divergent " + "§"(report.first_divergence() ↦ string) + ": " + report.detail()
+    }
+    catch err {
+        return block_verify.message(err)
+    }
+}
+
+describe "SD2-U4 — full-recompute oracle and equivalence" {
+    test "the block result equals the full-recompute oracle within 1e-5" {
+        do {
+            const block_verify.BlockRows rows ← forward_rows()
+            const block_verify.OracleTrace trace ← oracle_trace_p()
+            assert rows.target_positions() ≡ trace.rows().target_positions()
+            assert report_text(rows, trace, 0.00001 ∷ f32) ≡ "equivalent"
+            const block_verify.OracleReport report ← block_verify.oracle_equal(rows, trace, 0.00001 ∷ f32)
+            assert report.equivalent()
+            assert report.first_divergence() ≡ (0 - 1)
+            assert trace.final_layers().length() ≡ 3
+        }
+        catch err {
+            assert false
+        }
+    }
+
+    test "a forced perturbation records the first divergence index honestly" {
+        do {
+            const block_verify.BlockRows rows ← perturbed_rows()
+            assert rows.row_count() ≡ 2
+            assert report_text(rows, oracle_trace_p(), 0.00001 ∷ f32) ≡ "divergent 1: logits diverge at candidate row 1"
+        }
+        catch err {
+            assert false
+        }
+    }
+
+    test "the comparison refuses to widen tolerance above the pinned bound" {
+        do {
+            assert report_text(forward_rows(), oracle_trace_p(), 0.001 ∷ f32) ≡ "oracle epsilon cannot exceed the pinned 1e-5 reference bound"
+            assert report_text(forward_rows(), oracle_trace_p(), 0.0 ∷ f32) ≡ "oracle epsilon cannot exceed the pinned 1e-5 reference bound"
+        }
+        catch err {
+            assert false
+        }
+    }
+
+    test "a replay prefix that does not match the checkpoint rejects typed" {
+        do {
+            assert oracle_trace_prefix([0, 0]) ≡ "oracle replay prefix must match the request prefix length"
+            assert oracle_trace_prefix([]) ≡ "oracle replay prefix must be non-empty"
+        }
+        catch err {
+            assert false
+        }
+    }
+
+    test "report constructors enforce their own bounds" {
+        do {
+            const block_verify.OracleReport ok ← block_verify.construct_report(true, 0 - 1, "equivalent")
+            assert ok.equivalent()
+            const block_verify.OracleReport bad_text ← block_verify.construct_report(true, 0 - 1, "equivalent-ish")
+            assert false
+        }
+        catch err {
+            assert block_verify.message(err) ≡ "an equivalent report must carry the equivalent detail"
+        }
+    }
+}
