@@ -1,5 +1,7 @@
 # Delivery Lowering — GGUF-M2 (MODEL-02) Micro-Unit Re-Split: MoE Router And Expert Execution
 
+**Status**: SUPERSEDED 2026-08-22 by [`pml5-gguf-m2-moe-router-delivery-2026-08-22.md`](pml5-gguf-m2-moe-router-delivery-2026-08-22.md) — re-lowered against live main after the MODEL-01 merge (unit A1 silu landed; Latin surface spellings retracted; baseline re-verified). Frozen semantics (§2) inherited by the successor.
+
 **Planner**: planner-35. **Assignment**: task `688393b5` (Mind,
 2026-08-13T20:38:52+00:00): re-lower the fresh Qwen MODEL-02 MoE
 router/expert-execution delivery into one-logical-change Hand units before
