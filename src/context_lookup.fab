@@ -8,9 +8,10 @@ import from "gradus:speculative" speculative
 # Public import: import from "gradus:context_lookup" context_lookup
 #
 # This leaf freezes the pure search boundaries consumed by the provider in
-# SD4-U2. It deliberately does not search for matches or inspect generation,
-# cache, sampler, or model state. The caller supplies max_block from the
-# already-admitted AccelerationPolicy; it is not a new policy or wire field.
+# SD4-U2 and implements the deterministic provider. It searches only request
+# token ids and never inspects generation, cache, sampler, or model state. The
+# caller supplies max_block from the already-admitted AccelerationPolicy; it is
+# not a new policy or wire field.
 #
 # A usable lookup context has at least two tokens. The final token cannot be a
 # match because a match must have one following source token to begin the
@@ -133,4 +134,96 @@ fn empty_proposal() → speculative.ProviderResult {
 @ public { }
 fn fallback_kind() → string {
     return speculative.result_kind(empty_proposal())
+}
+
+# Validate the only request state the provider is allowed to inspect. The
+# request constructor normally establishes these facts, but a provider must
+# reject manually-bound malformed values rather than silently downgrading.
+@ private { }
+fn _validate_request(speculative.ProviderRequest request) → void ⇥ speculative.SpeculativeError {
+    require request.block_size() ≥ MIN_SUFFIX_LENGTH throw variant speculative.InvalidBlockSize {message = "provider block size must be at least one"}
+    for from request.prompt() const token {
+        require token ≥ 0 throw variant speculative.MalformedRequest {message = "token id must be non-negative"}
+    }
+    for from request.history() const token {
+        require token ≥ 0 throw variant speculative.MalformedRequest {message = "token id must be non-negative"}
+    }
+}
+
+# Make one owned context view. Prompt precedes accepted history, and no other
+# request, candidate, cache, or generation state can enter this list.
+@ private { }
+fn _context(speculative.ProviderRequest request) → list<int> {
+    var list<int> context ← empty
+    for from request.prompt() const token {
+        context.append(token)
+    }
+    for from request.history() const token {
+        context.append(token)
+    }
+    return context
+}
+
+# Compare a source occurrence with the final context suffix by token id. This
+# intentionally performs no text conversion or normalization.
+@ private { }
+fn _matches_suffix(list<int> context, int source_offset, int match_length) → bool {
+    const int suffix_start ← context.length() - match_length
+    for range 0‥match_length const i {
+        const int source_token ← context.get(source_offset + i) coalesce (0 - 1)
+        const int suffix_token ← context.get(suffix_start + i) coalesce (0 - 1)
+        if source_token ≠ suffix_token {
+            return false
+        }
+    }
+    return true
+}
+
+# Find the earliest usable occurrence for one suffix length. The final context
+# position is excluded as a match terminus by the following-token rule.
+@ private { }
+fn _first_match(list<int> context, int match_length) → int {
+    const int source_limit ← context.length() - match_length
+    for range 0‥source_limit const source_offset {
+        if _matches_suffix(context, source_offset, match_length) {
+            return source_offset
+        }
+    }
+    return 0 - 1
+}
+
+# Copy the source tokens immediately following a match, bounded by the
+# request's authorized candidate block and available context.
+@ private { }
+fn _candidate_extension(list<int> context, int source_offset, int match_length, int extension) → list<int> {
+    var list<int> candidates ← empty
+    const int following ← source_offset + match_length
+    for range 0‥extension const i {
+        candidates.append(context.get(following + i) coalesce (0 - 1))
+    }
+    return candidates
+}
+
+# Deterministic context-only provider. Equal ProviderRequests produce equal
+# ProviderResults: only the copied prompt/history token ids and block size are
+# read, and no sampler, train, cache, or generation surface is imported.
+@ public { }
+fn propose(speculative.ProviderRequest request) → speculative.ProviderResult ⇥ speculative.SpeculativeError {
+    _validate_request(request)
+    const list<int> context ← _context(request)
+    if context.length() ≺ 2 {
+        return speculative.no_draft()
+    }
+    const LookupBounds bounds ← construct_bounds(request.block_size(), context.length())
+    const list<int> lengths ← suffix_lengths(bounds)
+    for from lengths const match_length {
+        const int source_offset ← _first_match(context, match_length)
+        if source_offset ≥ 0 {
+            const int extension ← extension_length(bounds, source_offset, match_length)
+            const list<int> candidates ← _candidate_extension(context, source_offset, match_length, extension)
+            const speculative.CandidateProvenance provenance ← speculative.construct_provenance(speculative.context_lookup_source(), source_offset, match_length)
+            return speculative.construct_candidates(request, candidates, provenance)
+        }
+    }
+    return speculative.no_draft()
 }
