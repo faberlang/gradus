@@ -1,6 +1,6 @@
 # Delivery: PML5-GGUF — Qwen3.6 35B End-to-End Inference
 
-**Status**: active — LIB-02 (artifact-backed tokenizer, incl. real-artifact TOKENIZER PHASE PASS) and LIB-03 (checked packed storage + materialization, real-artifact coverage 753/753) COMPLETE and integrated on gradus main (`294c706`, `af139cc`); next frontier = REF-01 dense reference + MODEL-01 qwen35moe admission (see "Session state" below; full delivery map in radix `gpu-production-readiness/CAMPAIGN.md`)
+**Status**: active — LIB-02 (artifact-backed tokenizer, incl. real-artifact TOKENIZER PHASE PASS) and LIB-03 (checked packed storage + materialization, real-artifact coverage 753/753) COMPLETE and integrated on gradus main (`294c706`, `af139cc`); MODEL-02 MoE router/expert/full-layer component surface implemented through U6 at `b1ccfc8` (U7 real-artifact adapter receipt remains separate); PML5 continues toward the full Qwen3.6 invariant (see "Session state" below; full delivery map in radix `gpu-production-readiness/CAMPAIGN.md`)
 **Campaign**: [`CAMPAIGN.md`](CAMPAIGN.md), mandatory completion of PML5
 **Umbrella**: Radix `gpu-production-readiness` Qwen3.6 invariant
 **Repo**: `gradus`
@@ -543,6 +543,13 @@ typed execution configuration; mutated metadata, names, shapes, and storage
 layouts fail with typed first-divergence diagnostics.
 
 ### GGUF-M2 — MoE Router And Expert Execution
+
+**Implemented component surface (MODEL-02-U3–U6, `b1ccfc8`)**: `gradus:model/moe`
+now owns router logits, the artifact's declared expert selection and weight
+normalization, rank-3 expert projection access, expert dispatch, weighted
+accumulation, deterministic tie behavior, and the gated shared expert. The
+real-artifact adapter and receipt remain the separate U7 handoff; this line
+claims no executed token/model identity or device execution.
 
 Implement router logits, the artifact's declared expert selection and weight
 normalization, rank-3 expert projection access, expert dispatch, accumulation,

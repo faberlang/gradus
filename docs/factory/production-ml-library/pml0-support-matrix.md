@@ -18,7 +18,7 @@ tokenizer-identity-oracle.md`), not duplicated.
 
 This matrix holds **admitted rows only**, per `pml0-support-matrix-schema.md`
 
-§2/§3 (fail-closed R1–R11; one row is the unit of support claim). Fourteen
+§2/§3 (fail-closed R1–R11; one row is the unit of support claim). Fifteen
 admitted rows: two PML2 model-file format rows (Safetensors, GGUF), two PML3
 architecture rows (one training, one selected inference), one PML4
 training-layer row, one PML5 inference-layer row, two GGUF-A3
@@ -29,11 +29,13 @@ reference primitive row (row 10, generic RMSNorm, executed proof —
 REF-01-U1.1), one qwen2 architecture-adapter row (row 11, executed
 descriptor-resolution tier — REF-01-U1.7), one generic dense
 transformer-block row (row 12, executed proof tier — REF-01-U1.5), one
-dense model assembly row (row 13, executed proof tier — REF-01-U1.8), and
-one MODEL-01 qwen35moe architecture admission row at the **structural
-tier** (row 14, facts only). Every row is
-**structural tier** — the executed tier is recorded, never claimed (see §2 reject log and
-each row's structural-tier note).
+dense model assembly row (row 13, executed proof tier — REF-01-U1.8), one
+MODEL-01 qwen35moe architecture admission row at the **structural tier**
+(row 14, facts only), and one MODEL-02 MoE component row at the
+**output-checked component tier** (row 15, router/expert/full-layer values,
+not executed-token or model identity). Every row is **structural tier** —
+the executed tier is recorded, never claimed (see §2 reject log and each
+row's structural-tier note).
 
 GGUF-A1b extends the separate **format-inspection foundation**; it is not an admitted
 execution row. `gradus:model/artifact` and `gradus:model/gguf_manifest` parse
@@ -405,6 +407,28 @@ execution, logits, or device execution; CTO8-1 stays the named gate.
 | `schema version` | `gradus-support-matrix-schema v0.1.0` |
 ```
 
+### Row 15 — MODEL-02 qwen35moe MoE component row (output-checked component tier, not executed identity)
+
+```markdown
+| `format` | `gguf` (GGUF file version 3; quant version 2 — the MODEL-01 admitted row; no new format claim) |
+| `architecture` | `qwen35moe` (Qwen3.6-35B-A3B — the MODEL-01 admitted architecture; MoE semantics through `gradus:model/moe`) |
+| `dtype` | compute = `f32` carrier tier; storage remains the MODEL-01 mixed GGML union set and is consumed through bounded tensor windows |
+| `quantization` | `q4_k_m` file type (15 MOSTLY_Q4_K_M, quant version 2); quantization is a storage property, not a forward-path claim |
+| `shape` | hidden state `[1, 2048]`; router `[256, 2048]`; top-8 selection; expert gate/up `[512, 2048]`; expert down `[2048, 512]`; shared expert gate/up `[512, 2048]`; shared expert down `[2048, 512]`; all reads are bounded windows |
+| `tokenizer identity` | not part of the MoE component row; tokenizer identity remains the MODEL-01/LIB-02 admitted row |
+| `legal fixture ref` | operator-local `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` — 22,663,387,424 bytes, SHA-256 `0b21525e972670ed59e1812e170b27c26355381f0656ecc4e25617ece7dac58b`; never committed |
+| `oracle ref` | committed MODEL-02 probe/golden fixtures (`fixtures/gguf/gguf-moe-probes.json`, `gguf-moe-synthetic.json`, `gguf-moe-goldens.json`, schema `gguf-moe-goldens-v1`) plus the frozen f32 forward band; selected indices are exact and values use the recorded band |
+| `evidence links` | `src/model/moe.fab`, `src/model/moe.proba`, MODEL-02-U1/U2 fixture generators and goldens; U6 landed at `b1ccfc8`; the real-artifact `exempla/moe-probe` adapter is the U7 handoff and remains a separate execution receipt |
+| `executed proof` | **not claimed.** This component tier records router/expert/full-layer output checks; it does not claim executed token identity, model identity, logits, or device execution. |
+| `compatibility policy` | exact admitted combination: the carrier-tier `gradus:model/moe` router, deterministic lowest-index tie rule, selected-weight renormalization, windowed rank-3 expert SwiGLU, ascending-index accumulation, and gated shared expert for the admitted qwen35moe component facts. Non-goals: tokenizer, full-model execution, generated tokens, device execution, and any other architecture or model file |
+| `schema version` | `gradus-support-matrix-schema v0.1.0` |
+```
+
+**Output-checked component tier (recorded, not claimed).** Row 15 records
+component-level router, expert, and full-layer outputs against the committed
+MODEL-02 oracle shape. It does **NOT** claim executed token/model identity,
+full-model logits, or device execution; those remain downstream gates.
+
 **Structural tier (recorded, not claimed).** Row 14 records architecture +
 tensor-map facts only, with the guarded exemplar's expected-vs-observed rows
 as the receipt shape; the executed admission run (ADMIT + 753-tensor receipt)
@@ -439,7 +463,7 @@ the named open clause.
   `fixtures/tokenizer/tokenizer-identity-oracle.md`) and aggregated into this
   matrix at PML6 per `pml6-delivery.md` PML6-U3.
 - The PML6 gate's "support matrix is the full-matrix aggregation" clause is
-  satisfied by these nine admitted rows; the phase gate also requires README
+  satisfied by these fifteen admitted rows; the phase gate also requires README
   regen + audit 0 findings (planner/Mind-owned at gate).
 - Compatibility promises at the row level are each row's `compatibility
   policy` field; `docs/compatibility-policy.md`
@@ -451,17 +475,17 @@ the named open clause.
 
 ```bash
 cd /Users/ianzepp/work/faberlang/gradus
-# 1. Fourteen admitted rows (2 PML2 format, 2 PML3 architecture, 1 PML4
+# 1. Fifteen admitted rows (2 PML2 format, 2 PML3 architecture, 1 PML4
 #    training-layer, 1 PML5 inference-layer, 2 GGUF-A3 output-checked
 #    slice materialization, 1 GGUF-A2 executed-probe tokenizer runtime,
 #    1 REF-01 dense reference primitive, 1 REF-01 qwen2 architecture
 #    adapter, 1 REF-01 generic dense transformer block, 1 REF-01 dense
-#    model assembly, 1 MODEL-01 qwen35moe architecture admission); the
-#    eleven schema-version rows carry all 11 schema fields (rows 10, 12
-#    and 13, the REF-01 primitive/block/assembly rows, use their own
-#    Field/Value sets).
-grep -c '^| `format`' docs/factory/production-ml-library/pml0-support-matrix.md   # 11
-grep -c '^| `schema version`' docs/factory/production-ml-library/pml0-support-matrix.md   # 11
+#    model assembly, 1 MODEL-01 qwen35moe architecture admission, and 1
+#    MODEL-02 MoE output-checked component row); the twelve schema-version
+#    rows carry all 12 schema fields (rows 10, 12 and 13, the REF-01
+#    primitive/block/assembly rows, use their own Field/Value sets).
+grep -c '^| `format`' docs/factory/production-ml-library/pml0-support-matrix.md   # 12
+grep -c '^| `schema version`' docs/factory/production-ml-library/pml0-support-matrix.md   # 12
 # 2. Committed unit commits + oracle pins cited as evidence links.
 grep -c '07291d6\|b392fc8\|f12deaf\|02fae61\|9822cfa\|5260049\|7bf9acc\|359c5f0\|5f98e8b\|e09c79c\|9bebda9\|4b24c81\|94d8a94\|fc85de7\|bdefb5a\|3b2fc9b\|b1b01f1\|56e70f0\|8cf798a\|1a6abd0' docs/factory/production-ml-library/pml0-support-matrix.md   # >= 5
 grep -c 'LN3_\|IN_LN3_\|COS_1\|SIN_1\|1.576448169383708\|0.01137' docs/factory/production-ml-library/pml0-support-matrix.md   # >= 1

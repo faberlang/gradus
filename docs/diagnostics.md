@@ -62,6 +62,7 @@ pinned row is space-prefix-free (add_space_prefix = false)
 | `gradus:model/tensor_view` | `VisioError` | 7 | `src/model/tensor_view.fab` |
 | `gradus:model/dense_qwen2` | `DenseQwen2Error` | 5 | `src/model/dense_qwen2.fab` |
 | `gradus:model/dense` | `DenseError` | 4 | `src/model/dense.fab` |
+| `gradus:model/moe` | `MoeError` | 4 | `src/model/moe.fab` |
 | `gradus:nn` | `NnError` | 9 | `src/nn.fab` |
 | `gradus:optimize` | `OptimizeError` | 14 | `src/optimize.fab` |
 | `gradus:parameter` | `ParametrumError` | 10 | `src/parameter.fab` |
@@ -73,7 +74,7 @@ pinned row is space-prefix-free (add_space_prefix = false)
 | `gradus:train` | `TrainError` | 10 | `src/train.fab` |
 | `gradus:transformer` | `TransformerError` | 12 | `src/transformer.fab` |
 
-**Total**: 228 public error codes across 30 error types.
+**Total**: 232 public error codes across 31 error types.
 
 ## `gradus:model/artifact` — `ArtifactError`
 
@@ -397,6 +398,21 @@ preserving the documented message text.
 | `DenseError.BadConfig` | The architecture config cannot be assembled, or the token sequence/positions are inconsistent. | `layer count must be at least 1`<br>`head count must be at least 1`<br>`KV head count must be between 1 and the head count`<br>`head count must be a multiple of the KV head count`<br>`head dim must be at least 1`<br>`hidden dim must be at least 1`<br>`vocabulary size must be at least 1`<br>`token sequence must be non-empty`<br>`positions must match the token count` | Provide a positive config consistent with the materialized tensor shapes, and one position per token. |
 | `DenseError.BadShape` | A canonical tensor's shape contradicts the config, or a composed-row sub-call failed. | `canonical tensor … has shape …, expected …`<br>`embedding must be rank 2`<br>`block input must be rank 2`<br>`block weight must be rank 2`<br>`canonical tensor … must be rank 2` + the preserved nn/transformer/tensor message texts | Provide materialized stored-weight views whose shapes match the config (`[D, V]` embed, `[D]` norm scales, `[D, H·D]`/`[D, K·D]`/`[H·D, H·D]` projections, `[D, F]`/`[F, D]` MLP rows). |
 | `DenseError.TerminusExcedit` | A token id is outside the embedding vocabulary. | `token id out of range for the embedding` | Provide token ids within `[0, vocab)`. |
+
+## `gradus:model/moe` — `MoeError`
+
+Source: `src/model/moe.fab`. Render with module `message(e)`. The MODEL-02
+carrier-tier surface validates the hidden state and every bounded weight window
+before routing or projection. It preserves non-finite failures rather than
+coercing them to zero, and its full-layer accumulation order is ascending
+expert index.
+
+| Code | Class / when | Live messages (representative) | Resolution |
+| --- | --- | --- | --- |
+| `MoeError.BadConfig` | MoE dimensions, layer, or expert selection configuration is outside the admitted contract. | `expert count must be at least one`<br>`expert used count must be at least one`<br>`expert used count cannot exceed expert count`<br>`expert FFN length must be at least one`<br>`shared FFN length must be at least one`<br>`embedding length must be at least one`<br>`layer index must be non-negative`<br>`expert index is outside the configured range`<br>`router logits must be non-empty`<br>`router selection index is unavailable` | Supply a positive `MoeConfig`, a non-negative layer, and an expert index in `[0, expert_count)`; keep `expert_used_count` within `expert_count`. |
+| `MoeError.BadShape` | A hidden state, router result, projection, or output carrier has the wrong shape or is invalid. | `hidden state carrier is invalid`<br>`hidden state must have shape [1, embedding_length]`<br>`tensor window carrier is invalid`<br>`tensor window carrier has the wrong shape`<br>`router logits carrier is invalid`<br>`router logits carrier has the wrong shape`<br>`projection carrier is invalid`<br>`projection carrier has the wrong shape`<br>`FFN output carrier is invalid`<br>`FFN output carrier has the wrong shape` | Provide rank- and dimension-correct f32 carriers for the configured embedding and expert widths. |
+| `MoeError.BadWindow` | A bounded source window has invalid bounds or a carrier length that does not match the requested range. | `tensor window start must be non-negative`<br>`tensor window length must be positive`<br>`tensor window length does not match the carrier`<br>`down projection has the wrong length`<br>`projection carrier has the wrong length`<br>`expert output has the wrong length` | Return exactly the requested, element-aligned window with the shape and length declared by the callback contract. |
+| `MoeError.NonFinite` | A hidden state, weight window, router result, softmax intermediate, gate, or final output is non-finite. | `hidden state contains a non-finite value`<br>`tensor window contains a non-finite value`<br>`router logits contain a non-finite value`<br>`router softmax produced a non-finite value`<br>`shared expert gate is non-finite`<br>`FFN output contains a non-finite value` | Reject the input or source window and re-run with finite f32 values; never widen a tolerance or substitute a zero. |
 
 ## `gradus:model/gguf` — `GgufError`
 

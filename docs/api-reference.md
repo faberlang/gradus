@@ -816,6 +816,36 @@ Qwen35MoE frozen configuration, canonical tensor map, and admission checks.
 - `fn admission_message(Qwen35moeAdmissionError e) → string`
 - `fn admit(gguf_manifest.GgufCorpus corpus, string expected_digest, int expected_length) → Qwen35moeAdmission ⇥ Qwen35moeAdmissionError`
 
+## gradus:model/moe
+
+Carrier-tier mixture-of-experts routing, rank-3 expert dispatch, weighted
+accumulation, and gated shared-expert FFN composition for the MODEL-02 surface.
+The adapter owns bounded tensor windows and fails closed on malformed carriers,
+windows, configuration, and non-finite values. Routed experts are accumulated
+in ascending expert-index order for deterministic f32 results.
+
+**Source**: `src/model/moe.fab`
+
+### Public types
+
+- `union MoeError` — BadConfig, BadShape, BadWindow, NonFinite (each carries a `string message`)
+- `class MoeConfig`
+  - fields: int expert_count, int expert_used_count, int expert_ffn_length, int shared_ffn_length, int embedding_length
+- `class MoeSelection`
+  - fields: list<int> indices, list<f32> weights, list<f32> logits, list<f32> probabilities
+  - methods:
+    - `fn indices() → list<int>`
+    - `fn weights() → list<f32>`
+    - `fn logits() → list<f32>`
+    - `fn probabilities() → list<f32>`
+
+### Public functions
+
+- `fn message(MoeError e) → string`
+- `fn route(tensor.Tensor x, int layer, (string, int, int) → tensor.Tensor ⇥ MoeError source, MoeConfig cfg) → MoeSelection ⇥ MoeError`
+- `fn expert_out(tensor.Tensor x, int layer, int expert_index, (string, int, int) → tensor.Tensor ⇥ MoeError source, MoeConfig cfg) → tensor.Tensor ⇥ MoeError`
+- `fn ffn_moe(tensor.Tensor x, int layer, (string, int, int) → tensor.Tensor ⇥ MoeError source, MoeConfig cfg) → tensor.Tensor ⇥ MoeError`
+
 ## gradus:model/safetensors
 
 Safetensors header parsing and row admission into the typed model capsule.

@@ -28,6 +28,7 @@ for each live import that has a demo:
 | `gradus:model/dense_qwen2` | [`exempla/dense-qwen2-adapter/`](../exempla/dense-qwen2-adapter/) |
 | `gradus:model/dense` | [`exempla/dense-model/`](../exempla/dense-model/) |
 | `gradus:model/qwen35moe` | [`exempla/gguf-admit-qwen35moe/`](../exempla/gguf-admit-qwen35moe/) |
+| `gradus:model/moe` | MODEL-02 component surface; the real-artifact adapter is the U7 `moe-probe` handoff |
 | `gradus:tokenizer` | [`exempla/qwen36-35b-inference/`](../exempla/qwen36-35b-inference/) |
 | `gradus:generation` | [`exempla/generate-route/`](../exempla/generate-route/) |
 | `gradus:decode`, `gradus:sampling` | [`exempla/token-generation/`](../exempla/token-generation/) |
@@ -39,12 +40,13 @@ starts at [`exempla/dense-prefill-smollm2/`](../exempla/dense-prefill-smollm2/).
 
 ## Live modules (post-PML1–5 + correctness wave)
 
-The live tree has 35 modules (the U15 `gradus:mlp` leaf added to the prior 34). Module names
+The live documented tree has 36 modules (the U15 `gradus:mlp` leaf added to the prior 34, plus the MODEL-02 `gradus:model/moe` leaf). Module names
 are unchanged. This inventory is verified against the live `src/**/*.fab` tree after the no-latin
 conversion (U1–U6); it does not reuse a pre-conversion name map. The source
 surface includes the A1C capsule-schema-2.0.0 surface, LIB-02 tokenizer
 runtime, GGUF-A3 tensor payload/view and widened dequant rows, REF-01
-architecture adapters and dense assembly, and MODEL-01 qwen35moe admission.
+architecture adapters and dense assembly, MODEL-01 qwen35moe admission, and
+MODEL-02 MoE routing, expert dispatch, and full-layer FFN composition.
 See the coverage gate in [`docs/api-reference.md`](api-reference.md). The
 GGUF-A1b surface has an executed 40-case synthetic package-MIR proof and
 guarded real-file inspection receipts for six operator-local GGUFs. Exact
@@ -82,6 +84,7 @@ evidence and boundaries are recorded in
 | `gradus:model/dense_qwen2` | `src/model/dense_qwen2.fab` | Typed `qwen2` (Qwen2.5) architecture adapter — canonical dense tensor-name → manifest-descriptor resolution (`config`/`resolve`/`render_description`) with the qwen2 deltas: tensor-set tie status, GQA head config, rope_theta 1000000 (REF-01-U1.7) |
 | `gradus:model/dense` | `src/model/dense.fab` | Dense model assembly — the complete ordered dense forward graph (`forward`): embedding gather → N ordered U1.5 `dense_block` rows → final RMSNorm → output projection, assembled from the typed architecture config (`DenseConfig`) and materialized stored-weight views via canonical names; tied/untied embedding handling; zero per-row constants (REF-01-U1.8). Real-file Qwen2.5-0.5B prefill consumer: `exempla/dense-prefill-qwen2` (REF-01-U1.10; FINAL stop at radix `2ed9914e4`: packet `faber` green; PKG001 closed; rustc cargo-101, first `E0015` const `vec!`) |
 | `gradus:model/qwen35moe` | `src/model/qwen35moe.fab` | qwen35moe architecture admission: frozen config + canonical 753-tensor map + dimension/storage cross-reference validation + identity-precondition admission (MODEL-01, read through the `gguf_manifest` typed accessors) |
+| `gradus:model/moe` | `src/model/moe.fab` | MODEL-02 carrier-tier MoE router, deterministic top-k selection, bounded rank-3 expert dispatch, weighted accumulation, and gated shared-expert FFN |
 | `gradus:tokenizer` | `src/tokenizer.fab` | Tokenizer identity + probe parity + `is_eog` (PML2/PML5) + artifact-backed byte-level BPE runtime with the composed qwen35 pre-tokenizer and special/EOG/BOS/chat policy surface (LIB-02-U2/U3; completion oracle pinned in `fixtures/tokenizer/pinned-probe-oracle.md`); capstone tokenizer phase run by `exempla/qwen36-35b-inference` (LIB-02-U4-1) |
 | `gradus:cache` | `src/cache.fab` | KV-cache values + mutation rules (PML5) |
 | `gradus:calibration` | `src/calibration.fab` | Residual-energy calibration bake (W5d-U1) — per-expert output-energy scores, K-recommendation curve, overlap census, 75e4ab98 provenance; measurement artifact, not a weight transform |
@@ -111,6 +114,8 @@ REF-01 Dense reference  gradus:model/dense_llama (llama/SmolLM2 adapter,
 MODEL-01 Architecture   gradus:model/qwen35moe — MODEL-01
 admission (specific)    architecture-specific admission over the
                         format-general model rows
+MODEL-02 MoE component   gradus:model/moe — carrier-tier router, expert
+surface                  dispatch, weighted accumulation, and gated shared FFN
 PML2 Tokenizer identity gradus:tokenizer
 PML5 Inference          gradus:decode, gradus:cache, gradus:sampling,
                         gradus:generation

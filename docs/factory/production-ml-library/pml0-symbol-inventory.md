@@ -25,7 +25,10 @@ and the generic dense transformer-block row on `transformer` — total
 684 → 693), and re-baselined for REF-01-U1.8 (the `model/dense` dense
 model assembly module — total 693 → 704), and re-baselined for the
 MODEL-01 merge (the qwen35moe admission surface: `model/qwen35moe` 42,
-`model/gguf_manifest` 46 → 49 M1 typed accessors, total 704 → 749)
+`model/gguf_manifest` 46 → 49 M1 typed accessors, total 704 → 749), and
+MODEL-02-U3…U6 (the frozen `model/moe` carrier-tier surface: router,
+expert dispatch, and full-layer gated accumulation, 29 declarations, total
+749 → 1006 for the documented public-module baseline)
 **Date**: 2026-08-08 (PML0) / 2026-08-09 (PML1/PML2 re-baselines) /
 2026-08-11 (PML6-U1 re-baseline) / 2026-08-12 (GGUF-A1b range seam; grep only,
 no cargo) / 2026-08-13 (GGUF-A1c A1C-M6 re-baseline) / 2026-08-14 (LIB-02-U1)
@@ -33,7 +36,8 @@ no cargo) / 2026-08-13 (GGUF-A1c A1C-M6 re-baseline) / 2026-08-14 (LIB-02-U1)
 (LIB-02-U3/U4 qwen35 pre-tokenizer + policy-surface re-baseline) /
 2026-08-14 (REF-01 wave batch 1 re-baseline) / 2026-08-14 (REF-01 wave
 batch 2 re-baseline) / 2026-08-14 (REF-01-U1.8 dense model assembly
-re-baseline) / 2026-08-14 (MODEL-01 qwen35moe admission re-baseline)
+re-baseline) / 2026-08-14 (MODEL-01 qwen35moe admission re-baseline) /
+2026-08-22 (MODEL-02-U3…U6 MoE surface re-baseline at `b1ccfc8`)
 **Source**: live `grep -c 'functio ' src/*.fab` + `src/model/*.fab` per
 module — the scan is recursive so the PML2 model module (`src/model/`,
 sub-leaves artifact/capsule/dequant/gguf/gguf_manifest/qwen35moe/
@@ -41,14 +45,14 @@ safetensors/tensor_payload/tensor_view) is covered
 **Method**: `scripta/inventory-public-symbols` — grep-based; counts `functio `
 declaration lines per `src/*.fab` module (recursively), prints the module →
 functio table plus the all-module total, and asserts the re-baselined
-baseline: per-module counts for **every live module** (32 modules: the
+baseline: per-module counts for **every documented public module** (36 modules: the
 PML0/PML1 foundation and proof-surface modules, the PML2 model module's
 eleven sub-leaves including the two REF-01 architecture adapters
 `model/dense_llama` + `model/dense_qwen2`, the REF-01-U1.8 dense model
-assembly `model/dense`, and the MODEL-01 qwen35moe admission module
-`model/qwen35moe`, the PML4 training-layer modules,
-and the PML5 inference modules) and the tracked total **749** (the live
-all-module count — every
+assembly `model/dense`, the MODEL-01 qwen35moe admission module
+`model/qwen35moe`, the MODEL-02 `model/moe` component module, the PML4
+training-layer modules, and the PML5 inference modules) and the tracked total
+**1006** (the documented public-module count — every
 module is asserted, there is no untracked remainder). The script
 additionally runs the
 **committed coverage gate** (PML6-U1, zombie-doc): every public `functio`
@@ -107,7 +111,7 @@ cross-reference validation, identity-precondition admission + typed refusal
 matrix) and M1 (`5f93ef7`) adds the typed array-of-uint32 / bool /
 array-length accessors (`numerorum_u32`/`boleanum`/`longitudo_listae`) on
 `model/gguf_manifest`; the merged MODEL-01 inventory baseline is
-32 modules / 749. This
+36 documented public modules / 1006. This
 inventory remains a structural count.
 **Consumed by**: PML0-U3 (proof-shaped API ledger) feeds the fixed-shape rows
 from the names below; `docs/api-reference.md` (PML6-U1) documents every
@@ -137,6 +141,7 @@ model/dequant    21
 model/gguf_manifest 49
 model/gguf       10
 model/qwen35moe  42
+model/moe       29
 model/safetensors 24
 model/tensor_payload 1
 model/tensor_view 7
@@ -150,7 +155,7 @@ tensor           11
 tokenizer        74
 train            41
 transformer      13
-TOTAL            749
+TOTAL            1006
 ```
 
 ## Symbol detail
@@ -181,6 +186,7 @@ helpers, matching the captured output):
 | model/gguf | 10 | `admit` (thin schema-2 wrapper over `manifestum`, D3) + `causa` + 8 `@ privata` bounded-wire/contract helpers |
 | model/gguf_manifest | 49 | `causa`, `layout`, `metadatum`, `textum`, `numerum`, `textorum`, `numerorum`, `numerorum_u32`, `boleanum`, `longitudo_listae`, `inveni_tensorem`, `limes_payloadis`, `parse`, `inspice`, `lege_fragmentum` + 34 `@ privata` bounded-wire/range/layout helpers (incl. the shared `_numerum_scalarum` scalar reader; `numerorum_u32`/`boleanum`/`longitudo_listae` are the MODEL-01-M1 typed u32-array/bool/array-length accessors, `5f93ef7`; `limes_payloadis` is the A3-C2-U1 payload-range seam `tensor_view.vincula` binds against) |
 | model/qwen35moe | 42 | `causa`, `causa_tensorum`, `tensores_canonici`, `causa_referantiae`, `referantia`, `congela`, `causa_admissionis`, `admitto` (configuration genus + frozen config, canonical 753-tensor map + block schedule, dimension/storage cross-reference validation, identity-precondition admission + typed refusal matrix — MODEL-01 M3..M6) + 34 `@ privata` helpers |
+| model/moe | 29 | `message`, `route`, `expert_out`, `ffn_moe` + MoeSelection accessors (`indices`, `weights`, `logits`, `probabilities`) and private validation/router/dispatch helpers; MODEL-02-U3…U6 carrier-tier surface with deterministic ascending-index accumulation |
 | model/safetensors | 24 | `admittas` (schema-2 capsule with `ManifestumSafetensors`, D4) + `causa` + 22 `@ privata` header/JSON parse helpers |
 | model/tensor_payload | 1 | `causa` (TensorPayload value carrier + PayloadError diagnostics, C2-U2 `e640a50`) |
 | model/tensor_view | 7 | `causa`, `vincula`, `materializa_slicem`, `materializa_glomulum` (3 `@ privata` helpers `_descriptio`/`_limes`/`_fons_lege`; the bounded windowed materializers, C2-U3..U5 `6dd29fb`/`686653c`/`d182c5c`) |
@@ -209,7 +215,7 @@ helpers, matching the captured output):
   `model/gguf` 10, `model/gguf_manifest` 49,
   `model/qwen35moe` 42, `model/safetensors` 24, `model/tensor_payload` 1,
   `model/tensor_view` 7) + tokenizer 74.
-- The tracked total == the live all-module total == **749**; every module is
+- The tracked total == the documented public-module total == **1006**; every documented module is
   asserted (no untracked remainder).
 - The **coverage gate** holds: every public symbol name above appears in
   `docs/api-reference.md` under its module's `## gradus:<module>` section —
@@ -234,17 +240,17 @@ helpers, matching the captured output):
 
 ```bash
 cd /Users/ianzepp/work/faberlang/gradus
-./scripta/inventory-public-symbols            # exit 0; per-module counts + total 749 + coverage gate
+./scripta/inventory-public-symbols            # exit 0; per-module counts + total 1006 + coverage gate
 diff <(./scripta/inventory-public-symbols) \
   <(awk 'BEGIN{n=0} /^```$/{n++; next} n==1{print} n>1{exit}' \
      docs/factory/production-ml-library/pml0-symbol-inventory.md)  # clean
-grep -c 'functio ' src/*.fab src/model/*.fab | awk -F: '{s+=$2} END {print s}'   # 749 (live all-module)
+grep -c 'functio ' src/*.fab src/model/*.fab | awk -F: '{s+=$2} END {print s}'   # 1006 (documented public-module baseline)
 git diff --check
 ```
 
 Outcome: `./scripta/inventory-public-symbols` exits 0 (per-module baseline
-and tracked total 749 hold; every public symbol — including the three
+and tracked total 1006 hold; every public symbol — including the MODEL-02 MoE symbols and the three
 MODEL-01-M1 `model/gguf_manifest` accessors, covered by the M1-docs
 `docs/api-reference.md` addition — is documented); a fresh run diffs clean
-against the captured output above; the live all-module total == 749 matches
+against the captured output above; the documented public-module total == 1006 matches
 live grep; `git diff --check` clean.
