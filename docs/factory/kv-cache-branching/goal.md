@@ -1,6 +1,6 @@
 # GOAL: kv-cache-branching — immutable all-layer speculative branches with atomic prefix commit
 
-**Status**: planned — pre-implementation
+**Status**: active — lowered 2026-08-22 ([delivery.md](delivery.md) SD1-1..6; goal-check READY; U3 gated on SD0-U7's pending handoff, U6 behind the cache.proba classification seat; awaiting Mind dispatch)
 **Created**: 2026-08-21
 **Campaign:** `speculative-decode`
 **Source:** speculative-decode campaign lowering and the 2026-08-21 live-code audit
@@ -136,6 +136,13 @@ logical Gradus contract from any later device-residency implementation.
 | 4 | pending | — | — | — |
 | 5 | pending | — | — | — |
 | 6 | pending | — | — | — |
+
+Lowered to [`delivery.md`](delivery.md) as SD1-1..6 (2026-08-22). Delivery
+pins the goal's open questions against live code: epoch = the existing
+`KVCache.version` (`+1` once per successful commit, `n = 0` equivalent-base);
+capacity = the existing `_admit_write` bound; the new contract lives in a new
+leaf `src/cache_branch.fab` so the live `cache.fab`/`cache.proba` seat
+surfaces stay untouched. U3 wraps SD0-U4's landed `GreedyAcceptance`.
 
 ## Open questions
 
