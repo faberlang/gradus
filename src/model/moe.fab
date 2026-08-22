@@ -1,11 +1,13 @@
 +++
 locale = "en"
 +++
-# MODEL-02-U4 — MoE router arithmetic continuation.
+# MODEL-02-U6 — full-layer MoE FFN completion.
 #
-# The U3 carrier boundary remains fail-closed while this unit adds router
-# logits, stabilized softmax, deterministic top-k selection, and renormalized
-# selected weights. Expert and full-layer arithmetic remain in later units.
+# The U3 carrier boundary remains fail-closed while the router (U4), expert
+# dispatch (U5), and this unit complete the frozen surface: weighted expert
+# accumulation plus the gated shared expert. Accumulation order is pinned to
+# ascending expert index — f32 addition is order-sensitive, so the order is
+# deterministic here and mirrored in proba.
 
 import from "gradus:dtype" dtype
 import from "gradus:math" math
@@ -352,11 +354,120 @@ fn expert_out(tensor.Tensor x, int layer, int expert_index, (string, int, int) �
     return output
 }
 
+# Shared-expert sigmoid gate: self-hosted on _exp per the nn precedent (no
+# public nn.fab addition; a public sigmoid waits for a second caller).
+@ private { }
+fn _sigmoid(f32 x) → f32 {
+    return 1.0 / (1.0 + _exp(-x))
+}
+
+@ private { }
+fn _dot(tensor.Tensor a, tensor.Tensor b, int width) → f32 ⇥ MoeError {
+    var f32 out ← 0.0 ∷ f32
+    for range 0‥width const i {
+        const f32 left ← a.data.get(i) coalesce 0.0 ∷ f32
+        const f32 right ← b.data.get(i) coalesce 0.0 ∷ f32
+        out ← out + left * right
+    }
+    require dtype.finite(out) throw variant NonFinite {message = "shared expert gate dot product is non-finite"}
+    return out
+}
+
+@ private { }
+fn _scalar(f32 value) → tensor.Tensor {
+    var tensor.Tensor out ← tensor.default()
+    do {
+        out ← tensor.construct([value], [1])
+    }
+    catch err {
+        return out
+    }
+    return out
+}
+
+@ private { }
+fn _zeros(int width, tensor.Tensor like) → tensor.Tensor {
+    var list<f32> data ← empty
+    for range 0‥width const _ {
+        data.append(0.0 ∷ f32)
+    }
+    var tensor.Tensor out ← tensor.default()
+    do {
+        out ← tensor.construct_dtype(data, [width], like.dtype())
+    }
+    catch err {
+        return out
+    }
+    return out
+}
+
 @ public { }
 fn ffn_moe(tensor.Tensor x, int layer, (string, int, int) → tensor.Tensor ⇥ MoeError source, MoeConfig cfg) → tensor.Tensor ⇥ MoeError {
     _validate_config(cfg)
     require layer ≥ 0 throw variant BadConfig {message = "layer index must be non-negative"}
     _validate_input(x, cfg)
     const MoeSelection selection ← route(x, layer, source, cfg)
-    throw variant BadConfig {message = "FFN arithmetic is not implemented"}
+
+    # Shared expert: SwiGLU over the whole rank-2 windows plus a scalar
+    # sigmoid gate from the shared router row.
+    const string prefix ← _prefix(layer)
+    const tensor.Tensor x_column ← _column(x, cfg)
+    const int shared_length ← cfg.shared_ffn_length * cfg.embedding_length
+    const tensor.Tensor gate_shexp ← _window(source, prefix + ".ffn_gate_shexp", 0, shared_length, [cfg.shared_ffn_length, cfg.embedding_length])
+    const tensor.Tensor up_shexp ← _window(source, prefix + ".ffn_up_shexp", 0, shared_length, [cfg.shared_ffn_length, cfg.embedding_length])
+    const tensor.Tensor down_shexp ← _window(source, prefix + ".ffn_down_shexp", 0, shared_length, [cfg.embedding_length, cfg.shared_ffn_length])
+    const tensor.Tensor gate_shexp_row ← _row(_project(gate_shexp, x_column), cfg.shared_ffn_length)
+    const tensor.Tensor up_shexp_row ← _row(_project(up_shexp, x_column), cfg.shared_ffn_length)
+    const tensor.Tensor shexp_row ← _swiglu_no_bias(gate_shexp_row, up_shexp_row, _linear_weight(down_shexp))
+    const tensor.Tensor shexp ← _flatten_row(shexp_row, cfg.embedding_length)
+    require _finite_tensor(shexp) throw variant NonFinite {message = "shared expert output contains a non-finite value"}
+    const tensor.Tensor gate_input ← _window(source, prefix + ".ffn_gate_inp_shexp", 0, cfg.embedding_length, [cfg.embedding_length])
+    const f32 gate ← _sigmoid(_dot(x, gate_input, cfg.embedding_length))
+    require dtype.finite(gate) throw variant NonFinite {message = "shared expert gate is non-finite"}
+
+    # Accumulation order: ascending expert index — deterministic across runs.
+    const list<int> selected ← selection.indices()
+    var list<int> consumed ← empty
+    var tensor.Tensor moe_out ← _zeros(cfg.embedding_length, x)
+    for range 0‥cfg.expert_used_count const _ {
+        var int slot ← -1
+        for range 0‥selected.length() const j {
+            if not _contains(consumed, j) {
+                if slot ≺ 0 {
+                    slot ← j
+                }
+                else {
+                    const int candidate ← selected.get(j) coalesce -1
+                    const int incumbent ← selected.get(slot) coalesce -1
+                    if candidate ≺ incumbent {
+                        slot ← j
+                    }
+                }
+            }
+        }
+        require slot ≥ 0 throw variant BadConfig {message = "router selection index is unavailable"}
+        consumed.append(slot)
+        const int expert ← selected.get(slot) coalesce 0
+        const f32 weight ← selection.weights().get(slot) coalesce 0.0 ∷ f32
+        const tensor.Tensor output ← expert_out(x, layer, expert, source, cfg)
+        do {
+            moe_out ← math.add_carrier(moe_out, math.mul(output, _scalar(weight)))
+        }
+        catch err {
+            throw variant BadShape {message = math.message(err)}
+        }
+    }
+
+    var tensor.Tensor result ← tensor.default()
+    do {
+        const tensor.Tensor gated_shared ← math.mul(shexp, _scalar(gate))
+        result ← math.add_carrier(moe_out, gated_shared)
+    }
+    catch err {
+        throw variant BadShape {message = math.message(err)}
+    }
+    require result.valid() throw variant BadShape {message = "FFN output carrier is invalid"}
+    require result.shape() ≡ [cfg.embedding_length] throw variant BadShape {message = "FFN output carrier has the wrong shape"}
+    require _finite_tensor(result) throw variant NonFinite {message = "FFN output contains a non-finite value"}
+    return result
 }
