@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""Structural integrity check for the SD0 two-regime equivalence corpus.
+
+Validates the checked-in JSON rows under
+docs/factory/speculative-decode-contract/corpus/. Binding fields, disabled
+policy, stream length vs max_tokens, and regime prompt shape are fail-closed.
+Does not capture or rewrite streams.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+CORPUS_DIR = ROOT / "docs" / "factory" / "speculative-decode-contract" / "corpus"
+
+REGIMES = ("context-reproduction", "ordinary-chat")
+STOPS = ("eog", "ignore_eos")
+DEFAULT_FILES = (
+    CORPUS_DIR / "context-reproduction.json",
+    CORPUS_DIR / "ordinary-chat.json",
+)
+
+# Dotted paths that every corpus row must bind. A missing path is the
+# first-failing oracle named by SD0-U6.
+REQUIRED = (
+    "regime",
+    "model.id",
+    "model.version",
+    "model.config",
+    "tokenizer.id",
+    "prompt_ids",
+    "generation.schema_version",
+    "generation.wire",
+    "generation.context",
+    "generation.max_prompt",
+    "generation.max_tokens",
+    "generation.seed",
+    "generation.temperature",
+    "generation.top_k",
+    "generation.top_p",
+    "generation.min_p",
+    "generation.repetition_penalty",
+    "generation.acceleration.version",
+    "generation.acceleration.mode",
+    "generation.acceleration.min_block",
+    "generation.acceleration.max_block",
+    "stop",
+    "baseline_stream",
+    "oracle",
+)
+
+
+def lookup(row: Any, path: str) -> Any:
+    cur = row
+    for part in path.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return None
+        cur = cur[part]
+    return cur
+
+
+def is_int_list(value: Any) -> bool:
+    return isinstance(value, list) and all(isinstance(x, int) and not isinstance(x, bool) for x in value)
+
+
+def repeated_block(prompt: list[int]) -> bool:
+    n = len(prompt)
+    if n < 2:
+        return False
+    for k in range(1, n // 2 + 1):
+        if n % k != 0:
+            continue
+        copies = n // k
+        if copies < 2:
+            continue
+        block = prompt[:k]
+        if prompt == block * copies:
+            return True
+    return False
+
+
+def fail(path: Path, message: str) -> int:
+    print(f"check-corpus: {path}: {message}", file=sys.stderr)
+    return 1
+
+
+def check_row(path: Path, row: Any) -> int:
+    if not isinstance(row, dict):
+        return fail(path, "corpus row must be a JSON object")
+
+    for field in REQUIRED:
+        value = lookup(row, field)
+        if value is None or value == "":
+            return fail(path, f"missing binding field '{field}'")
+
+    regime = row["regime"]
+    if regime not in REGIMES:
+        return fail(path, "regime must be context-reproduction or ordinary-chat")
+    stem = path.stem
+    if stem != regime:
+        return fail(path, f"file stem '{stem}' must match regime '{regime}'")
+
+    prompt = row["prompt_ids"]
+    if not is_int_list(prompt) or len(prompt) < 1:
+        return fail(path, "prompt_ids must be a non-empty list of integers")
+    if any(x < 0 for x in prompt):
+        return fail(path, "prompt_ids must be non-negative")
+
+    if regime == "context-reproduction" and not repeated_block(prompt):
+        return fail(path, "context-reproduction prompt must be a repeated block")
+    if regime == "ordinary-chat" and repeated_block(prompt):
+        return fail(path, "ordinary-chat prompt must not be a repeated block")
+
+    gen = row["generation"]
+    if not isinstance(gen, dict):
+        return fail(path, "generation must be an object")
+    for key in ("context", "max_prompt", "max_tokens", "seed", "top_k"):
+        value = gen[key]
+        if not isinstance(value, int) or isinstance(value, bool):
+            return fail(path, f"generation.{key} must be an integer")
+    if gen["context"] < 1 or gen["max_prompt"] < 1:
+        return fail(path, "generation.context and generation.max_prompt must be at least one")
+    if gen["top_k"] < 0:
+        return fail(path, "generation.top_k must be non-negative")
+    if gen["max_tokens"] < 1:
+        return fail(path, "generation.max_tokens must be at least one")
+    if gen["seed"] < 1:
+        return fail(path, "generation.seed must be at least one")
+    if gen["max_tokens"] > gen["context"]:
+        return fail(path, "generation.max_tokens must fit within context")
+
+    accel = gen["acceleration"]
+    if not isinstance(accel, dict):
+        return fail(path, "generation.acceleration must be an object")
+    if accel["mode"] != "disabled":
+        return fail(path, "pinned GenerationConfig must carry a disabled policy")
+    if accel["min_block"] < 1 or accel["max_block"] < 1:
+        return fail(path, "acceleration block size must be at least one")
+    if accel["min_block"] > accel["max_block"]:
+        return fail(path, "acceleration block size minimum must not exceed the maximum")
+
+    stop = row["stop"]
+    if stop not in STOPS:
+        return fail(path, "stop must be eog or ignore_eos")
+
+    stream = row["baseline_stream"]
+    if not is_int_list(stream) or len(stream) < 1:
+        return fail(path, "baseline_stream must be a non-empty list of integers")
+    if any(x < 0 for x in stream):
+        return fail(path, "baseline_stream tokens must be non-negative")
+    if len(stream) > gen["max_tokens"]:
+        return fail(path, "baseline_stream length exceeds generation.max_tokens")
+
+    if row["oracle"] != "generate_dense_with_stop":
+        return fail(path, "oracle must be generate_dense_with_stop")
+
+    wire = gen["wire"]
+    if not isinstance(wire, str) or not wire.startswith("generation/config/"):
+        return fail(path, "generation.wire must be a generation config wire")
+    if ":disabled:" not in wire:
+        if gen["schema_version"] != "1.0.0":
+            return fail(path, "1.1.0 generation.wire must encode a disabled policy")
+
+    print(f"check-corpus: ok {path.relative_to(ROOT)}")
+    return 0
+
+
+def check_file(path: Path) -> int:
+    if not path.is_file():
+        print(f"check-corpus: missing file {path}", file=sys.stderr)
+        return 1
+    try:
+        row = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        return fail(path, f"invalid JSON: {exc}")
+    return check_row(path, row)
+
+
+def main(argv: list[str]) -> int:
+    targets = [Path(p) for p in argv] if argv else list(DEFAULT_FILES)
+    if not targets:
+        print("check-corpus: no corpus files", file=sys.stderr)
+        return 1
+    status = 0
+    for path in targets:
+        status = max(status, check_file(path.resolve()))
+    return status
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

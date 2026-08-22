@@ -42,6 +42,9 @@ import from "gradus:train" train
 import from "gradus:decode" decode
 import from "gradus:tensor" tensor
 import from "gradus:tokenizer" tokenizer
+import from "gradus:model/dense" dense
+import from "gradus:attention" attention
+import from "gradus:cache" kv
 
 # ---- helpers (the loss.proba pattern)
 
@@ -673,6 +676,157 @@ describe "SD0-U1 — executing baseline determinism and stop boundary" {
             assert stopped ≡ [0]
             assert continued ≡ [1, 1]
             assert (stopped.get(0) coalesce (0 - 1)) ≠ (continued.get(0) coalesce (0 - 1))
+        }
+        catch err {
+            assert false
+        }
+    }
+}
+
+# =========================================================================
+# SD0-U6 — two-regime dense baseline corpus
+# =========================================================================
+#
+# Live generate_dense_with_stop oracle over a one-layer synthetic dense
+# model (D=2, V=4, rope_dim=2). Streams are captured from the MIR runner
+# and pinned in docs/factory/speculative-decode-contract/corpus/. Do not
+# hand-edit the token lists: change a binding and recapture.
+#
+# Identity bindings (cache metadata + architecture):
+#   model id/version/config = sd0-tiny-dense / 1.0.0 / causal-rope-d2
+#   tokenizer id            = sd0-vocab4 (EOG set remains tokenizer {0, 2})
+#   GenerationConfig        = disabled policy, greedy, seed 1, max_tokens 2
+#   stop                    = eog_stop
+#
+# Prompts: repeated block [1, 3, 1, 3] for context-reproduction;
+# non-repeating [1, 3] for ordinary-chat.
+
+const string CORPUS_MODEL ← "sd0-tiny-dense"
+const string CORPUS_MODEL_VERSION ← "1.0.0"
+const string CORPUS_MODEL_CONFIG ← "causal-rope-d2"
+const string CORPUS_TOKENIZER ← "sd0-vocab4"
+const string CORPUS_WIRE ← "generation/config/1.1.0/16/1/2/1/0/0/1/0/1/1.0.0:disabled:1:1"
+const string CORPUS_WIRE_LEGACY ← "generation/config/1.0.0/16/1/2/1/0/0/1/0/1"
+const list<int> CORPUS_REPRO_PROMPT ← [1, 3, 1, 3]
+const list<int> CORPUS_CHAT_PROMPT ← [1, 3]
+const list<int> CORPUS_REPRO_STREAM ← [1, 1]
+const list<int> CORPUS_CHAT_STREAM ← [1, 1]
+
+const tensor.Tensor CORPUS_EMBED ← hold([1.0, 0.1, 0.1, 1.0, 0.8, 0.2, 0.2, 0.8], [2, 4])
+const tensor.Tensor CORPUS_NORM ← hold([1.0, 1.0], [2])
+const tensor.Tensor CORPUS_LN1 ← hold([1.0, 1.0], [2])
+const tensor.Tensor CORPUS_LN2 ← hold([1.0, 1.0], [2])
+const tensor.Tensor CORPUS_WQ ← hold([1.0, 0.0, 0.0, 1.0], [2, 2])
+const tensor.Tensor CORPUS_WK ← hold([1.0, 0.0, 0.0, 1.0], [2, 2])
+const tensor.Tensor CORPUS_WV ← hold([1.0, 0.0, 0.0, 1.0], [2, 2])
+const tensor.Tensor CORPUS_WO ← hold([1.0, 0.0, 0.0, 1.0], [2, 2])
+const tensor.Tensor CORPUS_WG ← hold([0.2, 0.0, 0.0, 0.2], [2, 2])
+const tensor.Tensor CORPUS_WU ← hold([0.2, 0.0, 0.0, 0.2], [2, 2])
+const tensor.Tensor CORPUS_WD ← hold([1.0, 0.0, 0.0, 1.0], [2, 2])
+
+fn corpus_dense_cfg() → dense.DenseConfig {
+    return dense.DenseConfig {layers = 1, heads = 1, kv_heads = 1, head_dim = 2, hidden_dim = 2, vocab = 4, tied = true}
+}
+
+fn corpus_rope() → attention.RopeConfig {
+    var attention.RopeConfig rope ← attention.default()
+    do {
+        rope ← attention.construct_rope_config(100000.0 ∷ f32, 1.0 ∷ f32, attention.consecutive_policy())
+        return rope
+    }
+    catch err {
+        return rope
+    }
+}
+
+fn corpus_engine() → generation.DenseEngine {
+    return generation.construct_dense_engine(corpus_dense_cfg(), 0.00001 ∷ f32, 0.5 ∷ f32, 2, corpus_rope())
+}
+
+fn corpus_lookup(string name, int layer) → tensor.Tensor ⇥ dense.DenseError {
+    if name ≡ "model.embed_tokens" then return CORPUS_EMBED
+    if name ≡ "model.norm" then return CORPUS_NORM
+    if layer ≠ 0 {
+        throw variant MissingTensor {message = "canonical tensor missing: §"(name)}
+    }
+    if name ≡ "model.layers.0.input_layernorm" then return CORPUS_LN1
+    if name ≡ "model.layers.0.self_attn.q_proj" then return CORPUS_WQ
+    if name ≡ "model.layers.0.self_attn.k_proj" then return CORPUS_WK
+    if name ≡ "model.layers.0.self_attn.v_proj" then return CORPUS_WV
+    if name ≡ "model.layers.0.self_attn.o_proj" then return CORPUS_WO
+    if name ≡ "model.layers.0.post_attention_layernorm" then return CORPUS_LN2
+    if name ≡ "model.layers.0.mlp.gate_proj" then return CORPUS_WG
+    if name ≡ "model.layers.0.mlp.up_proj" then return CORPUS_WU
+    if name ≡ "model.layers.0.mlp.down_proj" then return CORPUS_WD
+    throw variant MissingTensor {message = "canonical tensor missing: §"(name)}
+}
+
+fn corpus_structure() → kv.KVStructure {
+    var kv.KVStructure structure ← kv.default_kv_structure()
+    do {
+        const kv.LayerSet set ← kv.construct_layer_set([0], kv.dense_structure(), 1, 2)
+        var list<kv.LayerSet> sets ← empty
+        sets.append(set)
+        structure ← kv.construct_kv_structure(sets, kv.kv_dtype_f32(), kv.kv_dtype_f32(), kv.v_layout_transposed(), kv.sharing_single(), kv.attention_classic(), 1, 2, 16)
+        return structure
+    }
+    catch err {
+        return structure
+    }
+}
+
+fn corpus_layers() → list<kv.KVCache> {
+    var list<kv.KVCache> layers ← empty
+    do {
+        layers ← dense.empty_caches(corpus_structure(), CORPUS_MODEL, CORPUS_MODEL_VERSION, CORPUS_MODEL_CONFIG, CORPUS_TOKENIZER)
+        return layers
+    }
+    catch err {
+        return layers
+    }
+}
+
+fn corpus_generation() → generation.GenerationConfig {
+    var generation.GenerationConfig g ← generation.default()
+    do {
+        g ← generation.construct_generation(16, 1, 2, 1, 0.0 ∷ f32, 0, 1.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32)
+        return g
+    }
+    catch err {
+        return g
+    }
+}
+
+fn corpus_dense(generation.GenerationConfig g, list<int> prompt, generation.StopPolicy stop) → list<int> ⇥ generation.GenerationError {
+    return generation.generate_dense_with_stop(g, prompt, corpus_engine(), (string n, int s) → tensor.Tensor ⇥ dense.DenseError ∴ corpus_lookup(n, s), corpus_layers(), decode.fresh_cancellation(), stop)
+}
+
+describe "SD0-U6 — two-regime dense baseline corpus" {
+    test "the pinned config is disabled-policy 1.1.0 and matches the corpus wire" {
+        do {
+            const generation.GenerationConfig g ← corpus_generation()
+            assert generation.acceleration_mode_name(g.acceleration().mode()) ≡ "disabled"
+            assert generation.serialize_generation(g) ≡ CORPUS_WIRE
+            const generation.GenerationConfig decoded ← generation.deserialize_generation(CORPUS_WIRE)
+            assert generation.generation_equal(g, decoded)
+        }
+        catch err {
+            assert false
+        }
+    }
+    test "context-reproduction repeated-block prompt reproduces the pinned dense stream" {
+        do {
+            const list<int> tokens ← corpus_dense(corpus_generation(), CORPUS_REPRO_PROMPT, generation.eog_stop())
+            assert tokens ≡ CORPUS_REPRO_STREAM
+        }
+        catch err {
+            assert false
+        }
+    }
+    test "ordinary-chat non-repeating prompt reproduces the pinned dense stream" {
+        do {
+            const list<int> tokens ← corpus_dense(corpus_generation(), CORPUS_CHAT_PROMPT, generation.eog_stop())
+            assert tokens ≡ CORPUS_CHAT_STREAM
         }
         catch err {
             assert false
