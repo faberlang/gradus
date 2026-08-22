@@ -114,7 +114,7 @@ Latin identifiers that escape the checker lexicon (stems missing: `ignotum`, `in
 
 | Site | Token | Preferred |
 | --- | --- | --- |
-| `src/gradient.fab:78` (+ match arm :89, throws :143-145, :177, :246-248, :263, :299-301, :310) | `GradusIgnotum` | `UnknownGradient` / `UnknownIdentity` |
+| `src/gradient.fab:78` (+ match arm :89, throws :143-145, :177, :246-248, :263, :299-301, :310) | `UnknownGradient` | `UnknownGradient` / `UnknownIdentity` |
 | `src/transformer.fab:189` (arm :230, mapping :267) | `EpsilonInvalida` | `InvalidEpsilon` (matches `nn.fab:234`) |
 | `tests/admission_conformance.fab:78` (+ uses :730, :1192+) | `F_ALIA` | e.g. `F_ALT_DIGEST` |
 

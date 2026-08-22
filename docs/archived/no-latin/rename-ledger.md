@@ -90,7 +90,7 @@ Retained public fns (not in the 23): `signum`, `silu`, `eog`, `eog_stop`,
 `stops_on_eog`, `artifact_eog`, `is_artifact_eog`.
 
 Retained variants (not in the 201): `GradusMismatch` (every module that
-has it), `StopPolicy.Eog`, `UnicodeCategory.Signum`, `GradientError.GradusIgnotum`.
+has it), `StopPolicy.Eog`, `UnicodeCategory.Signum`, `GradientError.UnknownGradient`.
 
 ### 2.3 External-format keys
 

@@ -436,7 +436,7 @@ Gradient records and the forward/companion gradient wrapper surface.
 
 ### Public types
 
-- `union GradientError` — GradusIgnotum, GradientVersion
+- `union GradientError` — UnknownGradient, GradientVersion
 - `class Gradient`
   - fields: string owner, string name, int version, tensor.Tensor payload
   - methods:

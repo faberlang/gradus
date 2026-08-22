@@ -202,7 +202,7 @@ Source: `src/gradient.fab`. Render with module `message(e)`.
 
 | Code | Class / when | Live messages (representative) | Resolution |
 | --- | --- | --- | --- |
-| `GradienteError.GradusIgnotum` | Unknown or empty gradient identity field. | `empty gradient name`<br>`empty gradient owner`<br>`no gradient for that parameter identity` | Supply a non-empty name/owner with no reserved wire characters. |
+| `GradienteError.UnknownGradient` | Unknown or empty gradient identity field. | `empty gradient name`<br>`empty gradient owner`<br>`no gradient for that parameter identity` | Supply a non-empty name/owner with no reserved wire characters. |
 | `GradienteError.GradientVersion` | Invalid gradient generation counter. | `invalid gradient generation` | Supply a non-empty gradient owner/name and a valid generation counter. |
 
 ## `gradus:gradus` — `GradusError`
