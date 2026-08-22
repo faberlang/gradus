@@ -2,7 +2,7 @@
 
 **Status**: lowered 2026-08-22 — delivery rows produced for the goal's remaining units, **but not dispatchable**: the task premise "U1/U2 landed" is false against the live tree (see §0). Dense spine (`U3a→U3b→U4a→U5`) is dispatch-ready only after U1/U2 land; hybrid `U4b` is additionally blocked on unlanded PML receipts.
 **Goal:** [`goal.md`](goal.md)
-**Campaign:** [`speculative-decode`](../speculative-decode/CAMPAIGN.md) — the board labels this goal **SD4**; the campaign path numbers it **SD5** (campaign SD4 = `context-lookup-drafting`). Unit ids here use the goal's own U-numbering, prefixed `PP-`, so they cannot collide with the already-used `SD2-*`/`SD4-*` ids.
+**Campaign:** [`speculative-decode`](../speculative-decode/CAMPAIGN.md) — **numbering disambiguation: board SD4 = this goal (`prepared-prefix-state`); campaign SD4 = `context-lookup-drafting`** (this goal is campaign **SD5**). The campaign status line's "SD4 U1/U2 landed" refers to `context-lookup-drafting` under campaign numbering — it is not evidence that this goal's U1/U2 landed (see §0). Unit ids here use the goal's own U-numbering, prefixed `PP-`, so they cannot collide with the already-used `SD2-*`/`SD4-*` ids.
 **Repos:** primary `gradus/` (this repo); evidence-only `inferentia/` (no writes)
 **Mandatory dependency:** SD1 [`kv-cache-branching`](../../archived/kv-cache-branching/goal.md) done 6/6 (commit `1bb5ddb`); this goal consumes its immutable/transactional state, never re-owns it.
 
@@ -18,7 +18,7 @@ git and source 2026-08-22.
 | --- | --- | --- |
 | **Task: "U1 (7125e596) and U2 (d1898cf) landed"** | `git cat-file -t 7125e596` → `fatal: Not a valid object name`; `d1898cf` = `feat(context_lookup): implement deterministic provider` (SD3 `context-lookup-drafting` U2). No commit anywhere matches `prepared` / `prefix-state`; grep for `PreparedState|prepared_state|PreparedIdentity|CanonicalIdentity` over `src/` returns **zero** matches; the goal ledger is still all-pending. | **FALSE — U1 and U2 have not landed.** The cited hashes belong to the sibling `context-lookup-drafting` goal. This is a blocking gap, not a typo. |
 | Goal status line | `**Status**: planned — pre-implementation` | not yet goal-checked; no delivery existed before this file |
-| U1 precedent (existing cache identity) | `cache.fab:505` `CacheIdentity` (model/model_version/config/tokenizer/history/position/layers/dtype/layout); `cache_identity` `:571`; field-wise `cache_identity_equal` `:541`; wire `cache/identity/1.0.0` `:605` | live — U1's "existing cache identity" precedent is real; U1 still must build the **canonical prepared identity** on top of it |
+| U1 precedent (existing cache identity) | `cache.fab:505` `CacheIdentity` (model/model_version/config/tokenizer/history/position/layers/dtype/layout); `cache_identity` `:571`; field-wise `cache_identity_equal` `:555`; wire `cache/identity/1.0.0` `:605` | live — U1's "existing cache identity" precedent is real; U1 still must build the **canonical prepared identity** on top of it |
 | U2 typed-state precedent | no complete prepared-state type exists; `KVStructure` `cache.fab:1253` is a descriptor (not payload), `list<kv.KVCache>` + `KVCheckpoint` (`cache_branch.fab`) carry dense KV only | U2's "complete KV + recurrent/SSM/convolution state" value is **not** landed |
 | Tokenizer identity component | `tokenizer.fab` `TokenizerIdentity` schema `1.0.0`, fail-closed `construct` `:493` | live — U3's tokenizer binding source |
 | Dense nonempty-prefix gap | `dense.decode_block` `dense.fab:589` (multi-row, nonempty prefix) landed `fad0d57`; `prefill_cached` `:681` still empty-prefix-only; `decode_step` `:500` still requires `position ≡ prefix_before` | partially closed — suffix prefill has a landed multi-row seam, but "suffix-only from a prepared prefix" is still new |
@@ -73,13 +73,13 @@ admission/MoE routing/drafter; no multi-token verification policy.
 
 | Surface | Today | Note |
 | --- | --- | --- |
-| Identity precedent | `CacheIdentity` (`cache.fab:505`) + `cache_identity_equal` (`:541`) + `cache/identity/1.0.0` wire (`:605`) | U1 extends to canonical prepared identity; U3 consumes field-wise equality |
+| Identity precedent | `CacheIdentity` (`cache.fab:505`) + `cache_identity_equal` (`:555`) + `cache/identity/1.0.0` wire (`:605`) | U1 extends to canonical prepared identity; U3 consumes field-wise equality |
 | Typed state | `list<kv.KVCache>` / `KVCheckpoint` (`cache_branch.fab`) dense-only; `KVStructure` (`cache.fab:1253`) descriptor-only | U2 adds recurrent/SSM/convolution payload + binding |
 | Dense continuation seam | `dense.decode_block` (`dense.fab:589`, multi-row nonempty prefix, landed `fad0d57`); `prefill_cached` `:681` empty-prefix-only | U4a's suffix prefill building block |
 | Generation surface | `generate_dense_with_stop` (`generation.fab:924`) returns `list<int>` only | U4a must expose updated prepared state without forking a second public entry (see OQ) |
 | Tokenizer binding | `TokenizerIdentity` (`tokenizer.fab:493`, fail-closed, schema `1.0.0`) | U3's tokenizer component |
 | Hybrid state | none executed (`qwen35moe.fab` = metadata freeze) | U4b blocked on MODEL-01..04 |
-| Proba discipline | co-located `*.proba`; `faber test src/<file>.proba <filter>` | Hand sanity = file + filter; package-wide runs banned pending radix loader fix (`ed794237`) — verify at dispatch |
+| Proba discipline | co-located `*.proba`; `faber test src/<file>.proba <filter>` | Hand sanity = file + filter; package-wide runs banned pending radix loader fix (`ac7efdda2`) — verify at dispatch |
 | Foreign fences | gradus tree clean 2026-08-22 (HEAD `fad0d57`) | re-check `git status` at dispatch |
 
 ## 4. Unit graph — Hand units
@@ -142,7 +142,7 @@ no campaign or sibling-goal file edits (each unit's own proba excepted).
 | done_when | dense fixture proves: warm continuation consumes only suffix tokens (not the full prefix); emitted tokens and final prepared state equal a fresh cold run; cold-vs-warm logits match within the admitted `1e-5` reference epsilon; the returned next prepared state round-trips identity + payload |
 | first-failing oracle | the suffix-only + returned-state row fails today — `generate_dense_with_stop` returns tokens only and `prefill_cached` rejects a nonempty prefix |
 | depends_on | U2, PP-U3b (and landed `dense.decode_block` `fad0d57`) |
-| parallel | no — spine; touches the prepared_state leaf and the generation/dense surface |
+| parallel | no — spine; touches the prepared_state leaf and the generation/dense surface. Same-file dispatch partners: context-lookup-drafting **SD4-U3** owns `src/generation.fab` + `src/generation.proba` (gated on SD2-U5 — also future); the **dense.proba repair seat** (vivi task `81f2182c`) is live on `src/model/dense.proba` (`dense.fab` last touched by landed SD2-U3 `fad0d57`). Verify `git status` clean on `dense.fab`/`generation.fab` at dispatch. |
 | sanity | `faber test src/prepared_state.proba continue` |
 | non_goals | hybrid/SSM/recurrent/convolution state (U4b); device/tier work; a second public generate entry |
 | boundary rule | `generate_dense_with_stop` is campaign invariant 1's oracle — do not fork a fast path. If exposing the updated prepared state cannot be expressed additively (e.g. an added return or a sibling continuation entry), stop and report rather than changing the public generate signature. |
@@ -157,7 +157,7 @@ no campaign or sibling-goal file edits (each unit's own proba excepted).
 | write_scope | `src/prepared_state.fab`; `src/prepared_state.proba`; `src/model/qwen35moe.fab` + proba (or the MODEL-03/04 leaf surfaces); hybrid fixtures |
 | done_when | hybrid fixture proves KV + recurrent/convolution state carried, reset, replayed, and continued without conflation; first divergence recorded per layer/position; cold-vs-warm token/state equality on the admitted hybrid row |
 | first-failing oracle | the hybrid continuation rows fail today — no executed hybrid state exists (grep + `qwen35moe.fab` metadata-only) |
-| depends_on | U2, PP-U3b; **MODEL-01 (GGUF-M1) admission, MODEL-02 router/expert execution, MODEL-03 SSM/attention state, MODEL-04 full-model composition, LIB-02 tokenizer receipts — all unlanded** |
+| depends_on | U2, PP-U3b; **MODEL-01 (GGUF-M1) admission, MODEL-02 router/expert execution, MODEL-03 SSM/attention state ([`pml5-gguf-m3-ssm-attention-state-delivery`](../production-ml-library/pml5-gguf-m3-ssm-attention-state-delivery.md)), MODEL-04 full-model composition — all unlanded**; LIB-02 tokenizer receipts — **executed/landed** (see §7 OQ2) |
 | parallel | yes relative to U4a (different write surface) once its dependencies land |
 | sanity | `faber test src/prepared_state.proba hybrid` |
 | non_goals | dense continuation (U4a); model admission/MoE routing (PML owns); kernels/quantization |
@@ -186,7 +186,7 @@ from §4. **Nothing dispatches until U1/U2 land** (the task's premise is
 false — see §0). After that: `PP-U3a → PP-U3b → (PP-U4a ∥ PP-U4b when hybrid
 deps land) → PP-U5`. The dense spine `U3a→U3b→U4a→U5` is serial; the only
 internal parallelism is `U4a ∥ U4b` (disjoint write surfaces), and `U4b` is
-held until MODEL-01..04 + LIB-02 receipts.
+held until MODEL-01..04 receipts (LIB-02 tokenizer already landed).
 
 ## 6. Checkpoints and gates
 

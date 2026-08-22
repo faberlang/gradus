@@ -6,7 +6,7 @@
 **Source:** operator expansion of the SD5 boundary, grounded in the live Gradus cache/decode surface and PML MODEL-01–04 composition contracts
 **Dependency state:** dense rows are implementable from live source; hybrid closeout waits for MODEL-01 admission, MODEL-02 router/expert execution, MODEL-03 state, MODEL-04 full-model composition, and LIB-02 tokenizer receipts
 **Repos:** primary: `gradus/`; evidence only: `inferentia/`
-**Related:** [`../speculative-decode/CAMPAIGN.md`](../speculative-decode/CAMPAIGN.md); [`MODEL-01`](../production-ml-library/pml5-gguf-m1-qwen35moe-admission-delivery.md); [`MODEL-02`](../production-ml-library/pml5-gguf-m2-moe-router-delivery.md); [`MODEL-03`](../production-ml-library/model-03-ssm-attention-state-delivery.md); [`MODEL-04`](../production-ml-library/model04-full-model-reference-inference-delivery.md); [`LIB-02 tokenizer`](../production-ml-library/pml5-lib02-tokenizer-delivery.md); `gradus/docs/api-reference.md`
+**Related:** [`../speculative-decode/CAMPAIGN.md`](../speculative-decode/CAMPAIGN.md); [`MODEL-01`](../production-ml-library/pml5-gguf-m1-qwen35moe-admission-delivery.md); [`MODEL-02`](../production-ml-library/pml5-gguf-m2-moe-router-delivery.md); [`MODEL-03`](../production-ml-library/pml5-gguf-m3-ssm-attention-state-delivery.md); [`MODEL-04`](../production-ml-library/model04-full-model-reference-inference-delivery.md); [`LIB-02 tokenizer`](../production-ml-library/pml5-lib02-tokenizer-delivery.md); `gradus/docs/api-reference.md`
 
 ---
 
@@ -40,7 +40,7 @@ discarding the updated state (`src/generation.fab:774-811`). The public decode
 The future model set is not KV-only. The MODEL-03 contract requires separate
 attention KV state and linear-attention recurrent plus convolution state,
 with reset, replay, position handling, and incremental updates
-(`docs/factory/production-ml-library/model-03-ssm-attention-state-delivery.md`)
+(`docs/factory/production-ml-library/pml5-gguf-m3-ssm-attention-state-delivery.md`)
 §1–§2. A prefix goal that models only KV would silently make hybrid models
 unsafe to reuse.
 
