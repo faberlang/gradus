@@ -312,12 +312,12 @@ themselves.
 
 | Unit | Status | Seat | Receipt | Notes |
 | --- | --- | --- | --- | --- |
-| DNC-U1 | pending | — | — | KV family-law profiles (F6.1) |
-| DNC-U2 | pending | — | — | opened-vs-executed dtype honesty (F6.2) |
-| DNC-U3 | pending | — | — | CPU/reference tier of record |
-| DNC-U4 | pending | — | — | matrix capability/executed split (F6.3) |
-| DNC-U5 | pending | — | — | bench CUDA mirror slots (F6.3) |
-| DNC-U6 | pending | — | — | closeout + ledger |
+| DNC-U1 | done | hand | `2712d8f` | KV family-law profiles (F6.1) |
+| DNC-U2 | done | hand | `c9961af` | opened-vs-executed dtype honesty (F6.2) |
+| DNC-U3 | done | hand | `58e0155` | CPU/reference tier of record |
+| DNC-U4 | done | hand | `d6f2b99` | matrix capability/executed split (F6.3) |
+| DNC-U5 | done | hand | `58a704a` | bench CUDA mirror slots (F6.3) |
+| DNC-U6 | done | hand | [`cache-proba-classification.md`](cache-proba-classification.md) (`324e344`) | closeout: `faber test --include cache` 33/0; check-source; check-compile; factory audit 0 findings |
 
 ---
 

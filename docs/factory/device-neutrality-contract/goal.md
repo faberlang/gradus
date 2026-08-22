@@ -1,6 +1,6 @@
 # GOAL: device-neutrality-contract — Gradus states its tier and parameterizes backend-family law
 
-**Status**: planned — pre-implementation; ready for delivery (lowered to [delivery.md](delivery.md), 6 units, 2026-08-21)
+**Status**: done — 6/6 units landed (U1–U6 on gradus main). Closeout 2026-08-22: `faber test --include cache` 33/0; check-source; check-compile; factory audit 0 findings. U6 cites [`cache-proba-classification.md`](cache-proba-classification.md) (`324e344`).
 **Created**: 2026-08-21
 **Campaign:** `emission-lane-parity` (radix: [`docs/factory/emission-lane-parity/CAMPAIGN.md`](../../../../radix/docs/factory/emission-lane-parity/CAMPAIGN.md))
 **Source:** operator architecture-audit session 2026-08-21 (campaign evidence F6.1–F6.3). Origin reminder: the foundation deliberately kept Gradus backend-neutral (`docs/archived/gradus-ml-foundation/gpu-dependency.md`: "The device-neutral boundary means Gradus source compiles identically for CPU and GPU; Radix chooses the lowering target").
@@ -82,9 +82,12 @@ it, it does not replace it (device residency belongs to Radix EXEC rows).
 
 | Unit | Status | Seat | Receipt | Notes |
 | --- | --- | --- | --- | --- |
-| 1 | pending | — | — | KV profiles |
-| 2 | pending | — | — | tier truth |
-| 3 | pending | — | — | bench slots |
+| 1 | done | hand | `2712d8f` | KV family-law profiles (F6.1) |
+| 2 | done | hand | `c9961af` | opened-vs-executed dtype honesty (F6.2) |
+| 3 | done | hand | `58e0155` | CPU/reference tier of record |
+| 4 | done | hand | `d6f2b99` | matrix capability/executed split (F6.3) |
+| 5 | done | hand | `58a704a` | bench CUDA mirror slots (F6.3) |
+| 6 | done | hand | [`cache-proba-classification.md`](cache-proba-classification.md) (`324e344`) | closeout: `faber test --include cache` 33/0; bare `src/cache.proba` package-MIR miss classified environment-red |
 
 ## Open questions
 
