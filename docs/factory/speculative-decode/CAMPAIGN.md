@@ -7,7 +7,7 @@
 **Participating repos**: `gradus` (logical decode, cache, sampling, and prepared-state contracts); `radix` and `hosts` (compiled device execution); `inferentia` (single-node retained-state consumer)
 **Source**: operator-forwarded RTX 3090 post; [current reproduction repository](https://github.com/syv-ai/qwen38-27b-rtx3090); [DFlash paper](https://arxiv.org/abs/2602.06036)
 **Related**: [`production-ml-library`](../production-ml-library/CAMPAIGN.md); [`radix device-executor`](../../../../radix/docs/factory/device-executor/goal.md); [`radix kv-cache-decode`](../../../../radix/docs/factory/kv-cache-decode/CAMPAIGN.md); [`Inferentia`](../../../../inferentia/docs/factory/inferentia/CAMPAIGN.md)
-**Campaign readiness**: READY FOR DELIVERY — [`speculative-decode-contract`](../speculative-decode-contract/goal.md) is the first mandatory goal when this campaign receives capacity
+**Campaign readiness**: READY FOR DELIVERY — [`speculative-decode-contract`](../../archived/speculative-decode-contract/goal.md) is the first mandatory goal when this campaign receives capacity
 
 ## Summary
 
@@ -90,7 +90,7 @@ refresh these facts before implementation.
 
 | Goal | Repo | Owns | Mandatory dependency |
 | --- | --- | --- | --- |
-| [`speculative-decode-contract`](../speculative-decode-contract/goal.md) | Gradus | dense baseline, policy/version, acceptance and receipt contracts | PML generation/config authority |
+| [`speculative-decode-contract`](../../archived/speculative-decode-contract/goal.md) | Gradus | dense baseline, policy/version, acceptance and receipt contracts | PML generation/config authority |
 | [`kv-cache-branching`](../kv-cache-branching/goal.md) | Gradus | immutable checkpoint, private branch, atomic prefix commit | contract |
 | [`cached-block-verification`](../cached-block-verification/goal.md) | Gradus | nonempty-prefix k-row reference verification | branching |
 | [`context-lookup-drafting`](../context-lookup-drafting/goal.md) | Gradus | deterministic weightless candidate policy and transactional greedy generation integration | contract, cached block |
@@ -106,7 +106,7 @@ running, implemented, or validated.
 
 ### SD0 — Contract and evidence schema
 
-**Goal**: [`speculative-decode-contract`](../speculative-decode-contract/goal.md)
+**Goal**: [`speculative-decode-contract`](../../archived/speculative-decode-contract/goal.md)
 **Gate**: named dense baseline; explicit disabled-by-default policy; greedy and
 sampled admission rules; context-reproduction and ordinary-chat corpora; one
 versioned receipt schema. No candidate implementation is part of SD0.

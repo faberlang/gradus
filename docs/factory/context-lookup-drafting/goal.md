@@ -47,7 +47,7 @@ fast-path API.
    inability to preserve target sampler state is a typed reject, not a silent
    fast-path downgrade.
 4. Consume the versioned acceleration policy frozen by
-   [`speculative-decode-contract`](../speculative-decode-contract/goal.md).
+   [`speculative-decode-contract`](../../archived/speculative-decode-contract/goal.md).
    This goal implements its lookup mode and does not mint a second config wire
    or choose different defaults.
 5. Feed the candidates through

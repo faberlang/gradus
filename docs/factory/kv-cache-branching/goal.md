@@ -11,7 +11,7 @@
 
 | Artifact | Relationship |
 | --- | --- |
-| `../speculative-decode-contract/goal.md` | Consumes this branch/checkpoint contract for lossless dense verification and policy dispatch |
+| `../../archived/speculative-decode-contract/goal.md` | Consumes this branch/checkpoint contract for lossless dense verification and policy dispatch |
 | `../cached-block-verification/goal.md` | Owns dense nonempty-prefix block evaluation over this transaction primitive |
 | `../speculative-decode/CAMPAIGN.md` | Parent routing artifact; this goal lowers SD1 only |
 | `../production-ml-library/CAMPAIGN.md` | Existing KV identity, dense cache, and generation ownership authority |
