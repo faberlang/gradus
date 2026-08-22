@@ -13,7 +13,11 @@ import from "gradus:cache" kv
 
 import from "gradus:cache_branch" cache_branch
 
+import from "gradus:attention" attention
+
 import from "gradus:dtype" dtype
+
+import from "gradus:model/dense" dense
 
 import from "gradus:speculative" speculative
 
@@ -38,6 +42,12 @@ union VerifyError {
     NegativeToken {
         string message
     },
+    ModelMismatch {
+        string message
+    },
+    ForwardFailure {
+        string message
+    },
     ResultBounds {
         string message
     }
@@ -56,6 +66,12 @@ fn message(VerifyError e) → string {
             return message
         }
         case NegativeToken const message {
+            return message
+        }
+        case ModelMismatch const message {
+            return message
+        }
+        case ForwardFailure const message {
             return message
         }
         case ResultBounds const message {
@@ -248,6 +264,120 @@ fn construct_rows(BlockRequest request, list<int> target_positions, tensor.Tenso
         _valid_f32_rows(payload, [rows, layer.dimension()])
     }
     return BlockRows {request = request, target_positions = target_positions, logits = logits, candidate_keys = candidate_keys, candidate_payloads = candidate_payloads}
+}
+
+# -------------------------------------------------------------------------
+# Reference forward — consume the admitted request through the additive
+# dense multi-row cached seam. All model-relative checks happen before the
+# first candidate row is constructed; dense and tensor failures are mapped
+# into this leaf's typed vocabulary without importing a device surface.
+# -------------------------------------------------------------------------
+
+@ private { }
+fn _finite_value(tensor.Tensor value) → bool {
+    if not value.valid() {
+        return false
+    }
+    for from value.data const item {
+        if not dtype.finite(item) {
+            return false
+        }
+    }
+    return true
+}
+
+@ private { }
+fn _admit_model(BlockRequest request, dense.DenseConfig cfg) → bool ⇥ VerifyError {
+    require cfg.layers ≥ 1 throw variant ModelMismatch {message = "model must have at least one layer"}
+    require cfg.vocab ≥ 1 throw variant ModelMismatch {message = "model vocabulary must be positive"}
+    require cfg.kv_heads ≥ 1 and cfg.head_dim ≥ 1 throw variant ModelMismatch {message = "model KV dimensions must be positive"}
+    require cfg.layers ≡ request.checkpoint().layers().length() throw variant ModelMismatch {message = "cache layer count must equal model layer count"}
+    const int dimension ← cfg.kv_heads * cfg.head_dim
+    for from request.candidate_ids() const token_id {
+        require token_id ≥ 0 and token_id ≺ cfg.vocab throw variant ModelMismatch {message = "candidate token id is outside model vocabulary"}
+    }
+    for from request.checkpoint().layers() const layer {
+        require layer.dtype() ≡ "f32" throw variant ModelMismatch {message = "cache dtype must be f32"}
+        require layer.dimension() ≡ dimension throw variant ModelMismatch {message = "cache dimension does not match model KV width"}
+        require layer.key().shape() ≡ [request.prefix_length(), dimension] throw variant ModelMismatch {message = "cache key shape does not match the admitted prefix"}
+        require layer.payload().shape() ≡ [request.prefix_length(), dimension] throw variant ModelMismatch {message = "cache value shape does not match the admitted prefix"}
+        require _finite_value(layer.key()) throw variant ModelMismatch {message = "cache contains non-finite values"}
+        require _finite_value(layer.payload()) throw variant ModelMismatch {message = "cache contains non-finite values"}
+    }
+    return true
+}
+
+@ private { }
+fn _map_dense(string detail) → VerifyError {
+    if detail ≡ "token id out of range for the embedding" then {
+        return variant ModelMismatch {message = "candidate token id is outside model vocabulary"}
+    }
+    if detail ≡ "cache layer count must equal the model layer count" then {
+        return variant ModelMismatch {message = "cache layer count must equal model layer count"}
+    }
+    if detail ≡ "cache overflow" then {
+        return variant ModelMismatch {message = detail}
+    }
+    if detail ≡ "cache write leaves a gap" then {
+        return variant ModelMismatch {message = detail}
+    }
+    return variant ForwardFailure {message = detail}
+}
+
+@ private { }
+fn _candidate_rows(tensor.Tensor full, int prefix, int rows, int dimension) → tensor.Tensor ⇥ VerifyError {
+    require full.valid() throw variant ForwardFailure {message = "dense forward returned an invalid cache tensor"}
+    require dtype.name(full.dtype()) ≡ "f32" throw variant ModelMismatch {message = "dense forward cache dtype must be f32"}
+    require full.shape() ≡ [prefix + rows, dimension] throw variant ForwardFailure {message = "dense forward cache shape does not match the candidate block"}
+    var list<f32> data ← empty
+    for range prefix‥(prefix + rows) const row {
+        for range 0‥dimension const column {
+            data.append(full.data.get(row * dimension + column) coalesce 0.0 ∷ f32)
+        }
+    }
+    var tensor.Tensor out ← tensor.default()
+    do {
+        out ← tensor.construct(data, [rows, dimension])
+    }
+    catch err {
+        throw variant ForwardFailure {message = "dense forward candidate rows are not a valid tensor"}
+    }
+    require _finite_value(out) throw variant ModelMismatch {message = "dense forward produced non-finite candidate K/V values"}
+    return out
+}
+
+# `row i` is the dense cached result at absolute position L+i, with candidate
+# i's K/V written at that same position. The dense seam itself preserves the
+# lower attention primitive's causal prefix + through-row convention.
+@ public { }
+fn forward(BlockRequest request, dense.DenseConfig cfg, (string, int) → tensor.Tensor ⇥ dense.DenseError source, f32 epsilon, f32 scale, int rope_dim, attention.RopeConfig rope_cfg) → BlockRows ⇥ VerifyError {
+    _admit_model(request, cfg)
+    const int rows ← request.candidate_count()
+    const int prefix ← request.prefix_length()
+    var dense.DenseStep step ← dense.default_step()
+    do {
+        step ← dense.decode_block(cfg, source, request.candidate_ids(), epsilon, scale, rope_dim, rope_cfg, request.checkpoint().layers())
+    }
+    catch err {
+        throw _map_dense(dense.message(err))
+    }
+
+    const tensor.Tensor logits ← step.logits()
+    require _finite_value(logits) throw variant ModelMismatch {message = "dense forward produced non-finite logits"}
+    const int dimension ← cfg.kv_heads * cfg.head_dim
+    require step.layers().length() ≡ cfg.layers throw variant ForwardFailure {message = "dense forward returned the wrong layer count"}
+    var list<tensor.Tensor> keys ← empty
+    var list<tensor.Tensor> payloads ← empty
+    for range 0‥cfg.layers const i {
+        const kv.KVCache state ← step.layers().get(i) coalesce kv.default()
+        keys.append(_candidate_rows(state.key(), prefix, rows, dimension))
+        payloads.append(_candidate_rows(state.payload(), prefix, rows, dimension))
+    }
+    var list<int> positions ← empty
+    for range prefix‥(prefix + rows) const position {
+        positions.append(position)
+    }
+    return construct_rows(request, positions, logits, keys, payloads)
 }
 
 # -------------------------------------------------------------------------

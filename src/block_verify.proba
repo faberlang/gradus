@@ -12,7 +12,11 @@ import from "gradus:cache" kv
 
 import from "gradus:cache_branch" cache_branch
 
+import from "gradus:attention" attention
+
 import from "gradus:block_verify" block_verify
+
+import from "gradus:model/dense" dense
 
 import from "gradus:speculative" speculative
 
@@ -151,6 +155,142 @@ fn verification_p() → block_verify.BlockVerification {
     return verification
 }
 
+fn fill_model(list<int> shape, f32 value) → tensor.Tensor {
+    var tensor.Tensor t ← tensor.default()
+    do {
+        t ← tensor.fill(shape, value)
+    }
+    catch err {
+        return t
+    }
+    return t
+}
+
+fn block_source(string name, int layer) → tensor.Tensor ⇥ dense.DenseError {
+    if name ≡ "model.embed_tokens" {
+        return fill_model([4, 4], 0.1 ∷ f32)
+    }
+    if name ≡ "model.norm" {
+        return fill_model([4], 1.0 ∷ f32)
+    }
+    if name ≡ "lm_head" {
+        return fill_model([4, 4], 0.1 ∷ f32)
+    }
+    const string prefix ← "model.layers.§"(layer ↦ string)
+    if name ≡ prefix + ".input_layernorm" or name ≡ prefix + ".post_attention_layernorm" {
+        return fill_model([4], 1.0 ∷ f32)
+    }
+    if name ≡ prefix + ".self_attn.q_proj" or name ≡ prefix + ".self_attn.o_proj" {
+        return fill_model([4, 4], 0.05 ∷ f32)
+    }
+    if name ≡ prefix + ".self_attn.k_proj" or name ≡ prefix + ".self_attn.v_proj" {
+        return fill_model([4, 2], 0.05 ∷ f32)
+    }
+    if name ≡ prefix + ".mlp.gate_proj" or name ≡ prefix + ".mlp.up_proj" or name ≡ prefix + ".mlp.down_proj" {
+        return fill_model([4, 4], 0.05 ∷ f32)
+    }
+    throw variant MissingTensor {message = "fixture has no tensor: " + name}
+}
+
+fn block_rope() → attention.RopeConfig {
+    var attention.RopeConfig rope ← attention.default()
+    do {
+        rope ← attention.construct_rope_config(100000.0 ∷ f32, 1.0 ∷ f32, attention.consecutive_policy())
+    }
+    catch err {
+        return rope
+    }
+    return rope
+}
+
+fn block_cfg() → dense.DenseConfig {
+    return dense.DenseConfig {layers = 3, heads = 2, kv_heads = 1, head_dim = 2, hidden_dim = 4, vocab = 4, tied = true}
+}
+
+fn block_empty_layers() → list<kv.KVCache> {
+    var list<kv.KVCache> layers ← empty
+    for range 0‥3 const i {
+        do {
+            const kv.KVCache layer ← kv.empty_cache("block-fixture", "1.0.0", "f32", "fixture", 1, 2)
+            layers.append(layer)
+        }
+        catch err {
+            return layers
+        }
+    }
+    return layers
+}
+
+fn block_prefix_checkpoint() → cache_branch.KVCheckpoint {
+    var cache_branch.KVCheckpoint checkpoint ← cache_branch.default()
+    var list<kv.KVCache> prefix_layers ← empty
+    do {
+        const dense.DenseStep step ← dense.prefill_cached(block_cfg(), (string n, int s) → tensor.Tensor ⇥ dense.DenseError ∴ block_source(n, s), [0], 0.00001 ∷ f32, 0.5 ∷ f32, 2, block_rope(), block_empty_layers())
+        prefix_layers ← step.layers()
+    }
+    catch err {
+        return checkpoint
+    }
+    do {
+        checkpoint ← cache_branch.construct_checkpoint(prefix_layers)
+    }
+    catch err {
+        return checkpoint
+    }
+    return checkpoint
+}
+
+fn forward_rows() → block_verify.BlockRows {
+    var block_verify.BlockRows rows ← block_verify.default_rows()
+    do {
+        const block_verify.BlockRequest request ← block_verify.construct_request(block_prefix_checkpoint(), [1, 2])
+        rows ← block_verify.forward(request, block_cfg(), (string n, int s) → tensor.Tensor ⇥ dense.DenseError ∴ block_source(n, s), 0.00001 ∷ f32, 0.5 ∷ f32, 2, block_rope())
+    }
+    catch err {
+        return rows
+    }
+    return rows
+}
+
+fn forward_text(cache_branch.KVCheckpoint checkpoint, dense.DenseConfig cfg, list<int> ids) → string {
+    do {
+        const block_verify.BlockRequest request ← block_verify.construct_request(checkpoint, ids)
+        const block_verify.BlockRows _ ← block_verify.forward(request, cfg, (string n, int s) → tensor.Tensor ⇥ dense.DenseError ∴ block_source(n, s), 0.00001 ∷ f32, 0.5 ∷ f32, 2, block_rope())
+        return "ok"
+    }
+    catch err {
+        return block_verify.message(err)
+    }
+}
+
+fn nonfinite_checkpoint() → cache_branch.KVCheckpoint {
+    var cache_branch.KVCheckpoint checkpoint ← cache_branch.default()
+    var list<kv.KVCache> layers ← empty
+    for range 0‥3 const i {
+        var kv.KVCache layer ← kv.default()
+        do {
+            layer ← kv.empty_cache("block-fixture", "1.0.0", "f32", "fixture", 1, 2)
+            if i ≡ 0 {
+                layer ← kv.append(layer, 0, hold([1.0 / 0.0, 0.0], [1, 2]), hold([0.0, 0.0], [1, 2]))
+            }
+            else {
+                layer ← kv.append(layer, 0, hold([0.0, 0.0], [1, 2]), hold([0.0, 0.0], [1, 2]))
+            }
+            layers.append(layer)
+        }
+        catch err {
+            return checkpoint
+        }
+    }
+    do {
+        checkpoint ← cache_branch.construct_checkpoint(layers)
+    }
+    catch err {
+        return checkpoint
+    }
+    return checkpoint
+}
+
 describe "SD2-U1 — typed block request/result contract" {
     test "an admitted request carries a nonempty prefix and candidate block" {
         do {
@@ -241,6 +381,65 @@ describe "SD2-U1 — typed block request/result contract" {
             const cache_branch.KVCheckpoint before ← request.checkpoint()
             assert rows_detail(request, [], logits_p(), keys_p(), payloads_p()) ≡ "result row count is outside candidate block"
             assert cache_branch.checkpoint_equal(request.checkpoint(), before)
+        }
+        catch err {
+            assert false
+        }
+    }
+}
+
+describe "SD2-U2 — reference block forward" {
+    test "a three-layer admitted prefix yields k logits and per-layer candidate K/V rows" {
+        do {
+            const block_verify.BlockRows rows ← forward_rows()
+            assert rows.target_positions() ≡ [1, 2]
+            assert rows.logits().shape() ≡ [2, 4]
+            assert rows.candidate_keys().length() ≡ 3
+            assert rows.candidate_payloads().length() ≡ 3
+            for range 0‥3 const i {
+                const tensor.Tensor key ← rows.candidate_keys().get(i) coalesce tensor.default()
+                const tensor.Tensor payload ← rows.candidate_payloads().get(i) coalesce tensor.default()
+                assert key.shape() ≡ [2, 2]
+                assert payload.shape() ≡ [2, 2]
+                assert key.valid()
+                assert payload.valid()
+            }
+        }
+        catch err {
+            assert false
+        }
+    }
+
+    test "vocabulary admission rejects before any row exists and leaves the checkpoint equal" {
+        do {
+            const cache_branch.KVCheckpoint checkpoint ← block_prefix_checkpoint()
+            const cache_branch.KVCheckpoint before ← checkpoint
+            assert forward_text(checkpoint, block_cfg(), [1, 4]) ≡ "candidate token id is outside model vocabulary"
+            assert cache_branch.checkpoint_equal(checkpoint, before)
+        }
+        catch err {
+            assert false
+        }
+    }
+
+    test "cache dimension admission rejects before forward" {
+        do {
+            const cache_branch.KVCheckpoint checkpoint ← block_prefix_checkpoint()
+            var dense.DenseConfig wrong ← block_cfg()
+            wrong.head_dim ← 1
+            assert forward_text(checkpoint, wrong, [1, 2]) ≡ "cache dimension does not match model KV width"
+        }
+        catch err {
+            assert false
+        }
+    }
+
+    test "non-finite cache values reject before any candidate rows exist" {
+        do {
+            const cache_branch.KVCheckpoint checkpoint ← nonfinite_checkpoint()
+            const cache_branch.KVCheckpoint before ← checkpoint
+            assert forward_text(checkpoint, block_cfg(), [1, 2]) ≡ "cache contains non-finite values"
+            assert cache_branch.checkpoint_equal(checkpoint, before)
         }
         catch err {
             assert false

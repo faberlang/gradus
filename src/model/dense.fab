@@ -576,6 +576,99 @@ fn decode_step(DenseConfig cfg, (string, int) → tensor.Tensor ⇥ DenseError s
 }
 
 # -------------------------------------------------------------------------
+# decode_block — multi-row incremental dense decode over a non-empty
+# per-layer KV cache. Candidate token ids + one cache per layer in → logits
+# [T, V] + updated caches. All layers share one prefix L; the rows are
+# written at absolute positions L..L+T-1 and each causal row sees the
+# accepted prefix plus the candidate rows through its own position. This is
+# the additive SD2 seam; decode_step and prefill_cached retain their
+# respective scalar and empty-prefix contracts.
+# -------------------------------------------------------------------------
+
+@ public { }
+fn decode_block(DenseConfig cfg, (string, int) → tensor.Tensor ⇥ DenseError source, list<int> tokens, f32 epsilon, f32 scale, int rope_dim, attention.RopeConfig rope_cfg, list<kv.KVCache> layers) → DenseStep ⇥ DenseError {
+    require cfg.layers ≥ 1 throw variant BadConfig {message = "layer count must be at least 1"}
+    require cfg.heads ≥ 1 throw variant BadConfig {message = "head count must be at least 1"}
+    require not (cfg.kv_heads ≺ 1 or cfg.kv_heads ≻ cfg.heads) throw variant BadConfig {message = "KV head count must be between 1 and the head count"}
+    require cfg.heads % cfg.kv_heads ≡ 0 throw variant BadConfig {message = "head count must be a multiple of the KV head count"}
+    require cfg.head_dim ≥ 1 throw variant BadConfig {message = "head dim must be at least 1"}
+    require cfg.hidden_dim ≥ 1 throw variant BadConfig {message = "hidden dim must be at least 1"}
+    require cfg.vocab ≥ 1 throw variant BadConfig {message = "vocabulary size must be at least 1"}
+    require tokens.length() ≥ 1 throw variant BadConfig {message = "token sequence must be non-empty"}
+    require layers.length() ≡ cfg.layers throw variant BadConfig {message = "cache layer count must equal the model layer count"}
+    for from tokens const token_id {
+        require not (token_id ≺ 0 or token_id ≥ cfg.vocab) throw variant TerminusExcedit {message = "token id out of range for the embedding"}
+    }
+    const int prefix_before ← _shared_prefix(layers)
+    require prefix_before ≥ 1 throw variant Gap {message = "cache write leaves a gap"}
+    _admit_cached(layers, tokens.length())
+
+    const tensor.Tensor embed ← source("model.embed_tokens", 0)
+    _shape(embed, "model.embed_tokens", [cfg.hidden_dim, cfg.vocab])
+    const tensor.Tensor embed_v ← _token_major_view(embed)
+    const tensor.Tensor x ← _collect(embed_v, tokens)
+
+    const int qwidth ← cfg.heads * cfg.head_dim
+    const int kwidth ← cfg.kv_heads * cfg.head_dim
+    var list<int> positions ← empty
+    for range prefix_before‥(prefix_before + tokens.length()) const i {
+        positions.append(i)
+    }
+    var tensor.Tensor h ← x
+    var list<kv.KVCache> next ← empty
+    var int layer ← 0
+    while layer ≺ cfg.layers {
+        const string prefix ← "model.layers.§"(layer ↦ string)
+        const tensor.Tensor ln1_s ← source(prefix + ".input_layernorm", layer)
+        const tensor.Tensor wq ← source(prefix + ".self_attn.q_proj", layer)
+        const tensor.Tensor wk ← source(prefix + ".self_attn.k_proj", layer)
+        const tensor.Tensor wv ← source(prefix + ".self_attn.v_proj", layer)
+        const tensor.Tensor wo ← source(prefix + ".self_attn.o_proj", layer)
+        const tensor.Tensor ln2_s ← source(prefix + ".post_attention_layernorm", layer)
+        const tensor.Tensor wg ← source(prefix + ".mlp.gate_proj", layer)
+        const tensor.Tensor wu ← source(prefix + ".mlp.up_proj", layer)
+        const tensor.Tensor wd ← source(prefix + ".mlp.down_proj", layer)
+        _shape(ln1_s, prefix + ".input_layernorm", [cfg.hidden_dim])
+        _shape(wq, prefix + ".self_attn.q_proj", [cfg.hidden_dim, qwidth])
+        _shape(wk, prefix + ".self_attn.k_proj", [cfg.hidden_dim, kwidth])
+        _shape(wv, prefix + ".self_attn.v_proj", [cfg.hidden_dim, kwidth])
+        _shape(wo, prefix + ".self_attn.o_proj", [qwidth, qwidth])
+        _shape(ln2_s, prefix + ".post_attention_layernorm", [cfg.hidden_dim])
+        const list<int> fwg ← wg.shape()
+        require fwg.length() ≡ 2 throw variant BadShape {message = "canonical tensor §.mlp.gate_proj must be rank 2"(prefix)}
+        const int f ← fwg.get(1) coalesce 1
+        _shape(wu, prefix + ".mlp.up_proj", [cfg.hidden_dim, f])
+        _shape(wd, prefix + ".mlp.down_proj", [f, cfg.hidden_dim])
+        const tensor.Tensor bq ← _attn_bias(source, prefix + ".self_attn.q_proj.bias", layer, h, wq)
+        const tensor.Tensor bk ← _attn_bias(source, prefix + ".self_attn.k_proj.bias", layer, h, wk)
+        const tensor.Tensor bv ← _attn_bias(source, prefix + ".self_attn.v_proj.bias", layer, h, wv)
+        const tensor.Tensor bg ← _no_bias()
+        const tensor.Tensor bu ← _no_bias()
+        const tensor.Tensor bd ← _no_bias()
+        const kv.KVCache cache ← layers.get(layer) coalesce kv.default()
+        const transformer.DenseAttentionWeights attention_weights ← transformer.DenseAttentionWeights {wq = wq, bq = bq, wk = wk, bk = bk, wv = wv, bv = bv, wo = wo}
+        const transformer.DenseAttentionConfig attention_config ← transformer.DenseAttentionConfig {num_heads = cfg.heads, num_kv_heads = cfg.kv_heads, scale = scale, rope_dim = rope_dim, rope_config = rope_cfg}
+        const transformer.DenseMlpWeights mlp_weights ← transformer.DenseMlpWeights {wg = wg, bg = bg, wu = wu, bu = bu, wd = wd, bd = bd}
+        const transformer.DenseNormConfig norm_config ← transformer.DenseNormConfig {ln1_s = ln1_s, ln2_s = ln2_s, epsilon = epsilon}
+        const transformer.CachedBlock block ← _block_cached(h, positions, cache, tokens, attention_weights, attention_config, mlp_weights, norm_config)
+        h ← block.output()
+        next.append(block.state())
+        layer ← layer + 1
+    }
+
+    const tensor.Tensor norm_s ← source("model.norm", 0)
+    _shape(norm_s, "model.norm", [cfg.hidden_dim])
+    const tensor.Tensor hn ← _rmsnorm(h, norm_s, epsilon)
+    var tensor.Tensor w_head ← _transpose(embed_v)
+    if not cfg.tied {
+        w_head ← source("lm_head", 0)
+        _shape(w_head, "lm_head", [cfg.hidden_dim, cfg.vocab])
+    }
+    const tensor.Tensor b_head ← _no_bias()
+    return DenseStep {logits = _linear(hn, w_head, b_head), layers = next}
+}
+
+# -------------------------------------------------------------------------
 # prefill_cached — batched dense prefill over the per-layer KV caches.
 # Frozen coordinates: prefix_before = 0, query_rows = T, write_range =
 # [0, T). All layers must share that empty prefix and advance together.
