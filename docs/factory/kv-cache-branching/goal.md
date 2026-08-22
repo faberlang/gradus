@@ -1,6 +1,6 @@
 # GOAL: kv-cache-branching — immutable all-layer speculative branches with atomic prefix commit
 
-**Status**: active — U1–U3 landed (U1 `63a8d73` cache-branch contract leaf; U2 `f8f4b43` isolated speculative branches; U3 `0530fee` AcceptanceDecision — proven on HEAD `9793720da` after the package-MIR family fix: `--filter AcceptanceDecision` 4/0, `--include cache_branch` 18/0). U4–U6 remaining; dispatch sequenced after the radix canary green base freezes (U6's cache.proba dependency now healthy).
+**Status**: done — U1–U6 landed (U1 `63a8d73`; U2 `f8f4b43`; U3 `0530fee`; U4 `dd385c1`; U5 `5392885`; U6 receipt recorded in the ledger). The immutable checkpoint/private branch and atomic all-layer commit contract is closed out; physical allocation, residency, quantization, and scheduling remain outside the Gradus value contract.
 **Created**: 2026-08-21
 **Campaign:** `speculative-decode`
 **Source:** speculative-decode campaign lowering and the 2026-08-21 live-code audit
@@ -133,9 +133,9 @@ logical Gradus contract from any later device-residency implementation.
 | 1 | done | hand | `63a8d73` | cache-branch contract leaf `src/cache_branch.fab` |
 | 2 | done | hand | `f8f4b43` | isolated speculative branches |
 | 3 | done | hand | `0530fee` | AcceptanceDecision wraps SD0-U4 `GreedyAcceptance`; validation re-proven on `9793720da` (filter 4/0; `--include cache_branch` 18/0). Sanity-string nit: delivery filter `decision` matches 1 of 4 titles — use `--filter AcceptanceDecision` |
-| 4 | pending | — | — | sequenced post-canary |
-| 5 | pending | — | — | sequenced post-canary |
-| 6 | pending | — | — | sequenced post-canary; cache.proba dependency healthy |
+| 4 | done | hand | `dd385c1` | atomic all-layer prefix commit; zero/partial/full and failure-invariance rows landed |
+| 5 | done | hand | `5392885` | device-neutral begin/inspect/commit/abort lifecycle seam landed |
+| 6 | done | hand | `U6 closeout commit` | cache/dense rollback boundary and physical-ownership comments; truth scan and closeout gates recorded by task receipt |
 
 Lowered to [`delivery.md`](delivery.md) as SD1-1..6 (2026-08-22). Delivery
 pins the goal's open questions against live code: epoch = the existing
