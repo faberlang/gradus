@@ -263,6 +263,51 @@ fn forward_text(cache_branch.KVCheckpoint checkpoint, dense.DenseConfig cfg, lis
     }
 }
 
+fn staged_commit_detail(cache_branch.KVCheckpoint current, cache_branch.BranchHandle handle, int accepted_count) → string {
+    do {
+        const cache_branch.KVCheckpoint _ ← block_verify.commit_staged(current, handle, accepted_count)
+        return "ok"
+    }
+    catch err {
+        return block_verify.message(err)
+    }
+}
+
+fn other_prefix_checkpoint() → cache_branch.KVCheckpoint {
+    var cache_branch.KVCheckpoint checkpoint ← cache_branch.default()
+    var list<kv.KVCache> layers ← empty
+    for range 0‥3 const i {
+        do {
+            var kv.KVCache layer ← kv.empty_cache("other-block-fixture", "1.0.0", "f32", "fixture", 1, 2)
+            layer ← kv.append(layer, 0, hold([0.1, 0.2], [1, 2]), hold([0.3, 0.4], [1, 2]))
+            layers.append(layer)
+        }
+        catch err {
+            return checkpoint
+        }
+    }
+    do {
+        checkpoint ← cache_branch.construct_checkpoint(layers)
+    }
+    catch err {
+        return checkpoint
+    }
+    return checkpoint
+}
+
+fn identity_mismatch_handle(block_verify.BlockRows rows, cache_branch.KVCheckpoint checkpoint) → cache_branch.BranchHandle {
+    var cache_branch.BranchHandle handle ← cache_branch.default_handle()
+    do {
+        const cache_branch.KVCheckpoint other ← other_prefix_checkpoint()
+        const cache_branch.SpeculativeBranch branch ← cache_branch.construct_branch(other, [1, 2], rows.candidate_keys(), rows.candidate_payloads())
+        handle ← cache_branch.BranchHandle {checkpoint = checkpoint, branch = branch}
+    }
+    catch err {
+        return handle
+    }
+    return handle
+}
+
 fn nonfinite_checkpoint() → cache_branch.KVCheckpoint {
     var cache_branch.KVCheckpoint checkpoint ← cache_branch.default()
     var list<kv.KVCache> layers ← empty
@@ -440,6 +485,95 @@ describe "SD2-U2 — reference block forward" {
             const cache_branch.KVCheckpoint before ← checkpoint
             assert forward_text(checkpoint, block_cfg(), [1, 2]) ≡ "cache contains non-finite values"
             assert cache_branch.checkpoint_equal(checkpoint, before)
+        }
+        catch err {
+            assert false
+        }
+    }
+}
+
+describe "SD2-U3 — all-layer atomic staging and commit" {
+    test "a staged candidate block commits one accepted row across all three layers" {
+        do {
+            const block_verify.BlockRows rows ← forward_rows()
+            const cache_branch.KVCheckpoint base ← rows.request().checkpoint()
+            const cache_branch.KVCheckpoint before ← base
+            const cache_branch.BranchHandle handle ← block_verify.stage(rows)
+            const cache_branch.KVCheckpoint committed ← block_verify.commit_staged(base, handle, 1)
+            assert cache_branch.checkpoint_equal(base, before)
+            assert committed.layers().length() ≡ 3
+            assert committed.prefix_length() ≡ base.prefix_length() + 1
+            assert committed.version() ≡ base.version() + 1
+            for range 0‥3 const i {
+                const kv.KVCache layer ← committed.layers().get(i) coalesce kv.default()
+                assert layer.length() ≡ 2
+                assert layer.version() ≡ base.version() + 1
+                assert layer.history() ≡ [0, 1]
+            }
+        }
+        catch err {
+            assert false
+        }
+    }
+
+    test "zero accepted rows abort equivalently and never advance the base" {
+        do {
+            const block_verify.BlockRows rows ← forward_rows()
+            const cache_branch.KVCheckpoint base ← rows.request().checkpoint()
+            const cache_branch.BranchHandle handle ← block_verify.stage(rows)
+            const cache_branch.KVCheckpoint zero ← block_verify.commit_staged(base, handle, 0)
+            const cache_branch.KVCheckpoint aborted ← block_verify.abort_staged(handle)
+            assert cache_branch.checkpoint_equal(zero, base)
+            assert cache_branch.checkpoint_equal(aborted, base)
+            assert zero.version() ≡ base.version()
+            assert zero.prefix_length() ≡ base.prefix_length()
+        }
+        catch err {
+            assert false
+        }
+    }
+
+    test "an out-of-range accepted count rejects before changing the checkpoint" {
+        do {
+            const block_verify.BlockRows rows ← forward_rows()
+            const cache_branch.KVCheckpoint base ← rows.request().checkpoint()
+            const cache_branch.KVCheckpoint before ← base
+            const cache_branch.BranchHandle handle ← block_verify.stage(rows)
+            assert staged_commit_detail(base, handle, (0 - 1)) ≡ "accepted prefix count is outside candidate block"
+            assert staged_commit_detail(base, handle, 3) ≡ "accepted prefix count is outside candidate block"
+            assert cache_branch.checkpoint_equal(base, before)
+        }
+        catch err {
+            assert false
+        }
+    }
+
+    test "an identity-mismatched branch rejects without partial layer publication" {
+        do {
+            const block_verify.BlockRows rows ← forward_rows()
+            const cache_branch.KVCheckpoint base ← rows.request().checkpoint()
+            const cache_branch.KVCheckpoint before ← base
+            const cache_branch.BranchHandle handle ← identity_mismatch_handle(rows, base)
+            assert staged_commit_detail(base, handle, 1) ≡ "branch identity does not match checkpoint identity"
+            assert cache_branch.checkpoint_equal(base, before)
+        }
+        catch err {
+            assert false
+        }
+    }
+
+    test "a stale transaction rejects against the later all-layer commit" {
+        do {
+            const block_verify.BlockRows rows ← forward_rows()
+            const cache_branch.KVCheckpoint base ← rows.request().checkpoint()
+            const cache_branch.KVCheckpoint before ← base
+            const cache_branch.BranchHandle stale ← block_verify.stage(rows)
+            const cache_branch.BranchHandle fresh ← block_verify.stage(rows)
+            const cache_branch.KVCheckpoint newer ← block_verify.commit_staged(base, fresh, 1)
+            assert staged_commit_detail(newer, stale, 1) ≡ "transaction checkpoint is stale"
+            assert cache_branch.checkpoint_equal(base, before)
+            assert cache_branch.checkpoint_equal(stale.checkpoint(), before)
+            assert newer.prefix_length() ≡ base.prefix_length() + 1
         }
         catch err {
             assert false

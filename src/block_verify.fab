@@ -48,6 +48,9 @@ union VerifyError {
     ForwardFailure {
         string message
     },
+    TransactionFailure {
+        string message
+    },
     ResultBounds {
         string message
     }
@@ -72,6 +75,9 @@ fn message(VerifyError e) → string {
             return message
         }
         case ForwardFailure const message {
+            return message
+        }
+        case TransactionFailure const message {
             return message
         }
         case ResultBounds const message {
@@ -378,6 +384,57 @@ fn forward(BlockRequest request, dense.DenseConfig cfg, (string, int) → tensor
         positions.append(position)
     }
     return construct_rows(request, positions, logits, keys, payloads)
+}
+
+# -------------------------------------------------------------------------
+# Atomic staging and commit — compose the landed SD1 transaction only.
+# Candidate K/V rows are copied into a CandidateBlock by cache_branch.begin,
+# which materializes the private all-layer branch before any caller state is
+# eligible for commit. The public commit wrapper calls commit_transaction;
+# this leaf never appends or extends a shared cache directly.
+# -------------------------------------------------------------------------
+
+@ private { }
+fn _map_branch(string detail) → VerifyError {
+    if detail ≡ "accepted prefix count is outside candidate block" then {
+        return variant ResultBounds {message = detail}
+    }
+    return variant TransactionFailure {message = detail}
+}
+
+@ private { }
+fn _candidate_block(BlockRows rows) → cache_branch.CandidateBlock ⇥ VerifyError {
+    const BlockRequest request ← rows.request()
+    require rows.row_count() ≡ request.candidate_count() throw variant ResultBounds {message = "staged rows do not cover the candidate block"}
+    require rows.candidate_keys().length() ≡ request.checkpoint().layers().length() throw variant ResultBounds {message = "staged K layers do not match the checkpoint"}
+    require rows.candidate_payloads().length() ≡ request.checkpoint().layers().length() throw variant ResultBounds {message = "staged V layers do not match the checkpoint"}
+    return cache_branch.construct_block(request.candidate_ids(), rows.candidate_keys(), rows.candidate_payloads())
+}
+
+@ public { }
+fn stage(BlockRows rows) → cache_branch.BranchHandle ⇥ VerifyError {
+    const cache_branch.CandidateBlock block ← _candidate_block(rows)
+    do {
+        return cache_branch.begin(rows.request().checkpoint(), block)
+    }
+    catch err {
+        throw _map_branch(cache_branch.message(err))
+    }
+}
+
+@ public { }
+fn commit_staged(cache_branch.KVCheckpoint current, cache_branch.BranchHandle handle, int accepted_count) → cache_branch.KVCheckpoint ⇥ VerifyError {
+    do {
+        return cache_branch.commit_transaction(current, handle, accepted_count)
+    }
+    catch err {
+        throw _map_branch(cache_branch.message(err))
+    }
+}
+
+@ public { }
+fn abort_staged(cache_branch.BranchHandle handle) → cache_branch.KVCheckpoint {
+    return cache_branch.abort(handle)
 }
 
 # -------------------------------------------------------------------------
