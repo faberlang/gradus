@@ -1,10 +1,10 @@
 # GOAL: prepared-prefix-state — device-neutral prepared state for exact-prefix continuation
 
-**Status**: planned — pre-implementation; drafted from the speculative-decode audit
+**Status**: planned — pre-implementation; goal-checked 2026-08-23 against live code (every code claim re-verified); delivery lowered in [`delivery.md`](delivery.md)
 **Created**: 2026-08-21
 **Campaign:** `speculative-decode`
 **Source:** operator expansion of the SD5 boundary, grounded in the live Gradus cache/decode surface and PML MODEL-01–04 composition contracts
-**Dependency state:** dense rows are implementable from live source; hybrid closeout waits for MODEL-01 admission, MODEL-02 router/expert execution, MODEL-03 state, MODEL-04 full-model composition, and LIB-02 tokenizer receipts
+**Dependency state:** dense rows are implementable from live source; hybrid closeout waits for MODEL-03 state and MODEL-04 full-model composition (verified 2026-08-23: MODEL-01 admission chain landed on main; MODEL-02 done 2026-08-22, receipt `8febe40`; LIB-02 tokenizer landed — no longer blocking)
 **Repos:** primary: `gradus/`; evidence only: `inferentia/`
 **Related:** [`../speculative-decode/CAMPAIGN.md`](../speculative-decode/CAMPAIGN.md); [`MODEL-01`](../production-ml-library/pml5-gguf-m1-qwen35moe-admission-delivery.md); [`MODEL-02`](../production-ml-library/pml5-gguf-m2-moe-router-delivery.md); [`MODEL-03`](../production-ml-library/pml5-gguf-m3-ssm-attention-state-delivery.md); [`MODEL-04`](../production-ml-library/model04-full-model-reference-inference-delivery.md); [`LIB-02 tokenizer`](../production-ml-library/pml5-lib02-tokenizer-delivery.md); `gradus/docs/api-reference.md`
 
@@ -27,15 +27,22 @@ device handles.
 
 The current cache surface is a single transformer KV value with exact token
 history and structural identity fields, not a complete prepared-state or
-reuse protocol (`src/cache.fab:21-61,220-303,386-468,472-608`). The current
-identity is useful precedent, but it does not itself provide candidate
-selection, payload binding, or continuation.
+reuse protocol (`src/cache.fab` contract `:21-61`; `KVCache` `:239`;
+`append`/`extend`/`reset` `:413-494`; `CacheIdentity` `:505-579`; identity
+wire `:589-632`). The current identity is useful precedent, but it does not
+itself provide candidate selection, payload binding, or continuation.
 
-The current dense path cannot continue prefill from a non-empty prefix:
-`src/model/dense.fab:562-647` requires `prefix_before` to be zero. The
-generation entry point updates cache state locally and returns only tokens,
-discarding the updated state (`src/generation.fab:774-811`). The public decode
-`Session` tracks only position and context (`src/decode.fab:551-601`).
+Batched prefill remains empty-prefix-only: `prefill_cached`
+(`src/model/dense.fab:681`, zero-prefix guard at `:695`) rejects a non-empty
+prefix. The landed SD2 seam `decode_block` (`src/model/dense.fab:589`,
+commit `fad0d57`) already performs multi-row incremental decode over a
+non-empty per-layer cache, so suffix execution exists as a building block;
+what is missing is continuation from a complete prepared state that consumes
+only the suffix and returns the next complete state. The generation entry
+point updates cache state internally and returns only tokens, discarding the
+updated state (`generate_dense_with_stop`, `src/generation.fab:1100`). The
+public decode `Session` tracks only position and context
+(`src/decode.fab:551-601`).
 
 The future model set is not KV-only. The MODEL-03 contract requires separate
 attention KV state and linear-attention recurrent plus convolution state,
@@ -98,7 +105,7 @@ authorized and passes only those candidates to Gradus.
 - No multi-token verification policy; this goal shares branching primitives
   with cached-block verification but does not own its candidate/logit contract.
 
-## Units (lowering sketch — refine via `$delivery`)
+## Units (lowering sketch — lowered 2026-08-23 in [`delivery.md`](delivery.md) as `PP-U1`…`PP-U5`; U3/U4 split per behavior family)
 
 All units below are admitted and mandatory. There are no optional or deferred
 units in this goal.
