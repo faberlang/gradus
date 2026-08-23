@@ -88,13 +88,14 @@ admission/MoE routing/drafter; no multi-token verification policy.
 ```text
 PP-U1 (canonical identity) ──> PP-U2 (typed state + binding) ──> PP-U3a (admission) ──> PP-U3b (attach/continue)
                                                                                               │
-                                                                                  ┌───────────┴───────────┐
-                                                                                  v                       v
-                                                                           PP-U4a (dense, now)    PP-U4b (hybrid, BLOCKED on MODEL-03/04)
-                                                                                  │                       │
-                                                                                  └───────────┬───────────┘
-                                                                                              v
-                                                                                           PP-U5 (truth pass)
+                                                                                  v
+                                                                           PP-U4a (dense, now)
+                                                                                  │
+                                                                                  v
+                                                                           PP-U4b (hybrid, BLOCKED on MODEL-03/04)
+                                                                                  │
+                                                                                  v
+                                                                           PP-U5 (truth pass)
 ```
 
 Shared non-goals for every unit (goal §Non-goals + campaign invariants 5, 7, 9):
@@ -188,11 +189,11 @@ no campaign or sibling-goal file edits (each unit's own proba excepted).
 | write_scope | `src/prepared_state.fab`; `src/prepared_state.proba`; `src/model/qwen35moe.fab` + proba (or the MODEL-03/04 leaf surfaces); hybrid fixtures |
 | done_when | hybrid fixture proves KV + recurrent/convolution state carried, reset, replayed, and continued without conflation; first divergence recorded per layer/position; cold-vs-warm token/state equality on the admitted hybrid row |
 | first-failing oracle | the hybrid continuation rows fail today — no executed hybrid state exists (grep + `qwen35moe.fab` metadata-only) |
-| depends_on | PP-U2, PP-U3b; **MODEL-03 SSM/attention state ([`pml5-gguf-m3-ssm-attention-state-delivery`](../production-ml-library/pml5-gguf-m3-ssm-attention-state-delivery.md)) and MODEL-04 full-model composition — both unlanded (2026-08-23)**; MODEL-01 admission landed, MODEL-02 done (`8febe40`), LIB-02 tokenizer landed — **no longer blocking** |
-| parallel | yes relative to U4a (different write surface) once its dependencies land |
+| depends_on | PP-U2, PP-U3b, **PP-U4a (same `prepared_state` leaf — serialized, not parallel)**; **MODEL-03 SSM/attention state ([`pml5-gguf-m3-ssm-attention-state-delivery`](../production-ml-library/pml5-gguf-m3-ssm-attention-state-delivery.md)) and MODEL-04 full-model composition — both unlanded (2026-08-23)**; MODEL-01 admission landed, MODEL-02 done (`8febe40`), LIB-02 tokenizer landed — **no longer blocking** |
+| parallel | no — same `prepared_state.fab`/`prepared_state.proba` write surface as PP-U4a (audit `ceb0158d` finding 1); parallel only to radix lanes |
 | sanity | `faber test src/prepared_state.proba hybrid` |
 | non_goals | dense continuation (U4a); model admission/MoE routing (PML owns); kernels/quantization |
-| risk | high — blocked on five external receipts |
+| risk | high — blocked on MODEL-03 + MODEL-04 (unlanded; audit `ceb0158d` finding 2 — MODEL-01/02 and LIB-02 no longer block) |
 | integrable | yes (once landed) |
 
 ### PP-U5 — contract truth pass
@@ -213,17 +214,16 @@ no campaign or sibling-goal file edits (each unit's own proba excepted).
 ## 5. Implementation Work (Mind pointers)
 
 Each Hand task is a pointer: goal path + unit id + write_scope + done_when
-from §4. Dispatch order: `PP-U1 → PP-U2 → PP-U3a → PP-U3b → (PP-U4a ∥ PP-U4b
-when hybrid deps land) → PP-U5`. The dense spine `U1→U2→U3a→U3b→U4a→U5` is
-serial (one leaf plus one integration point); the only internal parallelism
-is `U4a ∥ U4b` (disjoint write surfaces once U4b's MODEL-03/04 receipts
-land). **First READY unit: `PP-U1`** — no unmet dependencies, additive leaf.
+from §4. Dispatch order: `PP-U1 → PP-U2 → PP-U3a → PP-U3b → PP-U4a → PP-U4b
+(once hybrid deps land) → PP-U5`. The full spine `U1→U2→U3a→U3b→U4a→U4b→U5`
+is serial: one `prepared_state` leaf plus one integration point; U4a and U4b
+share that leaf, so they never run in parallel (audit `ceb0158d` finding 1).
 
 ## 6. Checkpoints and gates
 
 **Batching:** seven rows, no merge gate — each integrable unit lands green at
-its own commit. `PP-U1→PP-U2→PP-U3a→PP-U3b→PP-U4a→PP-U5` dense spine;
-`PP-U4b` held until MODEL-03/04 receipts.
+its own commit. `PP-U1→PP-U2→PP-U3a→PP-U3b→PP-U4a→PP-U4b→PP-U5` serial
+spine; `PP-U4b` held until MODEL-03/04 receipts land and PP-U4a closes.
 
 **Lane-owned gates (named once, never copied onto child Hands):**
 
