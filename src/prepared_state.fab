@@ -806,3 +806,71 @@ fn attach(list<PreparedState> candidates, PreparedIdentity request) → AttachRe
     require found throw variant PayloadMismatch {message = "attach found no prepared prefix of the request"}
     return AttachResult {state = copy_state(best), consumed = best_len}
 }
+
+# =========================================================================
+# PP-U4a — dense continuation compose seam (suffix-only warm run → the
+# complete NEXT prepared state).
+#
+# continue_state composes the next prepared state from a prepared state,
+# the continuation suffix, and the dense seam's updated per-layer payload
+# (the decode_block output over the suffix). Running the suffix is the
+# CALLER's step: this leaf imports no model/dense/generation surface
+# (the architectural rule above holds), so the seam stays a pure compose
+# over typed payloads.
+#
+# Fail-closed on: empty suffix, a negative suffix token id, a layer-count
+# mismatch, an unbound base payload, a layer that does not carry the
+# prepared cache identity, or a payload that does not extend the prepared
+# prefix by exactly the suffix (length and token history both bind). The
+# next state's canonical identity extends the base prefix by the suffix
+# at the same start position (position_next advances by the suffix
+# length); the lookup digest stays passthrough (carried unchanged);
+# declared slots and whole-state generation are retained (a continuation
+# is not a reset); the payload is re-bound to the next identity (the
+# PP-U2 shape/content contract). The input state is an immutable value —
+# nothing is mutated, cleared, or retained.
+# =========================================================================
+
+# Stable cache-identity predicate (model / version / config /
+# tokenizer / layer set / dtype / layout): unlike kv.cache_identity this
+# excludes history and position, which a continuation legitimately
+# extends. Derived per-field — cache_identity itself embeds the token
+# history, so it never compares equal across a write.
+@ private { }
+fn _cache_lineage_equal(kv.KVCache a, kv.KVCache b) → bool {
+    if a.model() ≠ b.model() then return false
+    if a.model_version() ≠ b.model_version() then return false
+    if a.config() ≠ b.config() then return false
+    if a.tokenizer() ≠ b.tokenizer() then return false
+    if a.layers() ≠ b.layers() then return false
+    if a.dtype() ≠ b.dtype() then return false
+    if a.layout() ≠ b.layout() then return false
+    return true
+}
+
+@ public { }
+fn continue_state(PreparedState s, list<int> suffix, list<kv.KVCache> next_layers) → PreparedState ⇥ PreparedStateError {
+    require suffix.length() ≥ 1 throw variant PayloadMismatch {message = "continuation suffix must be non-empty"}
+    for from suffix const token_id {
+        require token_id ≥ 0 throw variant PayloadMismatch {message = "token id below zero in continuation suffix"}
+    }
+    require next_layers.length() ≡ s.layer_count() throw variant PayloadMismatch {message = "continuation layer count does not match the prepared state"}
+    _payload_matches(s.identity(), s.kv_layers())
+    var list<int> extended ← empty
+    for from s.identity().prefix() const token_id {
+        extended.append(token_id)
+    }
+    for from suffix const token_id {
+        extended.append(token_id)
+    }
+    for range 0‥next_layers.length() const i {
+        const kv.KVCache base ← s.kv_layers().get(i) coalesce kv.default()
+        const kv.KVCache after ← next_layers.get(i) coalesce kv.default()
+        require _cache_lineage_equal(base, after) throw variant PayloadMismatch {message = "continuation layers do not share the prepared cache identity"}
+        require after.length() ≡ base.length() + suffix.length() throw variant PayloadMismatch {message = "continuation payload does not extend the prepared prefix"}
+        require _prefix_equal(after.history(), extended) throw variant PayloadMismatch {message = "continuation payload does not extend the prepared prefix"}
+    }
+    const PreparedIdentity next_identity ← construct(s.identity().model(), s.identity().model_version(), s.identity().config(), s.identity().tokenizer_identity(), extended, s.identity().lookup_digest(), s.identity().position_start())
+    _payload_matches(next_identity, next_layers)
+    return PreparedState {identity = next_identity, kv_layers = _copy_kv_layers(next_layers), declared_slots = _copy_slots(s.declared_slots()), generation = s.generation()}
+}

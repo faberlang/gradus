@@ -21,8 +21,11 @@ locale = "en"
 #
 # Import surface: this suite and the leaf import gradus:tokenizer for
 # the typed TokenizerIdentity only — no model/dense/generation surface
-# appears anywhere in the leaf (the unit table's import ban holds by
-# construction).
+# appears anywhere in the LEAF (the unit table's import ban holds by
+# construction). The PP-U4a section below additionally wires the dense
+# seam and the generation oracle from the SUITE (test-only): the
+# integration proof needs a runnable model; the leaf keeps composing
+# over typed payloads only.
 #
 # NOTE: the tokenizer fixtures are typed record literals (the
 # prepared_state boundary binds the typed value; semantic tokenizer
@@ -35,6 +38,18 @@ import from "gradus:tokenizer" tokenizer
 import from "gradus:cache" cache
 
 import from "gradus:tensor" tensor
+
+import from "gradus:attention" attention
+
+import from "gradus:decode" decode
+
+import from "gradus:model/dense" dense
+
+import from "gradus:generation" generation
+
+import from "gradus:sampling" sampling
+
+import from "gradus:train" train
 
 # ---- pinned-row fixture facts (the tokenizer.proba pattern)
 
@@ -680,6 +695,15 @@ fn ids3(int a, int b, int c) → list<int> {
     return l
 }
 
+fn ids4(int a, int b, int c, int d) → list<int> {
+    var list<int> l ← empty
+    l.append(a)
+    l.append(b)
+    l.append(c)
+    l.append(d)
+    return l
+}
+
 # One KV layer carrying the given accepted prefix.
 fn layers_one(list<int> tokens) → list<cache.KVCache> {
     var list<cache.KVCache> l ← empty
@@ -830,5 +854,432 @@ test "attach rejects typed when no candidate is attachable and leaves snapshots 
     }
     catch err {
         assert false
+    }
+}
+
+# ---- PP-U4a: dense continuation integration (suffix-only warm run,
+# cold-vs-warm equivalence, the next prepared state)
+#
+# Proves, with the runnable corpus dense model (the generation.proba
+# corpus fixture verbatim: one layer, D=2, V=4, rope_dim=2) wired from
+# the SUITE (the leaf itself still imports no model/dense/generation
+# surface):
+#   * the warm continuation consumes ONLY the suffix — decode_block runs
+#     the suffix rows over the prepared KV payload (prefill_cached still
+#     rejects a nonempty prefix; the prepared snapshot is untouched);
+#   * cold-vs-warm equivalence — the suffix logit rows of the warm
+#     decode_block run match a fresh cold prefill of prefix+suffix
+#     within the admitted 1e-5 reference epsilon, and the final warm KV
+#     content (history + K/V tensors) equals the cold payload, with only
+#     the write-count version differing (the one continuation write);
+#   * the greedy warm continuation emits the same tokens as the cold
+#     campaign oracle generate_dense_with_stop over prefix+suffix;
+#   * continue_state composes the complete NEXT prepared state — the
+#     canonical identity extends by the suffix, the payload re-binds,
+#     identity + payload round-trip — and rejects fail-closed.
+
+# The admitted cold-vs-warm reference epsilon.
+const f32 U4_EPSILON ← (0.00001 ∷ f32)
+
+# The corpus identity strings (the generation.proba corpus bindings).
+const string U4_MODEL ← "sd0-tiny-dense"
+const string U4_MODEL_VERSION ← "1.0.0"
+const string U4_MODEL_CONFIG ← "causal-rope-d2"
+const string U4_TOKENIZER ← "sd0-vocab4"
+
+const tensor.Tensor U4_EMBED ← hold([1.0, 0.1, 0.1, 1.0, 0.8, 0.2, 0.2, 0.8], [2, 4])
+const tensor.Tensor U4_NORM ← hold([1.0, 1.0], [2])
+const tensor.Tensor U4_LN1 ← hold([1.0, 1.0], [2])
+const tensor.Tensor U4_LN2 ← hold([1.0, 1.0], [2])
+const tensor.Tensor U4_WQ ← hold([1.0, 0.0, 0.0, 1.0], [2, 2])
+const tensor.Tensor U4_WK ← hold([1.0, 0.0, 0.0, 1.0], [2, 2])
+const tensor.Tensor U4_WV ← hold([1.0, 0.0, 0.0, 1.0], [2, 2])
+const tensor.Tensor U4_WO ← hold([1.0, 0.0, 0.0, 1.0], [2, 2])
+const tensor.Tensor U4_WG ← hold([0.2, 0.0, 0.0, 0.2], [2, 2])
+const tensor.Tensor U4_WU ← hold([0.2, 0.0, 0.0, 0.2], [2, 2])
+const tensor.Tensor U4_WD ← hold([1.0, 0.0, 0.0, 1.0], [2, 2])
+
+fn u4_cfg() → dense.DenseConfig {
+    return dense.DenseConfig {layers = 1, heads = 1, kv_heads = 1, head_dim = 2, hidden_dim = 2, vocab = 4, tied = true}
+}
+
+fn u4_rope() → attention.RopeConfig {
+    var attention.RopeConfig rope ← attention.default()
+    do {
+        rope ← attention.construct_rope_config(100000.0 ∷ f32, 1.0 ∷ f32, attention.consecutive_policy())
+        return rope
+    }
+    catch err {
+        return rope
+    }
+}
+
+fn u4_lookup(string name, int layer) → tensor.Tensor ⇥ dense.DenseError {
+    if name ≡ "model.embed_tokens" then return U4_EMBED
+    if name ≡ "model.norm" then return U4_NORM
+    if layer ≠ 0 {
+        throw variant MissingTensor {message = "canonical tensor missing: §"(name)}
+    }
+    if name ≡ "model.layers.0.input_layernorm" then return U4_LN1
+    if name ≡ "model.layers.0.self_attn.q_proj" then return U4_WQ
+    if name ≡ "model.layers.0.self_attn.k_proj" then return U4_WK
+    if name ≡ "model.layers.0.self_attn.v_proj" then return U4_WV
+    if name ≡ "model.layers.0.self_attn.o_proj" then return U4_WO
+    if name ≡ "model.layers.0.post_attention_layernorm" then return U4_LN2
+    if name ≡ "model.layers.0.mlp.gate_proj" then return U4_WG
+    if name ≡ "model.layers.0.mlp.up_proj" then return U4_WU
+    if name ≡ "model.layers.0.mlp.down_proj" then return U4_WD
+    throw variant MissingTensor {message = "canonical tensor missing: §"(name)}
+}
+
+fn u4_source() → (string, int) → tensor.Tensor ⇥ dense.DenseError {
+    return (string n, int s) → tensor.Tensor ⇥ dense.DenseError ∴ u4_lookup(n, s)
+}
+
+fn u4_layers() → list<cache.KVCache> {
+    var cache.KVStructure structure ← cache.default_kv_structure()
+    do {
+        const cache.LayerSet set ← cache.construct_layer_set([0], cache.dense_structure(), 1, 2)
+        var list<cache.LayerSet> sets ← empty
+        sets.append(set)
+        structure ← cache.construct_kv_structure(sets, cache.kv_dtype_f32(), cache.kv_dtype_f32(), cache.v_layout_transposed(), cache.sharing_single(), cache.attention_classic(), 1, 2, 16)
+    }
+    catch err {
+        return empty
+    }
+    var list<cache.KVCache> layers ← empty
+    do {
+        layers ← dense.empty_caches(structure, U4_MODEL, U4_MODEL_VERSION, U4_MODEL_CONFIG, U4_TOKENIZER)
+        return layers
+    }
+    catch err {
+        return layers
+    }
+}
+
+fn u4_generation() → generation.GenerationConfig {
+    var generation.GenerationConfig g ← generation.default()
+    do {
+        g ← generation.construct_generation(16, 1, 2, 1, 0.0 ∷ f32, 0, 1.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32)
+        return g
+    }
+    catch err {
+        return g
+    }
+}
+
+# The prepared identity over the corpus bindings (prefix [1, 3]).
+fn u4_ident(list<int> prefix) → prepared_state.PreparedIdentity {
+    return ident_full(U4_MODEL, U4_MODEL_VERSION, U4_MODEL_CONFIG, tok_row(), prefix, "deadbeef", 0)
+}
+
+# Cold prefill over the given tokens from fresh caches (error → default).
+fn u4_prefill(list<int> tokens, list<cache.KVCache> layers) → dense.DenseStep {
+    var dense.DenseStep s ← dense.default_step()
+    do {
+        s ← dense.prefill_cached(u4_cfg(), u4_source(), tokens, U4_EPSILON, 0.5 ∷ f32, 2, u4_rope(), layers)
+    }
+    catch err {
+        return s
+    }
+    return s
+}
+
+# Warm suffix run over a NONEMPTY prepared prefix (error → default).
+fn u4_block(list<int> tokens, list<cache.KVCache> layers) → dense.DenseStep {
+    var dense.DenseStep s ← dense.default_step()
+    do {
+        s ← dense.decode_block(u4_cfg(), u4_source(), tokens, U4_EPSILON, 0.5 ∷ f32, 2, u4_rope(), layers)
+    }
+    catch err {
+        return s
+    }
+    return s
+}
+
+# Renders a dense-seam outcome as text (the dense.proba pattern).
+fn u4_prefill_text(list<int> tokens, list<cache.KVCache> layers) → string {
+    do {
+        const dense.DenseStep _ ← dense.prefill_cached(u4_cfg(), u4_source(), tokens, U4_EPSILON, 0.5 ∷ f32, 2, u4_rope(), layers)
+        return "ok"
+    }
+    catch err {
+        return dense.message(err)
+    }
+}
+
+# Staged tensor element read (swallow the never-firing access error).
+fn u4_at(tensor.Tensor t, int i, int j) → f32 {
+    do {
+        return t.get([i, j])
+    }
+    catch err {
+        return (0.0 ∷ f32)
+    }
+}
+
+# One logit row as a list (the sampling input).
+fn u4_row(tensor.Tensor t, int row, int width) → list<f32> {
+    var list<f32> out ← empty
+    for range 0‥width const j {
+        out.append(u4_at(t, row, j))
+    }
+    return out
+}
+
+# Payload CONTENT equality of two same-position caches: history and K/V
+# tensors (the write-count version is deliberately excluded — it counts
+# writes, not content).
+fn u4_content_equal(cache.KVCache warm, cache.KVCache cold, int rows, int dim) → bool {
+    if not (warm.history() ≡ cold.history()) then return false
+    if warm.dimension() ≠ cold.dimension() then return false
+    if warm.capacity() ≠ cold.capacity() then return false
+    for range 0‥rows const i {
+        for range 0‥dim const j {
+            if not u4_at(warm.key(), i, j).approximata(u4_at(cold.key(), i, j), U4_EPSILON) then return false
+            if not u4_at(warm.payload(), i, j).approximata(u4_at(cold.payload(), i, j), U4_EPSILON) then return false
+        }
+    }
+    return true
+}
+
+# Renders a continuation-compose outcome as text.
+fn continue_detail(prepared_state.PreparedState s, list<int> suffix, list<cache.KVCache> next_layers) → string {
+    do {
+        prepared_state.continue_state(s, suffix, next_layers)
+        return "ok"
+    }
+    catch err {
+        return prepared_state.message(err)
+    }
+}
+
+describe "PP-U4a — dense continuation (suffix-only warm run, cold-vs-warm equivalence, next prepared state)" {
+    test "continuation warm run consumes only the suffix through the dense seam" {
+        do {
+            # Cold prefill of the prepared prefix [1, 3] from fresh caches.
+            const dense.DenseStep pref ← u4_prefill(ids2(1, 3), u4_layers())
+            assert pref.layers().length() ≡ 1
+            const cache.KVCache base ← pref.layers().get(0) coalesce cache.default()
+            assert base.length() ≡ 2
+            assert base.history() ≡ [1, 3]
+            # The prepared state over that payload, plus its snapshot.
+            const prepared_state.PreparedState s ← state_of(u4_ident(ids2(1, 3)), pref.layers(), slots_row())
+            const prepared_state.PreparedState snapshot ← prepared_state.copy_state(s)
+            # prefill_cached still rejects a nonempty prefix: decode_block is
+            # the suffix seam.
+            assert u4_prefill_text(ids2(1, 3), pref.layers()) ≡ "cache write leaves a gap"
+            # The warm run receives ONLY the suffix; the prefix is never
+            # re-prefilled.
+            const dense.DenseStep block ← u4_block(ids2(1, 3), pref.layers())
+            assert block.logits().shape() ≡ [2, 4]
+            assert block.layers().length() ≡ 1
+            const cache.KVCache grown ← block.layers().get(0) coalesce cache.default()
+            assert grown.length() ≡ 4
+            assert grown.history() ≡ [1, 3, 1, 3]
+            # The prepared snapshot is untouched (immutable value).
+            assert base.length() ≡ 2
+            assert prepared_state.state_equal(s, snapshot)
+        }
+        catch err {
+            assert false
+        }
+    }
+
+    test "continuation cold-vs-warm logits match within the admitted 1e-5 epsilon" {
+        do {
+            const dense.DenseStep pref ← u4_prefill(ids2(1, 3), u4_layers())
+            const dense.DenseStep block ← u4_block(ids2(1, 3), pref.layers())
+            # Fresh cold run: one prefill over prefix+suffix.
+            const dense.DenseStep cold ← u4_prefill(ids4(1, 3, 1, 3), u4_layers())
+            assert cold.logits().shape() ≡ [4, 4]
+            # The warm suffix rows (absolute positions 2..3) match the cold
+            # rows 2..3 element-wise.
+            for range 0‥2 const r {
+                for range 0‥4 const c {
+                    assert u4_at(block.logits(), r, c).approximata(u4_at(cold.logits(), r + 2, c), U4_EPSILON)
+                }
+            }
+        }
+        catch err {
+            assert false
+        }
+    }
+
+    test "continuation final warm KV content equals the cold payload (only the write count differs)" {
+        do {
+            const dense.DenseStep pref ← u4_prefill(ids2(1, 3), u4_layers())
+            const dense.DenseStep block ← u4_block(ids2(1, 3), pref.layers())
+            const dense.DenseStep cold ← u4_prefill(ids4(1, 3, 1, 3), u4_layers())
+            const cache.KVCache base ← pref.layers().get(0) coalesce cache.default()
+            const cache.KVCache warm ← block.layers().get(0) coalesce cache.default()
+            const cache.KVCache ref ← cold.layers().get(0) coalesce cache.default()
+            # Identity, positions, history, and K/V content all match.
+            assert cache.cache_identity_equal(cache.cache_identity(warm), cache.cache_identity(ref))
+            assert u4_content_equal(warm, ref, 4, 2)
+            # The warm payload reached 4 rows through ONE continuation
+            # write on top of the prepared prefix (write count, not
+            # content — the only field state_equal sees differing).
+            assert warm.version() ≡ base.version() + 1
+            assert ref.version() ≡ base.version()
+            assert not cache.cache_equal(warm, ref)
+        }
+        catch err {
+            assert false
+        }
+    }
+
+    test "continuation warm run emits the cold oracle tokens (generate_dense_with_stop is the cold truth)" {
+        do {
+            const generation.GenerationConfig g ← u4_generation()
+            # Cold truth: the campaign oracle over the full prompt.
+            const list<int> cold_tokens ← generation.generate_dense_with_stop(g, ids4(1, 3, 1, 3), generation.construct_dense_engine(u4_cfg(), U4_EPSILON, 0.5 ∷ f32, 2, u4_rope()), u4_source(), u4_layers(), decode.fresh_cancellation(), generation.eog_stop())
+            assert cold_tokens ≡ [1, 1]
+            # Warm continuation: the prepared prefix, then ONLY the suffix
+            # through decode_block, then the same sampling loop the oracle
+            # runs (greedy config, same seed).
+            const dense.DenseStep pref ← u4_prefill(ids2(1, 3), u4_layers())
+            const dense.DenseStep block ← u4_block(ids2(1, 3), pref.layers())
+            const sampling.Config drawn ← generation.config(g)
+            var train.Seed rng ← generation.seed(g)
+            var list<f32> last ← u4_row(block.logits(), 1, 4)
+            var list<cache.KVCache> state ← block.layers()
+            var int position ← 4
+            var list<int> tokens ← empty
+            var list<int> history ← empty
+            var bool finished ← false
+            while tokens.length() ≺ g.max_tokens() and not finished {
+                var sampling.Sampler outcome ← sampling.default()
+                do {
+                    outcome ← sampling.sample(last, drawn, history, rng)
+                }
+                catch err {
+                    assert false
+                }
+                const int token ← outcome.token_id()
+                tokens.append(token)
+                history.append(token)
+                rng ← outcome.seed()
+                if tokenizer.is_eog(token) {
+                    finished ← true
+                }
+                else {
+                    if tokens.length() ≺ g.max_tokens() {
+                        var dense.DenseStep step ← dense.default_step()
+                        do {
+                            step ← dense.decode_step(u4_cfg(), u4_source(), token, position, U4_EPSILON, 0.5 ∷ f32, 2, u4_rope(), state)
+                        }
+                        catch err {
+                            assert false
+                        }
+                        last ← u4_row(step.logits(), 0, 4)
+                        state ← step.layers()
+                        position ← position + 1
+                    }
+                }
+            }
+            assert tokens ≡ cold_tokens
+        }
+        catch err {
+            assert false
+        }
+    }
+
+    test "continue_state composes the next prepared state identity (suffix extends the canonical prefix)" {
+        do {
+            const dense.DenseStep pref ← u4_prefill(ids2(1, 3), u4_layers())
+            const prepared_state.PreparedState s ← state_of(u4_ident(ids2(1, 3)), pref.layers(), slots_row())
+            const prepared_state.PreparedState snapshot ← prepared_state.copy_state(s)
+            const dense.DenseStep block ← u4_block(ids2(1, 3), pref.layers())
+            const prepared_state.PreparedState next ← prepared_state.continue_state(s, ids2(1, 3), block.layers())
+            assert next.identity().length() ≡ 4
+            assert next.identity().prefix() ≡ [1, 3, 1, 3]
+            assert next.identity().position_start() ≡ 0
+            assert next.identity().position_next() ≡ 4
+            assert prepared_state.prepared_identity_equal(next.identity(), u4_ident(ids4(1, 3, 1, 3)))
+            assert next.declared_slot_count() ≡ s.declared_slot_count()
+            assert next.generation() ≡ s.generation()
+            assert prepared_state.state_equal(s, snapshot)
+            assert not prepared_state.state_equal(next, s)
+            assert next.layer_count() ≡ 1
+        }
+        catch err {
+            assert false
+        }
+    }
+
+    test "continue_state next identity round-trips the versioned wire" {
+        do {
+            const dense.DenseStep pref ← u4_prefill(ids2(1, 3), u4_layers())
+            const prepared_state.PreparedState s ← state_of(u4_ident(ids2(1, 3)), pref.layers(), slots_row())
+            const dense.DenseStep block ← u4_block(ids2(1, 3), pref.layers())
+            const prepared_state.PreparedState next ← prepared_state.continue_state(s, ids2(1, 3), block.layers())
+            const prepared_state.PreparedIdentity decoded ← prepared_state.deserialize_identity(prepared_state.serialize_identity(next.identity()))
+            assert prepared_state.prepared_identity_equal(next.identity(), decoded)
+            const prepared_state.PreparedState bound ← prepared_state.bind_payload(next, u4_ident(ids4(1, 3, 1, 3)))
+            assert prepared_state.state_equal(bound, next)
+        }
+        catch err {
+            assert false
+        }
+    }
+
+    test "continue_state returned state is an independent value (copy independence)" {
+        do {
+            const dense.DenseStep pref ← u4_prefill(ids2(1, 3), u4_layers())
+            const prepared_state.PreparedState s ← state_of(u4_ident(ids2(1, 3)), pref.layers(), slots_row())
+            const dense.DenseStep block ← u4_block(ids2(1, 3), pref.layers())
+            const prepared_state.PreparedState next ← prepared_state.continue_state(s, ids2(1, 3), block.layers())
+            const prepared_state.PreparedState copied ← prepared_state.copy_state(next)
+            const prepared_state.PreparedState next_snapshot ← prepared_state.copy_state(next)
+            assert prepared_state.state_equal(copied, next)
+            var list<cache.KVCache> grown ← copied.kv_layers()
+            grown.append(cache.default())
+            assert next.layer_count() ≡ 1
+            assert prepared_state.state_equal(next, next_snapshot)
+        }
+        catch err {
+            assert false
+        }
+    }
+
+    test "continue_state rejects fail-closed (empty suffix, layer count, cache identity, non-extending payload)" {
+        do {
+            const dense.DenseStep pref ← u4_prefill(ids2(1, 3), u4_layers())
+            const prepared_state.PreparedState s ← state_of(u4_ident(ids2(1, 3)), pref.layers(), slots_row())
+            const dense.DenseStep block ← u4_block(ids2(1, 3), pref.layers())
+            const prepared_state.PreparedState snapshot ← prepared_state.copy_state(s)
+            # Empty suffix.
+            assert continue_detail(s, no_ids(), block.layers()) ≡ "continuation suffix must be non-empty"
+            # Layer count mismatch (the block payload plus an extra layer).
+            var list<cache.KVCache> extra ← block.layers()
+            extra.append(cache.default())
+            assert continue_detail(s, ids2(1, 3), extra) ≡ "continuation layer count does not match the prepared state"
+            # Payload does not extend the prepared prefix (the base layers
+            # themselves: right identity, unextended).
+            assert continue_detail(s, ids2(1, 3), pref.layers()) ≡ "continuation payload does not extend the prepared prefix"
+            # A layer with a different cache identity never continues.
+            var cache.KVCache other ← cache.default()
+            var list<int> full ← empty
+            full.append(1)
+            full.append(3)
+            full.append(1)
+            full.append(3)
+            do {
+                const cache.KVCache base ← cache.empty_cache(U4_MODEL, U4_MODEL_VERSION, "causal-rope-d8", U4_TOKENIZER, 1, 4)
+                other ← cache.extend(base, full, hold([0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1], [4, 4]), hold([0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2], [4, 4]))
+            }
+            catch err {
+                assert false
+            }
+            var list<cache.KVCache> foreign ← empty
+            foreign.append(other)
+            assert continue_detail(s, ids2(1, 3), foreign) ≡ "continuation layers do not share the prepared cache identity"
+            # Every reject leaves the input snapshot unchanged.
+            assert prepared_state.state_equal(s, snapshot)
+        }
+        catch err {
+            assert false
+        }
     }
 }
