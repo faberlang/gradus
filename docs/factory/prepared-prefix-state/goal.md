@@ -1,6 +1,6 @@
 # GOAL: prepared-prefix-state — device-neutral prepared state for exact-prefix continuation
 
-**Status**: planned — pre-implementation; goal-checked 2026-08-23 against live code (every code claim re-verified); delivery lowered in [`delivery.md`](delivery.md)
+**Status**: active — DENSE SPINE COMPLETE: PP-U1 5f1ad4d, U2 398545d, U3a 4ad5621, U3b 68f58c3, U4a 50fe7e8 (cold-vs-warm equivalence proven at 1e-5); U5 truth pass gated on U4b (hybrid, blocked MODEL-03/04). Known non-blocker: radix-mir-runner textus.get carrier divergence (fix 4baa3f09 in flight) explains tokenizer red (2026-08-23)
 **Created**: 2026-08-21
 **Campaign:** `speculative-decode`
 **Source:** operator expansion of the SD5 boundary, grounded in the live Gradus cache/decode surface and PML MODEL-01–04 composition contracts
