@@ -654,3 +654,181 @@ test "admission all-match passes and every reject leaves the input snapshot unch
         assert false
     }
 }
+
+# ---- PP-U3b: longest-prefix attach (selection, tie, independent
+# continuation)
+#
+# Proves, at compile level:
+#   * the longest EXACT prefix of the request's canonical token
+#     sequence beats shorter attachable candidates (identity-component
+#     and non-prefix candidates are skipped, never fatal);
+#   * equal-length ties resolve deterministically — the lowest declared
+#     source order wins, repeatably (same inputs → same selection);
+#   * the returned continuation state is independent — mutating its
+#     payload/slot lists leaves the candidate snapshot equal
+#     (PP-U2 state_equal);
+#   * the consumed prefix length is exact (≡ the continuation
+#     identity's own prefix length);
+#   * no admissible candidate rejects typed, and every reject leaves
+#     the input snapshots unchanged.
+
+fn ids3(int a, int b, int c) → list<int> {
+    var list<int> l ← empty
+    l.append(a)
+    l.append(b)
+    l.append(c)
+    return l
+}
+
+# One KV layer carrying the given accepted prefix.
+fn layers_one(list<int> tokens) → list<cache.KVCache> {
+    var list<cache.KVCache> l ← empty
+    l.append(layer_filled(tokens))
+    return l
+}
+
+# Two KV layers sharing the given accepted prefix.
+fn layers_pair(list<int> tokens) → list<cache.KVCache> {
+    var list<cache.KVCache> l ← empty
+    l.append(layer_filled(tokens))
+    l.append(layer_filled(tokens))
+    return l
+}
+
+# A candidate prepared state: the given canonical prefix, payload
+# layers, and the canonical declared-slot row.
+fn candidate_of(list<int> tokens, list<cache.KVCache> layers) → prepared_state.PreparedState {
+    return state_of(ident(tokens, "deadbeef", 0), layers, slots_row())
+}
+
+# The declared candidate list (caller-supplied authorized order).
+fn candidates2(prepared_state.PreparedState a, prepared_state.PreparedState b) → list<prepared_state.PreparedState> {
+    var list<prepared_state.PreparedState> l ← empty
+    l.append(a)
+    l.append(b)
+    return l
+}
+
+fn candidates3(prepared_state.PreparedState a, prepared_state.PreparedState b, prepared_state.PreparedState c) → list<prepared_state.PreparedState> {
+    var list<prepared_state.PreparedState> l ← empty
+    l.append(a)
+    l.append(b)
+    l.append(c)
+    return l
+}
+
+# Renders an attach outcome as text.
+fn attach_detail(list<prepared_state.PreparedState> candidates, prepared_state.PreparedIdentity request) → string {
+    do {
+        prepared_state.attach(candidates, request)
+        return "ok"
+    }
+    catch err {
+        return prepared_state.message(err)
+    }
+}
+
+test "attach selects the longest exact prefix among attachable candidates" {
+    do {
+        # Request canonical sequence [5, 2, 7]; candidates carry [5],
+        # [5, 2] (the longest exact prefix), and [5, 3] (not a prefix).
+        const prepared_state.PreparedIdentity request ← ident(ids3(5, 2, 7), "deadbeef", 0)
+        const prepared_state.PreparedState short ← candidate_of(ids1(5), layers_one(ids1(5)))
+        const prepared_state.PreparedState longest ← candidate_of(ids2(5, 2), layers_pair(ids2(5, 2)))
+        const prepared_state.PreparedState not_prefix ← candidate_of(ids2(5, 3), layers_pair(ids2(5, 3)))
+        # The shorter candidate declared first does NOT win; the
+        # non-prefix candidate in the middle is skipped.
+        const prepared_state.AttachResult r ← prepared_state.attach(candidates3(short, not_prefix, longest), request)
+        assert r.consumed() ≡ 2
+        assert prepared_state.state_equal(r.state(), longest)
+        assert r.state().identity().length() ≡ 2
+        assert r.state().identity().position_next() ≡ 2
+        assert r.state().generation() ≡ 1
+        # The shortest attachable candidate still wins when it is the
+        # sole_row attachable one.
+        const prepared_state.AttachResult sole_row ← prepared_state.attach(candidates2(not_prefix, short), request)
+        assert sole_row.consumed() ≡ 1
+        assert prepared_state.state_equal(sole_row.state(), short)
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "attach resolves equal-length ties deterministically (lowest declared source order)" {
+    do {
+        # Two attachable candidates with the SAME exact prefix [5, 2]
+        # but distinguishable payloads (two KV layers vs one).
+        const prepared_state.PreparedIdentity request ← ident(ids3(5, 2, 7), "deadbeef", 0)
+        const prepared_state.PreparedState pair ← candidate_of(ids2(5, 2), layers_pair(ids2(5, 2)))
+        const prepared_state.PreparedState single ← candidate_of(ids2(5, 2), layers_one(ids2(5, 2)))
+        # Lowest declared order wins — repeatably.
+        const prepared_state.AttachResult first ← prepared_state.attach(candidates2(pair, single), request)
+        assert first.consumed() ≡ 2
+        assert first.state().layer_count() ≡ 2
+        const prepared_state.AttachResult repeat ← prepared_state.attach(candidates2(pair, single), request)
+        assert repeat.state().layer_count() ≡ 2
+        assert prepared_state.state_equal(repeat.state(), first.state())
+        # Declared order decides: the same two candidates reversed
+        # select the other one.
+        const prepared_state.AttachResult flipped ← prepared_state.attach(candidates2(single, pair), request)
+        assert flipped.state().layer_count() ≡ 1
+        assert prepared_state.state_equal(flipped.state(), single)
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "attach returns an independent continuation state and the exact consumed length" {
+    do {
+        const prepared_state.PreparedIdentity request ← ident(ids3(5, 2, 7), "deadbeef", 0)
+        const prepared_state.PreparedState best ← candidate_of(ids2(5, 2), layers_pair(ids2(5, 2)))
+        const prepared_state.PreparedState snapshot ← prepared_state.copy_state(best)
+        const prepared_state.AttachResult r ← prepared_state.attach(candidates2(best, best), request)
+        # The consumed length is exact and binds the continuation's own
+        # canonical identity.
+        assert r.consumed() ≡ 2
+        assert r.consumed() ≡ r.state().identity().length()
+        assert r.state().identity().position_next() ≡ r.state().identity().position_start() + r.consumed()
+        # Mutate the returned continuation's payload and slot lists; the
+        # candidate snapshot stays equal (immutable snapshot).
+        var list<cache.KVCache> grown ← r.state().kv_layers()
+        grown.append(layer_filled(ids1(9)))
+        var list<prepared_state.DeclaredStateSlot> more ← r.state().declared_slots()
+        more.append(slot(prepared_state.state_family_ssm(), 11))
+        assert r.state().layer_count() ≡ 3
+        assert r.state().declared_slot_count() ≡ 3
+        assert prepared_state.state_equal(best, snapshot)
+        assert not prepared_state.state_equal(r.state(), best)
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "attach rejects typed when no candidate is attachable and leaves snapshots unchanged" {
+    do {
+        const prepared_state.PreparedIdentity request ← ident(ids3(5, 2, 7), "deadbeef", 0)
+        # [2, 5] and [5, 3] share no exact prefix with the request; a
+        # different model never attaches either.
+        const prepared_state.PreparedState scrambled ← candidate_of(ids2(2, 5), layers_pair(ids2(2, 5)))
+        const prepared_state.PreparedState diverged ← candidate_of(ids2(5, 3), layers_pair(ids2(5, 3)))
+        const prepared_state.PreparedState other_model ← state_of(ident_full("other-mlp", "1.0.0", "causal-rope-d4", tok_row(), ids1(5), "deadbeef", 0), layers_one(ids1(5)), slots_row())
+        const list<prepared_state.PreparedState> rejected_set ← candidates3(scrambled, diverged, other_model)
+        assert attach_detail(rejected_set, request) ≡ "attach found no prepared prefix of the request"
+        # Empty declared candidate list rejects typed.
+        var list<prepared_state.PreparedState> empty_set ← empty
+        assert attach_detail(empty_set, request) ≡ "attach requires at least one declared candidate"
+        # Every reject leaves the input snapshots unchanged.
+        const prepared_state.PreparedState scrambled_snapshot ← prepared_state.copy_state(scrambled)
+        const prepared_state.PreparedState diverged_snapshot ← prepared_state.copy_state(diverged)
+        const prepared_state.PreparedState other_model_snapshot ← prepared_state.copy_state(other_model)
+        assert prepared_state.state_equal(scrambled, scrambled_snapshot)
+        assert prepared_state.state_equal(diverged, diverged_snapshot)
+        assert prepared_state.state_equal(other_model, other_model_snapshot)
+    }
+    catch err {
+        assert false
+    }
+}
