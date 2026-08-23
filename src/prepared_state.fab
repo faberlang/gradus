@@ -1,13 +1,15 @@
 +++
 locale = "en"
 +++
-# Canonical prepared identity — PP-U1 (prepared-prefix-state spine, SD5).
-# The first unit of the goal: the typed record that NAMES a prepared
-# prefix state. PP-U2 adds the typed prepared payload and binding, PP-U3
-# the attach/continue operations — both land in this same leaf later.
+# Canonical prepared identity + typed prepared state — PP-U1/PP-U2
+# (prepared-prefix-state spine, SD5). PP-U1 names a prepared prefix state
+# (the canonical identity); PP-U2 adds the typed prepared payload and its
+# binding below. PP-U3 adds the attach/continue operations in this same
+# leaf later.
 #
 # Public import: import from "gradus:prepared_state" prepared_state
-# Depends on: gradus:tokenizer (the typed tokenizer identity component).
+# Depends on: gradus:tokenizer (the typed tokenizer identity component),
+#   gradus:cache (the dense KV payload family — list<kv.KVCache>).
 #
 # Extends the CacheIdentity precedent (cache.fab:505-632) without editing
 # it: a versioned typed record, field-wise equality, a versioned wire
@@ -53,6 +55,8 @@ locale = "en"
 
 import from "gradus:tokenizer" tokenizer
 
+import from "gradus:cache" kv
+
 # The prepared identity wire schema version.
 const string identity_schema_version ← "1.0.0"
 
@@ -72,6 +76,9 @@ union PreparedStateError {
     },
     InvalidIdentity {
         string message
+    },
+    PayloadMismatch {
+        string message
     }
 }
 
@@ -85,6 +92,9 @@ fn message(PreparedStateError e) → string {
             return message
         }
         case InvalidIdentity const message {
+            return message
+        }
+        case PayloadMismatch const message {
             return message
         }
     }
@@ -350,4 +360,278 @@ fn deserialize_identity(string wire) → PreparedIdentity ⇥ PreparedStateError
     }
     require position_next ≡ position_start + prefix.length() throw variant BadWire {message = "inconsistent consumed range in prepared identity wire"}
     return construct(model, model_version, config, tok, prefix, digest, position_start)
+}
+
+# =========================================================================
+# PP-U2 — typed prepared state (dense KV + architecture-declared state
+# families) and payload binding.
+#
+# The complete prepared-state VALUE: the PP-U1 canonical identity plus
+# the dense KV payload (the list<kv.KVCache> / KVCheckpoint family —
+# per-layer caches sharing one cache identity and one accepted prefix)
+# plus architecture-DECLARED slot families for recurrent / SSM / conv
+# state. The declarations carry NO state: no shape, no tensor, no math —
+# MODEL-03 (M3-U2) owns the executed state design; hybrid payloads
+# populate these slots when that lands (PP-U4b). The dense payload is
+# fully constructible today (an empty declaration list is valid).
+#
+# Semantics:
+#   * reset mirrors kv.KVCache.reset — payload cleared, identity and
+#     capacity retained, generation advanced by 1 (per-layer caches
+#     reset the same way);
+#   * copy gives value independence — the copied state owns fresh
+#     payload/slot lists, so mutating the copy never touches the
+#     original;
+#   * payload binding covers canonical identity plus payload
+#     shape/content — layers must share one cache identity and one
+#     generation, carry exactly the identity's position count, and hold
+#     exactly the canonical token history; any mismatch rejects typed
+#     (PayloadMismatch) before any attach exists to consume it.
+#
+# Same architectural rule as PP-U1: no registry, no retention, no auth,
+# no tenant, no device handle, no hidden global; no model/dense/
+# generation import.
+# =========================================================================
+
+# The three declared state families. Names only — deliberately not an
+# enum and not shaped: MODEL-03's typed state values (M3-U2) remain the
+# sole design authority for what each family carries.
+@ public { }
+fn state_family_recurrent() → string {
+    return "recurrent"
+}
+
+@ public { }
+fn state_family_ssm() → string {
+    return "ssm"
+}
+
+@ public { }
+fn state_family_conv() → string {
+    return "conv"
+}
+
+@ private { }
+fn _known_state_family(string family) → bool {
+    return ((family ≡ state_family_recurrent() or family ≡ state_family_ssm()) or family ≡ state_family_conv())
+}
+
+# -------------------------------------------------------------------------
+# DeclaredStateSlot — one architecture-declared state-family slot.
+# Family name + layer index; nothing else. Declared only (see above).
+# -------------------------------------------------------------------------
+
+@ public { }
+class DeclaredStateSlot {
+    string family
+    int layer
+
+    # The declared family name (recurrent / ssm / conv).
+    fn family() → string {
+        return self.family
+    }
+
+    # The declared layer index that will carry the family's state.
+    fn layer() → int {
+        return self.layer
+    }
+}
+
+# -------------------------------------------------------------------------
+# PreparedState — the complete typed prepared-state value (PP-U2).
+# Immutable value; accessors plus the reset/copy/bind operations below.
+# generation starts at 1 and advances on reset (the KVCache.version
+# mirror at the whole-state level).
+# -------------------------------------------------------------------------
+
+@ public { }
+class PreparedState {
+    PreparedIdentity identity
+    list<kv.KVCache> kv_layers
+    list<DeclaredStateSlot> declared_slots
+    int generation
+
+    # The canonical prepared identity (PP-U1).
+    fn identity() → PreparedIdentity {
+        return self.identity
+    }
+
+    # The dense KV payload — one cache per layer (the KVCheckpoint family).
+    fn kv_layers() → list<kv.KVCache> {
+        return self.kv_layers
+    }
+
+    # Payload layer count.
+    fn layer_count() → int {
+        return self.kv_layers.length()
+    }
+
+    # The architecture-declared state-family slots (declared only).
+    fn declared_slots() → list<DeclaredStateSlot> {
+        return self.declared_slots
+    }
+
+    # Declared slot count.
+    fn declared_slot_count() → int {
+        return self.declared_slots.length()
+    }
+
+    # Whole-state generation (starts 1; advances on reset).
+    fn generation() → int {
+        return self.generation
+    }
+}
+
+# -------------------------------------------------------------------------
+# Private copy/equality helpers (the cache_branch pattern).
+# -------------------------------------------------------------------------
+
+@ private { }
+fn _copy_kv_layers(list<kv.KVCache> layers) → list<kv.KVCache> {
+    var list<kv.KVCache> out ← empty
+    for from layers const layer {
+        out.append(layer)
+    }
+    return out
+}
+
+@ private { }
+fn _copy_slots(list<DeclaredStateSlot> slots) → list<DeclaredStateSlot> {
+    var list<DeclaredStateSlot> out ← empty
+    for from slots const slot {
+        out.append(slot)
+    }
+    return out
+}
+
+@ private { }
+fn _slot_list_equal(list<DeclaredStateSlot> a, list<DeclaredStateSlot> b) → bool {
+    if a.length() ≠ b.length() then return false
+    for range 0‥a.length() const i {
+        const DeclaredStateSlot left ← a.get(i) coalesce DeclaredStateSlot {family = "", layer = 0-1}
+        const DeclaredStateSlot right ← b.get(i) coalesce DeclaredStateSlot {family = "", layer = 0-1}
+        if left.family() ≠ right.family() then return false
+        if left.layer() ≠ right.layer() then return false
+    }
+    return true
+}
+
+# Payload shape/content validation against one canonical identity: at
+# least one layer, all layers share one cache identity and one
+# generation, every layer carries exactly the identity's position count
+# (shape), and every layer's token history is exactly the canonical
+# prefix (content).
+@ private { }
+fn _payload_matches(PreparedIdentity i, list<kv.KVCache> layers) → bool ⇥ PreparedStateError {
+    require layers.length() ≥ 1 throw variant PayloadMismatch {message = "prepared state requires at least one KV layer"}
+    const kv.KVCache first ← layers.get(0) coalesce kv.default()
+    const kv.CacheIdentity identity ← kv.cache_identity(first)
+    for from layers const layer {
+        require kv.cache_identity_equal(kv.cache_identity(layer), identity) throw variant PayloadMismatch {message = "prepared state layers do not share one cache identity"}
+        require layer.version() ≡ first.version() throw variant PayloadMismatch {message = "prepared state layers do not share one generation"}
+        require layer.length() ≡ i.length() throw variant PayloadMismatch {message = "payload position count does not match the prepared identity"}
+        require _prefix_equal(i.prefix(), layer.history()) throw variant PayloadMismatch {message = "payload token history does not match the prepared identity"}
+    }
+    return true
+}
+
+# -------------------------------------------------------------------------
+# construct_state — the fail-closed prepared-state admission. The KV
+# payload must bind the canonical identity (shape + content, above);
+# declared slots must name a known family, a non-negative layer, and no
+# duplicate (family, layer) pair. The state copies its payload and slot
+# lists so caller-owned lists are never aliased.
+# -------------------------------------------------------------------------
+
+@ public { }
+fn construct_state(PreparedIdentity i, list<kv.KVCache> layers, list<DeclaredStateSlot> slots) → PreparedState ⇥ PreparedStateError {
+    _payload_matches(i, layers)
+    for from slots const slot {
+        require _known_state_family(slot.family()) throw variant PayloadMismatch {message = "unknown declared state family"}
+        require slot.layer() ≥ 0 throw variant PayloadMismatch {message = "declared state slot layer below zero"}
+    }
+    for range 0‥slots.length() const a {
+        for range 0‥slots.length() const b {
+            if a ≠ b {
+                const DeclaredStateSlot left ← slots.get(a) coalesce DeclaredStateSlot {family = "", layer = 0-1}
+                const DeclaredStateSlot right ← slots.get(b) coalesce DeclaredStateSlot {family = "", layer = 0-1}
+                require (left.family() ≠ right.family()) or (left.layer() ≠ right.layer()) throw variant PayloadMismatch {message = "duplicate declared state slot"}
+            }
+        }
+    }
+    return PreparedState {identity = i, kv_layers = _copy_kv_layers(layers), declared_slots = _copy_slots(slots), generation = 1}
+}
+
+# -------------------------------------------------------------------------
+# state_equal — field-wise value equality over identity, payload,
+# declared slots, and generation (the PP-U2 equality PP-U3b's
+# immutability rows consume).
+# -------------------------------------------------------------------------
+
+@ public { }
+fn state_equal(PreparedState a, PreparedState b) → bool {
+    if a.generation() ≠ b.generation() then return false
+    if not prepared_identity_equal(a.identity(), b.identity()) then return false
+    if a.kv_layers().length() ≠ b.kv_layers().length() then return false
+    for range 0‥a.kv_layers().length() const i {
+        const kv.KVCache left ← a.kv_layers().get(i) coalesce kv.default()
+        const kv.KVCache right ← b.kv_layers().get(i) coalesce kv.default()
+        if not kv.cache_equal(left, right) then return false
+    }
+    if not _slot_list_equal(a.declared_slots(), b.declared_slots()) then return false
+    return true
+}
+
+# -------------------------------------------------------------------------
+# copy_state — value independence. The copy owns fresh payload and slot
+# lists (identity and per-layer cache values are never mutated in
+# place anywhere in this family), so mutating the copy's lists leaves
+# the original equal to itself.
+# -------------------------------------------------------------------------
+
+@ public { }
+fn copy_state(PreparedState s) → PreparedState {
+    return PreparedState {identity = s.identity(), kv_layers = _copy_kv_layers(s.kv_layers()), declared_slots = _copy_slots(s.declared_slots()), generation = s.generation()}
+}
+
+# -------------------------------------------------------------------------
+# reset_state — the KVCache.reset mirror at the whole-state level: every
+# KV layer resets (empty history, empty K/V, identity and immutable
+# capacity retained, per-layer generation advanced), declared slots are
+# retained (architecture facts, not payload), the canonical identity is
+# retained, and the whole-state generation advances by 1. The cleared
+# payload therefore no longer binds the retained identity — binding the
+# reset state against that identity rejects typed (below), which is the
+# intended post-reset contract.
+# -------------------------------------------------------------------------
+
+@ public { }
+fn reset_state(PreparedState s) → PreparedState ⇥ PreparedStateError {
+    var list<kv.KVCache> cleared ← empty
+    for from s.kv_layers() const layer {
+        var kv.KVCache fresh ← kv.default()
+        do {
+            fresh ← kv.reset(layer)
+        }
+        catch err {
+            throw variant PayloadMismatch {message = "prepared KV layer failed to reset"}
+        }
+        cleared.append(fresh)
+    }
+    return PreparedState {identity = s.identity(), kv_layers = cleared, declared_slots = _copy_slots(s.declared_slots()), generation = s.generation() + 1}
+}
+
+# -------------------------------------------------------------------------
+# bind_payload — the payload binding (PP-U2): bind a prepared state to a
+# request's canonical identity. Rejects typed BEFORE any attach exists to
+# consume it when (a) the canonical identity does not match the request,
+# or (b) the payload's shape/content does not match the identity. On
+# success the state is returned unchanged (bound).
+# -------------------------------------------------------------------------
+
+@ public { }
+fn bind_payload(PreparedState s, PreparedIdentity request) → PreparedState ⇥ PreparedStateError {
+    require prepared_identity_equal(s.identity(), request) throw variant PayloadMismatch {message = "prepared identity does not match the bind request"}
+    _payload_matches(request, s.kv_layers())
+    return s
 }

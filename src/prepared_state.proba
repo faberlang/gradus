@@ -32,6 +32,10 @@ import from "gradus:prepared_state" prepared_state
 
 import from "gradus:tokenizer" tokenizer
 
+import from "gradus:cache" cache
+
+import from "gradus:tensor" tensor
+
 # ---- pinned-row fixture facts (the tokenizer.proba pattern)
 
 const string F_SCHEMA ← "1.0.0"
@@ -237,4 +241,329 @@ test "identity wire rejects malformed input fail-closed" {
     assert deserialize_detail("prepared-state/identity/1.0.0|tiny-mlp|1.0.0|causal-rope-d4|1.0.0|gpt2|smollm||0,2|true|true|5,2|deadbeef|0|2") ≡ "empty tokenizer vocabulary digest in prepared identity wire"
     assert deserialize_detail("prepared-state/identity/1.0.0|tiny-mlp|1.0.0|causal-rope-d4|1.0.0|gpt2|smollm|" + F_VOCAB + "|0,2|true|true|5,2|deadbeef|0|3") ≡ "inconsistent consumed range in prepared identity wire"
     assert deserialize_detail("prepared-state/identity/1.0.0|tiny-mlp|1.0.0|causal-rope-d4|1.0.0|gpt2|smollm|" + F_VOCAB + "|0,2|true|true|5,2|deadbeef|x|2") ≡ "malformed start position in prepared identity wire"
+}
+
+# ---- PP-U2: typed prepared state (KV payload + declared families + binding)
+#
+# Proves, at compile level:
+#   * construction of a dense payload (list<kv.KVCache> — the
+#     KVCheckpoint family) plus architecture-declared slot families for
+#     recurrent/SSM/conv (DECLARED only — no state payload, shape, or
+#     math; MODEL-03 owns the executed state design);
+#   * reset mirrors KVCache.reset — payload cleared, identity and
+#     immutable capacity retained, generation advanced;
+#   * copy gives value independence — mutating the copy's payload/slot
+#     lists leaves the original equal;
+#   * payload binding (identity + payload shape/content) rejects typed
+#     on mismatch — identity mismatch, shape mismatch (a reset state
+#     against its retained identity), and content mismatch (at
+#     construction: same length, different tokens).
+
+# The staged-tensor builder (the cache.proba pattern).
+fn hold(list<f32> data, list<int> shape) → tensor.Tensor {
+    var tensor.Tensor t ← tensor.default()
+    do {
+        t ← tensor.construct(data, shape)
+    }
+    catch err {
+        return t
+    }
+    return t
+}
+
+# One fresh empty KV layer (model "tiny-mlp", version "1.0.0", config
+# "causal-rope-d4", tokenizer "smollm", 1 layer, dim 4).
+fn layer_empty() → cache.KVCache {
+    var cache.KVCache c ← cache.default()
+    do {
+        c ← cache.empty_cache("tiny-mlp", "1.0.0", "causal-rope-d4", "smollm", 1, 4)
+    }
+    catch err {
+        return c
+    }
+    return c
+}
+
+# One KV layer filled in a single extend write (generation 2).
+fn layer_filled(list<int> tokens) → cache.KVCache {
+    var cache.KVCache c ← layer_empty()
+    do {
+        if tokens.length() ≡ 1 {
+            c ← cache.extend(layer_empty(), tokens, hold([1.0, 0.5, 0.2, 0.25], [1, 4]), hold([0.1, 0.2, 0.3, 0.4], [1, 4]))
+        }
+        if tokens.length() ≡ 2 {
+            c ← cache.extend(layer_empty(), tokens, hold([1.0, 0.5, 0.2, 0.25, 2.0, 2.5, 2.2, 2.75], [2, 4]), hold([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8], [2, 4]))
+        }
+    }
+    catch err {
+        return c
+    }
+    return c
+}
+
+# The same accepted prefix reached in TWO extend writes (same history,
+# same identity — generation 3): the per-layer generation mismatch row.
+fn layer_two_step() → cache.KVCache {
+    var cache.KVCache c ← layer_empty()
+    do {
+        const cache.KVCache first ← cache.append(layer_empty(), 5, hold([1.0, 0.5, 0.2, 0.25], [1, 4]), hold([0.1, 0.2, 0.3, 0.4], [1, 4]))
+        c ← cache.append(first, 2, hold([2.0, 2.5, 2.2, 2.75], [1, 4]), hold([0.5, 0.6, 0.7, 0.8], [1, 4]))
+    }
+    catch err {
+        return c
+    }
+    return c
+}
+
+# A KV layer with a DIFFERENT execution config (identity mismatch row).
+fn layer_other_config() → cache.KVCache {
+    var cache.KVCache c ← cache.default()
+    do {
+        const cache.KVCache base ← cache.empty_cache("tiny-mlp", "1.0.0", "causal-rope-d8", "smollm", 1, 4)
+        c ← cache.extend(base, ids2(5, 2), hold([1.0, 0.5, 0.2, 0.25, 2.0, 2.5, 2.2, 2.75], [2, 4]), hold([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8], [2, 4]))
+    }
+    catch err {
+        return c
+    }
+    return c
+}
+
+# One declared slot.
+fn slot(string family, int layer) → prepared_state.DeclaredStateSlot {
+    return prepared_state.DeclaredStateSlot {family = family, layer = layer}
+}
+
+fn no_slots() → list<prepared_state.DeclaredStateSlot> {
+    var list<prepared_state.DeclaredStateSlot> l ← empty
+    return l
+}
+
+# The canonical declared-slot row (recurrent at layer 3, conv at 7).
+fn slots_row() → list<prepared_state.DeclaredStateSlot> {
+    var list<prepared_state.DeclaredStateSlot> l ← empty
+    l.append(slot(prepared_state.state_family_recurrent(), 3))
+    l.append(slot(prepared_state.state_family_conv(), 7))
+    return l
+}
+
+# Two dense KV layers sharing the [5, 2] accepted prefix.
+fn layers_dense() → list<cache.KVCache> {
+    var list<cache.KVCache> l ← empty
+    l.append(layer_filled(ids2(5, 2)))
+    l.append(layer_filled(ids2(5, 2)))
+    return l
+}
+
+# The canonical prepared state: identity prefix [5, 2], digest
+# "deadbeef", two KV layers, recurrent+conv slots declared.
+fn state_dense() → prepared_state.PreparedState {
+    var prepared_state.PreparedState s ← prepared_state.PreparedState {identity = ident(no_ids(), "", 0), kv_layers = empty, declared_slots = no_slots(), generation = 0}
+    do {
+        s ← prepared_state.construct_state(ident(ids2(5, 2), "deadbeef", 0), layers_dense(), slots_row())
+    }
+    catch err {
+        return s
+    }
+    return s
+}
+
+# Renders a state-construction outcome as the constructed state (the
+# ident_full fallback pattern — a rejected row returns the placeholder).
+fn state_of(prepared_state.PreparedIdentity i, list<cache.KVCache> layers, list<prepared_state.DeclaredStateSlot> slots) → prepared_state.PreparedState {
+    var prepared_state.PreparedState s ← prepared_state.PreparedState {identity = ident(no_ids(), "", 0), kv_layers = empty, declared_slots = no_slots(), generation = 0}
+    do {
+        s ← prepared_state.construct_state(i, layers, slots)
+    }
+    catch err {
+        return s
+    }
+    return s
+}
+
+# Renders a state-construction outcome as text.
+fn construct_state_detail(prepared_state.PreparedIdentity i, list<cache.KVCache> layers, list<prepared_state.DeclaredStateSlot> slots) → string {
+    do {
+        prepared_state.construct_state(i, layers, slots)
+        return "ok"
+    }
+    catch err {
+        return prepared_state.message(err)
+    }
+}
+
+# Renders a payload-binding outcome as text.
+fn bind_detail(prepared_state.PreparedState s, prepared_state.PreparedIdentity request) → string {
+    do {
+        prepared_state.bind_payload(s, request)
+        return "ok"
+    }
+    catch err {
+        return prepared_state.message(err)
+    }
+}
+
+test "state construct pins the canonical dense payload and declared slot families" {
+    do {
+        const prepared_state.PreparedState s ← state_dense()
+        assert s.identity().model() ≡ "tiny-mlp"
+        assert s.identity().position_next() ≡ 2
+        assert s.layer_count() ≡ 2
+        const cache.KVCache layer0 ← s.kv_layers().get(0) coalesce cache.default()
+        assert layer0.length() ≡ 2
+        assert layer0.history() ≡ [5, 2]
+        assert layer0.version() ≡ 2
+        assert layer0.dimension() ≡ 4
+        assert layer0.capacity() ≡ 2048
+        assert s.declared_slot_count() ≡ 2
+        const prepared_state.DeclaredStateSlot first ← s.declared_slots().get(0) coalesce slot("", 0-1)
+        assert first.family() ≡ prepared_state.state_family_recurrent()
+        assert first.layer() ≡ 3
+        const prepared_state.DeclaredStateSlot second ← s.declared_slots().get(1) coalesce slot("", 0-1)
+        assert second.family() ≡ prepared_state.state_family_conv()
+        assert second.layer() ≡ 7
+        assert s.generation() ≡ 1
+        # A dense payload with an EMPTY declaration list is fully valid today.
+        const prepared_state.PreparedState dense_only ← state_of(ident(ids2(5, 2), "deadbeef", 0), layers_dense(), no_slots())
+        assert dense_only.declared_slot_count() ≡ 0
+        assert dense_only.layer_count() ≡ 2
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "state construct rejects payload and slot mismatch fail-closed" {
+    var list<cache.KVCache> empty_layers ← empty
+    # No KV layer at all.
+    assert construct_state_detail(ident(ids2(5, 2), "deadbeef", 0), empty_layers, no_slots()) ≡ "prepared state requires at least one KV layer"
+    # Payload shape: identity says one position, payload carries two.
+    assert construct_state_detail(ident(ids1(5), "deadbeef", 0), layers_dense(), no_slots()) ≡ "payload position count does not match the prepared identity"
+    # Payload content: same length, different canonical tokens ([2, 5] vs [5, 2]).
+    assert construct_state_detail(ident(ids2(2, 5), "deadbeef", 0), layers_dense(), no_slots()) ≡ "payload token history does not match the prepared identity"
+    # Layers do not share one cache identity (different execution config).
+    var list<cache.KVCache> mixed_identity ← empty
+    mixed_identity.append(layer_filled(ids2(5, 2)))
+    mixed_identity.append(layer_other_config())
+    assert construct_state_detail(ident(ids2(5, 2), "deadbeef", 0), mixed_identity, no_slots()) ≡ "prepared state layers do not share one cache identity"
+    # Layers do not share one generation (same history, two writes vs one).
+    var list<cache.KVCache> mixed_generation ← empty
+    mixed_generation.append(layer_filled(ids2(5, 2)))
+    mixed_generation.append(layer_two_step())
+    assert construct_state_detail(ident(ids2(5, 2), "deadbeef", 0), mixed_generation, no_slots()) ≡ "prepared state layers do not share one generation"
+    # Declared slot family must be one of the three declared names.
+    var list<prepared_state.DeclaredStateSlot> bad_family ← empty
+    bad_family.append(slot("attention", 1))
+    assert construct_state_detail(ident(ids2(5, 2), "deadbeef", 0), layers_dense(), bad_family) ≡ "unknown declared state family"
+    # Declared slot layer must be non-negative.
+    var list<prepared_state.DeclaredStateSlot> bad_layer ← empty
+    bad_layer.append(slot(prepared_state.state_family_ssm(), 0-1))
+    assert construct_state_detail(ident(ids2(5, 2), "deadbeef", 0), layers_dense(), bad_layer) ≡ "declared state slot layer below zero"
+    # No duplicate (family, layer) declaration.
+    var list<prepared_state.DeclaredStateSlot> duplicate ← empty
+    duplicate.append(slot(prepared_state.state_family_ssm(), 4))
+    duplicate.append(slot(prepared_state.state_family_ssm(), 4))
+    assert construct_state_detail(ident(ids2(5, 2), "deadbeef", 0), layers_dense(), duplicate) ≡ "duplicate declared state slot"
+}
+
+test "state equality is field-wise over identity, payload, slots, and generation" {
+    const prepared_state.PreparedState s ← state_dense()
+    assert prepared_state.state_equal(s, prepared_state.copy_state(s))
+    # Different payload layer count.
+    var list<cache.KVCache> one_layer ← empty
+    one_layer.append(layer_filled(ids2(5, 2)))
+    const prepared_state.PreparedState short ← state_of(ident(ids2(5, 2), "deadbeef", 0), one_layer, slots_row())
+    assert not prepared_state.state_equal(s, short)
+    # Different declared slots.
+    const prepared_state.PreparedState bare ← state_of(ident(ids2(5, 2), "deadbeef", 0), layers_dense(), no_slots())
+    assert not prepared_state.state_equal(s, bare)
+    # Different canonical content (identity and payload move together).
+    var list<cache.KVCache> other_layers ← empty
+    other_layers.append(layer_filled(ids2(2, 5)))
+    other_layers.append(layer_filled(ids2(2, 5)))
+    const prepared_state.PreparedState other ← state_of(ident(ids2(2, 5), "deadbeef", 0), other_layers, slots_row())
+    assert not prepared_state.state_equal(s, other)
+    # The lookup digest is passthrough: same payload, different digest → EQUAL.
+    const prepared_state.PreparedState redigested ← state_of(ident(ids2(5, 2), "feedface", 0), layers_dense(), slots_row())
+    assert prepared_state.state_equal(s, redigested)
+}
+
+test "state reset mirrors KVCache.reset (payload cleared, identity retained, generation advanced)" {
+    do {
+        const prepared_state.PreparedState s ← state_dense()
+        const prepared_state.PreparedState r ← prepared_state.reset_state(s)
+        assert r.generation() ≡ 2
+        assert prepared_state.prepared_identity_equal(r.identity(), s.identity())
+        assert r.layer_count() ≡ 2
+        assert r.declared_slot_count() ≡ 2
+        for range 0‥r.layer_count() const i {
+            const cache.KVCache before ← s.kv_layers().get(i) coalesce cache.default()
+            const cache.KVCache after ← r.kv_layers().get(i) coalesce cache.default()
+            assert after.length() ≡ 0
+            assert after.version() ≡ before.version() + 1
+            assert after.capacity() ≡ before.capacity()
+            assert after.dimension() ≡ before.dimension()
+            assert after.model() ≡ before.model()
+            assert after.key().shape() ≡ [0, 4]
+            assert after.payload().shape() ≡ [0, 4]
+        }
+        assert not prepared_state.state_equal(r, s)
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "state copy gives value independence" {
+    do {
+        const prepared_state.PreparedState s ← state_dense()
+        const prepared_state.PreparedState snapshot ← prepared_state.copy_state(s)
+        const prepared_state.PreparedState c ← prepared_state.copy_state(s)
+        assert prepared_state.state_equal(c, s)
+        # Mutate the copy's payload and slot lists; the original is untouched.
+        var list<cache.KVCache> grown ← c.kv_layers()
+        grown.append(layer_filled(ids1(9)))
+        var list<prepared_state.DeclaredStateSlot> more ← c.declared_slots()
+        more.append(slot(prepared_state.state_family_ssm(), 11))
+        assert c.layer_count() ≡ 3
+        assert c.declared_slot_count() ≡ 3
+        assert prepared_state.state_equal(s, snapshot)
+        assert not prepared_state.state_equal(c, s)
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "state payload binding accepts the matching request and rejects identity mismatch typed" {
+    do {
+        const prepared_state.PreparedState s ← state_dense()
+        const prepared_state.PreparedState bound ← prepared_state.bind_payload(s, ident(ids2(5, 2), "deadbeef", 0))
+        assert prepared_state.state_equal(bound, s)
+        # The lookup digest is never binding-authoritative either.
+        const prepared_state.PreparedState redigested ← prepared_state.bind_payload(s, ident(ids2(5, 2), "feedface", 0))
+        assert prepared_state.state_equal(redigested, s)
+    }
+    catch err {
+        assert false
+    }
+    const prepared_state.PreparedState s ← state_dense()
+    assert bind_detail(s, ident(ids2(5, 3), "deadbeef", 0)) ≡ "prepared identity does not match the bind request"
+    assert bind_detail(s, ident(ids1(5), "deadbeef", 0)) ≡ "prepared identity does not match the bind request"
+    assert bind_detail(s, ident(ids2(5, 2), "deadbeef", 1)) ≡ "prepared identity does not match the bind request"
+}
+
+test "state payload binding rejects shape/content mismatch typed" {
+    do {
+        const prepared_state.PreparedState s ← state_dense()
+        const prepared_state.PreparedState r ← prepared_state.reset_state(s)
+        # Reset retained the identity but cleared the payload: the payload
+        # no longer binds — shape rejects before anything could attach.
+        assert bind_detail(r, ident(ids2(5, 2), "deadbeef", 0)) ≡ "payload position count does not match the prepared identity"
+        # An empty-prefix request against the reset payload still rejects on
+        # identity (the retained identity owns [5, 2]).
+        assert bind_detail(r, ident(no_ids(), "", 0)) ≡ "prepared identity does not match the bind request"
+    }
+    catch err {
+        assert false
+    }
 }
