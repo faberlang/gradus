@@ -1,15 +1,16 @@
 +++
 locale = "en"
 +++
-# GEA1-U2 — two independently inspectable GEMV bodies.
+# GEA1-R1 — two independently inspectable GEMV device entries.
 #
 # Public import: import from "gradus:kernel" kernel
 # Depends on: gradus:dtype (DType tag and name predicate)
 #
-# The kernel module receives only typed resident views and an F32 activation
-# vector. It knows no Safetensors/GGUF format, path, container, Hub identity,
-# or physical device. The selected source range is admitted before a caller
-# constructs the view; this module checks only the declared range facts.
+# The host admission layer receives typed resident views and validates their
+# dtype, shape, byte range, and activation length before the device boundary.
+# The @ nucleum entries receive only shaped resident tensors and an output
+# view. They know no Safetensors/GGUF format, path, container, Hub identity,
+# or physical device.
 
 import from "gradus:dtype" dtype
 
@@ -152,94 +153,82 @@ fn f32_view(bytes payload, int absolute_start, int absolute_end, list<int> shape
     return F32View {dtype_tag = dtype.f32(), shape = shape, absolute_start = absolute_start, absolute_end = absolute_end, byte_length = payload.length(), payload = payload}
 }
 
-# 2^n for the BF16 exponent path. BF16 shares F32's exponent range, and the
-# returned value is widened to the F32 accumulation carrier.
-@ private { }
-fn _power_two(int n) → float {
-    var float result ← 1.0
-    if n ≥ 0 {
-        for range 0‥n const _ {
-            result ← result * 2.0
-        }
-    }
-    else {
-        for range n‥0 const _ {
-            result ← result / 2.0
-        }
-    }
-    return result
-}
-
-# Exact BF16 load expansion to the F32 value domain. This decoder belongs to
-# the BF16 body; the F32 body below has a separate four-byte F32 load.
-@ private { }
-fn _bf16_load(bytes payload, int offset) → f32 ⇥ KernelError {
-    const int bits ← payload[offset‥offset + 2] ↦ int<u16, Le> ↦ int
-    const int sign ← (bits ⇒ 15) % 2
-    const int exponent ← (bits ⇒ 7) % 256
-    const int fraction ← bits % 128
-    var float sign_factor ← 1.0
-    if sign ≠ 0 {
-        sign_factor ← -1.0
-    }
-    if exponent ≡ 0 {
-        if fraction ≡ 0 {
-            return sign_factor * 0.0 ↦ f32
-        }
-        const float power ← _power_two(-126)
-        return (sign_factor * power) * ((fraction ↦ float) / 128.0) ↦ f32
-    }
-    if exponent ≡ 255 {
-        if fraction ≡ 0 {
-            const float power ← _power_two(128)
-            return (sign_factor * power) * 2.0 ↦ f32
-        }
-        throw variant BadValue {message = "NaN BF16 weight"}
-    }
-    const float power ← _power_two(exponent - 127)
-    const float fraction_ratio ← (fraction ↦ float) / 128.0
-    return (sign_factor * power) * (1.0 + fraction_ratio) ↦ f32
-}
-
-# GEA1 body 1: BF16 loads, F32 multiply, F32 accumulation, F32 output.
-# The row-major logical matrix is [N,K], and no bias is present.
+# Host admission checks. These are called before a Bf16View/F32View crosses
+# into the corresponding @ nucleum entry; no host validation remains in a
+# device body.
 @ public { }
-fn gemv_bf16_f32acc(Bf16View weights, list<f32> input) → list<f32> ⇥ KernelError {
+fn validate_bf16_view(Bf16View weights, list<f32> input) → void ⇥ KernelError {
     require dtype.name(weights.dtype()) ≡ "bf16" throw variant BadView {message = "BF16 GEMV received a non-BF16 view"}
     require _gemv_shape(weights.shape()) throw variant BadView {message = "BF16 GEMV received the wrong logical shape"}
+    require _range_ok(weights.absolute_start(), weights.absolute_end(), weights.payload(), GEMV_ELEMENTS * BF16_BYTES) throw variant BadView {message = "BF16 GEMV received an invalid resident range"}
     require input.length() ≡ GEMV_K throw variant BadInput {message = "GEMV input must have length 960"}
-    var list<f32> output ← empty
-    for range 0‥GEMV_N const row {
-        var f32 acc ← 0.0
-        for range 0‥GEMV_K const column {
-            const int offset ← (row * GEMV_K + column) * BF16_BYTES
-            const f32 weight ← _bf16_load(weights.payload(), offset)
-            const f32 value ← input.get(column) coalesce 0.0 ∷ f32
-            acc ← acc + weight * value
-        }
-        output.append(acc)
-    }
-    return output
 }
 
-# GEA1 body 2: independent F32 loads, F32 multiply, F32 accumulation, F32
-# output. This is intentionally a complete second body, not a type parameter,
-# macro, dispatch alias, or call through the BF16 implementation.
 @ public { }
-fn gemv_f32_f32acc(F32View weights, list<f32> input) → list<f32> ⇥ KernelError {
+fn validate_f32_view(F32View weights, list<f32> input) → void ⇥ KernelError {
     require dtype.name(weights.dtype()) ≡ "f32" throw variant BadView {message = "F32 GEMV received a non-F32 view"}
     require _gemv_shape(weights.shape()) throw variant BadView {message = "F32 GEMV received the wrong logical shape"}
+    require _range_ok(weights.absolute_start(), weights.absolute_end(), weights.payload(), GEMV_ELEMENTS * F32_BYTES) throw variant BadView {message = "F32 GEMV received an invalid resident range"}
     require input.length() ≡ GEMV_K throw variant BadInput {message = "GEMV input must have length 960"}
-    var list<f32> output ← empty
-    for range 0‥GEMV_N const row {
+}
+
+# GEA1 body 1: BF16 loads, inline BF16→F32 decode, F32 multiply,
+# F32 accumulation, and F32 output. The row-major logical matrix is
+# [N,K], and no bias is present.
+#
+# The outer `for from … at [row]` and nested rank-2 coordinate walk keep the
+# row/column facts explicit. The inner `sum from … thread` is the K-term
+# reduction; its valued term is exactly weight × input value. The coordinate
+# comparisons select the current output row and weight column while keeping
+# the reduction body to one valued return.
+@ nucleum
+@ public { }
+fn gemv_bf16_f32acc(tbf16[320,960] weights, tf32[960] input, tf32[320] output, u32 id) → void {
+    for from output at [row] const slot {
         var f32 acc ← 0.0
-        for range 0‥GEMV_K const column {
-            const int offset ← (row * GEMV_K + column) * F32_BYTES
-            const f32 weight ← weights.payload()[offset‥offset + 4] ↦ float<f32, Le>
-            const f32 value ← input.get(column) coalesce 0.0 ∷ f32
-            acc ← acc + weight * value
+        for from weights at [weight_row, weight_column] const weight_bits {
+            const f32 term ← sum from input at [input_column] thread f const value {
+                var f32 product ← 0.0
+                if weight_row ≡ row {
+                    if weight_column ≡ input_column {
+                        const f32 weight ← weight_bits ↦ f32
+                        product ← weight * value
+                    }
+                }
+                return product
+            }
+            acc ← acc + term
         }
-        output.append(acc)
+        const int dispatch_row ← id ↦ int
+        if row ≡ dispatch_row {
+            output[id] ← acc
+        }
     }
-    return output
+}
+
+# GEA1 body 2: independent F32 loads, F32 multiply, F32 accumulation, and
+# F32 output. This is intentionally a complete second body, not a type
+# parameter, macro, dispatch alias, or call through the BF16 implementation.
+@ nucleum
+@ public { }
+fn gemv_f32_f32acc(tf32[320,960] weights, tf32[960] input, tf32[320] output, u32 id) → void {
+    for from output at [row] const slot {
+        var f32 acc ← 0.0
+        for from weights at [weight_row, weight_column] const weight {
+            const f32 term ← sum from input at [input_column] thread f const value {
+                var f32 product ← 0.0
+                if weight_row ≡ row {
+                    if weight_column ≡ input_column {
+                        product ← weight * value
+                    }
+                }
+                return product
+            }
+            acc ← acc + term
+        }
+        const int dispatch_row ← id ↦ int
+        if row ≡ dispatch_row {
+            output[id] ← acc
+        }
+    }
 }

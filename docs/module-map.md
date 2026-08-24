@@ -59,7 +59,7 @@ evidence and boundaries are recorded in
 | Import | File | Role |
 | --- | --- | --- |
 | `gradus:dtype` | `src/dtype.fab` | Versioned dtype tag + cast/round/serialize (`dtype-schema-1.0.0`), including BF16 storage width |
-| `gradus:kernel` | `src/kernel.fab` | GEA1 paired BF16/F32 `[320,960]` GEMV bodies with F32 accumulation; typed resident views |
+| `gradus:kernel` | `src/kernel.fab` | GEA1 paired `@ nucleum` BF16/F32 `[320,960]` GEMV entries with F32 accumulation; host-validated typed resident views |
 | `gradus:shape` | `src/shape.fab` | Shape rules: broadcast/reshape/expand, bounded product |
 | `gradus:tensor` | `src/tensor.fab` | Staged-carrier tensor construction/shape/ops (not autograd-aware) |
 | `gradus:math` | `src/math.fab` | Pure operation families (elementwise/reduce/matmul/cast/concat/slice) |
