@@ -16,9 +16,14 @@ sibling library. A Gradus user never needs to decide between `norma:*` and
 `gradus:*` — if you need autograd or ML, import from Gradus; if you need plain
 math, import from Norma. Duplication between them is intentional isolation.
 
-GPU execution, kernel fusion, and tensor memory management are Radix and host
-concerns. Gradus owns device-neutral mathematical contracts; the compiler
-and host execute them.
+GPU architecture follows the canonical public
+[GPU Execution Architecture](https://github.com/faberlang/faber/blob/main/docs/gpu-execution-architecture.md).
+Gradus owns device-neutral ML semantics, logical placement and sharding intent,
+and all ML kernel source in Faber. Radix validates, specializes, and lowers
+that source to target artifacts and explicit execution facts. Hosts owns
+physical discovery, virtual-partition admission, binding, residency, launch,
+synchronization, and readback. Do not put a permanent ML kernel body or a
+silent CPU fallback in Radix or Hosts.
 
 ## Module layout (Norma / Triga style)
 
