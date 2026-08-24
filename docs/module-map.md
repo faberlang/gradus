@@ -40,8 +40,10 @@ starts at [`exempla/dense-prefill-smollm2/`](../exempla/dense-prefill-smollm2/).
 
 ## Live modules (post-PML1–5 + correctness wave)
 
-The live documented tree has 36 modules (the U15 `gradus:mlp` leaf added to the prior 34, plus the MODEL-02 `gradus:model/moe` leaf). Module names
-are unchanged. This inventory is verified against the live `src/**/*.fab` tree after the no-latin
+The live documented tree has 37 modules (the GEA1 `gradus:kernel` leaf added
+after the U15 `gradus:mlp` and MODEL-02 `gradus:model/moe` leaves). Module
+names are unchanged. This inventory is verified against the live
+`src/**/*.fab` tree after the no-latin
 conversion (U1–U6); it does not reuse a pre-conversion name map. The source
 surface includes the A1C capsule-schema-2.0.0 surface, LIB-02 tokenizer
 runtime, GGUF-A3 tensor payload/view and widened dequant rows, REF-01
@@ -56,7 +58,8 @@ evidence and boundaries are recorded in
 
 | Import | File | Role |
 | --- | --- | --- |
-| `gradus:dtype` | `src/dtype.fab` | Versioned dtype tag + cast/round/serialize (`dtype-schema-1.0.0`) |
+| `gradus:dtype` | `src/dtype.fab` | Versioned dtype tag + cast/round/serialize (`dtype-schema-1.0.0`), including BF16 storage width |
+| `gradus:kernel` | `src/kernel.fab` | GEA1 paired BF16/F32 `[320,960]` GEMV bodies with F32 accumulation; typed resident views |
 | `gradus:shape` | `src/shape.fab` | Shape rules: broadcast/reshape/expand, bounded product |
 | `gradus:tensor` | `src/tensor.fab` | Staged-carrier tensor construction/shape/ops (not autograd-aware) |
 | `gradus:math` | `src/math.fab` | Pure operation families (elementwise/reduce/matmul/cast/concat/slice) |
@@ -103,6 +106,7 @@ L4  Optimization        gradus:optimize
 L5  NN primitives       gradus:nn
 L6  Architecture blocks gradus:attention, gradus:mlp, gradus:transformer
 L7  Training            gradus:train, gradus:metrics, gradus:data
+GEA1 Kernel            gradus:kernel — paired BF16/F32 GEMV source bodies
 PML2 Model admission    gradus:model/artifact, gradus:model/capsule,
                         gradus:model/gguf_manifest, gradus:model/gguf,
                         gradus:model/safetensors, gradus:model/dequant,

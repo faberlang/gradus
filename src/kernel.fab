@@ -1,0 +1,242 @@
++++
+locale = "en"
++++
+# GEA1-U2 — two independently inspectable GEMV bodies.
+#
+# The kernel module receives only typed resident views and an F32 activation
+# vector. It knows no Safetensors/GGUF format, path, container, Hub identity,
+# or physical device. The selected source range is admitted before a caller
+# constructs the view; this module checks only the declared range facts.
+
+import from "gradus:dtype" dtype
+
+const int GEMV_N ← 320
+const int GEMV_K ← 960
+const int BF16_BYTES ← 2
+const int F32_BYTES ← 4
+const int GEMV_ELEMENTS ← GEMV_N * GEMV_K
+
+@ public { }
+union KernelError {
+    BadView {
+        string message
+    },
+    BadInput {
+        string message
+    },
+    BadValue {
+        string message
+    }
+}
+
+@ public { }
+fn message(KernelError e) → string {
+    match e {
+        case BadView const message {
+            return message
+        }
+        case BadInput const message {
+            return message
+        }
+        case BadValue const message {
+            return message
+        }
+    }
+}
+
+# Physical BF16 resident view. The payload is exactly one declared byte
+# range; it is not a file, path, or container.
+@ public { }
+class Bf16View {
+    dtype.DType dtype_tag
+    list<int> shape
+    int absolute_start
+    int absolute_end
+    int byte_length
+    bytes payload
+
+    fn dtype() → dtype.DType {
+        return self.dtype_tag
+    }
+
+    fn shape() → list<int> {
+        return self.shape
+    }
+
+    fn absolute_start() → int {
+        return self.absolute_start
+    }
+
+    fn absolute_end() → int {
+        return self.absolute_end
+    }
+
+    fn byte_length() → int {
+        return self.byte_length
+    }
+
+    fn payload() → bytes {
+        return self.payload
+    }
+}
+
+# Physical F32 resident view. It carries the same logical matrix shape while
+# retaining its own declared F32 byte range.
+@ public { }
+class F32View {
+    dtype.DType dtype_tag
+    list<int> shape
+    int absolute_start
+    int absolute_end
+    int byte_length
+    bytes payload
+
+    fn dtype() → dtype.DType {
+        return self.dtype_tag
+    }
+
+    fn shape() → list<int> {
+        return self.shape
+    }
+
+    fn absolute_start() → int {
+        return self.absolute_start
+    }
+
+    fn absolute_end() → int {
+        return self.absolute_end
+    }
+
+    fn byte_length() → int {
+        return self.byte_length
+    }
+
+    fn payload() → bytes {
+        return self.payload
+    }
+}
+
+@ private { }
+fn _gemv_shape(list<int> shape) → bool {
+    if shape.length() ≠ 2 then return false
+    if shape.get(0) coalesce (-1) ≠ GEMV_N then return false
+    if shape.get(1) coalesce (-1) ≠ GEMV_K then return false
+    return true
+}
+
+@ private { }
+fn _range_ok(int absolute_start, int absolute_end, bytes payload, int expected_bytes) → bool {
+    if absolute_start ≺ 0 then return false
+    if absolute_end ≤ absolute_start then return false
+    if absolute_end - absolute_start ≠ expected_bytes then return false
+    if payload.length() ≠ expected_bytes then return false
+    return true
+}
+
+# Construct the typed BF16 view after a bounded source-range read.
+@ public { }
+fn bf16_view(bytes payload, int absolute_start, int absolute_end, list<int> shape) → Bf16View ⇥ KernelError {
+    require _gemv_shape(shape) throw variant BadView {message = "BF16 view must have logical shape [320,960]"}
+    require _range_ok(absolute_start, absolute_end, payload, GEMV_ELEMENTS * BF16_BYTES) throw variant BadView {message = "BF16 view range does not match [320,960] storage"}
+    return Bf16View {dtype_tag = dtype.bf16(), shape = shape, absolute_start = absolute_start, absolute_end = absolute_end, byte_length = payload.length(), payload = payload}
+}
+
+# Construct the typed F32 view after its own bounded resident-range read.
+@ public { }
+fn f32_view(bytes payload, int absolute_start, int absolute_end, list<int> shape) → F32View ⇥ KernelError {
+    require _gemv_shape(shape) throw variant BadView {message = "F32 view must have logical shape [320,960]"}
+    require _range_ok(absolute_start, absolute_end, payload, GEMV_ELEMENTS * F32_BYTES) throw variant BadView {message = "F32 view range does not match [320,960] storage"}
+    return F32View {dtype_tag = dtype.f32(), shape = shape, absolute_start = absolute_start, absolute_end = absolute_end, byte_length = payload.length(), payload = payload}
+}
+
+# 2^n for the BF16 exponent path. BF16 shares F32's exponent range, and the
+# returned value is widened to the F32 accumulation carrier.
+@ private { }
+fn _power_two(int n) → float {
+    var float result ← 1.0
+    if n ≥ 0 {
+        for range 0‥n const i {
+            result ← result * 2.0
+        }
+    }
+    else {
+        for range n‥0 const i {
+            result ← result / 2.0
+        }
+    }
+    return result
+}
+
+# Exact BF16 load expansion to the F32 value domain. This decoder belongs to
+# the BF16 body; the F32 body below has a separate four-byte F32 load.
+@ private { }
+fn _bf16_load(bytes payload, int offset) → f32 ⇥ KernelError {
+    const int bits ← payload[offset‥offset + 2] ↦ int<u16, Le> ↦ int
+    const int sign ← (bits ⇒ 15) % 2
+    const int exponent ← (bits ⇒ 7) % 256
+    const int fraction ← bits % 128
+    var float sign_factor ← 1.0
+    if sign ≠ 0 {
+        sign_factor ← -1.0
+    }
+    if exponent ≡ 0 {
+        if fraction ≡ 0 {
+            return sign_factor * 0.0 ↦ f32
+        }
+        const float power ← _power_two(-126)
+        return (sign_factor * power) * ((fraction ↦ float) / 128.0) ↦ f32
+    }
+    if exponent ≡ 255 {
+        if fraction ≡ 0 {
+            const float power ← _power_two(128)
+            return (sign_factor * power) * 2.0 ↦ f32
+        }
+        throw variant BadValue {message = "NaN BF16 weight"}
+    }
+    const float power ← _power_two(exponent - 127)
+    const float fraction_ratio ← (fraction ↦ float) / 128.0
+    return (sign_factor * power) * (1.0 + fraction_ratio) ↦ f32
+}
+
+# GEA1 body 1: BF16 loads, F32 multiply, F32 accumulation, F32 output.
+# The row-major logical matrix is [N,K], and no bias is present.
+@ public { }
+fn gemv_bf16_f32acc(Bf16View weights, list<f32> input) → list<f32> ⇥ KernelError {
+    require dtype.name(weights.dtype()) ≡ "bf16" throw variant BadView {message = "BF16 GEMV received a non-BF16 view"}
+    require _gemv_shape(weights.shape()) throw variant BadView {message = "BF16 GEMV received the wrong logical shape"}
+    require input.length() ≡ GEMV_K throw variant BadInput {message = "GEMV input must have length 960"}
+    var list<f32> output ← empty
+    for range 0‥GEMV_N const row {
+        var f32 acc ← 0.0
+        for range 0‥GEMV_K const column {
+            const int offset ← (row * GEMV_K + column) * BF16_BYTES
+            const f32 weight ← _bf16_load(weights.payload(), offset)
+            const f32 value ← input.get(column) coalesce 0.0 ∷ f32
+            acc ← acc + weight * value
+        }
+        output.append(acc)
+    }
+    return output
+}
+
+# GEA1 body 2: independent F32 loads, F32 multiply, F32 accumulation, F32
+# output. This is intentionally a complete second body, not a type parameter,
+# macro, dispatch alias, or call through the BF16 implementation.
+@ public { }
+fn gemv_f32_f32acc(F32View weights, list<f32> input) → list<f32> ⇥ KernelError {
+    require dtype.name(weights.dtype()) ≡ "f32" throw variant BadView {message = "F32 GEMV received a non-F32 view"}
+    require _gemv_shape(weights.shape()) throw variant BadView {message = "F32 GEMV received the wrong logical shape"}
+    require input.length() ≡ GEMV_K throw variant BadInput {message = "GEMV input must have length 960"}
+    var list<f32> output ← empty
+    for range 0‥GEMV_N const row {
+        var f32 acc ← 0.0
+        for range 0‥GEMV_K const column {
+            const int offset ← (row * GEMV_K + column) * F32_BYTES
+            const f32 weight ← weights.payload()[offset‥offset + 4] ↦ float<f32, Le>
+            const f32 value ← input.get(column) coalesce 0.0 ∷ f32
+            acc ← acc + weight * value
+        }
+        output.append(acc)
+    }
+    return output
+}
