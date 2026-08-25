@@ -60,9 +60,10 @@ starts at [`exempla/dense-prefill-smollm2/`](../exempla/dense-prefill-smollm2/).
 
 ## Live modules (post-PML1–5 + correctness wave)
 
-The live documented tree has 39 modules (the GEA3 `gradus:model/full_model_view`
+The live documented tree has 40 modules (the GEA3 `gradus:model/full_model_view`
 leaf added after the GEA2 `gradus:model/block_view` leaf, which followed the
-GEA1 `gradus:kernel` leaf). Module
+GEA1 `gradus:kernel` leaf; the U4a `gradus:test_util` proba-support module
+added on 2026-08-25). Module
 names are unchanged. This inventory is verified against the live
 `src/**/*.fab` tree after the no-latin
 conversion (U1–U6); it does not reuse a pre-conversion name map. The source
@@ -95,6 +96,7 @@ evidence and boundaries are recorded in
 | `gradus:mlp` | `src/mlp.fab` | Two-layer MLP: staged `forward_mlp` + annotated `forward_mlp_loss` companion (PML3-U4) |
 | `gradus:train` | `src/train.fab` | Train steps, schedules, mode, RNG, dropout, and checkpoint `Checkpoint` (PML4) |
 | `gradus:metrics` | `src/metrics.fab` | Defined metrics: `accuracy`, `Metric` (PML4) |
+| `gradus:test_util` | `src/test_util.fab` | Shared proba-support helpers: `or_default` (U4a proba do/catch deblock) |
 | `gradus:data` | `src/data.fab` | Stub — batching/shuffling/tokenization declared future |
 | `gradus:model/artifact` | `src/model/artifact.fab` | Pathless content identity for bounded model artifacts (GGUF-A1a) |
 | `gradus:model/capsule` | `src/model/capsule.fab` | Admitted-model capsule — the typed identity handoff (`capsule-schema-2.0.0`, PML2, C8; A1C-M1 clean break — schema 1 retired) |

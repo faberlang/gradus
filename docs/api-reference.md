@@ -1324,6 +1324,16 @@ Fixed-shape and runtime-carrier transformer blocks, including cached block evalu
 - `fn transformer_block_cached(tensor.Tensor x, tensor.Tensor ln1_s, tensor.Tensor ln1_o, tensor.Tensor wq, tensor.Tensor bq, tensor.Tensor wk, tensor.Tensor bk, tensor.Tensor wv, tensor.Tensor bv, tensor.Tensor wo, tensor.Tensor bo, tensor.Tensor ln2_s, tensor.Tensor ln2_o, tensor.Tensor wf1, tensor.Tensor bf1, tensor.Tensor wf2, tensor.Tensor bf2, tensor.Tensor ln3_s, tensor.Tensor ln3_o, f32 scale, list<int> positions, int dim, kv.KVCache layer, list<int> tokens) → CachedBlock ⇥ TransformerError`
 - `fn dense_block_cached(tensor.Tensor x, list<int> positions, kv.KVCache layer, list<int> tokens, DenseAttentionWeights attention_weights, DenseAttentionConfig attention_config, DenseMlpWeights mlp_weights, DenseNormConfig norm_config) → CachedBlock ⇥ TransformerError`
 
+## gradus:test_util
+
+Shared proba-support helpers (U4a quality wave — proba do/catch deblock).
+
+**Source**: `src/test_util.fab`
+
+### Public functions
+
+- `fn or_default<T, E>(() → T ⇥ E work, T fallback) → T` — run a failable call and fall back to a default on error; Theme-Z1 proba blocks (`do { t ← f() } catch { return t }`) collapse to one call
+
 ---
 
 ## Inventory gate
