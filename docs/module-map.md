@@ -80,7 +80,7 @@ evidence and boundaries are recorded in
 | Import | File | Role |
 | --- | --- | --- |
 | `gradus:dtype` | `src/dtype.fab` | Versioned dtype tag + cast/round/serialize (`dtype-schema-1.0.0`), including BF16 storage width |
-| `gradus:kernel` | `src/kernel.fab` | GEA1 paired BF16/F32 `[320,960]` GEMV entries with F32 accumulation plus thirteen GEA2 F32 block entries (T=8, D=960, F=2560) and fifteen GEA3-U3a decode entries (T=1, `L_max`=32); host-validated typed resident views |
+| `gradus:kernel` | `src/kernel.fab` | GEA1 paired BF16/F32 `[320,960]` GEMV entries with F32 accumulation plus thirteen GEA2 F32 block entries (T=8, D=960, F=2560) and fifteen GEA3-U3a decode entries (T=1, `L_max`=32) and fifteen GEA3-U3b prefill entries (T_p=36, `L_max`=76); host-validated typed resident views |
 | `gradus:shape` | `src/shape.fab` | Shape rules: broadcast/reshape/expand, bounded product |
 | `gradus:tensor` | `src/tensor.fab` | Staged-carrier tensor construction/shape/ops (not autograd-aware) |
 | `gradus:math` | `src/math.fab` | Pure operation families (elementwise/reduce/matmul/cast/concat/slice) |
@@ -178,6 +178,39 @@ declared decode position; `slot · row` writes the incoming `[1,320]` K/V
 row into exactly that fixed-capacity slot. The `length_mask` input is the
 resident declared-length additive constant (0 within the declared history
 length L, negative beyond it) feeding softmax.
+
+### GEA3-U3b prefill device entries
+
+Fifteen independently selectable F32 entries for the prefill shape family
+at `T_p`=36. The frozen prompt tokenizes to 36 tokens (GEA3-U1 fixture
+`fixtures/tokenizer/gea3-prompt-tokens.manifest.json`), not the exact-8
+reuse case, so the GEA2 13-entry block identities are re-shaped at
+`[T_p,·]` rather than reused byte-identically (goal open item 3; ruling
+0891c09b — natural `T_p`, never re-shaped to fit geometry). The frozen
+KV capacity is `L_max`=76 (prompt 36 + n_predict 8 + margin 32); the
+`prefill_kv_write_k`/`_v` pair places the rope'd rows at positions
+`0..T_p-1` via the resident `[76,36]` 0/1 block indicator, the block
+granularity mirror of U3a's one-hot slot append. Per-head windows and the
+32× layer repetition stay plan-time facts; the bodies carry no loop,
+slice, failable construct, or in-body call.
+
+| Entry | Idiom | Declared input shape(s) → output shape |
+| --- | --- | --- |
+| `prefill_rmsnorm` | `rms_norm(1, 1e-5, weight)` | `[36,960]`, `[960]` → `[36,960]` |
+| `prefill_gemm_qo` | `input · weights` | `[36,960]`, `[960,960]` → `[36,960]` |
+| `prefill_gemm_kv` | `input · weights` | `[36,960]`, `[960,320]` → `[36,320]` |
+| `prefill_gemm_gate_up` | `input · weights` | `[36,960]`, `[960,2560]` → `[36,2560]` |
+| `prefill_gemm_down` | `input · weights` | `[36,2560]`, `[2560,960]` → `[36,960]` |
+| `prefill_rope_q` | `rope_norm(0, 64)` with table input | `[36,960]`, table `[36,32,3]` → `[36,960]` |
+| `prefill_rope_k` | `rope_norm(0, 64)` with table input | `[36,320]`, table `[36,32,3]` → `[36,320]` |
+| `prefill_key_transpose` | `input.transpose()` | `[36,64]` → `[64,36]` |
+| `prefill_score_gemm` | `(query · key_transposed) ⊙ attention_scale` | `[36,64]`, `[64,36]`, scale `[36,36]` → `[36,36]` |
+| `prefill_causal_softmax` | `scores.softmax()` | `[36,36]` → `[36,36]` |
+| `prefill_context_gemm` | `probabilities · values` | `[36,36]`, `[36,64]` → `[36,64]` |
+| `prefill_swiglu` | `gate.silu() ⊙ up` | `[36,2560]`, `[36,2560]` → `[36,2560]` |
+| `prefill_residual_add` | `left + right` | `[36,960]`, `[36,960]` → `[36,960]` |
+| `prefill_kv_write_k` | `history + block · rows` | `[76,320]`, block `[76,36]`, rows `[36,320]` → `[76,320]` |
+| `prefill_kv_write_v` | `history + block · rows` | `[76,320]`, block `[76,36]`, rows `[36,320]` → `[76,320]` |
 
 ## Layers
 

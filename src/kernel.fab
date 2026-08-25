@@ -431,3 +431,146 @@ fn decode_swiglu(tf32[1,2560] gate, tf32[1,2560] up, mut tf32[1,2560] output) �
 fn decode_residual_add(tf32[1,960] left, tf32[1,960] right, mut tf32[1,960] output) → void {
     output ← left + right
 }
+
+# GEA3-U3b — prefill device entries at T_p. The frozen prompt tokenizes to
+# 36 tokens (gea3-prompt-tokens.manifest.json), not the exact-8 reuse case,
+# so the GEA2 13-entry block set is re-shaped at [T_p,·] instead of reused
+# byte-identically (goal open item 3; ruling 0891c09b). T_p=36 is frozen by
+# GEA3-U1 and is never re-shaped to fit geometry. Geometry otherwise frozen
+# at GEA1/GEA2 (D=960, H=15, K=5, d=64, F=2560); the GEA3-U1 freeze puts
+# the fixed-capacity KV buffers at L_max=76 (prompt 36 + n_predict 8 +
+# margin 32). Positions 0..T_p-1; the K/V row writes place rows 0..35 of
+# the per-layer history buffers. Every entry is F32 and independently
+# selectable; per-head windows and the 32x layer repetition stay plan-time
+# facts, so these bodies carry no loop, slice, failable construct, or
+# in-body call.
+#
+# Entry inventory (input shapes → output shape):
+#   prefill_rmsnorm        [36,960] · [960]              → [36,960]
+#   prefill_gemm_qo        [36,960] · [960,960]          → [36,960]
+#   prefill_gemm_kv        [36,960] · [960,320]          → [36,320]
+#   prefill_gemm_gate_up   [36,960] · [960,2560]         → [36,2560]
+#   prefill_gemm_down      [36,2560] · [2560,960]        → [36,960]
+#   prefill_rope_q         [36,960] · table [36,32,3]    → [36,960]
+#   prefill_rope_k         [36,320] · table [36,32,3]    → [36,320]
+#   prefill_key_transpose  [36,64]                       → [64,36]
+#   prefill_score_gemm     [36,64] · [64,36] · scale [36,36] → [36,36]
+#   prefill_causal_softmax [36,36]                       → [36,36]
+#   prefill_context_gemm   [36,36] · [36,64]             → [36,64]
+#   prefill_swiglu         [36,2560] · [36,2560]         → [36,2560]
+#   prefill_residual_add   [36,960] · [36,960]           → [36,960]
+#   prefill_kv_write_k     [76,320] · block [76,36] · rows [36,320] → [76,320]
+#   prefill_kv_write_v     [76,320] · block [76,36] · rows [36,320] → [76,320]
+#
+# KV row writes use the U3a append idiom at block granularity: block is the
+# resident [76,36] 0/1 indicator selecting history rows 0..35, so
+# `block · rows` writes the [36,320] rope'd K (or V) rows into exactly
+# those slots of the fixed-capacity buffer.
+
+# GEA3-U3b body 1 — prefill RMSNorm over the T_p rows.
+@ kernel
+@ public { }
+fn prefill_rmsnorm(tf32[36,960] input, tf32[960] weight, mut tf32[36,960] output) → void {
+    output ← input.rms_norm(1, 1e-5, weight)
+}
+
+# GEA3-U3b bodies 2–5 — the projection GEMM shapes at T_p rows.
+@ kernel
+@ public { }
+fn prefill_gemm_qo(tf32[36,960] input, tf32[960,960] weights, mut tf32[36,960] output) → void {
+    output ← input · weights
+}
+
+@ kernel
+@ public { }
+fn prefill_gemm_kv(tf32[36,960] input, tf32[960,320] weights, mut tf32[36,320] output) → void {
+    output ← input · weights
+}
+
+@ kernel
+@ public { }
+fn prefill_gemm_gate_up(tf32[36,960] input, tf32[960,2560] weights, mut tf32[36,2560] output) → void {
+    output ← input · weights
+}
+
+@ kernel
+@ public { }
+fn prefill_gemm_down(tf32[36,2560] input, tf32[2560,960] weights, mut tf32[36,960] output) → void {
+    output ← input · weights
+}
+
+# GEA3-U3b bodies 6–7 — RoPE at positions 0..T_p-1. The [36,32,3] table is
+# the position-0..35 block of the committed angle/cos/sin table; the
+# consecutive-pair dim=64 contract is unchanged from GEA2.
+@ kernel
+@ public { }
+fn prefill_rope_q(tf32[36,960] input, tf32[36,32,3] rope_table, mut tf32[36,960] output) → void {
+    output ← input.rope_norm(0, 64)
+}
+
+@ kernel
+@ public { }
+fn prefill_rope_k(tf32[36,320] input, tf32[36,32,3] rope_table, mut tf32[36,320] output) → void {
+    output ← input.rope_norm(0, 64)
+}
+
+# GEA3-U3b bodies 8–9 — per-head key transpose and the T_p × T_p score GEMM
+# with the frozen 0.125 scale as the resident [36,36] constant.
+@ kernel
+@ public { }
+fn prefill_key_transpose(tf32[36,64] input, mut tf32[64,36] output) → void {
+    output ← input.transpose()
+}
+
+@ kernel
+@ public { }
+fn prefill_score_gemm(tf32[36,64] query, tf32[64,36] key_transposed, tf32[36,36] attention_scale, mut tf32[36,36] output) → void {
+    output ← (query · key_transposed) ⊙ attention_scale
+}
+
+# GEA3-U3b body 10 — causal row softmax over the T_p × T_p scores. The
+# softmax collection method owns the row-wise max-subtract/exp/sum recipe
+# and causal masking at lowering, exactly as in GEA2.
+@ kernel
+@ public { }
+fn prefill_causal_softmax(tf32[36,36] scores, mut tf32[36,36] output) → void {
+    const f32 _stability_max ← max from scores at [i, j] coalesce 0.0
+    output ← scores.softmax()
+}
+
+# GEA3-U3b body 11 — per-head context GEMM at T_p rows.
+@ kernel
+@ public { }
+fn prefill_context_gemm(tf32[36,36] probabilities, tf32[36,64] values, mut tf32[36,64] output) → void {
+    output ← probabilities · values
+}
+
+# GEA3-U3b body 12 — SwiGLU at T_p rows.
+@ kernel
+@ public { }
+fn prefill_swiglu(tf32[36,2560] gate, tf32[36,2560] up, mut tf32[36,2560] output) → void {
+    const tf32[36,2560] activated ← gate.silu()
+    output ← activated ⊙ up
+}
+
+# GEA3-U3b body 13 — prefill residual stream addition.
+@ kernel
+@ public { }
+fn prefill_residual_add(tf32[36,960] left, tf32[36,960] right, mut tf32[36,960] output) → void {
+    output ← left + right
+}
+
+# GEA3-U3b bodies 14–15 — K/V row writes into the fixed-capacity per-layer
+# history buffers at L_max=76. The [76,36] block is the resident 0/1 row
+# indicator for positions 0..T_p-1; rows are the rope'd K (or V) outputs.
+@ kernel
+@ public { }
+fn prefill_kv_write_k(tf32[76,320] history, tf32[76,36] block, tf32[36,320] rows, mut tf32[76,320] output) → void {
+    output ← history + block · rows
+}
+
+@ kernel
+@ public { }
+fn prefill_kv_write_v(tf32[76,320] history, tf32[76,36] block, tf32[36,320] rows, mut tf32[76,320] output) → void {
+    output ← history + block · rows
+}
