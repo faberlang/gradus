@@ -40,8 +40,8 @@ starts at [`exempla/dense-prefill-smollm2/`](../exempla/dense-prefill-smollm2/).
 
 ## Live modules (post-PML1–5 + correctness wave)
 
-The live documented tree has 37 modules (the GEA1 `gradus:kernel` leaf added
-after the U15 `gradus:mlp` and MODEL-02 `gradus:model/moe` leaves). Module
+The live documented tree has 38 modules (the GEA2 `gradus:model/block_view`
+leaf added after the GEA1 `gradus:kernel` leaf). Module
 names are unchanged. This inventory is verified against the live
 `src/**/*.fab` tree after the no-latin
 conversion (U1–U6); it does not reuse a pre-conversion name map. The source
@@ -84,6 +84,7 @@ evidence and boundaries are recorded in
 | `gradus:model/dequant` | `src/model/dequant.fab` | CPU dequant of the admitted GGML block types — union set F32/F16/BF16/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K (PML2; GGUF-A3 widens to BF16 + Q5_K; W1-U3 admits F16 via NativeF16Convert) |
 | `gradus:model/tensor_payload` | `src/model/tensor_payload.fab` | `TensorPayload` value + `PayloadError` diagnostics — pathless payload carrier (name, absolute start, length, bytes) (GGUF-A3) |
 | `gradus:model/tensor_view` | `src/model/tensor_view.fab` | `TensorView` typed view + `ViewError` + `links` bind + bounded windowed materializers `materialize_slice`/`materialize_block` (GGUF-A3) |
+| `gradus:model/block_view` | `src/model/block_view.fab` | GEA2 nine typed F32 layer-0 block tensor views, manifest-bound absolute ranges, and host-side boundary validation |
 | `gradus:model/dense_qwen2` | `src/model/dense_qwen2.fab` | Typed `qwen2` (Qwen2.5) architecture adapter — canonical dense tensor-name → manifest-descriptor resolution (`config`/`resolve`/`render_description`) with the qwen2 deltas: tensor-set tie status, GQA head config, rope_theta 1000000 (REF-01-U1.7) |
 | `gradus:model/dense` | `src/model/dense.fab` | Dense model assembly — the complete ordered dense forward graph (`forward`): embedding gather → N ordered U1.5 `dense_block` rows → final RMSNorm → output projection, assembled from the typed architecture config (`DenseConfig`) and materialized stored-weight views via canonical names; tied/untied embedding handling; zero per-row constants (REF-01-U1.8). Real-file Qwen2.5-0.5B prefill consumer: `exempla/dense-prefill-qwen2` (REF-01-U1.10; FINAL stop at radix `2ed9914e4`: packet `faber` green; PKG001 closed; rustc cargo-101, first `E0015` const `vec!`) |
 | `gradus:model/qwen35moe` | `src/model/qwen35moe.fab` | qwen35moe architecture admission: frozen config + canonical 753-tensor map + dimension/storage cross-reference validation + identity-precondition admission (MODEL-01, read through the `gguf_manifest` typed accessors) |
@@ -110,7 +111,8 @@ GEA1 Kernel            gradus:kernel — paired BF16/F32 GEMV source bodies
 PML2 Model admission    gradus:model/artifact, gradus:model/capsule,
                         gradus:model/gguf_manifest, gradus:model/gguf,
                         gradus:model/safetensors, gradus:model/dequant,
-                        gradus:model/tensor_payload, gradus:model/tensor_view
+                        gradus:model/tensor_payload, gradus:model/tensor_view,
+                        gradus:model/block_view
 REF-01 Dense reference  gradus:model/dense_llama (llama/SmolLM2 adapter,
                         REF-01-U1.6), gradus:model/dense_qwen2 (qwen2
                         adapter, REF-01-U1.7), gradus:model/dense (dense
