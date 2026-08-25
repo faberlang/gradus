@@ -59,7 +59,7 @@ evidence and boundaries are recorded in
 | Import | File | Role |
 | --- | --- | --- |
 | `gradus:dtype` | `src/dtype.fab` | Versioned dtype tag + cast/round/serialize (`dtype-schema-1.0.0`), including BF16 storage width |
-| `gradus:kernel` | `src/kernel.fab` | GEA1 paired `@ nucleum` BF16/F32 `[320,960]` GEMV entries with F32 accumulation; host-validated typed resident views |
+| `gradus:kernel` | `src/kernel.fab` | GEA1 paired BF16/F32 `[320,960]` GEMV entries with F32 accumulation plus thirteen GEA2 F32 block entries (T=8, D=960, F=2560); host-validated typed resident views |
 | `gradus:shape` | `src/shape.fab` | Shape rules: broadcast/reshape/expand, bounded product |
 | `gradus:tensor` | `src/tensor.fab` | Staged-carrier tensor construction/shape/ops (not autograd-aware) |
 | `gradus:math` | `src/math.fab` | Pure operation families (elementwise/reduce/matmul/cast/concat/slice) |
@@ -96,6 +96,33 @@ evidence and boundaries are recorded in
 | `gradus:sampling` | `src/sampling.fab` | Sampling pipeline: greedy + filters + draw (PML5) |
 | `gradus:generation` | `src/generation.fab` | Generation config + cursor (PML5) |
 | `gradus:gradus` | `src/gradus.fab` | Facade map — no genera |
+
+### GEA2 block device entries
+
+`gradus:kernel` extends the GEA1 leaf with thirteen independently selectable,
+position-independent F32 entries for the frozen SmolLM2-360M layer-0 block.
+The English package surface renders the canonical `@ nucleum` identity as
+`@ kernel`; the signatures below are the source/device contract.
+
+| Entry | Idiom | Declared input shape(s) → output shape |
+| --- | --- | --- |
+| `rmsnorm` | `rms_norm(1, 1e-5, weight)` | `[8,960]`, `[960]` → `[8,960]` |
+| `gemm_qo` | `input · weights` | `[8,960]`, `[960,960]` → `[8,960]` |
+| `gemm_kv` | `input · weights` | `[8,960]`, `[960,320]` → `[8,320]` |
+| `gemm_gate_up` | `input · weights` | `[8,960]`, `[960,2560]` → `[8,2560]` |
+| `gemm_down` | `input · weights` | `[8,2560]`, `[2560,960]` → `[8,960]` |
+| `rope_q` | `rope_norm(0, 64)` with table input | `[8,960]`, table `[8,32,3]` → `[8,960]` |
+| `rope_k` | `rope_norm(0, 64)` with table input | `[8,320]`, table `[8,32,3]` → `[8,320]` |
+| `transpose` | `input.transpose()` | `[8,64]` → `[64,8]` |
+| `score_gemm` | `(query · key_transposed) ⊙ attention_scale` | `[8,64]`, `[64,8]`, scale `[8,8]` → `[8,8]` |
+| `causal_softmax` | `max from … at [i,j] coalesce 0.0`; `scores.softmax()` | `[8,8]` → `[8,8]` |
+| `context_gemm` | `probabilities · values` | `[8,8]`, `[8,64]` → `[8,64]` |
+| `swiglu` | `gate.silu() ⊙ up` | `[8,2560]`, `[8,2560]` → `[8,2560]` |
+| `residual_add` | `left.added(right)` | `[8,960]`, `[8,960]` → `[8,960]` |
+
+All GEA2 tensor parameters and outputs are `tf32`; no GEA2 entry has a
+lane/id parameter. The scale input is the frozen `[8,8]` F32 constant whose elements
+are `0.125`; the RoPE table is the committed `[8,32,3]` angle/cos/sin input.
 
 ## Layers
 

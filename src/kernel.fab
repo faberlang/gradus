@@ -1,14 +1,38 @@
 +++
 locale = "en"
 +++
-# GEA1-R1 — two independently inspectable GEMV device entries.
+# GEA1-R1 / GEA2-U3 — independently inspectable device entries.
 #
 # Public import: import from "gradus:kernel" kernel
 # Depends on: gradus:dtype (DType tag and name predicate)
 #
+# GEA2 block geometry is frozen at T=8, D=960, H=15, K=5, d=64, and F=2560.
+# The thirteen new entries below are all F32 and position-independent.  Their
+# signatures are the device contract; host admission stays in ordinary
+# functions and the nine tensor views remain path/container-free.
+#
+# Entry inventory (input shapes → output shape):
+#   rmsnorm       [8,960] · [960]                 → [8,960]
+#   gemm_qo       [8,960] · [960,960]             → [8,960]
+#   gemm_kv       [8,960] · [960,320]             → [8,320]
+#   gemm_gate_up  [8,960] · [960,2560]            → [8,2560]
+#   gemm_down     [8,2560] · [2560,960]           → [8,960]
+#   rope_q        [8,960] · table [8,32,3]        → [8,960]
+#   rope_k        [8,320] · table [8,32,3]        → [8,320]
+#   transpose     [8,64]                          → [64,8]
+#   score_gemm    [8,64] · [64,8] · scale [8,8]   → [8,8]
+#   causal_softmax [8,8]                          → [8,8]
+#   context_gemm  [8,8] · [8,64]                  → [8,64]
+#   swiglu       [8,2560] · [8,2560]              → [8,2560]
+#   residual_add [8,960] · [8,960]                → [8,960]
+#
+# Glyph law: · is rank-2 matmul and ⊙ is same-shape elementwise product.
+# RMSNorm, RoPE, softmax, SiLU, transpose, and add use their method twins,
+# which resolve to the pinned collection operations without host calls.
+#
 # The host admission layer receives typed resident views and validates their
 # dtype, shape, byte range, and activation length before the device boundary.
-# The @ nucleum entries receive only shaped resident tensors and an output
+# The @ kernel entries receive only shaped resident tensors and an output
 # view. They know no Safetensors/GGUF format, path, container, Hub identity,
 # or physical device.
 
@@ -134,7 +158,7 @@ fn f32_view(bytes payload, int absolute_start, int absolute_end, list<int> shape
 }
 
 # Host admission checks. These are called before a Bf16View/F32View crosses
-# into the corresponding @ nucleum entry; no host validation remains in a
+# into the corresponding @ kernel entry; no host validation remains in a
 # device body.
 @ public { }
 fn validate_bf16_view(Bf16View weights, list<f32> input) → void ⇥ KernelError {
@@ -168,4 +192,101 @@ fn gemv_bf16_f32acc(tbf16[320,960] weights, tf32[960] input, mut tf32[320] outpu
 @ public { }
 fn gemv_f32_f32acc(tf32[320,960] weights, tf32[960] input, mut tf32[320] output, u32 id) → void {
     output ← weights · input
+}
+
+# GEA2-U3 body 1 — RMSNorm over the last axis with the frozen epsilon.
+@ kernel
+@ public { }
+fn rmsnorm(tf32[8,960] input, tf32[960] weight, mut tf32[8,960] output) → void {
+    output ← input.rms_norm(1, 1e-5, weight)
+}
+
+# GEA2-U3 bodies 2–5 — the four projection GEMM shapes.  q/o share one
+# [960,960] entry, k/v share [960,320], and gate/up share [960,2560].
+@ kernel
+@ public { }
+fn gemm_qo(tf32[8,960] input, tf32[960,960] weights, mut tf32[8,960] output) → void {
+    output ← input · weights
+}
+
+@ kernel
+@ public { }
+fn gemm_kv(tf32[8,960] input, tf32[960,320] weights, mut tf32[8,320] output) → void {
+    output ← input · weights
+}
+
+@ kernel
+@ public { }
+fn gemm_gate_up(tf32[8,960] input, tf32[960,2560] weights, mut tf32[8,2560] output) → void {
+    output ← input · weights
+}
+
+@ kernel
+@ public { }
+fn gemm_down(tf32[8,2560] input, tf32[2560,960] weights, mut tf32[8,960] output) → void {
+    output ← input · weights
+}
+
+# GEA2-U3 bodies 6–7 — packed RoPE with the committed [T,32,3]
+# angle/cos/sin table input.  RopePlan consumes the table at lowering time;
+# the source intrinsic keeps the frozen consecutive-pair dim=64 contract.
+@ kernel
+@ public { }
+fn rope_q(tf32[8,960] input, tf32[8,32,3] rope_table, mut tf32[8,960] output) → void {
+    output ← input.rope_norm(0, 64)
+}
+
+@ kernel
+@ public { }
+fn rope_k(tf32[8,320] input, tf32[8,32,3] rope_table, mut tf32[8,320] output) → void {
+    output ← input.rope_norm(0, 64)
+}
+
+# GEA2-U3 body 8 — explicit head transpose for q_h · k_g^T.
+@ kernel
+@ public { }
+fn transpose(tf32[8,64] input, mut tf32[64,8] output) → void {
+    output ← input.transpose()
+}
+
+# GEA2-U3 body 9 — score GEMM followed by the frozen 0.125 scale.  The
+# scale view is a [T,T] resident constant filled with 1/sqrt(64)=0.125;
+# using a shaped peer keeps the elementwise operation broadcast-free.
+@ kernel
+@ public { }
+fn score_gemm(tf32[8,64] query, tf32[64,8] key_transposed, tf32[8,8] attention_scale, mut tf32[8,8] output) → void {
+    output ← (query · key_transposed) ⊙ attention_scale
+}
+
+# GEA2-U3 body 10 — stable row softmax.  The explicit max-from reduction
+# records the caller-stated identity; the softmax collection method owns the
+# row-wise max-subtract/exp/sum recipe and causal masking at lowering.
+@ kernel
+@ public { }
+fn causal_softmax(tf32[8,8] scores, mut tf32[8,8] output) → void {
+    const f32 _stability_max ← max from scores at [i, j] coalesce 0.0
+    output ← scores.softmax()
+}
+
+# GEA2-U3 body 11 — per-head context GEMM.
+@ kernel
+@ public { }
+fn context_gemm(tf32[8,8] probabilities, tf32[8,64] values, mut tf32[8,64] output) → void {
+    output ← probabilities · values
+}
+
+# GEA2-U3 body 12 — SwiGLU: silu(gate) ⊙ up.  `silu` is the scalar-preserving
+# tensor method spelling admitted by the device surface; no host helper call.
+@ kernel
+@ public { }
+fn swiglu(tf32[8,2560] gate, tf32[8,2560] up, mut tf32[8,2560] output) → void {
+    const tf32[8,2560] activated ← gate.silu()
+    output ← activated ⊙ up
+}
+
+# GEA2-U3 body 13 — residual stream addition.
+@ kernel
+@ public { }
+fn residual_add(tf32[8,960] left, tf32[8,960] right, mut tf32[8,960] output) → void {
+    output ← left.added(right)
 }
