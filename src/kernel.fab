@@ -290,3 +290,144 @@ fn swiglu(tf32[8,2560] gate, tf32[8,2560] up, mut tf32[8,2560] output) → void 
 fn residual_add(tf32[8,960] left, tf32[8,960] right, mut tf32[8,960] output) → void {
     output ← left + right
 }
+
+# GEA3-U3a — decode-step device entries at T=1. Geometry frozen at GEA1/GEA2
+# (D=960, H=15, K=5, d=64, F=2560) with the GEA3-U1 decode freezes: T=1,
+# L_max=32, declared history length, mask beyond L. Every entry is F32 and
+# independently selectable; the route instantiates per-head windows and the
+# 32x layer repetition at plan time (GEA2-U7 inheritance), so these bodies
+# carry no loop, slice, failable construct, or in-body call.
+#
+# Entry inventory (input shapes → output shape):
+#   decode_rmsnorm        [1,960] · [960]              → [1,960]
+#   decode_gemv_qo        [1,960] · [960,960]          → [1,960]
+#   decode_gemv_kv        [1,960] · [960,320]          → [1,320]
+#   decode_gemv_gate_up   [1,960] · [960,2560]         → [1,2560]
+#   decode_gemv_down      [1,2560] · [2560,960]        → [1,960]
+#   decode_rope_q         [1,960] · table [1,32,3]     → [1,960]
+#   decode_rope_k         [1,320] · table [1,32,3]     → [1,320]
+#   kv_append_k           [32,320] · slot [32,1] · row [1,320] → [32,320]
+#   kv_append_v           [32,320] · slot [32,1] · row [1,320] → [32,320]
+#   decode_key_transpose  [32,64]                      → [64,32]
+#   decode_score_gemm     [1,64] · [64,32] · scale [1,32] → [1,32]
+#   decode_masked_softmax [1,32] · mask [1,32]         → [1,32]
+#   decode_context_gemm   [1,32] · [32,64]             → [1,64]
+#   decode_swiglu         [1,2560] · [1,2560]          → [1,2560]
+#   decode_residual_add   [1,960] · [1,960]            → [1,960]
+#
+# KV geometry (CTO ruling 0891c09b): fixed-capacity buffers at L_max=32,
+# append-in-place, declared history length, mask beyond L. The append
+# idioms keep the write rank-2: slot [32,1] is the resident one-hot row
+# selector at the declared position and `slot · row` writes the incoming
+# [1,320] row into exactly that slot; the additive mask is the resident
+# declared-length constant (0 within L, negative beyond) feeding softmax.
+
+# GEA3-U3a body 1 — decode RMSNorm over the single row.
+@ kernel
+@ public { }
+fn decode_rmsnorm(tf32[1,960] input, tf32[960] weight, mut tf32[1,960] output) → void {
+    output ← input.rms_norm(1, 1e-5, weight)
+}
+
+# GEA3-U3a bodies 2–5 — the projection GEMV shapes at query-1.
+@ kernel
+@ public { }
+fn decode_gemv_qo(tf32[1,960] input, tf32[960,960] weights, mut tf32[1,960] output) → void {
+    output ← input · weights
+}
+
+@ kernel
+@ public { }
+fn decode_gemv_kv(tf32[1,960] input, tf32[960,320] weights, mut tf32[1,320] output) → void {
+    output ← input · weights
+}
+
+@ kernel
+@ public { }
+fn decode_gemv_gate_up(tf32[1,960] input, tf32[960,2560] weights, mut tf32[1,2560] output) → void {
+    output ← input · weights
+}
+
+@ kernel
+@ public { }
+fn decode_gemv_down(tf32[1,2560] input, tf32[2560,960] weights, mut tf32[1,960] output) → void {
+    output ← input · weights
+}
+
+# GEA3-U3a bodies 6–7 — RoPE at the decode position. The [1,32,3] table is
+# the position-p row of the committed angle/cos/sin table; the consecutive-
+# pair dim=64 contract is unchanged from GEA2.
+@ kernel
+@ public { }
+fn decode_rope_q(tf32[1,960] input, tf32[1,32,3] rope_table, mut tf32[1,960] output) → void {
+    output ← input.rope_norm(0, 64)
+}
+
+@ kernel
+@ public { }
+fn decode_rope_k(tf32[1,320] input, tf32[1,32,3] rope_table, mut tf32[1,320] output) → void {
+    output ← input.rope_norm(0, 64)
+}
+
+# GEA3-U3a bodies 8–9 — in-place KV append at the declared slot. The fixed-
+# capacity [32,320] buffer is the whole resident K (or V) cache for one
+# layer; slot is the one-hot [32,1] row selector at position p.
+@ kernel
+@ public { }
+fn kv_append_k(tf32[32,320] history, tf32[32,1] slot, tf32[1,320] row, mut tf32[32,320] output) → void {
+    output ← history + slot · row
+}
+
+@ kernel
+@ public { }
+fn kv_append_v(tf32[32,320] history, tf32[32,1] slot, tf32[1,320] row, mut tf32[32,320] output) → void {
+    output ← history + slot · row
+}
+
+# GEA3-U3a body 10 — per-kv-head key-window transpose for query-1 · keys-L.
+@ kernel
+@ public { }
+fn decode_key_transpose(tf32[32,64] input, mut tf32[64,32] output) → void {
+    output ← input.transpose()
+}
+
+# GEA3-U3a body 11 — query-1 × keys-L score with the frozen 0.125 scale as
+# the resident [1,32] constant (1/sqrt(64)).
+@ kernel
+@ public { }
+fn decode_score_gemm(tf32[1,64] query, tf32[64,32] key_transposed, tf32[1,32] attention_scale, mut tf32[1,32] output) → void {
+    output ← (query · key_transposed) ⊙ attention_scale
+}
+
+# GEA3-U3a body 12 — declared-length masked softmax. The additive mask is
+# the resident [1,32] constant: 0 within the declared history length L and
+# negative beyond it; the softmax collection method owns the row-wise
+# stability recipe exactly as in GEA2.
+@ kernel
+@ public { }
+fn decode_masked_softmax(tf32[1,32] scores, tf32[1,32] length_mask, mut tf32[1,32] output) → void {
+    const f32 _stability_max ← max from scores at [i, j] coalesce 0.0
+    output ← (scores + length_mask).softmax()
+}
+
+# GEA3-U3a body 13 — per-head context GEMV over the L_max-keyed window.
+@ kernel
+@ public { }
+fn decode_context_gemm(tf32[1,32] probabilities, tf32[32,64] values, mut tf32[1,64] output) → void {
+    output ← probabilities · values
+}
+
+# GEA3-U3a body 14 — SwiGLU at query-1.
+@ kernel
+@ public { }
+fn decode_swiglu(tf32[1,2560] gate, tf32[1,2560] up, mut tf32[1,2560] output) → void {
+    const tf32[1,2560] activated ← gate.silu()
+    output ← activated ⊙ up
+}
+
+# GEA3-U3a body 15 — decode residual stream addition.
+@ kernel
+@ public { }
+fn decode_residual_add(tf32[1,960] left, tf32[1,960] right, mut tf32[1,960] output) → void {
+    output ← left + right
+}

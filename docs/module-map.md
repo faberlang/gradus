@@ -80,7 +80,7 @@ evidence and boundaries are recorded in
 | Import | File | Role |
 | --- | --- | --- |
 | `gradus:dtype` | `src/dtype.fab` | Versioned dtype tag + cast/round/serialize (`dtype-schema-1.0.0`), including BF16 storage width |
-| `gradus:kernel` | `src/kernel.fab` | GEA1 paired BF16/F32 `[320,960]` GEMV entries with F32 accumulation plus thirteen GEA2 F32 block entries (T=8, D=960, F=2560); host-validated typed resident views |
+| `gradus:kernel` | `src/kernel.fab` | GEA1 paired BF16/F32 `[320,960]` GEMV entries with F32 accumulation plus thirteen GEA2 F32 block entries (T=8, D=960, F=2560) and fifteen GEA3-U3a decode entries (T=1, `L_max`=32); host-validated typed resident views |
 | `gradus:shape` | `src/shape.fab` | Shape rules: broadcast/reshape/expand, bounded product |
 | `gradus:tensor` | `src/tensor.fab` | Staged-carrier tensor construction/shape/ops (not autograd-aware) |
 | `gradus:math` | `src/math.fab` | Pure operation families (elementwise/reduce/matmul/cast/concat/slice) |
@@ -145,6 +145,39 @@ The English package surface renders the canonical `@ nucleum` identity as
 All GEA2 tensor parameters and outputs are `tf32`; no GEA2 entry has a
 lane/id parameter. The scale input is the frozen `[8,8]` F32 constant whose elements
 are `0.125`; the RoPE table is the committed `[8,32,3]` angle/cos/sin input.
+
+### GEA3-U3a decode device entries
+
+Fifteen independently selectable F32 entries for single-token decode at
+T=1 with the GEA3-U1 freezes (`L_max`=32, declared history length, mask
+beyond L; CTO ruling 0891c09b — fixed-capacity buffers, append-in-place).
+Per-head windows and the 32× layer repetition are plan-time facts
+(GEA2-U7 inheritance); the bodies carry no loop, slice, failable
+construct, or in-body call.
+
+| Entry | Idiom | Declared input shape(s) → output shape |
+| --- | --- | --- |
+| `decode_rmsnorm` | `rms_norm(1, 1e-5, weight)` | `[1,960]`, `[960]` → `[1,960]` |
+| `decode_gemv_qo` | `input · weights` | `[1,960]`, `[960,960]` → `[1,960]` |
+| `decode_gemv_kv` | `input · weights` | `[1,960]`, `[960,320]` → `[1,320]` |
+| `decode_gemv_gate_up` | `input · weights` | `[1,960]`, `[960,2560]` → `[1,2560]` |
+| `decode_gemv_down` | `input · weights` | `[1,2560]`, `[2560,960]` → `[1,960]` |
+| `decode_rope_q` | `rope_norm(0, 64)` with table input | `[1,960]`, table `[1,32,3]` → `[1,960]` |
+| `decode_rope_k` | `rope_norm(0, 64)` with table input | `[1,320]`, table `[1,32,3]` → `[1,320]` |
+| `kv_append_k` | `history + slot · row` | `[32,320]`, slot `[32,1]`, row `[1,320]` → `[32,320]` |
+| `kv_append_v` | `history + slot · row` | `[32,320]`, slot `[32,1]`, row `[1,320]` → `[32,320]` |
+| `decode_key_transpose` | `input.transpose()` | `[32,64]` → `[64,32]` |
+| `decode_score_gemm` | `(query · key_transposed) ⊙ attention_scale` | `[1,64]`, `[64,32]`, scale `[1,32]` → `[1,32]` |
+| `decode_masked_softmax` | `(scores + length_mask).softmax()` | `[1,32]`, mask `[1,32]` → `[1,32]` |
+| `decode_context_gemm` | `probabilities · values` | `[1,32]`, `[32,64]` → `[1,64]` |
+| `decode_swiglu` | `gate.silu() ⊙ up` | `[1,2560]`, `[1,2560]` → `[1,2560]` |
+| `decode_residual_add` | `left + right` | `[1,960]`, `[1,960]` → `[1,960]` |
+
+The `slot` input is the resident one-hot `[32,1]` row selector at the
+declared decode position; `slot · row` writes the incoming `[1,320]` K/V
+row into exactly that fixed-capacity slot. The `length_mask` input is the
+resident declared-length additive constant (0 within the declared history
+length L, negative beyond it) feeding softmax.
 
 ## Layers
 
