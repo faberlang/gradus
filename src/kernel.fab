@@ -580,3 +580,50 @@ fn prefill_kv_write_k(tf32[76,320] history, tf32[76,36] block, tf32[36,320] rows
 fn prefill_kv_write_v(tf32[76,320] history, tf32[76,36] block, tf32[36,320] rows, mut tf32[76,320] output) → void {
     output ← history + block · rows
 }
+
+# GEA3-U3c — head entries: final RMSNorm, tied lm_head GEMV, and the
+# embedding row route. Three independently selectable F32 entries closing
+# the U3 kernel-authorship family, all at the decode-step shape T=1 with
+# the frozen head geometry (D=960, vocab V=49152). The weights of
+# `lm_head_gemv` and the matrix of `embedding_gather` are the SAME tied
+# `token_embd.weight` in its resident [V,960] layout (GEA3-U2 typed view);
+# lm_head consumes it transposed so the widest GEMV yet is
+# [1,960]·[960,49152] → [1,49152] over one physical buffer.
+#
+# Entry inventory (input shapes → output shape):
+#   head_rmsnorm      [1,960] · [960]            → [1,960]
+#   lm_head_gemv      [1,960] · [49152,960]^T    → [1,49152]
+#   embedding_gather  [1,49152] · [49152,960]    → [1,960]
+#
+# Embedding row route (design note, per CTO ruling 0891c09b): the gather is
+# the U3a slot-selector idiom read row-wise instead of write row-wise — the
+# resident [1,49152] one-hot selector places the token's single 1 over the
+# embed matrix, so `selector · embeddings` is exactly the [1,960] embedding
+# row, a device gather entry over the resident matrix with no host copy,
+# loop, slice, failable construct, or in-body call. The selector is the
+# plan-bound token index materialized at the row granularity, the direct
+# mirror of U3a's [76,1] decode-position one-hot and U3b's [76,36] block
+# indicator: one resident constant per selection, one matmul, one entry.
+
+# GEA3-U3c body 1 — final RMSNorm over output_norm.weight.
+@ kernel
+@ public { }
+fn head_rmsnorm(tf32[1,960] input, tf32[960] weight, mut tf32[1,960] output) → void {
+    output ← input.rms_norm(1, 1e-5, weight)
+}
+
+# GEA3-U3c body 2 — tied lm_head GEMV [960→49152]: the resident
+# token_embd.weight [49152,960] consumed transposed, one physical buffer.
+@ kernel
+@ public { }
+fn lm_head_gemv(tf32[1,960] input, tf32[49152,960] embeddings, mut tf32[1,49152] output) → void {
+    output ← input · embeddings.transpose()
+}
+
+# GEA3-U3c body 3 — embedding row gather: the [1,49152] one-hot token
+# selector reads exactly one row of the resident embed matrix.
+@ kernel
+@ public { }
+fn embedding_gather(tf32[1,49152] selector, tf32[49152,960] embeddings, mut tf32[1,960] output) → void {
+    output ← selector · embeddings
+}

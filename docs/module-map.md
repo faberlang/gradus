@@ -220,6 +220,35 @@ slice, failable construct, or in-body call.
 | `prefill_kv_write_k` | `history + block · rows` | `[76,320]`, block `[76,36]`, rows `[36,320]` → `[76,320]` |
 | `prefill_kv_write_v` | `history + block · rows` | `[76,320]`, block `[76,36]`, rows `[36,320]` → `[76,320]` |
 
+### GEA3-U3c head device entries
+
+Three independently selectable F32 entries closing the U3
+kernel-authorship family, at the decode-step shape T=1 with the frozen
+head geometry (D=960, V=49152). The `lm_head_gemv` weights and the
+`embedding_gather` matrix are the SAME tied `token_embd.weight` in its
+resident `[V,960]` layout (GEA3-U2 typed view, digest-bound); lm_head
+consumes it transposed so the widest GEMV yet is
+`[1,960]·[960,49152] → [1,49152]` over one physical buffer (ruling
+0891c09b — no fork gate remains). Bodies carry no loop, slice, failable
+construct, or in-body call.
+
+| Entry | Idiom | Declared input shape(s) → output shape |
+| --- | --- | --- |
+| `head_rmsnorm` | `rms_norm(1, 1e-5, weight)` | `[1,960]`, `[960]` → `[1,960]` |
+| `lm_head_gemv` | `input · embeddings.transpose()` | `[1,960]`, `[49152,960]` → `[1,49152]` |
+| `embedding_gather` | `selector · embeddings` | `[1,49152]`, `[49152,960]` → `[1,960]` |
+
+**Embedding row route (design note).** The gather is a NEW op family
+(row index → 960 values) with no precedent entry; it is designed as the
+U3a slot-selector idiom read row-wise instead of write row-wise. The
+resident `[1,49152]` one-hot token selector places the token's single 1
+over the embed matrix, so `selector · embeddings` is exactly the
+`[1,960]` embedding row — a device gather entry over the resident
+matrix with no host copy. The selector is the plan-bound token index
+materialized at row granularity, the direct mirror of U3a's `[76,1]`
+decode-position one-hot and U3b's `[76,36]` block indicator: one
+resident selection constant, one matmul, one entry.
+
 ## Layers
 
 ```text
