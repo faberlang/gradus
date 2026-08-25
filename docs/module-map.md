@@ -5,6 +5,26 @@
 The authoritative per-symbol surface is [`docs/api-reference.md`](api-reference.md)
 (post-no-latin English identifier surface).
 
+## Greek naming convention (Gradus-only policy)
+
+Gradus permits a visually distinct subset of Greek letters as ordinary
+identifier vocabulary on paper-fidelity surfaces. The active convention is:
+
+| Letter | Quantity |
+| --- | --- |
+| `σ` | sigmoid |
+| `γ` | normalization gain |
+| `ε` | tolerance or normalization epsilon |
+| `θ` | RoPE base or model parameter |
+| `τ` | sampling temperature |
+| `α`, `β` | optimizer coefficients when an optimizer surface needs them |
+
+Only the visually distinct subset is allowed: `α β γ δ ε θ λ μ π σ τ φ ω Δ`.
+Never use Latin-lookalike Greek letters (`ο ν ρ ι κ χ υ ζ`), and never use
+Unicode subscripts; plain digits are canonical. This is Gradus naming policy for
+paper-fidelity members and parameters only. It is not a precedent for Norma,
+Triga, or Tela, whose identifiers remain word-shaped.
+
 One `.fab` file → one import path. Nested dirs for packages.
 
 ## Examples tour
