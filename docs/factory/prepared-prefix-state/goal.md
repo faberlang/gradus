@@ -112,10 +112,10 @@ units in this goal.
 
 | Unit | Scope | Depends on | Hand evidence |
 | --- | --- | --- | --- |
-| 1 | Canonical prepared identity and versioned identity wire in `src/cache.fab` (or the owning state module) and `docs/api-reference.md`; include content/model/config/tokenizer/position fields and field-wise equality. A lookup digest is opaque host/provider input, never language-computed or equality authority. | Existing cache identity; MODEL-01/capsule content identity; LIB-02 tokenizer identity | `faber check .`; focused identity proba with exact fixtures |
-| 2 | Complete typed prepared-state value covering KV and architecture-declared recurrent/SSM/convolution state, reset/copy semantics, and payload binding. Done when dense and hybrid state families are represented without device handles or hidden global state. | 1; MODEL-01 architecture; MODEL-02 router/expert state consumers; MODEL-03 state schedule | `faber check .`; focused state construction/reset/equality proba |
-| 3 | Longest-authorized-prefix attach and independent continuation state. Done when exact-prefix candidates select the longest valid prefix, mismatches reject, equal candidates resolve deterministically, and the source snapshot remains unchanged. | 1, 2; tokenizer and position semantics | `faber test` scoped to identity/state/attach cases; first-divergence state comparison |
-| 4 | Continuation integration for dense and hybrid execution surfaces, including suffix prefill from a prepared state and returned updated state. Done when warm continuation consumes only the suffix and exposes the complete next prepared state through one decode/generation surface. | 2, 3; dense continuation; MODEL-03 incremental state; MODEL-04 full-model composition; LIB-02 tokenizer | Executed cold-vs-warm token/logit equality on each admitted architecture row |
+| 1 | done | hand | 5f1ad4d | Canonical identity and wire (PP-U1) |
+| 2 | done | hand | 398545d | KV payload + declared families (PP-U2) |
+| 3 | done | hand | 4ad5621, 68f58c3 | Attach admission + longest-prefix attach (PP-U3a/U3b) |
+| 4 | active | — | 50fe7e8 | Dense done (U4a); hybrid continuation (U4b) blocked on MODEL-03/04 |
 | 5 | Contract truth pass: diagnostics, API reference, module map, reject rows, and regression fixtures document no-retention/no-auth/no-device ownership. Done when the public surface and source agree and malformed or incompatible prepared payloads fail closed. | 1–4 | `faber check .`; scoped `faber test`; `rg` audit for stale KV-only/reuse claims |
 
 ## Validation
@@ -141,10 +141,10 @@ The closeout gate requires all of the following:
 
 | Unit | Status | Seat | Receipt | Notes |
 | --- | --- | --- | --- | --- |
-| 1 | pending | — | — | Canonical identity and wire |
-| 2 | pending | — | — | Complete KV plus recurrent/SSM prepared state |
-| 3 | pending | — | — | Longest authorized prefix attach |
-| 4 | pending | — | — | Dense and hybrid continuation |
+| 1 | done | hand | 5f1ad4d | Canonical identity and wire (PP-U1) |
+| 2 | done | hand | 398545d | KV payload + declared families (PP-U2) |
+| 3 | done | hand | 4ad5621, 68f58c3 | Attach admission + longest-prefix attach (PP-U3a/U3b) |
+| 4 | active | — | 50fe7e8 | Dense done (U4a); hybrid continuation (U4b) blocked on MODEL-03/04 |
 | 5 | pending | — | — | Truth, diagnostics, and regression fixtures |
 
 ## Open questions
