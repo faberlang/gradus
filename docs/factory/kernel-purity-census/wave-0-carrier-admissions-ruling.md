@@ -135,8 +135,14 @@ workload is four lines to reproduce from `generation.fab:_last_logits`).
   blocked/analysis-error patterns match; the only textual drift is
   warning-occurrence counts in the dense/moe analysis inventories:
   LOCALE002 1303→1286, WARN003 96→97 — inventory notes, not outcomes).
-  `tokenizer.proba` (no carrier dependency) captured before/after
-  separately; result recorded in the wave mail.
+  `tokenizer.proba` is **not runtime-compared**: its import chain
+  (tokenizer → model/gguf_manifest → model/artifact) contains no
+  `gradus:tensor` edge, so the suite cannot observe the carrier rename or
+  stride cache; a confirmatory before/after pair was launched, then
+  discarded — the baseline worktree was cut after the rename commits
+  (construction error, caught before use) and the concurrent U4b
+  campaign began mutating `src/tokenizer.proba` mid-flight. The 42
+  compared suites include every file that imports the carrier.
 
 ### 4.4 Digest re-adjudication (radix)
 
