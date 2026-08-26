@@ -1,0 +1,918 @@
++++
+locale = "en"
++++
+# MODEL-03 (GGUF-M3) executed per-layer agreement exemplar.
+#
+# Application-owned adapter (the gguf-admit-qwen35moe + moe-probe pattern):
+# resolves the operator artifact path from argv, pins identity (digest +
+# length), admits the qwen35moe manifest, derives + validates the hybrid
+# layer schedule against the tensor inventory, then replays the 40 trunk
+# layers' attention sub-blocks over the pinned llama.cpp probe dump —
+# one prefill batch of the pinned token window plus one one-token decode
+# step — comparing every named per-layer tensor (state and output) under
+# the delivery band with a first-divergence record. Incremental replay and
+# reset/replay determinism are executed on the same real row. Gradus never
+# receives the path, a reader, or a whole-model byte list; every payload
+# read is a bounded sub-window through the app-owned range source.
+#
+# Component tier only: no token, logit, MoE FFN, full-model, or device
+# claim. The llama.cpp probe itself lives in trials evidence.
+
+import from "gradus:model/artifact" artifact
+import from "gradus:model/gguf_manifest" gguf_manifest
+import from "gradus:model/qwen35moe" qwen35moe
+import from "gradus:model/qwen35moe_state" state
+import from "gradus:model/tensor_payload" tensor_payload
+import from "gradus:model/tensor_view" tensor_view
+import from "gradus:tensor" tensor
+import from "norma:fs" fs
+import from "norma:process" process
+
+# Pinned identity facts for the local Qwen3.6 artifact (operator evidence,
+# never committed): the same frozen facts as the moe-probe oracle header.
+const string QWEN36_DIGEST ← "0b21525e972670ed59e1812e170b27c26355381f0656ecc4e25617ece7dac58b"
+const int QWEN36_LENGTH ← 22663387424
+const int QWEN36_DATA ← 10991392
+
+# Pinned window: the probe's prefill token list and the probe build.
+const int PREFILL_TOKENS ← 7
+const int DECODE_TOKEN ← 314
+
+# Band: derived against the pinned comparator (trials evidence,
+# m3-ssm-attention-oracle); tolerances are never widened, any mismatch is
+# a divergence receipt naming the first divergent element.
+const f32 DELTA ← 0.00035380 ∷ f32
+
+union ProbeError {
+    ProbeArguments {
+        string message
+    },
+    ProbeIdentity {
+        string message
+    },
+    ProbeAdmission {
+        string message
+    },
+    ProbeWindow {
+        string message
+    },
+    ProbeDump {
+        string message
+    },
+    ProbeDivergence {
+        string message
+    }
+}
+
+fn message(ProbeError e) → string {
+    match e {
+        case ProbeArguments const m {
+            return m
+        }
+        case ProbeIdentity const m {
+            return m
+        }
+        case ProbeAdmission const m {
+            return m
+        }
+        case ProbeWindow const m {
+            return m
+        }
+        case ProbeDump const m {
+            return m
+        }
+        case ProbeDivergence const m {
+            return m
+        }
+    }
+}
+
+# -------------------------------------------------------------------------
+# Artifact admission + weight windows (moe-probe pattern).
+# -------------------------------------------------------------------------
+
+fn _range(string via, int total, int start, int length) → bytes ⇥ gguf_manifest.GgufManifestError {
+    if start < 0 or length < 0 or start > total - length {
+        throw variant BadSource {message = "range request exceeds the artifact"}
+    }
+    const bytes bytes ← fs.read_range(via, start, length)
+    if bytes.length() ≠ length {
+        throw variant BadSource {message = "short range read"}
+    }
+    return bytes
+}
+
+fn _ends_with(string s, string suffix) → bool {
+    if s.length() < suffix.length() {
+        return false
+    }
+    return s.slice(s.length() - suffix.length(), s.length()) ≡ suffix
+}
+
+# The GGUF tensor name for one canonical base name (adapter-owned suffix
+# table; ssm_a has no suffix, ssm_dt carries ".bias").
+fn _tensor_name(string base) → string {
+    if _ends_with(base, ".ssm_a") {
+        return base
+    }
+    if _ends_with(base, ".ssm_dt") {
+        return base + ".bias"
+    }
+    return base + ".weight"
+}
+
+# Carrier shape per canonical base name (the module checks the returned
+# shape, so this mapping is the adapter's declaration).
+fn _carrier_shape(string base) → list<int> {
+    if _ends_with(base, ".attn_norm") {
+        return [2048]
+    }
+    if _ends_with(base, ".attn_qkv") {
+        return [8192, 2048]
+    }
+    if _ends_with(base, ".attn_gate") {
+        return [4096, 2048]
+    }
+    if _ends_with(base, ".ssm_conv1d") {
+        return [8192, 4]
+    }
+    if _ends_with(base, ".ssm_dt") {
+        return [32]
+    }
+    if _ends_with(base, ".ssm_a") {
+        return [32]
+    }
+    if _ends_with(base, ".ssm_beta") {
+        return [32, 2048]
+    }
+    if _ends_with(base, ".ssm_alpha") {
+        return [32, 2048]
+    }
+    if _ends_with(base, ".ssm_norm") {
+        return [128]
+    }
+    if _ends_with(base, ".ssm_out") {
+        return [2048, 4096]
+    }
+    if _ends_with(base, ".attn_q") {
+        return [8192, 2048]
+    }
+    if _ends_with(base, ".attn_k") {
+        return [512, 2048]
+    }
+    if _ends_with(base, ".attn_v") {
+        return [512, 2048]
+    }
+    if _ends_with(base, ".attn_q_norm") {
+        return [256]
+    }
+    if _ends_with(base, ".attn_k_norm") {
+        return [256]
+    }
+    if _ends_with(base, ".attn_output") {
+        return [2048, 4096]
+    }
+    return [1]
+}
+
+fn _identity(string digest, int length) → artifact.ContentIdentity ⇥ ProbeError {
+    do {
+        return artifact.identity("sha-256", digest, length)
+    }
+    catch err {
+        throw variant ProbeIdentity {message = "content identity invalid: " + err.message}
+    }
+}
+
+fn _plimit(gguf_manifest.GgufManifest m, string name) → tuple<int, int> ⇥ ProbeError {
+    do {
+        return gguf_manifest.payload_limit(m, name)
+    }
+    catch err {
+        throw variant ProbeWindow {message = "payload range failed for " + name + ": " + err.message}
+    }
+}
+
+fn _links(gguf_manifest.GgufManifest m, tensor_payload.TensorPayload p) → tensor_view.TensorView ⇥ ProbeError {
+    do {
+        return tensor_view.links(m, p)
+    }
+    catch err {
+        throw variant ProbeWindow {message = "view bind failed for " + p.name + ": " + err.message}
+    }
+}
+
+fn _slice(tensor_view.TensorView v, int start, int length, (int, int) → bytes ⇥ gguf_manifest.GgufManifestError source) → list<f32> ⇥ ProbeError {
+    do {
+        return tensor_view.materialize_slice(v, start, length, source)
+    }
+    catch err {
+        throw variant ProbeWindow {message = "window materialize failed for " + v.name + ": " + err.message}
+    }
+}
+
+fn _construct(list<f32> y, list<int> shape) → tensor.NumericBlock ⇥ ProbeError {
+    do {
+        return tensor.construct(y, shape)
+    }
+    catch err {
+        throw variant ProbeWindow {message = "carrier construction failed"}
+    }
+}
+
+fn _weight_window(string via, int total, gguf_manifest.GgufManifest m, string base) → tensor.NumericBlock ⇥ state.Qwen35moeStateError {
+    const (int, int) → bytes ⇥ gguf_manifest.GgufManifestError reader ← (int begin, int span) → bytes ⇥ gguf_manifest.GgufManifestError ∴ _range(via, total, begin, span)
+    do {
+        const tuple<int, int> limit ← _plimit(m, _tensor_name(base))
+        const tensor_payload.TensorPayload p ← tensor_payload.TensorPayload {
+            name = _tensor_name(base),
+            absolute_start = limit[0],
+            length = limit[1],
+            bytes = ||
+        }
+        const tensor_view.TensorView v ← _links(m, p)
+        const list<int> shape ← _carrier_shape(base)
+        var int length ← 1
+        for from shape const d {
+            length ← length * d
+        }
+        const list<f32> y ← _slice(v, 0, length, reader)
+        const tensor.NumericBlock carrier ← _construct(y, shape)
+        return carrier
+    }
+    catch err {
+        throw variant BadWindow {message = "weight window failed: " + message(err)}
+    }
+}
+
+fn _admit(gguf_manifest.GgufCorpus corpus, string digest, int total) → qwen35moe.Qwen35moeAdmission ⇥ ProbeError {
+    do {
+        return qwen35moe.admit(corpus, digest, total)
+    }
+    catch err {
+        throw variant ProbeAdmission {message = qwen35moe.admission_message(err)}
+    }
+}
+
+fn _corpus(string via, int total, string digest) → gguf_manifest.GgufCorpus ⇥ ProbeError {
+    do {
+        const artifact.ContentIdentity identity ← _identity(digest, total)
+        const bytes prefix_bytes ← fs.read_range(via, 0, QWEN36_DATA)
+        if prefix_bytes.length() ≠ QWEN36_DATA {
+            throw variant ProbeAdmission {message = "short table-prefix read"}
+        }
+        return gguf_manifest.GgufCorpus {
+            table = prefix_bytes,
+            artifact_length = total,
+            identity = identity
+        }
+    }
+    catch err {
+        throw variant ProbeAdmission {message = message(err)}
+    }
+}
+
+fn _manifest((int, int) → bytes ⇥ gguf_manifest.GgufManifestError source, int total, artifact.ContentIdentity identity) → gguf_manifest.GgufManifest ⇥ ProbeError {
+    do {
+        return gguf_manifest.inspect(source, total, identity)
+    }
+    catch err {
+        throw variant ProbeAdmission {message = "manifest admission failed: " + err.message}
+    }
+}
+
+
+fn _linear_index(state.Qwen35moeSchedule s, int block) → int ⇥ ProbeError {
+    do {
+        return state.linear_index(s, block)
+    }
+    catch err {
+        throw variant ProbeWindow {message = err.message}
+    }
+}
+
+fn _attention_index(state.Qwen35moeSchedule s, int block) → int ⇥ ProbeError {
+    do {
+        return state.attention_index(s, block)
+    }
+    catch err {
+        throw variant ProbeWindow {message = err.message}
+    }
+}
+
+fn _linear_attention(list<f32> x_rows, int layer, state.ConvState conv_in, state.RecurrentState recurrent_in, (string, int, int) → tensor.NumericBlock ⇥ state.Qwen35moeStateError source, qwen35moe.Qwen35moeConfig cfg) → state.LinearAttentionOutcome ⇥ ProbeError {
+    do {
+        return state.linear_attention(x_rows, layer, conv_in, recurrent_in, source, cfg)
+    }
+    catch err {
+        throw variant ProbeWindow {message = err.message}
+    }
+}
+
+fn _linear_attention_step(list<f32> x_row, int layer, state.ConvState conv_in, state.RecurrentState recurrent_in, (string, int, int) → tensor.NumericBlock ⇥ state.Qwen35moeStateError source, qwen35moe.Qwen35moeConfig cfg) → state.LinearAttentionOutcome ⇥ ProbeError {
+    do {
+        return state.linear_attention_step(x_row, layer, conv_in, recurrent_in, source, cfg)
+    }
+    catch err {
+        throw variant ProbeWindow {message = err.message}
+    }
+}
+
+fn _full_attention(list<f32> x_rows, int layer, state.KeyValueState kv_in, int start_pos, (string, int, int) → tensor.NumericBlock ⇥ state.Qwen35moeStateError source, qwen35moe.Qwen35moeConfig cfg) → state.FullAttentionOutcome ⇥ ProbeError {
+    do {
+        return state.full_attention(x_rows, layer, kv_in, start_pos, source, cfg)
+    }
+    catch err {
+        throw variant ProbeWindow {message = err.message}
+    }
+}
+
+fn _full_attention_step(list<f32> x_row, int layer, state.KeyValueState kv_in, int pos, (string, int, int) → tensor.NumericBlock ⇥ state.Qwen35moeStateError source, qwen35moe.Qwen35moeConfig cfg) → state.FullAttentionOutcome ⇥ ProbeError {
+    do {
+        return state.full_attention_step(x_row, layer, kv_in, pos, source, cfg)
+    }
+    catch err {
+        throw variant ProbeWindow {message = err.message}
+    }
+}
+
+# -------------------------------------------------------------------------
+# Probe dump reading: raw f32 files in the dump directory.
+# -------------------------------------------------------------------------
+
+fn _read_f32_file(string path, int count) → list<f32> ⇥ ProbeError {
+    const bytes raw ← fs.read_range(path, 0, count * 4)
+    if raw.length() ≠ count * 4 {
+        throw variant ProbeDump {message = "short dump read: " + path}
+    }
+    var list<f32> out ← empty
+    var int i ← 0
+    while i < count {
+        out.append(raw[i * 4‥i * 4 + 4] ↦ float<f32, Le>)
+        i ↑
+    }
+    return out
+}
+
+fn _dump_path(string dump_dir, int phase, string name) → string {
+    return dump_dir + "/p" + (phase ↦ string) + "_" + name + ".f32"
+}
+
+# Layer input rows [T][2048] from the dump: layer 0 reads the input
+# embedding, later layers the previous layer's post_moe output. The dump
+# tensor is [2048, T] (ggml linear order, channel innermost).
+fn _layer_input(string dump_dir, int phase, int layer, int tokens) → list<f32> ⇥ ProbeError {
+    var string name ← ""
+    if layer ≡ 0 {
+        name ← "model.input_embed"
+    }
+    else {
+        name ← "l_out-" + ((layer - 1) ↦ string)
+    }
+    const list<f32> raw ← _read_f32_file(_dump_path(dump_dir, phase, name), 2048 * tokens)
+    var list<f32> rows ← empty
+    for range 0‥tokens const t {
+        for range 0‥2048 const d {
+            rows.append(raw.get(t * 2048 + d) coalesce 0.0 ∷ f32)
+        }
+    }
+    return rows
+}
+
+fn _abs(f32 v) → f32 {
+    if v < 0.0 ∷ f32 {
+        return -v
+    }
+    return v
+}
+
+# Compare one computed row-major window [T][row_width] against a dump
+# tensor laid out [width, T] (ggml order). Returns the first divergence
+# text or "none" and accumulates the max deviation.
+fn _compare(string label, list<f32> mine, list<f32> dump, int tokens, int width, f32 delta, f32 worst) → tuple<string, f32> {
+    if mine.length() ≠ tokens * width {
+        return tuple<string, f32> ["count mismatch for " + label + ": computed " + (mine.length() ↦ string) + " expected " + ((tokens * width) ↦ string), worst]
+    }
+    var f32 max_dev ← worst
+    for range 0‥tokens const t {
+        for range 0‥width const d {
+            const f32 a ← mine.get(t * width + d) coalesce 0.0 ∷ f32
+            const f32 b ← dump.get(t * width + d) coalesce 0.0 ∷ f32
+            const f32 dev ← _abs(a - b)
+            if dev ≻ max_dev {
+                max_dev ← dev
+            }
+            if dev ≻ delta {
+                return tuple<string, f32> ["layer " + label + " at token " + (t ↦ string) + " element " + (d ↦ string) + ": computed " + (a ↦ string) + " dump " + (b ↦ string), max_dev]
+            }
+        }
+    }
+    return tuple<string, f32> ["none", max_dev]
+}
+
+# Compare a computed head-major window [T][heads][dim] against a dump
+# tensor laid out [dim, heads, T].
+fn _compare_heads(string label, list<f32> mine, list<f32> dump, int tokens, int heads, int dim, f32 delta, f32 worst) → tuple<string, f32> {
+    if mine.length() ≠ tokens * heads * dim {
+        return tuple<string, f32> ["count mismatch for " + label, worst]
+    }
+    var f32 max_dev ← worst
+    for range 0‥tokens const t {
+        for range 0‥heads const h {
+            for range 0‥dim const d {
+                const f32 a ← mine.get((t * heads + h) * dim + d) coalesce 0.0 ∷ f32
+                const f32 b ← dump.get(t * heads * dim + h * dim + d) coalesce 0.0 ∷ f32
+                const f32 dev ← _abs(a - b)
+                if dev ≻ max_dev {
+                    max_dev ← dev
+                }
+                if dev ≻ delta {
+                    return tuple<string, f32> ["layer " + label + " token " + (t ↦ string) + " head " + (h ↦ string) + " element " + (d ↦ string) + ": computed " + (a ↦ string) + " dump " + (b ↦ string), max_dev]
+                }
+            }
+        }
+    }
+    return tuple<string, f32> ["none", max_dev]
+}
+
+# Compare the recurrent state cells [heads][dim*dim] against the dump
+# tensor [dim, dim, heads] (same linear order: head-major, row-major cells
+# with the value index innermost).
+fn _compare_state(string label, list<f32> mine, list<f32> dump, int heads, int dim, f32 delta, f32 worst) → tuple<string, f32> {
+    if mine.length() ≠ heads * dim * dim {
+        return tuple<string, f32> ["count mismatch for " + label, worst]
+    }
+    var f32 max_dev ← worst
+    for range 0‥heads const h {
+        for range 0‥dim const j {
+            for range 0‥dim const i {
+                const f32 a ← mine.get(h * dim * dim + j * dim + i) coalesce 0.0 ∷ f32
+                const f32 b ← dump.get(i + j * dim + h * dim * dim) coalesce 0.0 ∷ f32
+                const f32 dev ← _abs(a - b)
+                if dev ≻ max_dev {
+                    max_dev ← dev
+                }
+                if dev ≻ delta {
+                    return tuple<string, f32> ["layer " + label + " head " + (h ↦ string) + " cell " + (i ↦ string) + "," + (j ↦ string) + ": computed " + (a ↦ string) + " dump " + (b ↦ string), max_dev]
+                }
+            }
+        }
+    }
+    return tuple<string, f32> ["none", max_dev]
+}
+
+# Compare per (token, head) scalar windows (beta_sigmoid, gate) against a
+# dump tensor laid out [1, heads, T].
+fn _compare_scalars(string label, list<f32> mine, list<f32> dump, int tokens, int heads, f32 delta, f32 worst) → tuple<string, f32> {
+    var f32 max_dev ← worst
+    for range 0‥tokens const t {
+        for range 0‥heads const h {
+            const f32 a ← mine.get(t * heads + h) coalesce 0.0 ∷ f32
+            const f32 b ← dump.get(t * heads + h) coalesce 0.0 ∷ f32
+            const f32 dev ← _abs(a - b)
+            if dev ≻ max_dev {
+                max_dev ← dev
+            }
+            if dev ≻ delta {
+                return tuple<string, f32> ["layer " + label + " token " + (t ↦ string) + " head " + (h ↦ string) + ": computed " + (a ↦ string) + " dump " + (b ↦ string), max_dev]
+            }
+        }
+    }
+    return tuple<string, f32> ["none", max_dev]
+}
+
+# Compare per (token, head) rows where the dump carries fewer heads than the
+# computed trace (the q/k head repeat happens inside the comparator's fused
+# op): computed head h reads dump head h % dump_heads.
+fn _compare_repeated_heads(string label, list<f32> mine, list<f32> dump, int tokens, int heads, int dump_heads, int dim, f32 delta, f32 worst) → tuple<string, f32> {
+    var f32 max_dev ← worst
+    for range 0‥tokens const t {
+        for range 0‥heads const h {
+            for range 0‥dim const d {
+                const f32 a ← mine.get((t * heads + h) * dim + d) coalesce 0.0 ∷ f32
+                const f32 b ← dump.get(t * dump_heads * dim + (h % dump_heads) * dim + d) coalesce 0.0 ∷ f32
+                const f32 dev ← _abs(a - b)
+                if dev ≻ max_dev {
+                    max_dev ← dev
+                }
+                if dev ≻ delta {
+                    return tuple<string, f32> ["layer " + label + " token " + (t ↦ string) + " head " + (h ↦ string) + " element " + (d ↦ string) + ": computed " + (a ↦ string) + " dump " + (b ↦ string), max_dev]
+                }
+            }
+        }
+    }
+    return tuple<string, f32> ["none", max_dev]
+}
+
+# Compare the conv input window [(rows + T)][channels] against the dump
+# tensor [rows + T, channels] (channel-major in the dump: the row index is
+# the innermost dimension).
+fn _compare_conv(string label, list<f32> mine, list<f32> dump, int rows, f32 delta, f32 worst) → tuple<string, f32> {
+    const int channels ← 8192
+    const int total ← rows * channels
+    if mine.length() ≠ total or dump.length() ≺ total {
+        return tuple<string, f32> ["count mismatch for " + label, worst]
+    }
+    var f32 max_dev ← worst
+    for range 0‥rows const r {
+        for range 0‥channels const ch {
+            const f32 a ← mine.get(r * channels + ch) coalesce 0.0 ∷ f32
+            const f32 b ← dump.get(ch * rows + r) coalesce 0.0 ∷ f32
+            const f32 dev ← _abs(a - b)
+            if dev ≻ max_dev {
+                max_dev ← dev
+            }
+            if dev ≻ delta {
+                return tuple<string, f32> ["layer " + label + " row " + (r ↦ string) + " channel " + (ch ↦ string) + ": computed " + (a ↦ string) + " dump " + (b ↦ string), max_dev]
+            }
+        }
+    }
+    return tuple<string, f32> ["none", max_dev]
+}
+
+# -------------------------------------------------------------------------
+# Session threading across both phases + incremental replay + reset.
+# -------------------------------------------------------------------------
+
+union PhaseOutcome {
+    Result {
+        string verdict
+        f32 worst
+        list<state.ConvState> conv
+        list<state.RecurrentState> recurrent
+        list<state.KeyValueState> kv
+        list<list<f32>> outputs
+    }
+}
+
+fn _run_phase(string via, int total, gguf_manifest.GgufManifest m, string dump_dir, int phase, int tokens, int start_pos, qwen35moe.Qwen35moeConfig cfg, state.Qwen35moeSchedule schedule, list<state.ConvState> conv_in, list<state.RecurrentState> recurrent_in, list<state.KeyValueState> kv_in) → PhaseOutcome ⇥ ProbeError {
+    var list<state.ConvState> convs ← empty
+    var list<state.RecurrentState> recs ← empty
+    var list<state.KeyValueState> kvs ← empty
+    var list<list<f32>> outputs ← empty
+    var f32 worst ← 0.0 ∷ f32
+    var int passes ← 0
+    var int layer ← 0
+    while layer < 40 {
+        const list<f32> x_rows ← _layer_input(dump_dir, phase, layer, tokens)
+        const int kind ← schedule.kinds().get(layer) coalesce -1
+        if kind ≡ 0 {
+            const int slot ← _linear_index(schedule, layer)
+            const state.ConvState conv_cur ← conv_in.get(slot) coalesce state.ConvState {channels = empty, kernel = 3, channels_count = 8192}
+            const state.RecurrentState rec_cur ← recurrent_in.get(slot) coalesce state.RecurrentState {cells = empty, value_heads = 32, key_dim = 128, value_dim = 128}
+            const state.LinearAttentionOutcome outcome ← _linear_attention(x_rows, layer, conv_cur, rec_cur, (string name, int start, int length) → tensor.NumericBlock ⇥ state.Qwen35moeStateError ∴ _weight_window(via, total, m, name), cfg)
+            convs.append(outcome.conv())
+            recs.append(outcome.recurrent())
+            outputs.append(outcome.out())
+            # Tensor comparisons for this layer.
+            const string il ← (layer ↦ string)
+            const list<f32> normed_dump ← _read_f32_file(_dump_path(dump_dir, phase, "attn_norm-" + il), 2048 * tokens)
+            const tuple<string, f32> c1 ← _compare(il + " attn_norm", outcome.trace().normed(), normed_dump, tokens, 2048, DELTA, worst)
+            const list<f32> qkv_dump ← _read_f32_file(_dump_path(dump_dir, phase, "linear_attn_qkv_mixed-" + il), 8192 * tokens)
+            const tuple<string, f32> c2 ← _compare(il + " qkv_mixed", outcome.trace().qkv_mixed(), qkv_dump, tokens, 8192, DELTA, c1[1])
+            const list<f32> z_dump ← _read_f32_file(_dump_path(dump_dir, phase, "z-" + il), 4096 * tokens)
+            const tuple<string, f32> c3 ← _compare(il + " z", outcome.trace().gate_proj(), z_dump, tokens, 4096, DELTA, c2[1])
+            const list<f32> beta_dump ← _read_f32_file(_dump_path(dump_dir, phase, "beta_sigmoid-" + il), 32 * tokens)
+            const tuple<string, f32> c4 ← _compare_scalars(il + " beta_sigmoid", outcome.trace().beta_sigmoid(), beta_dump, tokens, 32, DELTA, c3[1])
+            const list<f32> gate_dump ← _read_f32_file(_dump_path(dump_dir, phase, "gate-" + il), 32 * tokens)
+            const tuple<string, f32> c5 ← _compare_scalars(il + " gate", outcome.trace().gate(), gate_dump, tokens, 32, DELTA, c4[1])
+            const list<f32> conv_in_dump ← _read_f32_file(_dump_path(dump_dir, phase, "conv_input-" + il), (3 + tokens) * 8192)
+            const tuple<string, f32> c6 ← _compare_conv(il + " conv_input", outcome.trace().conv_input(), conv_in_dump, 3 + tokens, DELTA, c5[1])
+            const list<f32> conv_dump ← _read_f32_file(_dump_path(dump_dir, phase, "conv_output_silu-" + il), 8192 * tokens)
+            const tuple<string, f32> c7 ← _compare(il + " conv_output", outcome.trace().conv_output(), conv_dump, tokens, 8192, DELTA, c6[1])
+            const list<f32> q_conv_dump ← _read_f32_file(_dump_path(dump_dir, phase, "q_conv_predelta-" + il), 128 * 32 * tokens)
+            const tuple<string, f32> c8 ← _compare_repeated_heads(il + " q_conv", outcome.trace().q_conv(), q_conv_dump, tokens, 32, 16, 128, DELTA, c7[1])
+            const list<f32> k_conv_dump ← _read_f32_file(_dump_path(dump_dir, phase, "k_conv_predelta-" + il), 128 * 32 * tokens)
+            const tuple<string, f32> c9 ← _compare_repeated_heads(il + " k_conv", outcome.trace().k_conv(), k_conv_dump, tokens, 32, 16, 128, DELTA, c8[1])
+            const list<f32> v_conv_dump ← _read_f32_file(_dump_path(dump_dir, phase, "v_conv_predelta-" + il), 128 * 32 * tokens)
+            const tuple<string, f32> c10 ← _compare_heads(il + " v_conv", outcome.trace().v_conv(), v_conv_dump, tokens, 32, 128, DELTA, c9[1])
+            const list<f32> core_dump ← _read_f32_file(_dump_path(dump_dir, phase, "attn_output-" + il), 128 * 32 * tokens)
+            const tuple<string, f32> c11 ← _compare_heads(il + " core_out", outcome.trace().core_out(), core_dump, tokens, 32, 128, DELTA, c10[1])
+            const list<f32> final_dump ← _read_f32_file(_dump_path(dump_dir, phase, "final_output-" + il), 4096 * tokens)
+            const tuple<string, f32> c12 ← _compare(il + " final_output", outcome.trace().final_output(), final_dump, tokens, 4096, DELTA, c11[1])
+            const list<f32> residual_dump ← _read_f32_file(_dump_path(dump_dir, phase, "attn_residual-" + il), 2048 * tokens)
+            const tuple<string, f32> c13 ← _compare(il + " attn_residual", outcome.out(), residual_dump, tokens, 2048, DELTA, c12[1])
+            const list<f32> state_dump ← _read_f32_file(_dump_path(dump_dir, phase, "new_state-" + il), 128 * 128 * 32)
+            const tuple<string, f32> c14 ← _compare_state(il + " new_state", outcome.recurrent().cells(), state_dump, 32, 128, DELTA, c13[1])
+            const list<f32> conv_state_dump ← _read_f32_file(_dump_path(dump_dir, phase, "conv_state_last-" + il), 3 * 8192)
+            const tuple<string, f32> c15 ← _compare_conv(il + " conv_state_last", outcome.conv().channels(), conv_state_dump, 3, DELTA, c14[1])
+            worst ← c15[1]
+            if (c1[0] ≢ "none") or (c15[0] ≢ "none") {
+                var string which ← c1[0]
+                if which ≡ "none" {
+                    which ← c15[0]
+                }
+                return variant Result {verdict = "FAIL layer=" + il + " first-divergence=" + which, worst = worst, conv = convs, recurrent = recs, kv = kvs, outputs = outputs}
+            }
+            passes ↑
+            print "PASS phase=" + (phase ↦ string) + " layer=" + il + " kind=linear max-dev=" + (worst ↦ string)
+        }
+        else {
+            const int slot ← _attention_index(schedule, layer)
+            const state.KeyValueState kv_cur ← kv_in.get(slot) coalesce state.KeyValueState {keys = empty, values = empty, kv_heads = 2, key_dim = 256, value_dim = 256, capacity = 262144, length = 0}
+            const state.FullAttentionOutcome outcome ← _full_attention(x_rows, layer, kv_cur, start_pos, (string name, int start, int length) → tensor.NumericBlock ⇥ state.Qwen35moeStateError ∴ _weight_window(via, total, m, name), cfg)
+            kvs.append(outcome.kv())
+            outputs.append(outcome.out())
+            const string il ← (layer ↦ string)
+            const list<f32> normed_dump ← _read_f32_file(_dump_path(dump_dir, phase, "attn_norm-" + il), 2048 * tokens)
+            const tuple<string, f32> c1 ← _compare(il + " attn_norm", outcome.trace().normed(), normed_dump, tokens, 2048, DELTA, worst)
+            const list<f32> q_full_dump ← _read_f32_file(_dump_path(dump_dir, phase, "Qcur_full-" + il), 8192 * tokens)
+            const tuple<string, f32> c2 ← _compare(il + " Qcur_full", outcome.trace().q_full(), q_full_dump, tokens, 8192, DELTA, c1[1])
+            const list<f32> q_dump ← _read_f32_file(_dump_path(dump_dir, phase, "Qcur-" + il), 256 * 16 * tokens)
+            const tuple<string, f32> c3 ← _compare_heads(il + " Qcur", outcome.trace().q_rope(), q_dump, tokens, 16, 256, DELTA, c2[1])
+            const list<f32> k_dump ← _read_f32_file(_dump_path(dump_dir, phase, "Kcur-" + il), 256 * 2 * tokens)
+            const tuple<string, f32> c4 ← _compare_heads(il + " Kcur", outcome.trace().k_rope(), k_dump, tokens, 2, 256, DELTA, c3[1])
+            const list<f32> v_dump ← _read_f32_file(_dump_path(dump_dir, phase, "Vcur-" + il), 256 * 2 * tokens)
+            const tuple<string, f32> c5 ← _compare_heads(il + " Vcur", outcome.trace().v(), v_dump, tokens, 2, 256, DELTA, c4[1])
+            const list<f32> gated_dump ← _read_f32_file(_dump_path(dump_dir, phase, "attn_gated-" + il), 4096 * tokens)
+            const tuple<string, f32> c6 ← _compare(il + " attn_gated", outcome.trace().gated(), gated_dump, tokens, 4096, DELTA, c5[1])
+            const list<f32> residual_dump ← _read_f32_file(_dump_path(dump_dir, phase, "attn_residual-" + il), 2048 * tokens)
+            const tuple<string, f32> c7 ← _compare(il + " attn_residual", outcome.out(), residual_dump, tokens, 2048, DELTA, c6[1])
+            worst ← c7[1]
+            if (c1[0] ≢ "none") or (c7[0] ≢ "none") {
+                var string which ← c1[0]
+                if which ≡ "none" {
+                    which ← c7[0]
+                }
+                return variant Result {verdict = "FAIL layer=" + il + " first-divergence=" + which, worst = worst, conv = convs, recurrent = recs, kv = kvs, outputs = outputs}
+            }
+            passes ↑
+            print "PASS phase=" + (phase ↦ string) + " layer=" + il + " kind=attention max-dev=" + (worst ↦ string)
+        }
+        layer ↑
+    }
+    return variant Result {verdict = "PASS layers=" + (passes ↦ string), worst = worst, conv = convs, recurrent = recs, kv = kvs, outputs = outputs}
+}
+
+# Incremental replay: feed the prefill window one token at a time through
+# the same per-layer state machinery and check exact equality of every
+# per-token output row against the batched pass (F5), then verify the
+# terminal states match (equality is exact: identical op order).
+fn _replay_prefill(string via, int total, gguf_manifest.GgufManifest m, string dump_dir, qwen35moe.Qwen35moeConfig cfg, state.Qwen35moeSchedule schedule, list<state.ConvState> conv_in, list<state.RecurrentState> recurrent_in, list<state.KeyValueState> kv_in, list<list<f32>> batched_outputs) → string ⇥ ProbeError {
+    var list<state.ConvState> convs ← empty
+    for from conv_in const c {
+        convs.append(c)
+    }
+    var list<state.RecurrentState> recs ← empty
+    for from recurrent_in const r {
+        recs.append(r)
+    }
+    var list<state.KeyValueState> kvs ← empty
+    for from kv_in const k {
+        kvs.append(k)
+    }
+    for range 0‥PREFILL_TOKENS const t {
+        var int layer ← 0
+        while layer < 40 {
+            var list<f32> one_row ← empty
+            const list<f32> all_rows ← _layer_input(dump_dir, 0, layer, PREFILL_TOKENS)
+            for range 0‥2048 const d {
+                one_row.append(all_rows.get(t * 2048 + d) coalesce 0.0 ∷ f32)
+            }
+            const int kind ← schedule.kinds().get(layer) coalesce -1
+            if kind ≡ 0 {
+                const int slot ← _linear_index(schedule, layer)
+                const state.ConvState conv_cur ← convs.get(slot) coalesce state.ConvState {channels = empty, kernel = 3, channels_count = 8192}
+                const state.RecurrentState rec_cur ← recs.get(slot) coalesce state.RecurrentState {cells = empty, value_heads = 32, key_dim = 128, value_dim = 128}
+                const state.LinearAttentionOutcome outcome ← _linear_attention_step(one_row, layer, conv_cur, rec_cur, (string name, int start, int length) → tensor.NumericBlock ⇥ state.Qwen35moeStateError ∴ _weight_window(via, total, m, name), cfg)
+                var list<state.ConvState> next_convs ← empty
+                var int ci ← 0
+                while ci < convs.length() {
+                    if ci ≡ slot {
+                        next_convs.append(outcome.conv())
+                    }
+                    else {
+                        next_convs.append(convs.get(ci) coalesce state.ConvState {channels = empty, kernel = 3, channels_count = 8192})
+                    }
+                    ci ↑
+                }
+                convs ← next_convs
+                var list<state.RecurrentState> next_recs ← empty
+                var int ri ← 0
+                while ri < recs.length() {
+                    if ri ≡ slot {
+                        next_recs.append(outcome.recurrent())
+                    }
+                    else {
+                        next_recs.append(recs.get(ri) coalesce state.RecurrentState {cells = empty, value_heads = 32, key_dim = 128, value_dim = 128})
+                    }
+                    ri ↑
+                }
+                recs ← next_recs
+                # the step output row must equal the batched row exactly
+                const list<f32> batch_row ← batched_outputs.get(layer) coalesce empty_row_f32()
+                for range 0‥2048 const d {
+                    const f32 a ← outcome.out().get(d) coalesce 1.0 ∷ f32
+                    const f32 b ← batch_row.get(t * 2048 + d) coalesce 0.0 ∷ f32
+                    if a ≠ b {
+                        return "replay divergence layer=" + (layer ↦ string) + " token=" + (t ↦ string) + " element=" + (d ↦ string)
+                    }
+                }
+            }
+            else {
+                const int slot ← _attention_index(schedule, layer)
+                const state.KeyValueState kv_cur ← kvs.get(slot) coalesce state.KeyValueState {keys = empty, values = empty, kv_heads = 2, key_dim = 256, value_dim = 256, capacity = 262144, length = 0}
+                const state.FullAttentionOutcome outcome ← _full_attention_step(one_row, layer, kv_cur, t, (string name, int start, int length) → tensor.NumericBlock ⇥ state.Qwen35moeStateError ∴ _weight_window(via, total, m, name), cfg)
+                var list<state.KeyValueState> next_kvs ← empty
+                var int ki ← 0
+                while ki < kvs.length() {
+                    if ki ≡ slot {
+                        next_kvs.append(outcome.kv())
+                    }
+                    else {
+                        next_kvs.append(kvs.get(ki) coalesce state.KeyValueState {keys = empty, values = empty, kv_heads = 2, key_dim = 256, value_dim = 256, capacity = 262144, length = 0})
+                    }
+                    ki ↑
+                }
+                kvs ← next_kvs
+                const list<f32> batch_row ← batched_outputs.get(layer) coalesce empty_row_f32()
+                for range 0‥2048 const d {
+                    const f32 a ← outcome.out().get(d) coalesce 1.0 ∷ f32
+                    const f32 b ← batch_row.get(t * 2048 + d) coalesce 0.0 ∷ f32
+                    if a ≠ b {
+                        return "replay divergence layer=" + (layer ↦ string) + " token=" + (t ↦ string) + " element=" + (d ↦ string)
+                    }
+                }
+            }
+            layer ↑
+        }
+    }
+    return "none"
+}
+
+main {
+    const list<string> args ← process.argv()
+    if args.length() ≠ 4 {
+        print "usage: qwen35moe-layer-probe <artifact> <data-offset> <dump-dir>"
+        process.exit_process(2)
+    }
+    const string via ← args.get(1) coalesce ""
+    const int total ← QWEN36_LENGTH
+    const string digest ← QWEN36_DIGEST
+    do {
+        # admission (identity precondition -> manifest -> schedule)
+        const gguf_manifest.GgufCorpus corpus ← _corpus(via, total, digest)
+        const qwen35moe.Qwen35moeAdmission admission ← _admit(corpus, digest, total)
+        print "ADMIT qwen35moe tensors=§ blocks=§"(admission.summary.total ↦ string, admission.config.block_count ↦ string)
+        const artifact.ContentIdentity identity ← _identity(digest, total)
+        const (int, int) → bytes ⇥ gguf_manifest.GgufManifestError reader ← (int begin, int span) → bytes ⇥ gguf_manifest.GgufManifestError ∴ _range(via, total, begin, span)
+        const gguf_manifest.GgufManifest manifest ← _manifest(reader, total, identity)
+        const state.Qwen35moeSchedule schedule ← _schedule(admission.config)
+        _validate_schedule(manifest, schedule, admission.config)
+        print "SCHEDULE trunk=§ linear=§ full=§ nextn=§"(schedule.trunk_layers() ↦ string, schedule.linear_layers() ↦ string, schedule.full_layers() ↦ string, schedule.nextn_layers() ↦ string)
+        const string dump_dir ← args.get(3) coalesce ""
+
+        # fresh session
+        var list<state.ConvState> convs ← empty
+        for range 0‥schedule.linear_layers() const _ {
+            convs.append(_fresh_conv(admission.config))
+        }
+        var list<state.RecurrentState> recs ← empty
+        for range 0‥schedule.linear_layers() const _ {
+            recs.append(state.fresh_recurrent_state(admission.config))
+        }
+        var list<state.KeyValueState> kvs ← empty
+        for range 0‥schedule.full_layers() const _ {
+            kvs.append(_fresh_kv(admission.config, admission.config.context_length))
+        }
+
+        # phase 0: prefill batch over the pinned window
+        const PhaseOutcome phase0 ← _run_phase(via, total, manifest, dump_dir, 0, PREFILL_TOKENS, 0, admission.config, schedule, convs, recs, kvs)
+        print "PHASE0 " + _phase_verdict(phase0)
+        if not _starts_with(_phase_verdict(phase0), "PASS") {
+            process.exit_process(1)
+        }
+        convs ← _phase_conv(phase0)
+        recs ← _phase_recurrent(phase0)
+        kvs ← _phase_kv(phase0)
+
+        # reset/replay determinism: fresh session, one token at a time,
+        # exact equality against the batched per-layer outputs (F5)
+        var list<state.ConvState> reset_convs ← empty
+        for range 0‥schedule.linear_layers() const _ {
+            reset_convs.append(_fresh_conv(admission.config))
+        }
+        var list<state.RecurrentState> reset_recs ← empty
+        for range 0‥schedule.linear_layers() const _ {
+            reset_recs.append(state.fresh_recurrent_state(admission.config))
+        }
+        var list<state.KeyValueState> reset_kvs ← empty
+        for range 0‥schedule.full_layers() const _ {
+            reset_kvs.append(_fresh_kv(admission.config, admission.config.context_length))
+        }
+        const string replay ← _replay_prefill(via, total, manifest, dump_dir, admission.config, schedule, reset_convs, reset_recs, reset_kvs, _phase_outputs(phase0))
+        print "REPLAY " + replay
+        if replay ≢ "none" {
+            process.exit_process(1)
+        }
+
+        # phase 1: one-token incremental decode
+        const PhaseOutcome phase1 ← _run_phase(via, total, manifest, dump_dir, 1, 1, PREFILL_TOKENS, admission.config, schedule, convs, recs, kvs)
+        print "PHASE1 " + _phase_verdict(phase1)
+        if not _starts_with(_phase_verdict(phase1), "PASS") {
+            process.exit_process(1)
+        }
+        print "ORACLE max-dev=§ delta=§"(_phase_worst(phase1) ↦ string, DELTA ↦ string)
+        print "PREFILL+DECODE: PASS"
+        process.exit_process(0)
+    }
+    catch err {
+        print "error: " + message(err)
+        process.exit_process(1)
+    }
+}
+
+fn _schedule(qwen35moe.Qwen35moeConfig c) → state.Qwen35moeSchedule ⇥ ProbeError {
+    do {
+        return state.schedule(c)
+    }
+    catch err {
+        throw variant ProbeAdmission {message = err.message}
+    }
+}
+
+fn _validate_schedule(gguf_manifest.GgufManifest m, state.Qwen35moeSchedule s, qwen35moe.Qwen35moeConfig c) → void ⇥ ProbeError {
+    do {
+        state.validate_schedule(m, s, c)
+    }
+    catch err {
+        throw variant ProbeAdmission {message = err.message}
+    }
+}
+
+fn _fresh_conv(qwen35moe.Qwen35moeConfig c) → state.ConvState ⇥ ProbeError {
+    do {
+        return state.fresh_conv_state(c)
+    }
+    catch err {
+        throw variant ProbeWindow {message = err.message}
+    }
+}
+
+fn _fresh_kv(qwen35moe.Qwen35moeConfig c, int capacity) → state.KeyValueState ⇥ ProbeError {
+    do {
+        return state.fresh_kv_state(c, capacity)
+    }
+    catch err {
+        throw variant ProbeWindow {message = err.message}
+    }
+}
+
+fn empty_row_f32() → list<f32> {
+    return empty
+}
+
+fn _phase_verdict(PhaseOutcome p) → string {
+    match p {
+        case Result const verdict, worst, conv, recurrent, kv, outputs {
+            return verdict
+        }
+    }
+}
+
+fn _phase_worst(PhaseOutcome p) → f32 {
+    match p {
+        case Result const verdict, worst, conv, recurrent, kv, outputs {
+            return worst
+        }
+    }
+}
+
+fn _phase_conv(PhaseOutcome p) → list<state.ConvState> {
+    match p {
+        case Result const verdict, worst, conv, recurrent, kv, outputs {
+            return conv
+        }
+    }
+}
+
+fn _phase_recurrent(PhaseOutcome p) → list<state.RecurrentState> {
+    match p {
+        case Result const verdict, worst, conv, recurrent, kv, outputs {
+            return recurrent
+        }
+    }
+}
+
+fn _phase_kv(PhaseOutcome p) → list<state.KeyValueState> {
+    match p {
+        case Result const verdict, worst, conv, recurrent, kv, outputs {
+            return kv
+        }
+    }
+}
+
+fn _phase_outputs(PhaseOutcome p) → list<list<f32>> {
+    match p {
+        case Result const verdict, worst, conv, recurrent, kv, outputs {
+            return outputs
+        }
+    }
+}
+
+fn _starts_with(string s, string prefix) → bool {
+    if s.length() < prefix.length() {
+        return false
+    }
+    return s.slice(0, prefix.length()) ≡ prefix
+}

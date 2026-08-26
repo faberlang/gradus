@@ -1,0 +1,498 @@
++++
+locale = "en"
++++
+# MODEL-03 proba: hybrid SSM/attention state (schedule derivation, state
+# value construction/equality, the delta rule core, multi-section RoPE
+# pair law, prefill/incremental equivalence, reset/replay determinism,
+# identity round-trip). Executed rows run on deterministic synthetic
+# weights; the real-artifact executed proof lives in
+# exempla/qwen35moe-layer-probe (per-layer oracle agreement).
+
+import from "gradus:model/qwen35moe" qwen35moe
+import from "gradus:model/qwen35moe_state" state
+import from "gradus:tensor" tensor
+
+# Synthetic configurations mirroring the frozen qwen35moe row (41 blocks)
+# and the two local 40-block rows (no NextN block), so schedule derivation
+# holds for every admitted local qwen35moe artifact shape.
+fn _config(int block_count, int nextn_layers) → qwen35moe.Qwen35moeConfig {
+    return qwen35moe.Qwen35moeConfig {
+        architecture = "qwen35moe",
+        file_type = 15,
+        quantization_version = 2,
+        block_count = block_count,
+        context_length = 262144,
+        embedding_length = 2048,
+        head_count = 16,
+        head_count_kv = 2,
+        key_length = 256,
+        value_length = 256,
+        rms_norm_epsilon = 0.000001 ∷ f32,
+        freq_base = 10000000.0 ∷ f32,
+        rope_dimension_count = 64,
+        rope_sections = [11, 11, 10, 0],
+        expert_count = 256,
+        expert_used_count = 8,
+        expert_ffn_length = 512,
+        shared_ffn_length = 512,
+        conv_kernel = 4,
+        state_size = 128,
+        group_count = 16,
+        gradus_temporis = 32,
+        inner_size = 4096,
+        full_attention_interval = 4,
+        nextn_predict_layers = nextn_layers,
+        tokenizer_model = "gpt2",
+        tokenizer_pre = "qwen35",
+        token_count = 248320,
+        token_type_count = 248320,
+        merge_count = 247587,
+        eos_token_id = 248046,
+        padding_token_id = 248055,
+        bos_token_id = 248044,
+        add_bos_token = false
+    }
+}
+
+fn _pinned_config() → qwen35moe.Qwen35moeConfig {
+    return _config(41, 1)
+}
+
+fn _heretic_config() → qwen35moe.Qwen35moeConfig {
+    return _config(40, 0)
+}
+
+# Minimal config for hand-computed recurrence rows: a 1-head, 2x2-cell
+# recurrent state so the delta rule can be asserted cell by cell. All other
+# fields mirror the pinned row (fresh_recurrent_state reads only
+# gradus_temporis and state_size).
+fn _small_config() → qwen35moe.Qwen35moeConfig {
+    return qwen35moe.Qwen35moeConfig {
+        architecture = "qwen35moe",
+        file_type = 15,
+        quantization_version = 2,
+        block_count = 41,
+        context_length = 262144,
+        embedding_length = 2048,
+        head_count = 16,
+        head_count_kv = 2,
+        key_length = 256,
+        value_length = 256,
+        rms_norm_epsilon = 0.000001 ∷ f32,
+        freq_base = 10000000.0 ∷ f32,
+        rope_dimension_count = 64,
+        rope_sections = [11, 11, 10, 0],
+        expert_count = 256,
+        expert_used_count = 8,
+        expert_ffn_length = 512,
+        shared_ffn_length = 512,
+        conv_kernel = 4,
+        state_size = 2,
+        group_count = 16,
+        gradus_temporis = 1,
+        inner_size = 4096,
+        full_attention_interval = 4,
+        nextn_predict_layers = 1,
+        tokenizer_model = "gpt2",
+        tokenizer_pre = "qwen35",
+        token_count = 248320,
+        token_type_count = 248320,
+        merge_count = 247587,
+        eos_token_id = 248046,
+        padding_token_id = 248055,
+        bos_token_id = 248044,
+        add_bos_token = false
+    }
+}
+
+# Deterministic synthetic weights: a fixed pseudo-random row derived from
+# the requested length, so the executed rows need no artifact. The value
+# scale is deliberately small (≈ ±0.30): at the naive ±3 magnitude the
+# alpha/dt gate path reaches softplus(alpha + dt_bias) * a ≈ ±670 and
+# exp(decay) legitimately overflows f32 — the module's loud trap is correct
+# behavior (FORK-2), and the out-of-distribution weights, not the module,
+# are the defect, so the harness keeps the gate path inside the model's
+# trained operating range.
+fn _fill(int count, int seed) → list<f32> {
+    var list<f32> out ← empty
+    var int h ← seed
+    for range 0‥count const _ {
+        h ← (h * 1103515245 + 12345) % 2147483647
+        if h ≺ 0 {
+            h ← -h
+        }
+        const int m ← h % 2000 - 1000
+        out.append((m ↦ f32) / 3310.0)
+    }
+    return out
+}
+
+fn _ends_with(string s, string suffix) → bool {
+    if s.length() ≺ suffix.length() {
+        return false
+    }
+    return s.slice(s.length() - suffix.length(), s.length()) ≡ suffix
+}
+
+# Carrier shape per canonical base name (the module checks the returned
+# shape, so this mapping is the test adapter's declaration).
+fn _carrier_shape(string name) → list<int> {
+    if _ends_with(name, ".attn_norm") {
+        return [2048]
+    }
+    if _ends_with(name, ".attn_qkv") {
+        return [8192, 2048]
+    }
+    if _ends_with(name, ".attn_gate") {
+        return [4096, 2048]
+    }
+    if _ends_with(name, ".ssm_conv1d") {
+        return [8192, 4]
+    }
+    if _ends_with(name, ".ssm_dt") {
+        return [32]
+    }
+    if _ends_with(name, ".ssm_a") {
+        return [32]
+    }
+    if _ends_with(name, ".ssm_beta") {
+        return [32, 2048]
+    }
+    if _ends_with(name, ".ssm_alpha") {
+        return [32, 2048]
+    }
+    if _ends_with(name, ".ssm_norm") {
+        return [128]
+    }
+    if _ends_with(name, ".ssm_out") {
+        return [2048, 4096]
+    }
+    if _ends_with(name, ".attn_q") {
+        return [8192, 2048]
+    }
+    if _ends_with(name, ".attn_k") {
+        return [512, 2048]
+    }
+    if _ends_with(name, ".attn_v") {
+        return [512, 2048]
+    }
+    if _ends_with(name, ".attn_q_norm") {
+        return [256]
+    }
+    if _ends_with(name, ".attn_k_norm") {
+        return [256]
+    }
+    if _ends_with(name, ".attn_output") {
+        return [2048, 4096]
+    }
+    return [length_of(name)]
+}
+
+fn length_of(string name) → int {
+    return 1
+}
+
+fn _synthetic_window(string name, int start, int length) → tensor.NumericBlock ⇥ state.Qwen35moeStateError {
+    do {
+        return tensor.construct(_fill(length, 7), _carrier_shape(name))
+    }
+    catch err {
+        throw variant BadWindow {message = "synthetic carrier failed"}
+    }
+}
+
+fn _kind_name(state.Qwen35moeSchedule s, int block) → string {
+    do {
+        return state.layer_kind_name(state.layer_kind(s, block))
+    }
+    catch err {
+        return "error"
+    }
+}
+
+fn _linear_index(state.Qwen35moeSchedule s, int block) → int {
+    do {
+        return state.linear_index(s, block)
+    }
+    catch err {
+        return -1
+    }
+}
+
+fn _attention_index(state.Qwen35moeSchedule s, int block) → int {
+    do {
+        return state.attention_index(s, block)
+    }
+    catch err {
+        return -1
+    }
+}
+
+fn _abs(f32 v) → f32 {
+    if v ≺ 0.0 then return -v
+    return v
+}
+
+test "schedule derivation on the pinned 41-block row" {
+    do {
+    const state.Qwen35moeSchedule s ← state.schedule(_pinned_config())
+    assert s.trunk_layers() ≡ 40
+    assert s.linear_layers() ≡ 30
+    assert s.full_layers() ≡ 10
+    assert s.nextn_layers() ≡ 1
+    assert _kind_name(s, 0) ≡ "linear_attention"
+    assert _kind_name(s, 2) ≡ "linear_attention"
+    assert _kind_name(s, 3) ≡ "full_attention"
+    assert _kind_name(s, 4) ≡ "linear_attention"
+    assert _kind_name(s, 7) ≡ "full_attention"
+    assert _kind_name(s, 38) ≡ "linear_attention"
+    assert _kind_name(s, 39) ≡ "full_attention"
+    assert _kind_name(s, 40) ≡ "nextn"
+    assert state.is_trunk(s, 39)
+    assert not state.is_trunk(s, 40)
+    assert _linear_index(s, 0) ≡ 0
+    assert _linear_index(s, 1) ≡ 1
+    assert _linear_index(s, 4) ≡ 3
+    assert _attention_index(s, 3) ≡ 0
+    assert _attention_index(s, 39) ≡ 9
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "schedule derivation on the 40-block rows (heretic/ornith shape)" {
+    do {
+    const state.Qwen35moeSchedule s ← state.schedule(_heretic_config())
+    assert s.trunk_layers() ≡ 40
+    assert s.linear_layers() ≡ 30
+    assert s.full_layers() ≡ 10
+    assert s.nextn_layers() ≡ 0
+    assert _kind_name(s, 39) ≡ "full_attention"
+    assert state.is_trunk(s, 39)
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "schedule bounds fail closed" {
+    do {
+        const state.Qwen35moeSchedule s ← state.schedule(_pinned_config())
+        assert _kind_name(s, 41) ≡ "error"
+        assert _kind_name(s, -1) ≡ "error"
+        assert _linear_index(s, 3) ≡ -1
+        assert _attention_index(s, 0) ≡ -1
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "fresh state values are empty and typed per family" {
+    do {
+    const qwen35moe.Qwen35moeConfig c ← _pinned_config()
+    const state.ConvState conv ← state.fresh_conv_state(c)
+    assert conv.kernel() ≡ 3
+    assert conv.channels_count() ≡ 8192
+    assert conv.channels.length() ≡ 3 * 8192
+    for range 0‥conv.channels.length() const i {
+        assert conv.channels.get(i) coalesce 1.0 ∷ f32 ≡ 0.0 ∷ f32
+    }
+    const state.RecurrentState recurrent ← state.fresh_recurrent_state(c)
+    assert recurrent.value_heads() ≡ 32
+    assert recurrent.key_dim() ≡ 128
+    assert recurrent.value_dim() ≡ 128
+    assert recurrent.cells.length() ≡ 32 * 128 * 128
+    for range 0‥recurrent.cells.length() const i {
+        assert recurrent.cells.get(i) coalesce 1.0 ∷ f32 ≡ 0.0 ∷ f32
+    }
+    const state.KeyValueState kv ← state.fresh_kv_state(c, 16)
+    assert kv.kv_heads() ≡ 2
+    assert kv.key_dim() ≡ 256
+    assert kv.value_dim() ≡ 256
+    assert kv.length() ≡ 0
+    assert kv.capacity() ≡ 16
+    assert kv.keys.length() ≡ 0
+    assert kv.values.length() ≡ 0
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "state families stay separate and equality is family-wise" {
+    do {
+    const qwen35moe.Qwen35moeConfig c ← _pinned_config()
+    const state.ConvState a ← state.fresh_conv_state(c)
+    const state.ConvState b ← state.fresh_conv_state(c)
+    assert state.conv_equal(a, b)
+    const state.RecurrentState r ← state.fresh_recurrent_state(c)
+    const state.KeyValueState kv ← state.fresh_kv_state(c, 4)
+    assert state.recurrent_equal(r, r)
+    assert state.kv_equal(kv, kv)
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "session identity round-trips and covers the required fields" {
+    do {
+    const qwen35moe.Qwen35moeConfig c ← _pinned_config()
+    const state.HybridSession s ← state.fresh_session(c)
+    const string wire ← state.session_identity_key(s)
+    const state.HybridSession parsed ← state.deserialize_session_identity(wire)
+    assert state.session_identity_key(parsed) ≡ wire
+    assert wire.slice(0, 30) ≡ "qwen35moe-state/identity/1.0.0"
+    assert s.generation() ≡ 0
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "reset returns a fresh session with the same identity" {
+    do {
+    const qwen35moe.Qwen35moeConfig c ← _pinned_config()
+    const state.HybridSession s ← state.fresh_session(c)
+    const state.HybridSession again ← state.reset_session(s)
+    assert state.session_identity_key(again) ≡ state.session_identity_key(s)
+    assert state.session_state_equal(again, s)
+    assert again.generation ≡ 0
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "rope rotation preserves pair norms over the multi-section series" {
+    # Pair j of a head row is (element j, element j + dims/2) with angle
+    # theta_j = pos * base^(-2j/dims); sections [11, 11, 10, 0] cover the
+    # pairs and every section reads the text position on this row.
+    const list<f32> head ← [1.0 ∷ f32, 0.0 ∷ f32, 0.5 ∷ f32, -0.5 ∷ f32, 2.0 ∷ f32, 0.25 ∷ f32, -1.0 ∷ f32, 1.0 ∷ f32]
+    do {
+    const list<f32> turned ← state.rope_head(head, 8, 4, 10000000.0 ∷ f32, [1, 1, 1, 1, 0, 0, 0, 0], 3, 8)
+    assert turned.length() ≡ 8
+    const f32 n_before ← (head.get(0) coalesce 0.0 ∷ f32) * (head.get(0) coalesce 0.0 ∷ f32) + (head.get(4) coalesce 0.0 ∷ f32) * (head.get(4) coalesce 0.0 ∷ f32)
+    const f32 n_after ← (turned.get(0) coalesce 0.0 ∷ f32) * (turned.get(0) coalesce 0.0 ∷ f32) + (turned.get(4) coalesce 0.0 ∷ f32) * (turned.get(4) coalesce 0.0 ∷ f32)
+    assert _abs(n_before - n_after) ≺ 0.0001 ∷ f32
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "the delta rule core matches a hand-computed 2-cell update" {
+    const qwen35moe.Qwen35moeConfig c ← _small_config()
+    const state.RecurrentState s0 ← state.fresh_recurrent_state(c)
+    const list<f32> q ← [1.0 ∷ f32, 0.0 ∷ f32]
+    const list<f32> k ← [0.0 ∷ f32, 1.0 ∷ f32]
+    const list<f32> v ← [2.0 ∷ f32, 4.0 ∷ f32]
+    do {
+    const state.RecurrentState s1 ← state.recurrent_update(s0, q, k, v, 0.0 ∷ f32, 1.0 ∷ f32, 0)
+    # Zero state, g = 0, beta = 1: delta = v, so the state becomes
+    # M[j][i] = k[i] * v[j] (cell (j, i) = S[i][j] — the comparator's
+    # transposed layout, ggml_compute_forward_gated_delta_net).
+    assert (s1.cells.get(0 * 2 + 0) coalesce 9.0 ∷ f32) ≡ 0.0 ∷ f32
+    assert (s1.cells.get(0 * 2 + 1) coalesce 9.0 ∷ f32) ≡ 2.0 ∷ f32
+    assert (s1.cells.get(1 * 2 + 0) coalesce 9.0 ∷ f32) ≡ 0.0 ∷ f32
+    assert (s1.cells.get(1 * 2 + 1) coalesce 9.0 ∷ f32) ≡ 4.0 ∷ f32
+    # Output read: out[j] = (Σ_i M[j][i] * q[i]) / sqrt(dim). With the
+    # declared q = [1, 0] the read is degenerate (k·q = 0), so exercise the
+    # row read with a q parallel to k: out = [2, 4] / sqrt(2).
+    const list<f32> out ← state.recurrent_output(s1, [0.0 ∷ f32, 1.0 ∷ f32], 0)
+    assert _abs((out.get(0) coalesce 9.0 ∷ f32) - 2.0 * (0.7071067811865476 ∷ f32)) ≺ 0.000001 ∷ f32
+    assert _abs((out.get(1) coalesce 9.0 ∷ f32) - 4.0 * (0.7071067811865476 ∷ f32)) ≺ 0.000001 ∷ f32
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "linear attention prefill equals incremental one-token steps" {
+    const qwen35moe.Qwen35moeConfig c ← _pinned_config()
+    const list<f32> rows ← _fill(3 * 2048, 11)
+    do {
+    const state.LinearAttentionOutcome batch ← state.linear_attention(rows, 0, state.fresh_conv_state(c), state.fresh_recurrent_state(c), (string name, int start, int length) → tensor.NumericBlock ⇥ state.Qwen35moeStateError ∴ _synthetic_window(name, start, length), c)
+    var state.ConvState conv ← state.fresh_conv_state(c)
+    var state.RecurrentState recurrent ← state.fresh_recurrent_state(c)
+    var list<f32> outputs ← empty
+    for range 0‥3 const t {
+        var list<f32> one ← empty
+        for range 0‥2048 const d {
+            one.append(rows.get(t * 2048 + d) coalesce 0.0 ∷ f32)
+        }
+        const state.LinearAttentionOutcome step ← state.linear_attention_step(one, 0, conv, recurrent, (string name, int start, int length) → tensor.NumericBlock ⇥ state.Qwen35moeStateError ∴ _synthetic_window(name, start, length), c)
+        conv ← step.conv
+        recurrent ← step.recurrent
+        for range 0‥2048 const d {
+            outputs.append(step.out.get(d) coalesce 0.0 ∷ f32)
+        }
+    }
+    assert batch.out.length() ≡ outputs.length()
+    var f32 worst ← 0.0 ∷ f32
+    for range 0‥outputs.length() const i {
+        const f32 d ← _abs((batch.out.get(i) coalesce 0.0 ∷ f32) - (outputs.get(i) coalesce 0.0 ∷ f32))
+        if d ≻ worst {
+            worst ← d
+        }
+    }
+    assert worst ≺ 0.000001 ∷ f32
+    assert state.conv_equal(batch.conv, conv)
+    assert state.recurrent_equal(batch.recurrent, recurrent)
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "full attention prefill equals incremental one-token steps" {
+    const qwen35moe.Qwen35moeConfig c ← _pinned_config()
+    const list<f32> rows ← _fill(3 * 2048, 13)
+    do {
+    const state.FullAttentionOutcome batch ← state.full_attention(rows, 3, state.fresh_kv_state(c, 8), 0, (string name, int start, int length) → tensor.NumericBlock ⇥ state.Qwen35moeStateError ∴ _synthetic_window(name, start, length), c)
+    var state.KeyValueState kv ← state.fresh_kv_state(c, 8)
+    var list<f32> outputs ← empty
+    for range 0‥3 const t {
+        var list<f32> one ← empty
+        for range 0‥2048 const d {
+            one.append(rows.get(t * 2048 + d) coalesce 0.0 ∷ f32)
+        }
+        const state.FullAttentionOutcome step ← state.full_attention_step(one, 3, kv, t, (string name, int start, int length) → tensor.NumericBlock ⇥ state.Qwen35moeStateError ∴ _synthetic_window(name, start, length), c)
+        kv ← step.kv
+        for range 0‥2048 const d {
+            outputs.append(step.out.get(d) coalesce 0.0 ∷ f32)
+        }
+    }
+    assert batch.out.length() ≡ 3 * 2048
+    assert batch.out.length() ≡ outputs.length()
+    var f32 worst ← 0.0 ∷ f32
+    for range 0‥outputs.length() const i {
+        const f32 d ← _abs((batch.out.get(i) coalesce 0.0 ∷ f32) - (outputs.get(i) coalesce 0.0 ∷ f32))
+        if d ≻ worst {
+            worst ← d
+        }
+    }
+    assert worst ≺ 0.000001 ∷ f32
+    assert state.kv_equal(batch.kv, kv)
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "replay is deterministic across fresh sessions" {
+    const qwen35moe.Qwen35moeConfig c ← _pinned_config()
+    const list<f32> rows ← _fill(2048, 17)
+    do {
+    const state.LinearAttentionOutcome first ← state.linear_attention_step(rows, 0, state.fresh_conv_state(c), state.fresh_recurrent_state(c), (string name, int start, int length) → tensor.NumericBlock ⇥ state.Qwen35moeStateError ∴ _synthetic_window(name, start, length), c)
+    const state.LinearAttentionOutcome second ← state.linear_attention_step(rows, 0, state.fresh_conv_state(c), state.fresh_recurrent_state(c), (string name, int start, int length) → tensor.NumericBlock ⇥ state.Qwen35moeStateError ∴ _synthetic_window(name, start, length), c)
+    assert first.out ≡ second.out
+    assert state.conv_equal(first.conv, second.conv)
+    assert state.recurrent_equal(first.recurrent, second.recurrent)
+    }
+    catch err {
+        assert false
+    }
+}
