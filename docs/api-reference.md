@@ -25,9 +25,9 @@ Scaled dot-product attention, causal masking, RoPE configuration, multi-head att
     - `fn scale() → f32`
     - `fn policy() → RopePolicy`
 - `class CachedAttention`
-  - fields: tensor.Tensor context, kv.KVCache state
+  - fields: tensor.NumericBlock context, kv.KVCache state
   - methods:
-    - `fn context() → tensor.Tensor`
+    - `fn context() → tensor.NumericBlock`
     - `fn state() → kv.KVCache`
 
 ### Public functions
@@ -40,15 +40,15 @@ Scaled dot-product attention, causal masking, RoPE configuration, multi-head att
 - `fn policy_name(RopePolicy p) → string`
 - `fn construct_rope_config(f32 base, f32 scale, RopePolicy policy) → RopeConfig ⇥ AttentionError`
 - `fn default() → RopeConfig`
-- `fn rotary_position_embedding(tensor.Tensor x, list<int> positions, int dim) → tensor.Tensor ⇥ AttentionError`
-- `fn rotary_position_embedding_config(tensor.Tensor x, list<int> positions, int dim, RopeConfig config) → tensor.Tensor ⇥ AttentionError`
-- `fn scaled_dot_product(tensor.Tensor q, tensor.Tensor k, tensor.Tensor v, f32 scale) → tensor.Tensor ⇥ AttentionError`
-- `fn scaled_dot_product_causal(tensor.Tensor q, tensor.Tensor k, tensor.Tensor v, f32 scale) → tensor.Tensor ⇥ AttentionError`
-- `fn scaled_dot_product_causal_rope(tensor.Tensor q, tensor.Tensor k, tensor.Tensor v, f32 scale, list<int> positions, int dim) → tensor.Tensor ⇥ AttentionError`
-- `fn multi_head_attention(tensor.Tensor q, tensor.Tensor k, tensor.Tensor v, tensor.Tensor wo, int num_heads, int num_kv_heads, f32 scale, list<int> positions, int rope_dim, RopeConfig rope_config) → tensor.Tensor ⇥ AttentionError`
+- `fn rotary_position_embedding(tensor.NumericBlock x, list<int> positions, int dim) → tensor.NumericBlock ⇥ AttentionError`
+- `fn rotary_position_embedding_config(tensor.NumericBlock x, list<int> positions, int dim, RopeConfig config) → tensor.NumericBlock ⇥ AttentionError`
+- `fn scaled_dot_product(tensor.NumericBlock q, tensor.NumericBlock k, tensor.NumericBlock v, f32 scale) → tensor.NumericBlock ⇥ AttentionError`
+- `fn scaled_dot_product_causal(tensor.NumericBlock q, tensor.NumericBlock k, tensor.NumericBlock v, f32 scale) → tensor.NumericBlock ⇥ AttentionError`
+- `fn scaled_dot_product_causal_rope(tensor.NumericBlock q, tensor.NumericBlock k, tensor.NumericBlock v, f32 scale, list<int> positions, int dim) → tensor.NumericBlock ⇥ AttentionError`
+- `fn multi_head_attention(tensor.NumericBlock q, tensor.NumericBlock k, tensor.NumericBlock v, tensor.NumericBlock wo, int num_heads, int num_kv_heads, f32 scale, list<int> positions, int rope_dim, RopeConfig rope_config) → tensor.NumericBlock ⇥ AttentionError`
 - `fn default_cached() → CachedAttention`
-- `fn scaled_dot_product_causal_rope_cached(tensor.Tensor q, tensor.Tensor k, tensor.Tensor v, f32 scale, list<int> positions, int dim, kv.KVCache layer, list<int> tokens) → CachedAttention ⇥ AttentionError`
-- `fn multi_head_attention_cached(tensor.Tensor q, tensor.Tensor k, tensor.Tensor v, tensor.Tensor wo, kv.KVCache layer, int num_heads, int num_kv_heads, f32 scale, list<int> positions, int rope_dim, RopeConfig rope_config, list<int> tokens) → CachedAttention ⇥ AttentionError`
+- `fn scaled_dot_product_causal_rope_cached(tensor.NumericBlock q, tensor.NumericBlock k, tensor.NumericBlock v, f32 scale, list<int> positions, int dim, kv.KVCache layer, list<int> tokens) → CachedAttention ⇥ AttentionError`
+- `fn multi_head_attention_cached(tensor.NumericBlock q, tensor.NumericBlock k, tensor.NumericBlock v, tensor.NumericBlock wo, kv.KVCache layer, int num_heads, int num_kv_heads, f32 scale, list<int> positions, int rope_dim, RopeConfig rope_config, list<int> tokens) → CachedAttention ⇥ AttentionError`
 
 ## gradus:cache
 
@@ -67,7 +67,7 @@ KV-cache values, mutation rules, cache identity, identity serialization, and KV 
 - `union KvSharing` — Single, GqaShared
 - `union AttentionFamily` — Classic, Flash
 - `class KVCache`
-  - fields: string model, string model_version, string config, string tokenizer, list<int> history, int layers, string dtype, string layout, tensor.Tensor key, tensor.Tensor payload, int version, int dimension, int capacity
+  - fields: string model, string model_version, string config, string tokenizer, list<int> history, int layers, string dtype, string layout, tensor.NumericBlock key, tensor.NumericBlock payload, int version, int dimension, int capacity
   - methods:
     - `fn model() → string`
     - `fn model_version() → string`
@@ -77,8 +77,8 @@ KV-cache values, mutation rules, cache identity, identity serialization, and KV 
     - `fn layers() → int`
     - `fn dtype() → string`
     - `fn layout() → string`
-    - `fn key() → tensor.Tensor`
-    - `fn payload() → tensor.Tensor`
+    - `fn key() → tensor.NumericBlock`
+    - `fn payload() → tensor.NumericBlock`
     - `fn version() → int`
     - `fn dimension() → int`
     - `fn capacity() → int`
@@ -123,8 +123,8 @@ KV-cache values, mutation rules, cache identity, identity serialization, and KV 
 - `fn cache_equal(KVCache a, KVCache b) → bool`
 - `fn empty_cache(string model, string model_version, string config, string tokenizer, int layers, int dimension) → KVCache ⇥ CacheError`
 - `fn default() → KVCache`
-- `fn append(KVCache c, int token_id, tensor.Tensor key, tensor.Tensor payload) → KVCache ⇥ CacheError`
-- `fn extend(KVCache c, list<int> tokens, tensor.Tensor key, tensor.Tensor payload) → KVCache ⇥ CacheError`
+- `fn append(KVCache c, int token_id, tensor.NumericBlock key, tensor.NumericBlock payload) → KVCache ⇥ CacheError`
+- `fn extend(KVCache c, list<int> tokens, tensor.NumericBlock key, tensor.NumericBlock payload) → KVCache ⇥ CacheError`
 - `fn reset(KVCache c) → KVCache ⇥ CacheError`
 - `fn cache_identity_equal(CacheIdentity a, CacheIdentity b) → bool`
 - `fn cache_identity(KVCache c) → CacheIdentity`
@@ -272,41 +272,41 @@ One-token decode, prefill, explicit sessions, cancellation, replica-loop mechani
 
 - `union DecodeError` — IdOutOfRange, InvalidPosition, LimitReached, InvalidDecoder, ShapeMismatch, DtypeMismatch, ElementMismatch, Incompatible, InvalidDimension, Cancelled, SamplingFailure
 - `class Weights`
-  - fields: tensor.Tensor ln1_s, tensor.Tensor ln1_o, tensor.Tensor wq, tensor.Tensor bq, tensor.Tensor wk, tensor.Tensor bk, tensor.Tensor wv, tensor.Tensor bv, tensor.Tensor wo, tensor.Tensor bo, tensor.Tensor ln2_s, tensor.Tensor ln2_o, tensor.Tensor wf1, tensor.Tensor bf1, tensor.Tensor wf2, tensor.Tensor bf2, tensor.Tensor ln3_s, tensor.Tensor ln3_o
+  - fields: tensor.NumericBlock ln1_s, tensor.NumericBlock ln1_o, tensor.NumericBlock wq, tensor.NumericBlock bq, tensor.NumericBlock wk, tensor.NumericBlock bk, tensor.NumericBlock wv, tensor.NumericBlock bv, tensor.NumericBlock wo, tensor.NumericBlock bo, tensor.NumericBlock ln2_s, tensor.NumericBlock ln2_o, tensor.NumericBlock wf1, tensor.NumericBlock bf1, tensor.NumericBlock wf2, tensor.NumericBlock bf2, tensor.NumericBlock ln3_s, tensor.NumericBlock ln3_o
   - methods:
-    - `fn ln1_s() → tensor.Tensor`
-    - `fn ln1_o() → tensor.Tensor`
-    - `fn wq() → tensor.Tensor`
-    - `fn bq() → tensor.Tensor`
-    - `fn wk() → tensor.Tensor`
-    - `fn bk() → tensor.Tensor`
-    - `fn wv() → tensor.Tensor`
-    - `fn bv() → tensor.Tensor`
-    - `fn wo() → tensor.Tensor`
-    - `fn bo() → tensor.Tensor`
-    - `fn ln2_s() → tensor.Tensor`
-    - `fn ln2_o() → tensor.Tensor`
-    - `fn wf1() → tensor.Tensor`
-    - `fn bf1() → tensor.Tensor`
-    - `fn wf2() → tensor.Tensor`
-    - `fn bf2() → tensor.Tensor`
-    - `fn ln3_s() → tensor.Tensor`
-    - `fn ln3_o() → tensor.Tensor`
+    - `fn ln1_s() → tensor.NumericBlock`
+    - `fn ln1_o() → tensor.NumericBlock`
+    - `fn wq() → tensor.NumericBlock`
+    - `fn bq() → tensor.NumericBlock`
+    - `fn wk() → tensor.NumericBlock`
+    - `fn bk() → tensor.NumericBlock`
+    - `fn wv() → tensor.NumericBlock`
+    - `fn bv() → tensor.NumericBlock`
+    - `fn wo() → tensor.NumericBlock`
+    - `fn bo() → tensor.NumericBlock`
+    - `fn ln2_s() → tensor.NumericBlock`
+    - `fn ln2_o() → tensor.NumericBlock`
+    - `fn wf1() → tensor.NumericBlock`
+    - `fn bf1() → tensor.NumericBlock`
+    - `fn wf2() → tensor.NumericBlock`
+    - `fn bf2() → tensor.NumericBlock`
+    - `fn ln3_s() → tensor.NumericBlock`
+    - `fn ln3_o() → tensor.NumericBlock`
 - `class Decoder`
-  - fields: tensor.Tensor table, Weights weights, tensor.Tensor projection, tensor.Tensor projection_bias, f32 scale, int vocabulary, int context, int dimension
+  - fields: tensor.NumericBlock table, Weights weights, tensor.NumericBlock projection, tensor.NumericBlock projection_bias, f32 scale, int vocabulary, int context, int dimension
   - methods:
-    - `fn table() → tensor.Tensor`
+    - `fn table() → tensor.NumericBlock`
     - `fn weights() → Weights`
-    - `fn projection() → tensor.Tensor`
-    - `fn projection_bias() → tensor.Tensor`
+    - `fn projection() → tensor.NumericBlock`
+    - `fn projection_bias() → tensor.NumericBlock`
     - `fn scale() → f32`
     - `fn vocabulary() → int`
     - `fn context() → int`
     - `fn dimension() → int`
 - `class DecodeStep`
-  - fields: tensor.Tensor logits, kv.KVCache state
+  - fields: tensor.NumericBlock logits, kv.KVCache state
   - methods:
-    - `fn logits() → tensor.Tensor`
+    - `fn logits() → tensor.NumericBlock`
     - `fn state() → kv.KVCache`
 - `class Session`
   - fields: int position, int context
@@ -321,13 +321,13 @@ One-token decode, prefill, explicit sessions, cancellation, replica-loop mechani
 ### Public functions
 
 - `fn message(DecodeError e) → string`
-- `fn construct_weights(tensor.Tensor ln1_s, tensor.Tensor ln1_o, tensor.Tensor wq, tensor.Tensor bq, tensor.Tensor wk, tensor.Tensor bk, tensor.Tensor wv, tensor.Tensor bv, tensor.Tensor wo, tensor.Tensor bo, tensor.Tensor ln2_s, tensor.Tensor ln2_o, tensor.Tensor wf1, tensor.Tensor bf1, tensor.Tensor wf2, tensor.Tensor bf2, tensor.Tensor ln3_s, tensor.Tensor ln3_o) → Weights`
-- `fn construct_decoder(tensor.Tensor table, Weights weights, tensor.Tensor projection, tensor.Tensor projection_bias, f32 scale, int vocabulary, int context, int dimension) → Decoder ⇥ DecodeError`
+- `fn construct_weights(tensor.NumericBlock ln1_s, tensor.NumericBlock ln1_o, tensor.NumericBlock wq, tensor.NumericBlock bq, tensor.NumericBlock wk, tensor.NumericBlock bk, tensor.NumericBlock wv, tensor.NumericBlock bv, tensor.NumericBlock wo, tensor.NumericBlock bo, tensor.NumericBlock ln2_s, tensor.NumericBlock ln2_o, tensor.NumericBlock wf1, tensor.NumericBlock bf1, tensor.NumericBlock wf2, tensor.NumericBlock bf2, tensor.NumericBlock ln3_s, tensor.NumericBlock ln3_o) → Weights`
+- `fn construct_decoder(tensor.NumericBlock table, Weights weights, tensor.NumericBlock projection, tensor.NumericBlock projection_bias, f32 scale, int vocabulary, int context, int dimension) → Decoder ⇥ DecodeError`
 - `fn default() → Decoder`
-- `fn decode_data(int token_id, int position, Decoder m) → tensor.Tensor ⇥ DecodeError`
+- `fn decode_data(int token_id, int position, Decoder m) → tensor.NumericBlock ⇥ DecodeError`
 - `fn default_step() → DecodeStep`
 - `fn decode_cached(int token_id, int position, Decoder m, kv.KVCache layer) → DecodeStep ⇥ DecodeError`
-- `fn prefill(list<int> tokens, Decoder m) → tensor.Tensor ⇥ DecodeError`
+- `fn prefill(list<int> tokens, Decoder m) → tensor.NumericBlock ⇥ DecodeError`
 - `fn fresh_session(int context) → Session ⇥ DecodeError`
 - `fn default_session() → Session`
 - `fn advance(Session s) → Session ⇥ DecodeError`
@@ -425,8 +425,8 @@ Generation configuration, sampling projection, serialized config, cursor limits,
 - `fn generate_cancelled_with_stop(GenerationConfig g, list<int> prompt_ids, decode.Decoder m, decode.Cancellation cancel, StopPolicy stop) → list<int> ⇥ GenerationError`
 - `fn construct_dense_engine(dense.DenseConfig architecture, f32 epsilon, f32 scale, int rope_dim, attention.RopeConfig rope) → DenseEngine`
 - `fn default_dense_engine() → DenseEngine`
-- `fn generate_dense(GenerationConfig g, list<int> prompt_ids, DenseEngine engine, (string, int) → tensor.Tensor ⇥ dense.DenseError source, list<kv.KVCache> layers, decode.Cancellation cancel) → list<int> ⇥ GenerationError {` — EOG-stop default
-- `fn generate_dense_with_stop(GenerationConfig g, list<int> prompt_ids, DenseEngine engine, (string, int) → tensor.Tensor ⇥ dense.DenseError source, list<kv.KVCache> layers, decode.Cancellation cancel, StopPolicy stop) → list<int> ⇥ GenerationError`
+- `fn generate_dense(GenerationConfig g, list<int> prompt_ids, DenseEngine engine, (string, int) → tensor.NumericBlock ⇥ dense.DenseError source, list<kv.KVCache> layers, decode.Cancellation cancel) → list<int> ⇥ GenerationError {` — EOG-stop default
+- `fn generate_dense_with_stop(GenerationConfig g, list<int> prompt_ids, DenseEngine engine, (string, int) → tensor.NumericBlock ⇥ dense.DenseError source, list<kv.KVCache> layers, decode.Cancellation cancel, StopPolicy stop) → list<int> ⇥ GenerationError`
 
 ## gradus:gradient
 
@@ -438,12 +438,12 @@ Gradient records and the forward/companion gradient wrapper surface.
 
 - `union GradientError` — UnknownGradient, GradientVersion
 - `class Gradient`
-  - fields: string owner, string name, int version, tensor.Tensor payload
+  - fields: string owner, string name, int version, tensor.NumericBlock payload
   - methods:
     - `fn owner() → string`
     - `fn name() → string`
     - `fn version() → int`
-    - `fn payload() → tensor.Tensor`
+    - `fn payload() → tensor.NumericBlock`
 - `class Gradients`
   - fields: list<Gradient> gradients
   - methods:
@@ -453,7 +453,7 @@ Gradient records and the forward/companion gradient wrapper surface.
 ### Public functions
 
 - `fn message(GradientError e) → string`
-- `fn construct(string name, string owner, int version, tensor.Tensor payload) → Gradient ⇥ GradientError`
+- `fn construct(string name, string owner, int version, tensor.NumericBlock payload) → Gradient ⇥ GradientError`
 - `fn default() → Gradient`
 - `fn construct_gradients(list<Gradient> gradients) → Gradients`
 - `fn obsolete(Gradient g, int current_version) → bool`
@@ -475,7 +475,7 @@ Package map facade. No genera.
 
 ## gradus:loss
 
-Tensor loss functions and fixed-shape MSE rows.
+NumericBlock loss functions and fixed-shape MSE rows.
 
 **Source**: `src/loss.fab`
 
@@ -486,8 +486,8 @@ Tensor loss functions and fixed-shape MSE rows.
 ### Public functions
 
 - `fn message(LossError e) → string`
-- `fn mse(tensor.Tensor prediction, tensor.Tensor target) → f32 ⇥ LossError`
-- `fn cross_entropy(tensor.Tensor logits, tensor.Tensor target) → f32 ⇥ LossError`
+- `fn mse(tensor.NumericBlock prediction, tensor.NumericBlock target) → f32 ⇥ LossError`
+- `fn cross_entropy(tensor.NumericBlock logits, tensor.NumericBlock target) → f32 ⇥ LossError`
 - `fn mse_2x2(tensor<f32, [2, 2]> prediction, tensor<f32, [2, 2]> target) → f32`
 - `fn mse_4x4(tensor<f32, [4, 4]> prediction, tensor<f32, [4, 4]> target) → f32`
 - `fn mse_2x8(tensor<f32, [2, 8]> prediction, tensor<f32, [2, 8]> target) → f32`
@@ -505,21 +505,21 @@ Device-neutral tensor arithmetic, reductions, matrix multiplication, casts, conc
 ### Public functions
 
 - `fn message(MathError e) → string`
-- `fn construct(list<f32> data, list<int> shape) → tensor.Tensor ⇥ MathError`
+- `fn construct(list<f32> data, list<int> shape) → tensor.NumericBlock ⇥ MathError`
 - `fn add<size M, size N>(tensor<f32, [M, N]> a, tensor<f32, [M, N]> b) → tensor<f32, [M, N]>`
-- `fn add_carrier(tensor.Tensor a, tensor.Tensor b) → tensor.Tensor ⇥ MathError`
-- `fn sub(tensor.Tensor a, tensor.Tensor b) → tensor.Tensor ⇥ MathError`
-- `fn mul(tensor.Tensor a, tensor.Tensor b) → tensor.Tensor ⇥ MathError`
-- `fn div(tensor.Tensor a, tensor.Tensor b) → tensor.Tensor ⇥ MathError`
-- `fn neg(tensor.Tensor t) → tensor.Tensor ⇥ MathError`
-- `fn abs(tensor.Tensor t) → tensor.Tensor ⇥ MathError`
-- `fn signum(tensor.Tensor t) → tensor.Tensor ⇥ MathError`
-- `fn sum(tensor.Tensor t, int axis) → tensor.Tensor ⇥ MathError`
-- `fn mean(tensor.Tensor t, int axis) → tensor.Tensor ⇥ MathError`
-- `fn matmul(tensor.Tensor a, tensor.Tensor b) → tensor.Tensor ⇥ MathError`
-- `fn cast(tensor.Tensor t, string name) → tensor.Tensor ⇥ MathError`
-- `fn concatenate(list<tensor.Tensor> parts, int axis) → tensor.Tensor ⇥ MathError`
-- `fn slice(tensor.Tensor t, int axis, int start, int end) → tensor.Tensor ⇥ MathError`
+- `fn add_carrier(tensor.NumericBlock a, tensor.NumericBlock b) → tensor.NumericBlock ⇥ MathError`
+- `fn sub(tensor.NumericBlock a, tensor.NumericBlock b) → tensor.NumericBlock ⇥ MathError`
+- `fn mul(tensor.NumericBlock a, tensor.NumericBlock b) → tensor.NumericBlock ⇥ MathError`
+- `fn div(tensor.NumericBlock a, tensor.NumericBlock b) → tensor.NumericBlock ⇥ MathError`
+- `fn neg(tensor.NumericBlock t) → tensor.NumericBlock ⇥ MathError`
+- `fn abs(tensor.NumericBlock t) → tensor.NumericBlock ⇥ MathError`
+- `fn signum(tensor.NumericBlock t) → tensor.NumericBlock ⇥ MathError`
+- `fn sum(tensor.NumericBlock t, int axis) → tensor.NumericBlock ⇥ MathError`
+- `fn mean(tensor.NumericBlock t, int axis) → tensor.NumericBlock ⇥ MathError`
+- `fn matmul(tensor.NumericBlock a, tensor.NumericBlock b) → tensor.NumericBlock ⇥ MathError`
+- `fn cast(tensor.NumericBlock t, string name) → tensor.NumericBlock ⇥ MathError`
+- `fn concatenate(list<tensor.NumericBlock> parts, int axis) → tensor.NumericBlock ⇥ MathError`
+- `fn slice(tensor.NumericBlock t, int axis, int start, int end) → tensor.NumericBlock ⇥ MathError`
 
 ## gradus:metrics
 
@@ -539,7 +539,7 @@ Classification accuracy and validated loss/accuracy metric records.
 ### Public functions
 
 - `fn message(MetricError e) → string`
-- `fn accuracy(tensor.Tensor prediction, tensor.Tensor target) → f32 ⇥ MetricError`
+- `fn accuracy(tensor.NumericBlock prediction, tensor.NumericBlock target) → f32 ⇥ MetricError`
 - `fn metric(f32 loss, f32 accuracy) → Metric ⇥ MetricError`
 - `fn default() → Metric`
 - `fn metric_equal(Metric a, Metric b) → bool`
@@ -557,7 +557,7 @@ Two-layer MLP: staged `forward_mlp` over the nn carrier and the annotated traini
 ### Public functions
 
 - `fn message(GradusError e) → string`
-- `fn forward_mlp(tensor.Tensor x, tensor.Tensor w1, tensor.Tensor b1, tensor.Tensor w2, tensor.Tensor b2) → tensor.Tensor ⇥ GradusError`
+- `fn forward_mlp(tensor.NumericBlock x, tensor.NumericBlock w1, tensor.NumericBlock b1, tensor.NumericBlock w2, tensor.NumericBlock b2) → tensor.NumericBlock ⇥ GradusError`
 - `fn nil() → void`
 - `fn forward_mlp_loss(tensor<f32, [4, 4]> input, tensor<f32, [4, 4]> weight1, tensor<f32, [4, 4]> bias1, tensor<f32, [4, 4]> weight2, tensor<f32, [4, 4]> bias2, tensor<f32, [4, 4]> target) → f32`
 
@@ -658,18 +658,18 @@ Ordered dense-model forward assembly over canonical architecture descriptors and
 - `class DenseConfig`
   - fields: int layers, int heads, int kv_heads, int head_dim, int hidden_dim, int vocab, bool tied
 - `class DenseStep`
-  - fields: tensor.Tensor logits, list<kv.KVCache> layers
+  - fields: tensor.NumericBlock logits, list<kv.KVCache> layers
   - methods:
-    - `fn logits() → tensor.Tensor`
+    - `fn logits() → tensor.NumericBlock`
     - `fn layers() → list<kv.KVCache>`
 
 ### Public functions
 
 - `fn message(DenseError e) → string`
-- `fn forward(DenseConfig cfg, (string, int) → tensor.Tensor ⇥ DenseError source, list<int> tokens, f32 epsilon, f32 scale, list<int> positions, int rope_dim, attention.RopeConfig rope_cfg) → tensor.Tensor ⇥ DenseError`
+- `fn forward(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ DenseError source, list<int> tokens, f32 epsilon, f32 scale, list<int> positions, int rope_dim, attention.RopeConfig rope_cfg) → tensor.NumericBlock ⇥ DenseError`
 - `fn default_step() → DenseStep`
 - `fn empty_caches(kv.KVStructure structure, string model, string model_version, string config, string tokenizer) → list<kv.KVCache> ⇥ DenseError`
-- `fn decode_step(DenseConfig cfg, (string, int) → tensor.Tensor ⇥ DenseError source, int token_id, int position, f32 epsilon, f32 scale, int rope_dim, attention.RopeConfig rope_cfg, list<kv.KVCache> layers) → DenseStep ⇥ DenseError`
+- `fn decode_step(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ DenseError source, int token_id, int position, f32 epsilon, f32 scale, int rope_dim, attention.RopeConfig rope_cfg, list<kv.KVCache> layers) → DenseStep ⇥ DenseError`
 
 ## gradus:model/dense_llama
 
@@ -842,9 +842,9 @@ in ascending expert-index order for deterministic f32 results.
 ### Public functions
 
 - `fn message(MoeError e) → string`
-- `fn route(tensor.Tensor x, int layer, (string, int, int) → tensor.Tensor ⇥ MoeError source, MoeConfig cfg) → MoeSelection ⇥ MoeError`
-- `fn expert_out(tensor.Tensor x, int layer, int expert_index, (string, int, int) → tensor.Tensor ⇥ MoeError source, MoeConfig cfg) → tensor.Tensor ⇥ MoeError`
-- `fn ffn_moe(tensor.Tensor x, int layer, (string, int, int) → tensor.Tensor ⇥ MoeError source, MoeConfig cfg) → tensor.Tensor ⇥ MoeError`
+- `fn route(tensor.NumericBlock x, int layer, (string, int, int) → tensor.NumericBlock ⇥ MoeError source, MoeConfig cfg) → MoeSelection ⇥ MoeError`
+- `fn expert_out(tensor.NumericBlock x, int layer, int expert_index, (string, int, int) → tensor.NumericBlock ⇥ MoeError source, MoeConfig cfg) → tensor.NumericBlock ⇥ MoeError`
+- `fn ffn_moe(tensor.NumericBlock x, int layer, (string, int, int) → tensor.NumericBlock ⇥ MoeError source, MoeConfig cfg) → tensor.NumericBlock ⇥ MoeError`
 
 ## gradus:model/safetensors
 
@@ -930,13 +930,13 @@ Differentiable tensor primitives: linear, GELU, LayerNorm, RMSNorm, SiLU, and Sw
 - `fn gelu_2x8(tensor<f32, [2, 8]> x) → tensor<f32, [2, 8]>`
 - `fn message(NnError e) → string`
 - `fn linear<size M, size K, size N>(tensor<f32, [M, K]> x, tensor<f32, [K, N]> w, tensor<f32, [M, N]> b) → tensor<f32, [M, N]>`
-- `fn linear_from_raw<size M, size K, size N>(tensor.Tensor raw_x, tensor.Tensor raw_w, tensor.Tensor raw_b) → tensor<f32, [M, N]>`
-- `fn linear_carrier(tensor.Tensor x, tensor.Tensor w, tensor.Tensor b) → tensor.Tensor ⇥ NnError`
-- `fn gelu(tensor.Tensor x) → tensor.Tensor ⇥ NnError`
-- `fn layernorm(tensor.Tensor x, tensor.Tensor scale, tensor.Tensor offset, f32 epsilon) → tensor.Tensor ⇥ NnError`
-- `fn rmsnorm(tensor.Tensor x, tensor.Tensor scale, f32 epsilon) → tensor.Tensor ⇥ NnError`
-- `fn silu(tensor.Tensor x) → tensor.Tensor ⇥ NnError`
-- `fn swiglu(tensor.Tensor gate, tensor.Tensor up, tensor.Tensor down_weight, tensor.Tensor down_bias) → tensor.Tensor ⇥ NnError`
+- `fn linear_from_raw<size M, size K, size N>(tensor.NumericBlock raw_x, tensor.NumericBlock raw_w, tensor.NumericBlock raw_b) → tensor<f32, [M, N]>`
+- `fn linear_carrier(tensor.NumericBlock x, tensor.NumericBlock w, tensor.NumericBlock b) → tensor.NumericBlock ⇥ NnError`
+- `fn gelu(tensor.NumericBlock x) → tensor.NumericBlock ⇥ NnError`
+- `fn layernorm(tensor.NumericBlock x, tensor.NumericBlock scale, tensor.NumericBlock offset, f32 epsilon) → tensor.NumericBlock ⇥ NnError`
+- `fn rmsnorm(tensor.NumericBlock x, tensor.NumericBlock scale, f32 epsilon) → tensor.NumericBlock ⇥ NnError`
+- `fn silu(tensor.NumericBlock x) → tensor.NumericBlock ⇥ NnError`
+- `fn swiglu(tensor.NumericBlock gate, tensor.NumericBlock up, tensor.NumericBlock down_weight, tensor.NumericBlock down_bias) → tensor.NumericBlock ⇥ NnError`
 
 ## gradus:optimize
 
@@ -1004,7 +1004,7 @@ Parameter identity, trainable/frozen status, mutation, registry traversal, and i
     - `fn version() → int`
     - `fn owner() → string`
 - `class Parameter`
-  - fields: Identity identity, Station status, tensor.Tensor payload
+  - fields: Identity identity, Station status, tensor.NumericBlock payload
   - methods:
     - `fn identity() → Identity`
     - `fn status() → Station`
@@ -1014,7 +1014,7 @@ Parameter identity, trainable/frozen status, mutation, registry traversal, and i
     - `fn version() → int`
     - `fn owner() → string`
     - `fn numel() → int`
-    - `fn payload() → tensor.Tensor`
+    - `fn payload() → tensor.NumericBlock`
 - `class Registry`
   - fields: list<Parameter> parameters
   - methods:
@@ -1141,8 +1141,8 @@ The staged tensor carrier with runtime shape/dtype/data validation and indexed a
 ### Public types
 
 - `union TensorError` — InvalidShape, ElementMismatch, IndexOutOfBounds
-- `class Tensor`
-  - fields: dtype.DType dtype, list<int> shape, list<f32> data
+- `class NumericBlock`
+  - fields: dtype.DType dtype, list<int> shape, list<f32> data, int numel, list<int> strides (stride/count cache, computed at construction — W0)
   - methods:
     - `fn shape() → list<int>`
     - `fn rank() → int`
@@ -1154,10 +1154,11 @@ The staged tensor carrier with runtime shape/dtype/data validation and indexed a
 ### Public functions
 
 - `fn message(TensorError e) → string`
-- `fn default() → Tensor`
-- `fn construct(list<f32> data, list<int> shape) → Tensor ⇥ TensorError`
-- `fn construct_dtype(list<f32> data, list<int> shape, dtype.DType dtype) → Tensor ⇥ TensorError`
-- `fn fill(list<int> shape, f32 payload) → Tensor ⇥ TensorError`
+- `fn default() → NumericBlock`
+- `fn construct(list<f32> data, list<int> shape) → NumericBlock ⇥ TensorError`
+- `fn construct_dtype(list<f32> data, list<int> shape, dtype.DType dtype) → NumericBlock ⇥ TensorError`
+- `fn fill(list<int> shape, f32 payload) → NumericBlock ⇥ TensorError`
+- `fn stage(dtype.DType dtype, list<int> shape, list<f32> data) → NumericBlock` (trusted-input staging — W0; no validation, library-internal producers only)
 
 ## gradus:tokenizer
 
@@ -1251,9 +1252,9 @@ Training steps, learning-rate schedules, modes, RNG, dropout, and checkpoints.
     - `fn payload() → f32`
     - `fn seed() → Seed`
 - `class Dropout`
-  - fields: tensor.Tensor payload, Seed seed
+  - fields: tensor.NumericBlock payload, Seed seed
   - methods:
-    - `fn payload() → tensor.Tensor`
+    - `fn payload() → tensor.NumericBlock`
     - `fn seed() → Seed`
 - `class Checkpoint`
   - fields: int age, int step, Seed rng, string state_wire
@@ -1282,7 +1283,7 @@ Training steps, learning-rate schedules, modes, RNG, dropout, and checkpoints.
 - `fn default() → Seed`
 - `fn next(Seed s) → Draw`
 - `fn next_f32(Seed s) → DrawF32`
-- `fn dropout(tensor.Tensor x, Seed s, Mode m, f32 rate) → Dropout ⇥ TrainError`
+- `fn dropout(tensor.NumericBlock x, Seed s, Mode m, f32 rate) → Dropout ⇥ TrainError`
 - `fn serialize_seed(Seed s) → string`
 - `fn deserialize_seed(string wire) → Seed ⇥ TrainError`
 - `fn construct_checkpoint(int age, int step, Seed rng, string state_wire) → Checkpoint ⇥ TrainError`
@@ -1301,28 +1302,28 @@ Fixed-shape and runtime-carrier transformer blocks, including cached block evalu
 
 - `union TransformerError` — NegativeDimension, DimensionAboveLimit, ProductAboveLimit, GradusMismatch, ShapeMismatch, Incompatible, DtypeMismatch, ElementMismatch, EpsilonInvalida, InvalidPosition, InvalidDimension, InvalidMode
 - `class DenseAttentionWeights`
-  - fields: tensor.Tensor wq, tensor.Tensor bq, tensor.Tensor wk, tensor.Tensor bk, tensor.Tensor wv, tensor.Tensor bv, tensor.Tensor wo
+  - fields: tensor.NumericBlock wq, tensor.NumericBlock bq, tensor.NumericBlock wk, tensor.NumericBlock bk, tensor.NumericBlock wv, tensor.NumericBlock bv, tensor.NumericBlock wo
 - `class DenseAttentionConfig`
   - fields: int num_heads, int num_kv_heads, f32 scale, int rope_dim, attention.RopeConfig rope_config
 - `class DenseMlpWeights`
-  - fields: tensor.Tensor wg, tensor.Tensor bg, tensor.Tensor wu, tensor.Tensor bu, tensor.Tensor wd, tensor.Tensor bd
+  - fields: tensor.NumericBlock wg, tensor.NumericBlock bg, tensor.NumericBlock wu, tensor.NumericBlock bu, tensor.NumericBlock wd, tensor.NumericBlock bd
 - `class DenseNormConfig`
-  - fields: tensor.Tensor ln1_s, tensor.Tensor ln2_s, f32 epsilon
+  - fields: tensor.NumericBlock ln1_s, tensor.NumericBlock ln2_s, f32 epsilon
 - `class CachedBlock`
-  - fields: tensor.Tensor output, kv.KVCache state
+  - fields: tensor.NumericBlock output, kv.KVCache state
   - methods:
-    - `fn output() → tensor.Tensor`
+    - `fn output() → tensor.NumericBlock`
     - `fn state() → kv.KVCache`
 
 ### Public functions
 
 - `fn bert_tiny_block_2x8(tensor<f32, [2, 8]> x, tensor<f32, [8]> ln1_s, tensor<f32, [8]> ln1_o, tensor<f32, [8, 8]> wq, tensor<f32, [8]> bq, tensor<f32, [8, 8]> wk, tensor<f32, [8]> bk, tensor<f32, [8, 8]> wv, tensor<f32, [8]> bv, tensor<f32, [8, 8]> wo, tensor<f32, [8]> bo, tensor<f32, [8]> ln2_s, tensor<f32, [8]> ln2_o, tensor<f32, [8, 8]> wf1, tensor<f32, [8]> bf1, tensor<f32, [8, 8]> wf2, tensor<f32, [8]> bf2, tensor<f32, [8]> ln3_s, tensor<f32, [8]> ln3_o, tensor<f32, [2, 2]> scale) → tensor<f32, [2, 8]>`
 - `fn message(TransformerError e) → string`
-- `fn transformer_block(tensor.Tensor x, tensor.Tensor ln1_s, tensor.Tensor ln1_o, tensor.Tensor wq, tensor.Tensor bq, tensor.Tensor wk, tensor.Tensor bk, tensor.Tensor wv, tensor.Tensor bv, tensor.Tensor wo, tensor.Tensor bo, tensor.Tensor ln2_s, tensor.Tensor ln2_o, tensor.Tensor wf1, tensor.Tensor bf1, tensor.Tensor wf2, tensor.Tensor bf2, tensor.Tensor ln3_s, tensor.Tensor ln3_o, f32 scale, int mode, list<int> positions, int dim) → tensor.Tensor ⇥ TransformerError`
-- `fn dense_block(tensor.Tensor x, list<int> positions, DenseAttentionWeights attention_weights, DenseAttentionConfig attention_config, DenseMlpWeights mlp_weights, DenseNormConfig norm_config) → tensor.Tensor ⇥ TransformerError`
+- `fn transformer_block(tensor.NumericBlock x, tensor.NumericBlock ln1_s, tensor.NumericBlock ln1_o, tensor.NumericBlock wq, tensor.NumericBlock bq, tensor.NumericBlock wk, tensor.NumericBlock bk, tensor.NumericBlock wv, tensor.NumericBlock bv, tensor.NumericBlock wo, tensor.NumericBlock bo, tensor.NumericBlock ln2_s, tensor.NumericBlock ln2_o, tensor.NumericBlock wf1, tensor.NumericBlock bf1, tensor.NumericBlock wf2, tensor.NumericBlock bf2, tensor.NumericBlock ln3_s, tensor.NumericBlock ln3_o, f32 scale, int mode, list<int> positions, int dim) → tensor.NumericBlock ⇥ TransformerError`
+- `fn dense_block(tensor.NumericBlock x, list<int> positions, DenseAttentionWeights attention_weights, DenseAttentionConfig attention_config, DenseMlpWeights mlp_weights, DenseNormConfig norm_config) → tensor.NumericBlock ⇥ TransformerError`
 - `fn default_cached_block() → CachedBlock`
-- `fn transformer_block_cached(tensor.Tensor x, tensor.Tensor ln1_s, tensor.Tensor ln1_o, tensor.Tensor wq, tensor.Tensor bq, tensor.Tensor wk, tensor.Tensor bk, tensor.Tensor wv, tensor.Tensor bv, tensor.Tensor wo, tensor.Tensor bo, tensor.Tensor ln2_s, tensor.Tensor ln2_o, tensor.Tensor wf1, tensor.Tensor bf1, tensor.Tensor wf2, tensor.Tensor bf2, tensor.Tensor ln3_s, tensor.Tensor ln3_o, f32 scale, list<int> positions, int dim, kv.KVCache layer, list<int> tokens) → CachedBlock ⇥ TransformerError`
-- `fn dense_block_cached(tensor.Tensor x, list<int> positions, kv.KVCache layer, list<int> tokens, DenseAttentionWeights attention_weights, DenseAttentionConfig attention_config, DenseMlpWeights mlp_weights, DenseNormConfig norm_config) → CachedBlock ⇥ TransformerError`
+- `fn transformer_block_cached(tensor.NumericBlock x, tensor.NumericBlock ln1_s, tensor.NumericBlock ln1_o, tensor.NumericBlock wq, tensor.NumericBlock bq, tensor.NumericBlock wk, tensor.NumericBlock bk, tensor.NumericBlock wv, tensor.NumericBlock bv, tensor.NumericBlock wo, tensor.NumericBlock bo, tensor.NumericBlock ln2_s, tensor.NumericBlock ln2_o, tensor.NumericBlock wf1, tensor.NumericBlock bf1, tensor.NumericBlock wf2, tensor.NumericBlock bf2, tensor.NumericBlock ln3_s, tensor.NumericBlock ln3_o, f32 scale, list<int> positions, int dim, kv.KVCache layer, list<int> tokens) → CachedBlock ⇥ TransformerError`
+- `fn dense_block_cached(tensor.NumericBlock x, list<int> positions, kv.KVCache layer, list<int> tokens, DenseAttentionWeights attention_weights, DenseAttentionConfig attention_config, DenseMlpWeights mlp_weights, DenseNormConfig norm_config) → CachedBlock ⇥ TransformerError`
 
 ## gradus:test_util
 

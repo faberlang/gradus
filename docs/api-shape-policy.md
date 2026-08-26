@@ -12,10 +12,10 @@ operator session recorded in faber `docs/design/typed-error-union.md`.
 ## The posture: the staged carrier
 
 Gradus uses the **staged carrier**: shape is a runtime dimension list inside
-the value carrier (`Tensor.shape`), and the **static shape is pinned by the
+the value carrier (`NumericBlock.shape`), and the **static shape is pinned by the
 consumer at materialization** (boundary types stay `tensor<f32, [2,2]>`).
 
-- **Why**: the generic shape genus (`genus Tensor<magnitudo F>` type-argument
+- **Why**: the generic shape genus (`genus NumericBlock<magnitudo F>` type-argument
   application) is `PARSE001` and the shape-hole `tensor<f32, _>` genus fields
   / returns are `SEM014` in standalone library context. The staged carrier
   compiles today (PML1 closeout R1 record 1; compiler evidence recorded in
@@ -29,7 +29,7 @@ consumer at materialization** (boundary types stay `tensor<f32, [2,2]>`).
 ## Executed tier of record
 
 Gradus's executed tier of record is the CPU/reference tier — f32 host-list
-carrier (`src/tensor.fab` `class Tensor` `list<f32> data`), reference
+carrier (`src/tensor.fab` `class NumericBlock` `list<f32> data`), reference
 kernels, and FMIR stepper receipts. Device residency and emission are
 Radix and hosts scope.
 
@@ -38,7 +38,7 @@ Radix and hosts scope.
 | Surface | Signature form | Example |
 | --- | --- | --- |
 | **Fixed-shape admitted rows** | `tensor<f32, [..]>` typed tensors | `linear_2x2`, `mse_4x4`, `bert_tiny_block_2x8` — the admitted caller-backed rows |
-| **Production (shape-generic)** | `tensor.Tensor` staged carrier | `nn.linear`, `loss.mse`, `attention.scaled_dot_product`, `math.add` — runtime shape facts |
+| **Production (shape-generic)** | `tensor.NumericBlock` staged carrier | `nn.linear`, `loss.mse`, `attention.scaled_dot_product`, `math.add` — runtime shape facts |
 
 The concrete-overload precedent (norma:optimizer) governs the fixed-shape
 rows; the production surface keeps shapes as runtime facts.
@@ -74,7 +74,7 @@ PML1). Consequences:
   general math limit.
 - General checked shape arithmetic (`numel` / `broadcast` /
   `reshape` / `expand`) does not apply the per-dimension cap, so
-  128k–152k vocab rows stay expressible. Tensor construction routes the
+  128k–152k vocab rows stay expressible. NumericBlock construction routes the
   element product through ONE validator: `shape.numel`.
 - The serialize mirror was aligned to `shape.numel` (no per-dimension
   cap; element ceiling 1_000_000_000 and negative-dim rejection retained;
