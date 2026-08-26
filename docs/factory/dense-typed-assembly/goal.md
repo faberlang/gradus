@@ -1,6 +1,6 @@
 # GOAL: dense-typed-assembly — pin weights at load; typed host graph
 
-**Status**: active — units 1–4 landed; `c7bd96e0` closed (`1fd242b43`) so loaded `DenseLayer` fields assign to `TypedDenseLayer` and `dense_block_static` can consume them; unit 5 (delete bag wrappers, typed public routes) still blocked on SEM008 / inferred type-arg backfill
+**Status**: active — units 1–4 landed; REF-01 typed runners now call generic `load` + `TypedDenseLayer` + `dense_block_static` / `dense_block_cached_static`; unit 5 (delete bag wrappers, typed public routes for all geometries) still blocked on SEM008 size-param forwarding (need `687583b1`)
 **Created**: 2026-08-26
 **Campaign:** `—` (standalone; complementary to `kernel-purity-census`, not a purity wave)
 **Source:** operator session 2026-08-26 — contrast of `src/model/dense.fab` vs `src/kernel.fab`; Wave 0 carrier/admissions ruling
@@ -251,8 +251,8 @@ Closeout requires all of the following:
 | 1 | done | direct | `faber check .` green | `DenseModel` + `load`; bag routes unchanged. Package MIR cannot execute `dense.load<16,…>` (namespace type args) — load is check-only until unit 4 unifies sizes from tensor/model args |
 | 2 | done | direct | `faber check .` green | `@ kernel @ public rmsnorm<size T, D>` + `swiglu_hidden`; bag renamed `rmsnorm_carrier` (SEM005) |
 | 3 | done | direct | `faber check .` green; `transformer.proba` dense-block rows still pass | `dense_block_static` / `dense_block_cached_static` ordinary assemblers; attention stays bag at the QKV seam |
-| 4 | done (REF-01 workaround) | direct | `dense.proba` 20/20 including tied/untied `forward_ref01` @ 5e-4 and prefill/decode compose | Bag `forward` still the public runner. Typed routes are `load_ref01` / `forward_ref01` / `prefill_ref01` / `decode_step_ref01` over non-generic `DenseModelRef01` + `transformer.Ref01Layer`. Glyphs + literal `data ↦ tensor<f32, […]>`. `decode_block` still bag. |
-| 5 | pending | — | — | `c7bd96e0` / `1fd242b43` unblocks `DenseLayer` → `TypedDenseLayer` assign (`probe_typed_block_static`). Callers, delete bag wrappers, docs still pending on SEM008 / inferred type-arg backfill. |
+| 4 | done (REF-01 on generic load) | direct | source rewrite; package proba still blocked on in-union `@ conversion` PARSE018 (`68c0e69e`) | `forward_ref01` / `prefill_ref01` / `decode_step_ref01` now `load<16,8,16,8,16>` + `_typed_ref01` + `dense_block_static` / `dense_block_cached_static`. Deleted `DenseModelRef01` / `load_ref01` / `Ref01Layer` / `dense_block_ref01`. Bag `forward` still the public runner. `decode_block` still bag. |
+| 5 | pending | — | — | Callers, delete bag wrappers, docs still pending on SEM008 size-param forwarding (need `687583b1`: generic `forward<T,D,…>` cannot call `dense_block_static<T,D,…>`). Standalone `@ conversion` (`68c0e69e`) is the proof oracle, not a write blocker. |
 
 ## Open questions
 
@@ -282,10 +282,14 @@ Closeout requires all of the following:
    `cd52c31c2`. `dense.load<16, 8, 16, 8, 16>(…)` now **runs** from
    `dense.proba` (same-module field read of `model.cfg` and `layer.ln1`
    + `.rms_norm` also run).    Remaining gates for unit 5 after `c7bd96e0` / radix `1fd242b43`
-   (loaded `DenseLayer` fields assign to `TypedDenseLayer`;
-   `probe_typed_block_static` is the Gradus consumer):
-   (a) inferred namespace generics still drop type args (no-backfill);
-   (b) generic pin helpers still fail to bake runtime rank;
-   (c) SEM008: size params cannot be forwarded as `_fn<D, Q, …>(…)`,
-   so a general `forward<T, D, …>` cannot call the assembler.
-   REF-01 monomorphic classes + glyphs stay the executable typed graph.
+   (loaded `DenseLayer` fields assign to `TypedDenseLayer`; REF-01
+   runners now consume that path):
+   (a) SEM008: size params cannot be forwarded as `_fn<D, Q, …>(…)`,
+   so a general `forward<T, D, …>` cannot call the assembler — this is
+   the unit-5 stop for SmolLM2 / Qwen2 / generation callers;
+   (b) generic pin helpers still fail to bake runtime rank
+   (`↦ tensor<f32, [T, D]>` is SEM016; `gather` stays literal-shaped);
+   (c) inferred namespace generics dropping type args — verify only;
+   the literal-size static block already calls `nn.rmsnorm`;
+   (d) standalone `@ conversion fn` (`68c0e69e`) is in flight elsewhere
+   and is required to *prove* Gradus, not to write it. Do not refile.

@@ -347,6 +347,15 @@ fn _require_cfg(DenseConfig cfg) → bool ⇥ DenseError {
     return true
 }
 
+fn _require_ref01(DenseConfig cfg) → bool ⇥ DenseError {
+    _require_cfg(cfg)
+    require cfg.hidden_dim ≡ 16 throw variant BadConfig {message = "REF-01 load requires hidden_dim 16"}
+    require cfg.vocab ≡ 8 throw variant BadConfig {message = "REF-01 load requires vocab 8"}
+    require cfg.heads * cfg.head_dim ≡ 16 throw variant BadConfig {message = "REF-01 load requires Q width 16"}
+    require cfg.kv_heads * cfg.head_dim ≡ 8 throw variant BadConfig {message = "REF-01 load requires K width 8"}
+    return true
+}
+
 fn _zeros_rank1(int n) → tensor.NumericBlock ⇥ DenseError {
     var list<f32> out ← empty
     for range 0‥n const i {
@@ -501,6 +510,17 @@ fn probe_layer_rms_len(DenseConfig cfg, (string, int) → tensor.NumericBlock �
     return data.length()
 }
 
+# DenseLayer → TypedDenseLayer at REF-01 sizes. Size-generic assign is
+# SEM008 (cannot write `_typed<D, Q, K, F>`). Literal sizes only.
+fn _typed_ref01(DenseLayer<16, 16, 8, 16> layer) → transformer.TypedDenseLayer<16, 16, 8, 16> {
+    return transformer.TypedDenseLayer {
+        ln1 = layer.ln1, wq = layer.wq, bq = layer.bq, has_bq = layer.has_bq,
+        wk = layer.wk, bk = layer.bk, has_bk = layer.has_bk,
+        wv = layer.wv, bv = layer.bv, has_bv = layer.has_bv,
+        wo = layer.wo, ln2 = layer.ln2, wg = layer.wg, wu = layer.wu, wd = layer.wd
+    }
+}
+
 # Typed-assembly unit 5 seam: a monomorphized DenseLayer field must assign
 # to the same-shape TypedDenseLayer field, and one static block must run on
 # a layer taken from the generic load (need c7bd96e0 / radix 1fd242b43).
@@ -511,13 +531,7 @@ fn probe_typed_block_static(DenseConfig cfg, (string, int) → tensor.NumericBlo
     const transformer.DenseAttentionConfig attention_config ← transformer.DenseAttentionConfig {num_heads = model.cfg.heads, num_kv_heads = model.cfg.kv_heads, scale = scale, rope_dim = rope_dim, rope_config = rope_cfg}
     var tensor<f32, [2, 16]> h ← x
     for from model.layers const layer {
-        const transformer.TypedDenseLayer<16, 16, 8, 16> typed ← transformer.TypedDenseLayer {
-            ln1 = layer.ln1, wq = layer.wq, bq = layer.bq, has_bq = layer.has_bq,
-            wk = layer.wk, bk = layer.bk, has_bk = layer.has_bk,
-            wv = layer.wv, bv = layer.bv, has_bv = layer.has_bv,
-            wo = layer.wo, ln2 = layer.ln2, wg = layer.wg, wu = layer.wu, wd = layer.wd
-        }
-        h ← transformer.dense_block_static<2, 16, 16, 8, 16>(h, positions, typed, attention_config, epsilon, 2, 16, 16, 8)
+        h ← transformer.dense_block_static<2, 16, 16, 8, 16>(h, positions, _typed_ref01(layer), attention_config, epsilon, 2, 16, 16, 8)
     }
     const list<f32> data ← h ↦ list<f32>
     return data.length()
@@ -540,122 +554,26 @@ fn probe_inferred_leaves() → tensor<f32, [2, 4]> ⇥ DenseError {
     }
 }
 
-@ public
-class DenseModelRef01 {
-    DenseConfig cfg
-    tensor<f32, [16, 8]> embed
-    tensor<f32, [8, 16]> embed_tokens
-    tensor<f32, [16]> norm
-    tensor<f32, [16, 8]> w_head
-    list<transformer.Ref01Layer> layers
-}
-
-@ public
-fn load_ref01(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ DenseError source) → DenseModelRef01 ⇥ DenseError {
-    # --- config + REF-01 shape (fail closed) ------------------------------
-    _require_cfg(cfg)
-    require cfg.hidden_dim ≡ 16 throw variant BadConfig {message = "REF-01 load requires hidden_dim 16"}
-    require cfg.vocab ≡ 8 throw variant BadConfig {message = "REF-01 load requires vocab 8"}
-    require cfg.heads * cfg.head_dim ≡ 16 throw variant BadConfig {message = "REF-01 load requires Q width 16"}
-    require cfg.kv_heads * cfg.head_dim ≡ 8 throw variant BadConfig {message = "REF-01 load requires K width 8"}
-
-    # --- embed ------------------------------------------------------------
-    const tensor.NumericBlock embed_b ← source("model.embed_tokens", 0)
-    _shape(embed_b, "model.embed_tokens", [cfg.hidden_dim, cfg.vocab])
-
-    # --- per-layer pins ---------------------------------------------------
-    var list<transformer.Ref01Layer> layers ← empty
-    for range 0‥cfg.layers const layer {
-        const string prefix ← "model.layers.§"(layer ↦ string)
-
-        # --- resolve stored weights ---------------------------------------
-        const tensor.NumericBlock ln1_s ← source(prefix + ".input_layernorm", layer)
-        const tensor.NumericBlock wq ← source(prefix + ".self_attn.q_proj", layer)
-        const tensor.NumericBlock wk ← source(prefix + ".self_attn.k_proj", layer)
-        const tensor.NumericBlock wv ← source(prefix + ".self_attn.v_proj", layer)
-        const tensor.NumericBlock wo ← source(prefix + ".self_attn.o_proj", layer)
-        const tensor.NumericBlock ln2_s ← source(prefix + ".post_attention_layernorm", layer)
-        const tensor.NumericBlock wg ← source(prefix + ".mlp.gate_proj", layer)
-        const tensor.NumericBlock wu ← source(prefix + ".mlp.up_proj", layer)
-        const tensor.NumericBlock wd ← source(prefix + ".mlp.down_proj", layer)
-
-        # --- shape contract against cfg -----------------------------------
-        _shape(ln1_s, prefix + ".input_layernorm", [cfg.hidden_dim])
-        _shape(wq, prefix + ".self_attn.q_proj", [cfg.hidden_dim, 16])
-        _shape(wk, prefix + ".self_attn.k_proj", [cfg.hidden_dim, 8])
-        _shape(wv, prefix + ".self_attn.v_proj", [cfg.hidden_dim, 8])
-        _shape(wo, prefix + ".self_attn.o_proj", [16, cfg.hidden_dim])
-        _shape(ln2_s, prefix + ".post_attention_layernorm", [cfg.hidden_dim])
-        _shape(wg, prefix + ".mlp.gate_proj", [cfg.hidden_dim, 16])
-        _shape(wu, prefix + ".mlp.up_proj", [cfg.hidden_dim, 16])
-        _shape(wd, prefix + ".mlp.down_proj", [16, cfg.hidden_dim])
-
-        # --- optional Q/K/V bias ------------------------------------------
-        const BiasBag bq_bag ← _probe_bias(source, prefix + ".self_attn.q_proj.bias", layer, 16)
-        const BiasBag bk_bag ← _probe_bias(source, prefix + ".self_attn.k_proj.bias", layer, 8)
-        const BiasBag bv_bag ← _probe_bias(source, prefix + ".self_attn.v_proj.bias", layer, 8)
-
-        # --- pin and append layer -----------------------------------------
-        do {
-            const tensor<f32, [16]> ln1 ← ln1_s.data ↦ tensor<f32, [16]>
-            const tensor<f32, [16, 16]> wq_t ← wq.data ↦ tensor<f32, [16, 16]>
-            const tensor<f32, [16, 8]> wk_t ← wk.data ↦ tensor<f32, [16, 8]>
-            const tensor<f32, [16, 8]> wv_t ← wv.data ↦ tensor<f32, [16, 8]>
-            const tensor<f32, [16, 16]> wo_t ← wo.data ↦ tensor<f32, [16, 16]>
-            const tensor<f32, [16]> ln2 ← ln2_s.data ↦ tensor<f32, [16]>
-            const tensor<f32, [16, 16]> wg_t ← wg.data ↦ tensor<f32, [16, 16]>
-            const tensor<f32, [16, 16]> wu_t ← wu.data ↦ tensor<f32, [16, 16]>
-            const tensor<f32, [16, 16]> wd_t ← wd.data ↦ tensor<f32, [16, 16]>
-            const tensor<f32, [16]> bq ← bq_bag.value.data ↦ tensor<f32, [16]>
-            const tensor<f32, [8]> bk ← bk_bag.value.data ↦ tensor<f32, [8]>
-            const tensor<f32, [8]> bv ← bv_bag.value.data ↦ tensor<f32, [8]>
-            layers.append(transformer.Ref01Layer {ln1 = ln1, wq = wq_t, bq = bq, has_bq = bq_bag.present, wk = wk_t, bk = bk, has_bk = bk_bag.present, wv = wv_t, bv = bv, has_bv = bv_bag.present, wo = wo_t, ln2 = ln2, wg = wg_t, wu = wu_t, wd = wd_t})
-        }
-        catch conv {
-            throw variant BadShape {message = "canonical tensor § pin failed"(prefix)}
-        }
-    }
-
-    # --- final norm + lm_head ---------------------------------------------
-    const tensor.NumericBlock norm_b ← source("model.norm", 0)
-    _shape(norm_b, "model.norm", [cfg.hidden_dim])
-    var tensor.NumericBlock head_b ← embed_b
-    if not cfg.tied {
-        head_b ← source("lm_head", 0)
-        _shape(head_b, "lm_head", [cfg.hidden_dim, cfg.vocab])
-    }
-
-    # --- construct model --------------------------------------------------
-    do {
-        const tensor<f32, [16, 8]> embed ← embed_b.data ↦ tensor<f32, [16, 8]>
-        const tensor<f32, [8, 16]> embed_tokens ← embed_b.data ↦ tensor<f32, [8, 16]>
-        const tensor<f32, [16]> norm ← norm_b.data ↦ tensor<f32, [16]>
-        var tensor<f32, [16, 8]> w_head ← embed_tokens.transpose()
-        if not cfg.tied {
-            w_head ← head_b.data ↦ tensor<f32, [16, 8]>
-        }
-        return DenseModelRef01 {cfg = cfg, embed = embed, embed_tokens = embed_tokens, norm = norm, w_head = w_head, layers = layers}
-    }
-    catch conv {
-        throw variant BadShape {message = "canonical tensor pin failed"}
-    }
-}
+# REF-01 typed runners — generic load + TypedDenseLayer + static
+# assemblers at literal sizes. Public bag `forward` / decode stay until
+# SEM008 can forward size params into `dense_block_static<T, D, Q, K, F>`.
 
 @ public
 fn forward_ref01(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ DenseError source, list<int> tokens, f32 epsilon, f32 scale, list<int> positions, int rope_dim, attention.RopeConfig rope_cfg) → tensor.NumericBlock ⇥ DenseError {
     # --- sequence (fail closed) -------------------------------------------
     require tokens.length() ≡ 2 throw variant BadConfig {message = "token sequence must be non-empty"}
     require positions.length() ≡ 2 throw variant BadConfig {message = "positions must match the token count"}
+    _require_ref01(cfg)
 
     # --- load + embed gather ----------------------------------------------
-    const DenseModelRef01 model ← load_ref01(cfg, source)
+    const DenseModel<16, 8, 16, 8, 16> model ← load<16, 8, 16, 8, 16>(cfg, source)
     const tensor<f32, [2, 16]> x ← gather(model.embed_tokens, tokens)
     const transformer.DenseAttentionConfig attention_config ← transformer.DenseAttentionConfig {num_heads = model.cfg.heads, num_kv_heads = model.cfg.kv_heads, scale = scale, rope_dim = rope_dim, rope_config = rope_cfg}
 
     # --- per-layer blocks -------------------------------------------------
     var tensor<f32, [2, 16]> h ← x
     for from model.layers const layer {
-        h ← transformer.dense_block_ref01(h, positions, layer, attention_config, epsilon)
+        h ← transformer.dense_block_static<2, 16, 16, 8, 16>(h, positions, _typed_ref01(layer), attention_config, epsilon, 2, 16, 16, 8)
     }
 
     # --- final RMSNorm + output projection --------------------------------
@@ -673,9 +591,10 @@ fn decode_step_ref01(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ 
     const int prefix_before ← _shared_prefix(layers)
     require position ≡ prefix_before throw variant Gap {message = "position must equal the cache length"}
     _admit_cached(layers, 1)
+    _require_ref01(cfg)
 
     # --- load + embed gather ----------------------------------------------
-    const DenseModelRef01 model ← load_ref01(cfg, source)
+    const DenseModel<16, 8, 16, 8, 16> model ← load<16, 8, 16, 8, 16>(cfg, source)
     const tensor<f32, [1, 16]> x ← gather_step(model.embed_tokens, token_id)
     const transformer.DenseAttentionConfig attention_config ← transformer.DenseAttentionConfig {num_heads = model.cfg.heads, num_kv_heads = model.cfg.kv_heads, scale = scale, rope_dim = rope_dim, rope_config = rope_cfg}
 
@@ -685,8 +604,8 @@ fn decode_step_ref01(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ 
     var int i ← 0
     for from model.layers const layer {
         const kv.KVCache cache ← layers.get(i) coalesce kv.default()
-        const transformer.CachedRef01T1 block ← transformer.dense_block_cached_ref01_t1(h, [position], cache, [token_id], layer, attention_config, epsilon)
-        h ← block.hidden
+        const transformer.TypedCachedBlock<1, 16> block ← transformer.dense_block_cached_static<1, 16, 16, 8, 16>(h, [position], cache, [token_id], _typed_ref01(layer), attention_config, epsilon, 1, 16, 16, 8)
+        h ← block.output
         next.append(block.state)
         i ← i + 1
     }
@@ -705,9 +624,10 @@ fn prefill_ref01(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ Dens
     const int prefix_before ← _shared_prefix(layers)
     require prefix_before ≡ 0 throw variant Gap {message = "cache write leaves a gap"}
     _admit_cached(layers, 2)
+    _require_ref01(cfg)
 
     # --- load + embed gather ----------------------------------------------
-    const DenseModelRef01 model ← load_ref01(cfg, source)
+    const DenseModel<16, 8, 16, 8, 16> model ← load<16, 8, 16, 8, 16>(cfg, source)
     const tensor<f32, [2, 16]> x ← gather(model.embed_tokens, tokens)
     const transformer.DenseAttentionConfig attention_config ← transformer.DenseAttentionConfig {num_heads = model.cfg.heads, num_kv_heads = model.cfg.kv_heads, scale = scale, rope_dim = rope_dim, rope_config = rope_cfg}
 
@@ -717,8 +637,8 @@ fn prefill_ref01(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ Dens
     var int i ← 0
     for from model.layers const layer {
         const kv.KVCache cache ← layers.get(i) coalesce kv.default()
-        const transformer.CachedRef01T2 block ← transformer.dense_block_cached_ref01_t2(h, [0, 1], cache, tokens, layer, attention_config, epsilon)
-        h ← block.hidden
+        const transformer.TypedCachedBlock<2, 16> block ← transformer.dense_block_cached_static<2, 16, 16, 8, 16>(h, [0, 1], cache, tokens, _typed_ref01(layer), attention_config, epsilon, 2, 16, 16, 8)
+        h ← block.output
         next.append(block.state)
         i ← i + 1
     }
