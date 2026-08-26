@@ -63,6 +63,7 @@ pinned row is space-prefix-free (add_space_prefix = false)
 | `gradus:model/dense_qwen2` | `DenseQwen2Error` | 5 | `src/model/dense_qwen2.fab` |
 | `gradus:model/dense` | `DenseError` | 4 | `src/model/dense.fab` |
 | `gradus:model/moe` | `MoeError` | 4 | `src/model/moe.fab` |
+| `gradus:model/qwen35moe_state` | `Qwen35moeStateError` | 6 | `src/model/qwen35moe_state.fab` |
 | `gradus:nn` | `NnError` | 9 | `src/nn.fab` |
 | `gradus:optimize` | `OptimizeError` | 14 | `src/optimize.fab` |
 | `gradus:parameter` | `ParametrumError` | 10 | `src/parameter.fab` |
@@ -413,6 +414,22 @@ expert index.
 | `MoeError.BadShape` | A hidden state, router result, projection, or output carrier has the wrong shape or is invalid. | `hidden state carrier is invalid`<br>`hidden state must have shape [1, embedding_length]`<br>`tensor window carrier is invalid`<br>`tensor window carrier has the wrong shape`<br>`router logits carrier is invalid`<br>`router logits carrier has the wrong shape`<br>`projection carrier is invalid`<br>`projection carrier has the wrong shape`<br>`FFN output carrier is invalid`<br>`FFN output carrier has the wrong shape` | Provide rank- and dimension-correct f32 carriers for the configured embedding and expert widths. |
 | `MoeError.BadWindow` | A bounded source window has invalid bounds or a carrier length that does not match the requested range. | `tensor window start must be non-negative`<br>`tensor window length must be positive`<br>`tensor window length does not match the carrier`<br>`down projection has the wrong length`<br>`projection carrier has the wrong length`<br>`expert output has the wrong length` | Return exactly the requested, element-aligned window with the shape and length declared by the callback contract. |
 | `MoeError.NonFinite` | A hidden state, weight window, router result, softmax intermediate, gate, or final output is non-finite. | `hidden state contains a non-finite value`<br>`tensor window contains a non-finite value`<br>`router logits contain a non-finite value`<br>`router softmax produced a non-finite value`<br>`shared expert gate is non-finite`<br>`FFN output contains a non-finite value` | Reject the input or source window and re-run with finite f32 values; never widen a tolerance or substitute a zero. |
+
+## `gradus:model/qwen35moe_state` — `Qwen35moeStateError`
+
+Source: `src/model/qwen35moe_state.fab`. Render with module `state_message(e)`.
+The MODEL-03 hybrid SSM/attention surface validates schedule arithmetic, state
+shapes, and every bounded weight window before executing a layer; non-finite
+values propagate as failures, never coerced to zero.
+
+| Code | Class / when | Live messages (representative) | Resolution |
+| --- | --- | --- | --- |
+| `Qwen35moeStateError.BadConfig` | Schedule derivation or block addressing is outside the admitted contract. | `block count must be at least one`<br>`block index outside the schedule`<br>`block is not a full-attention layer`<br>`block is not a linear-attention layer`<br>`conv kernel must leave a state slice`<br>`full attention interval must be at least one`<br>`kv capacity must be at least one`<br>`layer index must be non-negative`<br>`nextn layer count must be non-negative`<br>`nextn layers must sit inside the block stack`<br>`schedule does not match the configuration` | Supply the admitted MODEL-01 config (`block_count ≥ 1`, `full_attention_interval ≥ 1`, NextN inside the stack) and address blocks with the matching kind accessor (`linear_index`/`attention_index`). |
+| `Qwen35moeStateError.BadSchedule` | The schedule's own invariants contradict the frozen config. | `schedule contradiction at §` | Never hand-build a `Qwen35moeSchedule`; derive it with `schedule(c)` from the admitted config. |
+| `Qwen35moeStateError.BadShape` | Input rows, head rows, projections, or rope parameters have the wrong shape. | `delta rule rows must match the state dim`<br>`full attention input rows must be [T][embedding]`<br>`linear attention input rows must be [T][embedding]`<br>`head row is shorter than the rope dims`<br>`norm row is empty`<br>`norm row and weight lengths differ`<br>`pass-through width must be the head width`<br>`projection input has the wrong length`<br>`projection input rows have the wrong length`<br>`projection weight window has the wrong length`<br>`query row must match the state dim`<br>`rope dims must be twice the pair count`<br>`rope needs four section lengths`<br>`tensor window carrier has the wrong shape: §`<br>`tensor window carrier is invalid: §` | Feed `[T][2048]` rows for the pinned config, per-head vectors of the configured width, weight windows matching the canonical tensor shapes, and the four rope section lengths from the frozen config. |
+| `Qwen35moeStateError.BadState` | A state value or session identity wire is malformed for its slot. | `kv state window exceeds capacity`<br>`malformed generation wire`<br>`malformed qwen35moe state identity wire`<br>`malformed schedule wire`<br>`positions must continue the kv state exactly`<br>`recurrent head index outside the state`<br>`unknown identity marker`<br>`unknown identity schema` | Start from `fresh_*` constructors, continue positions from the KV state's own length, and round-trip identity wires produced by `session_identity_key`. |
+| `Qwen35moeStateError.BadWindow` | A bounded source window has invalid bounds. | `tensor window length does not match the carrier: §`<br>`tensor window length must be positive`<br>`tensor window start must be non-negative` | Return exactly the requested, element-aligned window with the length declared by the callback contract. |
+| `Qwen35moeStateError.NonFinite` | A window, projection, softmax, or layer output is non-finite. | `attention softmax normalizer collapsed`<br>`full attention output is non-finite`<br>`gated delta net output is non-finite`<br>`linear attention output is non-finite`<br>`projection produced a non-finite value`<br>`tensor window contains a non-finite value: §` | Reject the input or source window and re-run with finite f32 values; never widen a tolerance or substitute a zero. |
 
 ## `gradus:model/gguf` — `GgufError`
 

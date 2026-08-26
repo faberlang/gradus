@@ -1,6 +1,6 @@
 # Delivery: MODEL-03 — qwen35moe Hybrid SSM/Attention State (GGUF-M3)
 
-**Status**: lowering complete — READY for delivery audit; dispatch waits on the predecessor receipts named in §5
+**Status**: delivered 2026-08-26 — MODEL-03 implementation landed on gradus main (module + proba + `exempla/qwen35moe-layer-probe` + docs; §3.5/§7 spec touch-ups folded); executed probe receipt follows in `evidence/`
 **Campaign**: `radix/docs/factory/gpu-production-readiness/CAMPAIGN.md` (MODEL-03 mandatory work row)
 **Delivery authority**: [`pml5-general-gguf-delivery.md`](pml5-general-gguf-delivery.md) §GGUF-M3
 **Control-plane repo**: `radix`; **owning repo (implementation)**: `gradus`
@@ -200,7 +200,7 @@ by GGUF-A4/A5/A6 and are read-only context for this unit.
 ### 3.5 Live Gradus state
 
 - `src/model/gguf_manifest.fab` + `artifact.fab` (GGUF-A1a/A1b landed): parse,
-  `LectioFontis`, `inspice`, `lege_fragmentum`; executed receipts via
+  `inspect`, `read_fragment`; executed receipts via
   `exempla/gguf-manifest` and `exempla/gguf-inspect`.
 - `src/cache.fab` (PML5-U2): single-block structural `KVCache` with append,
   reset, and identity-key wire; **single-block only, no recurrent/conv state** —
@@ -326,12 +326,15 @@ One delivery-sized Hand task, GGUF-M3.
   ./scripta/check-source
   ./scripta/check-compile
   env FABER_LIBRARY_HOME=<lane-home> FABER_BIN=<lane-radix>/target/debug/faber \
-    run --target fmir exempla/qwen35moe-layer-probe -- <probe-dump-dir>
+    run --target fmir exempla/qwen35moe-layer-probe -- \
+      /Users/ianzepp/Ai/models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf 10991392 <probe-dump-dir>
   <lane>/trials/compare-per-layer.py <probe-dump-dir> --gate <gate>
   git diff --check -- src/model/qwen35moe_state.fab src/model/qwen35moe_state.proba \
     exempla/qwen35moe-layer-probe docs/module-map.md docs/api-reference.md \
     docs/diagnostics.md docs/regression-corpus.md
   ```
+  (the exempla resolves the artifact path + GGUF data offset + dump dir from
+  argv; the data offset is the pinned 10,991,392 constant)
 - **Expected observed result**: `check-source` and `check-compile` exit 0;
   the per-layer comparison reports agreement at every layer and position up to
   the first-divergence boundary with `DIVERGENCE=none` (or a named first
@@ -382,7 +385,6 @@ One delivery-sized Hand task, GGUF-M3.
 
 ```bash
 cd gradus && ./scripta/check-source && ./scripta/check-compile
-cd gradus && python3 ../radix/scripta/generate-factory-readme.py --factory-root docs/factory --check
 cd gradus && ./scripta/check-factory-goal-status --fail-on error
 ```
 

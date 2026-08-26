@@ -1,6 +1,6 @@
 # Gradus Regression Corpus
 
-**Version**: `gradus-regression-corpus v1.10.0` (2026-08-22 — MODEL-02 MoE router/expert/full-layer suites and pinned fixtures added after the U6 surface landed at `b1ccfc8`; merged REF-01-U1.8 dense-model assembly + MODEL-01 qwen35moe admission: the full-graph logits (embedding gather → 2 ordered U1.5 blocks → final RMSNorm → output projection) for a synthetic T=2/D=16/vocab-8 config with tied + untied embedding rows + exempla `dense-model` executed proof (37 PASS / 0 FAIL); REF-01-U1.5 — generic dense block pins: the ordered block composition (input RMSNorm → GQA causal+RoPE → residual → post-attn RMSNorm → SwiGLU → residual) over a synthetic T=2/D=16 config + exempla `dense-block` executed proof (32 PASS / 0 FAIL); REF-01-U1.4 — multi-head GQA attention pins: GQA n_h=14/n_kv=2 + MHA n_kv=n_h config rows + exempla `dense-gqa`; REF-01-U1.3 configurable RoPE pins + exempla `dense-rope`; REF-01-U1.2 `nn` SiLU/SwiGLU pins + `exempla/dense-swiglu` executed proof; REF-01-U1.1 RMSNorm pins + `exempla/dense-rmsnorm`; REF-01-U1.6 `dense_llama` llama adapter descriptor-resolution pins + `exempla/dense-llama-adapter`; REF-01-U1.7 `dense_qwen2` qwen2 adapter pins; MODEL-01 — qwen35moe architecture admission pins + M1 `gguf_manifest` typed accessors + the guarded real-file admission receipt (M7); LIB-03 GGUF-A3 C1/C2-U5 — `tensor_payload` / `tensor_view` suites + union-set dequant goldens)
+**Version**: `gradus-regression-corpus v1.11.0` (2026-08-26 — MODEL-03 hybrid SSM/attention state suite `src/model/qwen35moe_state.proba` + executed probe exemplum `exempla/qwen35moe-layer-probe` added: schedule derivation, state equality/reset/identity round-trip, RoPE pair-norm preservation, hand-computed delta-rule cells, prefill≡incremental equivalence for both layer kinds, replay determinism; v1.10.0 (2026-08-22) — MODEL-02 MoE router/expert/full-layer suites and pinned fixtures added after the U6 surface landed at `b1ccfc8`; merged REF-01-U1.8 dense-model assembly + MODEL-01 qwen35moe admission: the full-graph logits (embedding gather → 2 ordered U1.5 blocks → final RMSNorm → output projection) for a synthetic T=2/D=16/vocab-8 config with tied + untied embedding rows + exempla `dense-model` executed proof (37 PASS / 0 FAIL); REF-01-U1.5 — generic dense block pins: the ordered block composition (input RMSNorm → GQA causal+RoPE → residual → post-attn RMSNorm → SwiGLU → residual) over a synthetic T=2/D=16 config + exempla `dense-block` executed proof (32 PASS / 0 FAIL); REF-01-U1.4 — multi-head GQA attention pins: GQA n_h=14/n_kv=2 + MHA n_kv=n_h config rows + exempla `dense-gqa`; REF-01-U1.3 configurable RoPE pins + exempla `dense-rope`; REF-01-U1.2 `nn` SiLU/SwiGLU pins + `exempla/dense-swiglu` executed proof; REF-01-U1.1 RMSNorm pins + `exempla/dense-rmsnorm`; REF-01-U1.6 `dense_llama` llama adapter descriptor-resolution pins + `exempla/dense-llama-adapter`; REF-01-U1.7 `dense_qwen2` qwen2 adapter pins; MODEL-01 — qwen35moe architecture admission pins + M1 `gguf_manifest` typed accessors + the guarded real-file admission receipt (M7); LIB-03 GGUF-A3 C1/C2-U5 — `tensor_payload` / `tensor_view` suites + union-set dequant goldens)
 **Repo**: gradus. **Tier**: structural inventory.
 **Delivery**: `docs/factory/production-ml-library/pml6-delivery.md` §PML6-U4;
 GGUF-A1b delivery in `pml5-general-gguf-delivery.md`.
@@ -27,7 +27,7 @@ closeout, never a dev-loop suite.
 | --- | --- | --- |
 | Co-located package tests | `src/*.proba`, `src/model/*.proba` | Compile-level contract + oracle pins per module |
 | Model / tokenizer fixtures | `fixtures/safetensors/`, `fixtures/gguf/`, `fixtures/tokenizer/` | Legal fixtures + row-oracle docs, including the three GGUF-A1a manifest fixtures and the GGUF-A3 union-set dequant goldens (`gguf-dequant-goldens.json` + derivation contract) |
-| Exempla consumers | `exempla/gradient-seam`, `exempla/gradient-seam-nolib`, `exempla/training-loop-mlp`, `exempla/token-generation`, `exempla/gguf-manifest`, `exempla/gguf-inspect`, `exempla/qwen36-35b-inference`, `exempla/dense-rmsnorm`, `exempla/dense-swiglu`, `exempla/dense-llama-adapter`, `exempla/dense-qwen2-adapter`, `exempla/dense-block`, `exempla/dense-model`, `exempla/dense-prefill-smollm2`, `exempla/dense-prefill-qwen2`, `exempla/gguf-admit-qwen35moe`, `exempla/moe-probe` (MODEL-02-U7 adapter handoff) | Public-surface consumers plus the executed GGUF synthetic proof (40 PASS / 0 FAIL), guarded six-file local inspection receipt, the capstone tokenizer-phase run (LIB-02-U4-1), the REF-01-U1.1 RMSNorm executed proof (32 PASS / 0 FAIL), the executed REF-01-U1.2 SiLU/SwiGLU proof (14 PASS / 0 FAIL), the REF-01-U1.6 llama-adapter executed proof (19 PASS / 0 FAIL), the qwen2 adapter executed proof (23 PASS / 0 FAIL, REF-01-U1.7), the REF-01-U1.5 dense-block executed proof (32 PASS / 0 FAIL), the REF-01-U1.8 dense-model assembly executed proof (37 PASS / 0 FAIL, tied + untied rows + the fail-closed rejection row), the REF-01-U1.9 compiled-route consumer `dense-prefill-smollm2` (FINAL stop at radix `2ed9914e4` / faber `b1adfc9`: packet faber green; rust emit reaches cargo; rustc 258 errors, first `cast cannot be followed by a method call` — no executed logits), the REF-01-U1.10 Qwen2.5-0.5B prefill consumer (FINAL stop at radix `2ed9914e4`: packet `faber` green; PKG001 closed; rustc cargo-101, first `E0015` const `vec!`; prior PKG001 at `3853d4b8f`, E0432 at `b919052f0`, `CODEGEN001` on `7863624e2`), and the guarded real-file qwen35moe admission receipt (MODEL-01-M7) |
+| Exempla consumers | `exempla/gradient-seam`, `exempla/gradient-seam-nolib`, `exempla/training-loop-mlp`, `exempla/token-generation`, `exempla/gguf-manifest`, `exempla/gguf-inspect`, `exempla/qwen36-35b-inference`, `exempla/dense-rmsnorm`, `exempla/dense-swiglu`, `exempla/dense-llama-adapter`, `exempla/dense-qwen2-adapter`, `exempla/dense-block`, `exempla/dense-model`, `exempla/dense-prefill-smollm2`, `exempla/dense-prefill-qwen2`, `exempla/gguf-admit-qwen35moe`, `exempla/moe-probe` (MODEL-02-U7 adapter handoff), `exempla/qwen35moe-layer-probe` (MODEL-03 executed probe; oracle = trials `m3-ssm-attention-oracle.py` + llama.cpp `dee2a846b`) | Public-surface consumers plus the executed GGUF synthetic proof (40 PASS / 0 FAIL), guarded six-file local inspection receipt, the capstone tokenizer-phase run (LIB-02-U4-1), the REF-01-U1.1 RMSNorm executed proof (32 PASS / 0 FAIL), the executed REF-01-U1.2 SiLU/SwiGLU proof (14 PASS / 0 FAIL), the REF-01-U1.6 llama-adapter executed proof (19 PASS / 0 FAIL), the qwen2 adapter executed proof (23 PASS / 0 FAIL, REF-01-U1.7), the REF-01-U1.5 dense-block executed proof (32 PASS / 0 FAIL), the REF-01-U1.8 dense-model assembly executed proof (37 PASS / 0 FAIL, tied + untied rows + the fail-closed rejection row), the REF-01-U1.9 compiled-route consumer `dense-prefill-smollm2` (FINAL stop at radix `2ed9914e4` / faber `b1adfc9`: packet faber green; rust emit reaches cargo; rustc 258 errors, first `cast cannot be followed by a method call` — no executed logits), the REF-01-U1.10 Qwen2.5-0.5B prefill consumer (FINAL stop at radix `2ed9914e4`: packet `faber` green; PKG001 closed; rustc cargo-101, first `E0015` const `vec!`; prior PKG001 at `3853d4b8f`, E0432 at `b919052f0`, `CODEGEN001` on `7863624e2`), the guarded real-file qwen35moe admission receipt (MODEL-01-M7), and the MODEL-03 per-layer probe receipt (prefill + one-token decode, `DIVERGENCE=none` under the derived band) |
 | Admission conformance | `tests/admission_conformance.fab` | Capsule admission composition check |
 
 Nested package dirs follow the Agents rule (≥2 modules); model package
@@ -37,7 +37,7 @@ tests live under `src/model/`.
 
 ## 2. Proba inventory (structural)
 
-Live co-located suites (32 files):
+Live co-located suites (44 files):
 
 | Suite | Module / surface | Pin class (summary) |
 | --- | --- | --- |
@@ -74,6 +74,7 @@ Live co-located suites (32 files):
 | `src/model/dense.proba` | `gradus:model/dense` (REF-01-U1.8) | Full-graph logit pins for the small synthetic dense config (T=2, D=16, F=16, H=4, K=2, head_dim=4, vocab 8, tokens `[0, 7]`) — tied and untied embedding rows, f64 references @ **5e-4** (zero same-shape biases, the assembly's synthesized-bias contract) — plus the fail-closed typed-error rows (missing canonical tensor, token out of range, invalid config, shape contradiction, positions mismatch) |
 | `src/model/qwen35moe.proba` | `gradus:model/qwen35moe` (MODEL-01) | qwen35moe architecture admission pins: frozen config rows + 55-entry metadata count + mutation family 1 (M3); canonical 753-tensor map + 41-block schedule + storage distribution + families 2–5 (M4); dimension/storage cross-reference validation (M5); identity precondition + seven-family typed refusal matrix (M6) |
 | `src/model/moe.proba` | `gradus:model/moe` (MODEL-02-U3…U6) | MoE fail-closed configuration/carrier/window/non-finite rows; router logits, stabilized softmax, deterministic lowest-index ties, top-k renormalization; bounded rank-3 expert dispatch; hand-computed full-layer weighted accumulation plus gated shared expert |
+| `src/model/qwen35moe_state.proba` | `gradus:model/qwen35moe_state` (MODEL-03) | Hybrid SSM/attention state pins: schedule derivation rows (41-block/40-trunk + interval-1 degenerate) + fail-closed bounds; fresh state typing + exact equality; session identity round-trip + reset; RoPE pair-norm preservation; hand-computed 2-cell delta rule; prefill≡incremental equivalence for linear and full layers; replay determinism |
 
 Every suite header states **EVIDENCE HONESTY (CTO Q2)**: structural /
 compile-level proof; executed value-identity deferred.
@@ -326,7 +327,7 @@ test -f fixtures/gguf/smollm2-360m-scaled-row.gguf
 test -f fixtures/tokenizer/tokenizer-identity-oracle.md
 
 # Proba count stays the admitted co-located surface
-find src -name '*.proba' | wc -l   # expect 32 at this corpus version
+find src -name '*.proba' | wc -l   # expect 44 at this corpus version
 
 # REF-01-U1.8 dense-model pins in the proba + the executed exempla
 rg -n 'LG_T_|LG_U_|token id out of range for the embedding|positions must match the token count' \
@@ -348,6 +349,11 @@ rg -n 'MODEL-01-M6 admission entry point and typed refusal matrix' \
   src/model/qwen35moe.proba
 test -d exempla/gguf-admit-qwen35moe
 test -f exempla/gguf-admit-qwen35moe/README.md
+
+# MODEL-03 hybrid SSM/attention state suite + executed probe exemplum
+rg -n 'linear iff|full_attention_interval' src/model/qwen35moe_state.proba
+rg -n 'PREFILL\+DECODE: PASS' exempla/qwen35moe-layer-probe/src/main.fab
+test -f exempla/qwen35moe-layer-probe/README.md
 ```
 
 ### 5.3 Executed pass (auditor-owned; not claimed by this unit)
