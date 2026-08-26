@@ -393,11 +393,14 @@ fn _u64_le(list<int<u8>> b) → int ⇥ SafetensorError {
 # length, followed by bounds, 8-byte alignment, and UTF-8 header extraction.
 # Ceilings are checked BEFORE the header slice is materialized.
 fn _header(list<int<u8>> corpus) → HeaderCursor ⇥ SafetensorError {
+    # --- header length + bounds (fail closed) -----------------------------
     const int header ← _u64_le(corpus)
     require header ≥ 1 throw variant BadFormat {message = "invalid safetensors header size"}
     require header ≤ HEADER_LIMIT throw variant BadBounds {message = "header size above ceiling"}
     require 8 + header ≤ corpus.length() throw variant BadFormat {message = "truncated header — header size beyond file"}
     require header % ALIGNMENT ≡ 0 throw variant BadFormat {message = "misaligned safetensors header (not 8-byte aligned)"}
+
+    # --- header slice + UTF-8 extraction ----------------------------------
     var list<int<u8>> sub ← empty
     for range 8‥8 + header const i {
         sub.append(corpus.get(i) coalesce 0 ∷ int<u8>)
@@ -912,14 +915,19 @@ fn _shapes_equal(list<int> a, list<int> b) → bool ⇥ SafetensorError {
 
 @ public
 fn admit_selected(bytes payload, string digest, int artifact_length, int data_start, int relative_start, int relative_end) → SelectedTensor ⇥ SafetensorError {
+    # --- pinned artifact identity (fail closed) ---------------------------
     require digest ≡ GEA1_DIGEST throw variant BadDigest {message = "GEA1 source digest does not match the pinned artifact"}
     require artifact_length ≡ GEA1_ARTIFACT_LENGTH throw variant BadBounds {message = "GEA1 source length does not match the pinned artifact"}
     require data_start ≡ GEA1_DATA_START throw variant BadOffset {message = "GEA1 data-region start does not match the pinned header"}
+
+    # --- pinned tensor range (fail closed) --------------------------------
     require relative_start ≡ GEA1_RELATIVE_START throw variant BadOffset {message = "GEA1 selected tensor start does not match the pinned header"}
     require relative_end ≡ GEA1_RELATIVE_END throw variant BadOffset {message = "GEA1 selected tensor end does not match the pinned header"}
     require relative_end ≻ relative_start throw variant BadOffset {message = "GEA1 selected tensor range is empty"}
     require relative_end - relative_start ≡ GEA1_BYTES throw variant BadShape {message = "GEA1 selected tensor byte length does not match BF16 shape"}
     require payload.length() ≡ GEA1_BYTES throw variant BadOffset {message = "GEA1 selected range read has the wrong byte length"}
+
+    # --- absolute consistency + construct ---------------------------------
     const int absolute_start ← data_start + relative_start
     require absolute_start ≡ GEA1_ABSOLUTE_START throw variant BadOffset {message = "GEA1 selected tensor absolute range is inconsistent"}
     return SelectedTensor {name = GEA1_TENSOR_NAME, dtype_tag = dtype.bf16(), shape = [320, 960], artifact_digest = digest, artifact_length = artifact_length, data_start = data_start, relative_start = relative_start, relative_end = relative_end, absolute_start = absolute_start, payload = payload}
@@ -939,17 +947,17 @@ fn admit_selected(bytes payload, string digest, int artifact_length, int data_st
 
 @ public
 fn admit(list<int<u8>> corpus, string digest, string path) → capsule.Capsule ⇥ SafetensorError {
-    # -- container (format) ----------------------------------------------
+    # --- container (format) -----------------------------------------------
     const HeaderCursor cc ← _header(corpus)
     const int header ← cc.header
     const string header_text ← cc.text
     const int data_length ← corpus.length() - 8 - header
 
-    # -- header parse + pinned extraction --------------------------------
+    # --- header parse + pinned extraction ---------------------------------
     const list<Token> tks ← _scan(header_text)
     const Structure st ← _walk(tks)
 
-    # -- metadata facts (format / version / arch / tokenizer) ------------
+    # --- metadata facts (format / version / arch / tokenizer) -------------
     const string format_name ← _metadata_require(st.meta_keys, st.meta_values, K_FORMAT_NAME)
     const string format_version ← _metadata_require(st.meta_keys, st.meta_values, K_FORMAT_VERSION)
     const string arch ← _metadata_require(st.meta_keys, st.meta_values, K_ARCH)
@@ -976,7 +984,7 @@ fn admit(list<int<u8>> corpus, string digest, string path) → capsule.Capsule �
     require _hex_ok(vocab_digest) throw variant BadDigest {message = "malformed vocabulary digest"}
     require _hex_ok(digest) throw variant BadDigest {message = "malformed digest value"}
 
-    # -- tensor table (dtype / shapes / ceilings / offsets / coverage) ---
+    # --- tensor table (dtype / shapes / ceilings / offsets / coverage) ----
     const int n ← st.names.length()
     require n ≡ EXPECTED_NAMES.length() throw variant BadArchitecture {message = "tensor count mismatch"}
     for range 0‥n const i {
@@ -1010,7 +1018,8 @@ fn admit(list<int<u8>> corpus, string digest, string path) → capsule.Capsule �
         require total_elements ≤ ELEMENT_LIMIT throw variant BadBounds {message = "total element count above ceiling"}
         descriptors.append(capsule.SafetensorsTensorDescriptor {name = name, dtype = kind, shape = shape, start = start, end = end, elements = elements})
     }
-    # pairwise overlap — intervals must not intersect (O(n²), n ≤ 16).
+
+    # --- data-region coverage (pairwise overlap + exact tiling) -----------
     for range 0‥n const i {
         for range 0‥n const j {
             if i ≠ j {
@@ -1022,15 +1031,9 @@ fn admit(list<int<u8>> corpus, string digest, string path) → capsule.Capsule �
             }
         }
     }
-    # exact tiling: non-overlapping intervals with total length == data
-    # region length within [0, data_len] cover the region exactly.
     require sum_lengths ≡ data_length throw variant BadOffset {message = "data region does not tile exactly"}
 
-    # -- capsule construction (the schema-2 admission target, C8) --------
-    # The capsule carries the pathless content identity (host-computed
-    # digest claim, form-validated above) plus the Safetensors manifest
-    # (format/version + header metadata + per-tensor descriptors). path
-    # never enters the capsule — schema 2 has no path.
+    # --- capsule construction (schema-2 admission target) -----------------
     do {
         const artifact.ContentIdentity identity ← artifact.ContentIdentity {algorithm = DIGEST_SHA256, digest = digest, length = corpus.length()}
         const capsule.SafetensorsManifest manifest ← capsule.SafetensorsManifest {format = ROW_FORMAT_NAME, version = ROW_FORMAT_VERSION, artifact_length = corpus.length(), data_length = data_length, metadata = _metadata(st.meta_keys, st.meta_values), tensors = descriptors}

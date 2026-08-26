@@ -203,20 +203,26 @@ fn _best_index(list<f32> probabilities, list<int> selected) → int {
 
 @ public
 fn route(tensor.NumericBlock x, int layer, (string, int, int) → tensor.NumericBlock ⇥ MoeError source, MoeConfig cfg) → MoeSelection ⇥ MoeError {
+    # --- config + input (fail closed) -------------------------------------
     _validate_config(cfg)
     require layer ≥ 0 throw variant BadConfig {message = "layer index must be non-negative"}
     _validate_input(x, cfg)
+
+    # --- router weights + logits (fail closed) ----------------------------
     const tensor.NumericBlock weights ← _router_weights(source, layer, cfg)
     const tensor.NumericBlock matrix ← _router_logits(weights, _column(x, cfg))
     require matrix.valid() throw variant BadShape {message = "router logits carrier is invalid"}
     require matrix.shape() ≡ ([cfg.expert_count, 1] ↦ list<int>) throw variant BadShape {message = "router logits carrier has the wrong shape"}
     require _finite_tensor(matrix) throw variant NonFinite {message = "router logits contain a non-finite value"}
 
+    # --- softmax over expert logits ---------------------------------------
     var list<f32> logits ← empty
     for range 0‥cfg.expert_count const i {
         logits.append(matrix.data.get(i) coalesce 0.0 ∷ f32)
     }
     const list<f32> probabilities ← _softmax(logits)
+
+    # --- top-k selection (lowest index on ties) ---------------------------
     var list<int> indices ← empty
     var list<f32> selected_probabilities ← empty
     var f32 selected_total ← 0.0 ∷ f32
@@ -229,6 +235,8 @@ fn route(tensor.NumericBlock x, int layer, (string, int, int) → tensor.Numeric
         selected_total ← selected_total + probability
     }
     require dtype.finite(selected_total) throw variant NonFinite {message = "router selection normalizer is non-finite"}
+
+    # --- weight normalization + construct ---------------------------------
     var f32 denominator ← ROUTER_WEIGHT_FLOOR
     if selected_total ≻ denominator {
         denominator ← selected_total
@@ -295,20 +303,27 @@ fn _flatten_row(tensor.NumericBlock row, int width) → tensor.NumericBlock ⇥ 
 
 @ public
 fn expert_out(tensor.NumericBlock x, int layer, int expert_index, (string, int, int) → tensor.NumericBlock ⇥ MoeError source, MoeConfig cfg) → tensor.NumericBlock ⇥ MoeError {
+    # --- config + input (fail closed) -------------------------------------
     _validate_config(cfg)
     require layer ≥ 0 throw variant BadConfig {message = "layer index must be non-negative"}
     require expert_index ≥ 0 and expert_index ≺ cfg.expert_count throw variant BadConfig {message = "expert index is outside the configured range"}
     _validate_input(x, cfg)
+
+    # --- expert windows (storage-order reads) -----------------------------
     const int length ← cfg.expert_ffn_length * cfg.embedding_length
     const int start ← expert_index * length
     const string prefix ← _prefix(layer)
     const tensor.NumericBlock gate_window ← _window(source, prefix + ".ffn_gate_exps", start, length, [cfg.expert_ffn_length, cfg.embedding_length])
     const tensor.NumericBlock up_window ← _window(source, prefix + ".ffn_up_exps", start, length, [cfg.expert_ffn_length, cfg.embedding_length])
     const tensor.NumericBlock down_window ← _window(source, prefix + ".ffn_down_exps", start, length, [cfg.embedding_length, cfg.expert_ffn_length])
+
+    # --- projections + SwiGLU ---------------------------------------------
     const tensor.NumericBlock x_column ← _column(x, cfg)
     const tensor.NumericBlock gate ← _row(_project(gate_window, x_column), cfg.expert_ffn_length)
     const tensor.NumericBlock up ← _row(_project(up_window, x_column), cfg.expert_ffn_length)
     const tensor.NumericBlock output_row ← _swiglu_no_bias(gate, up, _linear_weight(down_window))
+
+    # --- flatten + finite check -------------------------------------------
     const tensor.NumericBlock output ← _flatten_row(output_row, cfg.embedding_length)
     require _finite_tensor(output) throw variant NonFinite {message = "expert output contains a non-finite value"}
     return output
@@ -359,13 +374,15 @@ fn _zeros(int width, tensor.NumericBlock like) → tensor.NumericBlock {
 
 @ public
 fn ffn_moe(tensor.NumericBlock x, int layer, (string, int, int) → tensor.NumericBlock ⇥ MoeError source, MoeConfig cfg) → tensor.NumericBlock ⇥ MoeError {
+    # --- config + input (fail closed) -------------------------------------
     _validate_config(cfg)
     require layer ≥ 0 throw variant BadConfig {message = "layer index must be non-negative"}
     _validate_input(x, cfg)
+
+    # --- router selection -------------------------------------------------
     const MoeSelection selection ← route(x, layer, source, cfg)
 
-    # Shared expert: SwiGLU over the whole rank-2 windows plus a scalar
-    # sigmoid gate from the shared router row.
+    # --- shared expert (SwiGLU + sigmoid gate) ----------------------------
     const string prefix ← _prefix(layer)
     const tensor.NumericBlock x_column ← _column(x, cfg)
     const int shared_length ← cfg.shared_ffn_length * cfg.embedding_length
@@ -381,7 +398,7 @@ fn ffn_moe(tensor.NumericBlock x, int layer, (string, int, int) → tensor.Numer
     const f32 gate ← _sigmoid(_dot(x, gate_input, cfg.embedding_length))
     require dtype.finite(gate) throw variant NonFinite {message = "shared expert gate is non-finite"}
 
-    # Accumulation order: ascending expert index — deterministic across runs.
+    # --- weighted accumulation (ascending expert index) -------------------
     const list<int> selected ← selection.indices()
     var list<int> consumed ← empty
     var tensor.NumericBlock moe_out ← _zeros(cfg.embedding_length, x)
@@ -409,6 +426,7 @@ fn ffn_moe(tensor.NumericBlock x, int layer, (string, int, int) → tensor.Numer
         moe_out ← math.add_carrier(moe_out, math.mul(output, _scalar(weight)))
     }
 
+    # --- combine + fail-closed output -------------------------------------
     var tensor.NumericBlock result ← tensor.default()
     const tensor.NumericBlock gated_shared ← math.mul(shexp, _scalar(gate))
     result ← math.add_carrier(moe_out, gated_shared)
