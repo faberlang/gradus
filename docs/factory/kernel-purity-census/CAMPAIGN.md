@@ -59,7 +59,8 @@ entries vs per-geometry specialization — plus the admissions list below.
 - `gradient.fab` + `mlp.forward_mlp_loss` — frozen until the
   backward ⊕ nucleum compiler ruling exists (census F4).
 - `dense.fab` forward family — needs the resident-weight program route,
-  not purity edits.
+  not purity edits. Owned by
+  [`../dense-typed-assembly/goal.md`](../dense-typed-assembly/goal.md).
 - Numeric-core consolidation (softmax ×4, transpose ×3, exp ×5) precedes
   Wave 2 (census F2).
 
@@ -78,6 +79,6 @@ the lineage change (never silent; precedent `e5e484ec8`).
 | W0 rename `Tensor` → `NumericBlock` | done 2026-08-26 | gradus `500342d` | converter-driven, per-file check |
 | W0 stride cache | done 2026-08-26 | gradus `500342d` | 1.75× on the decode logits handoff (ruling §4.2) |
 | W0 digest re-pin | done 2026-08-26 | radix `9e5070d76` | GEA2 source lineage, identity proof attached |
-| W1 annotation/method-twin swaps | planned | — | blocked on shape-generic admission |
+| W1 annotation/method-twin swaps | done 2026-08-26 | gradus `2a1d361970` (task `ba835b45`) | gate cleared by ruling `fc7f15a2`; entries 4 + helpers 2, all zero-body-change; 2 size-generic admitted; **six import-loss sites remain KNOWN BUGS per ruling `fc7f15a2`** (library @ kernel accepted at check; device role does not cross the import boundary — fix is its own unit, now DFV2-3 in radix device-fragments-v2); stop-reported rows routed to W2/W3 (nn.silu/gelu/rmsnorm, math typed twins) |
 | W2 prefill-chain migration | planned | — | blocked on W1 + admissions |
 | W3 program composition | planned | — | blocked on W2 |
