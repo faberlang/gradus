@@ -128,7 +128,7 @@ whole package is not required for closeout.
 | Unit | Status | Receipt | Notes |
 | --- | --- | --- | --- |
 | 1 | done | `93ef4f9` | this file |
-| 2 | done | landing with this commit | `block_verify`, `shape`, `tokenizer`, `gguf`, `gguf_manifest`; bytes walks kept after `SEM010` |
+| 2 | done | `5664e3b` | `block_verify`, `shape`, `tokenizer`, `gguf`, `gguf_manifest`; bytes walks kept after `SEM010` |
 
 ## Open questions
 
