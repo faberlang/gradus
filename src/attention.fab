@@ -825,24 +825,36 @@ fn scaled_dot_product_causal_rope(tensor.NumericBlock q, tensor.NumericBlock k, 
 
 @ public
 fn multi_head_attention(tensor.NumericBlock q, tensor.NumericBlock k, tensor.NumericBlock v, tensor.NumericBlock wo, int num_heads, int num_kv_heads, f32 scale, list<int> positions, int rope_dim, RopeConfig rope_config) → tensor.NumericBlock ⇥ AttentionError {
+    # --- config + shape validation (fail closed) --------------------------
     const int d ← _validate_multi(q, k, v, wo, num_heads, num_kv_heads, positions, rope_dim)
+
+    # --- rope config + shared table ---------------------------------------
     const int ratio ← num_heads / num_kv_heads
     const f32 base ← rope_config.base()
     const f32 rope_scale ← rope_config.scale()
     const bool interposita ← _interleaved(rope_config.policy())
     const list<f32> table ← _rope_table(positions, rope_dim, base, rope_scale)
+
+    # --- per-head blocks (GQA split → RoPE → causal) ----------------------
     var list<tensor.NumericBlock> heads ← empty
     for range 0‥num_heads const h {
+        # --- GQA group + per-head split -----------------------------------
         const int g ← h / ratio
         const tensor.NumericBlock qh ← _head(q, h * d, d)
         const tensor.NumericBlock kg ← _head(k, g * d, d)
         const tensor.NumericBlock vg ← _head(v, g * d, d)
+
+        # --- RoPE rotation + causal attention -----------------------------
         const tensor.NumericBlock qr ← _rope(qh, rope_dim, table, interposita)
         const tensor.NumericBlock kr ← _rope(kg, rope_dim, table, interposita)
         const tensor.NumericBlock ctx ← _attention_core(qr, kr, vg, scale, true)
         heads.append(ctx)
     }
+
+    # --- head concatenation -----------------------------------------------
     const tensor.NumericBlock concat ← _reconcile(heads)
+
+    # --- output projection ------------------------------------------------
     return _attention_matmul(concat, wo)
 }
 
@@ -989,15 +1001,24 @@ fn _validate_cached_triplet(tensor.NumericBlock q, tensor.NumericBlock k, tensor
 
 @ public
 fn scaled_dot_product_causal_rope_cached(tensor.NumericBlock q, tensor.NumericBlock k, tensor.NumericBlock v, f32 scale, list<int> positions, int dim, kv.KVCache layer, list<int> tokens) → CachedAttention ⇥ AttentionError {
+    # --- cache + triplet + positions (fail closed) ------------------------
     const int prefix_before ← _validate_cached_triplet(q, k, v, layer, tokens)
     _validate_rope(q, positions, dim)
     _validate_absolute_positions(prefix_before, positions, q.shape().get(0) coalesce 0)
+
+    # --- rope table + q/k rotation ----------------------------------------
     const list<f32> table ← _rope_table(positions, dim, ROPE_FREQ_BASE, 1.0 ∷ f32)
     const tensor.NumericBlock qr ← _rope(q, dim, table, false)
     const tensor.NumericBlock kr ← _rope(k, dim, table, false)
+
+    # --- append new rows to the cached prefix -----------------------------
     const tensor.NumericBlock full_k ← _concat_rows(layer.key(), kr)
     const tensor.NumericBlock full_v ← _concat_rows(layer.payload(), v)
+
+    # --- causal attention (offset core) -----------------------------------
     const tensor.NumericBlock context ← _attention_core_offset(qr, full_k, full_v, scale, prefix_before)
+
+    # --- cache write + result ---------------------------------------------
     return CachedAttention {context = context, state = _write_cache(layer, tokens, kr, v)}
 }
 
@@ -1027,32 +1048,48 @@ fn _validate_cached_multi(tensor.NumericBlock q, tensor.NumericBlock k, tensor.N
 
 @ public
 fn multi_head_attention_cached(tensor.NumericBlock q, tensor.NumericBlock k, tensor.NumericBlock v, tensor.NumericBlock wo, kv.KVCache layer, int num_heads, int num_kv_heads, f32 scale, list<int> positions, int rope_dim, RopeConfig rope_config, list<int> tokens) → CachedAttention ⇥ AttentionError {
+    # --- cache + GQA validation (fail closed) -----------------------------
     const int d ← _validate_cached_multi(q, k, v, wo, layer, num_heads, num_kv_heads, positions, rope_dim, tokens)
     const int prefix_before ← layer.length()
     _validate_absolute_positions(prefix_before, positions, q.shape().get(0) coalesce 0)
+
+    # --- rope config + shared table ---------------------------------------
     const int ratio ← num_heads / num_kv_heads
     const f32 base ← rope_config.base()
     const f32 rope_scale ← rope_config.scale()
     const bool interposita ← _interleaved(rope_config.policy())
     const list<f32> table ← _rope_table(positions, rope_dim, base, rope_scale)
+
+    # --- rotate + reconcile new keys (per KV head) ------------------------
     var list<tensor.NumericBlock> new_ks ← empty
     for range 0‥num_kv_heads const g {
         const tensor.NumericBlock kg ← _head(k, g * d, d)
         new_ks.append(_rope(kg, rope_dim, table, interposita))
     }
     const tensor.NumericBlock new_k ← _reconcile(new_ks)
+
+    # --- append to the cached prefix --------------------------------------
     const tensor.NumericBlock full_k ← _concat_rows(layer.key(), new_k)
     const tensor.NumericBlock full_v ← _concat_rows(layer.payload(), v)
+
+    # --- per-head blocks (GQA split → RoPE → causal) ----------------------
     var list<tensor.NumericBlock> heads ← empty
     for range 0‥num_heads const h {
+        # --- GQA group + query split + RoPE -------------------------------
         const int group ← h / ratio
         const tensor.NumericBlock qh ← _head(q, h * d, d)
         const tensor.NumericBlock qr ← _rope(qh, rope_dim, table, interposita)
+
+        # --- cached K/V split + causal attention --------------------------
         const tensor.NumericBlock kg_all ← _head(full_k, group * d, d)
         const tensor.NumericBlock vg_all ← _head(full_v, group * d, d)
         heads.append(_attention_core_offset(qr, kg_all, vg_all, scale, prefix_before))
     }
+
+    # --- head concatenation + output projection ---------------------------
     const tensor.NumericBlock concat ← _reconcile(heads)
     const tensor.NumericBlock context ← _attention_matmul(concat, wo)
+
+    # --- cache write + result ---------------------------------------------
     return CachedAttention {context = context, state = _write_cache(layer, tokens, new_k, v)}
 }
