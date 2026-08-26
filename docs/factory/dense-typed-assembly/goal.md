@@ -1,6 +1,6 @@
 # GOAL: dense-typed-assembly — pin weights at load; typed host graph
 
-**Status**: planned — drafted-not-lowered; pre-implementation
+**Status**: active — units 1–3 landed (load + typed rmsnorm/swiglu_hidden + typed dense_block assemblers); units 4–5 open
 **Created**: 2026-08-26
 **Campaign:** `—` (standalone; complementary to `kernel-purity-census`, not a purity wave)
 **Source:** operator session 2026-08-26 — contrast of `src/model/dense.fab` vs `src/kernel.fab`; Wave 0 carrier/admissions ruling
@@ -248,9 +248,9 @@ Closeout requires all of the following:
 
 | Unit | Status | Seat | Receipt | Notes |
 | --- | --- | --- | --- | --- |
-| 1 | pending | — | — | Admit/pin + `DenseModel` |
-| 2 | pending | — | — | Typed `rmsnorm` twin; skip if Wave 1 landed it |
-| 3 | pending | — | — | Typed `dense_block` twins |
+| 1 | done | direct | `faber check .` green | `DenseModel` + `load`; bag routes unchanged. Package MIR cannot execute `dense.load<16,…>` (namespace type args) — load is check-only until unit 4 unifies sizes from tensor/model args |
+| 2 | done | direct | `faber check .` green | `@ kernel @ public rmsnorm<size T, D>` + `swiglu_hidden`; bag renamed `rmsnorm_carrier` (SEM005) |
+| 3 | done | direct | `faber check .` green; `transformer.proba` dense-block rows still pass | `dense_block_static` / `dense_block_cached_static` ordinary assemblers; attention stays bag at the QKV seam |
 | 4 | pending | — | — | Rewrite dense routes; public clean break |
 | 5 | pending | — | — | Callers, delete bag wrappers, docs |
 
@@ -278,3 +278,11 @@ Closeout requires all of the following:
    one fused-at-source mega-body and hide the split fusion is meant to
    see. Revisit only if a later program-composition form admits a kernel
    that *names* other kernels without inlining them.
+6. **Package MIR namespace type args (2026-08-26)** — `dense.load<16, 8,
+   16, 8, 16>(…)` checks and is the only way to bind `load` (no tensor
+   args to unify from). Package MIR refuses type arguments on namespace
+   calls, so proba cannot execute `load` today. Unit 4 routes must take a
+   typed tensor or `DenseModel` argument so `T`/`D`/`V` unify from values,
+   not from `foo<16, …>(…)` at a namespace call. Size params also cannot
+   be forwarded as explicit generic arguments (`_load_layer<D, Q, …>` is
+   SEM008); pins stay in the function that owns the size params.

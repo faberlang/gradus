@@ -51,6 +51,8 @@ import from "gradus:math" math
 
 import from "gradus:nn" nn
 
+import from "gradus:dtype" dtype
+
 import from "gradus:tensor" tensor
 
 # -------------------------------------------------------------------------
@@ -336,7 +338,7 @@ fn transformer_block(tensor.NumericBlock x, tensor.NumericBlock ln1_s, tensor.Nu
 
 # rmsnorm wrapper — nn.rmsnorm → TransformerError.
 fn _rmsnorm(tensor.NumericBlock x, tensor.NumericBlock s, f32 epsilon) → tensor.NumericBlock ⇥ TransformerError {
-    return nn.rmsnorm(x, s, epsilon)
+    return nn.rmsnorm_carrier(x, s, epsilon)
 }
 
 # swiglu wrapper — nn.swiglu → TransformerError.
@@ -484,4 +486,106 @@ fn dense_block_cached(tensor.NumericBlock x, list<int> positions, kv.KVCache lay
     const tensor.NumericBlock up ← _linear(ln2, mlp_weights.wu, mlp_weights.bu)
     const tensor.NumericBlock h ← _swiglu(gate, up, mlp_weights.wd, mlp_weights.bd)
     return CachedBlock {output = _add(r1, h), state = step.state()}
+}
+
+# -------------------------------------------------------------------------
+# Typed dense_block twins — ordinary assemblers over pinned tensors.
+# Attention stays on the bag seam until GQA+RoPE is typed. Runtime ints
+# are the bag-conversion geometry (T/D/Q/K/F as values).
+# -------------------------------------------------------------------------
+
+@ public
+class TypedDenseLayer<size D, size Q, size K, size F> {
+    tensor<f32, [D]> ln1
+    tensor<f32, [D, Q]> wq
+    tensor<f32, [Q]> bq
+    bool has_bq
+    tensor<f32, [D, K]> wk
+    tensor<f32, [K]> bk
+    bool has_bk
+    tensor<f32, [D, K]> wv
+    tensor<f32, [K]> bv
+    bool has_bv
+    tensor<f32, [Q, D]> wo
+    tensor<f32, [D]> ln2
+    tensor<f32, [D, F]> wg
+    tensor<f32, [D, F]> wu
+    tensor<f32, [F, D]> wd
+}
+
+@ public
+class TypedCachedBlock<size T, size D> {
+    tensor<f32, [T, D]> output
+    kv.KVCache state
+}
+
+fn _to_block<size A, size B>(tensor<f32, [A, B]> t, int a, int b) → tensor.NumericBlock {
+    return tensor.stage(dtype.f32(), [a, b], t ↦ list<f32>)
+}
+
+fn _from_block<size A, size B>(tensor.NumericBlock t) → tensor<f32, [A, B]> ⇥ TransformerError {
+    do {
+        return t.data ↦ tensor<f32, [A, B]>
+    }
+    catch conv {
+        throw variant ShapeMismatch {message = "attention context pin failed"}
+    }
+}
+
+@ public
+fn dense_block_static<size T, size D, size Q, size K, size F>(tensor<f32, [T, D]> x, list<int> positions, TypedDenseLayer<D, Q, K, F> layer, DenseAttentionConfig attention_config, f32 epsilon, int rows, int hidden, int qwidth, int kwidth) → tensor<f32, [T, D]> ⇥ TransformerError {
+    const tensor<f32, [T, D]> ln1 ← nn.rmsnorm(x, layer.ln1, epsilon)
+    const tensor<f32, [T, Q]> q0 ← ln1 · layer.wq
+    var tensor<f32, [T, Q]> qb ← q0
+    if layer.has_bq {
+        qb ← q0.added_bias(layer.bq)
+    }
+    const tensor<f32, [T, K]> k0 ← ln1 · layer.wk
+    var tensor<f32, [T, K]> kb ← k0
+    if layer.has_bk {
+        kb ← k0.added_bias(layer.bk)
+    }
+    const tensor<f32, [T, K]> v0 ← ln1 · layer.wv
+    var tensor<f32, [T, K]> vb ← v0
+    if layer.has_bv {
+        vb ← v0.added_bias(layer.bv)
+    }
+    const tensor.NumericBlock ctx_b ← _multi_attention(_to_block(qb, rows, qwidth), _to_block(kb, rows, kwidth), _to_block(vb, rows, kwidth), _to_block(layer.wo, qwidth, hidden), attention_config.num_heads, attention_config.num_kv_heads, attention_config.scale, positions, attention_config.rope_dim, attention_config.rope_config)
+    const tensor<f32, [T, D]> ctx ← _from_block(ctx_b)
+    const tensor<f32, [T, D]> r1 ← math.add(x, ctx)
+    const tensor<f32, [T, D]> ln2 ← nn.rmsnorm(r1, layer.ln2, epsilon)
+    const tensor<f32, [T, F]> gate ← ln2 · layer.wg
+    const tensor<f32, [T, F]> up ← ln2 · layer.wu
+    const tensor<f32, [T, F]> hidden_act ← nn.swiglu_hidden(gate, up)
+    const tensor<f32, [T, D]> h ← hidden_act · layer.wd
+    return math.add(r1, h)
+}
+
+@ public
+fn dense_block_cached_static<size T, size D, size Q, size K, size F>(tensor<f32, [T, D]> x, list<int> positions, kv.KVCache cache, list<int> tokens, TypedDenseLayer<D, Q, K, F> layer, DenseAttentionConfig attention_config, f32 epsilon, int rows, int hidden, int qwidth, int kwidth) → TypedCachedBlock<T, D> ⇥ TransformerError {
+    const tensor<f32, [T, D]> ln1 ← nn.rmsnorm(x, layer.ln1, epsilon)
+    const tensor<f32, [T, Q]> q0 ← ln1 · layer.wq
+    var tensor<f32, [T, Q]> qb ← q0
+    if layer.has_bq {
+        qb ← q0.added_bias(layer.bq)
+    }
+    const tensor<f32, [T, K]> k0 ← ln1 · layer.wk
+    var tensor<f32, [T, K]> kb ← k0
+    if layer.has_bk {
+        kb ← k0.added_bias(layer.bk)
+    }
+    const tensor<f32, [T, K]> v0 ← ln1 · layer.wv
+    var tensor<f32, [T, K]> vb ← v0
+    if layer.has_bv {
+        vb ← v0.added_bias(layer.bv)
+    }
+    const attention.CachedAttention step ← _multi_attention_cached(_to_block(qb, rows, qwidth), _to_block(kb, rows, kwidth), _to_block(vb, rows, kwidth), _to_block(layer.wo, qwidth, hidden), cache, attention_config.num_heads, attention_config.num_kv_heads, attention_config.scale, positions, attention_config.rope_dim, attention_config.rope_config, tokens)
+    const tensor<f32, [T, D]> ctx ← _from_block(step.context())
+    const tensor<f32, [T, D]> r1 ← math.add(x, ctx)
+    const tensor<f32, [T, D]> ln2 ← nn.rmsnorm(r1, layer.ln2, epsilon)
+    const tensor<f32, [T, F]> gate ← ln2 · layer.wg
+    const tensor<f32, [T, F]> up ← ln2 · layer.wu
+    const tensor<f32, [T, F]> hidden_act ← nn.swiglu_hidden(gate, up)
+    const tensor<f32, [T, D]> h ← hidden_act · layer.wd
+    return TypedCachedBlock {output = math.add(r1, h), state = step.state()}
 }
