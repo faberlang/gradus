@@ -75,65 +75,65 @@ fn tene_i32(list<f32> data, list<int> shape) → tensor.NumericBlock {
 }
 
 # Staged-result element reads (swallow the never-firing access errors).
-# BLOCKER (Z1, bug 7ec5e484 family): trap bodies cannot host receiver
-# method calls (r.get(...) → SEM001) — kept on do/catch until the funnel
-# is fixed. Do not convert.
+# Batch 11: converted to the staged or_default wrapper — the SEM001
+# receiver-call wall dissolved with the MIR repair (radix c18e36783), but
+# scalar-result narrowing still blocks (`outcome is f32` is SEM001 in
+# is-position; `is float` narrows to float and every f32 conversion then
+# fails SEM010/SEM016), so the trap shape cannot express the fallback.
 fn e2(tensor.NumericBlock r, int i, int j) → f32 {
-    do {
-        return r.get([i, j])
-    }
-    catch err {
-        return 0.0 ∷ f32
-    }
+    return test_util.or_default(() → f32 ⇥ tensor.TensorError ∴ r.get([i, j]), 0.0 ∷ f32)
 }
 
 # Per-function error renderers: the typed error's message on failure, "no
 # error" otherwise. The message texts are the documented error identity.
-# BLOCKER (Z1, funnel family 7ec5e484): `if outcome is <qualified type>`
-# after trap → unsupported MIR lowering "projection base that does not
-# resolve to a local value"; it would turn this running suite BLOCKED.
-# Kept on do/catch. Do not convert.
+# Batch 11: error-arm narrowing works at radix-HEAD (MIR repair c18e36783
+# "lower narrowed trap projections") — converted. The success arm is
+# runtime-dead here (every caller asserts an error row).
 fn rope_detail(tensor.NumericBlock x, list<int> positions, int dim) → string {
-    do {
+    const _ outcome ← trap {
         attention.rotary_position_embedding(x, positions, dim)
+    }
+    if outcome is tensor.NumericBlock {
         return "no error"
     }
-    catch err {
-        return err.message
-    }
+    const attention.AttentionError err ← outcome
+    return err.message
 }
 
-# BLOCKER (Z1, funnel family 7ec5e484): see rope_detail. Do not convert.
+# Batch 11: see rope_detail.
 fn sdp_detail(tensor.NumericBlock q, tensor.NumericBlock k, tensor.NumericBlock v, f32 scale) → string {
-    do {
+    const _ outcome ← trap {
         attention.scaled_dot_product(q, k, v, scale)
+    }
+    if outcome is tensor.NumericBlock {
         return "no error"
     }
-    catch err {
-        return err.message
-    }
+    const attention.AttentionError err ← outcome
+    return err.message
 }
 
-# BLOCKER (Z1, funnel family 7ec5e484): see rope_detail. Do not convert.
+# Batch 11: see rope_detail.
 fn sdp_causal_detail(tensor.NumericBlock q, tensor.NumericBlock k, tensor.NumericBlock v, f32 scale) → string {
-    do {
+    const _ outcome ← trap {
         attention.scaled_dot_product_causal(q, k, v, scale)
+    }
+    if outcome is tensor.NumericBlock {
         return "no error"
     }
-    catch err {
-        return err.message
-    }
+    const attention.AttentionError err ← outcome
+    return err.message
 }
 
-# BLOCKER (Z1, funnel family 7ec5e484): see rope_detail. Do not convert.
+# Batch 11: see rope_detail.
 fn sdp_rope_detail(tensor.NumericBlock q, tensor.NumericBlock k, tensor.NumericBlock v, f32 scale, list<int> positions, int dim) → string {
-    do {
+    const _ outcome ← trap {
         attention.scaled_dot_product_causal_rope(q, k, v, scale, positions, dim)
+    }
+    if outcome is tensor.NumericBlock {
         return "no error"
     }
-    catch err {
-        return err.message
-    }
+    const attention.AttentionError err ← outcome
+    return err.message
 }
 
 # ---- rotary_position_embedding oracle rows vs the frozen GI3 Rope recipe
@@ -382,7 +382,11 @@ test "rejects a non-f32 dtype (only the F32 row is admitted)" {
 
 test "causal attention enforces the same error contract" {
     assert sdp_causal_detail(tene([1.0, 2.0], [2]), tene([1.0, 0.0, 0.0, 1.0], [2, 2]), tene([0.0, 0.0], [2]), 1.0) ≡ "attention requires rank-2 tensors"
-    assert sdp_causal_detail(tene([1.0, 0.0, 0.0, 1.0], [2, 2]), tene([1.0, 0.0, 0.0, 1.0, 0.0, 0.0], [3, 2]), tene([0.0, 0.0], [2]), 1.0) ≡ "query, key, value must share shape"
+    # Batch 11 artifact fix: the original row passed a rank-1 v ([2]), so
+    # the rank-2 gate fired first and the pinned "share shape" expectation
+    # was unreachable (probe-evidenced at radix-HEAD). v is now a rank-2
+    # [3, 2] block so the shape-mismatch row is honest.
+    assert sdp_causal_detail(tene([1.0, 0.0, 0.0, 1.0], [2, 2]), tene([1.0, 0.0, 0.0, 1.0, 0.0, 0.0], [3, 2]), tene([0.0, 0.0, 0.0, 0.0, 0.0, 0.0], [3, 2]), 1.0) ≡ "query, key, value must share shape"
     assert sdp_causal_detail(tene_i32([1.0, 0.0, 0.0, 1.0], [2, 2]), tene_i32([1.0, 0.0, 0.0, 1.0], [2, 2]), tene_i32([0.0, 0.0], [2]), 1.0) ≡ "unsupported dtype for attention primitive"
 }
 
@@ -540,9 +544,10 @@ test "interleaved-pair leaves elements beyond dim untouched (dim 2 over width 8)
     assert trap_result_11 is void
 }
 
-# BLOCKER (Z1, funnel family 7ec5e484): `assert outcome is <qualified
-# type>` after trap hits the same unsupported MIR lowering as the
-# renderers; kept on do/catch. Do not convert.
+# PARKED (batch 11, fresh probe at radix-HEAD): test-level narrowing after
+# trap — `assert outcome is attention.AttentionError` on a trap outcome —
+# fails at runtime even on error rows, while helper-fn `if outcome is`
+# error-arm narrowing works. Kept on do/catch. Do not convert.
 test "configurable row with a non-finite base fails closed" {
     do {
         const attention.RopeConfig c0 ← attention.construct_rope_config(0.0 ∷ f32, 1.0 ∷ f32, attention.consecutive_policy())
@@ -647,7 +652,10 @@ test "MHA config (n_kv = n_h = 14, rope identity) matches the f64 reference" {
 
 # Error renderer: builds a valid consecutive-pair config, then returns the
 # typed error's message on failure, "no error" otherwise.
-# BLOCKER (Z1, funnel family 7ec5e484): see rope_detail. Do not convert.
+# PARKED (batch 11, fresh probe at radix-HEAD): a caller asserts the
+# success row ("the base config runs clean" ≡ "no error"), and the
+# NumericBlock success arm of trap narrowing still fails at runtime
+# ("missing struct field"). Kept on do/catch. Do not convert.
 fn mha_detail(tensor.NumericBlock q, tensor.NumericBlock k, tensor.NumericBlock v, tensor.NumericBlock wo, int num_heads, int num_kv_heads, f32 scale, list<int> positions, int rope_dim) → string {
     var attention.RopeConfig c ← attention.default()
     do {
@@ -843,7 +851,9 @@ test "incremental cached attention matches the last full-row position" {
 # Compile-level pin; no runtime value identity is claimed for this row.
 # -------------------------------------------------------------------------
 
-# BLOCKER (Z1, funnel family 7ec5e484): see rope_detail. Do not convert.
+# PARKED (batch 11): a caller asserts the success row (≡ "no error") and
+# the NumericBlock success arm of trap narrowing fails at runtime
+# ("missing struct field"). Kept on do/catch. Do not convert.
 fn sdp_cached_detail(tensor.NumericBlock q, tensor.NumericBlock k, tensor.NumericBlock v, f32 scale, list<int> positions, int dim, kv.KVCache layer, list<int> tokens) → string {
     do {
         attention.scaled_dot_product_causal_rope_cached(q, k, v, scale, positions, dim, layer, tokens)
@@ -854,7 +864,9 @@ fn sdp_cached_detail(tensor.NumericBlock q, tensor.NumericBlock k, tensor.Numeri
     }
 }
 
-# BLOCKER (Z1, funnel family 7ec5e484): see rope_detail. Do not convert.
+# PARKED (batch 11): a caller asserts the success row (≡ "no error") and
+# the NumericBlock success arm of trap narrowing fails at runtime
+# ("missing struct field"). Kept on do/catch. Do not convert.
 fn mha_cached_detail(tensor.NumericBlock q, tensor.NumericBlock k, tensor.NumericBlock v, tensor.NumericBlock wo, kv.KVCache layer, int num_heads, int num_kv_heads, f32 scale, list<int> positions, int rope_dim, list<int> tokens) → string {
     var attention.RopeConfig c ← attention.default()
     do {
