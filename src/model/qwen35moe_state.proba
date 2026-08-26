@@ -54,6 +54,114 @@ fn _config(int block_count, int nextn_layers) → qwen35moe.Qwen35moeConfig {
     }
 }
 
+# Mid-size row for the budget-bound linear-attention rows: same field
+# relationships as the pinned row (inner_size = gradus_temporis *
+# state_size so head_v_dim = key_dim, conv_kernel 4) at 1/16 scale.
+fn _mid_dimensions() → tuple<int, int, int, int, int, int> {
+    # embd, conv_kernel, state, group, temporis, inner
+    return tuple<int, int, int, int, int, int> [64, 4, 16, 4, 8, 128]
+}
+
+fn _mid_config() → qwen35moe.Qwen35moeConfig {
+    const qwen35moe.Qwen35moeConfig c ← _config(41, 1)
+    const tuple<int, int, int, int, int, int> d ← _mid_dimensions()
+    return qwen35moe.Qwen35moeConfig {
+        architecture = c.architecture,
+        file_type = c.file_type,
+        quantization_version = c.quantization_version,
+        block_count = c.block_count,
+        context_length = c.context_length,
+        embedding_length = d[0],
+        head_count = c.head_count,
+        head_count_kv = c.head_count_kv,
+        key_length = c.key_length,
+        value_length = c.value_length,
+        rms_norm_epsilon = c.rms_norm_epsilon,
+        freq_base = c.freq_base,
+        rope_dimension_count = c.rope_dimension_count,
+        rope_sections = c.rope_sections,
+        expert_count = c.expert_count,
+        expert_used_count = c.expert_used_count,
+        expert_ffn_length = c.expert_ffn_length,
+        shared_ffn_length = c.shared_ffn_length,
+        conv_kernel = d[1],
+        state_size = d[2],
+        group_count = d[3],
+        gradus_temporis = d[4],
+        inner_size = d[5],
+        full_attention_interval = c.full_attention_interval,
+        nextn_predict_layers = c.nextn_predict_layers,
+        tokenizer_model = c.tokenizer_model,
+        tokenizer_pre = c.tokenizer_pre,
+        token_count = c.token_count,
+        token_type_count = c.token_type_count,
+        merge_count = c.merge_count,
+        eos_token_id = c.eos_token_id,
+        padding_token_id = c.padding_token_id,
+        bos_token_id = c.bos_token_id,
+        add_bos_token = c.add_bos_token
+    }
+}
+
+fn _mid_embd() → int {
+    const tuple<int, int, int, int, int, int> d ← _mid_dimensions()
+    return d[0]
+}
+
+# Config-derived carrier shapes for the mid row (the module checks every
+# returned shape against its own expectation).
+fn _mid_carrier_shape(string name) → list<int> {
+    const tuple<int, int, int, int, int, int> d ← _mid_dimensions()
+    const int embd ← d[0]
+    const int conv_kernel ← d[1]
+    const int state ← d[2]
+    const int group ← d[3]
+    const int temporis ← d[4]
+    const int inner ← d[5]
+    const int conv_channels ← inner + 2 * group * state
+    const int head_v_dim ← inner / temporis
+    if _ends_with(name, ".attn_norm") {
+        return [embd]
+    }
+    if _ends_with(name, ".attn_qkv") {
+        return [conv_channels, embd]
+    }
+    if _ends_with(name, ".attn_gate") {
+        return [inner, embd]
+    }
+    if _ends_with(name, ".ssm_conv1d") {
+        return [conv_channels, conv_kernel]
+    }
+    if _ends_with(name, ".ssm_dt") {
+        return [temporis]
+    }
+    if _ends_with(name, ".ssm_a") {
+        return [temporis]
+    }
+    if _ends_with(name, ".ssm_beta") {
+        return [temporis, embd]
+    }
+    if _ends_with(name, ".ssm_alpha") {
+        return [temporis, embd]
+    }
+    if _ends_with(name, ".ssm_norm") {
+        return [head_v_dim]
+    }
+    if _ends_with(name, ".ssm_out") {
+        return [embd, inner]
+    }
+    return [1]
+}
+
+fn _mid_window(string name, int start, int length) → tensor.NumericBlock ⇥ state.Qwen35moeStateError {
+    do {
+        return tensor.construct(_fill(length, 7), _mid_carrier_shape(name))
+    }
+    catch err {
+        throw variant BadWindow {message = "mid-row synthetic carrier failed"}
+    }
+}
+
 fn _pinned_config() → qwen35moe.Qwen35moeConfig {
     return _config(41, 1)
 }
@@ -112,7 +220,15 @@ fn _small_config() → qwen35moe.Qwen35moeConfig {
 # exp(decay) legitimately overflows f32 — the module's loud trap is correct
 # behavior (FORK-2), and the out-of-distribution weights, not the module,
 # are the defect, so the harness keeps the gate path inside the model's
-# trained operating range.
+# trained operating range. The linear-attention executed rows run on a
+# mid-size row (`_mid_config`): at pinned dimensions one
+# `linear_attention` window costs ≈33.5M projection inner steps per token,
+# so the prefill-equivalence and replay rows exceed the runner's fixed
+# 100,000,000-step interpreter budget — a harness artifact, not module
+# behavior (the budget trap is the runner's loud guard, kept). The
+# pinned-shape executed proof lives in exempla/qwen35moe-layer-probe
+# against the llama.cpp oracle dump; the mid-size rows here prove the same
+# prefill≡incremental and replay properties of the same code paths.
 fn _fill(int count, int seed) → list<f32> {
     var list<f32> out ← empty
     var int h ← seed
@@ -411,22 +527,23 @@ test "the delta rule core matches a hand-computed 2-cell update" {
 }
 
 test "linear attention prefill equals incremental one-token steps" {
-    const qwen35moe.Qwen35moeConfig c ← _pinned_config()
-    const list<f32> rows ← _fill(3 * 2048, 11)
+    const qwen35moe.Qwen35moeConfig c ← _mid_config()
+    const int embd ← _mid_embd()
+    const list<f32> rows ← _fill(3 * embd, 11)
     do {
-    const state.LinearAttentionOutcome batch ← state.linear_attention(rows, 0, state.fresh_conv_state(c), state.fresh_recurrent_state(c), (string name, int start, int length) → tensor.NumericBlock ⇥ state.Qwen35moeStateError ∴ _synthetic_window(name, start, length), c)
+    const state.LinearAttentionOutcome batch ← state.linear_attention(rows, 0, state.fresh_conv_state(c), state.fresh_recurrent_state(c), (string name, int start, int length) → tensor.NumericBlock ⇥ state.Qwen35moeStateError ∴ _mid_window(name, start, length), c)
     var state.ConvState conv ← state.fresh_conv_state(c)
     var state.RecurrentState recurrent ← state.fresh_recurrent_state(c)
     var list<f32> outputs ← empty
     for range 0‥3 const t {
         var list<f32> one ← empty
-        for range 0‥2048 const d {
-            one.append(rows.get(t * 2048 + d) coalesce 0.0 ∷ f32)
+        for range 0‥embd const d {
+            one.append(rows.get(t * embd + d) coalesce 0.0 ∷ f32)
         }
-        const state.LinearAttentionOutcome step ← state.linear_attention_step(one, 0, conv, recurrent, (string name, int start, int length) → tensor.NumericBlock ⇥ state.Qwen35moeStateError ∴ _synthetic_window(name, start, length), c)
+        const state.LinearAttentionOutcome step ← state.linear_attention_step(one, 0, conv, recurrent, (string name, int start, int length) → tensor.NumericBlock ⇥ state.Qwen35moeStateError ∴ _mid_window(name, start, length), c)
         conv ← step.conv
         recurrent ← step.recurrent
-        for range 0‥2048 const d {
+        for range 0‥embd const d {
             outputs.append(step.out.get(d) coalesce 0.0 ∷ f32)
         }
     }
@@ -483,11 +600,12 @@ test "full attention prefill equals incremental one-token steps" {
 }
 
 test "replay is deterministic across fresh sessions" {
-    const qwen35moe.Qwen35moeConfig c ← _pinned_config()
-    const list<f32> rows ← _fill(2048, 17)
+    const qwen35moe.Qwen35moeConfig c ← _mid_config()
+    const int embd ← _mid_embd()
+    const list<f32> rows ← _fill(embd, 17)
     do {
-    const state.LinearAttentionOutcome first ← state.linear_attention_step(rows, 0, state.fresh_conv_state(c), state.fresh_recurrent_state(c), (string name, int start, int length) → tensor.NumericBlock ⇥ state.Qwen35moeStateError ∴ _synthetic_window(name, start, length), c)
-    const state.LinearAttentionOutcome second ← state.linear_attention_step(rows, 0, state.fresh_conv_state(c), state.fresh_recurrent_state(c), (string name, int start, int length) → tensor.NumericBlock ⇥ state.Qwen35moeStateError ∴ _synthetic_window(name, start, length), c)
+    const state.LinearAttentionOutcome first ← state.linear_attention_step(rows, 0, state.fresh_conv_state(c), state.fresh_recurrent_state(c), (string name, int start, int length) → tensor.NumericBlock ⇥ state.Qwen35moeStateError ∴ _mid_window(name, start, length), c)
+    const state.LinearAttentionOutcome second ← state.linear_attention_step(rows, 0, state.fresh_conv_state(c), state.fresh_recurrent_state(c), (string name, int start, int length) → tensor.NumericBlock ⇥ state.Qwen35moeStateError ∴ _mid_window(name, start, length), c)
     assert first.out ≡ second.out
     assert state.conv_equal(first.conv, second.conv)
     assert state.recurrent_equal(first.recurrent, second.recurrent)
