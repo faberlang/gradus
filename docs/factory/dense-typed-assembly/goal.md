@@ -223,7 +223,7 @@ Closeout requires all of the following:
 - `faber test src/model/dense.proba` plus the migrated consumer suites
   (`generation.proba`, `prepared_state.proba`, `block_verify.proba`) prove
   the same logit / cache contracts the current fixtures pin (tied and
-  untied, overflow, gap, `TerminusExcedit`, `BadShape`, `BadConfig`).
+  untied, overflow, gap, `IndexOutOfBounds`, `BadShape`, `BadConfig`).
 - After unit 4, `rg -n 'NumericBlock' src/model/dense.fab` hits only the
   `load` / resolver admission seam (and error-conversion arms that wrap
   load-edge failures). No `NumericBlock` in `forward` / decode signatures

@@ -29,7 +29,7 @@ locale = "en"
 # tensor (resolver throw → MissingTensor), an invalid
 # architecture config (BadConfig), a shape that contradicts the config
 # (BadShape), token ids outside the embedding vocabulary
-# (TerminusExcedit), cache overflow (Overflow), and a write that is not
+# (IndexOutOfBounds), cache overflow (Overflow), and a write that is not
 # the shared prefix length (Gap). Sub-call errors from nn / transformer /
 # tensor are mapped into BadShape preserving the documented message
 # text, except cache overflow and gap, which keep their variants.
@@ -63,7 +63,7 @@ import from "gradus:transformer" transformer
 
 # -------------------------------------------------------------------------
 # DenseConfig — the typed dense architecture config the assembly is
-# built from. `ligatum` records tied embeddings (lm_head shares the
+# built from. `tied` records tied embeddings (lm_head shares the
 # embedding tensor). No per-row constants: the head counts and dims are
 # carried here and every shape is validated against them.
 # -------------------------------------------------------------------------
@@ -138,7 +138,10 @@ union DenseError {
         return variant TensorFailure {message = err.message, inner = err}
     }
     @ conversion nn.NnError err {
-        return variant NnFailure {message = err.message, inner = err}
+        match err {
+            case nn.NnError.IndexOutOfBounds const message { return variant IndexOutOfBounds {message = message} }
+            case _ { return variant NnFailure {message = err.message, inner = err} }
+        }
     }
     @ conversion transformer.TransformerError err {
         return variant TransformerFailure {message = err.message, inner = err}
@@ -150,7 +153,7 @@ union DenseError {
     MissingTensor,
     BadConfig,
     BadShape,
-    TerminusExcedit,
+    IndexOutOfBounds,
     Overflow,
     Gap,
     TensorFailure {
@@ -207,37 +210,30 @@ fn _token_major_view(tensor.NumericBlock t) → tensor.NumericBlock ⇥ DenseErr
     return tensor.construct(t.data, [vocab, hidden])
 }
 
-# Rank-2 transpose [rows, cols] → [cols, rows] (math has no transpose; a
-# TIED lm_head needs the true row-major [D, V] from the token-major view).
+# Rank-2 transpose [rows, cols] → [cols, rows]. A TIED lm_head needs the
+# true row-major [D, V] from the token-major view. Typed routes use
+# `.transpose()`; a bag cannot pin runtime [rows, cols] (SEM014).
 fn _transpose(tensor.NumericBlock t) → tensor.NumericBlock ⇥ DenseError {
-    const list<int> f ← t.shape()
-    require f.length() ≡ 2 throw variant BadShape {message = "embedding must be rank 2"}
-    const int rows ← f.get(0) coalesce 1
-    const int cols ← f.get(1) coalesce 1
-    var list<f32> out ← empty
-    for range 0‥cols const j {
-        for range 0‥rows const i {
-            out.append(t.data.get(i * cols + j) coalesce 0.0 ∷ f32)
-        }
-    }
-    return tensor.construct(out, [cols, rows])
+    return nn.transpose_carrier(t)
 }
 
 # Embedding gather: token-major embed [V, D] → rows for the token ids.
 fn _collect(tensor.NumericBlock embed, list<int> tokens) → tensor.NumericBlock ⇥ DenseError {
-    const list<int> fe ← embed.shape()
-    require fe.length() ≡ 2 throw variant BadShape {message = "embedding must be rank 2"}
-    const int v ← fe.get(0) coalesce 1
-    const int d ← fe.get(1) coalesce 1
-    var list<f32> out ← empty
-    for from tokens const tok {
-        require not (tok ≺ 0 or tok ≥ v) throw variant TerminusExcedit {message = "token id out of range for the embedding"}
-        for range 0‥d const j {
-            out.append(embed.data.get(tok * d + j) coalesce 0.0 ∷ f32)
-        }
-    }
-    const list<int> ft ← [tokens.length(), d]
-    return tensor.construct(out, ft)
+    return nn.gather_carrier(embed, tokens)
+}
+
+# Typed REF-01 pins over the carrier. A size-generic pin is SEM016
+# (`↦ tensor<f32, [T, D]>` on ⇥ DenseError). Concrete shapes pin.
+fn gather(tensor<f32, [8, 16]> table, list<int> ids) → tensor<f32, [2, 16]> ⇥ DenseError {
+    const tensor.NumericBlock bag ← tensor.construct(table ↦ list<f32>, [8, 16])
+    const tensor.NumericBlock out ← nn.gather_carrier(bag, ids)
+    return _pin_same(out, "gather")
+}
+
+fn gather_step(tensor<f32, [8, 16]> table, int token_id) → tensor<f32, [1, 16]> ⇥ DenseError {
+    const tensor.NumericBlock bag ← tensor.construct(table ↦ list<f32>, [8, 16])
+    const tensor.NumericBlock out ← nn.gather_carrier(bag, [token_id])
+    return _pin_same(out, "gather")
 }
 
 # Absent bias: rank-0 empty carrier. nn.linear_carrier treats this as
@@ -418,15 +414,22 @@ fn _probe_bias((string, int) → tensor.NumericBlock ⇥ DenseError source, stri
 # unify (size params cannot be forwarded as explicit generic arguments).
 @ public
 fn load<size D, size V, size Q, size K, size F>(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ DenseError source) → DenseModel<D, V, Q, K, F> ⇥ DenseError {
+    # --- config (fail closed) ---------------------------------------------
     _require_cfg(cfg)
     const int qwidth ← cfg.heads * cfg.head_dim
     const int kwidth ← cfg.kv_heads * cfg.head_dim
+
+    # --- embed pin --------------------------------------------------------
     const tensor.NumericBlock embed_b ← source("model.embed_tokens", 0)
     const tensor<f32, [D, V]> embed ← _pin_rank2(embed_b, "model.embed_tokens", [cfg.hidden_dim, cfg.vocab])
     const tensor<f32, [V, D]> embed_tokens ← _pin_same(embed_b, "model.embed_tokens")
+
+    # --- per-layer pins ---------------------------------------------------
     var list<DenseLayer<D, Q, K, F>> layers ← empty
     for range 0‥cfg.layers const layer {
         const string prefix ← "model.layers.§"(layer ↦ string)
+
+        # --- resolve stored weights ---------------------------------------
         const tensor.NumericBlock ln1_s ← source(prefix + ".input_layernorm", layer)
         const tensor.NumericBlock wq ← source(prefix + ".self_attn.q_proj", layer)
         const tensor.NumericBlock wk ← source(prefix + ".self_attn.k_proj", layer)
@@ -436,6 +439,8 @@ fn load<size D, size V, size Q, size K, size F>(DenseConfig cfg, (string, int) �
         const tensor.NumericBlock wg ← source(prefix + ".mlp.gate_proj", layer)
         const tensor.NumericBlock wu ← source(prefix + ".mlp.up_proj", layer)
         const tensor.NumericBlock wd ← source(prefix + ".mlp.down_proj", layer)
+
+        # --- pin against cfg ----------------------------------------------
         const tensor<f32, [D]> ln1 ← _pin_rank1(ln1_s, prefix + ".input_layernorm", [cfg.hidden_dim])
         const tensor<f32, [D, Q]> wq_t ← _pin_rank2(wq, prefix + ".self_attn.q_proj", [cfg.hidden_dim, qwidth])
         const tensor<f32, [D, K]> wk_t ← _pin_rank2(wk, prefix + ".self_attn.k_proj", [cfg.hidden_dim, kwidth])
@@ -448,14 +453,20 @@ fn load<size D, size V, size Q, size K, size F>(DenseConfig cfg, (string, int) �
         const tensor<f32, [D, F]> wg_t ← _pin_rank2(wg, prefix + ".mlp.gate_proj", [cfg.hidden_dim, f])
         const tensor<f32, [D, F]> wu_t ← _pin_rank2(wu, prefix + ".mlp.up_proj", [cfg.hidden_dim, f])
         const tensor<f32, [F, D]> wd_t ← _pin_rank2(wd, prefix + ".mlp.down_proj", [f, cfg.hidden_dim])
+
+        # --- optional Q/K/V bias ------------------------------------------
         const BiasBag bq_bag ← _probe_bias(source, prefix + ".self_attn.q_proj.bias", layer, qwidth)
         const tensor<f32, [Q]> bq ← _pin_same_rank1(bq_bag.value, prefix + ".self_attn.q_proj.bias")
         const BiasBag bk_bag ← _probe_bias(source, prefix + ".self_attn.k_proj.bias", layer, kwidth)
         const tensor<f32, [K]> bk ← _pin_same_rank1(bk_bag.value, prefix + ".self_attn.k_proj.bias")
         const BiasBag bv_bag ← _probe_bias(source, prefix + ".self_attn.v_proj.bias", layer, kwidth)
         const tensor<f32, [K]> bv ← _pin_same_rank1(bv_bag.value, prefix + ".self_attn.v_proj.bias")
+
+        # --- append layer -------------------------------------------------
         layers.append(DenseLayer {ln1 = ln1, wq = wq_t, bq = bq, has_bq = bq_bag.present, wk = wk_t, bk = bk, has_bk = bk_bag.present, wv = wv_t, bv = bv, has_bv = bv_bag.present, wo = wo_t, ln2 = ln2, wg = wg_t, wu = wu_t, wd = wd_t})
     }
+
+    # --- final norm + lm_head ---------------------------------------------
     const tensor.NumericBlock norm_b ← source("model.norm", 0)
     const tensor<f32, [D]> norm ← _pin_rank1(norm_b, "model.norm", [cfg.hidden_dim])
     var tensor<f32, [D, V]> w_head ← embed_tokens.transpose()
@@ -463,6 +474,8 @@ fn load<size D, size V, size Q, size K, size F>(DenseConfig cfg, (string, int) �
         const tensor.NumericBlock head_b ← source("lm_head", 0)
         w_head ← _pin_rank2(head_b, "lm_head", [cfg.hidden_dim, cfg.vocab])
     }
+
+    # --- construct model --------------------------------------------------
     return DenseModel {cfg = cfg, embed = embed, embed_tokens = embed_tokens, norm = norm, w_head = w_head, layers = layers}
 }
 
@@ -480,7 +493,7 @@ fn probe_load_layer_count(DenseConfig cfg, (string, int) → tensor.NumericBlock
 @ public
 fn probe_layer_rms_len(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ DenseError source, list<int> tokens, f32 epsilon) → int ⇥ DenseError {
     const DenseModel<16, 8, 16, 8, 16> model ← load<16, 8, 16, 8, 16>(cfg, source)
-    var tensor<f32, [2, 16]> h ← gather_ref01(model.embed_tokens, tokens)
+    var tensor<f32, [2, 16]> h ← gather(model.embed_tokens, tokens)
     for from model.layers const layer {
         h ← h.rms_norm(1, epsilon, layer.ln1)
     }
@@ -515,35 +528,25 @@ class DenseModelRef01 {
     list<transformer.Ref01Layer> layers
 }
 
-fn gather_ref01(tensor<f32, [8, 16]> embed, list<int> tokens) → tensor<f32, [2, 16]> ⇥ DenseError {
-    var list<f32> out ← empty
-    const list<f32> data ← embed ↦ list<f32>
-    for from tokens const tok {
-        require not (tok ≺ 0 or tok ≥ 8) throw variant TerminusExcedit {message = "token id out of range for the embedding"}
-        for range 0‥16 const j {
-            out.append(data.get(tok * 16 + j) coalesce 0.0 ∷ f32)
-        }
-    }
-    do {
-        return out ↦ tensor<f32, [2, 16]>
-    }
-    catch conv {
-        throw variant BadShape {message = "gather pin failed"}
-    }
-}
-
 @ public
 fn load_ref01(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ DenseError source) → DenseModelRef01 ⇥ DenseError {
+    # --- config + REF-01 shape (fail closed) ------------------------------
     _require_cfg(cfg)
     require cfg.hidden_dim ≡ 16 throw variant BadConfig {message = "REF-01 load requires hidden_dim 16"}
     require cfg.vocab ≡ 8 throw variant BadConfig {message = "REF-01 load requires vocab 8"}
     require cfg.heads * cfg.head_dim ≡ 16 throw variant BadConfig {message = "REF-01 load requires Q width 16"}
     require cfg.kv_heads * cfg.head_dim ≡ 8 throw variant BadConfig {message = "REF-01 load requires K width 8"}
+
+    # --- embed ------------------------------------------------------------
     const tensor.NumericBlock embed_b ← source("model.embed_tokens", 0)
     _shape(embed_b, "model.embed_tokens", [cfg.hidden_dim, cfg.vocab])
+
+    # --- per-layer pins ---------------------------------------------------
     var list<transformer.Ref01Layer> layers ← empty
     for range 0‥cfg.layers const layer {
         const string prefix ← "model.layers.§"(layer ↦ string)
+
+        # --- resolve stored weights ---------------------------------------
         const tensor.NumericBlock ln1_s ← source(prefix + ".input_layernorm", layer)
         const tensor.NumericBlock wq ← source(prefix + ".self_attn.q_proj", layer)
         const tensor.NumericBlock wk ← source(prefix + ".self_attn.k_proj", layer)
@@ -553,6 +556,8 @@ fn load_ref01(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ DenseEr
         const tensor.NumericBlock wg ← source(prefix + ".mlp.gate_proj", layer)
         const tensor.NumericBlock wu ← source(prefix + ".mlp.up_proj", layer)
         const tensor.NumericBlock wd ← source(prefix + ".mlp.down_proj", layer)
+
+        # --- shape contract against cfg -----------------------------------
         _shape(ln1_s, prefix + ".input_layernorm", [cfg.hidden_dim])
         _shape(wq, prefix + ".self_attn.q_proj", [cfg.hidden_dim, 16])
         _shape(wk, prefix + ".self_attn.k_proj", [cfg.hidden_dim, 8])
@@ -562,9 +567,13 @@ fn load_ref01(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ DenseEr
         _shape(wg, prefix + ".mlp.gate_proj", [cfg.hidden_dim, 16])
         _shape(wu, prefix + ".mlp.up_proj", [cfg.hidden_dim, 16])
         _shape(wd, prefix + ".mlp.down_proj", [16, cfg.hidden_dim])
+
+        # --- optional Q/K/V bias ------------------------------------------
         const BiasBag bq_bag ← _probe_bias(source, prefix + ".self_attn.q_proj.bias", layer, 16)
         const BiasBag bk_bag ← _probe_bias(source, prefix + ".self_attn.k_proj.bias", layer, 8)
         const BiasBag bv_bag ← _probe_bias(source, prefix + ".self_attn.v_proj.bias", layer, 8)
+
+        # --- pin and append layer -----------------------------------------
         do {
             const tensor<f32, [16]> ln1 ← ln1_s.data ↦ tensor<f32, [16]>
             const tensor<f32, [16, 16]> wq_t ← wq.data ↦ tensor<f32, [16, 16]>
@@ -584,6 +593,8 @@ fn load_ref01(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ DenseEr
             throw variant BadShape {message = "canonical tensor § pin failed"(prefix)}
         }
     }
+
+    # --- final norm + lm_head ---------------------------------------------
     const tensor.NumericBlock norm_b ← source("model.norm", 0)
     _shape(norm_b, "model.norm", [cfg.hidden_dim])
     var tensor.NumericBlock head_b ← embed_b
@@ -591,6 +602,8 @@ fn load_ref01(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ DenseEr
         head_b ← source("lm_head", 0)
         _shape(head_b, "lm_head", [cfg.hidden_dim, cfg.vocab])
     }
+
+    # --- construct model --------------------------------------------------
     do {
         const tensor<f32, [16, 8]> embed ← embed_b.data ↦ tensor<f32, [16, 8]>
         const tensor<f32, [8, 16]> embed_tokens ← embed_b.data ↦ tensor<f32, [8, 16]>
@@ -608,46 +621,43 @@ fn load_ref01(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ DenseEr
 
 @ public
 fn forward_ref01(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ DenseError source, list<int> tokens, f32 epsilon, f32 scale, list<int> positions, int rope_dim, attention.RopeConfig rope_cfg) → tensor.NumericBlock ⇥ DenseError {
+    # --- sequence (fail closed) -------------------------------------------
     require tokens.length() ≡ 2 throw variant BadConfig {message = "token sequence must be non-empty"}
     require positions.length() ≡ 2 throw variant BadConfig {message = "positions must match the token count"}
+
+    # --- load + embed gather ----------------------------------------------
     const DenseModelRef01 model ← load_ref01(cfg, source)
-    const tensor<f32, [2, 16]> x ← gather_ref01(model.embed_tokens, tokens)
+    const tensor<f32, [2, 16]> x ← gather(model.embed_tokens, tokens)
     const transformer.DenseAttentionConfig attention_config ← transformer.DenseAttentionConfig {num_heads = model.cfg.heads, num_kv_heads = model.cfg.kv_heads, scale = scale, rope_dim = rope_dim, rope_config = rope_cfg}
+
+    # --- per-layer blocks -------------------------------------------------
     var tensor<f32, [2, 16]> h ← x
     for from model.layers const layer {
         h ← transformer.dense_block_ref01(h, positions, layer, attention_config, epsilon)
     }
+
+    # --- final RMSNorm + output projection --------------------------------
     const tensor<f32, [2, 16]> hn ← h.rms_norm(1, epsilon, model.norm)
     const tensor<f32, [2, 8]> y ← hn · model.w_head
     return tensor.construct(y ↦ list<f32>, [2, 8])
 }
 
-fn gather_step_ref01(tensor<f32, [8, 16]> embed, int token_id) → tensor<f32, [1, 16]> ⇥ DenseError {
-    require not (token_id ≺ 0 or token_id ≥ 8) throw variant TerminusExcedit {message = "token id out of range for the embedding"}
-    var list<f32> out ← empty
-    const list<f32> data ← embed ↦ list<f32>
-    for range 0‥16 const j {
-        out.append(data.get(token_id * 16 + j) coalesce 0.0 ∷ f32)
-    }
-    do {
-        return out ↦ tensor<f32, [1, 16]>
-    }
-    catch conv {
-        throw variant BadShape {message = "gather pin failed"}
-    }
-}
-
 @ public
 fn decode_step_ref01(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ DenseError source, int token_id, int position, f32 epsilon, f32 scale, int rope_dim, attention.RopeConfig rope_cfg, list<kv.KVCache> layers) → DenseStep ⇥ DenseError {
+    # --- cache + token (fail closed) --------------------------------------
     require layers.length() ≡ cfg.layers throw variant BadConfig {message = "cache layer count must equal the model layer count"}
-    require not (token_id ≺ 0 or token_id ≥ cfg.vocab) throw variant TerminusExcedit {message = "token id out of range for the embedding"}
+    require not (token_id ≺ 0 or token_id ≥ cfg.vocab) throw variant IndexOutOfBounds {message = "token id out of range for the embedding"}
     require position ≥ 0 throw variant BadConfig {message = "position must be non-negative"}
     const int prefix_before ← _shared_prefix(layers)
     require position ≡ prefix_before throw variant Gap {message = "position must equal the cache length"}
     _admit_cached(layers, 1)
+
+    # --- load + embed gather ----------------------------------------------
     const DenseModelRef01 model ← load_ref01(cfg, source)
-    const tensor<f32, [1, 16]> x ← gather_step_ref01(model.embed_tokens, token_id)
+    const tensor<f32, [1, 16]> x ← gather_step(model.embed_tokens, token_id)
     const transformer.DenseAttentionConfig attention_config ← transformer.DenseAttentionConfig {num_heads = model.cfg.heads, num_kv_heads = model.cfg.kv_heads, scale = scale, rope_dim = rope_dim, rope_config = rope_cfg}
+
+    # --- per-layer cached blocks ------------------------------------------
     var tensor<f32, [1, 16]> h ← x
     var list<kv.KVCache> next ← empty
     var int i ← 0
@@ -658,6 +668,8 @@ fn decode_step_ref01(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ 
         next.append(block.state)
         i ← i + 1
     }
+
+    # --- final RMSNorm + output projection --------------------------------
     const tensor<f32, [1, 16]> hn ← h.rms_norm(1, epsilon, model.norm)
     const tensor<f32, [1, 8]> y ← hn · model.w_head
     return DenseStep {logits = tensor.construct(y ↦ list<f32>, [1, 8]), layers = next}
@@ -665,14 +677,19 @@ fn decode_step_ref01(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ 
 
 @ public
 fn prefill_ref01(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ DenseError source, list<int> tokens, f32 epsilon, f32 scale, int rope_dim, attention.RopeConfig rope_cfg, list<kv.KVCache> layers) → DenseStep ⇥ DenseError {
+    # --- cache + sequence (fail closed) -----------------------------------
     require tokens.length() ≡ 2 throw variant BadConfig {message = "token sequence must be non-empty"}
     require layers.length() ≡ cfg.layers throw variant BadConfig {message = "cache layer count must equal the model layer count"}
     const int prefix_before ← _shared_prefix(layers)
     require prefix_before ≡ 0 throw variant Gap {message = "cache write leaves a gap"}
     _admit_cached(layers, 2)
+
+    # --- load + embed gather ----------------------------------------------
     const DenseModelRef01 model ← load_ref01(cfg, source)
-    const tensor<f32, [2, 16]> x ← gather_ref01(model.embed_tokens, tokens)
+    const tensor<f32, [2, 16]> x ← gather(model.embed_tokens, tokens)
     const transformer.DenseAttentionConfig attention_config ← transformer.DenseAttentionConfig {num_heads = model.cfg.heads, num_kv_heads = model.cfg.kv_heads, scale = scale, rope_dim = rope_dim, rope_config = rope_cfg}
+
+    # --- per-layer cached blocks ------------------------------------------
     var tensor<f32, [2, 16]> h ← x
     var list<kv.KVCache> next ← empty
     var int i ← 0
@@ -683,6 +700,8 @@ fn prefill_ref01(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ Dens
         next.append(block.state)
         i ← i + 1
     }
+
+    # --- final RMSNorm + output projection --------------------------------
     const tensor<f32, [2, 16]> hn ← h.rms_norm(1, epsilon, model.norm)
     const tensor<f32, [2, 8]> y ← hn · model.w_head
     return DenseStep {logits = tensor.construct(y ↦ list<f32>, [2, 8]), layers = next}
@@ -708,6 +727,7 @@ fn prefill_ref01(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ Dens
 
 @ public
 fn forward(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ DenseError source, list<int> tokens, f32 epsilon, f32 scale, list<int> positions, int rope_dim, attention.RopeConfig rope_cfg) → tensor.NumericBlock ⇥ DenseError {
+    # --- config + sequence (fail closed) ----------------------------------
     require cfg.layers ≥ 1 throw variant BadConfig {message = "layer count must be at least 1"}
     require cfg.heads ≥ 1 throw variant BadConfig {message = "head count must be at least 1"}
     require not (cfg.kv_heads ≺ 1 or cfg.kv_heads ≻ cfg.heads) throw variant BadConfig {message = "KV head count must be between 1 and the head count"}
@@ -718,27 +738,20 @@ fn forward(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ DenseError
     require tokens.length() ≥ 1 throw variant BadConfig {message = "token sequence must be non-empty"}
     require positions.length() ≡ tokens.length() throw variant BadConfig {message = "positions must match the token count"}
 
-    # Embedding: the resolver returns the stored [D, V] GGUF/A1b descriptor
-    # (ggml dim0 = D innermost). The buffer is already token-major — gather
-    # at [token * D + d], no data transpose. A TIED lm_head later transposes
-    # this view into true row-major [D, V] for the output linear.
+    # --- embed gather (token-major view; tied head transposes later) ------
     const tensor.NumericBlock embed ← source("model.embed_tokens", 0)
     _shape(embed, "model.embed_tokens", [cfg.hidden_dim, cfg.vocab])
     const tensor.NumericBlock embed_v ← _token_major_view(embed)
     const tensor.NumericBlock x ← _collect(embed_v, tokens)
 
-    # N ordered U1.5 blocks. Every weight is resolved by its canonical name
-    # at the current layer index; every shape is validated against the
-    # config (the MLP hidden width derives from the gate/up width at
-    # runtime). Q/K/V bias is optional: present Qwen2 tensors stay
-    # per-channel [N] and are added after the linear (before RoPE for
-    # q/k, before cache-write for v). A resolver miss keeps the U1.8
-    # absent-bias contract (no add). MLP / output biases stay absent.
+    # --- per-layer blocks -------------------------------------------------
     const int qwidth ← cfg.heads * cfg.head_dim
     const int kwidth ← cfg.kv_heads * cfg.head_dim
     var tensor.NumericBlock h ← x
     for range 0‥cfg.layers const layer {
         const string prefix ← "model.layers.§"(layer ↦ string)
+
+        # --- resolve stored weights ---------------------------------------
         const tensor.NumericBlock ln1_s ← source(prefix + ".input_layernorm", layer)
         const tensor.NumericBlock wq ← source(prefix + ".self_attn.q_proj", layer)
         const tensor.NumericBlock wk ← source(prefix + ".self_attn.k_proj", layer)
@@ -748,6 +761,8 @@ fn forward(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ DenseError
         const tensor.NumericBlock wg ← source(prefix + ".mlp.gate_proj", layer)
         const tensor.NumericBlock wu ← source(prefix + ".mlp.up_proj", layer)
         const tensor.NumericBlock wd ← source(prefix + ".mlp.down_proj", layer)
+
+        # --- shape contract against cfg -----------------------------------
         _shape(ln1_s, prefix + ".input_layernorm", [cfg.hidden_dim])
         _shape(wq, prefix + ".self_attn.q_proj", [cfg.hidden_dim, qwidth])
         _shape(wk, prefix + ".self_attn.k_proj", [cfg.hidden_dim, kwidth])
@@ -759,12 +774,16 @@ fn forward(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ DenseError
         const int f ← fwg.get(1) coalesce 1
         _shape(wu, prefix + ".mlp.up_proj", [cfg.hidden_dim, f])
         _shape(wd, prefix + ".mlp.down_proj", [f, cfg.hidden_dim])
+
+        # --- optional Q/K/V bias (MLP / output stay absent) ---------------
         const tensor.NumericBlock bq ← _attn_bias(source, prefix + ".self_attn.q_proj.bias", layer, h, wq)
         const tensor.NumericBlock bk ← _attn_bias(source, prefix + ".self_attn.k_proj.bias", layer, h, wk)
         const tensor.NumericBlock bv ← _attn_bias(source, prefix + ".self_attn.v_proj.bias", layer, h, wv)
         const tensor.NumericBlock bg ← _no_bias()
         const tensor.NumericBlock bu ← _no_bias()
         const tensor.NumericBlock bd ← _no_bias()
+
+        # --- pack and apply the block -------------------------------------
         const transformer.DenseAttentionWeights attention_weights ← transformer.DenseAttentionWeights {wq = wq, bq = bq, wk = wk, bk = bk, wv = wv, bv = bv, wo = wo}
         const transformer.DenseAttentionConfig attention_config ← transformer.DenseAttentionConfig {num_heads = cfg.heads, num_kv_heads = cfg.kv_heads, scale = scale, rope_dim = rope_dim, rope_config = rope_cfg}
         const transformer.DenseMlpWeights mlp_weights ← transformer.DenseMlpWeights {wg = wg, bg = bg, wu = wu, bu = bu, wd = wd, bd = bd}
@@ -772,14 +791,12 @@ fn forward(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ DenseError
         h ← _block(h, positions, attention_weights, attention_config, mlp_weights, norm_config)
     }
 
-    # Final RMSNorm.
+    # --- final RMSNorm ----------------------------------------------------
     const tensor.NumericBlock norm_s ← source("model.norm", 0)
     _shape(norm_s, "model.norm", [cfg.hidden_dim])
     const tensor.NumericBlock hn ← _rmsnorm(h, norm_s, epsilon)
 
-    # Output projection. A TIED lm_head transposes the token-major embed
-    # view into true row-major [D, V] (the linear [in, out] layout); an
-    # UNTIED row resolves lm_head as its own canonical tensor.
+    # --- output projection (tied transpose / untied lm_head) --------------
     var tensor.NumericBlock w_head ← _transpose(embed_v)
     if not cfg.tied {
         w_head ← source("lm_head", 0)
@@ -825,6 +842,7 @@ fn empty_caches(kv.KVStructure structure, string model, string model_version, st
 
 @ public
 fn decode_step(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ DenseError source, int token_id, int position, f32 epsilon, f32 scale, int rope_dim, attention.RopeConfig rope_cfg, list<kv.KVCache> layers) → DenseStep ⇥ DenseError {
+    # --- config + cache (fail closed) -------------------------------------
     require cfg.layers ≥ 1 throw variant BadConfig {message = "layer count must be at least 1"}
     require cfg.heads ≥ 1 throw variant BadConfig {message = "head count must be at least 1"}
     require not (cfg.kv_heads ≺ 1 or cfg.kv_heads ≻ cfg.heads) throw variant BadConfig {message = "KV head count must be between 1 and the head count"}
@@ -832,18 +850,20 @@ fn decode_step(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ DenseE
     require cfg.head_dim ≥ 1 throw variant BadConfig {message = "head dim must be at least 1"}
     require cfg.hidden_dim ≥ 1 throw variant BadConfig {message = "hidden dim must be at least 1"}
     require cfg.vocab ≥ 1 throw variant BadConfig {message = "vocabulary size must be at least 1"}
-    require not (token_id ≺ 0 or token_id ≥ cfg.vocab) throw variant TerminusExcedit {message = "token id out of range for the embedding"}
+    require not (token_id ≺ 0 or token_id ≥ cfg.vocab) throw variant IndexOutOfBounds {message = "token id out of range for the embedding"}
     require position ≥ 0 throw variant BadConfig {message = "position must be non-negative"}
     require layers.length() ≡ cfg.layers throw variant BadConfig {message = "cache layer count must equal the model layer count"}
     const int prefix_before ← _shared_prefix(layers)
     require position ≡ prefix_before throw variant Gap {message = "position must equal the cache length"}
     _admit_cached(layers, 1)
 
+    # --- embed gather -----------------------------------------------------
     const tensor.NumericBlock embed ← source("model.embed_tokens", 0)
     _shape(embed, "model.embed_tokens", [cfg.hidden_dim, cfg.vocab])
     const tensor.NumericBlock embed_v ← _token_major_view(embed)
     const tensor.NumericBlock x ← _collect(embed_v, [token_id])
 
+    # --- per-layer cached blocks ------------------------------------------
     const int qwidth ← cfg.heads * cfg.head_dim
     const int kwidth ← cfg.kv_heads * cfg.head_dim
     const list<int> positions ← [position]
@@ -852,6 +872,8 @@ fn decode_step(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ DenseE
     var list<kv.KVCache> next ← empty
     for range 0‥cfg.layers const layer {
         const string prefix ← "model.layers.§"(layer ↦ string)
+
+        # --- resolve stored weights ---------------------------------------
         const tensor.NumericBlock ln1_s ← source(prefix + ".input_layernorm", layer)
         const tensor.NumericBlock wq ← source(prefix + ".self_attn.q_proj", layer)
         const tensor.NumericBlock wk ← source(prefix + ".self_attn.k_proj", layer)
@@ -861,6 +883,8 @@ fn decode_step(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ DenseE
         const tensor.NumericBlock wg ← source(prefix + ".mlp.gate_proj", layer)
         const tensor.NumericBlock wu ← source(prefix + ".mlp.up_proj", layer)
         const tensor.NumericBlock wd ← source(prefix + ".mlp.down_proj", layer)
+
+        # --- shape contract against cfg -----------------------------------
         _shape(ln1_s, prefix + ".input_layernorm", [cfg.hidden_dim])
         _shape(wq, prefix + ".self_attn.q_proj", [cfg.hidden_dim, qwidth])
         _shape(wk, prefix + ".self_attn.k_proj", [cfg.hidden_dim, kwidth])
@@ -872,12 +896,16 @@ fn decode_step(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ DenseE
         const int f ← fwg.get(1) coalesce 1
         _shape(wu, prefix + ".mlp.up_proj", [cfg.hidden_dim, f])
         _shape(wd, prefix + ".mlp.down_proj", [f, cfg.hidden_dim])
+
+        # --- optional Q/K/V bias (MLP / output stay absent) ---------------
         const tensor.NumericBlock bq ← _attn_bias(source, prefix + ".self_attn.q_proj.bias", layer, h, wq)
         const tensor.NumericBlock bk ← _attn_bias(source, prefix + ".self_attn.k_proj.bias", layer, h, wk)
         const tensor.NumericBlock bv ← _attn_bias(source, prefix + ".self_attn.v_proj.bias", layer, h, wv)
         const tensor.NumericBlock bg ← _no_bias()
         const tensor.NumericBlock bu ← _no_bias()
         const tensor.NumericBlock bd ← _no_bias()
+
+        # --- pack and apply the cached block ------------------------------
         const kv.KVCache cache ← layers.get(layer) coalesce kv.default()
         const transformer.DenseAttentionWeights attention_weights ← transformer.DenseAttentionWeights {wq = wq, bq = bq, wk = wk, bk = bk, wv = wv, bv = bv, wo = wo}
         const transformer.DenseAttentionConfig attention_config ← transformer.DenseAttentionConfig {num_heads = cfg.heads, num_kv_heads = cfg.kv_heads, scale = scale, rope_dim = rope_dim, rope_config = rope_cfg}
@@ -888,9 +916,12 @@ fn decode_step(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ DenseE
         next.append(block.state())
     }
 
+    # --- final RMSNorm ----------------------------------------------------
     const tensor.NumericBlock norm_s ← source("model.norm", 0)
     _shape(norm_s, "model.norm", [cfg.hidden_dim])
     const tensor.NumericBlock hn ← _rmsnorm(h, norm_s, epsilon)
+
+    # --- output projection (tied transpose / untied lm_head) --------------
     var tensor.NumericBlock w_head ← _transpose(embed_v)
     if not cfg.tied {
         w_head ← source("lm_head", 0)
@@ -912,6 +943,7 @@ fn decode_step(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ DenseE
 
 @ public
 fn decode_block(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ DenseError source, list<int> tokens, f32 epsilon, f32 scale, int rope_dim, attention.RopeConfig rope_cfg, list<kv.KVCache> layers) → DenseStep ⇥ DenseError {
+    # --- config + cache (fail closed) -------------------------------------
     require cfg.layers ≥ 1 throw variant BadConfig {message = "layer count must be at least 1"}
     require cfg.heads ≥ 1 throw variant BadConfig {message = "head count must be at least 1"}
     require not (cfg.kv_heads ≺ 1 or cfg.kv_heads ≻ cfg.heads) throw variant BadConfig {message = "KV head count must be between 1 and the head count"}
@@ -922,17 +954,19 @@ fn decode_block(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ Dense
     require tokens.length() ≥ 1 throw variant BadConfig {message = "token sequence must be non-empty"}
     require layers.length() ≡ cfg.layers throw variant BadConfig {message = "cache layer count must equal the model layer count"}
     for from tokens const token_id {
-        require not (token_id ≺ 0 or token_id ≥ cfg.vocab) throw variant TerminusExcedit {message = "token id out of range for the embedding"}
+        require not (token_id ≺ 0 or token_id ≥ cfg.vocab) throw variant IndexOutOfBounds {message = "token id out of range for the embedding"}
     }
     const int prefix_before ← _shared_prefix(layers)
     require prefix_before ≥ 1 throw variant Gap {message = "cache write leaves a gap"}
     _admit_cached(layers, tokens.length())
 
+    # --- embed gather -----------------------------------------------------
     const tensor.NumericBlock embed ← source("model.embed_tokens", 0)
     _shape(embed, "model.embed_tokens", [cfg.hidden_dim, cfg.vocab])
     const tensor.NumericBlock embed_v ← _token_major_view(embed)
     const tensor.NumericBlock x ← _collect(embed_v, tokens)
 
+    # --- per-layer cached blocks ------------------------------------------
     const int qwidth ← cfg.heads * cfg.head_dim
     const int kwidth ← cfg.kv_heads * cfg.head_dim
     var list<int> positions ← empty
@@ -943,6 +977,8 @@ fn decode_block(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ Dense
     var list<kv.KVCache> next ← empty
     for range 0‥cfg.layers const layer {
         const string prefix ← "model.layers.§"(layer ↦ string)
+
+        # --- resolve stored weights ---------------------------------------
         const tensor.NumericBlock ln1_s ← source(prefix + ".input_layernorm", layer)
         const tensor.NumericBlock wq ← source(prefix + ".self_attn.q_proj", layer)
         const tensor.NumericBlock wk ← source(prefix + ".self_attn.k_proj", layer)
@@ -952,6 +988,8 @@ fn decode_block(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ Dense
         const tensor.NumericBlock wg ← source(prefix + ".mlp.gate_proj", layer)
         const tensor.NumericBlock wu ← source(prefix + ".mlp.up_proj", layer)
         const tensor.NumericBlock wd ← source(prefix + ".mlp.down_proj", layer)
+
+        # --- shape contract against cfg -----------------------------------
         _shape(ln1_s, prefix + ".input_layernorm", [cfg.hidden_dim])
         _shape(wq, prefix + ".self_attn.q_proj", [cfg.hidden_dim, qwidth])
         _shape(wk, prefix + ".self_attn.k_proj", [cfg.hidden_dim, kwidth])
@@ -963,12 +1001,16 @@ fn decode_block(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ Dense
         const int f ← fwg.get(1) coalesce 1
         _shape(wu, prefix + ".mlp.up_proj", [cfg.hidden_dim, f])
         _shape(wd, prefix + ".mlp.down_proj", [f, cfg.hidden_dim])
+
+        # --- optional Q/K/V bias (MLP / output stay absent) ---------------
         const tensor.NumericBlock bq ← _attn_bias(source, prefix + ".self_attn.q_proj.bias", layer, h, wq)
         const tensor.NumericBlock bk ← _attn_bias(source, prefix + ".self_attn.k_proj.bias", layer, h, wk)
         const tensor.NumericBlock bv ← _attn_bias(source, prefix + ".self_attn.v_proj.bias", layer, h, wv)
         const tensor.NumericBlock bg ← _no_bias()
         const tensor.NumericBlock bu ← _no_bias()
         const tensor.NumericBlock bd ← _no_bias()
+
+        # --- pack and apply the cached block ------------------------------
         const kv.KVCache cache ← layers.get(layer) coalesce kv.default()
         const transformer.DenseAttentionWeights attention_weights ← transformer.DenseAttentionWeights {wq = wq, bq = bq, wk = wk, bk = bk, wv = wv, bv = bv, wo = wo}
         const transformer.DenseAttentionConfig attention_config ← transformer.DenseAttentionConfig {num_heads = cfg.heads, num_kv_heads = cfg.kv_heads, scale = scale, rope_dim = rope_dim, rope_config = rope_cfg}
@@ -979,9 +1021,12 @@ fn decode_block(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ Dense
         next.append(block.state())
     }
 
+    # --- final RMSNorm ----------------------------------------------------
     const tensor.NumericBlock norm_s ← source("model.norm", 0)
     _shape(norm_s, "model.norm", [cfg.hidden_dim])
     const tensor.NumericBlock hn ← _rmsnorm(h, norm_s, epsilon)
+
+    # --- output projection (tied transpose / untied lm_head) --------------
     var tensor.NumericBlock w_head ← _transpose(embed_v)
     if not cfg.tied {
         w_head ← source("lm_head", 0)
@@ -1002,6 +1047,7 @@ fn decode_block(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ Dense
 
 @ public
 fn prefill_cached(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ DenseError source, list<int> tokens, f32 epsilon, f32 scale, int rope_dim, attention.RopeConfig rope_cfg, list<kv.KVCache> layers) → DenseStep ⇥ DenseError {
+    # --- config + cache (fail closed) -------------------------------------
     require cfg.layers ≥ 1 throw variant BadConfig {message = "layer count must be at least 1"}
     require cfg.heads ≥ 1 throw variant BadConfig {message = "head count must be at least 1"}
     require not (cfg.kv_heads ≺ 1 or cfg.kv_heads ≻ cfg.heads) throw variant BadConfig {message = "KV head count must be between 1 and the head count"}
@@ -1012,17 +1058,19 @@ fn prefill_cached(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ Den
     require tokens.length() ≥ 1 throw variant BadConfig {message = "token sequence must be non-empty"}
     require layers.length() ≡ cfg.layers throw variant BadConfig {message = "cache layer count must equal the model layer count"}
     for from tokens const token_id {
-        require not (token_id ≺ 0 or token_id ≥ cfg.vocab) throw variant TerminusExcedit {message = "token id out of range for the embedding"}
+        require not (token_id ≺ 0 or token_id ≥ cfg.vocab) throw variant IndexOutOfBounds {message = "token id out of range for the embedding"}
     }
     const int prefix_before ← _shared_prefix(layers)
     require prefix_before ≡ 0 throw variant Gap {message = "cache write leaves a gap"}
     _admit_cached(layers, tokens.length())
 
+    # --- embed gather -----------------------------------------------------
     const tensor.NumericBlock embed ← source("model.embed_tokens", 0)
     _shape(embed, "model.embed_tokens", [cfg.hidden_dim, cfg.vocab])
     const tensor.NumericBlock embed_v ← _token_major_view(embed)
     const tensor.NumericBlock x ← _collect(embed_v, tokens)
 
+    # --- per-layer cached blocks ------------------------------------------
     const int qwidth ← cfg.heads * cfg.head_dim
     const int kwidth ← cfg.kv_heads * cfg.head_dim
     var list<int> positions ← empty
@@ -1033,6 +1081,8 @@ fn prefill_cached(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ Den
     var list<kv.KVCache> next ← empty
     for range 0‥cfg.layers const layer {
         const string prefix ← "model.layers.§"(layer ↦ string)
+
+        # --- resolve stored weights ---------------------------------------
         const tensor.NumericBlock ln1_s ← source(prefix + ".input_layernorm", layer)
         const tensor.NumericBlock wq ← source(prefix + ".self_attn.q_proj", layer)
         const tensor.NumericBlock wk ← source(prefix + ".self_attn.k_proj", layer)
@@ -1042,6 +1092,8 @@ fn prefill_cached(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ Den
         const tensor.NumericBlock wg ← source(prefix + ".mlp.gate_proj", layer)
         const tensor.NumericBlock wu ← source(prefix + ".mlp.up_proj", layer)
         const tensor.NumericBlock wd ← source(prefix + ".mlp.down_proj", layer)
+
+        # --- shape contract against cfg -----------------------------------
         _shape(ln1_s, prefix + ".input_layernorm", [cfg.hidden_dim])
         _shape(wq, prefix + ".self_attn.q_proj", [cfg.hidden_dim, qwidth])
         _shape(wk, prefix + ".self_attn.k_proj", [cfg.hidden_dim, kwidth])
@@ -1053,12 +1105,16 @@ fn prefill_cached(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ Den
         const int f ← fwg.get(1) coalesce 1
         _shape(wu, prefix + ".mlp.up_proj", [cfg.hidden_dim, f])
         _shape(wd, prefix + ".mlp.down_proj", [f, cfg.hidden_dim])
+
+        # --- optional Q/K/V bias (MLP / output stay absent) ---------------
         const tensor.NumericBlock bq ← _attn_bias(source, prefix + ".self_attn.q_proj.bias", layer, h, wq)
         const tensor.NumericBlock bk ← _attn_bias(source, prefix + ".self_attn.k_proj.bias", layer, h, wk)
         const tensor.NumericBlock bv ← _attn_bias(source, prefix + ".self_attn.v_proj.bias", layer, h, wv)
         const tensor.NumericBlock bg ← _no_bias()
         const tensor.NumericBlock bu ← _no_bias()
         const tensor.NumericBlock bd ← _no_bias()
+
+        # --- pack and apply the cached block ------------------------------
         const kv.KVCache cache ← layers.get(layer) coalesce kv.default()
         const transformer.DenseAttentionWeights attention_weights ← transformer.DenseAttentionWeights {wq = wq, bq = bq, wk = wk, bk = bk, wv = wv, bv = bv, wo = wo}
         const transformer.DenseAttentionConfig attention_config ← transformer.DenseAttentionConfig {num_heads = cfg.heads, num_kv_heads = cfg.kv_heads, scale = scale, rope_dim = rope_dim, rope_config = rope_cfg}
@@ -1069,9 +1125,12 @@ fn prefill_cached(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ Den
         next.append(block.state())
     }
 
+    # --- final RMSNorm ----------------------------------------------------
     const tensor.NumericBlock norm_s ← source("model.norm", 0)
     _shape(norm_s, "model.norm", [cfg.hidden_dim])
     const tensor.NumericBlock hn ← _rmsnorm(h, norm_s, epsilon)
+
+    # --- output projection (tied transpose / untied lm_head) --------------
     var tensor.NumericBlock w_head ← _transpose(embed_v)
     if not cfg.tied {
         w_head ← source("lm_head", 0)

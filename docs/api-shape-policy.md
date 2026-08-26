@@ -200,7 +200,7 @@ Model admission and adapters: `ArtifactError`, `AdmissionError`,
 `Qwen35moeReferenceError` / `Qwen35moeAdmissionError`).
 
 `DecodeError` (5/11 shape-family) and `DenseError` (assembly-specific
-`MissingTensor` / `TerminusExcedit` / copied `Overflow`/`Gap`) stay
+`MissingTensor` / `IndexOutOfBounds` / copied `Overflow`/`Gap`) stay
 because callers of those import paths match domain variants, not the
 spine eight. Their remaining spine remaps become **typed match on the
 one `GradusError`**, an N×1 wall, not N×M.
