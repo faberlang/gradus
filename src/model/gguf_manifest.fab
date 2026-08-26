@@ -327,15 +327,18 @@ fn _join_bytes(bytes a, bytes b) → bytes {
 # exactly that value's wire bytes. Arrays recurse over their declared element
 # type, but no cumulative header/table prefix is copied or retained.
 fn _source_value((int, int) → bytes ⇥ GgufManifestError source, int total, int off, int kind, int depth) → bytes ⇥ GgufManifestError {
+    # --- bounds + kind (fail closed) --------------------------------------
     require depth ≤ 64 throw variant BadBounds {message = "metadata array nesting exceeds the bounded depth"}
     require _dtype_valid(kind) throw variant BadWire {message = "unknown GGUF metadata value type"}
     const int scalar ← _scalar_size(kind)
     if scalar ≻ 0 {
+        # --- scalar wire (exact read) -------------------------------------
         const bytes wire ← _read_source(source, total, off, scalar)
         _size_value(_byte_list(wire), 0, kind, depth)
         return wire
     }
     if kind ≡ GGUF_STRING {
+        # --- string wire (length header + corpus) -------------------------
         const bytes header ← _read_source(source, total, off, 8)
         const int len ← _u64(_byte_list(header), 0)
         require len ≤ TEXT_LIMIT throw variant BadBounds {message = "GGUF string exceeds the bounded text limit"}
@@ -344,6 +347,7 @@ fn _source_value((int, int) → bytes ⇥ GgufManifestError source, int total, i
         return _join_bytes(header, corpus)
     }
     if kind ≡ GGUF_ARRAY {
+        # --- array wire (element kind + count) ----------------------------
         const bytes header ← _read_source(source, total, off, 12)
         const list<int<u8>> header_list ← _byte_list(header)
         const int element_kind ← _u32(header_list, 0)
@@ -352,6 +356,7 @@ fn _source_value((int, int) → bytes ⇥ GgufManifestError source, int total, i
         require n ≤ ARRAY_LIMIT throw variant BadBounds {message = "GGUF array count exceeds the bounded limit"}
         const int element_scalar ← _scalar_size(element_kind)
         if element_scalar ≻ 0 {
+            # --- scalar element array (bulk read) -------------------------
             const int length ← _mul(n, element_scalar)
             const bytes corpus ← _read_source(source, total, _add(off, 12), length)
             const bytes out ← _join_bytes(header, corpus)
@@ -359,6 +364,7 @@ fn _source_value((int, int) → bytes ⇥ GgufManifestError source, int total, i
             return out
         }
         if element_kind ≡ GGUF_STRING {
+            # --- string element array (scan → exact read) -----------------
             var int cursor ← _add(off, 12)
             for range 0‥n const i {
                 const bytes item_head ← _read_source(source, total, cursor, 8)
@@ -374,6 +380,8 @@ fn _source_value((int, int) → bytes ⇥ GgufManifestError source, int total, i
             _size_value(_byte_list(wire), 0, kind, depth)
             return wire
         }
+
+        # --- nested element array (recursive reads) -----------------------
         var bytes out ← header
         var int cursor ← _add(off, 12)
         for range 0‥n const i {
@@ -397,9 +405,11 @@ fn _source_value((int, int) → bytes ⇥ GgufManifestError source, int total, i
 # returned size includes its element-type and count headers and every nested
 # element. No value bytes are retained here; the caller slices them once.
 fn _size_value(list<int<u8>> b, int off, int kind, int depth) → int ⇥ GgufManifestError {
+    # --- bounds + kind (fail closed) --------------------------------------
     require depth ≤ 64 throw variant BadBounds {message = "metadata array nesting exceeds the bounded depth"}
     const int scalar ← _scalar_size(kind)
     if scalar ≻ 0 {
+        # --- scalar wire (BOOL validated) ---------------------------------
         if kind ≡ GGUF_BOOL {
             const int v ← _u8_value(b, off)
             require not (v ≠ 0 and v ≠ 1) throw variant BadWire {message = "malformed GGUF bool value"}
@@ -408,15 +418,16 @@ fn _size_value(list<int<u8>> b, int off, int kind, int depth) → int ⇥ GgufMa
         return scalar
     }
     if kind ≡ GGUF_STRING {
+        # --- string wire (length + UTF-8 check) ---------------------------
         const int len ← _u64(b, off)
         require len ≤ TEXT_LIMIT throw variant BadBounds {message = "GGUF string exceeds the bounded text limit"}
         const int total ← _add(8, len)
         _slice(b, off, total)
-        # Validate the bytes even though the exact wire is retained.
         _text(b, off + 8, len)
         return total
     }
     if kind ≡ GGUF_ARRAY {
+        # --- array wire (element size recursion) --------------------------
         const int header ← _add(off, 12)
         require header ≤ b.length() throw variant Truncated {message = "truncated GGUF array header"}
         const int element_kind ← _u32(b, off)
@@ -576,11 +587,16 @@ fn _elements(list<int> shape) → int ⇥ GgufManifestError {
 
 @ public
 fn layout(int ggml_dtype, list<int> shape) → GgmlLayout ⇥ GgufManifestError {
+    # --- rank + element count (fail closed) -------------------------------
     require shape.length() ≠ 0 throw variant BadBounds {message = "tensor rank must be at least one"}
     const int elements ← _elements(shape)
+
+    # --- block + byte layout resolution -----------------------------------
     const int elements_per_block ← _block_layout(ggml_dtype)
     if elements_per_block ≡ 0 then return variant Unknown {dtype = ggml_dtype}
     const int bytes_per_block ← _byte_layout(ggml_dtype)
+
+    # --- first-dim alignment + byte length (fail closed) ------------------
     const int first_dimension ← shape.get(0) coalesce 0
     require first_dimension % elements_per_block ≡ 0 throw variant BadOffset {message = "tensor first dimension is not a complete GGML block"}
     const int blocks ← elements / elements_per_block
@@ -745,9 +761,12 @@ fn _power_two(int value) → bool {
 }
 
 fn _construct(artifact.ContentIdentity identity, int total, int version, int alignment, int table_end, int corpus_length, list<GgufMetadata> metadata, list<GgufTensorDescriptor> tensors) → GgufManifest ⇥ GgufManifestError {
+    # --- data region start + corpus boundary (fail closed) ----------------
     const int data_start ← _align(table_end, alignment)
     require data_start ≤ total throw variant BadOffset {message = "GGUF data section begins beyond the artifact"}
     require corpus_length ≤ data_start throw variant Surplus {message = "bounded GGUF corpus contains bytes from the data region"}
+
+    # --- tensor absolute ranges (within the artifact) ---------------------
     var list<int> abs_starts ← empty
     var list<int> abs_ends ← empty
     for from tensors const tensor {
@@ -764,6 +783,8 @@ fn _construct(artifact.ContentIdentity identity, int total, int version, int ali
             }
         }
     }
+
+    # --- range overlap scan (fail closed) ---------------------------------
     var int a ← 0
     while a ≺ abs_starts.length() {
         var int z ← a + 1
@@ -777,11 +798,14 @@ fn _construct(artifact.ContentIdentity identity, int total, int version, int ali
         }
         a ↑
     }
+
+    # --- manifest construct -----------------------------------------------
     return GgufManifest {identity = identity, version = version, alignment = alignment, data_start = data_start, artifact_length = total, metadata = metadata, tensors = tensors}
 }
 
 @ public
 fn parse(GgufCorpus corpus) → GgufManifest ⇥ GgufManifestError {
+    # --- corpus + identity bounds (fail closed) ---------------------------
     # Check the caller-owned prefix before copying it into the parser's list
     # representation; otherwise an oversized octet corpus would already have
     # amplified memory before the bounded parser could reject it.
@@ -789,6 +813,8 @@ fn parse(GgufCorpus corpus) → GgufManifest ⇥ GgufManifestError {
     const list<int<u8>> b ← _byte_list(corpus.table)
     const int total ← corpus.artifact_length
     require not ((total ≤ 0 or corpus.identity.length ≠ total) or not _identity_valid(corpus.identity, total)) throw variant BadIdentity {message = "content identity does not match the supplied artifact length"}
+
+    # --- header + format guard (magic/version/counts) ---------------------
     require b.length() ≥ 24 throw variant Truncated {message = "truncated GGUF header"}
     const int m0 ← _u8_value(b, 0)
     const int m1 ← _u8_value(b, 1)
@@ -800,25 +826,34 @@ fn parse(GgufCorpus corpus) → GgufManifest ⇥ GgufManifestError {
     const int tensor_count ← _u64(b, 8)
     const int kv_num ← _u64(b, 16)
     require not (tensor_count ≻ TENSOR_LIMIT or kv_num ≻ KV_LIMIT) throw variant BadBounds {message = "GGUF count exceeds the bounded limit"}
+
+    # --- metadata table (keys + wire values) ------------------------------
     var int cursor ← 24
     var list<GgufMetadata> metadata ← empty
     var list<string> keys ← empty
     for range 0‥kv_num const i {
+        # --- key (length + duplicate check) -------------------------------
         const int key_len ← _u64(b, cursor)
         require key_len ≤ NAME_LIMIT throw variant BadBounds {message = "metadata key exceeds the bounded length"}
         const string key ← _text(b, cursor + 8, key_len)
         require not _contains(keys, key) throw variant DuplicateKey {message = "duplicate GGUF metadata key: §"(key)}
         keys.append(key)
         cursor ← _add(cursor, 8 + key_len)
+
+        # --- value kind (fail closed) -------------------------------------
         const int kind ← _u32(b, cursor)
         require _dtype_valid(kind) throw variant BadWire {message = "unknown GGUF metadata value type"}
         cursor ← _add(cursor, 4)
+
+        # --- value wire + record append -----------------------------------
         const int value_start ← cursor
         const int value_len ← _size_value(b, value_start, kind, 0)
         const list<int<u8>> value_bytes ← _slice(b, value_start, value_len)
         metadata.append(GgufMetadata {key = key, dtype = kind, payload_wire = _byte_from_list(value_bytes)})
         cursor ← _add(cursor, value_len)
     }
+
+    # --- alignment override (general.alignment) ---------------------------
     var int alignment ← DEFAULT_ALIGNMENT
     const GgufMetadata ∪ null alignment_meta ← _find_metadata(metadata, "general.alignment")
     if alignment_meta not is null {
@@ -827,10 +862,13 @@ fn parse(GgufCorpus corpus) → GgufManifest ⇥ GgufManifestError {
         require not ((file_alignment ≤ 0 or file_alignment ≻ 4294967295) or not _power_two(file_alignment)) throw variant BadWire {message = "general.alignment must be a positive power of two"}
         alignment ← file_alignment
     }
+
+    # --- tensor table (names + shapes + layouts) --------------------------
     var list<GgufTensorDescriptor> tensors ← empty
     var list<string> names ← empty
     var int t ← 0
     while t ≺ tensor_count {
+        # --- name (length + duplicate check) ------------------------------
         const int name_len ← _u64(b, cursor)
         require name_len ≤ NAME_LIMIT throw variant BadBounds {message = "tensor name exceeds the bounded length"}
         const string name ← _text(b, cursor + 8, name_len)
@@ -838,6 +876,8 @@ fn parse(GgufCorpus corpus) → GgufManifest ⇥ GgufManifestError {
         require not _contains(names, name) throw variant DuplicateTensor {message = "duplicate GGUF tensor name: §"(name)}
         names.append(name)
         cursor ← _add(cursor, 8 + name_len)
+
+        # --- rank + shape dims (bounded) ----------------------------------
         const int rank ← _u32(b, cursor)
         cursor ← _add(cursor, 4)
         require rank ≠ 0 throw variant BadBounds {message = "tensor rank must be at least one"}
@@ -851,15 +891,21 @@ fn parse(GgufCorpus corpus) → GgufManifest ⇥ GgufManifestError {
             cursor ← _add(cursor, 8)
             d ↑
         }
+
+        # --- dtype + offset + layout --------------------------------------
         const int ggml_dtype ← _u32(b, cursor)
         cursor ← _add(cursor, 4)
         const int offset ← _u64(b, cursor)
         cursor ← _add(cursor, 8)
         const int elements ← _elements(shape)
         const GgmlLayout lay ← layout(ggml_dtype, shape)
+
+        # --- append tensor descriptor -------------------------------------
         tensors.append(GgufTensorDescriptor {name = name, shape = shape, dtype_ggml = ggml_dtype, relative_offset = offset, elements = elements, layout = lay})
         t ↑
     }
+
+    # --- manifest construct -----------------------------------------------
     return _construct(corpus.identity, total, version, alignment, cursor, b.length(), metadata, tensors)
 }
 
@@ -868,6 +914,7 @@ fn parse(GgufCorpus corpus) → GgufManifest ⇥ GgufManifestError {
 # of the tensor table and never asks for a tensor payload byte.
 @ public
 fn inspect((int, int) → bytes ⇥ GgufManifestError source, int artifact_length, artifact.ContentIdentity identity) → GgufManifest ⇥ GgufManifestError {
+    # --- identity + header (fail closed) ----------------------------------
     require not (artifact_length ≤ 0 or not _identity_valid(identity, artifact_length)) throw variant BadIdentity {message = "content identity does not match the supplied artifact length"}
     const bytes header_wire ← _read_source(source, artifact_length, 0, 24)
     const list<int<u8>> header ← _byte_list(header_wire)
@@ -877,10 +924,13 @@ fn inspect((int, int) → bytes ⇥ GgufManifestError source, int artifact_lengt
     const int tensor_count ← _u64(header, 8)
     const int kv_num ← _u64(header, 16)
     require not (tensor_count ≻ TENSOR_LIMIT or kv_num ≻ KV_LIMIT) throw variant BadBounds {message = "GGUF count exceeds the bounded limit"}
+
+    # --- metadata table (ranged reads) ------------------------------------
     var int cursor ← 24
     var list<GgufMetadata> metadata ← empty
     var list<string> keys ← empty
     for range 0‥kv_num const i {
+        # --- key (length + duplicate check) -------------------------------
         const bytes key_head_wire ← _read_source(source, artifact_length, cursor, 8)
         const int key_len ← _u64(_byte_list(key_head_wire), 0)
         require key_len ≤ NAME_LIMIT throw variant BadBounds {message = "metadata key exceeds the bounded length"}
@@ -890,14 +940,20 @@ fn inspect((int, int) → bytes ⇥ GgufManifestError source, int artifact_lengt
         require not _contains(keys, key) throw variant DuplicateKey {message = "duplicate GGUF metadata key: §"(key)}
         keys.append(key)
         cursor ← _add(cursor, key_len)
+
+        # --- value kind + wire read ---------------------------------------
         const bytes type_wire ← _read_source(source, artifact_length, cursor, 4)
         const int kind ← _u32(_byte_list(type_wire), 0)
         require _dtype_valid(kind) throw variant BadWire {message = "unknown GGUF metadata value type"}
         cursor ← _add(cursor, 4)
         const bytes value_wire ← _source_value(source, artifact_length, cursor, kind, 0)
+
+        # --- append metadata record ---------------------------------------
         metadata.append(GgufMetadata {key = key, dtype = kind, payload_wire = value_wire})
         cursor ← _add(cursor, value_wire.length())
     }
+
+    # --- alignment override (general.alignment) ---------------------------
     var int alignment ← DEFAULT_ALIGNMENT
     const GgufMetadata ∪ null alignment_meta ← _find_metadata(metadata, "general.alignment")
     if alignment_meta not is null {
@@ -907,10 +963,13 @@ fn inspect((int, int) → bytes ⇥ GgufManifestError source, int artifact_lengt
         require not ((file_alignment ≤ 0 or file_alignment ≻ 4294967295) or not _power_two(file_alignment)) throw variant BadWire {message = "general.alignment must be a positive power of two"}
         alignment ← file_alignment
     }
+
+    # --- tensor table (ranged reads) --------------------------------------
     var list<GgufTensorDescriptor> tensors ← empty
     var list<string> names ← empty
     var int t ← 0
     while t ≺ tensor_count {
+        # --- name (length + duplicate check) ------------------------------
         const bytes name_head_wire ← _read_source(source, artifact_length, cursor, 8)
         const int name_len ← _u64(_byte_list(name_head_wire), 0)
         require name_len ≤ NAME_LIMIT throw variant BadBounds {message = "tensor name exceeds the bounded length"}
@@ -921,6 +980,8 @@ fn inspect((int, int) → bytes ⇥ GgufManifestError source, int artifact_lengt
         require not _contains(names, name) throw variant DuplicateTensor {message = "duplicate GGUF tensor name: §"(name)}
         names.append(name)
         cursor ← _add(cursor, name_len)
+
+        # --- rank + shape dims (bounded) ----------------------------------
         const bytes rank_wire ← _read_source(source, artifact_length, cursor, 4)
         const int rank ← _u32(_byte_list(rank_wire), 0)
         cursor ← _add(cursor, 4)
@@ -936,6 +997,8 @@ fn inspect((int, int) → bytes ⇥ GgufManifestError source, int artifact_lengt
             cursor ← _add(cursor, 8)
             d ↑
         }
+
+        # --- dtype + offset + layout --------------------------------------
         const bytes ggml_wire ← _read_source(source, artifact_length, cursor, 4)
         const int ggml_dtype ← _u32(_byte_list(ggml_wire), 0)
         cursor ← _add(cursor, 4)
@@ -944,9 +1007,13 @@ fn inspect((int, int) → bytes ⇥ GgufManifestError source, int artifact_lengt
         cursor ← _add(cursor, 8)
         const int elements ← _elements(shape)
         const GgmlLayout lay ← layout(ggml_dtype, shape)
+
+        # --- append tensor descriptor -------------------------------------
         tensors.append(GgufTensorDescriptor {name = name, shape = shape, dtype_ggml = ggml_dtype, relative_offset = offset, elements = elements, layout = lay})
         t ↑
     }
+
+    # --- manifest construct -----------------------------------------------
     return _construct(identity, artifact_length, version, alignment, cursor, cursor, metadata, tensors)
 }
 
@@ -955,10 +1022,12 @@ fn inspect((int, int) → bytes ⇥ GgufManifestError source, int artifact_lengt
 # the checked absolute range and is not retained in the returned bytes.
 @ public
 fn read_fragment(GgufManifest m, string name, int start, int length, (int, int) → bytes ⇥ GgufManifestError source) → bytes ⇥ GgufManifestError {
+    # --- fragment range + tensor lookup (fail closed) ---------------------
     require not (start ≺ 0 or length ≺ 0) throw variant BadOffset {message = "tensor fragment range is negative"}
     const GgufTensorDescriptor tensor ← find_tensor(m, name)
     match tensor.layout {
         case Known const elements_per_block, bytes_per_block, byte_length {
+            # --- absolute range + exact source read -----------------------
             require not (start ≻ byte_length or length ≻ byte_length - start) throw variant BadOffset {message = "tensor fragment range exceeds the known tensor"}
             const int rel ← _add(tensor.relative_offset, start)
             const int absolute ← _add(m.data_start, rel)

@@ -349,20 +349,27 @@ class Decoder {
 
 @ public
 fn construct_decoder(tensor.NumericBlock table, Weights weights, tensor.NumericBlock projection, tensor.NumericBlock projection_bias, f32 scale, int vocabulary, int context, int dimension) → Decoder ⇥ DecodeError {
+    # --- scalar invariants (fail closed) ----------------------------------
     require vocabulary ≥ 1 throw variant InvalidDecoder {message = "vocabulary must be non-empty"}
     require context ≥ 1 throw variant InvalidDecoder {message = "context length must be at least one"}
     require dimension ≥ 1 throw variant InvalidDecoder {message = "embedding dimension must be at least one"}
     require dtype.finite(scale) throw variant InvalidDecoder {message = "invalid attention scale"}
     require scale ≻ 0.0 throw variant InvalidDecoder {message = "invalid attention scale"}
+
+    # --- embedding shape contract (fail closed) ---------------------------
     const list<int> fm ← table.shape()
     require fm.length() ≡ 2 throw variant InvalidDecoder {message = "embedding must be rank-2"}
     require fm.get(0) coalesce 1 ≡ vocabulary throw variant InvalidDecoder {message = "embedding rows must equal the vocabulary"}
     require fm.get(1) coalesce 1 ≡ dimension throw variant InvalidDecoder {message = "embedding columns must equal the dimension"}
+
+    # --- projection shape contracts (fail closed) -------------------------
     const list<int> fp ← projection.shape()
     require fp.length() ≡ 2 throw variant InvalidDecoder {message = "output projection must be rank-2"}
     require not (fp.get(0) coalesce 1 ≠ dimension or fp.get(1) coalesce 1 ≠ vocabulary) throw variant InvalidDecoder {message = "output projection shape must be [dim, vocab]"}
     const list<int> fpb ← projection_bias.shape()
     require not (fpb.length() ≠ 1 or fpb.get(0) coalesce 1 ≠ vocabulary) throw variant InvalidDecoder {message = "output projection bias must be [vocab]"}
+
+    # --- construct --------------------------------------------------------
     return Decoder {table = table, weights = weights, projection = projection, projection_bias = projection_bias, scale = scale, vocabulary = vocabulary, context = context, dimension = dimension}
 }
 
@@ -414,13 +421,19 @@ fn _project(Decoder m, tensor.NumericBlock h) → tensor.NumericBlock ⇥ Decode
 
 @ public
 fn decode_data(int token_id, int position, Decoder m) → tensor.NumericBlock ⇥ DecodeError {
+    # --- token + position domain (fail closed) ----------------------------
     require not (token_id ≺ 0 or token_id ≥ m.vocabulary()) throw variant IdOutOfRange {message = "token id out of vocabulary range"}
     require not (position ≺ 0 or position ≥ m.context()) throw variant InvalidPosition {message = "position out of context"}
+
+    # --- embedding gather + staged row ------------------------------------
     const list<f32> row ← _embedding(m.table(), token_id, m.dimension())
     const tensor.NumericBlock x ← _tensor(row, [1, m.dimension()])
+
+    # --- shared forward block ---------------------------------------------
     const tensor.NumericBlock h ← _block(m, x, [position])
+
+    # --- output projection + flatten to full-vocab logits -----------------
     const tensor.NumericBlock logits ← _project(m, h)
-    # The [1, V] projection flattens to the full-vocab logits [V].
     return _tensor(logits.data, [m.vocabulary()])
 }
 
@@ -457,12 +470,19 @@ fn _block_cached(Decoder m, tensor.NumericBlock x, list<int> positions, kv.KVCac
 
 @ public
 fn decode_cached(int token_id, int position, Decoder m, kv.KVCache layer) → DecodeStep ⇥ DecodeError {
+    # --- token + position + cache domain (fail closed) --------------------
     require not (token_id ≺ 0 or token_id ≥ m.vocabulary()) throw variant IdOutOfRange {message = "token id out of vocabulary range"}
     require not (position ≺ 0 or position ≥ m.context()) throw variant InvalidPosition {message = "position out of context"}
     require layer.dimension() ≡ m.dimension() throw variant ShapeMismatch {message = "cache dimension must equal the decoder dimension"}
+
+    # --- embedding gather + staged row ------------------------------------
     const list<f32> row ← _embedding(m.table(), token_id, m.dimension())
     const tensor.NumericBlock x ← _tensor(row, [1, m.dimension()])
+
+    # --- cached forward block (read/write layer) --------------------------
     const transformer.CachedBlock block ← _block_cached(m, x, [position], layer, [token_id])
+
+    # --- output projection + decode step ----------------------------------
     const tensor.NumericBlock projected ← _project(m, block.output())
     return DecodeStep {logits = _tensor(projected.data, [m.vocabulary()]), state = block.state()}
 }
@@ -475,11 +495,14 @@ fn decode_cached(int token_id, int position, Decoder m, kv.KVCache layer) → De
 
 @ public
 fn prefill(list<int> tokens, Decoder m) → tensor.NumericBlock ⇥ DecodeError {
+    # --- prompt domain (fail closed) --------------------------------------
     require tokens.length() ≠ 0 throw variant ElementMismatch {message = "empty prompt"}
     require tokens.length() ≤ m.context() throw variant InvalidPosition {message = "prompt exceeds the context limit"}
     for from tokens const t {
         require not (t ≺ 0 or t ≥ m.vocabulary()) throw variant IdOutOfRange {message = "token id out of vocabulary range"}
     }
+
+    # --- embed gather → staged rows + positions ---------------------------
     var list<f32> flat ← empty
     for from tokens const t {
         const list<f32> row ← _embedding(m.table(), t, m.dimension())
@@ -492,6 +515,8 @@ fn prefill(list<int> tokens, Decoder m) → tensor.NumericBlock ⇥ DecodeError 
     for range 0‥tokens.length() const i {
         positions.append(i)
     }
+
+    # --- shared forward block + output projection -------------------------
     const tensor.NumericBlock h ← _block(m, x, positions)
     return _project(m, h)
 }
@@ -607,13 +632,18 @@ fn _sampling_map(sampling.SamplingError e) → DecodeError {
 
 @ public
 fn replay(list<list<f32>> logit_rows, sampling.Config c, list<int> history, train.Seed seed, Cancellation cancellation) → list<int> ⇥ DecodeError {
+    # --- entry cancellation (fail closed) ---------------------------------
     observe_cancellation(cancellation)
+
+    # --- running history + seed init --------------------------------------
     var list<int> result ← empty
     var list<int> running ← empty
     for from history const t {
         running.append(t)
     }
     var train.Seed current ← seed
+
+    # --- per-step sampling (cancellation observed) ------------------------
     for from logit_rows const row {
         observe_cancellation(cancellation)
         var sampling.Sampler outcome ← sampling.default()
