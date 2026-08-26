@@ -1,7 +1,6 @@
 # Delivery: GGUF-A7 — Native Quantized Execution Contract
 
-**Status**: planned — re-lowered 2026-08-26 against the current compiler and
-cross-repo tips; no A7 unit dispatched from this artifact
+**Status**: active — U2 landed and folded to radix main (`f9d65f7b8` ← `356e5edaa`: Q4_K_M SmolLM2 native Metal receipt, MATCH — prefill top-1 exact, decode max_delta 0.0, 128-step resident session, no F32 expansion); U3 filed honest NOT ATTEMPTED, pharos unreachable (lane `60ec5d28e`, fold queued; recheck = machine answers SSH); U4a/U4b/U5 blocked on U3 recheck (operator mailed `5797807b`); Metal side unaffected
 **Campaign**: [`radix/docs/factory/gpu-production-readiness/CAMPAIGN.md`](../../../../radix/docs/factory/gpu-production-readiness/CAMPAIGN.md), mandatory work **A7 — native quantized execution contract**
 **Semantic delivery authority**: [`pml5-general-gguf-delivery.md`](pml5-general-gguf-delivery.md) §§GGUF-A7 and GGUF-M5
 **Planner**: planner
