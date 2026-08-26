@@ -1,6 +1,6 @@
 # GOAL: collection-walk — `for from xs` when the index only re-indexes `xs`
 
-**Status**: planned — drafted; convert class inventoried; implementation next
+**Status**: done — convert class landed (`for from xs` on single-collection walks); leftovers are keep-class (zip / count / index / string / bytes)
 **Created**: 2026-08-26
 **Campaign:** `—` (standalone host idiom; complementary to the 2026-08-26 while-to-range wave, not a second pass of that wave)
 **Source:** operator session 2026-08-26 — the remaining offensive host form after count-`while` conversion is `for range 0‥d.data.layers().length()` used only to `get` the same collection
@@ -46,11 +46,9 @@ Live convert-class sites in `gradus/src/` (2026-08-26 inventory; skip
 | `src/block_verify.fab` | `_request_capacity` | `checkpoint.layers()` |
 | `src/block_verify.fab` | `_committed_identity_matches` | `accepted_ids` |
 | `src/shape.fab` | `reshape` (both passes) | `target` |
-| `src/serialize.fab` | `_byte_list` | `bytes o` |
 | `src/tokenizer.fab` | `_sort_ascending` membership | `out` |
 | `src/model/gguf.fab` | `_contains` | `xs` |
 | `src/model/gguf_manifest.fab` | `_contains` | `xs` |
-| `src/model/gguf_manifest.fab` | `_join_bytes` | `bytes b` |
 
 `rg 'for range 0‥.+\.length\(\)' src --glob '*.fab'` still matches after
 this goal. Those leftovers are keep-class (see Proposal). Zero remaining
@@ -78,6 +76,7 @@ where `i` is not used except to index that same `xs` (including
 | Zip / write-back | two or more aligned collections, or `legacy-L2` comments | `a.layers()` vs `b.layers()`; candidate keys + payloads |
 | Index is identity | vocab id, return-index, replace-at | `tokenizer.is_eog(i)`; `_best_index`; `_find_name` |
 | String walk | `for from s` not proven on `string` | `_hex_ok`, `_numeric`, `_contains_separator` |
+| Bytes walk | `for from o` does not bind `int<u8>` (`SEM010` on `append`) | `_byte_list`, `_join_bytes` |
 
 Do not invent a zip combinator. Do not fold tensor `for from grid at [r,c]`
 into this goal — that sibling is already law in `$faber` and
@@ -87,7 +86,7 @@ into this goal — that sibling is already law in `$faber` and
 
 - Checker enforcement (that is `container-bounds-law`)
 - A second while-to-range pass
-- String `for from s` until a dedicated proof lands
+- String `for from s` or bytes `for from o` until dedicated proofs land
 - Zip / parallel-list helpers
 - `src/kernel.fab` (frozen GEA)
 - Foreign dirt: dirty docs, `scripta/`, untracked `src/model/qwen35moe_state.fab`
@@ -128,8 +127,8 @@ whole package is not required for closeout.
 
 | Unit | Status | Receipt | Notes |
 | --- | --- | --- | --- |
-| 1 | in progress | — | this file |
-| 2 | pending | — | convert class only |
+| 1 | done | `93ef4f9` | this file |
+| 2 | done | landing with this commit | `block_verify`, `shape`, `tokenizer`, `gguf`, `gguf_manifest`; bytes walks kept after `SEM010` |
 
 ## Open questions
 
@@ -137,7 +136,11 @@ whole package is not required for closeout.
    `s.get(i)` / `s.slice(i, i + 1)` until a dedicated proof shows
    `for from` on `string` binds characters. Revisit; do not convert in
    this goal.
-2. **Method-call source.** Default: `for from checkpoint.layers() const layer`
+2. **Bytes `for from o`.** Tried in unit 2: `for from o const octet`
+   then `out.append(octet)` is `SEM010` (`list<int<u8>>.append` rejects
+   the bound type). Keep the indexed form with `get(i) coalesce 0 ∷ int<u8>`
+   until a dedicated proof lands. Same default as strings.
+3. **Method-call source.** Default: `for from checkpoint.layers() const layer`
    is the spelling (evaluate the getter as the walk source). If check
    rejects a call in that position, bind once (`const layers ← checkpoint.layers()`)
    then `for from layers`.
