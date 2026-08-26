@@ -1,6 +1,6 @@
 # GOAL: dense-typed-assembly — pin weights at load; typed host graph
 
-**Status**: active — units 1–4 landed (load, typed leaves, assemblers, REF-01 `forward_ref01` / `prefill_ref01` / `decode_step_ref01` via monomorphic non-generic carriers); unit 5 and general `load<…>` wait on radix MIR (`cdd41ffa`)
+**Status**: active — units 1–4 landed; `cdd41ffa` closed (`cd52c31c2`) so `dense.load<16,…>` runs from proba; unit 5 (delete bag wrappers, typed public routes for all geometries) still blocked on SEM008 / inferred type-arg backfill / generic `DenseLayer` → `TypedDenseLayer` assign
 **Created**: 2026-08-26
 **Campaign:** `—` (standalone; complementary to `kernel-purity-census`, not a purity wave)
 **Source:** operator session 2026-08-26 — contrast of `src/model/dense.fab` vs `src/kernel.fab`; Wave 0 carrier/admissions ruling
@@ -252,7 +252,7 @@ Closeout requires all of the following:
 | 2 | done | direct | `faber check .` green | `@ kernel @ public rmsnorm<size T, D>` + `swiglu_hidden`; bag renamed `rmsnorm_carrier` (SEM005) |
 | 3 | done | direct | `faber check .` green; `transformer.proba` dense-block rows still pass | `dense_block_static` / `dense_block_cached_static` ordinary assemblers; attention stays bag at the QKV seam |
 | 4 | done (REF-01 workaround) | direct | `dense.proba` 20/20 including tied/untied `forward_ref01` @ 5e-4 and prefill/decode compose | Bag `forward` still the public runner. Typed routes are `load_ref01` / `forward_ref01` / `prefill_ref01` / `decode_step_ref01` over non-generic `DenseModelRef01` + `transformer.Ref01Layer`. Glyphs + literal `data ↦ tensor<f32, […]>`. `decode_block` still bag. |
-| 5 | pending | — | — | Callers, delete bag wrappers, docs |
+| 5 | pending | — | — | Callers, delete bag wrappers, docs. `cdd41ffa` is not the remaining gate. |
 
 ## Open questions
 
@@ -278,14 +278,15 @@ Closeout requires all of the following:
    one fused-at-source mega-body and hide the split fusion is meant to
    see. Revisit only if a later program-composition form admits a kernel
    that *names* other kernels without inlining them.
-6. **Package MIR namespace type args (2026-08-26)** — `dense.load<16, 8,
-   16, 8, 16>(…)` checks and is the only way to bind `load` (no tensor
-   args to unify from). Package MIR refuses type arguments on namespace
-   calls, so proba cannot execute `load` today. Further execution gaps
-   found in unit 4: (a) inferred namespace generics *link* but drop type
-   args (`nn.rmsnorm` → `rms_norm` axis out of range); (b) monomorphizing
-   a generic class then reading a field is invalid MIR; (c) generic pin
-   helpers with written `<16, 8>` still fail to bake runtime rank.
-   Working workaround: non-generic REF-01 classes + glyphs + literal
-   `data ↦ tensor<f32, [2, 16]>`. Size params also cannot be forwarded
-   as explicit generic arguments (`_load_layer<D, Q, …>` is SEM008).
+6. **Package MIR after `cdd41ffa` (2026-08-26)** — closed at radix
+   `cd52c31c2`. `dense.load<16, 8, 16, 8, 16>(…)` now **runs** from
+   `dense.proba` (same-module field read of `model.cfg` and `layer.ln1`
+   + `.rms_norm` also run). Remaining gates for unit 5:
+   (a) inferred namespace generics still drop type args (no-backfill);
+   (b) `DenseLayer` fields do not type as `TypedDenseLayer<16,16,8,16>`
+   initializers (`SEM010` incompatible_tensor_index) — unit-3
+   `dense_block_static` cannot consume a loaded layer;
+   (c) generic pin helpers still fail to bake runtime rank;
+   (d) SEM008: size params cannot be forwarded as `_fn<D, Q, …>(…)`,
+   so a general `forward<T, D, …>` cannot call the assembler.
+   REF-01 monomorphic classes + glyphs stay the executable typed graph.
