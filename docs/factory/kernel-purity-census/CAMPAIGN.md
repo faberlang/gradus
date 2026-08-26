@@ -77,7 +77,7 @@ the lineage change (never silent; precedent `e5e484ec8`).
 | W0 ruling doc | done 2026-08-26 | `wave-0-carrier-admissions-ruling.md` | operator priority ruling, task `aee52855` |
 | W0 rename `Tensor` → `NumericBlock` | done 2026-08-26 | gradus `500342d` | converter-driven, per-file check |
 | W0 stride cache | done 2026-08-26 | gradus `500342d` | 1.75× on the decode logits handoff (ruling §4.2) |
-| W0 digest re-pin | done 2026-08-26 | radix `main` (ruling §4.4) | GEA2 source lineage, identity proof attached |
+| W0 digest re-pin | done 2026-08-26 | radix `9e5070d76` | GEA2 source lineage, identity proof attached |
 | W1 annotation/method-twin swaps | planned | — | blocked on shape-generic admission |
 | W2 prefill-chain migration | planned | — | blocked on W1 + admissions |
 | W3 program composition | planned | — | blocked on W2 |

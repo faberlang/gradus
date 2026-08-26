@@ -144,10 +144,10 @@ The GEA2 `GRADUS_SOURCE_LINEAGE` digests cover gradus **source bytes**
 (SHA-256 of the `.fab` files). This wave changed three of the four lineage
 files (`transformer.fab`, `attention.fab`, `nn.fab`; `dense_llama.fab` is
 byte-identical — its `Tensor` hits are all longer identifiers). Re-pinned
-explicitly in `radix` (const + manifest `source_lineage`, annotations
-citing this wave and the identity proof: proba identical-outcome per file,
-`faber check` green tree-wide, diff is a pure rename + the stride cache
-with bit-identical arithmetic). Precedent: `e5e484ec8`. Never silent.
+explicitly in `radix` at `9e5070d76` (const + manifest `source_lineage`,
+annotations citing this wave and the identity proof: proba identical-outcome
+per file, `faber check` green tree-wide, diff is a pure rename + the stride
+cache with bit-identical arithmetic). Precedent: `e5e484ec8`. Never silent.
 
 ### 4.5 Residuals (routed, not hidden)
 
