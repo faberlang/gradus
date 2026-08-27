@@ -117,11 +117,15 @@ Implementation proceeds in parallel where the declared write paths permit
 it. No unit depends on another unit's unlanded output.
 
 Wave 1 is deliberately split into two top-level sub-waves. `PGC-W1A` is the
-maximal entry-disjoint set: `B1`, `B3`, `C2`, and `C5` may run concurrently.
-The only common physical source path in that set is `gradus/src/kernel.fab`,
-which the goal's §4 packet mechanism explicitly permits: the cards own
-disjoint entry regions and the Mind folds their packet commits serially. Their
-export and device tests are not shared files. `PGC-W1B` is the remainder. Its
+maximal entry/case-disjoint set: `B1`, `B3`, `C2`, and `C5` may run
+concurrently. The common physical Gradus paths in that set are
+`gradus/src/kernel.fab` and the co-located test file `gradus/src/kernel.proba`.
+The goal's §4 packet mechanism explicitly permits both: each card owns named,
+disjoint `kernel.fab` entry regions and named `kernel.proba` cases (or an
+explicit verify-untouched scope), and the Mind folds both paths' packet
+commits serially. Their new export and device test files are per-card and
+additive; `kernel.proba` is the intentional shared test file handled by case
+ownership, not an unowned append surface. `PGC-W1B` is the remainder. Its
 cards are one-card, file-disjoint folds in the stated order because the
 `radix-mir` kernel-plan files are shared by `B2`, `C1`, `C3`, and `C4`, and
 `radix-mir-metal` `emit/matmul.rs` plus its test are shared by `B2` and `C4`.
@@ -130,7 +134,7 @@ No two cards in `PGC-W1B` are live concurrently.
 | Wave | Parallel group | Execution |
 | --- | --- | --- |
 | 0 | `PGC-W0-DIRECT` | `PGC-D1` in hosts direct mode and `PGC-A0` in the skills repo direct mode, concurrently |
-| 1a | `PGC-W1A` | `PGC-B1`, `PGC-B3`, `PGC-C2`, and `PGC-C5` in separate packets, concurrently; shared `kernel.fab` entry regions fold serially |
+| 1a | `PGC-W1A` | `PGC-B1`, `PGC-B3`, `PGC-C2`, and `PGC-C5` in separate packets, concurrently; disjoint `kernel.fab` entry regions and `kernel.proba` cases fold serially through the Mind |
 | 1b.1 | `PGC-W1B-1` | `PGC-B2` alone; owns the shared kernel-plan and Metal matmul paths for this fold |
 | 1b.2 | `PGC-W1B-2` | `PGC-C1` after `PGC-B2`; owns the kernel-plan paths for this fold |
 | 1b.3 | `PGC-W1B-3` | `PGC-C3` after `PGC-C1`; owns the kernel-plan paths for this fold |
@@ -140,11 +144,13 @@ No two cards in `PGC-W1B` are live concurrently.
 Every Wave-1 packet is `worktrees/pgc-<lowercase-id>/` on branch
 `factory/pgc-<lowercase-id>`; for example `worktrees/pgc-b1/` and
 `factory/pgc-b1`. Each card owns one defect, its declared Gradus entry region,
-and additive-only per-card test files. The `kernel_plan/{plan,build,kernel_plan_test}.rs`
-and `emit/matmul.rs`/`emit/tests/matmul.rs` paths never occur in two live
-sub-waves. Shared physical `kernel.fab` is the sole allowed concurrent source
-file and is handled only by disjoint entry ownership plus serial packet folds.
-Each A card uses `worktrees/pgc-<lowercase-id>/` and
+and additive-only per-card export/device test files. The co-located
+`gradus/src/kernel.proba` test file is intentionally shared by case, not by
+append. The `kernel_plan/{plan,build,kernel_plan_test}.rs` and
+`emit/matmul.rs`/`emit/tests/matmul.rs` paths never occur in two live
+sub-waves. Shared physical `kernel.fab` and `kernel.proba` are the allowed
+concurrent Gradus paths and are handled only by disjoint entry/case ownership
+plus serial packet folds through the Mind. Each A card uses `worktrees/pgc-<lowercase-id>/` and
 `factory/pgc-<lowercase-id>` by the same rule. Cheap seats are welcome for A
 batches because their oracle is mechanical.
 
@@ -159,10 +165,12 @@ leave a conditionally listed implementation path read-only only when its
 preflight proof records that no fact there changed; it may not edit a path
 owned by another `PGC-W1B` fold.
 
-All Wave-1 export and device proofs are additive. No B/C card appends to
-`radix/crates/mir-emit-harness/src/gea3_pipeline_test.rs` or
-`hosts/macos-arm64/tests/gea3_decode.rs`; each uses its own path named on its
-card below.
+All Wave-1 export and device proofs are additive and use per-card files. No
+B/C card appends to `radix/crates/mir-emit-harness/src/gea3_pipeline_test.rs`
+or `hosts/macos-arm64/tests/gea3_decode.rs`; each uses its own path named on
+its card below. The co-located `gradus/src/kernel.proba` file is the exception
+for Gradus proba tests: its named cases are disjoint and its packet folds stay
+serial through the Mind, just like the shared `kernel.fab` entry regions.
 
 ## 2. Unit cards
 
@@ -238,7 +246,7 @@ the card.
 | --- | --- |
 | `id` | `PGC-B1` |
 | `outcome` | Stop splicing capacity 1,100 into decode attention work. Score, mask/softmax, transpose, and context use actual history length or a declared bucket while preserving the capacity allocation boundary. |
-| `write_scope` | Packet `worktrees/pgc-b1/`, branch `factory/pgc-b1`. `gradus/src/kernel.fab` only entries `decode_key_transpose`, `decode_score_gemm`, `decode_masked_softmax`, and `decode_context_gemm`; `gradus/src/kernel.proba` only their cases. New additive-only export test `radix/crates/mir-emit-harness/src/gea3_pipeline_pgc_b1_test.rs`; new additive-only device test `hosts/macos-arm64/tests/gea3_decode_pgc_b1.rs`. No edits to shared `gea3_pipeline_test.rs` or `gea3_decode.rs`; no other kernel entries. |
+| `write_scope` | Packet `worktrees/pgc-b1/`, branch `factory/pgc-b1`. `gradus/src/kernel.fab` only entries `decode_key_transpose`, `decode_score_gemm`, `decode_masked_softmax`, and `decode_context_gemm`; `gradus/src/kernel.proba` only the named cases `decode_key_transpose`, `decode_score_gemm`, `decode_masked_softmax`, and `decode_context_gemm`. New additive-only export test `radix/crates/mir-emit-harness/src/gea3_pipeline_pgc_b1_test.rs`; new additive-only device test `hosts/macos-arm64/tests/gea3_decode_pgc_b1.rs`. No edits to shared `gea3_pipeline_test.rs` or `gea3_decode.rs`; no other kernel entries. |
 | `done_when` | Focused proba tuples (`case_path`, `status`, exact stderr bytes) are byte-identical before/after. A device test proves early and late fixed-1000 steps dispatch score/softmax/transpose/context at actual or declared bucket extent rather than 1,100, while certified output stays 1000/1000. Exactly one fixed-1000 decode paired-parity capture against the standing baseline records per-step wall and the affected entry geometry; expected-effect hypothesis retained: about 64 → about 50 ms/step (decode report range 48–52 ms). |
 | `measurement_commands` | From `/Users/ianzepp/work/faberlang/radix`: `scripta/parity run --stage full --output-dir /Users/ianzepp/work/faberlang/gradus/docs/factory/perf-gap-closure/evidence/PGC-B1/parity-raw`; then `scripta/parity reduce /Users/ianzepp/work/faberlang/gradus/docs/factory/perf-gap-closure/evidence/PGC-B1/parity-raw --out /Users/ianzepp/work/faberlang/gradus/docs/factory/perf-gap-closure/evidence/PGC-B1/parity-receipt.json`; then append-only candidate `scripta/parity baseline /Users/ianzepp/work/faberlang/gradus/docs/factory/perf-gap-closure/evidence/PGC-B1/parity-raw --baselines-dir /Users/ianzepp/work/faberlang/gradus/docs/factory/perf-gap-closure/evidence/PGC-B1/baseline-candidate --receipt-out /Users/ianzepp/work/faberlang/gradus/docs/factory/perf-gap-closure/evidence/PGC-B1/baseline-candidate.md`. Raw capture, reduced receipt, candidate baseline, and geometry/delta evidence live under `gradus/docs/factory/perf-gap-closure/evidence/PGC-B1/`; a lesser stage is not baseline-grade. |
 | `depends_on` | none |
@@ -277,7 +285,7 @@ static proxy is 3,814,195,200 dispatched versus 476,528,640 useful FMAs.
 | --- | --- |
 | `id` | `PGC-B3` |
 | `outcome` | Replace capacity-scaled full-arena KV append scans with a direct selected-row write and compact runtime selection constants. |
-| `write_scope` | Packet `worktrees/pgc-b3/`, branch `factory/pgc-b3`. `gradus/src/kernel.fab` only `kv_append_k` and `kv_append_v`; `gradus/src/kernel.proba` only their cases. New additive-only export test `radix/crates/mir-emit-harness/src/gea3_pipeline_pgc_b3_test.rs`; new additive-only device test `hosts/macos-arm64/tests/gea3_decode_pgc_b3.rs` covering KV append constant construction, launch binding, arena probe, and focused physical assertions. No edits to shared `gea3_pipeline_test.rs` or `gea3_decode.rs`; no prefill KV entries. |
+| `write_scope` | Packet `worktrees/pgc-b3/`, branch `factory/pgc-b3`. `gradus/src/kernel.fab` only `kv_append_k` and `kv_append_v`; `gradus/src/kernel.proba` only the named cases `kv_append_k` and `kv_append_v`. New additive-only export test `radix/crates/mir-emit-harness/src/gea3_pipeline_pgc_b3_test.rs`; new additive-only device test `hosts/macos-arm64/tests/gea3_decode_pgc_b3.rs` covering KV append constant construction, launch binding, arena probe, and focused physical assertions. No edits to shared `gea3_pipeline_test.rs` or `gea3_decode.rs`; no prefill KV entries. |
 | `done_when` | Focused proba tuples (`case_path`, `status`, exact stderr bytes) are byte-identical before/after. Device test proves only the selected K/V row changes, all prior rows remain identical, no full `[capacity,1]` selector is staged, and certified output remains 1000/1000. Exactly one fixed-1000 decode paired-parity capture records per-step wall, KV write bytes/work, and compact-constant bytes. Expected effect retained: trim per-step KV-side waste. |
 | `measurement_commands` | From `/Users/ianzepp/work/faberlang/radix`: `scripta/parity run --stage full --output-dir /Users/ianzepp/work/faberlang/gradus/docs/factory/perf-gap-closure/evidence/PGC-B3/parity-raw`; then `scripta/parity reduce /Users/ianzepp/work/faberlang/gradus/docs/factory/perf-gap-closure/evidence/PGC-B3/parity-raw --out /Users/ianzepp/work/faberlang/gradus/docs/factory/perf-gap-closure/evidence/PGC-B3/parity-receipt.json`; then append-only candidate `scripta/parity baseline /Users/ianzepp/work/faberlang/gradus/docs/factory/perf-gap-closure/evidence/PGC-B3/parity-raw --baselines-dir /Users/ianzepp/work/faberlang/gradus/docs/factory/perf-gap-closure/evidence/PGC-B3/baseline-candidate --receipt-out /Users/ianzepp/work/faberlang/gradus/docs/factory/perf-gap-closure/evidence/PGC-B3/baseline-candidate.md`. Raw capture, reduced receipt, candidate baseline, and KV work evidence live under `gradus/docs/factory/perf-gap-closure/evidence/PGC-B3/`; a lesser stage is not baseline-grade. |
 | `depends_on` | none |
