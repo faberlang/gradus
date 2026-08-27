@@ -1,0 +1,392 @@
++++
+locale = "en"
++++
+# Bench case package — the bench-harness 7-label inventory (goal
+# docs/factory/bench-harness/goal.md §Case inventory; delivery row GB-U2).
+#
+# Six runnable labels dispatch on a CLI operand; the seventh
+# (check.library.compile) is a `faber check` route recorded in cases.toml,
+# not a case here. Run route: `faber run <bench-dir> -- <label> <K>` —
+# each case executes its fixed computation K times, folds a per-iteration
+# residual against an independently computed oracle, prints exactly one
+# value-check line, and panics on mismatch (no zero-artifact greens).
+#
+# Composition record (device entries -> public carrier surface, per the
+# goal's substitution rule; full notes in cases.toml):
+#   * gemv.f32.320x960          — GEA1 kernel gemv entry -> math.matmul
+#                                  carrier row [1,960] x [960,320] (weights
+#                                  stored transposed at construction; same
+#                                  307,200 MACs, same tell-tale width).
+#   * decode.attention.row76.d960 — GEA3-U3a per-head entries (d=64, H=15)
+#                                  -> attention.scaled_dot_product_causal_
+#                                  rope_cached full-width row: q/k/v [1,960],
+#                                  a 75-row KV cache at dimension 960 (the
+#                                  row attends all 76 keys; RoPE dim 960;
+#                                  cache write included). Same MAC count as
+#                                  the per-head GEA chain; no O-projection
+#                                  (the kernel chain stops at context_gemm).
+#   * prefill.attention.rows36.l76.d960 — GEA3-U3b -> the same cached row
+#                                  surface at T_p=36: q/k/v [36,960] into an
+#                                  empty L_max=76-admitted cache, causal,
+#                                  positions 0..35.
+#
+# Oracle method: query/key rows are all-zero, so scores are exactly zero,
+# every causal softmax row over its attended prefix is uniform, and the
+# context row equals the mean of the patterned value rows — an expected
+# value computable by a plain in-case loop through no library op. Kernel
+# cases (add/sum/matmul) use generator-pattern operands whose expected
+# probe values reduce to independent ascending-order accumulation loops
+# (bit-matching the library's own accumulation order).
+
+import from "gradus:math" math
+
+import from "gradus:tensor" tensor
+
+import from "gradus:attention" attention
+
+import from "gradus:cache" kv
+
+# -------------------------------------------------------------------------
+# Shared helpers
+# -------------------------------------------------------------------------
+
+# Staged construction (test data is always valid; the cape arm is
+# unreachable — the exempla tene precedent).
+fn tene(list<f32> data, list<int> shape) → tensor.NumericBlock {
+    var tensor.NumericBlock t ← tensor.default()
+    do {
+        t ← tensor.construct(data, shape)
+    }
+    catch err {
+        return t
+    }
+    return t
+}
+
+# Staged-result element read (swallow the never-firing access errors).
+fn e2(tensor.NumericBlock r, int i, int j) → f32 {
+    do {
+        return r.get([i, j])
+    }
+    catch err {
+        return 0.0
+    }
+}
+
+# Rank-1 staged-result read (math.sum over axis 1 of a rank-2 input).
+fn e1(tensor.NumericBlock r, int i) → f32 {
+    do {
+        return r.get([i])
+    }
+    catch err {
+        return 0.0
+    }
+}
+
+# One value-check line per run; FAIL panics so the harness observes a
+# non-zero exit (the § template carries the numbers).
+fn check_line(string label, f32 residual, f32 expected, f32 eps) → void {
+    if residual.abs() ≤ eps {
+        print "§: PASS residual=§ expected=§"(label, residual, expected)
+    }
+    else {
+        print "§: FAIL residual=§ expected=§"(label, residual, expected)
+        panic "value check failed"
+    }
+}
+
+# Patterned [320,960] operand: element (i,j) -> ((flat % 977) * 0.5).
+fn gradus_320x960() → tensor.NumericBlock {
+    var list<f32> data ← empty
+    for range 0‥307200 const i {
+        data.append(((i % 977) ↦ f32) * 0.5)
+    }
+    return tene(data, [320, 960])
+}
+
+# -------------------------------------------------------------------------
+# carrier.elementwise.add.f32.320x960 — math.add_carrier over the staged
+# carrier at the GEA1 tell-tale shape. Oracle: generator arithmetic.
+# -------------------------------------------------------------------------
+
+fn case_carrier_add(int k) → void {
+    const tensor.NumericBlock a ← gradus_320x960()
+    var tensor.NumericBlock b ← tensor.default()
+    do {
+        b ← tensor.fill([320, 960], 1.25)
+    }
+    catch err {
+        panic "fill failed"
+    }
+    const f32 expected ← (((313 * 960 + 7) % 977) ↦ f32) * 0.5 + 1.25
+    var f32 residual ← 0.0
+    for range 0‥k const n {
+        var tensor.NumericBlock out ← tensor.default()
+        do {
+            out ← math.add_carrier(a, b)
+        }
+        catch err {
+            panic "add_carrier failed"
+        }
+        residual ← residual + (e2(out, 313, 7) - expected)
+    }
+    check_line("carrier.elementwise.add.f32.320x960", residual, expected, 0.01)
+}
+
+# -------------------------------------------------------------------------
+# carrier.reduce.sum.f32.320x960 — math.sum over axis 1. Oracle: an
+# independent ascending-order accumulation over the generator pattern
+# (bit-matching math.sum's inner loop).
+# -------------------------------------------------------------------------
+
+fn case_carrier_sum(int k) → void {
+    const tensor.NumericBlock a ← gradus_320x960()
+    var f32 expected ← 0.0
+    for range 0‥960 const j {
+        expected ← expected + (((313 * 960 + j) % 977) ↦ f32) * 0.5
+    }
+    var f32 residual ← 0.0
+    for range 0‥k const n {
+        var tensor.NumericBlock out ← tensor.default()
+        do {
+            out ← math.sum(a, 1)
+        }
+        catch err {
+            panic "sum failed"
+        }
+        residual ← residual + (e1(out, 313) - expected)
+    }
+    check_line("carrier.reduce.sum.f32.320x960", residual, expected, 0.01)
+}
+
+# -------------------------------------------------------------------------
+# gemv.f32.320x960 — the GEA1 GEMV tell-tale as a carrier matmul row
+# [1,960] x [960,320] (substitution recorded in cases.toml). Oracle: the
+# probed dot product re-accumulated in the library's ascending order.
+# -------------------------------------------------------------------------
+
+fn case_gemv(int k) → void {
+    var list<f32> xd ← empty
+    for range 0‥960 const j {
+        xd.append(((j % 61) ↦ f32) * 0.5)
+    }
+    const tensor.NumericBlock x ← tene(xd, [1, 960])
+    var list<f32> wd ← empty
+    for range 0‥307200 const i {
+        wd.append(((((i % 320) + (i / 320)) % 7) ↦ f32) * 0.25 + 0.25)
+    }
+    const tensor.NumericBlock w ← tene(wd, [960, 320])
+    var f32 expected ← 0.0
+    for range 0‥960 const j {
+        expected ← expected + (((j % 61) ↦ f32) * 0.5) * ((((0 + j) % 7) ↦ f32) * 0.25 + 0.25)
+    }
+    var f32 residual ← 0.0
+    for range 0‥k const n {
+        var tensor.NumericBlock out ← tensor.default()
+        do {
+            out ← math.matmul(x, w)
+        }
+        catch err {
+            panic "matmul failed"
+        }
+        residual ← residual + (e2(out, 0, 0) - expected)
+    }
+    check_line("gemv.f32.320x960", residual, expected, 0.01)
+}
+
+# -------------------------------------------------------------------------
+# block.matmul.f32.t8.d960.f2560 — the GEA2 gemm_gate_up entry shape as a
+# carrier matmul [8,960] x [960,2560]. Oracle: probed output element
+# re-accumulated ascending over k.
+# -------------------------------------------------------------------------
+
+fn case_block_matmul(int k) → void {
+    var list<f32> ad ← empty
+    for range 0‥7680 const i {
+        ad.append(((i % 13) ↦ f32) * 0.5)
+    }
+    const tensor.NumericBlock a ← tene(ad, [8, 960])
+    var list<f32> wd ← empty
+    for range 0‥2457600 const i {
+        wd.append((((i % 11) ↦ f32) + 1.0) * 0.125)
+    }
+    const tensor.NumericBlock w ← tene(wd, [960, 2560])
+    var f32 expected ← 0.0
+    for range 0‥960 const p {
+        expected ← expected + (((p % 13) ↦ f32) * 0.5) * (((((p * 2560) % 11) ↦ f32) + 1.0) * 0.125)
+    }
+    var f32 residual ← 0.0
+    for range 0‥k const n {
+        var tensor.NumericBlock out ← tensor.default()
+        do {
+            out ← math.matmul(a, w)
+        }
+        catch err {
+            panic "matmul failed"
+        }
+        residual ← residual + (e2(out, 0, 0) - expected)
+    }
+    check_line("block.matmul.f32.t8.d960.f2560", residual, expected, 0.01)
+}
+
+# -------------------------------------------------------------------------
+# decode.attention.row76.d960 — one attention row over the 76-key window
+# (75 cached rows + the new row) at width 960 on the public cached
+# surface. Value rows carry the pattern f(j) = (j+1)*0.25; the zero-score
+# softmax is uniform, so the context row is the mean of the 76 value
+# rows. Oracle: plain loop over f(j).
+# -------------------------------------------------------------------------
+
+fn case_decode_attention(int k) → void {
+    # 75-row KV cache at dimension 960: zero keys, patterned values.
+    var list<f32> keys ← empty
+    var list<f32> vals ← empty
+    var list<int> priora ← empty
+    for range 0‥75 const j {
+        for range 0‥960 const c {
+            keys.append(0.0)
+            vals.append(((j + 1) ↦ f32) * 0.25)
+        }
+        priora.append(j)
+    }
+    var kv.KVCache layer ← kv.default()
+    do {
+        const kv.KVCache empty_layer ← kv.empty_cache("gradusbench", "gb2", "carrierrow", "none", 1, 960)
+        layer ← kv.extend(empty_layer, priora, tene(keys, [75, 960]), tene(vals, [75, 960]))
+    }
+    catch err {
+        panic "cache setup failed"
+    }
+    # New row at absolute position 75: zero q/k, value row f(75).
+    var tensor.NumericBlock q ← tensor.default()
+    var tensor.NumericBlock key ← tensor.default()
+    do {
+        q ← tensor.fill([1, 960], 0.0)
+        key ← tensor.fill([1, 960], 0.0)
+    }
+    catch err {
+        panic "row fill failed"
+    }
+    var list<f32> vd ← empty
+    for range 0‥960 const c {
+        vd.append(19.0)
+    }
+    const tensor.NumericBlock v ← tene(vd, [1, 960])
+    const f32 scale ← 0.03227487
+    var f32 expected ← 0.0
+    for range 0‥76 const j {
+        expected ← expected + ((j + 1) ↦ f32) * 0.25
+    }
+    const f32 expected_once ← expected / 76.0
+    var f32 residual ← 0.0
+    for range 0‥k const n {
+        var attention.CachedAttention step ← attention.default_cached()
+        do {
+            step ← attention.scaled_dot_product_causal_rope_cached(q, key, v, scale, [75], 960, layer, [7])
+        }
+        catch err {
+            panic "cached attention failed"
+        }
+        const tensor.NumericBlock context ← step.context()
+        residual ← residual + (e2(context, 0, 0) - expected_once) + (e2(context, 0, 959) - expected_once)
+    }
+    const f32 eps ← 0.001 * (k ↦ f32)
+    check_line("decode.attention.row76.d960", residual, expected_once, eps)
+}
+
+# -------------------------------------------------------------------------
+# prefill.attention.rows36.l76.d960 — the 36-row prefill window into the
+# L_max=76-admitted cache at width 960, causal. Value rows f(i) =
+# (i+1)*0.25; row i's uniform-softmax context is the mean of f(0..i).
+# Oracle probes row 35 (full 36-key prefix) and row 0.
+# -------------------------------------------------------------------------
+
+fn case_prefill_attention(int k) → void {
+    var kv.KVCache layer ← kv.default()
+    do {
+        layer ← kv.empty_cache("gradusbench", "gb2", "carrierrow", "none", 1, 960)
+    }
+    catch err {
+        panic "cache setup failed"
+    }
+    var tensor.NumericBlock q ← tensor.default()
+    var tensor.NumericBlock key ← tensor.default()
+    do {
+        q ← tensor.fill([36, 960], 0.0)
+        key ← tensor.fill([36, 960], 0.0)
+    }
+    catch err {
+        panic "row fill failed"
+    }
+    var list<f32> vd ← empty
+    var list<int> positions ← empty
+    for range 0‥36 const i {
+        for range 0‥960 const c {
+            vd.append(((i + 1) ↦ f32) * 0.25)
+        }
+        positions.append(i)
+    }
+    const tensor.NumericBlock v ← tene(vd, [36, 960])
+    const f32 scale ← 0.03227487
+    var f32 expected_full ← 0.0
+    for range 0‥36 const i {
+        expected_full ← expected_full + ((i + 1) ↦ f32) * 0.25
+    }
+    const f32 expected_once ← expected_full / 36.0
+    var f32 residual ← 0.0
+    for range 0‥k const n {
+        var attention.CachedAttention step ← attention.default_cached()
+        do {
+            step ← attention.scaled_dot_product_causal_rope_cached(q, key, v, scale, positions, 960, layer, positions)
+        }
+        catch err {
+            panic "cached attention failed"
+        }
+        const tensor.NumericBlock context ← step.context()
+        residual ← residual + (e2(context, 35, 0) - expected_once) + (e2(context, 0, 0) - 0.25)
+    }
+    const f32 eps ← 0.001 * (k ↦ f32)
+    check_line("prefill.attention.rows36.l76.d960", residual, expected_once, eps)
+}
+
+# -------------------------------------------------------------------------
+# Entry — CLI label dispatch (@ operand binding; no norma import so the
+# pinned radix+hosts+gradus scratch triple resolves every import).
+# -------------------------------------------------------------------------
+
+@ cli "gradus-bench"
+@ description "gradus bench case package (GB-U2)"
+@ operand string label description "case label from cases.toml"
+@ operand int iterations description "fixed-iteration loop count K"
+main args args {
+    const int k ← args.iterations
+    if k ≤ 0 then panic "iterations must be positive"
+    var bool matched ← false
+    if args.label ≡ "carrier.elementwise.add.f32.320x960" {
+        case_carrier_add(k)
+        matched ← true
+    }
+    if args.label ≡ "carrier.reduce.sum.f32.320x960" {
+        case_carrier_sum(k)
+        matched ← true
+    }
+    if args.label ≡ "gemv.f32.320x960" {
+        case_gemv(k)
+        matched ← true
+    }
+    if args.label ≡ "block.matmul.f32.t8.d960.f2560" {
+        case_block_matmul(k)
+        matched ← true
+    }
+    if args.label ≡ "decode.attention.row76.d960" {
+        case_decode_attention(k)
+        matched ← true
+    }
+    if args.label ≡ "prefill.attention.rows36.l76.d960" {
+        case_prefill_attention(k)
+        matched ← true
+    }
+    if not matched {
+        panic "unknown label (runnable labels: carrier.elementwise.add.f32.320x960 carrier.reduce.sum.f32.320x960 gemv.f32.320x960 block.matmul.f32.t8.d960.f2560 decode.attention.row76.d960 prefill.attention.rows36.l76.d960; check.library.compile is a faber-check route, see cases.toml): " + args.label
+    }
+}
