@@ -1,6 +1,6 @@
 # GOAL: bench-harness — repeatable gradus bench pinned to the radix+hosts+gradus triple, with committed baselines
 
-**Status**: active — GB-U1 landed (hand `c212004`, fold `f85272b`), GB-U2 landed (hand `e5f658f`, fold `f2d3595`), GB-U3 landed (hand `d85c3c9`, fold `19937dc`; full 7-label sweep RUN_EXIT 0, checker self-compare green — battery-labeled format evidence, GB-U4 capture requires AC). Stage-ladder amendment admitted (operator rulings `1309af45`/`88895a02`/`d3cc0123`; planner `8add67c0` + ruling-3 resume): §Stage ladder added, GB-U3b next, GB-U4/GB-U5 ordering invariants extended to the ladder. No baseline captured yet.
+**Status**: active — GB-U1 fold `f85272b`; GB-U2 fold `f2d3595`; GB-U3 fold `19937dc`; GB-U3b landed `71ab87a` (fold `c3bb796`: stage ladder measured — smoke 45 s / dev 2 m22 s default / rough 7 m14 s all-7 at 1+2 / full 31 m42 s byte-preserving; every stage self-compare green; K unshrunk; stage identity + comparability in metadata). GB-U4 (baseline capture + gate wrapper) is NEXT and AC-GATED: machine on battery at dispatch time; capture requires AC per done_when (a) — dispatches when the machine is on AC (or the operator rules a battery-labeled capture). No baseline captured yet.
 **Created**: 2026-08-27
 **Campaign:** `—` (standalone; operator pause-exception order 2026-08-27 morning, task `076e7a1a`)
 **Source:** operator order (verbatim requirements 1–4 in §Problem); routed by mind task `076e7a1a`
@@ -443,7 +443,7 @@ valid history either way (append-only, never rewritten).
 | GB-U1 | pin-and-build driver: `scripta/bench` materialize+build (detached worktrees at 3 hashes, release faber, `faber doctor` proof) + `clean` teardown (worktree remove/prune; registrations never accumulate) | — | landed `c212004` (fold `f85272b`) |
 | GB-U2 | bench case package: `bench/` Faber package, 7 labels at GEA tell-tale shapes + manifest (class + work-unit/metric fields + `cap_s` per case) | — | landed `e5f658f` (fold `f2d3595`) |
 | GB-U3 | run loop + emitter: 3/10 sampling, caps as circuit breakers, checker-format JSON (median_ms + t/s metric fields) + environment-identity metadata | GB-U1, GB-U2 | landed `d85c3c9` (fold `19937dc`) |
-| GB-U3b | stage ladder on `scripta/bench run`: `--stage smoke/dev/rough/full` (+`1-4`, `--full`), `--label` subsets, manifest `smoke_label`/`dev_labels`, stage identity in metadata, default = dev | GB-U3 | pending |
+| GB-U3b | stage ladder on `scripta/bench run`: `--stage smoke/dev/rough/full` (+`1-4`, `--full`), `--label` subsets, manifest `smoke_label`/`dev_labels`, stage identity in metadata, default = dev | GB-U3 | landed 71ab87a (fold c3bb796) |
 | GB-U4 | baseline capture + gate wrapper: committed dated 3-hash baseline + receipt; gate comparability refusal + green/red proofs | GB-U3, GB-U3b | none |
 | GB-U5 | reproduction proof: fresh materialization from the recorded triple, gate PASS, receipt rider | GB-U4 | none |
 | GB-U6 | AGENTS.md Benchmarks law + `docs/benchmark-method.md` v1.1.0 amendment | GB-U5 | none |
@@ -518,7 +518,7 @@ baseline receipt.
 | GB-U1 pin-and-build driver | landed | hand | `c212004` (fold `f85272b`) | `scripta/bench` materialize+build |
 | GB-U2 bench case package | landed | hand | `e5f658f` (fold `f2d3595`) | `bench/` package, 7 labels |
 | GB-U3 run loop + JSON emitter | landed | hand | `d85c3c9` (fold `19937dc`) | full sweep RUN_EXIT 0; self-compare green; battery-labeled format evidence |
-| GB-U3b stage ladder | pending — awaiting dispatch | — | — | operator rulings `1309af45`/`88895a02`/`d3cc0123` |
+| GB-U3b stage ladder | landed | hand | `71ab87a` (fold `c3bb796`) | measured: smoke 45 s, dev 2 m22 s (default), rough 7 m14 s all-7, full 31 m42 s; self-compares green at every stage |
 | GB-U4 baseline capture + gate wrapper | pending | — | — | first committed baseline; requires AC power |
 | GB-U5 reproduction proof | pending | — | — | 3-hash rerun PASS |
 | GB-U6 AGENTS.md law + method v1.1.0 | pending | — | — | requirement 4 |
