@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Bench pin-and-build driver (bench-harness delivery GB-U1) and run
-loop + JSON emitter (GB-U3).
+"""Bench pin-and-build driver (bench-harness delivery GB-U1), run
+loop + JSON emitter (GB-U3), and stage ladder (GB-U3b).
 
 materialize  detached git worktrees of radix/hosts/gradus at explicit
              hashes into a scratch root outside all repos
 build        release faber from the pinned radix worktree
-run          sample the pinned bench manifest (3 warmups / 10 samples
-             per case, benchmark-method §4.3) and emit
+run          sample the pinned bench manifest on the four-stage ladder
+             (goal §Stage ladder) and emit
              check-benchmark-regression-format JSON with the
              environment-identity metadata block
 clean        worktree remove --force + prune in each source repo, then
@@ -36,10 +36,20 @@ Run laws (delivery.md GB-U3; goal §Run loop + §Perf-taxonomy):
   from the pinned gradus worktree inside the scratch root, so a run is
   attached to the recorded triple (reproducibility law); the harness
   itself may run from a dev checkout — the pinned tree is what is timed;
-* protocol is pinned: 3 discarded warmups + 10 measured samples of
-  `faber run`/`faber check` wall time per case, K iterations per case
-  from the manifest (benchmark-method §4.3; K calibrated so the op loop
-  dominates process startup);
+* protocol is pinned at the top stage: 3 discarded warmups + 10 measured
+  samples of `faber run`/`faber check` wall time per case, K iterations
+  per case from the manifest (benchmark-method §4.3; K calibrated so the
+  op loop dominates process startup); lesser ladder stages reduce
+  warmup/sample counts and label breadth only — never K;
+* the stage ladder (GB-U3b; goal §Stage ladder, operator rulings
+  1309af45/88895a02/d3cc0123) controls both knobs — label breadth ×
+  repetition depth: smoke (1 label, 1 warmup + 3 samples), dev
+  (2 labels, 1/3; the no-flag default), rough (all labels, 1 warmup +
+  2 samples — the full-breadth rough pass), full (all labels, 3/10 —
+  the byte-preserved GB-U3 protocol, the only gate-comparable shape);
+  `--label` picks an explicit subset at the selected stage's sampling
+  (iteration-signal only); K never shrinks on any stage, so per-sample
+  t/s math is identical across the ladder;
 * runtime caps are safety circuit breakers only — never a metric, never
   pass/fail: a sample exceeding `cap_s` is killed at the cap and records
   its valid t/s plus `capped: true`, and the run does not fail;
@@ -82,12 +92,30 @@ DEFAULT_MIN_FREE_GB = 10.0
 DEFAULT_DISK_FLOOR_GB = 1.0
 BYTES_PER_GIB = 1024**3
 
-# GB-U3 run-loop law (benchmark-method §4.3, unchanged by the harness).
+# GB-U3 run-loop law (benchmark-method §4.3, unchanged by the harness) —
+# the full-stage protocol, byte-preserved as the ladder's top stage.
 WARMUPS = 3
 SAMPLES = 10
 CHECKER_FORMAT_VERSION = "1"
 BENCH_MANIFEST = Path("bench") / "cases.toml"  # inside the pinned gradus worktree
 DEFAULT_CAP_S = 60  # per goal §Perf-taxonomy; overridable per case in the manifest
+
+# Stage ladder (GB-U3b; goal §Stage ladder): both knobs per stage — label
+# breadth × repetition depth. Full keeps WARMUPS/SAMPLES above exactly; no
+# stage exceeds it, and K (manifest iterations) never shrinks on any stage.
+STAGE_LADDER = {
+    "smoke": {"number": 1, "warmups": 1, "samples": 3},
+    "dev": {"number": 2, "warmups": 1, "samples": 3},
+    "rough": {"number": 3, "warmups": 1, "samples": 2},
+    "full": {"number": 4, "warmups": WARMUPS, "samples": SAMPLES},
+}
+STAGE_TOKENS = {
+    **{name: name for name in STAGE_LADDER},
+    "1": "smoke", "2": "dev", "3": "rough", "4": "full",
+}
+DEFAULT_STAGE = "dev"  # no-flag run = stage 2 dev (operator default dev mode)
+DEFAULT_SMOKE_LABEL = "gemv.f32.320x960"  # cheapest measured (goal table)
+DEFAULT_DEV_LABELS = ("gemv.f32.320x960", "carrier.reduce.sum.f32.320x960")
 
 SCRIPT = Path(__file__).resolve()
 GRADUS_ROOT = SCRIPT.parents[1]
@@ -415,9 +443,12 @@ def sysctl(name: str) -> str | None:
     return probe(["sysctl", "-n", name])
 
 
-def load_manifest(scratch: Path) -> list[dict]:
+def load_manifest(scratch: Path) -> dict:
     """Read bench/cases.toml from the pinned gradus worktree (the run is
-    attached to the recorded triple) and fail closed on taxonomy gaps."""
+    attached to the recorded triple) and fail closed on taxonomy gaps.
+    Returns the case list plus the ladder label-breadth fields
+    (`smoke_label` / `dev_labels`; goal-table defaults when the pinned
+    manifest predates GB-U3b)."""
     path = scratch / "gradus" / BENCH_MANIFEST
     if not path.is_file():
         raise BenchError(
@@ -468,7 +499,25 @@ def load_manifest(scratch: Path) -> list[dict]:
         cap = entry.get("cap_s", DEFAULT_CAP_S)
         if isinstance(cap, bool) or not isinstance(cap, (int, float)) or cap <= 0:
             raise BenchError("manifest-invalid", f"{label}: cap_s must be a positive number")
-    return cases
+
+    smoke_label = data.get("smoke_label", DEFAULT_SMOKE_LABEL)
+    if not isinstance(smoke_label, str) or smoke_label not in seen:
+        raise BenchError(
+            "manifest-invalid",
+            f"{path}: smoke_label {smoke_label!r} is not a manifest label",
+        )
+    dev_labels = data.get("dev_labels", list(DEFAULT_DEV_LABELS))
+    if (
+        not isinstance(dev_labels, list)
+        or not 1 <= len(dev_labels) <= 2  # dev mode = 1-2 tests at most (ruling 88895a02)
+        or any(not isinstance(label, str) or label not in seen for label in dev_labels)
+        or len(set(dev_labels)) != len(dev_labels)
+    ):
+        raise BenchError(
+            "manifest-invalid",
+            f"{path}: dev_labels {dev_labels!r} must be 1-2 distinct manifest labels",
+        )
+    return {"cases": cases, "smoke_label": smoke_label, "dev_labels": dev_labels}
 
 
 def case_command(faber: Path, scratch: Path, case: dict) -> list[str]:
@@ -532,50 +581,105 @@ def check_observed(case: dict, sample: dict) -> bool:
     )
 
 
-def run_case(scratch: Path, faber: Path, case: dict, env: dict) -> dict:
+def select_labels(
+    stage: str, manifest: dict, explicit: list[str] | None
+) -> tuple[list[str], str]:
+    """Ladder label breadth (goal §Stage ladder): the stage's label set,
+    or the explicit `--label` subset at the same sampling. Explicit
+    subsets are iteration-signal only — never gate input."""
+    if explicit:
+        known = {case["label"] for case in manifest["cases"]}
+        unknown = [label for label in explicit if label not in known]
+        if unknown:
+            raise BenchError(
+                "label-unknown",
+                f"--label {', '.join(unknown)}: not in the pinned manifest "
+                f"(labels: {', '.join(sorted(known))})",
+            )
+        selected: list[str] = []
+        for label in explicit:
+            if label not in selected:
+                selected.append(label)
+        return selected, "explicit"
+    if stage == "smoke":
+        return [manifest["smoke_label"]], "stage"
+    if stage == "dev":
+        return list(manifest["dev_labels"]), "stage"
+    return [case["label"] for case in manifest["cases"]], "stage"
+
+
+def comparability_note(stage: str, label_mode: str, labels: list[str], cases: list[dict]) -> str:
+    """Protocol identity for the GB-U4 wrapper: only the exact full shape
+    (stage full, no explicit subset, all manifest labels) is
+    gate-comparable; everything else is iteration-signal only."""
+    if (
+        stage == "full"
+        and label_mode == "stage"
+        and len(labels) == len(cases)
+    ):
+        return (
+            "gate-comparable: stage full, warmups 3 / samples 10, all "
+            "manifest labels — the only gate-comparable shape "
+            "(goal §Stage ladder)"
+        )
+    return (
+        "iteration-signal only: recorded protocol is not the full "
+        "3/10 all-manifest-label capture shape; the GB-U4 gate wrapper "
+        "refuses it as NOT COMPARABLE"
+    )
+
+
+def run_case(
+    scratch: Path,
+    faber: Path,
+    case: dict,
+    env: dict,
+    warmups: int,
+    samples: int,
+) -> dict:
     label = case["label"]
     cap_s = float(case.get("cap_s", DEFAULT_CAP_S))
     iterations = case["iterations"]
     command = case_command(faber, scratch, case)
 
-    for index in range(WARMUPS):
+    for index in range(warmups):
         sample = timed_sample(command, cap_s, env, scratch)
         state = (
             "capped" if sample["capped"]
             else ("ok" if check_observed(case, sample) else "FAILED")
         )
         print(
-            f"bench: {label} warmup {index + 1}/{WARMUPS} "
+            f"bench: {label} warmup {index + 1}/{warmups} "
             f"wall={sample['wall_s']:.3f}s {state}",
             file=sys.stderr,
         )
 
     units_per_sample = iterations * case["units_per_iteration"]
-    samples: list[dict] = []
-    for index in range(SAMPLES):
+    samples_list: list[dict] = []
+    for index in range(samples):
         sample = timed_sample(command, cap_s, env, scratch)
         sample["observed"] = (not sample["capped"]) and check_observed(case, sample)
         # t/s law (goal §Perf-taxonomy): units produced (K ×
         # units_per_iteration) over min(sample wall, cap_s). A capped sample
         # keeps its valid t/s and is marked; caps never gate anything.
         sample["units_per_s"] = units_per_sample / min(sample["wall_s"], cap_s)
-        samples.append(sample)
+        samples_list.append(sample)
         state = "capped" if sample["capped"] else ("ok" if sample["observed"] else "FAILED")
         print(
-            f"bench: {label} sample {index + 1}/{SAMPLES} "
+            f"bench: {label} sample {index + 1}/{samples} "
             f"wall={sample['wall_s']:.3f}s {state}",
             file=sys.stderr,
         )
 
-    walls_ms = [sample["wall_s"] * 1000.0 for sample in samples]
-    failures = [s for s in samples if not s["capped"] and not s["observed"]]
-    verified = [s for s in samples if s["observed"]]
+    walls_ms = [sample["wall_s"] * 1000.0 for sample in samples_list]
+    failures = [s for s in samples_list if not s["capped"] and not s["observed"]]
+    verified = [s for s in samples_list if s["observed"]]
     return {
         "label": label,
         "median_ms": round(statistics.median(walls_ms), 3),
         "min_ms": round(min(walls_ms), 3),
         "max_ms": round(max(walls_ms), 3),
-        "samples": SAMPLES,
+        "samples": samples,
         "iterations": iterations,
         "ok": bool(verified) and not failures,
         "class": case["class"],
@@ -583,14 +687,24 @@ def run_case(scratch: Path, faber: Path, case: dict, env: dict) -> dict:
         "throughput": case.get("throughput", "units/s"),
         "units_per_sample": units_per_sample,
         "median_units_per_s": round(
-            statistics.median([s["units_per_s"] for s in samples]), 6
+            statistics.median([s["units_per_s"] for s in samples_list]), 6
         ),
-        "capped": any(sample["capped"] for sample in samples),
+        "capped": any(sample["capped"] for sample in samples_list),
         "tier": case.get("tier", "cpu-reference"),
     }
 
 
-def collect_metadata(scratch: Path, triple: dict, faber: Path, cases: list[dict]) -> dict:
+def collect_metadata(
+    scratch: Path,
+    triple: dict,
+    faber: Path,
+    cases: list[dict],
+    stage: str,
+    warmups: int,
+    samples: int,
+    labels: list[str],
+    label_mode: str,
+) -> dict:
     """Environment-identity block (done_when b). Missing-any-voids-the-claim:
     every field records a value or an explicit 'unavailable'."""
     mac = sys.platform == "darwin"
@@ -661,6 +775,8 @@ def collect_metadata(scratch: Path, triple: dict, faber: Path, cases: list[dict]
 
     return {
         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "stage": stage,
+        "stage_number": STAGE_LADDER[stage]["number"],
         "hostname": platform.node() or socket.gethostname() or "unavailable",
         "machine_model": machine_model,
         "cpu": cpu,
@@ -686,8 +802,9 @@ def collect_metadata(scratch: Path, triple: dict, faber: Path, cases: list[dict]
             "target_dir": str(scratch / "radix" / "target"),
         },
         "protocol": {
-            "warmups": WARMUPS,
-            "samples": SAMPLES,
+            "warmups": warmups,
+            "samples": samples,
+            "label_selection": {"mode": label_mode, "labels": labels},
             "iterations": {case["label"]: case["iterations"] for case in cases},
             "timer": "wall clock — time.monotonic seconds around the faber "
             "process (benchmark-method §4.3)",
@@ -703,10 +820,19 @@ def collect_metadata(scratch: Path, triple: dict, faber: Path, cases: list[dict]
             "t/s plus capped=true",
         },
         "citations": CITATIONS,
+        "comparability": comparability_note(stage, label_mode, labels, cases),
     }
 
 
 def cmd_run(args: argparse.Namespace) -> int:
+    if args.full and args.stage:
+        raise BenchError(
+            "stage-conflict", "--full and --stage are mutually exclusive; pick one"
+        )
+    stage = STAGE_TOKENS[args.stage or ("full" if args.full else DEFAULT_STAGE)]
+    spec = STAGE_LADDER[stage]
+    warmups, samples = spec["warmups"], spec["samples"]
+
     scratch = single_scratch(args.scratch)
     triple = load_triple(scratch)
     verify_triple(scratch, triple)
@@ -715,7 +841,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         raise BenchError(
             "no-build", f"{faber} is missing; run `bench build` before `bench run`"
         )
-    cases = load_manifest(scratch)
+    manifest = load_manifest(scratch)
+    cases = manifest["cases"]
     if any(case["route"] == "run" for case in cases) and not (
         scratch / "gradus" / "bench" / "faber.toml"
     ).is_file():
@@ -724,6 +851,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             f"{scratch / 'gradus' / 'bench'} has no faber.toml (pinned gradus "
             f"predates the GB-U2 bench package)",
         )
+    labels, label_mode = select_labels(stage, manifest, args.label)
+    selected = [case for case in cases if case["label"] in labels]
 
     env = os.environ.copy()
     # gradus:* imports resolve to the pinned gradus worktree (check-compile seam).
@@ -731,13 +860,19 @@ def cmd_run(args: argparse.Namespace) -> int:
     # compiled-arm-only seam (runtime_sources.rs); keep the MIR arm deterministic
     env.pop("FABER_SUPPORT_PATH_OVERRIDE", None)
 
-    metadata = collect_metadata(scratch, triple, faber, cases)
+    metadata = collect_metadata(
+        scratch, triple, faber, cases, stage, warmups, samples, labels, label_mode
+    )
     print(
-        f"bench: run {len(cases)} labels at radix {triple['radix'][:7]} "
+        f"bench: run stage {stage} ({spec['number']}) — {len(selected)} label(s) "
+        f"[{label_mode} selection], {warmups} warmup + {samples} sample(s) per "
+        f"label, K per manifest; radix {triple['radix'][:7]} "
         f"hosts {triple['hosts'][:7]} gradus {triple['gradus'][:7]}",
         file=sys.stderr,
     )
-    rows = [run_case(scratch, faber, case, env) for case in cases]
+    rows = [
+        run_case(scratch, faber, case, env, warmups, samples) for case in selected
+    ]
     document = {
         "format_version": CHECKER_FORMAT_VERSION,
         "metadata": metadata,
@@ -873,10 +1008,36 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = sub.add_parser(
         "run",
-        help="sample the pinned bench manifest (3 warmups / 10 samples per "
-        "case) and emit checker-format JSON",
+        help="sample the pinned bench manifest on the stage ladder and "
+        "emit checker-format JSON (default: stage 2 dev)",
     )
     run.add_argument("--scratch", metavar="DIR", help="scratch root to run against")
+    run.add_argument(
+        "--stage",
+        choices=sorted(STAGE_TOKENS),
+        default=None,
+        metavar="STAGE",
+        help=(
+            "ladder stage by name or number — smoke|dev|rough|full ≡ 1|2|3|4 "
+            "(goal §Stage ladder: smoke 1 label, 1 warmup + 3 samples; dev "
+            "2 labels, 1/3; rough all labels, 1 warmup + 2 samples; full "
+            "all labels, 3/10, the byte-preserved capture protocol). "
+            "Default: dev (stage 2, the operator fast path)"
+        ),
+    )
+    run.add_argument(
+        "--full",
+        action="store_true",
+        help="alias for --stage full — the 3-warmup/10-sample all-label "
+        "protocol, the only gate-comparable shape",
+    )
+    run.add_argument(
+        "--label",
+        action="append",
+        metavar="LABEL",
+        help="explicit label subset at the selected stage's sampling "
+        "(repeatable; iteration-signal only, never gate input)",
+    )
     run.add_argument(
         "--out",
         metavar="FILE",
