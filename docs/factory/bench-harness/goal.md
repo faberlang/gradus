@@ -1,6 +1,6 @@
 # GOAL: bench-harness — repeatable gradus bench pinned to the radix+hosts+gradus triple, with committed baselines
 
-**Status**: active — GB-U1 fold `f85272b`; GB-U2 fold `f2d3595`; GB-U3 fold `19937dc`; GB-U3b fold `c3bb796`; GB-U3c fold `4158a2b`; GB-U4 fold `15c643e` — **FIRST BASELINE COMMITTED** (`bench/baselines/baseline-20260827-re792964-hc9cfb5a-g536b7ab.{json,md}`: AC capture, unanimous `power_class: ac`, ordering invariant proven pre-write; gate green/red + all four NOT COMPARABLE refusals at distinct exits 3-6; full-sweep wall 21.1 min on AC vs 30-35 battery — real signal, honestly recorded). GB-U5 (reproduction from the recorded triple) running; GB-U6 (AGENTS.md law) last.
+**Status**: active — ALL EIGHT UNITS LANDED: GB-U1 `f85272b`; GB-U2 `f2d3595`; GB-U3 `19937dc`; GB-U3b `c3bb796`; GB-U3c `4158a2b`; GB-U4 `15c643e` (first baseline, AC unanimous); GB-U5 `533121e` (reproduction PASS — worst +0.96%, noise floor ~±1%); GB-U6 `a8c0182` (AGENTS.md §Benchmarks law + benchmark-method v1.1.0). Acceptance 1-9 evidenced by unit receipts. End-of-goal audit dispatching; on pass → done + archive. The gradus polish wave OPENS (bench-before-polish ordering satisfied).
 **Created**: 2026-08-27
 **Campaign:** `—` (standalone; operator pause-exception order 2026-08-27 morning, task `076e7a1a`)
 **Source:** operator order (verbatim requirements 1–4 in §Problem); routed by mind task `076e7a1a`
@@ -603,5 +603,5 @@ baseline receipt.
 | GB-U3b stage ladder | landed | hand | `71ab87a` (fold `c3bb796`) | measured: smoke 45 s, dev 2 m22 s (default), rough 7 m14 s all-7, full 31 m42 s; self-compares green at every stage |
 | GB-U3c per-row power-state capture | landed | hand | `407a9df` (fold `4158a2b`) | smoke rows labeled live; mock transition → mixed; additive-only diff; unavailable proven |
 | GB-U4 baseline capture + gate wrapper | landed | hand | `536b7ab`+`9ceeb71` (fold `15c643e`) | first baseline at radix e792964/hosts c9cfb5a/gradus 536b7ab; AC unanimous; refusals at exits 3-6 |
-| GB-U5 reproduction proof | pending | — | — | 3-hash rerun PASS |
-| GB-U6 AGENTS.md law + method v1.1.0 | pending | — | — | requirement 4 |
+| GB-U5 reproduction proof | landed | hand | `7ed603e` (fold `533121e`) | gate PASS default threshold; worst +0.96%; noise floor ~±1% |
+| GB-U6 AGENTS.md law + method v1.1.0 | landed | hand | `17dd979` (fold `a8c0182`) | requirement 4; both law families carried |
