@@ -33,12 +33,13 @@ locale = "en"
 #                         bert-gradus-probe train.fab:369
 #
 # PML3-U1 (production-ml-library/pml3-delivery.md): the PRODUCTION surface —
-# shape-generic forward-only primitives over the PML1 staged tensor carrier
-# (gradus:tensor NumericBlock): linear, gelu, layernorm. They compose the PML1
-# operation families (gradus:math matmul/add) and the staged carrier; they
-# do NOT use the compiler's typed-tensor ops (tensor<f32, [...]>), so their
-# shapes are runtime facts (R3: no one-row/one-shape narrowing in the public
-# API). Every failure is a typed NnError with a text message.
+# shape-generic forward-only primitives. The activation/norm rows are typed
+# static-shape kernel twins on the compiler tensor (linear, rmsnorm,
+# swiglu_hidden, gelu, silu); the staged NumericBlock residuals carry the
+# runtime-shape paths under explicit *_carrier names (linear_carrier,
+# rmsnorm_carrier, gelu_carrier, silu_carrier) beside the still-staged
+# layernorm (R3: no one-row/one-shape narrowing in the public API). Every
+# failure is a typed NnError with a text message.
 #
 # --- Autograd independence (PML3 thesis, forward-without-autograd) --------
 # This module imports NO autograd surface: no gradus:gradient, no @ radix
@@ -129,7 +130,7 @@ fn linear_4x4(tensor<f32, [4, 4]> input, tensor<f32, [4, 4]> weight, tensor<f32,
 
 @ public
 fn gelu_4x4(tensor<f32, [4, 4]> x) → tensor<f32, [4, 4]> ⇥ NnError {
-    const tensor.NumericBlock y ← gelu(_staged(x ↦ list<f32>, [4, 4]))
+    const tensor.NumericBlock y ← gelu_carrier(_staged(x ↦ list<f32>, [4, 4]))
     do {
         return y.data ↦ tensor<f32, [4, 4]>
     }
@@ -179,7 +180,7 @@ fn layernorm_2x8(tensor<f32, [2, 8]> x, tensor<f32, [8]> scale, tensor<f32, [8]>
 
 @ public
 fn gelu_2x8(tensor<f32, [2, 8]> x) → tensor<f32, [2, 8]> ⇥ NnError {
-    const tensor.NumericBlock y ← gelu(_staged(x ↦ list<f32>, [2, 8]))
+    const tensor.NumericBlock y ← gelu_carrier(_staged(x ↦ list<f32>, [2, 8]))
     do {
         return y.data ↦ tensor<f32, [2, 8]>
     }
@@ -421,13 +422,23 @@ fn linear_carrier(tensor.NumericBlock x, tensor.NumericBlock w, tensor.NumericBl
 }
 
 # -------------------------------------------------------------------------
-# Family: gelu — GELU activation, elementwise over the staged carrier.
-# Shape and dtype are preserved; the F32 row is the admitted row (any other
-# tag fails closed).
+# Family: gelu — GELU activation. Production twin is typed [M, N] on the
+# compiler tensor: the `.gelu()` method (the tanh approximation of the
+# compiler identity — the same contract as the scalar walk below, never a
+# different approximation). Staged carriers and non-rank-2 shapes stay on
+# gelu_carrier (SEM005 — no same-name overload).
 # -------------------------------------------------------------------------
 
+@ kernel
 @ public
-fn gelu(tensor.NumericBlock x) → tensor.NumericBlock ⇥ NnError {
+fn gelu<size M, size N>(tensor<f32, [M, N]> x) → tensor<f32, [M, N]> {
+    return x.gelu()
+}
+
+# gelu_carrier — load-edge staged residual. Same scalar walk and F32 gate
+# as the former production gelu; not the production name (SEM005).
+@ public
+fn gelu_carrier(tensor.NumericBlock x) → tensor.NumericBlock ⇥ NnError {
     _dtype_f32(x)
     # legacy-L3: shape recovery pending shape-binding/S0-R1.
     const list<int> f ← x.shape()
@@ -595,13 +606,24 @@ fn rmsnorm_carrier(tensor.NumericBlock x, tensor.NumericBlock γ, f32 ε) → te
 }
 
 # -------------------------------------------------------------------------
-# Family: silu — SiLU activation, elementwise over the staged carrier.
+# Family: silu — SiLU activation. Production twin is typed [M, N] on the
+# compiler tensor: the `.silu()` method (the proven device idiom — GI3-1,
+# composed x/(1+exp(-x)) lowering). Staged carriers and non-rank-2 shapes
+# stay on silu_carrier (SEM005 — no same-name overload).
 #   silu(x) = x·sigmoid(x); shape and dtype are preserved; the F32 row is
 #   the admitted row (any other tag fails closed).
 # -------------------------------------------------------------------------
 
+@ kernel
 @ public
-fn silu(tensor.NumericBlock x) → tensor.NumericBlock ⇥ NnError {
+fn silu<size M, size N>(tensor<f32, [M, N]> x) → tensor<f32, [M, N]> {
+    return x.silu()
+}
+
+# silu_carrier — load-edge staged residual. Same scalar walk and F32 gate
+# as the former production silu; not the production name (SEM005).
+@ public
+fn silu_carrier(tensor.NumericBlock x) → tensor.NumericBlock ⇥ NnError {
     _dtype_f32(x)
     # legacy-L3: shape recovery pending shape-binding/S0-R1.
     const list<int> f ← x.shape()
@@ -617,7 +639,7 @@ fn silu(tensor.NumericBlock x) → tensor.NumericBlock ⇥ NnError {
 
 # -------------------------------------------------------------------------
 # Family: swiglu — the SwiGLU gated-MLP row over the staged carrier:
-#   h = silu(gate) ⊙ up; y = linear(h, down_weight, down_bias).
+#   h = silu_carrier(gate) ⊙ up; y = linear(h, down_weight, down_bias).
 #   gate [M,F] and up [M,F] must share the same rank-2 shape; down_weight
 #   is [F,N]; down_bias is [N] (per-channel) or [M,N] (same-shape) — the
 #   linear bias contracts. No fixed-shape constants; the F32 row is the
@@ -633,7 +655,7 @@ fn swiglu(tensor.NumericBlock gate, tensor.NumericBlock up, tensor.NumericBlock 
     require fg.length() ≡ 2 throw variant GradusMismatch {message = "swiglu requires rank-2 gate and up"}
     require fu.length() ≡ 2 throw variant GradusMismatch {message = "swiglu requires rank-2 gate and up"}
     require fg ≡ fu throw variant ShapeMismatch {message = "gate and up must share the same shape"}
-    const tensor.NumericBlock g ← silu(gate)
+    const tensor.NumericBlock g ← silu_carrier(gate)
     const tensor.NumericBlock h ← math.mul_carrier(g, up)
     return linear_carrier(h, down_weight, down_bias)
 }
