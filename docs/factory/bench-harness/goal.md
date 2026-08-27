@@ -1,10 +1,25 @@
 # GOAL: bench-harness — repeatable gradus bench pinned to the radix+hosts+gradus triple, with committed baselines
 
-**Status**: planned — forged + checked 2026-08-27 (verdict READY); delivery filed (`delivery.md`); awaiting Hand dispatch
+**Status**: active — GB-U1 landed (hand `c212004`, fold `f85272b`), GB-U2 landed (hand `e5f658f`, fold `f2d3595`), GB-U3 landed (hand `d85c3c9`, fold `19937dc`; full 7-label sweep RUN_EXIT 0, checker self-compare green — battery-labeled format evidence, GB-U4 capture requires AC). Stage-ladder amendment admitted (operator rulings `1309af45`/`88895a02`/`d3cc0123`; planner `8add67c0` + ruling-3 resume): §Stage ladder added, GB-U3b next, GB-U4/GB-U5 ordering invariants extended to the ladder. No baseline captured yet.
 **Created**: 2026-08-27
 **Campaign:** `—` (standalone; operator pause-exception order 2026-08-27 morning, task `076e7a1a`)
 **Source:** operator order (verbatim requirements 1–4 in §Problem); routed by mind task `076e7a1a`
 **Amended:** 2026-08-27 — audit `c4f621fa` fix pass: operator perf-taxonomy folded (addendum mail `46ab4e94`, delivered via mind task `06a9cf0b`; §Perf-taxonomy), scratch-worktree teardown added to the pin driver, baseline-capture ordering invariant pinned
+**Amended:** 2026-08-27 — stage-ladder amendment (operator rulings, mind mails `1309af45` + `88895a02` + `d3cc0123`; planner task `8add67c0`): §Stage ladder added (scripta/test-model stages smoke/dev/rough/full; full 3/10/7-label protocol byte-preserved as the top stage; default dev mode = stage 2), unit GB-U3b added, GB-U4/GB-U5 ordering invariant extended to the ladder, GB-U6 law extended
+
+Ruling 3 reconciliation (mail `d3cc0123`, folded via planner resume before
+commit): the ladder now exposes BOTH knobs — label breadth × repetition
+count — per stage. Stage 3 was redefined from a 6-compute-label focused
+subset to the full-breadth rough pass of ruling 3 (all 7 labels at 1 warmup
++ 2 samples, ~7–8 min): a rough t/s for every test, because dev-time signal
+is order-of-magnitude difference, which 1–2 reps catch. The old focus stage
+is retired (it never landed): its breadth use is strictly dominated by the
+rough pass (7 labels at under half its wall), and its subset-depth use
+remains available via `--label <set>` at the selected stage's sampling
+(iteration-signal only). A fifth token was rejected — ruling 2 mandates the
+stages-1–4 mirror, and the old focus added no capability the two knobs do
+not already cover. Statistical reliability stays reserved for the top
+stage, byte-preserved 3/10.
 **Repos:** primary: `gradus/` (writes gradus-only); read-only pinned inputs: `radix/`, `hosts/`
 **Related:** `gradus/docs/benchmark-method.md` (v1.0.0 — amended by this goal to v1.1.0); `radix/scripta/check-benchmark-regression.py` (gate consumer, read-only); `radix/docs/factory/perf-parity-baseline/` (receipt + battery-ruling precedent); `~/work/ianzepp/skills/gpu-lessons/` (measurement laws, cited not duplicated); `gradus/docs/factory/kernel-purity-census/` (the perf work that needs this harness)
 
@@ -70,7 +85,7 @@ gradus. The process law lands in `gradus/AGENTS.md`.
 | Library resolution | `FABER_LIBRARY_HOME=<scratch-root>` so `gradus:*` imports resolve to the pinned gradus worktree (same seam `scripta/check-compile` uses; `faber doctor` proves it). |
 | Hosts role | Recorded in the pin and in every baseline name. The MIR-runner arm does not link hosts crates; the hash is still part of the reproducibility law because the triple is the unit of record, and any future device/compiled arm (open question 3) consumes hosts via `FABER_SUPPORT_PATH_OVERRIDE` path deps (`radix/crates/faber/src/package/runtime_sources.rs` — the offline seam that replaces branch-pinned git sources with container-local checkouts). |
 | Case source on reproduction | The harness itself and the bench cases live in gradus, so a reproduction run invokes `scripta/bench` **from the pinned gradus worktree** — cases, manifest, and harness are all at the recorded gradus hash. The main-checkout invocation is the dev path. Ordering invariant: the recorded `gradus_sha` must **already contain the complete harness** — capture runs only after the harness + case commits land, and verifies the recorded hash resolves `scripta/bench` with the full subcommand set before writing the baseline; the reproduction proof cites that hash as harness-complete. |
-| Run loop | Per case: 3 discarded warmups, 10 measured samples (benchmark-method §4.3 protocol, unchanged), each sample = wall time of `faber run` over an in-case fixed-iteration loop (K per case from the manifest, calibrated so op time dominates process startup; K recorded per case in the baseline). Report min/median/max; `median_ms` per label is the gate quantity (checker contract unchanged). Timer: portable wall clock. Runtime caps (`cap_s` per case, default 60) are **safety circuit breakers, never metrics and never pass/fail**: a capped sample still records its valid throughput (units produced / min(elapsed, cap)) plus a `capped: true` marker; completion under the cap is not a performance datum. |
+| Run loop | Per case: 3 discarded warmups, 10 measured samples (benchmark-method §4.3 protocol, unchanged), each sample = wall time of `faber run` over an in-case fixed-iteration loop (K per case from the manifest, calibrated so op time dominates process startup; K recorded per case in the baseline). Report min/median/max; `median_ms` per label is the gate quantity (checker contract unchanged). Timer: portable wall clock. Runtime caps (`cap_s` per case, default 60) are **safety circuit breakers, never metrics and never pass/fail**: a capped sample still records its valid throughput (units produced / min(elapsed, cap)) plus a `capped: true` marker; completion under the cap is not a performance datum. The 3/10/7-label shape is the **stage-4 (full)** protocol (§Stage ladder); dev iteration runs the cheaper ladder stages. |
 | Baseline naming | `gradus/bench/baselines/baseline-YYYYMMDD-r<radix7>-h<hosts7>-g<gradus7>.json` + same-stem `.md` receipt. Append-only: a new triple gets a new file; an existing baseline is never edited (library history, requirement 3). |
 | Execution route | `faber run` (MIR interpreter, feature `runner`) — package route, not single-file scripts (kernel imports in staged scripts fail PKG001; `scripta/check-compile` documents the same constraint). One bench package, main dispatches on a label argument; `--`-args pass-through is the exempla precedent. |
 
@@ -182,6 +197,87 @@ Disposition:
   caps-as-breakers law above still carry into the AGENTS.md law (GB-U6)
   so that future harness inherits them correctly.
 
+### Stage ladder (operator rulings 2026-08-27 — mails `1309af45` + `88895a02` + `d3cc0123`, resolved)
+
+Operator rulings (2026-08-27, while GB-U3's full sweep ran at 35–40 min):
+bench runs used during development must execute exactly one or two tests,
+minutes at most (target ~2–3 min wall) as the default dev mode; the harness
+must be a staged ladder modeled on `radix/scripta/test` stages 1–4 — earlier
+stages very fast, progressing into slower and more thorough — so iteration
+never waits on the full sweep; the ladder must control repetition count per
+stage, not just label breadth — the fast stage may run the FULL 7-label
+corpus at 1–2 repetitions per test (rough t/s for every test; dev-time
+signal is order-of-magnitude difference), while statistical reliability is
+reserved for the top stage. The full 3-warmup/10-sample/7-label protocol is
+**byte-preserved unchanged as the top stage** (baseline-capture and
+reproduction mode). Disposition — a four-stage ladder on `scripta/bench
+run`, cheap-first law mirrored from `radix/scripta/test`, both knobs per
+stage:
+
+| Stage | Token(s) | Label set (breadth) | Warmups | Samples (reps) | Expected wall | Purpose |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 smoke | `--stage smoke` / `--stage 1` | 1 label — manifest `smoke_label` (default `gemv.f32.320x960`, cheapest measured) | 1 | 3 | ≤ 1 min (measured ≈ 45 s + overhead) | wiring smoke: pin → build → run → emit end-to-end; iteration-signal only |
+| 2 dev **(default)** | `--stage dev` / `--stage 2` | 2 labels — manifest `dev_labels` (default `gemv.f32.320x960` + `carrier.reduce.sum.f32.320x960`) | 1 | 3 | ~2–3 min (measured est. ≈ 2 m 20 s + overhead) | the operator fast path: default dev mode, iteration signal while developing; iteration-signal only |
+| 3 rough | `--stage rough` / `--stage 3` | all 7 labels | 1 | 2 | ~7–8 min (measured arithmetic: 3 × ≈ 144.2 s ≈ 7.2 min + overhead) | full-breadth rough pass (`d3cc0123`): a rough t/s for every test; order-of-magnitude signal across the whole inventory; iteration-signal only |
+| 4 full | `--stage full` / `--stage 4` / `--full` | all 7 labels | 3 | 10 | 35–40 min (measured; full-sweep log 2026-08-27) | statistical-reliability stage: full sweep, baseline-grade capture (GB-U4) + reproduction (GB-U5); the **only** gate-comparable shape |
+
+Laws (mirroring `radix/scripta/test`'s cheap-first discipline):
+
+- **Explicit stage selection.** `run` takes `--stage <token>` (name or
+  number: `smoke|dev|rough|full` ≡ `1|2|3|4`; `--full` aliases stage 4).
+  `--label <label>` (repeatable) selects an explicit label subset at the
+  selected stage's sampling (stage-2 sampling when no stage is given).
+  **Default (no flags) = stage 2 dev** — the operator ruling names the
+  1–2-label fast path as the default dev mode, a deliberate deviation
+  from scripta/test's default-to-cheapest (the wiring smoke is not the
+  dev loop).
+- **Two knobs, monotonic total cost.** Each stage is strictly more
+  expensive in expected total wall than the one before it
+  (≈ 45 s → ~2–3 min → ~7–8 min → 35–40 min). Label breadth is
+  non-decreasing (1 → 2 → 7 → 7); repetition depth is the second knob
+  (`d3cc0123`) and statistical depth (3 warmups / 10 samples) is
+  reserved for the top stage — no lower stage's per-label protocol
+  exceeds it.
+- **Iteration policy — K fixed across the ladder (t/s math preserved).**
+  Rulings `88895a02` and `d3cc0123` both permit per-case in-case
+  iterations K to shrink per stage only where the t/s math is preserved
+  (units-per-sample recomputed from the actual K). This ladder never
+  exercises that permission: every stage meets its wall bar at the
+  manifest K (now proven by measurement — all seven per-sample walls are
+  measured), and fixed K keeps units-per-sample identical across stages,
+  so per-sample t/s needs no per-stage reconciliation. Shrinking K on
+  any stage requires a new amendment naming the stage and the recomputed
+  unit fields.
+- **Stage identity in output.** Every stage's JSON carries additive
+  metadata: `stage` (name), `stage_number`, and the run's actual
+  warmup/sample counts in `metadata.protocol`. The checker reads only
+  `format_version` / `results[].label` / `median_ms` — extra fields
+  compose; no checker change.
+- **Comparability rules (checker), keyed on protocol identity.** Only
+  JSON whose recorded protocol is exactly the full shape — stage full,
+  warmups 3, samples 10, all 7 manifest labels — is gate-comparable:
+  eligible as baseline capture and as gate input. Everything else —
+  lesser stage, explicit `--label` subset, any samples/protocol override
+  — is **iteration-signal only**: the GB-U4 gate wrapper refuses it
+  (`NOT COMPARABLE`, the same refusal family as the environment
+  mismatch) before the checker runs. Same-stage / same-shape comparison
+  (e.g. rough vs rough, before/after a change) is legitimate recorded
+  signal and never gates. Checker self-compare (same file on both sides)
+  remains valid format evidence for any stage.
+- **Pre-release depth (10–20 reps class) — deferred.** No `--samples`
+  override ships in GB-U3b. If deep pre-release verification is ordered
+  later, it lands as an explicit `--samples N` override on `run`,
+  signal-only by the comparability law above (the wrapper refuses
+  anything whose recorded protocol is not exactly 3/10 × 7 labels); the
+  capture/reproduction path stays 3/10 byte-preserved (`88895a02`).
+- **Measured context** (per-sample walls, full-sweep log 2026-08-27,
+  radix `9c90249` hosts `c9cfb5a` gradus `f2d3595`, RUN_EXIT 0): gemv
+  ≈ 11.3 s · block.matmul ≈ 23.5 s · carrier.reduce ≈ 24.3 s · prefill
+  ≈ 26.4 s · carrier.elementwise ≈ 28.4 s · decode ≈ 29.1 s ·
+  check.library.compile ≈ 1.22 s. Six compute labels ≈ 143.0 s per
+  full pass; all seven ≈ 144.2 s. Rough = 3 passes ≈ 7.2 min; full
+  ≈ 31 min run time + overhead = 35–40 min.
+
 ### Threshold policy (design input, resolved)
 
 - Gate default 10 % (the checker's own default). Same machine AND same
@@ -201,7 +297,7 @@ New `## Benchmarks` section in `gradus/AGENTS.md` recording: the 3-hash
 reproducibility law; the run command (`./scripta/bench …` with
 subcommands, `clean` teardown included); where baselines live and the
 append-only rule; the environment-identity + battery-ruling requirement;
-the threshold policy; the metric law (t/s = unit-count /
+the threshold policy; the stage ladder (both knobs: label breadth × repetition count; default dev mode = stage 2, one–two labels, ~2–3 min; stage 3 = full-breadth rough pass at 1–2 reps, ~7–8 min; `--stage` tokens smoke/dev/rough/full; the full 3/10 protocol is the top stage and the only gate-comparable shape; lesser stages and any protocol override are iteration-signal only); the metric law (t/s = unit-count /
 min(completion, cap) is the sole throughput metric; runtime caps are
 safety circuit breakers, never metrics, never pass/fail); the class-(b)
 not-fitting ruling (fixed-output-length + per-side expected counts are
@@ -332,15 +428,23 @@ valid history either way (append-only, never rewritten).
 7. Taxonomy carried: every result row has class/work-unit/units/t-s
    fields; a capped sample records valid t/s + `capped: true` and never
    fails the run; the checker contract is untouched (§Perf-taxonomy).
+8. Stage ladder live: all four stages selectable by name and number;
+   no-flag `run` = stage 2 dev; smoke ≤ 1 min, dev ≤ 3 min, and rough
+   ≤ 10 min measured on the current triple with all 7 labels present in
+   rough output; stage 4 byte-preserves the 3/10/7-label protocol (K
+   unshrunk on every stage); any JSON whose recorded protocol is not
+   exactly 3/10 × 7 labels is refused by the gate wrapper (proven with
+   the GB-U4 `NOT COMPARABLE` path).
 
 ## Units (lowering sketch — refined in `delivery.md`)
 
 | Unit | Scope | Depends on | Hand evidence |
 | --- | --- | --- | --- |
-| GB-U1 | pin-and-build driver: `scripta/bench` materialize+build (detached worktrees at 3 hashes, release faber, `faber doctor` proof) + `clean` teardown (worktree remove/prune; registrations never accumulate) | — | none |
-| GB-U2 | bench case package: `bench/` Faber package, 7 labels at GEA tell-tale shapes + manifest (class + work-unit/metric fields + `cap_s` per case) | — | none |
-| GB-U3 | run loop + emitter: 3/10 sampling, caps as circuit breakers, checker-format JSON (median_ms + t/s metric fields) + environment-identity metadata | GB-U1, GB-U2 | none |
-| GB-U4 | baseline capture + gate wrapper: committed dated 3-hash baseline + receipt; gate comparability refusal + green/red proofs | GB-U3 | none |
+| GB-U1 | pin-and-build driver: `scripta/bench` materialize+build (detached worktrees at 3 hashes, release faber, `faber doctor` proof) + `clean` teardown (worktree remove/prune; registrations never accumulate) | — | landed `c212004` (fold `f85272b`) |
+| GB-U2 | bench case package: `bench/` Faber package, 7 labels at GEA tell-tale shapes + manifest (class + work-unit/metric fields + `cap_s` per case) | — | landed `e5f658f` (fold `f2d3595`) |
+| GB-U3 | run loop + emitter: 3/10 sampling, caps as circuit breakers, checker-format JSON (median_ms + t/s metric fields) + environment-identity metadata | GB-U1, GB-U2 | landed `d85c3c9` (fold `19937dc`) |
+| GB-U3b | stage ladder on `scripta/bench run`: `--stage smoke/dev/rough/full` (+`1-4`, `--full`), `--label` subsets, manifest `smoke_label`/`dev_labels`, stage identity in metadata, default = dev | GB-U3 | pending |
+| GB-U4 | baseline capture + gate wrapper: committed dated 3-hash baseline + receipt; gate comparability refusal + green/red proofs | GB-U3, GB-U3b | none |
 | GB-U5 | reproduction proof: fresh materialization from the recorded triple, gate PASS, receipt rider | GB-U4 | none |
 | GB-U6 | AGENTS.md Benchmarks law + `docs/benchmark-method.md` v1.1.0 amendment | GB-U5 | none |
 
@@ -354,6 +458,9 @@ validation is named once in `delivery.md` §6.
 cd /path/to/faberlang/gradus
 ./scripta/bench gate bench/baselines/<latest-baseline>.json   # green path, exit 0
 BENCH_REGRESSION_THRESHOLD=0.000001 ./scripta/bench gate bench/baselines/<latest>.json  # red path, exit 1
+./scripta/bench run --stage smoke   # <= 1 min wiring smoke
+./scripta/bench run                 # default = stage 2 dev, ~2-3 min
+./scripta/bench run --stage rough   # ~7-8 min full-breadth rough pass, 1-2 reps
 ./scripta/bench clean                                         # teardown: no scratch worktree registrations remain
 ./scripta/check-source && ./scripta/check-compile             # repo still green (lane-owned at merge)
 ```
@@ -408,9 +515,10 @@ baseline receipt.
 
 | Unit | Status | Seat | Receipt | Notes |
 | --- | --- | --- | --- | --- |
-| GB-U1 pin-and-build driver | pending — awaiting dispatch | — | — | `scripta/bench` materialize+build |
-| GB-U2 bench case package | pending — awaiting dispatch | — | — | `bench/` package, 7 labels |
-| GB-U3 run loop + JSON emitter | pending — awaiting dispatch | — | — | checker-format output |
-| GB-U4 baseline capture + gate wrapper | pending — awaiting dispatch | — | — | first committed baseline |
-| GB-U5 reproduction proof | pending — awaiting dispatch | — | — | 3-hash rerun PASS |
-| GB-U6 AGENTS.md law + method v1.1.0 | pending — awaiting dispatch | — | — | requirement 4 |
+| GB-U1 pin-and-build driver | landed | hand | `c212004` (fold `f85272b`) | `scripta/bench` materialize+build |
+| GB-U2 bench case package | landed | hand | `e5f658f` (fold `f2d3595`) | `bench/` package, 7 labels |
+| GB-U3 run loop + JSON emitter | landed | hand | `d85c3c9` (fold `19937dc`) | full sweep RUN_EXIT 0; self-compare green; battery-labeled format evidence |
+| GB-U3b stage ladder | pending — awaiting dispatch | — | — | operator rulings `1309af45`/`88895a02`/`d3cc0123` |
+| GB-U4 baseline capture + gate wrapper | pending | — | — | first committed baseline; requires AC power |
+| GB-U5 reproduction proof | pending | — | — | 3-hash rerun PASS |
+| GB-U6 AGENTS.md law + method v1.1.0 | pending | — | — | requirement 4 |

@@ -4,6 +4,7 @@
 **Goal**: [`goal.md`](goal.md) — verdict **READY**, consumer: delivery
 **Planner**: planner (mind task `076e7a1a`, operator pause-exception order 2026-08-27)
 **Amended**: 2026-08-27 — audit `c4f621fa` fix pass (perf-taxonomy fold incl. class-(b) not-fitting ruling, GB-U1 scratch-worktree teardown, GB-U4/GB-U5 capture-ordering invariant)
+**Amended**: 2026-08-27 — stage-ladder amendment (operator rulings `1309af45` + `88895a02` + `d3cc0123`, planner task `8add67c0`): GB-U3b added (goal §Stage ladder), GB-U4 depends on GB-U3 + GB-U3b with the ladder-in-baseline ordering invariant and stage-refusal proof, GB-U5 reproduction pinned to `--stage full`, GB-U6 law extended to name the ladder
 **Write theme**: gradus-only. `radix/` and `hosts/` are pinned read-only inputs — zero tracked-content contact by construction (linked-worktree registration under each source repo's `.git/worktrees/` is named in GB-U1 and removed by `clean`).
 
 ---
@@ -71,7 +72,7 @@ law in `gradus/AGENTS.md` + `docs/benchmark-method.md` v1.1.0.
 ## 4. Hand unit graph
 
 Parallelism: GB-U1 ∥ GB-U2 (disjoint surfaces); then the chain
-GB-U3 → GB-U4 → GB-U5 → GB-U6.
+GB-U3 → GB-U3b → GB-U4 → GB-U5 → GB-U6.
 
 | Field | GB-U1 — pin-and-build driver |
 | --- | --- |
@@ -106,12 +107,23 @@ GB-U3 → GB-U4 → GB-U5 → GB-U6.
 | `risk` | low — format contract is small and pinned by the checker source |
 | `integrable` | yes |
 
+| Field | GB-U3b — stage ladder (operator rulings `1309af45` + `88895a02` + `d3cc0123`) |
+| --- | --- |
+| `outcome` | `scripta/bench run` gains the four-stage two-knob ladder (goal §Stage ladder): `--stage {smoke\|dev\|rough\|full}` with numeric aliases `1`–`4` and `--full`; `--label` repeatable explicit subsets at the selected stage's sampling; manifest `smoke_label` / `dev_labels` (no `focus_labels` — rough and full run all labels by construction); per-stage warmup/sample counts exactly as the goal table (smoke 1/3 one label; dev 1/3 two labels; rough 1/2 all seven; full 3/10 all seven); additive stage identity in JSON metadata (`stage`, `stage_number`, actual protocol counts); no-flag `run` = stage 2 dev (the operator default dev mode) |
+| `write_scope` | `gradus/scripta/bench.py`, `gradus/scripta/bench` (usage/help text), `gradus/bench/cases.toml` (additive `smoke_label`/`dev_labels` fields only) |
+| `done_when` | (a) `--stage smoke`, `--stage dev`, and `--stage rough` complete on the current triple with measured wall: smoke ≤ 1 min, dev ≤ 3 min (the operator ~2–3 min bar), rough ≤ 10 min with all 7 labels present in its output (the full-breadth rough pass, `d3cc0123`) — measurements in the unit report; (b) every stage emits checker-valid JSON (per-stage self-compare exit 0 via `python3 ../radix/scripta/check-benchmark-regression.py <out> <out>`) carrying `stage`/`stage_number` plus that run's warmup/sample counts in `metadata.protocol`; (c) iteration policy held: per-label `iterations` equals the manifest K on every stage (K never shrinks; the rulings' conditional shrink permission is not exercised — goal §Stage ladder), t/s fields computed identically at every stage, caps stay circuit breakers (capped sample → valid t/s + `capped: true`; run never fails); (d) no-flag `run` = stage 2 dev, proven by the emitted stage identity or a plan line; (e) `--label <x>` explicit subset runs at the selected stage's sampling with explicit-selection mode recorded (iteration-signal-only by construction); (f) stage 4 byte-preserves the 3/10/7-label protocol — a stage-4 JSON differs from the GB-U3-landed emitter shape only by additive `stage` metadata, so GB-U3's landed full-sweep evidence remains valid as stage-4 output; (g) comparability precondition recorded: the stage identity + protocol counts in metadata are sufficient for the GB-U4 wrapper to refuse any JSON whose recorded protocol is not exactly warmups 3 / samples 10 / all 7 labels (lesser stage, label subset, any override) — the refusal itself is GB-U4's surface |
+| `depends_on` | GB-U3 |
+| `sanity` | `run --stage rough` wall + all-7-label presence; `run --stage smoke` wall + stage identity in JSON; the (f) additive-diff check against GB-U3's landed output shape |
+| `non_goals` | No gate/threshold/refusal logic (GB-U4 owns the wrapper), no baseline writes, no AGENTS.md / benchmark-method law (GB-U6), no bench case program changes (manifest fields only), no `--samples` or protocol override (deferred by the ruling-3 reconciliation), no new metrics, no threshold changes, no engine-semantics changes to the landed GB-U3 run loop beyond the additive CLI/metadata surface |
+| `risk` | medium-low — additive CLI over a landed engine; all seven per-sample walls are measured (rough ≈ 7.2 min arithmetic, bar ≤ 10 min), so stage walls are grounded; monotonicity holds by construction (breadth non-decreasing; total wall 45 s → ~2–3 min → ~7–8 min → 35–40 min) |
+| `integrable` | yes |
+
 | Field | GB-U4 — baseline capture + gate wrapper |
 | --- | --- |
 | `outcome` | `scripta/bench capture` + `gate`: commit the first baseline (`bench/baselines/baseline-YYYYMMDD-r…-h…-g….json` + same-stem receipt `.md`); gate refuses non-comparable environments (machine or power-class mismatch → `NOT COMPARABLE`, distinct exit) then delegates to the radix checker |
 | `write_scope` | `gradus/bench/baselines/**` (new), `gradus/scripta/bench.py` (extend) |
-| `done_when` | (a) baseline captured at the current triple with AC power verified (`power_state: ac (pmset-verified…)`); battery capture allowed only battery-labeled per the ruling; (b) receipt committed with environment table + run transcript; (c) gate green path exit 0 against the committed baseline; (d) red path proven once — forced exit 1 (e.g. `BENCH_REGRESSION_THRESHOLD=0.000001`) — transcript kept in the receipt (L1); (e) gate `NOT COMPARABLE` path proven once with a doctored environment field; (f) ordering invariant held — the recorded `gradus_sha` already contains the complete harness: capture runs only after the harness + case commits land, and verifies the recorded hash resolves `scripta/bench` with the full subcommand set before writing the baseline |
-| `depends_on` | GB-U3 |
+| `done_when` | (a) baseline captured at the current triple with AC power verified (`power_state: ac (pmset-verified…)`); battery capture allowed only battery-labeled per the ruling; (b) receipt committed with environment table + run transcript; (c) gate green path exit 0 against the committed baseline; (d) red path proven once — forced exit 1 (e.g. `BENCH_REGRESSION_THRESHOLD=0.000001`) — transcript kept in the receipt (L1); (e) gate `NOT COMPARABLE` path proven twice — once with a doctored environment field, once with a lesser-stage JSON (stage refusal); (f) ordering invariant held — the recorded `gradus_sha` already contains the complete harness **including the stage ladder**: capture runs only after the harness + case + ladder commits land, and verifies the recorded hash resolves `scripta/bench` with the full subcommand set and all four stage tokens (smoke\|dev\|rough\|full) before writing the baseline; the baseline itself is captured at `--stage full` and its metadata records `stage: full` |
+| `depends_on` | GB-U3, GB-U3b |
 | `sanity` | `scripta/bench gate <baseline>` green then red |
 | `non_goals` | No threshold changes (10 % default stands), no CI wiring, no editing of any previously committed baseline |
 | `risk` | medium — capture honesty (power verification, warmups honored); fail-closed metadata checks bound it |
@@ -121,7 +133,7 @@ GB-U3 → GB-U4 → GB-U5 → GB-U6.
 | --- | --- |
 | `outcome` | Demonstrate requirement 2 once: fresh scratch materialization from the committed baseline's recorded `triple` (harness + cases invoked from the pinned gradus worktree at the recorded gradus sha — which GB-U4 pinned as harness-complete), rerun, gate PASS at default threshold |
 | `write_scope` | `gradus/bench/baselines/<baseline-stem>.md` (receipt rider; or same-stem `-reproduction.md`) |
-| `done_when` | (a) reproduction run's environment identity matches the baseline's machine + power class (else the receipt records NOT COMPARABLE honestly and the unit reports back instead of forcing green); (b) gate exit 0 within default threshold; (c) receipt records both runs side by side (hashes, environment, per-label medians + t/s) and cites the recorded `gradus_sha` as harness-complete (the GB-U4 ordering invariant); (d) no baseline file modified |
+| `done_when` | (a) reproduction run's environment identity matches the baseline's machine + power class (else the receipt records NOT COMPARABLE honestly and the unit reports back instead of forcing green); (b) gate exit 0 within default threshold; (c) receipt records both runs side by side (hashes, environment, per-label medians + t/s) and cites the recorded `gradus_sha` as harness-complete (the GB-U4 ordering invariant); (d) no baseline file modified; (e) reproduction runs `--stage full` from the pinned gradus worktree; a lesser-stage rerun is iteration-signal, not a reproduction |
 | `depends_on` | GB-U4 |
 | `sanity` | The gate run itself |
 | `non_goals` | No re-capture, no threshold tuning to force PASS (L21), no investigation of an exceeded threshold inside this unit — that is recorded signal for a new goal |
@@ -132,7 +144,7 @@ GB-U3 → GB-U4 → GB-U5 → GB-U6.
 | --- | --- |
 | `outcome` | Requirement 4: `## Benchmarks` section in `gradus/AGENTS.md` (3-hash law, exact run commands incl. `clean` teardown, baseline home + append-only rule, environment-identity + battery ruling, threshold policy, metric law — t/s = unit-count / min(completion, cap) sole throughput metric, runtime caps safety circuit breakers never pass/fail, class-(b) not-fitting ruling pointing at the parity harness — citations); `docs/benchmark-method.md` bumped to v1.1.0 recording the harness delta |
 | `write_scope` | `gradus/AGENTS.md`, `gradus/docs/benchmark-method.md` |
-| `done_when` | (a) AGENTS.md section present, naming `./scripta/bench materialize/build/run/capture/gate/clean` and the committed baseline path of record; (b) benchmark-method v1.1.0 with delta note (its §6 "no benchmark binary" clause superseded by the 2026-08-27 operator order, cited); (c) the section carries the taxonomy law — t/s sole metric, caps as circuit breakers, class-(b) not-fitting ruling (goal §Perf-taxonomy; addendum mail `46ab4e94`); (d) no other AGENTS.md section weakened or reordered; (e) citations resolve (goal path, perf-parity U7 receipt, gpu-lessons) |
+| `done_when` | (a) AGENTS.md section present, naming `./scripta/bench materialize/build/run/capture/gate/clean` and the committed baseline path of record; (b) benchmark-method v1.1.0 with delta note (its §6 "no benchmark binary" clause superseded by the 2026-08-27 operator order, cited); (c) the section carries the taxonomy law — t/s sole metric, caps as circuit breakers, class-(b) not-fitting ruling (goal §Perf-taxonomy; addendum mail `46ab4e94`); (d) no other AGENTS.md section weakened or reordered; (e) citations resolve (goal path, perf-parity U7 receipt, gpu-lessons); (f) the law names the stage ladder with both knobs: default dev mode (stage 2), stage-3 full-breadth rough pass at 1–2 reps, `--stage` tokens smoke/dev/rough/full, full protocol as top stage, gate comparability keyed on protocol identity (goal §Stage ladder) |
 | `depends_on` | GB-U5 (the law cites a demonstrated reproduction) |
 | `sanity` | Grep the section; open the cited paths |
 | `non_goals` | No goal.md ledger/status edits (Mind-owned), no harness code changes |
