@@ -43,7 +43,84 @@ O(D²) vs O(D)), ~1.65B padded (scalar untiled 8×8 GEMMs).
 **Instrument defects found by the audits (fix first):** GPU-busy partial
 sample unlabeled; receipt `sync_wait_us` mislabeled (it is the launch clock).
 
-## 3. Parallelism architecture (the operator's structural requirement)
+## 3. The guidance law and the fusion chain (operator commentary, 2026-08-27 — binding context for every unit)
+
+**The law (strong guidance, written to override LLM training priors).** LLMs
+have seen millions of C/Python softmax/rope/matmul/stride-walk kernels
+written *without* language-level tensor constructs — accumulator variables,
+`while`+`for` pairs, nested counter loops — because those languages have no
+streamlined forms. That prior is wrong here. Faber's constructs put the lane
+and thread into the loop itself (`sum from … at [i] thread f const s { }`),
+walk Cartesian coordinates in ONE loop definition (`for range a‥b, c‥d
+const i, j` — corpus `itera/range-product-n2.fab`), and fold via closure
+intrinsics (`res.reduce((acc, x) ∴ acc + x, 0)`). The compiler lowers these
+to per-target recipes (e.g. tensor `·` → `Collection(TensorMatMul)`
+intrinsic + `CollectionKernelPlan::TiledMatMul`: threadgroup tiles,
+barriers, zero-fill — chosen for the exact backend, CUDA/Metal/other). A
+hand-rolled loop freezes one imperative shape and can never reach those
+recipes. **Polish seats specifically hunt hand-rolled implementations and
+convert them to language-level constructs; the compiler does a better job of
+optimizing the shape for the target than the hand ever will.**
+
+**Pattern-family targets (convert-or-record; a site with no covering
+construct stays, with an in-code reason):**
+
+| Hand-rolled prior | Faber construct |
+| --- | --- |
+| counter-`while` / managed counter walks | `for range` (n-ary for Cartesian; zip walks are `for from` series) |
+| accumulator variable + loop (10 lines) | `.reduce((acc, x) ∴ expr, init)` — 1 line, no managed binding |
+| transform loop building a new list | `.map(x ∴ expr)` |
+| predicate loop with appends | `.filter(x ∴ pred)` |
+| tensor reduction loops | from-family with multi-index `at`-clauses (`max from scores at [i, j]`) |
+| best-index scan loops | `.argmax()` / `.argmin()` twins (LSR W0) |
+
+**Measured starting point:** gradus uses closure intrinsics **zero times**
+across `src/` while hand-rolled accumulators sit at `nn.fab:488`,
+`train.fab:266`, `attention.fab:337/350/432`, `sampling.fab:458`, and
+beyond; loop density: tokenizer 51 sites, cache 33, math 31, block_verify
+28, calibration 26, sampling 24, serialize 23. Kernel bodies themselves are
+largely modern already (`causal_softmax` = `max from … at [i,j] coalesce` +
+`scores.softmax()`; zero `while` in `kernel.fab`/`math.fab`) — the debt is
+host-side and older paths.
+
+**The three skills define the refactor structure together:** `$faber`
+(constructs + validation recipes), `$faber/canonical-faber` (anti-pattern
+catalog — already cites gradus as bad examples: counter-`while` proven
+across 15 files/~55 sites; the `tokenizer.fab _in_name` contains-loop), and
+`$gpu-lessons` (measurement law: L84 decompose algorithm vs dispatch;
+structural-change re-baseline). A0 writes the law into the first two as
+standing text.
+
+**The fusion chain and the machinery already waiting.** The pre-work thesis
+is the kernel-purity-census campaign's own framing (operator fusion
+directive, task `ed5144c7`): *"Purity is the prerequisite for fusion" —
+typed, pure, small leaves mean fewer submissions, so fusion can erase
+inter-kernel waits.* `dense-typed-assembly` defines the leaf law: the
+compiler later fuses kernel leaves; fusion wants the leaves, not one
+mega-kernel wrapping the split. On the radix side the machinery exists and
+waits: `radix-air` carries a fusion-table side-channel for fused-kernel
+lowering and `to_mir.rs` already absorbs fused groups (only the group root
+is lowered). The measured L1 loss (2,115 serialized single-kernel encoders,
+~1,440 of them per-head pieces averaging 11.6 µs GPU work —
+`per-head fragmentation` per the prefill audit; llama runs one reused
+graph) is exactly what that chain exists to erase. Track A executes the
+purity prerequisite; the fusion payoff metric is encoders per decode step.
+
+**Deterministic drivers (the work list comes from the machine, not vibes).**
+`faber check --air --json` emits tier-labeled rows — `ADMISSIBLE-ONE-AWAY`
+is the ranked fusion-candidate queue (one refactor from kernel
+admissibility), `ADMISSIBLE-KERNEL` is the consumable-now set, `WOULD-REJECT`
+is the honest far set polish turns must not waste on. `faber check` also
+emits WARN027 `complexity_budget_exceeded` (`--complexity-budget` default
+12 from the census p95=11 over 2,393 fns; `--kernel-complexity-budget`
+default 2 — the 84 kernel-marked fns already max at 2, so hotspots are
+host-side). Both surfaces are report-only by design: THIS goal owns the
+enforcement moment — progress is measured as tier counts moving in
+committed census rows and WARN027 rows falling per module, never as a gate
+the polish has to fight. LSR campaign wave 6 (functional-intrinsic adoption
+sweep) is the language-surface sibling of the A-series; its rulings apply.
+
+## 4. Parallelism architecture (the operator's structural requirement)
 
 No unit in this goal depends on another unit's unlanded output. Parallelism
 comes from three mechanisms:
@@ -65,7 +142,7 @@ The serial exception is the polish wave's **guidance law (A0)**: polish
 seats may not spawn before the law text exists. A0 is a skills-repo-only
 unit and lands first.
 
-## 4. Units
+## 5. Units
 
 ### D1 — instrument hardening (hosts + radix receipts)
 | Field | Value |
@@ -103,6 +180,7 @@ Same unit shape; oracle: ONE paired-parity prefill delta + per-kernel FMA/receip
 | `PGC-C2` | Terminal-row-only logits at prefill | all-36-row LM head vs 1 needed row | ~36× less lm_head prefill work |
 | `PGC-C3` | Single-pass RMSNorm (no per-output-element row rescan) | O(D²) rescan, ~2.15B avoidable FMAs | removes ~2.15B FMAs |
 | `PGC-C4` | Tiled GEMM recipes on prefill paths | scalar untiled 8×8 GEMMs, ~1.65B padded FMAs | removes padding waste; raises GPU-busy efficiency |
+| `PGC-C5` | Stop re-staging weight-shaped inputs | 23 MB of weight-shaped inputs re-staged per prefill step (prefill audit) | removes redundant staging bytes and its encode-adjacent wall |
 
 ### A-series — purity polish waves (after A0; massively parallel batches)
 | Field | Value |
@@ -120,7 +198,7 @@ ladder from the reports: B+A fusion lands decode plausibly ~10–15 ms/step
 (~65–100 t/s); llama-class 4.3 ms requires every track. No synthetic
 targets — the ladder is a hypothesis to be measured, not a promise.
 
-## 5. Non-goals
+## 6. Non-goals
 
 No MIR-runner execution of anything (L86); no quantization work (f32 parity
 is the contract); no CUDA arm (blocked on hosts need `411b16f3`, carried by
@@ -128,7 +206,14 @@ the parity goal); no llama.cpp changes (comparator is pinned); no new model
 rungs (larger models are a later goal — this goal closes the 360M rung's
 gaps and builds the method).
 
-## 6. Sources (all six reports, on the Vivi record)
+## 7. Sources (all six reports, on the Vivi record)
+
+Cross-family confidence: the Luna and GLM seats independently converged on
+every major claim (encoder counts, serialization, capacity family,
+instrument defects) and independently corrected the same two provisional
+errors (the partial-sample bubble figure; the prefill bandwidth-floor
+misapplication) — the two-dimension cross-comparison the operator ordered
+did its job.
 
 Prefill audit (GLM-5.3) mail `c1640a4e`; decode audit (GLM-5.3) mails
 `ded525e1`/`02f34add`; fixed-1000 decode inspector (Luna) mail `c0c86fe4`;
