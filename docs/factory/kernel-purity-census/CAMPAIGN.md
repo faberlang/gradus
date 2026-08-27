@@ -67,7 +67,7 @@ Wave 0 ruling recorded here:
 | Wave | Scope (census §4) | Status | Evidence |
 | --- | --- | --- | --- |
 | 0 | Carrier/admissions ruling + `NumericBlock` rename + stride cache | **done 2026-08-26** | [`wave-0-carrier-admissions-ruling.md`](wave-0-carrier-admissions-ruling.md) |
-| 1 | Annotation + method-twin swaps (≈15 historical rows: loss `mse_*`, math elementwise typed twins, `nn.silu/gelu/rmsnorm`, attention `scaled_dot_product_2x8/_static`) | **partially delivered — six census annotations landed; `nn.rmsnorm` is already typed; residual eight rows lowered** | [`wave-1-delivery.md`](wave-1-delivery.md) |
+| 1 | Annotation + method-twin swaps (≈15 historical rows: loss `mse_*`, math elementwise typed twins, `nn.silu/gelu/rmsnorm`, attention `scaled_dot_product_2x8/_static`) | **done 2026-08-27** — all 15 accounted: 8 prior-landed, 6 admitted this wave (`sub`/`mul`/`div`/`neg` gradus `13df284`, `gelu`/`silu` `47d3d69`), `abs`/`signum` red-named SEM004 lane gaps; phase audit `9fbec2c7` residual (7/7 lenses pass; one P2 lineage re-pin routed); Wave-2 gate = CTR-08 + consumer-proof (CTO ruling `f489d2eb`) + lineage pin | [`wave-1-delivery.md`](wave-1-delivery.md); audit probes `/tmp/kpc-audit/` |
 | 2 | One production chain end to end (llama/SmolLM2 prefill off the carrier; decode-shaped T=1 first) | planned — sized only; waits for Wave 1 admission | [`wave-1-delivery.md`](wave-1-delivery.md) §6 |
 | 3 | Program composition (multi-head programs; MoE last) | planned — waits for Wave 2 | — |
 
