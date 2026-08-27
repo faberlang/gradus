@@ -12,6 +12,19 @@ run          sample the pinned bench manifest on the four-stage ladder
              environment-identity metadata block, per-row `power_state`
              (sampled at each row's execution), and the
              `metadata.power_class` run summary (ea4dd0a3)
+capture      first-baseline capture (GB-U4): AC-gated (pmset) materialize
+             + build at the current triple, ordering-invariant
+             verification (the recorded gradus_sha resolves the full
+             subcommand set, all four stage tokens, and row-level
+             power_state in a smoke output) BEFORE any baseline write, a
+             pinned --stage full run (~35 min), then the dated 3-hash
+             baseline JSON + same-stem receipt under bench/baselines/
+gate         comparability wrapper (GB-U4): refuses non-comparable inputs
+             BEFORE the checker — environment mismatch (exit 3),
+             lesser-stage protocol (exit 4), cross-power-class (exit 5),
+             power-deficient (exit 6), each NOT COMPARABLE — comparable
+             runs delegate to ../radix/scripta/check-benchmark-regression.py
+             (exit 0 pass / exit 1 regress)
 clean        worktree remove --force + prune in each source repo, then
              scratch-root removal, so registrations never accumulate
 
@@ -91,6 +104,7 @@ import socket
 import statistics
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tomllib
@@ -129,10 +143,33 @@ DEFAULT_STAGE = "dev"  # no-flag run = stage 2 dev (operator default dev mode)
 DEFAULT_SMOKE_LABEL = "gemv.f32.320x960"  # cheapest measured (goal table)
 DEFAULT_DEV_LABELS = ("gemv.f32.320x960", "carrier.reduce.sum.f32.320x960")
 
+# GB-U4 capture + gate: refusal exits are distinct per NOT COMPARABLE
+# family so a caller can tell an incomparable input from a real checker
+# regression (goal §Stage-ladder comparability rules + §Per-row
+# power-state law).
+GATE_SUBCOMMANDS = ("materialize", "build", "run", "capture", "gate", "clean")
+STAGE_NAMES = ("smoke", "dev", "rough", "full")
+ENV_IDENTITY_FIELDS = (
+    "hostname",
+    "machine_model",
+    "cpu",
+    "cores",
+    "memory",
+    "os",
+    "kernel",
+    "arch",
+)
+POWER_CLASSES = ("ac", "battery")  # gate-comparable run classes (ea4dd0a3)
+EXIT_NOT_COMPARABLE_ENV = 3
+EXIT_NOT_COMPARABLE_PROTOCOL = 4
+EXIT_NOT_COMPARABLE_CROSS_POWER = 5
+EXIT_NOT_COMPARABLE_POWER_DEFICIENT = 6
+
 SCRIPT = Path(__file__).resolve()
 GRADUS_ROOT = SCRIPT.parents[1]
 WORKSPACE = SCRIPT.parents[2]
 BENCH_ROOT = WORKSPACE / ".bench" / "gradus"
+BASELINE_DIR = GRADUS_ROOT / "bench" / "baselines"
 
 
 class BenchError(Exception):
@@ -991,6 +1028,557 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# capture + gate — first-baseline capture + comparability wrapper (GB-U4)
+# ---------------------------------------------------------------------------
+
+
+class NotComparable(Exception):
+    """A pre-checker refusal: the wrapper refuses before the radix checker
+    ever runs (goal §Stage-ladder comparability rules + §Per-row
+    power-state law). Distinct exit per refusal family."""
+
+    def __init__(self, kind: str, message: str, exit_code: int):
+        super().__init__(message)
+        self.kind = kind
+        self.exit_code = exit_code
+
+
+def run_pinned(
+    scratch: Path, argv: list[str], timeout: float | None = None
+) -> subprocess.CompletedProcess:
+    """Run the harness from the PINNED gradus worktree — the recorded
+    gradus_sha owns the manifest, the loop, and (for capture) itself."""
+    command = [sys.executable, str(scratch / "gradus" / "scripta" / "bench.py"), *argv]
+    return subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+
+
+def run_pinned_stream(scratch: Path, argv: list[str]) -> tuple[int, list[str], float]:
+    """Stream the pinned harness's stderr live while collecting it verbatim
+    (the receipt's run transcript). stdout is empty with --out."""
+    command = [sys.executable, str(scratch / "gradus" / "scripta" / "bench.py"), *argv]
+    print(f"bench: $ {' '.join(command)}", file=sys.stderr)
+    started = time.monotonic()
+    proc = subprocess.Popen(
+        command,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    lines = [f"$ {' '.join(command)}"]
+    assert proc.stderr is not None
+    for line in proc.stderr:
+        line = line.rstrip("\n")
+        lines.append(line)
+        print(line, file=sys.stderr)
+    code = proc.wait()
+    return code, lines, time.monotonic() - started
+
+
+def verify_ordering_invariant(scratch: Path, triple: dict) -> str:
+    """done_when (f), run BEFORE any baseline write: the recorded gradus_sha
+    already contains the complete harness — the full subcommand set, all
+    four stage tokens, and row-level power_state in a smoke output. Returns
+    the smoke run's power_class for the receipt."""
+    pinned = scratch / "gradus" / "scripta" / "bench.py"
+    if not pinned.is_file():
+        raise BenchError(
+            "invariant-failed",
+            f"{pinned} is missing at gradus {triple['gradus']} — the recorded "
+            f"sha does not contain the harness",
+        )
+
+    help_proc = run_pinned(scratch, ["--help"])
+    if help_proc.returncode != 0:
+        raise BenchError(
+            "invariant-failed",
+            f"pinned `bench --help` exited {help_proc.returncode}: "
+            f"{(help_proc.stderr or '').strip()}",
+        )
+    missing = [name for name in GATE_SUBCOMMANDS if name not in help_proc.stdout]
+    if missing:
+        raise BenchError(
+            "invariant-failed",
+            f"pinned `bench --help` lacks subcommand(s) {', '.join(missing)} — "
+            f"gradus {triple['gradus']} is not harness-complete",
+        )
+    run_help = run_pinned(scratch, ["run", "--help"])
+    missing_stages = [name for name in STAGE_NAMES if name not in run_help.stdout]
+    if missing_stages:
+        raise BenchError(
+            "invariant-failed",
+            f"pinned `bench run --help` lacks stage token(s) "
+            f"{', '.join(missing_stages)} — the ladder (GB-U3b) is not in "
+            f"the recorded sha",
+        )
+
+    with tempfile.TemporaryDirectory(prefix="bench-invariant-") as tmp:
+        smoke_out = Path(tmp) / "smoke.json"
+        smoke = run_pinned(
+            scratch,
+            [
+                "run",
+                "--scratch",
+                str(scratch),
+                "--stage",
+                "smoke",
+                "--out",
+                str(smoke_out),
+            ],
+            timeout=600.0,
+        )
+        if smoke.returncode != 0:
+            tail = " | ".join((smoke.stderr or "").strip().splitlines()[-5:])
+            raise BenchError(
+                "invariant-failed",
+                f"pinned `run --stage smoke` exited {smoke.returncode}: {tail}",
+            )
+        document = json.loads(smoke_out.read_text(encoding="utf-8"))
+    rows = document.get("results") or []
+    unpowered = [
+        str(row.get("label"))
+        for row in rows
+        if not isinstance(row.get("power_state"), str)
+    ]
+    if not rows or unpowered:
+        raise BenchError(
+            "invariant-failed",
+            f"smoke output at gradus {triple['gradus']} lacks row power_state "
+            f"({', '.join(unpowered) or 'no result rows'}) — GB-U3c is not in "
+            f"the recorded sha",
+        )
+    smoke_class = (document.get("metadata") or {}).get("power_class")
+    if not isinstance(smoke_class, str):
+        raise BenchError(
+            "invariant-failed",
+            f"smoke output at gradus {triple['gradus']} lacks "
+            f"metadata.power_class",
+        )
+    print(
+        f"bench: ordering invariant ok at gradus {triple['gradus']} — full "
+        f"subcommand set, stage tokens {'/'.join(STAGE_NAMES)}, smoke rows "
+        f"carry power_state (power_class {smoke_class})",
+        file=sys.stderr,
+    )
+    return smoke_class
+
+
+def write_receipt(
+    path: Path,
+    *,
+    stem: str,
+    document: dict,
+    triple: dict,
+    transcript: list[str],
+    wall_s: float,
+    smoke_class: str,
+    captured: datetime,
+) -> None:
+    """Same-stem receipt (done_when b): environment table, run transcript,
+    battery-ruling citations (gpu-lessons L4 — receipt committed with the
+    code)."""
+    meta = document["metadata"]
+    rows = document["results"]
+    protocol = meta["protocol"]
+
+    def table(header: list[str], body: list[list[str]]) -> list[str]:
+        out = [
+            "| " + " | ".join(header) + " |",
+            "|" + "|".join("---" for _ in header) + "|",
+        ]
+        out += ["| " + " | ".join(row) + " |" for row in body]
+        return out
+
+    lines = [
+        f"# Bench baseline receipt — {stem}",
+        "",
+        f"captured {captured.isoformat()} · full-run wall {wall_s / 60:.1f} min · "
+        f"RUN_EXIT 0 · harness `scripta/bench capture` (gradus "
+        f"`{triple['gradus']}`)",
+        "",
+        "## Ordering invariant (unit f — verified BEFORE the baseline write)",
+        "",
+        f"- recorded `gradus_sha` `{triple['gradus']}` resolves `scripta/bench` "
+        f"with the full subcommand set ({', '.join(GATE_SUBCOMMANDS)}) — proven "
+        f"from the pinned worktree",
+        f"- all four stage tokens ({'/'.join(STAGE_NAMES)}) present in the "
+        f"pinned `run` help",
+        f"- pinned `run --stage smoke` emitted `power_state` on every result "
+        f"row (`metadata.power_class: {smoke_class}`)",
+        "",
+        "## Triple (requirement 2 — reproduction pin)",
+        "",
+        *table(["repo", "sha"], [[name, triple[name]] for name in REPOS]),
+        "",
+        "## Environment (metadata block)",
+        "",
+        *table(
+            ["field", "value"],
+            [
+                [field, str(meta.get(field, "unavailable"))]
+                for field in ENV_IDENTITY_FIELDS
+            ]
+            + [
+                [
+                    "power_state (start-of-run point observation)",
+                    str(meta.get("power_state")),
+                ],
+                ["power_class (run summary)", str(meta.get("power_class"))],
+                ["rustc", str((meta.get("faber_binary") or {}).get("rustc"))],
+            ],
+        ),
+        "",
+        "```",
+        str(meta.get("pmset_raw", "unavailable")),
+        "```",
+        "",
+        "## Protocol",
+        "",
+        f"stage `{meta['stage']}` ({meta['stage_number']}) · warmups "
+        f"{protocol['warmups']} · samples {protocol['samples']} · K per label: "
+        + ", ".join(f"{label}={k}" for label, k in sorted(protocol["iterations"].items()))
+        + " · caps are safety circuit breakers only (never a metric, never "
+        "pass/fail) · t/s = (K × units_per_iteration) / min(sample wall, "
+        "cap_s), median across samples",
+        "",
+        "## Results",
+        "",
+        *table(
+            ["label", "median_ms", "median units/s", "capped", "ok", "power_state"],
+            [
+                [
+                    str(row["label"]),
+                    str(row["median_ms"]),
+                    str(row["median_units_per_s"]),
+                    str(row["capped"]),
+                    str(row["ok"]),
+                    str(row["power_state"]),
+                ]
+                for row in rows
+            ],
+        ),
+        "",
+        "## Run transcript (verbatim `--stage full` stderr from the pinned harness)",
+        "",
+        "```",
+        *transcript,
+        "```",
+        "",
+        "## Battery ruling + citations",
+        "",
+        "- Operator ruling `ea4dd0a3` (per-row power-state law): the first "
+        "baseline is AC-gated; a battery capture is battery-labeled, valid "
+        "evidence, but NOT the first baseline. Battery absolutes are "
+        "depressed, never steady-state claims; per-class ratio-is-signal.",
+        *[f"- {citation}" for citation in meta["citations"]],
+        "",
+    ]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def cmd_capture(args: argparse.Namespace) -> int:
+    # AC gate (done_when a; ruling ea4dd0a3 keeps the FIRST baseline
+    # AC-gated). A battery capture is honest evidence but not the first
+    # baseline — refuse up front, and stop-and-report below if power
+    # leaves AC during the run.
+    power = probe_power_class()
+    if power != "ac":
+        raise BenchError(
+            "not-ac-power",
+            f"power class is {power!r}; the first baseline capture requires "
+            f"AC (goal §Per-row power-state law) — no capture started",
+        )
+    pmset_batt = probe(["pmset", "-g", "batt"]) or "unavailable"
+    first_line = pmset_batt.splitlines()[0] if pmset_batt != "unavailable" else pmset_batt
+    print(f"bench: capture AC gate ok — pmset: {first_line}")
+
+    gradus_repo = source_repo("gradus")
+    dirty = run_git(
+        gradus_repo, "status", "--porcelain", "--", "scripta/bench.py", check=False
+    ).stdout.strip()
+    if dirty:
+        raise BenchError(
+            "harness-uncommitted",
+            "scripta/bench.py has uncommitted changes — commit first: the "
+            "recorded gradus_sha must already contain the complete harness "
+            "(ordering invariant, done_when f)",
+        )
+
+    captured = datetime.now(timezone.utc)
+    triple = {name: resolve_commit(source_repo(name), name, "HEAD") for name in REPOS}
+    scratch = Path(args.scratch).resolve() if args.scratch else default_scratch(triple)
+    guard_scratch_outside_repos(scratch)
+    if scratch.exists() and any(scratch.iterdir()):
+        raise BenchError(
+            "scratch-not-empty",
+            f"{scratch} exists and is not empty; run `bench clean --scratch "
+            f"{scratch}` first — capture pins a fresh triple",
+        )
+
+    print(
+        f"bench: capture triple radix {triple['radix']} hosts "
+        f"{triple['hosts']} gradus {triple['gradus']}",
+        file=sys.stderr,
+    )
+    cmd_materialize(
+        argparse.Namespace(radix=None, hosts=None, gradus=None, scratch=str(scratch))
+    )
+    cmd_build(
+        argparse.Namespace(
+            scratch=str(scratch),
+            min_free_gb=args.min_free_gb,
+            disk_floor_gb=args.disk_floor_gb,
+        )
+    )
+    smoke_class = verify_ordering_invariant(scratch, triple)
+
+    with tempfile.TemporaryDirectory(prefix="bench-capture-") as tmp:
+        full_out = Path(tmp) / "full.json"
+        print(
+            f"bench: pinned --stage full run starting (expect ~30-35 min)",
+            file=sys.stderr,
+        )
+        code, transcript, wall_s = run_pinned_stream(
+            scratch,
+            ["run", "--scratch", str(scratch), "--stage", "full", "--out", str(full_out)],
+        )
+        if code != 0:
+            tail = " | ".join(transcript[-6:])
+            raise BenchError(
+                "capture-run-failed",
+                f"pinned --stage full exited {code}: {tail}",
+            )
+        document = json.loads(full_out.read_text(encoding="utf-8"))
+
+    metadata = document.get("metadata") or {}
+    protocol = metadata.get("protocol") or {}
+    selection = protocol.get("label_selection") or {}
+    manifest = load_manifest(scratch)
+    manifest_labels = sorted(case["label"] for case in manifest["cases"])
+    problems: list[str] = []
+    if document.get("format_version") != CHECKER_FORMAT_VERSION:
+        problems.append(f"format_version {document.get('format_version')!r}")
+    if (
+        metadata.get("stage") != "full"
+        or metadata.get("stage_number") != STAGE_LADDER["full"]["number"]
+    ):
+        problems.append(f"stage {metadata.get('stage')!r}/{metadata.get('stage_number')!r}")
+    if protocol.get("warmups") != WARMUPS or protocol.get("samples") != SAMPLES:
+        problems.append(f"protocol {protocol.get('warmups')}/{protocol.get('samples')}")
+    if selection.get("mode") != "stage" or sorted(selection.get("labels") or []) != manifest_labels:
+        problems.append("label selection is not the full manifest breadth")
+    if not str(metadata.get("comparability", "")).startswith("gate-comparable"):
+        problems.append(f"comparability {metadata.get('comparability')!r}")
+    rows = document.get("results") or []
+    failed_rows = [str(row.get("label")) for row in rows if not row.get("ok")]
+    if failed_rows:
+        problems.append(f"value-check not observed: {', '.join(failed_rows)}")
+    if problems:
+        raise BenchError("capture-invalid", "; ".join(problems))
+
+    # stop-and-report law: a battery/mixed capture is honestly labeled by
+    # the per-row law but is NOT the first baseline (goal §Per-row
+    # power-state law)
+    off_ac = [
+        f"{row.get('label')}={row.get('power_state')!r}"
+        for row in rows
+        if row.get("power_state") != "ac"
+    ]
+    if metadata.get("power_class") != "ac" or off_ac:
+        raise BenchError(
+            "baseline-not-ac",
+            f"power left AC during the capture (run power_class "
+            f"{metadata.get('power_class')!r}; rows {', '.join(off_ac) or '—'}). "
+            f"The capture is honestly labeled per the per-row law, but it is "
+            f"NOT the first baseline — stop-and-report, then re-run capture "
+            f"on AC",
+        )
+
+    stem = (
+        f"baseline-{captured.strftime('%Y%m%d')}"
+        f"-r{triple['radix'][:7]}-h{triple['hosts'][:7]}-g{triple['gradus'][:7]}"
+    )
+    BASELINE_DIR.mkdir(parents=True, exist_ok=True)
+    baseline_path = BASELINE_DIR / f"{stem}.json"
+    if baseline_path.exists():
+        raise BenchError(
+            "baseline-exists",
+            f"{baseline_path} already exists; baselines are append-only — a "
+            f"re-capture at a new triple lands as a new dated file",
+        )
+    baseline_path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    receipt_path = BASELINE_DIR / f"{stem}.md"
+    write_receipt(
+        receipt_path,
+        stem=stem,
+        document=document,
+        triple=triple,
+        transcript=transcript,
+        wall_s=wall_s,
+        smoke_class=smoke_class,
+        captured=captured,
+    )
+    print(f"bench: wrote {baseline_path}", file=sys.stderr)
+    print(f"bench: wrote {receipt_path}", file=sys.stderr)
+    print(
+        f"bench: capture ok — full-run wall {wall_s / 60:.1f} min; gate "
+        f"proofs next: `scripta/bench gate {baseline_path}` (green), then "
+        f"BENCH_REGRESSION_THRESHOLD=0.000001 against a slower candidate "
+        f"(red, gpu-lessons L1)",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def load_gate_json(path: Path) -> dict:
+    if not path.is_file():
+        raise BenchError("no-file", f"{path} does not exist")
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except ValueError as err:
+        raise BenchError("bad-json", f"{path}: {err}") from err
+    if (
+        not isinstance(document, dict)
+        or document.get("format_version") != CHECKER_FORMAT_VERSION
+        or not isinstance(document.get("results"), list)
+        or not document["results"]
+    ):
+        raise BenchError(
+            "not-bench-json",
+            f"{path}: expected format_version '1' with a non-empty results array",
+        )
+    return document
+
+
+def gate_baseline_path(explicit: str | None) -> Path:
+    if explicit:
+        path = Path(explicit)
+        if not path.is_file():
+            raise BenchError("no-file", f"baseline {path} does not exist")
+        return path
+    stems = sorted(BASELINE_DIR.glob("baseline-*.json")) if BASELINE_DIR.is_dir() else []
+    if not stems:
+        raise BenchError(
+            "no-baseline",
+            f"no baseline-*.json under {BASELINE_DIR}; run `bench capture` first",
+        )
+    return stems[-1]  # append-only library: newest dated stem
+
+
+def doc_label_set(document: dict) -> set[str]:
+    return {str(row.get("label")) for row in document["results"]}
+
+
+def refuse_incomparable(base_doc: dict, cand_doc: dict) -> None:
+    """The four NOT COMPARABLE families, each a distinct exit, all BEFORE
+    the radix checker runs (goal §Stage-ladder comparability rules +
+    §Per-row power-state law)."""
+    base_meta = base_doc.get("metadata") or {}
+    cand_meta = cand_doc.get("metadata") or {}
+    sides = (
+        ("baseline", base_doc, base_meta),
+        ("candidate", cand_doc, cand_meta),
+    )
+
+    # (1) environment mismatch — same machine required (§Threshold policy)
+    for field in ENV_IDENTITY_FIELDS:
+        base_value, cand_value = base_meta.get(field), cand_meta.get(field)
+        if base_value != cand_value:
+            raise NotComparable(
+                "environment-mismatch",
+                f"{field}: baseline {base_value!r} vs candidate "
+                f"{cand_value!r} — gate comparison requires the same machine",
+                EXIT_NOT_COMPARABLE_ENV,
+            )
+
+    # (2) lesser-stage protocol — only stage full / 3 warmups / 10 samples /
+    # all labels / manifest K is gate-comparable; explicit subsets and any
+    # protocol override are iteration-signal only
+    protocol_problems: list[str] = []
+    for name, _doc, meta in sides:
+        protocol = meta.get("protocol") or {}
+        selection = protocol.get("label_selection") or {}
+        if (
+            meta.get("stage") != "full"
+            or meta.get("stage_number") != STAGE_LADDER["full"]["number"]
+        ):
+            protocol_problems.append(f"{name} stage {meta.get('stage')!r}")
+        if protocol.get("warmups") != WARMUPS or protocol.get("samples") != SAMPLES:
+            protocol_problems.append(
+                f"{name} protocol {protocol.get('warmups')}/{protocol.get('samples')}"
+            )
+        if selection.get("mode") != "stage":
+            protocol_problems.append(f"{name} label mode {selection.get('mode')!r}")
+    if doc_label_set(base_doc) != doc_label_set(cand_doc):
+        protocol_problems.append("label sets differ (lesser breadth or drift)")
+    elif (base_meta.get("protocol") or {}).get("iterations") != (
+        cand_meta.get("protocol") or {}
+    ).get("iterations"):
+        protocol_problems.append("per-label K differs (protocol drift)")
+    if protocol_problems:
+        raise NotComparable(
+            "lesser-stage-protocol",
+            "; ".join(protocol_problems)
+            + " — only stage full, 3 warmups / 10 samples, all manifest "
+            "labels is gate-comparable",
+            EXIT_NOT_COMPARABLE_PROTOCOL,
+        )
+
+    # (3) power law (ea4dd0a3), fail-closed first: a missing run class or
+    # any missing/mixed/unavailable row class never silently compares
+    for name, doc, meta in sides:
+        run_class = meta.get("power_class")
+        if run_class not in POWER_CLASSES:
+            raise NotComparable(
+                "power-deficient",
+                f"{name} metadata.power_class {run_class!r} not in "
+                f"{{ac, battery}} — fail-closed, never silently comparable",
+                EXIT_NOT_COMPARABLE_POWER_DEFICIENT,
+            )
+        for row in doc["results"]:
+            row_class = row.get("power_state")
+            if row_class not in POWER_CLASSES:
+                raise NotComparable(
+                    "power-deficient",
+                    f"{name} row {row.get('label')!r} power_state {row_class!r} "
+                    f"(missing/mixed/unavailable) — fail-closed",
+                    EXIT_NOT_COMPARABLE_POWER_DEFICIENT,
+                )
+    if base_meta["power_class"] != cand_meta["power_class"]:
+        raise NotComparable(
+            "cross-power-class",
+            f"baseline power_class {base_meta['power_class']!r} vs candidate "
+            f"{cand_meta['power_class']!r} — cross-class comparison is NOT "
+            f"COMPARABLE; per-test stratified comparison is receipt signal "
+            f"only, never a gate (ruling ea4dd0a3)",
+            EXIT_NOT_COMPARABLE_CROSS_POWER,
+        )
+
+
+def cmd_gate(args: argparse.Namespace) -> int:
+    candidate = Path(args.candidate)
+    baseline = gate_baseline_path(args.baseline)
+    print(f"bench: gate candidate {candidate}")
+    print(f"bench: gate baseline  {baseline}")
+    cand_doc = load_gate_json(candidate)
+    base_doc = load_gate_json(baseline)
+    try:
+        refuse_incomparable(base_doc, cand_doc)
+    except NotComparable as err:
+        print(f"bench: NOT COMPARABLE ({err.kind}): {err}", file=sys.stderr)
+        return err.exit_code
+
+    checker = source_repo("radix") / "scripta" / "check-benchmark-regression.py"
+    if not checker.is_file():
+        raise BenchError(
+            "checker-missing", f"{checker} not found (radix sibling required)"
+        )
+    command = [sys.executable, str(checker), str(baseline), str(candidate)]
+    print("bench: comparable — delegating to the radix checker")
+    print(f"bench: $ {' '.join(command)}")
+    return subprocess.run(command).returncode
+
+
 def clean_one(scratch: Path) -> None:
     print(f"bench: clean {scratch}")
     for name in REPOS:
@@ -1045,8 +1633,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="bench",
         description="Bench pin-and-build driver: pin the radix/hosts/gradus "
-        "triple into a scratch root, build the pinned faber, tear down "
-        "clean. Errors are typed (`bench: <kind>: <message>`, exit 1).",
+        "triple into a scratch root, build the pinned faber, run the "
+        "stage-ladder benchmark, capture the dated baseline, gate "
+        "comparability, tear down clean. Errors are typed "
+        "(`bench: <kind>: <message>`, exit 1).",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -1129,6 +1719,56 @@ def build_parser() -> argparse.ArgumentParser:
         help="write the JSON here (default: stdout; progress always goes to stderr)",
     )
     run.set_defaults(fn=cmd_run)
+
+    capture = sub.add_parser(
+        "capture",
+        help="first-baseline capture: AC-gated (pmset) pin+build at the "
+        "current triple, ordering-invariant verification, pinned --stage "
+        "full run (~35 min), dated baseline JSON + same-stem receipt",
+    )
+    capture.add_argument(
+        "--scratch", metavar="DIR", help="scratch root to pin+build+run in"
+    )
+    capture.add_argument(
+        "--min-free-gb",
+        type=float,
+        default=DEFAULT_MIN_FREE_GB,
+        metavar="N",
+        help=f"required free space before the build (default {DEFAULT_MIN_FREE_GB:g})",
+    )
+    capture.add_argument(
+        "--disk-floor-gb",
+        type=float,
+        default=DEFAULT_DISK_FLOOR_GB,
+        metavar="N",
+        help=(
+            "free-space floor watched during the build; below it cargo is "
+            f"stopped and reported (default {DEFAULT_DISK_FLOOR_GB:g})"
+        ),
+    )
+    capture.set_defaults(fn=cmd_capture)
+
+    gate = sub.add_parser(
+        "gate",
+        help="comparability wrapper: refuses environment mismatch / "
+        "lesser-stage protocol / cross-power-class / power-deficient inputs "
+        "(NOT COMPARABLE, exits 3-6) before delegating to "
+        "../radix/scripta/check-benchmark-regression.py (0 pass / 1 regress)",
+    )
+    gate.add_argument(
+        "candidate",
+        metavar="CURRENT_JSON",
+        help="current-run JSON to gate",
+    )
+    gate.add_argument(
+        "--baseline",
+        metavar="BASELINE_JSON",
+        help=(
+            "baseline to compare against (default: newest "
+            f"{BASELINE_DIR}/baseline-*.json)"
+        ),
+    )
+    gate.set_defaults(fn=cmd_gate)
 
     clean = sub.add_parser(
         "clean", help="remove worktrees, prune registrations, delete the scratch root"
