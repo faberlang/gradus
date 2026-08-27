@@ -1,6 +1,6 @@
 # Campaign: Kernel-Purity Census (OX-Alpha)
 
-**Status**: active — Wave 0 (carrier/admissions ruling + `NumericBlock` rename + stride-cache rider) delivered 2026-08-26, see [`wave-0-carrier-admissions-ruling.md`](wave-0-carrier-admissions-ruling.md); Wave 1 is partially delivered and lowered for audit; Waves 2–3 remain planned and gated on current Radix admission evidence (§Waves)
+**Status**: active — Wave 0 (carrier/admissions ruling + `NumericBlock` rename + stride-cache rider) delivered 2026-08-26, see [`wave-0-carrier-admissions-ruling.md`](wave-0-carrier-admissions-ruling.md); Wave 1 DONE 2026-08-27 — all 15 units accounted (math twins 13df284, nn twins 47d3d69, prior-landed 8; phase audit clean 1c6f1ad9; consumer proof 1d9127f); Wave 2 gate chain lowered and in flight (KPC-SEM landed 16f69d1d2 radix; PKG-ADM/PKG-REP dispatched a5d8c0f0/11948fae; KPC-WIRE/EMIT queued on shared surfaces); Waves 2–3 per §Waves
 **Created**: 2026-08-26
 **Mode**: routing + delivery record — this campaign owns the census rulings and wave ledger; code lands as normal direct-mode units
 **Control-plane repo**: `/Users/ianzepp/work/faberlang/gradus`
@@ -127,7 +127,7 @@ is sized but not lowered in this Wave 1 record.
 | W0 rename `Tensor` → `NumericBlock` | done 2026-08-26 | gradus `500342d` | converter-driven, per-file check |
 | W0 stride cache | done 2026-08-26 | gradus `500342d` | 1.75× on the decode logits handoff (ruling §4.2) |
 | W0 digest re-pin | done 2026-08-26 | radix `9e5070d76` | GEA2 source lineage, identity proof attached |
-| W1 annotation/method-twin swaps | **partially delivered** — six census annotations landed 2026-08-26; `nn.rmsnorm` was already typed; residual eight rows lowered 2026-08-27 | gradus `2a1d361970` (task `ba835b45`); [`wave-1-delivery.md`](wave-1-delivery.md) | The six import-role-loss observations were valid at the old Radix tip. Role/body transport and composition subsequently landed at Radix `5482bc5ac`, `fae613683`, `dba1383c8`; current target-facing spike proof remains a gate. Residual rows are `math.sub/mul/div/neg/abs/signum` and `nn.silu/gelu`; no numeric contract is relaxed. |
+| W1 annotation/method-twin swaps | **done 2026-08-27 — all 15 accounted**: six census annotations 2026-08-26 (`2a1d361970`, task `ba835b45`); residual rows landed — math twins `13df284`, nn twins `47d3d69`; abs/signum red-named (SEM004 lane gaps, routed); phase audit clean `1c6f1ad9`; consumer proof `1d9127f` | gradus `2a1d361970`+`13df284`+`47d3d69`; [`wave-1-delivery.md`](wave-1-delivery.md) | Role/body transport and composition landed at Radix `5482bc5ac`, `fae613683`, `dba1383c8`; consumer proof classifies the remaining gate as radix linkage (KPC chain), not gradus purity. No numeric contract is relaxed. |
 | W2 prefill-chain migration | planned — sized only; waits for Wave 1 admission and current Radix consumer proof | [`wave-1-delivery.md`](wave-1-delivery.md) §6 | No Wave 2 units lowered here; production llama/SmolLM2 prefill chain remains mandatory |
 
 | W3 program composition | planned | — | blocked on W2 |
