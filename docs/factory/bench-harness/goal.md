@@ -6,6 +6,7 @@
 **Source:** operator order (verbatim requirements 1–4 in §Problem); routed by mind task `076e7a1a`
 **Amended:** 2026-08-27 — audit `c4f621fa` fix pass: operator perf-taxonomy folded (addendum mail `46ab4e94`, delivered via mind task `06a9cf0b`; §Perf-taxonomy), scratch-worktree teardown added to the pin driver, baseline-capture ordering invariant pinned
 **Amended:** 2026-08-27 — stage-ladder amendment (operator rulings, mind mails `1309af45` + `88895a02` + `d3cc0123`; planner task `8add67c0`): §Stage ladder added (scripta/test-model stages smoke/dev/rough/full; full 3/10/7-label protocol byte-preserved as the top stage; default dev mode = stage 2), unit GB-U3b added, GB-U4/GB-U5 ordering invariant extended to the ladder, GB-U6 law extended
+**Amended:** 2026-08-27 — per-row power-state amendment (operator ruling 4, mind mail `ea4dd0a3`, extends `1309af45`/`88895a02`/`d3cc0123`; planner task `4f87b663`): §Environment-identity gains the per-row power-state law (row-level `power_state` sampled at each row's execution; `metadata.power_class` run summary with honest mixed semantics; §Output-format row example extended), §Stage-ladder comparability rules gain power-class stratification (cross-class NOT COMPARABLE; per-class ratio law), §Threshold policy keyed on `power_class`, unit GB-U3c added (capture) with GB-U4 (wrapper stratified refusal) re-gated on it, acceptance 9 added. The AC gate on the first baseline capture is NOT rescinded.
 
 Ruling 3 reconciliation (mail `d3cc0123`, folded via planner resume before
 commit): the ladder now exposes BOTH knobs — label breadth × repetition
@@ -103,15 +104,19 @@ accepts, following the committed convention
     { "label": "gemv.f32.320x960", "median_ms": 0.0, "min_ms": 0.0,
       "max_ms": 0.0, "samples": 10, "iterations": 25, "ok": true,
       "class": "fixed-oracle", "work_unit": "<manifest-defined>",
-      "units_per_sample": 0, "median_units_per_s": 0.0, "capped": false }
+      "units_per_sample": 0, "median_units_per_s": 0.0, "capped": false,
+      "power_state": "ac" }
   ]
 }
 ```
 
 The checker reads only `format_version`, `results[].label`, and
-`results[].median_ms`; extra fields compose. Gate: exit 0 pass / exit 1
-regress; default threshold 10 %, overridable via
-`BENCH_REGRESSION_THRESHOLD` (checker's own contract, unchanged).
+`results[].median_ms`; extra fields compose — including the per-row
+`power_state` field (`ea4dd0a3`): the checker is power-blind by
+contract, and the gradus gate wrapper owns every power-class refusal
+(§Per-row power-state law). Gate: exit 0 pass / exit 1 regress; default
+threshold 10 %, overridable via `BENCH_REGRESSION_THRESHOLD` (checker's
+own contract, unchanged).
 
 ### Environment-identity metadata (design input, resolved)
 
@@ -121,11 +126,68 @@ Every baseline `metadata` block carries, missing-any-voids-the-claim
 | Field | Source |
 | --- | --- |
 | `timestamp` (UTC), `hostname`, `machine_model`, `cpu`, `cores`, `memory`, `os`/`kernel`, `arch` | `sysctl`/`sw_vers`/`uname`/`hostname` — the gi0 run-metadata precedent (`radix/docs/factory/gpu-inference-gguf/gi0-inventory.md` §277; `trials` harness `run_metadata.py`) |
-| `power_state` (AC/battery + charge % + powermode), `pmset_raw` | `pmset -g batt` / `pmset -g`. **Battery ruling applies to absolute numbers**: a battery-power capture is labeled `power_state: battery`, its absolutes are depressed and are NOT steady-state claims; ratio-is-signal (`radix/docs/factory/perf-parity-baseline/evidence/2026-08-26-metal-m5max-soak-l2000/perf-parity-receipt-v1-2026-08-27-soak.json` `environment_note` + `power_state`; operator ruling recorded in the U7 status clause). Non-macOS records `unavailable` and is not gate-comparable. |
+| `power_state` (AC/battery + charge % + powermode), `pmset_raw`, `power_class` | `pmset -g batt` / `pmset -g`. **Per-row power-state law (`ea4dd0a3`)**: every result row carries `power_state` sampled at that row's execution; `metadata.power_state` (descriptive string) is the start-of-run point observation only; `metadata.power_class` is the run summary (§Per-row power-state law). **Battery ruling applies to absolute numbers**: a battery capture's absolutes are depressed and are NOT steady-state claims; ratio-is-signal per class (perf-parity soak receipt `environment_note`; §Per-row power-state law). Non-macOS records `unavailable` and is not gate-comparable. |
 | `triple` (`radix_sha`, `hosts_sha`, `gradus_sha` — full SHAs) | requirement 2 |
 | `faber_binary` (profile, rustc version, build command) | binary identity, benchmark-method §5 |
 | `protocol` (warmups=3, samples=10, per-case iterations, timer) | §Run loop above |
 | `citations` (benchmark-method version, gpu-lessons law ids, battery-ruling handle) | cite, never duplicate |
+
+### Per-row power-state law (operator ruling `ea4dd0a3`, resolved)
+
+Operator ruling 4 (2026-08-27): the harness must capture, for each test
+it runs, whether the machine was on battery or AC — a per-result-row
+`power_state` field sampled at that row's execution, not only the
+run-level metadata label. Motivation includes mixed-power runs: a 31-min
+full sweep can span a plug-in transition, so the run-level label can
+misdescribe later rows; per-row capture makes battery data honestly
+usable via stratification instead of discarded.
+
+Field shape (additive; checker-untouched; protocol and K unchanged):
+
+- `results[].power_state` ∈ `ac | battery | mixed | unavailable`,
+  sampled at that row's execution: one probe immediately before the
+  row's first warmup and one immediately after its last measured
+  sample. Probes agreeing → that class; disagreeing → `mixed` (a point
+  sample that can misdescribe its own row is the run-label's defect one
+  level down — avoided). Non-macOS → `unavailable`. Every stage of the
+  ladder emits the field (smoke through full); the 3/10/K protocol is
+  untouched and K stays fixed on every stage.
+- `metadata.power_state` (existing descriptive string: class + charge %
+  + pmset-verified) is now defined honestly as the **start-of-run point
+  observation** — kept for continuity with the landed GB-U3 evidence,
+  never a claim about later rows.
+- `metadata.power_class` ∈ `ac | battery | mixed | unavailable` is the
+  **run summary the law keys on**: the unanimous row class when every
+  row agrees, else `mixed`; when mixed, `power_class_first` and
+  `power_class_last` record the first and last row classes. A
+  unanimous-battery run is a battery run — honestly labeled, never
+  discarded.
+
+Comparison law (extends the §Stage-ladder comparability rules):
+
+- **Stratify per test by power class.** A test's AC rows compare
+  against that test's AC rows across runs; battery against battery.
+  Cross-class comparison is **NOT COMPARABLE** — the same refusal family
+  as environment mismatch and lesser-stage protocol. Rows that are
+  `mixed`, `unavailable`, or missing the field compare against nothing
+  (fail closed: a row-field-less JSON is treated as unavailable-class
+  and refused, never silently comparable).
+- **Gate grade vs signal grade.** The gate wrapper (GB-U4) requires
+  whole-file unanimity: both sides' `metadata.power_class` ∈ {ac,
+  battery} and equal, else `NOT COMPARABLE` before the checker runs.
+  Per-test stratified row comparison (AC vs AC, battery vs battery,
+  across runs) is legitimate recorded signal in receipts — never a gate
+  mode in v1.
+- **Per-class ratio law.** As long as gradus and a comparison side
+  (llama, in the future parity harness) run the SAME test on the SAME
+  power class, their ratio/difference is valid signal even on battery —
+  the perf-parity ratio-is-signal precedent extended per class. Battery
+  absolutes stay depressed, never steady-state claims; the ratio
+  carries.
+- **AC gate on the first baseline — NOT rescinded.** GB-U4 done_when
+  (a) still requires AC for the first baseline capture; a battery
+  capture is battery-labeled per this law and is valid evidence, but it
+  is not the first baseline.
 
 Measurement laws that govern (gpu-lessons, canonical
 `~/work/ianzepp/skills/gpu-lessons/`, laws in `references/laws.md`):
@@ -264,6 +326,16 @@ Laws (mirroring `radix/scripta/test`'s cheap-first discipline):
   (e.g. rough vs rough, before/after a change) is legitimate recorded
   signal and never gates. Checker self-compare (same file on both sides)
   remains valid format evidence for any stage.
+- **Power-class stratification (`ea4dd0a3`), same refusal family.** On
+  top of protocol identity, gate comparability requires power-class
+  identity: both files' `metadata.power_class` ∈ {ac, battery} and
+  equal. Cross-power-class comparison is **NOT COMPARABLE** (refused
+  before the checker runs); `mixed`/`unavailable` runs and
+  row-field-missing files are refused fail-closed. Per-test stratified
+  comparison (AC rows vs AC rows, battery vs battery, across runs) is
+  recorded signal only (§Per-row power-state law). The per-class ratio
+  law makes same-test same-class gradus-vs-llama ratios valid signal
+  even on battery.
 - **Pre-release depth (10–20 reps class) — deferred.** No `--samples`
   override ships in GB-U3b. If deep pre-release verification is ordered
   later, it lands as an explicit `--samples N` override on `run`,
@@ -281,9 +353,11 @@ Laws (mirroring `radix/scripta/test`'s cheap-first discipline):
 ### Threshold policy (design input, resolved)
 
 - Gate default 10 % (the checker's own default). Same machine AND same
-  power class required — the checker is machine-blind, so the gradus gate
-  wrapper refuses comparison on environment-identity mismatch
-  (`NOT COMPARABLE`, distinct exit) before the checker ever runs.
+  power class required — the checker is machine- and power-blind, so
+  the gradus gate wrapper refuses comparison on environment-identity
+  mismatch or power-class mismatch (`metadata.power_class` not both
+  {ac, battery} and equal — `NOT COMPARABLE`, distinct exit) before the
+  checker ever runs (§Per-row power-state law).
 - First generation is advisory: the gate is demonstrated green and red,
   but gradus merges are not blocked on it until the operator wires it.
 - Re-baseline = new committed file at a new triple (append-only). L21:
@@ -297,7 +371,7 @@ New `## Benchmarks` section in `gradus/AGENTS.md` recording: the 3-hash
 reproducibility law; the run command (`./scripta/bench …` with
 subcommands, `clean` teardown included); where baselines live and the
 append-only rule; the environment-identity + battery-ruling requirement;
-the threshold policy; the stage ladder (both knobs: label breadth × repetition count; default dev mode = stage 2, one–two labels, ~2–3 min; stage 3 = full-breadth rough pass at 1–2 reps, ~7–8 min; `--stage` tokens smoke/dev/rough/full; the full 3/10 protocol is the top stage and the only gate-comparable shape; lesser stages and any protocol override are iteration-signal only); the metric law (t/s = unit-count /
+the threshold policy; the stage ladder (both knobs: label breadth × repetition count; default dev mode = stage 2, one–two labels, ~2–3 min; stage 3 = full-breadth rough pass at 1–2 reps, ~7–8 min; `--stage` tokens smoke/dev/rough/full; the full 3/10 protocol is the top stage and the only gate-comparable shape; lesser stages and any protocol override are iteration-signal only); the per-row power-state law (row-level `power_state` sampled at each row's execution; `metadata.power_class` run-summary semantics with honest mixed handling; stratified comparison — cross-class NOT COMPARABLE; per-class ratio-is-signal even on battery, perf-parity precedent; AC-gated first baseline — `ea4dd0a3`); the metric law (t/s = unit-count /
 min(completion, cap) is the sole throughput metric; runtime caps are
 safety circuit breakers, never metrics, never pass/fail); the class-(b)
 not-fitting ruling (fixed-output-length + per-side expected counts are
@@ -435,6 +509,13 @@ valid history either way (append-only, never rewritten).
    unshrunk on every stage); any JSON whose recorded protocol is not
    exactly 3/10 × 7 labels is refused by the gate wrapper (proven with
    the GB-U4 `NOT COMPARABLE` path).
+9. Per-row power-state law live (`ea4dd0a3`): every stage's run output
+   carries `results[].power_state` on every row plus the
+   `metadata.power_class` summary; the gate wrapper refuses
+   cross-power-class, mixed-class, and row-field-missing JSON
+   (`NOT COMPARABLE`, proven with the GB-U4 refusal path); the first
+   baseline remains AC-gated (a battery capture is battery-labeled
+   evidence, not the first baseline).
 
 ## Units (lowering sketch — refined in `delivery.md`)
 
@@ -444,7 +525,8 @@ valid history either way (append-only, never rewritten).
 | GB-U2 | bench case package: `bench/` Faber package, 7 labels at GEA tell-tale shapes + manifest (class + work-unit/metric fields + `cap_s` per case) | — | landed `e5f658f` (fold `f2d3595`) |
 | GB-U3 | run loop + emitter: 3/10 sampling, caps as circuit breakers, checker-format JSON (median_ms + t/s metric fields) + environment-identity metadata | GB-U1, GB-U2 | landed `d85c3c9` (fold `19937dc`) |
 | GB-U3b | stage ladder on `scripta/bench run`: `--stage smoke/dev/rough/full` (+`1-4`, `--full`), `--label` subsets, manifest `smoke_label`/`dev_labels`, stage identity in metadata, default = dev | GB-U3 | landed 71ab87a (fold c3bb796) |
-| GB-U4 | baseline capture + gate wrapper: committed dated 3-hash baseline + receipt; gate comparability refusal + green/red proofs | GB-U3, GB-U3b | none |
+| GB-U3c | per-row power-state capture: run-loop probes each row's power class at its execution window; additive `results[].power_state` + `metadata.power_class` summary (`power_class_first`/`_last` when mixed) on every stage; usage text | GB-U3, GB-U3b | none |
+| GB-U4 | baseline capture + gate wrapper: committed dated 3-hash baseline + receipt; gate comparability refusal (environment mismatch, lesser-stage protocol, cross-power-class) + green/red proofs | GB-U3, GB-U3b, GB-U3c | none |
 | GB-U5 | reproduction proof: fresh materialization from the recorded triple, gate PASS, receipt rider | GB-U4 | none |
 | GB-U6 | AGENTS.md Benchmarks law + `docs/benchmark-method.md` v1.1.0 amendment | GB-U5 | none |
 
@@ -507,7 +589,7 @@ baseline receipt.
 | Check | Enforced by |
 | --- | --- |
 | Baseline JSON parses and self-compares green in the radix checker | `check-benchmark-regression.py` (acceptance 6) |
-| Baseline carries triple + power state + protocol metadata | Receipt review + `capture` fail-closed checks |
+| Baseline carries triple + power state (run summary + per-row fields) + protocol metadata | Receipt review + `capture` fail-closed checks |
 | AGENTS.md section names the exact run command | Acceptance 5 |
 | No writes outside `gradus/` | Unit write scopes (`delivery.md`) + merge review |
 
@@ -519,6 +601,7 @@ baseline receipt.
 | GB-U2 bench case package | landed | hand | `e5f658f` (fold `f2d3595`) | `bench/` package, 7 labels |
 | GB-U3 run loop + JSON emitter | landed | hand | `d85c3c9` (fold `19937dc`) | full sweep RUN_EXIT 0; self-compare green; battery-labeled format evidence |
 | GB-U3b stage ladder | landed | hand | `71ab87a` (fold `c3bb796`) | measured: smoke 45 s, dev 2 m22 s (default), rough 7 m14 s all-7, full 31 m42 s; self-compares green at every stage |
+| GB-U3c per-row power-state capture | pending | — | — | ruling `ea4dd0a3`; lands before GB-U4 dispatch |
 | GB-U4 baseline capture + gate wrapper | pending | — | — | first committed baseline; requires AC power |
 | GB-U5 reproduction proof | pending | — | — | 3-hash rerun PASS |
 | GB-U6 AGENTS.md law + method v1.1.0 | pending | — | — | requirement 4 |
