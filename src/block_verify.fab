@@ -43,7 +43,8 @@ union VerifyError {
     ResultBounds
 }
 
-@ conversion fn from_dense_error(dense.DenseError err) → VerifyError {
+@ conversion
+fn from_dense_error(dense.DenseError err) → VerifyError {
     match err {
         case dense.DenseError.IndexOutOfBounds const message {
             return variant ModelMismatch {message = "candidate token id is outside model vocabulary"}
@@ -60,7 +61,8 @@ union VerifyError {
     }
 }
 
-@ conversion fn from_branch_error(cache_branch.BranchError err) → VerifyError {
+@ conversion
+fn from_branch_error(cache_branch.BranchError err) → VerifyError {
     match err {
         case cache_branch.BranchError.CandidateNumeric const message {
             return variant ResultBounds {message = message}
@@ -118,14 +120,7 @@ fn request_equal(BlockRequest a, BlockRequest b) → bool {
 
 fn _request_capacity(cache_branch.KVCheckpoint checkpoint) → int {
     const kv.KVCache first ← checkpoint.layers().get(0) coalesce kv.default()
-    var int remaining ← first.capacity() - checkpoint.prefix_length()
-    for from checkpoint.layers() const layer {
-        const int layer_remaining ← layer.capacity() - checkpoint.prefix_length()
-        if layer_remaining ≺ remaining then {
-            remaining ← layer_remaining
-        }
-    }
-    return remaining
+    return checkpoint.layers().reduce((int acc, kv.KVCache layer) ∴ (layer.capacity() - checkpoint.prefix_length()) ⤓ acc, first.capacity() - checkpoint.prefix_length())
 }
 
 # Structural admission is complete before any forward or model call can be
@@ -195,6 +190,9 @@ fn _tensor_equal(tensor.NumericBlock a, tensor.NumericBlock b) → bool {
 
 @ public
 fn rows_equal(BlockRows a, BlockRows b) → bool {
+    # Keep: pairwise staged-tensor equality with early return on the first
+    # mismatch; per-index `get(i) coalesce` gathers across four parallel
+    # lists. No zip/equality construct covers staged NumericBlock carriers.
     if not request_equal(a.request(), b.request()) then return false
     if not (a.target_positions() ≡ b.target_positions()) then return false
     if not _tensor_equal(a.logits(), b.logits()) then return false
@@ -212,6 +210,8 @@ fn rows_equal(BlockRows a, BlockRows b) → bool {
 }
 
 fn _expected_positions(int prefix, int rows) → list<int> {
+    # Keep: transform of a range source; `.map` covers collections, not
+    # `for range` operands.
     var list<int> positions ← empty
     for range prefix‥(prefix + rows) const position {
         positions.append(position)
@@ -231,6 +231,9 @@ fn _valid_f32_rows(tensor.NumericBlock value, list<int> expected_shape) → bool
 # request checkpoint.
 @ public
 fn construct_rows(BlockRequest request, list<int> target_positions, tensor.NumericBlock logits, list<tensor.NumericBlock> candidate_keys, list<tensor.NumericBlock> candidate_payloads) → BlockRows ⇥ VerifyError {
+    # Keep: each row/layer is validated (count, shape, dtype) in first-failure
+    # order before construction; a map/reduce cannot carry the typed failure
+    # boundary.
     const int rows ← target_positions.length()
     require rows ≥ 1 and rows ≤ request.candidate_count() throw variant ResultBounds {message = "result row count is outside candidate block"}
     require target_positions ≡ _expected_positions(request.prefix_length(), rows) throw variant ResultBounds {message = "result positions do not start at the checkpoint prefix"}
@@ -265,15 +268,14 @@ fn _finite_value(tensor.NumericBlock value) → bool {
     if not value.valid() {
         return false
     }
-    for from value.data const item {
-        if not dtype.finite(item) {
-            return false
-        }
-    }
-    return true
+    const list<f32> data ← value.data
+    const list<f32> finite_values ← data.filter(f32 item ∴ dtype.finite(item))
+    return finite_values.length() ≡ data.length()
 }
 
 fn _admit_model(BlockRequest request, dense.DenseConfig cfg) → bool ⇥ VerifyError {
+    # Keep: model admission is a failable per-layer/per-token require chain in
+    # first-failure order; no covering construct carries the typed boundary.
     require cfg.layers ≥ 1 throw variant ModelMismatch {message = "model must have at least one layer"}
     require cfg.vocab ≥ 1 throw variant ModelMismatch {message = "model vocabulary must be positive"}
     require cfg.kv_heads ≥ 1 and cfg.head_dim ≥ 1 throw variant ModelMismatch {message = "model KV dimensions must be positive"}
@@ -294,6 +296,9 @@ fn _admit_model(BlockRequest request, dense.DenseConfig cfg) → bool ⇥ Verify
 }
 
 fn _candidate_rows(tensor.NumericBlock full, int prefix, int rows, int dimension) → tensor.NumericBlock ⇥ VerifyError {
+    # Keep: the row/column gather is index-space (row * dimension + column
+    # into the staged carrier); no map construct covers an index-space gather
+    # over a range source.
     require full.valid() throw variant ForwardFailure {message = "dense forward returned an invalid cache tensor"}
     require dtype.name(full.dtype()) ≡ "f32" throw variant ModelMismatch {message = "dense forward cache dtype must be f32"}
     require full.shape() ≡ ([prefix + rows, dimension] ↦ list<int>) throw variant ForwardFailure {message = "dense forward cache shape does not match the candidate block"}
@@ -405,6 +410,8 @@ fn default_trace() → OracleTrace {
 }
 
 fn _oracle_empty_layers(cache_branch.KVCheckpoint base) → list<kv.KVCache> ⇥ VerifyError {
+    # Keep: each layer construction is failable (ForwardFailure must surface
+    # in first-failure order); map cannot carry the typed failure boundary.
     const kv.KVCache first ← base.layers().get(0) coalesce kv.default()
     var list<kv.KVCache> layers ← empty
     for range 0‥base.layers().length() const i {
@@ -421,6 +428,9 @@ fn _oracle_empty_layers(cache_branch.KVCheckpoint base) → list<kv.KVCache> ⇥
 
 @ public
 fn recompute(BlockRequest request, list<int> prefix_ids, dense.DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ dense.DenseError source, f32 epsilon, f32 scale, int rope_dim, attention.RopeConfig rope_cfg) → OracleTrace ⇥ VerifyError {
+    # Keep: the replay is stateful — step/layers are updated per token through
+    # the scalar dense seam; a fold over stateful failable steps has no
+    # covering construct.
     _admit_model(request, cfg)
     require prefix_ids.length() ≥ 1 throw variant EmptyPrefix {message = "oracle replay prefix must be non-empty"}
     require prefix_ids.length() ≡ request.prefix_length() throw variant ModelMismatch {message = "oracle replay prefix must match the request prefix length"}
@@ -520,6 +530,8 @@ fn _divergent_report(int index, string detail) → OracleReport ⇥ VerifyError 
 # Earliest flat row whose values differ by more than epsilon, or -1 when the
 # tensors agree within epsilon. Shapes are the caller's admission.
 fn _first_row_delta(tensor.NumericBlock a, tensor.NumericBlock b, f32 epsilon) → int {
+    # Keep: first-divergence search with early return; not a filter (no
+    # output list is built) and not a reduction (the index is the answer).
     const list<int> shape ← a.shape()
     const int width ← shape.get(shape.length() - 1) coalesce 1
     for range 0‥a.data.length() const i {
@@ -551,6 +563,9 @@ fn _first_list_delta(list<int> a, list<int> b) → int {
 # 1e-5 reference bound is refused, never widened.
 @ public
 fn oracle_equal(BlockRows block_rows, OracleTrace trace, f32 epsilon) → OracleReport ⇥ VerifyError {
+    # Keep: earliest-divergence comparison with early-return reports across
+    # positions, logits, history, and staged tensors (index-space flat scan);
+    # no covering construct for a first-divergence search over staged carriers.
     require dtype.finite(epsilon) and epsilon ≻ 0.0 and not (epsilon ≻ 0.00001 ∷ f32) throw variant ResultBounds {message = "oracle epsilon cannot exceed the pinned 1e-5 reference bound"}
     const BlockRows oracle_rows ← trace.rows()
     require request_equal(block_rows.request(), oracle_rows.request()) throw variant ModelMismatch {message = "oracle replay request does not match the block request"}
@@ -661,6 +676,8 @@ fn verification_equal(BlockVerification a, BlockVerification b) → bool {
 # shape of the value result; it does not recompute acceptance or commit state.
 @ public
 fn construct_verification(BlockRows rows, speculative.GreedyAcceptance acceptance, cache_branch.KVCheckpoint committed_checkpoint) → BlockVerification ⇥ VerifyError {
+    # Keep: bounded acceptance/identity admission is a require chain, not loop
+    # debt; the complexity is the admission contract itself.
     const int candidate_count ← rows.row_count()
     const int accepted_count ← acceptance.accepted_prefix_length()
     const int divergence ← acceptance.divergence_index()
@@ -703,10 +720,7 @@ fn _committed_identity_matches(kv.CacheIdentity base, kv.CacheIdentity committed
     if base.layers() ≠ committed.layers() then return false
     if base.dtype() ≠ committed.dtype() then return false
     if base.layout() ≠ committed.layout() then return false
-    var string expected_history ← base.history()
-    for from accepted_ids const token_id {
-        expected_history ← expected_history + "," + (token_id ↦ string)
-    }
+    const string expected_history ← accepted_ids.reduce((string out, int token_id) ∴ out + "," + (token_id ↦ string), base.history())
     if committed.history() ≠ expected_history then return false
     return committed.position() ≡ "0..§"(committed_length ↦ string)
 }
@@ -721,6 +735,9 @@ fn _committed_identity_matches(kv.CacheIdentity base, kv.CacheIdentity committed
 
 # Greedy target token per result row: argmax over that row's vocab width.
 fn _greedy_targets(BlockRows rows) → list<int> ⇥ VerifyError {
+    # Keep: the LSR-W0 model form — per-row argmax over an index-space
+    # (r * width + c) gather; the row build itself has no map-over-range
+    # construct.
     const tensor.NumericBlock logits ← rows.logits()
     require logits.rank() ≡ 2 and rows.row_count() ≥ 1 throw variant ResultBounds {message = "verify requires a non-empty result matrix"}
     const list<int> shape ← logits.shape()
@@ -728,15 +745,11 @@ fn _greedy_targets(BlockRows rows) → list<int> ⇥ VerifyError {
     require width ≥ 1 throw variant ResultBounds {message = "verify requires a positive vocabulary width"}
     var list<int> targets ← empty
     for range 0‥rows.row_count() const r {
-        var int best ← 0
-        var f32 best_value ← logits.data.get(r * width) coalesce 0.0 ∷ f32
-        for range 1‥width const c {
-            const f32 value ← logits.data.get(r * width + c) coalesce 0.0 ∷ f32
-            if value ≻ best_value then {
-                best ← c
-                best_value ← value
-            }
+        var list<f32> row_values ← empty
+        for range 0‥width const c {
+            row_values.append(logits.data.get(r * width + c) coalesce 0.0 ∷ f32)
         }
+        const int best ← row_values.argmax() coalesce 0
         targets.append(best)
     }
     return targets

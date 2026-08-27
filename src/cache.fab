@@ -122,7 +122,8 @@ union CacheError {
     }
 }
 
-@ conversion fn from_tensor_error(tensor.TensorError err) → CacheError {
+@ conversion
+fn from_tensor_error(tensor.TensorError err) → CacheError {
     return variant TensorFailure {message = err.message, inner = err}
 }
 
@@ -140,6 +141,12 @@ fn _tensor(list<f32> data, list<int> shape) → tensor.NumericBlock ⇥ CacheErr
     return tensor.construct(data, shape)
 }
 
+# Immutable typed concatenation keeps source order while exposing the list
+# shape to the collection reducer.
+fn _append_f32(list<f32> base, list<f32> values) → list<f32> {
+    return values.reduce((list<f32> out, f32 value) ∴ out.added(value), base)
+}
+
 # "/" and ";" are reserved in the identity wire fields (the U3 wire-safety
 # rule).
 fn _contains_separator(string s) → bool {
@@ -153,6 +160,8 @@ fn _digit(string c) → bool {
 fn _numeric(string s) → bool {
     if s.length() ≡ 0 then return false
     if s.length() ≻ 18 then return false
+    # Keep: validation must short-circuit on the first invalid character;
+    # filter/map would change that failable boundary and still need a scan.
     for from s const c {
         if not _digit(c ↦ string) then return false
     }
@@ -259,6 +268,8 @@ class KVCache {
 }
 
 # Field-wise cache equality — the determinism/round-trip predicate.
+# Convert-or-record: this is a small typed pure leaf whose ordered checks span
+# heterogeneous fields; no collection intrinsic covers the short-circuit shape.
 @ public
 fn cache_equal(KVCache a, KVCache b) → bool {
     if a.model() ≠ b.model() then return false
@@ -349,25 +360,9 @@ fn append(KVCache c, int token_id, tensor.NumericBlock key, tensor.NumericBlock 
     require dtype.name(key.dtype()) ≡ "f32" throw variant DtypeMismatch {message = "unsupported dtype for cache"}
     require dtype.name(payload.dtype()) ≡ "f32" throw variant DtypeMismatch {message = "unsupported dtype for cache"}
     _admit_write(c, 1)
-    var list<int> new_history ← empty
-    for from c.history() const prior {
-        new_history.append(prior)
-    }
-    new_history.append(token_id)
-    var list<f32> new_key ← empty
-    for from c.key().data const v {
-        new_key.append(v)
-    }
-    for from key.data const v {
-        new_key.append(v)
-    }
-    var list<f32> new_payload ← empty
-    for from c.payload().data const v {
-        new_payload.append(v)
-    }
-    for from payload.data const v {
-        new_payload.append(v)
-    }
+    const list<int> new_history ← c.history().added(token_id)
+    const list<f32> new_key ← _append_f32(c.key().data, key.data)
+    const list<f32> new_payload ← _append_f32(c.payload().data, payload.data)
     const int new_len ← c.length() + 1
     return _keep(c, new_history, _tensor(new_key, [new_len, c.dimension()]), _tensor(new_payload, [new_len, c.dimension()]), c.version() + 1)
 }
@@ -387,28 +382,14 @@ fn extend(KVCache c, list<int> tokens, tensor.NumericBlock key, tensor.NumericBl
     require dtype.name(key.dtype()) ≡ "f32" throw variant DtypeMismatch {message = "unsupported dtype for cache"}
     require dtype.name(payload.dtype()) ≡ "f32" throw variant DtypeMismatch {message = "unsupported dtype for cache"}
     _admit_write(c, tokens.length())
-    var list<int> new_history ← empty
-    for from c.history() const prior {
-        new_history.append(prior)
-    }
+    # Keep: token validation must reject the first bad id before any new
+    # collection is assembled; a transform cannot preserve this boundary.
     for from tokens const token_id {
         require token_id ≥ 0 throw variant IdOutOfRange {message = "token id must be non-negative"}
-        new_history.append(token_id)
     }
-    var list<f32> new_key ← empty
-    for from c.key().data const v {
-        new_key.append(v)
-    }
-    for from key.data const v {
-        new_key.append(v)
-    }
-    var list<f32> new_payload ← empty
-    for from c.payload().data const v {
-        new_payload.append(v)
-    }
-    for from payload.data const v {
-        new_payload.append(v)
-    }
+    const list<int> new_history ← tokens.reduce((list<int> out, int token_id) ∴ out.added(token_id), c.history())
+    const list<f32> new_key ← _append_f32(c.key().data, key.data)
+    const list<f32> new_payload ← _append_f32(c.payload().data, payload.data)
     const int new_len ← c.length() + tokens.length()
     return _keep(c, new_history, _tensor(new_key, [new_len, c.dimension()]), _tensor(new_payload, [new_len, c.dimension()]), c.version() + 1)
 }
@@ -501,15 +482,7 @@ fn cache_identity_equal(CacheIdentity a, CacheIdentity b) → bool {
 # comma-joined token history; the position span is "0..<count>".
 @ public
 fn cache_identity(KVCache c) → CacheIdentity {
-    var string history ← ""
-    var bool first ← true
-    for from c.history() const token {
-        if not first {
-            history ← history + ","
-        }
-        history ← history + (token ↦ string)
-        first ← false
-    }
+    const string history ← c.history().reduce((string out, int token) ∴ out.length() ≡ 0 ? (token ↦ string) : "§,§"(out, token ↦ string), "")
     return CacheIdentity {model = c.model(), model_version = c.model_version(), config = c.config(), tokenizer = c.tokenizer(), history = history, position = "0..§"(c.length() ↦ string), layers = c.layers(), dtype = c.dtype(), layout = c.layout()}
 }
 
@@ -528,6 +501,8 @@ fn serialize_identity(CacheIdentity i) → string {
     return "cache/identity/§/§/§/§/§/§/§/§/§/§"(schema_version, i.model(), i.model_version(), i.config(), i.tokenizer(), history, i.position(), i.layers() ↦ string, i.dtype(), i.layout())
 }
 
+# Convert-or-record: wire validation and conversion must retain the exact
+# first-failure error order; no closure intrinsic covers this failable parser.
 @ public
 fn deserialize_identity(string wire) → CacheIdentity ⇥ CacheError {
     const list<string> parts ← wire.split("/")
@@ -1063,6 +1038,8 @@ fn profile_cuda() → KVProfile {
     return KVProfile {name = "cuda", classic_v_layouts = empty, flash_v_layouts = empty, quantized_v_requires_flash = false, kv_dtypes = empty, f32_block = 0, f16_block = 0, q8_0_block = 0, q4_k_block = 0, reserve_policy = "", admitted = false}
 }
 
+# Keep: these are short-circuit membership checks over tagged union values;
+# between has no covering nominal-union equality form here.
 fn _profile_has_v_layout(list<VLayout> allowed, VLayout target) → bool {
     for from allowed const candidate {
         if v_layout_eq(candidate, target) then return true
@@ -1139,6 +1116,8 @@ fn construct_layer_set(list<int> indices, LayerStructure structure, int kv_heads
     require kv_heads ≥ 1 throw variant InvalidDimension {message = "kv head count must be at least one"}
     require head_dim ≥ 1 throw variant InvalidDimension {message = "head dim must be at least one"}
     var list<int> seen ← empty
+    # Keep: duplicate detection is an ordered, fail-closed validation walk;
+    # the growing seen list is part of the check, not a reduction result.
     for from indices const idx {
         require idx ≥ 0 throw variant InvalidDimension {message = "invalid layer index"}
         require not _index_seen(seen, idx) throw variant InvalidCombination {message = "duplicate layer index"}
@@ -1291,6 +1270,9 @@ fn _layer_set_eq(LayerSet a, LayerSet b) → bool {
     }
 }
 
+# Convert-or-record: equality compares two aligned flat carriers and then
+# short-circuits through scalar identity fields; the indexed lockstep walks
+# are retained under the legacy-L2 bounded-list rule.
 @ public
 fn kv_structure_equal(KVStructure a, KVStructure b) → bool {
     if a.layers().length() ≠ b.layers().length() then return false
@@ -1362,6 +1344,8 @@ fn _uses_extended_class(LayerStructure s) → bool {
 
 fn _check_class_partitions(list<LayerSet> layers, list<CachePartition> partitions) → bool ⇥ CacheError {
     var int indexer_parts ← 0
+    # Keep: each partition is validated before the final cardinality rule;
+    # a reducer cannot carry the existing failable validation order.
     for from partitions const part {
         match part {
             case IndexerBudget const bytes {
@@ -1371,12 +1355,7 @@ fn _check_class_partitions(list<LayerSet> layers, list<CachePartition> partition
         }
     }
     require indexer_parts ≤ 1 throw variant InvalidCombination {message = "duplicate indexer partition"}
-    var bool has_indexer ← false
-    for from layers const layer {
-        if _is_indexer_structure(layer.structure()) {
-            has_indexer ← true
-        }
-    }
+    const bool has_indexer ← layers.reduce((bool seen, LayerSet layer) ∴ seen or _is_indexer_structure(layer.structure()), false)
     if has_indexer {
         require indexer_parts ≠ 0 throw variant InvalidCombination {message = "indexer class requires an indexer partition budget"}
     }
@@ -1401,6 +1380,8 @@ fn _check_profile_law(KVProfile profile, KvDtype kv_dtype_k, KvDtype kv_dtype_v,
     return true
 }
 
+# Convert-or-record: nested admission checks and duplicate tracking must
+# preserve fail-closed validation order; no reducer covers these failable walks.
 fn _construct_kv_structure_with_profile_and_partitions(KVProfile profile, list<LayerSet> layers, KvDtype kv_dtype_k, KvDtype kv_dtype_v, VLayout v_layout, KvSharing sharing, AttentionFamily attention_family, int query_heads, int slots, int context_length, list<CachePartition> partitions) → KVStructure ⇥ CacheError {
     require profile.admitted() throw variant ProfileUnavailable {message = "cuda profile has no admitted KV layout law; awaiting device receipts (ELP-06/EXEC-02)"}
     require layers.length() ≥ 1 throw variant InvalidDimension {message = "layer set must be at least one"}
@@ -1490,6 +1471,8 @@ fn _parse_indices(string text) → list<int> ⇥ CacheError {
     const list<string> parts ← text.split("+")
     require parts.length() ≥ 1 throw variant BadWire {message = "malformed layer set wire"}
     var list<int> indices ← empty
+    # Keep: each index has a typed conversion and ordered error mapping;
+    # map/reduce cannot preserve the first malformed wire failure.
     for from parts const part {
         require _numeric(part) throw variant BadWire {message = "malformed layer index in structure wire"}
         var int idx ← 0
@@ -1504,6 +1487,8 @@ fn _parse_indices(string text) → list<int> ⇥ CacheError {
     return indices
 }
 
+# Convert-or-record: each wire shape has a distinct branch and typed
+# conversion errors must remain mapped to the existing message.
 fn _parse_layer_wire(string text) → LayerSet ⇥ CacheError {
     const list<string> parts ← text.split(":")
     if parts.length() ≡ 4 {
@@ -1573,26 +1558,23 @@ fn _parse_layer_wire(string text) → LayerSet ⇥ CacheError {
 
 fn _structure_uses_v11(KVStructure s) → bool {
     if s.partitions().length() ≻ 0 then return true
+    # Keep: this is an early-exit predicate over a tagged structure list;
+    # no admitted any/exists intrinsic preserves the first match boundary.
     for from s.layers() const layer {
         if _uses_extended_class(layer.structure()) then return true
     }
     return false
 }
 
+fn _partition_wire(CachePartition part) → string {
+    return "§:§"(partition_class_name(part), partition_bytes(part) ↦ string)
+}
+
 fn _partitions_wire(list<CachePartition> partitions) → string {
     if partitions.length() ≡ 0 {
         return "-"
     }
-    var string wire ← ""
-    var bool first ← true
-    for from partitions const part {
-        if not first {
-            wire ← wire + ";"
-        }
-        wire ← wire + ((partition_class_name(part) + ":") + (partition_bytes(part) ↦ string))
-        first ← false
-    }
-    return wire
+    return partitions.reduce((string out, CachePartition part) ∴ out.length() ≡ 0 ? _partition_wire(part) : "§;§"(out, _partition_wire(part)), "")
 }
 
 fn _parse_partitions(string text) → list<CachePartition> ⇥ CacheError {
@@ -1602,6 +1584,8 @@ fn _parse_partitions(string text) → list<CachePartition> ⇥ CacheError {
     require text.length() ≠ 0 throw variant BadWire {message = "malformed cache partition wire"}
     const list<string> parts ← text.split(";")
     var list<CachePartition> partitions ← empty
+    # Keep: partition parsing validates and converts each item in wire order;
+    # map/reduce cannot preserve the existing typed failure boundary.
     for from parts const part {
         const list<string> bits ← part.split(":")
         require bits.length() ≡ 2 throw variant BadWire {message = "malformed cache partition wire"}
@@ -1622,15 +1606,7 @@ fn _parse_partitions(string text) → list<CachePartition> ⇥ CacheError {
 
 @ public
 fn serialize_structure(KVStructure s) → string {
-    var string layers ← ""
-    var bool first ← true
-    for from s.layers() const layer {
-        if not first {
-            layers ← layers + ";"
-        }
-        layers ← layers + _layer_wire(layer)
-        first ← false
-    }
+    const string layers ← s.layers().reduce((string out, LayerSet layer) ∴ out.length() ≡ 0 ? _layer_wire(layer) : "§;§"(out, _layer_wire(layer)), "")
     var string wire_schema ← structure_schema
     if _structure_uses_v11(s) {
         wire_schema ← structure_schema_v11
@@ -1663,6 +1639,8 @@ fn serialize_structure(KVStructure s) → string {
     return wire
 }
 
+# Convert-or-record: schema branching, field checks, and nested failable
+# parsers are ordered wire validation; no closure intrinsic covers this path.
 @ public
 fn deserialize_structure(string wire) → KVStructure ⇥ CacheError {
     const list<string> parts ← wire.split("/")
@@ -1723,7 +1701,16 @@ fn deserialize_structure(string wire) → KVStructure ⇥ CacheError {
 # Copies KVStructure.context_length as immutable KVCache.capacity.
 # -------------------------------------------------------------------------
 
+fn _cache_layer_count(LayerSet layer) → int {
+    if _is_indexer_structure(layer.structure()) {
+        return 0
+    }
+    return layer.indices().length()
+}
+
 fn _layer_width(KVStructure s, int idx) → int ⇥ CacheError {
+    # Keep: this nested search returns the first matching layer width and
+    # rejects missing coverage; no flat collection transform states that law.
     for from s.layers() const layer {
         if not _is_indexer_structure(layer.structure()) {
             for from layer.indices() const layer_idx {
@@ -1740,14 +1727,11 @@ fn _layer_width(KVStructure s, int idx) → int ⇥ CacheError {
 fn empty_layers(KVStructure s, string model, string model_version, string config, string tokenizer) → list<KVCache> ⇥ CacheError {
     const int capacity ← s.context_length()
     require capacity ≥ 1 throw variant InvalidDimension {message = "capacity must be at least one"}
-    var int count ← 0
-    for from s.layers() const layer {
-        if not _is_indexer_structure(layer.structure()) {
-            count ← count + layer.indices().length()
-        }
-    }
+    const int count ← s.layers().reduce((int total, LayerSet layer) ∴ total + _cache_layer_count(layer), 0)
     require count ≥ 1 throw variant InvalidDimension {message = "layer set must be at least one"}
     var list<KVCache> out ← empty
+    # Keep: this is a count-like address walk whose body can fail while
+    # constructing each cache; map cannot carry the existing error channel.
     for range 0‥count const idx {
         out.append(_empty_cache(model, model_version, config, tokenizer, 1, _layer_width(s, idx), capacity))
     }
