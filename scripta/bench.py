@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Bench pin-and-build driver (bench-harness delivery GB-U1), run
-loop + JSON emitter (GB-U3), and stage ladder (GB-U3b).
+loop + JSON emitter (GB-U3), stage ladder (GB-U3b), and per-row
+power-state capture (GB-U3c).
 
 materialize  detached git worktrees of radix/hosts/gradus at explicit
              hashes into a scratch root outside all repos
@@ -8,7 +9,9 @@ build        release faber from the pinned radix worktree
 run          sample the pinned bench manifest on the four-stage ladder
              (goal §Stage ladder) and emit
              check-benchmark-regression-format JSON with the
-             environment-identity metadata block
+             environment-identity metadata block, per-row `power_state`
+             (sampled at each row's execution), and the
+             `metadata.power_class` run summary (ea4dd0a3)
 clean        worktree remove --force + prune in each source repo, then
              scratch-root removal, so registrations never accumulate
 
@@ -61,7 +64,16 @@ Run laws (delivery.md GB-U3; goal §Run loop + §Perf-taxonomy):
 * the emitted JSON keeps the exact checker contract —
   `format_version:"1"` + `results[].label/median_ms` — plus composing
   extra fields; every metadata field records a value or an explicit
-  `unavailable`, never a silent drop.
+  `unavailable`, never a silent drop;
+* per-row power-state capture (GB-U3c; goal §Per-row power-state law,
+  ruling ea4dd0a3): every result row carries `power_state` (ac|battery|
+  mixed|unavailable) from two probes — immediately before the row's
+  first warmup and immediately after its last measured sample; agreeing
+  probes → that class, ac↔battery disagreement inside the row → mixed,
+  non-macOS or any probe miss → unavailable, never a guess.
+  `metadata.power_state` stays the start-of-run point observation;
+  `metadata.power_class` is the run summary the law keys on (unanimous
+  row class, else mixed with power_class_first/_last recorded).
 
 Errors are typed: `bench: <kind>: <message>` on stderr, exit 1.
 """
@@ -629,6 +641,55 @@ def comparability_note(stage: str, label_mode: str, labels: list[str], cases: li
     )
 
 
+# ---------------------------------------------------------------------
+# per-row power-state law (GB-U3c; goal §Per-row power-state law,
+# operator ruling ea4dd0a3)
+# ---------------------------------------------------------------------
+
+def classify_power(pmset_batt: str | None) -> str | None:
+    """Classify one `pmset -g batt` output: 'ac' | 'battery', None on a
+    miss (unknown text) — never a guess."""
+    if pmset_batt is None:
+        return None
+    if "AC Power" in pmset_batt:
+        return "ac"
+    if "Battery Power" in pmset_batt:
+        return "battery"
+    return None
+
+
+def probe_power_class() -> str:
+    """One power-class probe: 'ac' | 'battery'; 'unavailable' on
+    non-macOS or any probe miss — never a guess."""
+    if sys.platform != "darwin":
+        return "unavailable"
+    return classify_power(probe(["pmset", "-g", "batt"])) or "unavailable"
+
+
+def row_power_state(power_start: str, power_end: str) -> str:
+    """Row class from its two probes: agreeing → that class; an ac↔battery
+    transition inside the row → 'mixed'; any miss → 'unavailable'."""
+    if "unavailable" in (power_start, power_end):
+        return "unavailable"
+    if power_start != power_end:
+        return "mixed"
+    return power_start
+
+
+def power_class_summary(rows: list[dict]) -> dict:
+    """Run summary the law keys on: the unanimous row class, else 'mixed'
+    with power_class_first/_last recording the first/last row classes."""
+    classes = [row["power_state"] for row in rows]
+    if not classes:
+        return {"power_class": "unavailable"}
+    power_class = classes[0] if len(set(classes)) == 1 else "mixed"
+    summary: dict = {"power_class": power_class}
+    if power_class == "mixed":
+        summary["power_class_first"] = classes[0]
+        summary["power_class_last"] = classes[-1]
+    return summary
+
+
 def run_case(
     scratch: Path,
     faber: Path,
@@ -641,6 +702,9 @@ def run_case(
     cap_s = float(case.get("cap_s", DEFAULT_CAP_S))
     iterations = case["iterations"]
     command = case_command(faber, scratch, case)
+
+    # per-row law: probe immediately before the first warmup …
+    power_start = probe_power_class()
 
     for index in range(warmups):
         sample = timed_sample(command, cap_s, env, scratch)
@@ -671,6 +735,10 @@ def run_case(
             file=sys.stderr,
         )
 
+    # … and immediately after the last measured sample (ea4dd0a3)
+    power_end = probe_power_class()
+    power_state = row_power_state(power_start, power_end)
+
     walls_ms = [sample["wall_s"] * 1000.0 for sample in samples_list]
     failures = [s for s in samples_list if not s["capped"] and not s["observed"]]
     verified = [s for s in samples_list if s["observed"]]
@@ -691,6 +759,7 @@ def run_case(
         ),
         "capped": any(sample["capped"] for sample in samples_list),
         "tier": case.get("tier", "cpu-reference"),
+        "power_state": power_state,
     }
 
 
@@ -739,6 +808,8 @@ def collect_metadata(
                     pass
                 break
 
+    # start-of-run point observation only (ea4dd0a3) — the per-row law
+    # samples each row at its own execution window (run_case)
     power_state = "unavailable"
     pmset_raw = "unavailable"
     pmset_batt = probe(["pmset", "-g", "batt"]) if mac else None
@@ -873,6 +944,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     rows = [
         run_case(scratch, faber, case, env, warmups, samples) for case in selected
     ]
+    # power_class summarizes the emitted rows (ea4dd0a3) — appended after
+    # collect_metadata because only the rows know their classes
+    power_class = power_class_summary(rows)
+    metadata.update(power_class)
     document = {
         "format_version": CHECKER_FORMAT_VERSION,
         "metadata": metadata,
@@ -893,9 +968,18 @@ def cmd_run(args: argparse.Namespace) -> int:
             f"bench: {row['label']} median={row['median_ms']}ms "
             f"min={row['min_ms']}ms max={row['max_ms']}ms "
             f"t/s={row['median_units_per_s']} {row['throughput']} "
-            f"capped={row['capped']} ok={row['ok']}",
+            f"capped={row['capped']} ok={row['ok']} power={row['power_state']}",
             file=sys.stderr,
         )
+    if power_class["power_class"] == "mixed":
+        print(
+            f"bench: power_class=mixed "
+            f"(first {power_class['power_class_first']}, "
+            f"last {power_class['power_class_last']})",
+            file=sys.stderr,
+        )
+    else:
+        print(f"bench: power_class={power_class['power_class']}", file=sys.stderr)
     failed = [row["label"] for row in rows if not row["ok"]]
     if failed:
         print(
@@ -1009,7 +1093,8 @@ def build_parser() -> argparse.ArgumentParser:
     run = sub.add_parser(
         "run",
         help="sample the pinned bench manifest on the stage ladder and "
-        "emit checker-format JSON (default: stage 2 dev)",
+        "emit checker-format JSON with per-row power_state + the "
+        "metadata.power_class run summary (ea4dd0a3; default: stage 2 dev)",
     )
     run.add_argument("--scratch", metavar="DIR", help="scratch root to run against")
     run.add_argument(
