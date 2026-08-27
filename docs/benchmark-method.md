@@ -1,8 +1,9 @@
 # Gradus Benchmark Method
 
-**Version**: `gradus-benchmark-method v1.0.0` (2026-08-11, PML6-U4)
+**Version**: `gradus-benchmark-method v1.1.0` (2026-08-27, bench-harness GB-U6)
 **Repo**: gradus. **Tier**: structural only.
-**Delivery**: `docs/factory/production-ml-library/pml6-delivery.md` §PML6-U4.
+**Delivery**: `docs/factory/production-ml-library/pml6-delivery.md` §PML6-U4;
+v1.1.0: `docs/factory/bench-harness/delivery.md` §GB-U6.
 **Consumes (read-only)**: `docs/numeric-tolerances.md`,
 `docs/regression-corpus.md`, `docs/compatibility-policy.md`,
 `docs/factory/production-ml-library/pml0-support-matrix.md`, cross-repo
@@ -10,11 +11,22 @@
 and the honest capability floors of
 `radix/docs/factory/gpu-workload-floor/goal.md` (consumed, not duplicated).
 
+**v1.1.0 delta (2026-08-27)**: this method now has its committed harness —
+`scripta/bench` (`materialize`/`build`/`run`/`capture`/`gate`/`clean`) over
+the `bench/` 7-label case package, with dated 3-hash append-only baselines
+under `bench/baselines/` (operator order 2026-08-27,
+`docs/factory/bench-harness/goal.md` §Problem, routed by mind task
+`076e7a1a`). §6's "no new benchmark binary" clause is **superseded** by
+that order. Operative bench law: [`AGENTS.md`](../AGENTS.md) §Benchmarks.
+The §1 claim-tier law and §5 hardware-discipline are unchanged and carry
+into the harness unchanged.
+
 This document pins **how** a Gradus benchmark is run and claimed. It does
-**not** publish a speed number. No committed bench binary lands in this
-phase (pml6-delivery.md Open Question 5). Executed regression/benchmark
-passes are **auditor-owned** at the FMIR-lever gate (CTO8-1 / CTO8-3) —
-never a dev-loop claim.
+**not** publish a speed number. No committed bench binary landed in the
+PML6 phase (pml6-delivery.md Open Question 5) — **superseded in v1.1.0**
+by the 2026-08-27 operator order; see the delta note above. Executed
+regression/benchmark passes are **auditor-owned** at the FMIR-lever gate
+(CTO8-1 / CTO8-3) — never a dev-loop claim.
 
 ---
 
@@ -182,17 +194,39 @@ Missing any required field voids the claim.
 - No GPU speed, kernel occupancy, or device-vs-device comparison.
 - No "matches PyTorch performance" or product-replace claim.
 - No executed token / loss / gradient value from a Hand unit.
-- No new benchmark binary, harness crate, or CI suite in PML6-U4.
+- No new benchmark binary, harness crate, or CI suite in PML6-U4 —
+  **superseded in v1.1.0** (2026-08-27 operator order,
+  `docs/factory/bench-harness/goal.md` §Problem): `scripta/bench` + the
+  `bench/` package + committed baselines now exist; law in
+  [`AGENTS.md`](../AGENTS.md) §Benchmarks. Still true: no CI suite — the
+  gate stays advisory until the operator wires it.
 - No redefinition of `gpu-workload-floor` rung floors.
 
 ---
 
 ## 7. Versioning
 
-`gradus-benchmark-method v1.0.0`. Pre-1.0 clean-break posture
+`gradus-benchmark-method v1.1.0`. Pre-1.0 clean-break posture
 (`docs/compatibility-policy.md`). A method change that alters warmups,
 sample counts, claim rules, or workload membership bumps this version
 and records the delta in the commit message.
+
+Version history:
+
+- **v1.1.0** (2026-08-27, bench-harness GB-U6) — harness delta: committed
+  `scripta/bench` driver (materialize/build/run/capture/gate/clean), the
+  `bench/` 7-label case package, the stage ladder (smoke/dev/rough/full;
+  default = dev, stage 2; full 3/10 all-label is the only gate-comparable
+  shape), per-row `power_state` capture + `metadata.power_class`
+  stratification (cross-class NOT COMPARABLE), t/s =
+  unit-count / min(completion, cap) as sole throughput metric with runtime
+  caps as safety circuit breakers, and dated 3-hash append-only baselines
+  under `bench/baselines/` — first of record
+  `baseline-20260827-re792964-hc9cfb5a-g536b7ab` with its GB-U5
+  reproduction rider (gate PASS from the recorded triple alone). §6 "no
+  benchmark binary" clause superseded by the 2026-08-27 operator order.
+  Operative law: `AGENTS.md` §Benchmarks.
+- **v1.0.0** (2026-08-11, PML6-U4) — original method (this document).
 
 ---
 
