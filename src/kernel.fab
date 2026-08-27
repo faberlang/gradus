@@ -310,8 +310,8 @@ fn residual_add(tf32[8,960] left, tf32[8,960] right, mut tf32[8,960] output) →
 #   decode_gemv_down      [1,2560] · [2560,960]        → [1,960]
 #   decode_rope_q         [1,960] · table [1,32,3]     → [1,960]
 #   decode_rope_k         [1,320] · table [1,32,3]     → [1,320]
-#   kv_append_k           [76,320] · slot [76,1] · row [1,320] → [76,320]
-#   kv_append_v           [76,320] · slot [76,1] · row [1,320] → [76,320]
+#   kv_append_k           row view [320] · row [320] → row view [320]
+#   kv_append_v           row view [320] · row [320] → row view [320]
 #   decode_key_transpose  [76,64]                      → [64,76]
 #   decode_score_gemm     [1,64] · [64,76] · scale [1,76] → [1,76]
 #   decode_masked_softmax [1,76] · mask [1,76]         → [1,76]
@@ -320,11 +320,12 @@ fn residual_add(tf32[8,960] left, tf32[8,960] right, mut tf32[8,960] output) →
 #   decode_residual_add   [1,960] · [1,960]            → [1,960]
 #
 # KV geometry (CTO ruling 0891c09b): fixed-capacity buffers at L_max=76,
-# append-in-place, declared history length, mask beyond L. The append
-# idioms keep the write rank-2: slot [76,1] is the resident one-hot row
-# selector at the declared position and `slot · row` writes the incoming
-# [1,320] row into exactly that slot; the additive mask is the resident
-# declared-length constant (0 within L, negative beyond) feeding softmax.
+# append-in-place, declared history length, mask beyond L. The append entries
+# consume a single position-projected [320] row view of the resident arena;
+# the host's typed Position binding moves that view to the declared slot and
+# `history + row` writes only that row. No capacity-sized selector is staged.
+# The additive mask is the resident declared-length constant (0 within L,
+# negative beyond) feeding softmax.
 
 # GEA3-U3a body 1 — decode RMSNorm over the single row.
 @ kernel
@@ -373,19 +374,21 @@ fn decode_rope_k(tf32[1,320] input, tf32[1,32,3] rope_table, mut tf32[1,320] out
     output ← input.rope_norm(0, 64)
 }
 
-# GEA3-U3a bodies 8–9 — in-place KV append at the declared slot. The fixed-
-# capacity [76,320] buffer is the whole resident K (or V) cache for one
-# layer; slot is the one-hot [76,1] row selector at position p.
+# GEA3-U3a bodies 8–9 — direct in-place KV append at the declared slot.
+# The fixed-capacity [76,320] buffer remains the resident K (or V) arena,
+# while each launch binds one [320] Position view of that arena. The source
+# entry therefore performs one selected-row add and never scans capacity or
+# stages a one-hot selector.
 @ kernel
 @ public
-fn kv_append_k(tf32[76,320] history, tf32[76,1] slot, tf32[1,320] row, mut tf32[76,320] output) → void {
-    output ← history + slot · row
+fn kv_append_k(tf32[320] history, tf32[320] row, mut tf32[320] output) → void {
+    output ← history + row
 }
 
 @ kernel
 @ public
-fn kv_append_v(tf32[76,320] history, tf32[76,1] slot, tf32[1,320] row, mut tf32[76,320] output) → void {
-    output ← history + slot · row
+fn kv_append_v(tf32[320] history, tf32[320] row, mut tf32[320] output) → void {
+    output ← history + row
 }
 
 # GEA3-U3a body 10 — per-kv-head key-window transpose for query-1 · keys-L.
