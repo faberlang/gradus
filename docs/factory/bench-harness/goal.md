@@ -1,6 +1,6 @@
 # GOAL: bench-harness — repeatable gradus bench pinned to the radix+hosts+gradus triple, with committed baselines
 
-**Status**: active — GB-U1 fold `f85272b`; GB-U2 fold `f2d3595`; GB-U3 fold `19937dc`; GB-U3b landed `71ab87a` (fold `c3bb796`: stage ladder measured — smoke 45 s / dev 2 m22 s default / rough 7 m14 s all-7 at 1+2 / full 31 m42 s byte-preserving; every stage self-compare green; K unshrunk; stage identity + comparability in metadata). GB-U4 (baseline capture + gate wrapper) is NEXT and AC-GATED: machine on battery at dispatch time; capture requires AC per done_when (a) — dispatches when the machine is on AC (or the operator rules a battery-labeled capture). No baseline captured yet.
+**Status**: active — GB-U1 fold `f85272b`; GB-U2 fold `f2d3595`; GB-U3 fold `19937dc`; GB-U3b landed `71ab87a` (fold `c3bb796`); GB-U3c landed `407a9df` (fold `4158a2b`: per-row power-state live — smoke run rows labeled battery with `power_class: battery`, mock transition → mixed with first/last, additive-only diff vs GB-U3b, unavailable paths proven). Harness COMPLETE through capture: GB-U4 (baseline capture + gate wrapper) is the only remaining unit — AC-GATED (machine on battery at last check; first baseline requires AC per done_when (a)). No baseline captured yet.
 **Created**: 2026-08-27
 **Campaign:** `—` (standalone; operator pause-exception order 2026-08-27 morning, task `076e7a1a`)
 **Source:** operator order (verbatim requirements 1–4 in §Problem); routed by mind task `076e7a1a`
@@ -525,7 +525,7 @@ valid history either way (append-only, never rewritten).
 | GB-U2 | bench case package: `bench/` Faber package, 7 labels at GEA tell-tale shapes + manifest (class + work-unit/metric fields + `cap_s` per case) | — | landed `e5f658f` (fold `f2d3595`) |
 | GB-U3 | run loop + emitter: 3/10 sampling, caps as circuit breakers, checker-format JSON (median_ms + t/s metric fields) + environment-identity metadata | GB-U1, GB-U2 | landed `d85c3c9` (fold `19937dc`) |
 | GB-U3b | stage ladder on `scripta/bench run`: `--stage smoke/dev/rough/full` (+`1-4`, `--full`), `--label` subsets, manifest `smoke_label`/`dev_labels`, stage identity in metadata, default = dev | GB-U3 | landed 71ab87a (fold c3bb796) |
-| GB-U3c | per-row power-state capture: run-loop probes each row's power class at its execution window; additive `results[].power_state` + `metadata.power_class` summary (`power_class_first`/`_last` when mixed) on every stage; usage text | GB-U3, GB-U3b | none |
+| GB-U3c | per-row power-state capture: run-loop probes each row's power class at its execution window; additive `results[].power_state` + `metadata.power_class` summary (`power_class_first`/`_last` when mixed) on every stage; usage text | GB-U3, GB-U3b | landed 407a9df (fold 4158a2b) |
 | GB-U4 | baseline capture + gate wrapper: committed dated 3-hash baseline + receipt; gate comparability refusal (environment mismatch, lesser-stage protocol, cross-power-class) + green/red proofs | GB-U3, GB-U3b, GB-U3c | none |
 | GB-U5 | reproduction proof: fresh materialization from the recorded triple, gate PASS, receipt rider | GB-U4 | none |
 | GB-U6 | AGENTS.md Benchmarks law + `docs/benchmark-method.md` v1.1.0 amendment | GB-U5 | none |
@@ -601,7 +601,7 @@ baseline receipt.
 | GB-U2 bench case package | landed | hand | `e5f658f` (fold `f2d3595`) | `bench/` package, 7 labels |
 | GB-U3 run loop + JSON emitter | landed | hand | `d85c3c9` (fold `19937dc`) | full sweep RUN_EXIT 0; self-compare green; battery-labeled format evidence |
 | GB-U3b stage ladder | landed | hand | `71ab87a` (fold `c3bb796`) | measured: smoke 45 s, dev 2 m22 s (default), rough 7 m14 s all-7, full 31 m42 s; self-compares green at every stage |
-| GB-U3c per-row power-state capture | pending | — | — | ruling `ea4dd0a3`; lands before GB-U4 dispatch |
+| GB-U3c per-row power-state capture | landed | hand | `407a9df` (fold `4158a2b`) | smoke rows labeled live; mock transition → mixed; additive-only diff; unavailable proven |
 | GB-U4 baseline capture + gate wrapper | pending | — | — | first committed baseline; requires AC power |
 | GB-U5 reproduction proof | pending | — | — | 3-hash rerun PASS |
 | GB-U6 AGENTS.md law + method v1.1.0 | pending | — | — | requirement 4 |
