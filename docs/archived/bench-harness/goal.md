@@ -1,6 +1,6 @@
 # GOAL: bench-harness — repeatable gradus bench pinned to the radix+hosts+gradus triple, with committed baselines
 
-**Status**: active — ALL EIGHT UNITS LANDED: GB-U1 `f85272b`; GB-U2 `f2d3595`; GB-U3 `19937dc`; GB-U3b `c3bb796`; GB-U3c `4158a2b`; GB-U4 `15c643e` (first baseline, AC unanimous); GB-U5 `533121e` (reproduction PASS — worst +0.96%, noise floor ~±1%); GB-U6 `a8c0182` (AGENTS.md §Benchmarks law + benchmark-method v1.1.0). Acceptance 1-9 evidenced by unit receipts. End-of-goal audit dispatching; on pass → done + archive. The gradus polish wave OPENS (bench-before-polish ordering satisfied).
+**Status**: done — closed 2026-08-27 by end-of-goal audit `e3c9cd4a` (CLEAN PASS: requirements 1–4 satisfied; acceptance 1–9 traced to receipts with the critical gate paths independently re-proven — checker self-compare, wrapper green/red, all four NOT COMPARABLE refusals at exits 3/4/5/6; all 17 work+fold hashes verified; machine audit 0 findings). Eight units landed across folds `f85272b`/`f2d3595`/`19937dc`/`c3bb796`/`4158a2b`/`15c643e`/`533121e`/`a8c0182`. Baseline of record: `baseline-20260827-re792964-hc9cfb5a-g536b7ab` (+receipt +reproduction rider; noise floor ~±1% AC). Residuals: gate advisory until the operator wires it; battery-labeled captures legal, never the first baseline. The gradus polish wave is OPEN on this record.
 **Created**: 2026-08-27
 **Campaign:** `—` (standalone; operator pause-exception order 2026-08-27 morning, task `076e7a1a`)
 **Source:** operator order (verbatim requirements 1–4 in §Problem); routed by mind task `076e7a1a`
