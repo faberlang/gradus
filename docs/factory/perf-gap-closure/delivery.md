@@ -897,3 +897,58 @@ directly):
    R4–R7 — Mind may pull it forward for seat-availability reasons without
    amending this delivery, provided its capture still keys against the R3
    family.
+
+### 7.7 PGC-R5 bag amendment — option (b) NVVM row-mapping (ruling `dce2a356`, 2026-08-28)
+
+Appended by planner under Vivi task `443d2c25` from Mind ruling `dce2a356`
+(ruling thread `160d6429`; head-cto recommendation `190e7520`, posture
+`correct_before_resume`, hard gate; CTO-B audit `a694cd2b` finding 4).
+This section amends the `PGC-R5` card in §7.4 — where this section and the
+card's frozen text differ, **this section governs** (append-only law: the
+card text above is retained as record, not rewritten). All other §7 cards
+are untouched.
+
+**Amendment — containment mechanism settled to option (b).** The
+containment fork the card's `constraints` invariant (2) left to the seat
+("gate at the target-aware synthesis seam … or an admission const … seat
+picks the smallest") is closed by ruling:
+
+| Amended field | Operative amendment |
+| --- | --- |
+| `constraints` (2) | **Retired as mechanism**: containment at `storage_buffer_kernel_with_interner_for_target_entry` (`signature.rs:291`) — the seam carries **no backend parameter** and is **WGSL-shared**; gating there without an API/call-chain redesign would be a **false gate resolution**. **Adopted**: option (b) — the NVVM row-mapping recipe. RowReduction stays a target-neutral launch/body contract (workgroup `[32,1,1]`, dispatch/workgroup grid `[rows,1,1]`; one workgroup owns exactly one logical row). |
+| `constraints` (2) / `write_scope` | The NVVM consumer is **mandatory in scope**, superseding the card's "nvvm files named either way per the containment choice (smallest path picked by the seat)": `radix-mir-llvm/src/nvvm/recipe.rs` — a row-mapping body selected by `Some(RowReduction)` (32 lanes strided over the owned row, uniform cooperative reduction, vectorized scale/output pass over the same row; **never** falls through to the per-element recipe) — plus `nvvm_descriptor.rs` — the matching signature route — for `TensorRmsNorm` and `TensorCausalMaskedSoftmax` only. Seam-redesign and admission-const gate work at `signature.rs`/`contract.rs` is **out of scope**. |
+| `done_when` | Carries the fail-closed proof (resume condition 2 below) in addition to the card's two-class oracle: the receipt records the proof that **no RowReduction signature reaches an old per-element body**. |
+
+**Resume conditions (all mandatory, from the ruling — implementation does
+not resume until the amended bag carries all three):**
+
+1. The bag names option (b) and the NVVM body/descriptor consumer
+   (`nvvm/recipe.rs` row-mapping body + `nvvm_descriptor.rs` signature
+   route) — satisfied by this amendment; Mind's re-issued Hand bag must
+   carry it.
+2. **Fail-closed proof**: no RowReduction signature reaches an old
+   per-element body — any backend without a consuming row-mapping recipe
+   **rejects the contract before launch/signature synthesis** (WGSL stays
+   unadmitted; shared synthesis must not treat backend-blind code as
+   backend containment). Focused proofs land **before** implementation
+   resumes.
+3. **Class B numeric tolerance unchanged** (frozen per-family contract per
+   the R4 schema, never widened) plus the barrier/masking proofs per the
+   `190e7520` seam-contract sketch: RMSNorm covers the full row width
+   including 960-wide rows; causal softmax excludes masked future columns
+   from max/sum and output semantics; no lane crosses a barrier
+   conditionally.
+
+**do_not carried forward**: no backend-blind admission const as
+containment; no rows-x-32 grid over a per-element NVVM body (that is wrong
+code, not slow code); not record-only.
+
+**Effort**: M, est ~150k–300k tokens (CTO basis, `190e7520`: two
+backend recipe/descriptor files already admitted by the amended card, plus
+focused contract/launch/body proofs and the existing Metal/numeric work).
+
+**Status**: `PGC-R5` stays **parked / resume-gated** (task `160d6429`).
+Resume is ready-for-capacity after the live P1 repair burst. At resume, the
+`worktrees/pgc-r5` packet holds dirty interrupted WIP — classify it against
+this ruling before building on it (Mind owns the classification; nothing in
+this amendment pre-approves it).
