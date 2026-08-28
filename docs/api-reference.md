@@ -32,7 +32,6 @@ Scaled dot-product attention, causal masking, RoPE configuration, multi-head att
 
 ### Public functions
 
-- `fn scaled_dot_product_2x8(tensor<f32, [2, 8]> qb, tensor<f32, [2, 8]> kb, tensor<f32, [2, 8]> vb, tensor<f32, [2, 2]> scale) → tensor<f32, [2, 8]>`
 - `fn scaled_dot_product_static<size B, size D>(tensor<f32, [B, D]> qb, tensor<f32, [B, D]> kb, tensor<f32, [B, D]> vb, tensor<f32, [B, B]> scale) → tensor<f32, [B, D]>`
 - `fn message(AttentionError e) → string`
 - `fn consecutive_policy() → RopePolicy`
@@ -987,15 +986,11 @@ Differentiable tensor primitives: linear, GELU, LayerNorm, RMSNorm, SiLU, and Sw
 
 ### Public functions
 
-- `fn linear_2x2(tensor<f32, [2, 2]> input, tensor<f32, [2, 2]> weight, tensor<f32, [2, 2]> bias) → tensor<f32, [2, 2]>`
-- `fn linear_4x4(tensor<f32, [4, 4]> input, tensor<f32, [4, 4]> weight, tensor<f32, [4, 4]> bias) → tensor<f32, [4, 4]>`
-- `fn gelu_4x4(tensor<f32, [4, 4]> x) → tensor<f32, [4, 4]>`
 - `fn linear_2x8(tensor<f32, [2, 8]> input, tensor<f32, [8, 8]> weight, tensor<f32, [8]> bias) → tensor<f32, [2, 8]>`
 - `fn layernorm_2x8(tensor<f32, [2, 8]> x, tensor<f32, [8]> scale, tensor<f32, [8]> offset) → tensor<f32, [2, 8]>`
-- `fn gelu_2x8(tensor<f32, [2, 8]> x) → tensor<f32, [2, 8]>`
 - `fn message(NnError e) → string`
 - `fn linear<size M, size K, size N>(tensor<f32, [M, K]> x, tensor<f32, [K, N]> w, tensor<f32, [M, N]> b) → tensor<f32, [M, N]>`
-- `fn linear_from_raw<size M, size K, size N>(tensor.NumericBlock raw_x, tensor.NumericBlock raw_w, tensor.NumericBlock raw_b) → tensor<f32, [M, N]>`
+- `fn gelu<size M, size N>(tensor<f32, [M, N]> x) → tensor<f32, [M, N]>`
 - `fn linear_carrier(tensor.NumericBlock x, tensor.NumericBlock w, tensor.NumericBlock b) → tensor.NumericBlock ⇥ NnError`
 - `fn gelu(tensor.NumericBlock x) → tensor.NumericBlock ⇥ NnError`
 - `fn layernorm(tensor.NumericBlock x, tensor.NumericBlock scale, tensor.NumericBlock offset, f32 epsilon) → tensor.NumericBlock ⇥ NnError`

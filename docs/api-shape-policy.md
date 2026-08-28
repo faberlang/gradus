@@ -9,17 +9,24 @@ question answered by PML0; PML1-U3 implements it), the PML1 closeout R1
 record 1, the live source headers, and for error identity the 2026-08-21
 operator session recorded in faber `docs/design/typed-error-union.md`.
 
-## The posture: the staged carrier
+## Posture: typed generics are the production surface; the staged carrier is the load-edge tier
 
-Gradus uses the **staged carrier**: shape is a runtime dimension list inside
-the value carrier (`NumericBlock.shape`), and the **static shape is pinned by the
-consumer at materialization** (boundary types stay `tensor<f32, [2,2]>`).
+The production shape-generic surface is the **typed generic leaves**
+(`nn.linear<M,K,N>`, `nn.gelu<M,N>`,
+`attention.scaled_dot_product_static<B,D>`, `math.add<M,N>`): shapes are
+static `tensor<f32, [M, N]>` facts at the boundary, instantiated at the call
+site. The **staged carrier** — shape as a runtime dimension list inside the
+value carrier (`NumericBlock.shape`), the static shape pinned by the
+consumer at materialization — is the staged/runtime-shape tier only: the
+SEM014/SEM005 load-edge posture and the `*_carrier` residuals. It is not
+the production form for families whose typed twin ships.
 
-- **Why**: the generic shape genus (`genus NumericBlock<magnitudo F>` type-argument
-  application) is `PARSE001` and the shape-hole `tensor<f32, _>` genus fields
-  / returns are `SEM014` in standalone library context. The staged carrier
-  compiles today (PML1 closeout R1 record 1; compiler evidence recorded in
-  `src/shape.fab` and `src/tensor.fab`).
+- **Why the carrier exists (PML1 history)**: the generic shape genus
+  (`genus NumericBlock<magnitudo F>` type-argument application) is
+  `PARSE001` and the shape-hole `tensor<f32, _>` genus fields / returns are
+  `SEM014` in standalone library context. The staged carrier compiles today
+  (PML1 closeout R1 record 1; compiler evidence recorded in `src/shape.fab`
+  and `src/tensor.fab`); the typed leaves supersede it wherever one ships.
 - **Boundary unchanged**: the interface packet v1 shape facts (compile-time
   class — shapes are static facts at the boundary) stand. The runtime list is
   the value-carrier representation; the boundary still carries static
@@ -37,11 +44,13 @@ Radix and hosts scope.
 
 | Surface | Signature form | Example |
 | --- | --- | --- |
-| **Fixed-shape admitted rows** | `tensor<f32, [..]>` typed tensors | `linear_2x2`, `mse_4x4`, `bert_tiny_block_2x8` — the admitted caller-backed rows |
-| **Production (shape-generic)** | `tensor.NumericBlock` staged carrier | `nn.linear`, `loss.mse`, `attention.scaled_dot_product`, `math.add` — runtime shape facts |
+| **Production (shape-generic)** | `tensor<f32, [..]>` typed tensors with shape parameters | `nn.linear<M,K,N>`, `nn.gelu<M,N>`, `attention.scaled_dot_product_static<B,D>`, `math.add<M,N>` — static shape facts, instantiated at the call site |
+| **Fixed-shape admitted rows** | `tensor<f32, [..]>` typed tensors | `linear_2x8`, `mse_4x4`, `bert_tiny_block_2x8` — surviving caller-backed rows (wave-2 targets) |
+| **Staged carrier (runtime-shape tier)** | `tensor.NumericBlock` staged carrier | `linear_carrier` / `gelu(NumericBlock)` load-edge forms — SEM014/SEM005 posture, `*_carrier` residuals |
 
-The concrete-overload precedent (norma:optimizer) governs the fixed-shape
-rows; the production surface keeps shapes as runtime facts.
+The concrete-overload precedent (norma:optimizer) governs the surviving
+fixed-shape rows; the staged carrier keeps shapes as runtime facts, while
+the production shape-generic leaves carry static shape facts.
 
 ## R3 — no one-row / one-shape narrowing in the public API
 

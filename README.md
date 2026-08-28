@@ -127,7 +127,7 @@ Gradus is pre-1.0 with a clean-break posture; APIs may change. See
 
 What ships today is the **structural** surface: compile-validated,
 proba-pinned source contracts, plus an executed 100-step MLP training
-loop through `train_step_4x4` → `optimize.sgd_step_4x4` whose final loss
+loop through `train_step_4x4` → `optimize._sgd_family` (list-form SGD) whose final loss
 matches the f64 oracle (`0.017928625511508454`). Broader model-forward
 identity, GPU training, and executed performance are not claimed here.
 
@@ -242,16 +242,16 @@ explicit parameters, explicit gradients, scalar learning rates, and
 explicit update tuples — no universal parameter registry, model class, or
 device/backend handle:
 
-- `gradus:nn` — `linear_2x2`, `linear_4x4`, `gelu_4x4`
+- `gradus:nn` — `linear<M,K,N>`, `gelu<M,N>` (shape-generic leaves)
 - `gradus:loss` — `mse_2x2`, `mse_4x4`
 - `gradus:train` — `train_step_2x2`, `train_step_4x4` (explicit current
   parameters + explicit trainable gradients + scalar lr → explicit tuple of
   updated parameters)
 
-The fixed-shape `sgd_step_2x2` / `sgd_step_4x4` helpers are part of
-`gradus:optimize` again, alongside `SgdState` slots, `step`, and wires.
-The fixed-shape MSE rows and train steps remain the admitted caller surface;
-`train_step_*` delegates its tensor update to the optimizer's SGD helpers.
+The `gradus:optimize` tensor update delegates through the
+`optimize._sgd_family` list form, alongside `SgdState` slots, `step`, and
+wires. The fixed-shape MSE rows and train steps remain the admitted caller
+surface; `train_step_*` delegates its tensor update to that list form.
 
 The seam proof for this surface is `exempla/gradient-seam/`. The
 `@ radix backward` annotation lives in `gradus:gradient`; that exemplum
