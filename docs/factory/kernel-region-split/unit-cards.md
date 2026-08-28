@@ -43,6 +43,13 @@ Lane gates named once (not on any card): lint owns `./scripta/check-source`; tes
 | `risk` | low — arithmetic-identical rerouting through existing kernels plus one annotation; the only trap is misreporting the known red |
 | `integrable` | yes |
 
+**KRS-2 receipt (2026-08-28, lane `factory/krs-2`).** Five reroutes landed: `linear_2x2` → `linear` (typed leaf, `linear_from_raw` detour dropped), `gelu_4x4`/`gelu_2x8` → `gelu`, `linear_2x8` → `(input · weight).added_bias(bias)` (per-channel `[8]` contract kept), `layernorm_2x8` → `x.layer_norm(1, 0.00001 ∷ f32, scale, offset)`; the private `_staged` helper is deleted with its last callers. No `_staged`/`*_carrier` detour remains in the five bodies; error channels (`⇥ NnError`) kept on the wrappers.
+
+Two blockers recorded, neither fixed here:
+
+1. **`linear_4x4` `@ kernel` annotation deferred (compiler blocker).** With `@ kernel` added (either annotation order), `faber check src/nn.fab` stays green but `faber test src/nn.proba` fails package link: `error: @ nucleum fragment call shape IndexId(262) does not match specialized shape IndexId(61)` — every one of the 47 rows blocks (radix workspace binary at `radix/target/debug/faber`, tip of 2026-08-28). A fixed-shape `@ kernel` (`[4,4]`) calling the generic `@ kernel linear<M,K,N>` fails specialization. Annotation reverted; `linear_4x4` keeps `@ public` only and its body `return linear(input, weight, bias)`. Needs a radix ruling/fix before re-attempt.
+2. **Bridge run oracle unavailable at tip.** `faber run exempla/nn-bridge` — note `--target fmir` is not a live `faber run` flag; the manifest `[build] target` carries it — refuses at the first typed-leaf call on **both** sides of the change: `error: runner refuses execution of @ kernel function` (radix `65f2d7d6b` "refuse device kernel execution", 2026-08-27, post-dates the adapters' `@ kernel` twins `47d3d69`). Baseline and post-change runs are byte-identical (single refusal line, `/tmp` receipts `krs2-bridge-before/after.txt`); the card's printed-pin comparison is therefore vacuous at this tip, not green and not claimed. `faber check exempla/nn-bridge` green both sides; `faber test src/nn.proba` identical pass/fail sets before/after (44 passed, 3 failed — the 3 are the pre-existing `runner refuses execution of @ kernel function` rows, plus the known pre-existing `linear_2x2`-family red carried as baseline; timings jitter). No bridge edit made.
+
 ---
 
 ## KRS-3 — `transformer.fab` named private `@ kernel dense_mlp` shared by both static block twins
