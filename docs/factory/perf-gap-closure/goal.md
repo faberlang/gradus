@@ -176,11 +176,11 @@ Same unit shape; oracle: ONE paired-parity prefill delta + per-kernel FMA/receip
 
 | `id` | Defect | Evidence anchor | Expected effect |
 | --- | --- | --- | --- |
-| `PGC-C1` | Embedding as gather, not dense one-hot matmul | one-hot embedding matmul; direct token-row gather recommended | large share of 3.73B avoidable FMAs |
-| `PGC-C2` | Terminal-row-only logits at prefill | all-36-row LM head vs 1 needed row | ~36× less lm_head prefill work |
-| `PGC-C3` | Single-pass RMSNorm (no per-output-element row rescan) | O(D²) rescan, ~2.15B avoidable FMAs | removes ~2.15B FMAs |
-| `PGC-C4` | Tiled GEMM recipes on prefill paths | scalar untiled 8×8 GEMMs, ~1.65B padded FMAs | removes padding waste; raises GPU-busy efficiency |
-| `PGC-C5` | Stop re-staging weight-shaped inputs | 23 MB of weight-shaped inputs re-staged per prefill step (prefill audit) | removes redundant staging bytes and its encode-adjacent wall |
+| `PGC-C1` | Embedding as gather, not dense one-hot matmul — **SUPERSEDED 2026-08-28 by `PGC-R1` (delivery §7.0); do not dispatch as written** | one-hot embedding matmul; direct token-row gather recommended | large share of 3.73B avoidable FMAs |
+| `PGC-C2` | Terminal-row-only logits at prefill — folded 2026-08-27; producer-fact verification owned by `PGC-R2` (delivery §7.4) | all-36-row LM head vs 1 needed row | ~36× less lm_head prefill work |
+| `PGC-C3` | Single-pass RMSNorm (no per-output-element row rescan) — **SUPERSEDED 2026-08-28 by `PGC-R5`; do not dispatch as written** | O(D²) rescan, ~2.15B avoidable FMAs | removes ~2.15B FMAs |
+| `PGC-C4` | Tiled GEMM recipes on prefill paths — **SUPERSEDED 2026-08-28 by `PGC-R4`; do not dispatch as written** | scalar untiled 8×8 GEMMs, ~1.65B padded FMAs | removes padding waste; raises GPU-busy efficiency |
+| `PGC-C5` | Stop re-staging weight-shaped inputs — folded; owed capture + evidence dir owned by `PGC-R3` (delivery §7.4) | 23 MB of weight-shaped inputs re-staged per prefill step (prefill audit) | removes redundant staging bytes and its encode-adjacent wall |
 
 ### A-series — purity polish waves (after A0; massively parallel batches)
 | Field | Value |

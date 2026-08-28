@@ -1,6 +1,6 @@
 # Delivery: perf-gap-closure — parallel unit graph
 
-**Status**: lowered for Mind routing 2026-08-27 — dispatch-ready; no GO stamp
+**Status**: lowered for Mind routing 2026-08-27; AMENDED 2026-08-28 (reopen package, Mind memo `cbc68961` — §7 PGC-R series supersedes the undispatched C1/C3/C4 cards and folds B/C residuals; no GO stamp)
 **Goal**: [`goal.md`](goal.md), committed `bd37d20`; this document adds execution detail and does not amend the goal
 **Assignment**: Vivi task `943dc1fc` (planner lowering)
 **Primary repo**: `/Users/ianzepp/work/faberlang/gradus`
@@ -593,3 +593,306 @@ capacity defects, and instrument defects, and both corrected the partial
 sample and prefill bandwidth-floor errors. Operator commentary 2026-08-27
 owns the fusion pre-work chain, anti-prior law, closure intrinsics, and
 `--air` / `--complexity-budget` deterministic-driver contract.
+
+## 7. Reopen package — amended unit graph (PGC-R series, 2026-08-28)
+
+Added by planner under Vivi task `a7a9ffb5` from Mind memo `cbc68961`
+(reopen package), CTO#1 mail `1bbfce59`, CTO#2 mail `54e48e56` (the sol
+seat — amendments govern where the two differ), GAP findings
+`f7f5dbd3` / `5f3b144d` / `b1c7f917` / `06a62904`+`051731ac`, and
+B2-RETUNE close `82dc3199`. This section governs all reopen work; §1–§6
+remain the record of waves 0–1 and keep their folded cards' authority.
+
+### 7.0 Supersession and the landed-inliner constraint
+
+| Old card | Disposition under §7 |
+| --- | --- |
+| `PGC-C1` (embedding gather) | **Superseded by `PGC-R1`** — do not dispatch C1 as written |
+| `PGC-C2` (terminal-row logits) | Folded 2026-08-27 (LM-head FMAs 1.70B→47.2M); remaining producer-fact verification owned by `PGC-R2` |
+| `PGC-C3` (single-pass RMSNorm) | **Superseded by `PGC-R5`** (row-reduction family widened to prefill softmax) — do not dispatch C3 as written |
+| `PGC-C4` (tiled prefill GEMM) | **Superseded by `PGC-R4`** (simdgroup/vectorized recipe class) — do not dispatch C4 as written |
+| `PGC-C5` (resident weights) | Folded; owed full-stage capture + missing evidence dir owned by `PGC-R3` |
+| `PGC-B1` (bucketed extents) | Folded; owed full-stage delta, physical gate, and missing evidence dir owned by `PGC-R3` |
+
+**Landed-inliner law.** Semantic device-to-device call composition is LANDED
+(radix `fae613683`, DFV2-4: `radix-module/src/mir/fragment_composition.rs`,
+run post-monomorphization from `mir/lower.rs:363` and
+`package_instantiate.rs:304`). No card in this delivery mints an inliner,
+duplicates that pass, or adds an MSL device-function fallback rung — budget
+overflow fails closed by the landed contract. The open work is
+target-neutral **launch fusion / intermediate-materialization elision** at
+the decomposition/DeviceProgram seam, per
+`radix/docs/design/operation-fusion.md`, plus bounded Gradus corpus
+adoption. The operation-fusion design's Units 1–2 (typed elementwise plan +
+decomposition attachment) are also already landed as OF-1 `3d8ce4d8a6` and
+OF-2 `aebec9180` (`radix-mir/src/elementwise_plan.rs`,
+`kernel_decomposition.rs`); what is unbuilt is the backend consumer and the
+corpus that exercises it.
+
+### 7.1 Amended measurement law for R cards
+
+These riders amend §1.1 for every R card. Where a rider and §1–§6 conflict,
+the rider governs R cards.
+
+**Condition-B rider (CTO#1 E(a) / CTO#2, binding).** L2/L3 units claim
+**FMA / work-census / staged-byte / launch-graph deltas as primary
+evidence**. Wall deltas (t/s, ms/step) are **L1-gated secondary
+observations**: they may be reported only family-keyed against the re-keyed
+baseline, with the L1 dispatch-shell state named (encoders per step, launch
+encode ms), and are never the card's pass oracle. The corrected record
+behind this: true decode idle is ~3.3 ms/step and the honest launch-boundary
+class is ~6–10 ms/step (sample-cap correction, `5f3b144d`), not the
+superseded ~28 ms reading; prefill is body-efficiency dominated (~50.6 ms
+GPU busy at ~0.51 vs llama ~2.3 effective TFLOP/s on the same 26 GFLOP).
+
+**Two-class numeric oracle (CTO#2 Q5, per `operation-fusion.md` §6).**
+Byte/exact identity is the landing target **only** where the operation
+contract and emitted form prove the change has no observable rounding,
+contraction, or materialization effect (the B2 class: dispatch-shape change,
+arithmetic untouched). Otherwise the frozen per-family numeric contract
+applies — compared against the unfused/old output, **never widened after
+observation**. Every R card states which class its change is in. Launch
+count, geometry, slot/resource/version, and intermediate-materialization
+deltas are pinned separately wherever they move; a numeric pass that hides a
+launch-graph change is not a pass.
+
+**Baseline family.** R cards measure against the gradus-llama-parity
+baseline family of record (GLP U5 landed; first AC baseline
+`radix/docs/factory/gradus-llama-parity/baselines/`), re-keyed by `PGC-R3`
+after the algebraic cards and the B2-RETUNE landing (w16, `82dc3199`,
+KEEP at 16.44 t/s vs 15.77 baseline). Until R3 lands, no R card claims a
+wall delta.
+
+**Closeout-command correction (defect fix; three seats confirmed).** Any
+closeout or proof command citing `exempla_rust_canonical` must name the rust
+lane explicitly:
+
+```text
+cargo test -p exempla --no-default-features --features hir-rust --test e2e_harness exempla_rust_canonical -- --ignored --nocapture
+```
+
+`exempla`'s default feature set is empty (`radix/crates/exempla/Cargo.toml`
+— per-lane default-off), so the bare form recorded in the test's own ignore
+attribute compiles no lane and fails. R cards and any Mind-minted closeout
+use the corrected form verbatim.
+
+### 7.2 Parked delivery-repair findings — closed into this artifact
+
+The three PGC-DELIVERY-REPAIR findings were repaired on the pre-reopen text
+(gradus `afdf79d`, `6f70767`, `0b1db1e`). Their laws carry into every R
+card and are hereby closed against §7:
+
+| Finding | Law carried into §7 |
+| --- | --- |
+| `7c97ff62` (wave overlap) | Per-card additive test files for all new tests (`gea3_pipeline_pgc_r<N>_test.rs`, `hosts/macos-arm64/tests/gea3_decode_pgc_r<N>.rs`); no R card appends new cases to shared `gea3_pipeline_test.rs` / `gea3_decode.rs` — a card touches those two files only inside its named entry pin regions (the B1/B2 amended mechanism), with regions declared on the card; shared `kernel.fab` / `kernel.proba` handled by disjoint entry/case ownership with serial Mind folds; `kernel_plan/{plan,build,kernel_plan_test}.rs` never live in two cards (§7.3 order) |
+| `ec594fd` (C2/C5 vertical narrowing) | Every host/export-only R card declares its Gradus entry/case scope explicitly (verify-untouched allowed only with the `git diff --exit-code` proof artifact) and captures the `(case_path, status, stderr bytes)` tuple oracle for every named case |
+| `01fd4c61` (phantom proba names) | R cards name only live `src/kernel.proba` identifiers (verified 2026-08-28 against `gradus/src/kernel.proba`); no unbounded phrases like "existing prefill cases" |
+
+### 7.3 R-wave structure
+
+Execution order is the amended CTO#2 order: algebraic fixes → re-census /
+baseline re-key → prefill body efficiency → launch-fusion lane (parallel
+architecture track) → L13 encoder construction. `PGC-R6` is architecture
+and runs parallel with `PGC-R4`/`PGC-R5` (CTO#2 Q3.5); nothing else
+reorders.
+
+| Wave | Cards | Mode / packet |
+| --- | --- | --- |
+| `R-W1` | `PGC-R1` ∥ `PGC-R2` (disjoint `kernel.fab` entry regions: embedding vs head) | packets `worktrees/pgc-r1/`, `worktrees/pgc-r2/` (`factory/pgc-r1`, `factory/pgc-r2`) |
+| `R-W2` | `PGC-R3` alone | direct mode (captures + docs; no source) |
+| `R-W3` | `PGC-R4` → `PGC-R5` (serial on `kernel_plan/` trio); `PGC-R6` ∥ both (emit files disjoint) | packets `worktrees/pgc-r4|r5|r6/` |
+| `R-W4` | `PGC-R7` after `PGC-R6` + `PGC-R3` | packet `worktrees/pgc-r7/` |
+| `R-W5` | `PGC-R8` after `PGC-R3` | direct mode (hosts-only, path-limited) |
+
+File-disjointness inside `R-W3`: `PGC-R4` owns
+`emit/matmul.rs` + `emit/tests/matmul.rs`; `PGC-R5` owns `emit/rmsnorm.rs`,
+`emit/causal_softmax.rs` + their tests; `PGC-R6` owns `emit/elementwise.rs`,
+`emit/recipes.rs`, the elementwise path of `emit/mod.rs`, and additive
+`radix-mir/src/elementwise_plan*.rs` accessors. The
+`kernel_plan/{plan,build,kernel_plan_test}.rs` trio is owned by `PGC-R4`
+then folded to `PGC-R5` serially through the Mind.
+
+### 7.4 Unit cards
+
+#### PGC-R1 — indexed prefill embedding gather
+
+| Field | Value |
+| --- | --- |
+| `id` | `PGC-R1` |
+| `outcome` | Replace the dense one-hot embedding matmul with a direct indexed token-row copy kernel, prefill (`[36,49152]·[49152,960]` selector matmul → 36 row copies) and the shared entry's decode use. Supersedes `PGC-C1` and the one-hot idiom's design note at `gradus/src/kernel.fab:601-634` (CTO ruling `0891c09b` superseded by the reopen order). |
+| `write_scope` | Packet `worktrees/pgc-r1/`, branch `factory/pgc-r1`. `gradus/src/kernel.fab` only the `embedding_gather` entry and its prefill-shaped use; `gradus/src/kernel.proba` only the live case `src/kernel.proba:test "gea3u3c_embedding_gather_static_f32_shape"`. Radix, only as live inspection requires and named in the report: the existing indexed/gather admission seams (`radix-mir-metal/src/emit/gather.rs`, `emit/literal_indexed.rs`), `kernel_plan/` admission facts if no existing recipe covers a token-indexed row copy (this card owns the trio in its wave; R4/R5 follow), and the embedding-entry pin regions inside `radix/crates/mir-emit-harness/src/gea3_pipeline_test.rs` (these supersede the B2-era T=1 matmul pins for that entry). New additive-only `radix/crates/mir-emit-harness/src/gea3_pipeline_pgc_r1_test.rs`; new additive-only `hosts/macos-arm64/tests/gea3_decode_pgc_r1.rs` (compact token-id binding, no selector upload, physical row-copy assertions). No other kernel entries; no edits to unrelated harness regions. |
+| `done_when` | Focused proba tuple (`case_path`, `status`, exact stderr bytes) byte-identical before/after for the named case (two-class note: a row copy has no rounding surface — byte identity is the correct class). Export + device evidence prove no `[36,49152]` one-hot selector is staged (pre-prefill upload drops by ~7.08 MB of the 23.1 MB fixed-1000 staging) and dispatched embedding FMAs fall from the padded 1,887,436,800 (~1.89 GFMA, `06a62904`+`051731ac`: 40-row-padded `[40,49152,960]` vs 36×960 row copies) to zero GEMM-class work. Certified outputs unchanged (1000/1000 on the device test). No per-card wall claim (condition-B rider); wall observations belong to `PGC-R3`'s family capture. Evidence under `gradus/docs/factory/perf-gap-closure/evidence/PGC-R1/`. |
+| `depends_on` | none |
+| `sanity` | Duplicate and boundary token ids gather byte-identical rows in source order; invalid ids fail under the existing bounds law; tied `[49152,960]` buffer stays one physical allocation. |
+| `non_goals` | No terminal-head work (R2), no GEMM recipe work (R4), no decode selector-upload cleanup beyond what the shared entry carries, no fusion, no quantization. |
+| `risk` | medium — entry signature change (selector input → token-id input) must keep the plan-bound resource law and the tied-weight layout. |
+| `integrable` | yes — one defect, named entry region, packet fold |
+| `parallel_group` | `R-W1` |
+
+#### PGC-R2 — final-row-only LM-head contract, producer facts explicit
+
+| Field | Value |
+| --- | --- |
+| `id` | `PGC-R2` |
+| `outcome` | Close the final-row prefill contract with every producer fact proven from live evidence, not from the fold claim. C2 folded the LM-head GEMV (goal Status: FMAs 1.70B→47.2M); CTO#2 requires the complete contract treated as explicit producer facts. The four facts: (a) prefill terminal head consumes row 35 through the decode-shaped entry; (b) prefill LM-head work is final-row-only (47,185,920 FMAs class, not 1,698,693,120 — the 36× evidence, `5f3b144d`); (c) prefill logits readback is one row (196,608 B / 49,152 floats, not `36×49152` / 7,077,888 B); (d) prefill head RMSNorm is final-row-only (`[1,960]` input, not the `[36,960]` 33.2M-FMA full-row scan, `06a62904`). Any unmet fact is implemented in this card's vertical (export pin + device test); every met fact is proven from committed receipts/tests. |
+| `write_scope` | Packet `worktrees/pgc-r2/`, branch `factory/pgc-r2`. Gradus verify-untouched scope: `gradus/src/kernel.fab` head-entry regions (`head_rmsnorm`, `lm_head_gemv`) and `gradus/src/kernel.proba` live cases `src/kernel.proba:test "gea3u3c_head_rmsnorm_static_f32_shape"` and `src/kernel.proba:test "gea3u3c_lm_head_gemv_static_f32_shape"` — no Gradus edit; the card records `git diff --exit-code -- gradus/src/kernel.fab gradus/src/kernel.proba` as the explicit no-diff proof. If a producer fact is unmet, the implementation follows the C2 pattern — per-card additive files only: new additive-only `radix/crates/mir-emit-harness/src/gea3_pipeline_pgc_r2_test.rs` (final-row view pin, output count, head-norm row selection) and new additive-only `hosts/macos-arm64/tests/gea3_decode_pgc_r2.rs` (terminal-row binding, readback slice); no edits to shared `gea3_pipeline_test.rs` or `gea3_decode.rs`; no kernel-body source change (row selection is view/plan work). |
+| `done_when` | Each of the four producer facts carries committed evidence (export pin assertion, device-test assertion, or receipt field) under `evidence/PGC-R2/`, or was implemented and then proven. Named proba tuples byte-identical before/after (row selection must not perturb kernel numerics — byte-identity class). Device test selects the same next token as the pre-fold fixture. FMA/readback census recorded per fact. No per-card wall claim (condition-B rider). |
+| `depends_on` | none |
+| `sanity` | Compare final-row vector and argmax byte-for-byte against the C2 fixture evidence (`evidence/PGC-C2/terminal-row-delta.json`); row 34/36 selection or a 35-row off-by-one fails. |
+| `non_goals` | No embedding gather (R1), no row-reduction recipe work (R5), no sampling change, no new head entry. |
+| `risk` | medium — a mis-selected row is silently plausible; byte-for-byte argmax continuity is the oracle. |
+| `integrable` | yes — one contract, packet fold |
+| `parallel_group` | `R-W1` |
+
+#### PGC-R3 — post-fix re-census, baseline-family re-key, owed-evidence reconciliation
+
+| Field | Value |
+| --- | --- |
+| `id` | `PGC-R3` |
+| `outcome` | One certified post-retune, post-algebraic family capture that (1) re-keys the parity baseline family (condition-A resolved by `82dc3199`: KEEP w16), (2) discharges the B1/C5 owed evidence (auditor `77ca6b07` P2: `evidence/PGC-B1/` and `evidence/PGC-C5/` absent on main), and (3) re-censuses the corrected launch graph / FMA / staging table (L17) as the fusion-priority input CTO#2 demands — a census before R1/R2 is obsolete by construction. |
+| `write_scope` | Direct mode. `gradus/docs/factory/perf-gap-closure/evidence/PGC-R3/` (family capture, reduced receipt, census tables); create and populate `evidence/PGC-B1/` (derive the B1 delta from the family capture **and run the B1 physical gate** — both bucket extents at capacity 1100, hosts `gea3_decode_pgc_b1.rs`) and `evidence/PGC-C5/` (copy-in census derivation + the C5 no-diff proof artifact); append-only baseline-family artifacts under `radix/docs/factory/gradus-llama-parity/baselines/`. No source, no kernel, no test edits. |
+| `done_when` | One full-stage paired capture (`scripta/parity run --stage full`) on the folded mains (radix/hosts/gradus post-pgc-b2-final), certified 1000/1000, power AC, three-repo pins recorded; `evidence/PGC-B1/` and `evidence/PGC-C5/` rows stop owing; the census table records per-step encoders, launches per family, launch-encode ms, upload bytes/handles, readback bytes, dispatched vs useful FMAs per entry family, and the two-class-compatible candidate list for fusion waves (compatible launch graph). Wall deltas for R1/R2 are reported here, L1-gated, never on those cards. Baseline re-key respects §7.5's pin ruling (default: keep pre-B3 gradus pin until the operator rules). |
+| `measurement_commands` | From `/Users/ianzepp/work/faberlang/radix`: `scripta/parity run --stage full --output-dir /Users/ianzepp/work/faberlang/gradus/docs/factory/perf-gap-closure/evidence/PGC-R3/parity-raw`; `scripta/parity reduce /Users/ianzepp/work/faberlang/gradus/docs/factory/perf-gap-closure/evidence/PGC-R3/parity-raw --out /Users/ianzepp/work/faberlang/gradus/docs/factory/perf-gap-closure/evidence/PGC-R3/parity-receipt.json`; append-only candidate `scripta/parity baseline /Users/ianzepp/work/faberlang/gradus/docs/factory/perf-gap-closure/evidence/PGC-R3/parity-raw --baselines-dir /Users/ianzepp/work/faberlang/radix/docs/factory/gradus-llama-parity/baselines/ --receipt-out /Users/ianzepp/work/faberlang/gradus/docs/factory/perf-gap-closure/evidence/PGC-R3/baseline-candidate.md`. A lesser stage is not baseline-grade. |
+| `depends_on` | `PGC-R1`, `PGC-R2` |
+| `sanity` | Family identity: same GGUF/statues/env/power as the GLP baseline of record; the capture tree integrates B1+B2(w16)+B3+C2+C5+R1+R2 — the receipt's per-entry census must show every one of those folds present before the re-key is certified. |
+| `non_goals` | No source change, no new lever pulled inside the capture, no fusion target selection beyond recording the census, no MIR runner. |
+| `risk` | medium — re-key discipline: append-only, never rewrite the standing family; the B1 physical gate must run, not be derived. |
+| `integrable` | yes — direct-mode, path-limited commits (gradus evidence + radix baselines) |
+| `parallel_group` | `R-W2` |
+
+#### PGC-R4 — simdgroup/vectorized prefill GEMM recipes
+
+| Field | Value |
+| --- | --- |
+| `id` | `PGC-R4` |
+| `outcome` | Replace the scalar 8×8-tile, per-K-slice-barrier prefill GEMM emission with a simdgroup-matrix / vectorized-load recipe (float4 loads, cooperative simdgroup multiply-accumulate, partial-tile guards), preserving the language-level tensor `·` contract. Absorbs `PGC-C4`. Dominant prefill lever: ~0.51 vs ~2.3 effective TFLOP/s on the same 26 GFLOP (`5f3b144d`); the padded-FMA class (~1.65B, 40-row padding of M=36, score 40×40/36×36) falls with real tiles. |
+| `write_scope` | Packet `worktrees/pgc-r4/`, branch `factory/pgc-r4`. `gradus/src/kernel.fab` only `prefill_gemm_qo`, `prefill_gemm_kv`, `prefill_gemm_gate_up`, `prefill_gemm_down` and any shared body helper they call (named in the report); `gradus/src/kernel.proba` only the live cases `gea3u3b_prefill_gemm_qo_static_f32_shape`, `gea3u3b_prefill_gemm_kv_static_f32_shape`, `gea3u3b_prefill_gemm_gate_up_static_f32_shape`, `gea3u3b_prefill_gemm_down_static_f32_shape`. Radix: `kernel_plan/{plan,build,kernel_plan_test}.rs` for the recipe plan facts (this card owns the trio in `R-W3`); `radix-mir-metal/src/emit/matmul.rs` + `emit/tests/matmul.rs` only. New additive-only `gea3_pipeline_pgc_r4_test.rs`; new additive-only `hosts/macos-arm64/tests/gea3_decode_pgc_r4.rs`. No edits to `emit/mod.rs`/`recipes.rs` (R6 owns them this wave) or shared harness regions. |
+| `done_when` | Focused proba tuples byte-identical where the recipe preserves declared accumulation order; otherwise the frozen per-family tolerance vs the old recipe output, never widened (two-class note: simdgroup accumulate contracts the multiply-add — declare the class per entry in the report). Device evidence: valid tail zero-fill/barriers on M=36/N-multiple edges, dispatched-vs-useful FMA census (padding class gone), and one fixed-1000 prefill paired-parity capture vs the R3 family recording prefill wall + GPU-busy efficiency as **L1-gated secondary** with the FMA/efficiency census primary (condition-B rider). Evidence under `evidence/PGC-R4/`. |
+| `measurement_commands` | From `/Users/ianzepp/work/faberlang/radix`: `scripta/parity run --stage full --output-dir /Users/ianzepp/work/faberlang/gradus/docs/factory/perf-gap-closure/evidence/PGC-R4/parity-raw`; then `scripta/parity reduce /Users/ianzepp/work/faberlang/gradus/docs/factory/perf-gap-closure/evidence/PGC-R4/parity-raw --out /Users/ianzepp/work/faberlang/gradus/docs/factory/perf-gap-closure/evidence/PGC-R4/parity-receipt.json`; then append-only candidate `scripta/parity baseline /Users/ianzepp/work/faberlang/gradus/docs/factory/perf-gap-closure/evidence/PGC-R4/parity-raw --baselines-dir /Users/ianzepp/work/faberlang/gradus/docs/factory/perf-gap-closure/evidence/PGC-R4/baseline-candidate --receipt-out /Users/ianzepp/work/faberlang/gradus/docs/factory/perf-gap-closure/evidence/PGC-R4/baseline-candidate.md`. Raw capture, reduced receipt, candidate baseline, and the FMA/efficiency census evidence live under `gradus/docs/factory/perf-gap-closure/evidence/PGC-R4/`; a lesser stage is not baseline-grade. |
+| `depends_on` | `PGC-R3` |
+| `sanity` | Emitted Metal for one GEMM shows simdgroup ops and no per-K-slice threadgroup barrier pair; non-multiple tails read zero-fill without changing valid outputs. |
+| `non_goals` | No decode T=1 work (B2 landed), no row reductions (R5), no fusion (R6/R7), no weight-layout rewrite beyond what the recipe's load contract requires (named if touched), no quantization. |
+| `risk` | high — tile/barrier/layout errors are silently numerically wrong; focused device readback and the tolerance declaration are mandatory. |
+| `integrable` | yes — one recipe family, packet fold |
+| `parallel_group` | `R-W3` |
+
+#### PGC-R5 — vectorized prefill row reductions
+
+| Field | Value |
+| --- | --- |
+| `id` | `PGC-R5` |
+| `outcome` | One SIMD/threadgroup reduction per row, then a vectorized scale pass, for the prefill row-reduction family: `prefill_rmsnorm`/`head_rmsnorm` (O(D²) rescan: 2,156,544,000 iterations → 2,246,400, a 960× class, `06a62904`) and `prefill_causal_softmax` (36× per-column row recompute: 23,016,960 → 639,360 exp-class iterations). Absorbs `PGC-C3` and widens it to the softmax row reduction the same evidence names. |
+| `write_scope` | Packet `worktrees/pgc-r5/`, branch `factory/pgc-r5`. `gradus/src/kernel.fab` only `prefill_rmsnorm`, `head_rmsnorm` recipe uses, and `prefill_causal_softmax`; `gradus/src/kernel.proba` only the live cases `gea3u3b_prefill_rmsnorm_static_f32_shape`, `gea3u3c_head_rmsnorm_static_f32_shape`, `gea3u3b_prefill_causal_softmax_static_f32_shape`. Radix: `kernel_plan/{plan,build,kernel_plan_test}.rs` (after R4's fold — serial ownership); `radix-mir-metal/src/emit/rmsnorm.rs`, `emit/causal_softmax.rs` + `emit/tests/{rmsnorm,causal_softmax}.rs` only. New additive-only `gea3_pipeline_pgc_r5_test.rs`; new additive-only `hosts/macos-arm64/tests/gea3_decode_pgc_r5.rs`. |
+| `done_when` | Two-class note governs: a threadgroup row reduction changes summation order — the frozen per-family numeric contract vs the old recipe output is the oracle (never widened), unless a variant preserves declared order and then byte identity holds; declare the class per entry. Proba tuples byte-identical **or** the declared tolerance proof recorded per the class. Device proof counts one reduction per row; FMA/iteration census primary; one fixed-1000 prefill paired-parity capture vs the R3 family with wall as L1-gated secondary. Evidence under `evidence/PGC-R5/`. |
+| `measurement_commands` | From `/Users/ianzepp/work/faberlang/radix`: `scripta/parity run --stage full --output-dir /Users/ianzepp/work/faberlang/gradus/docs/factory/perf-gap-closure/evidence/PGC-R5/parity-raw`; then `scripta/parity reduce /Users/ianzepp/work/faberlang/gradus/docs/factory/perf-gap-closure/evidence/PGC-R5/parity-raw --out /Users/ianzepp/work/faberlang/gradus/docs/factory/perf-gap-closure/evidence/PGC-R5/parity-receipt.json`; then append-only candidate `scripta/parity baseline /Users/ianzepp/work/faberlang/gradus/docs/factory/perf-gap-closure/evidence/PGC-R5/parity-raw --baselines-dir /Users/ianzepp/work/faberlang/gradus/docs/factory/perf-gap-closure/evidence/PGC-R5/baseline-candidate --receipt-out /Users/ianzepp/work/faberlang/gradus/docs/factory/perf-gap-closure/evidence/PGC-R5/baseline-candidate.md`. Raw capture, reduced receipt, candidate baseline, and the reduction/iteration census evidence live under `gradus/docs/factory/perf-gap-closure/evidence/PGC-R5/`; a lesser stage is not baseline-grade. |
+| `depends_on` | `PGC-R3`, `PGC-R4` (kernel_plan fold order) |
+| `sanity` | Constant, mixed-sign, and near-epsilon rows stay inside the declared f32 contract; masked future columns remain excluded; no unsafe barrier crossing. |
+| `non_goals` | No GEMM recipe (R4), no decode softmax (B1 owns extents; decode body is B2-landed), no fusion, no f16/quantized work, no tolerance widening. |
+| `risk` | high — reduction-order change is the whole risk; the two-class declaration plus frozen tolerance is the containment. |
+| `integrable` | yes — one family, packet fold |
+| `parallel_group` | `R-W3` (serialized after R4 on the kernel_plan trio) |
+
+#### PGC-R6 — launch-fusion consumer: Metal emitter migration (operation-fusion OF-3 re-admission)
+
+| Field | Value |
+| --- | --- |
+| `id` | `PGC-R6` |
+| `outcome` | Migrate the Metal elementwise emit path to consume the landed target-neutral `ElementwisePlan` (OF-1 `3d8ce4d8a6`, OF-2 `aebec9180`) instead of rebuilding pointwise expressions backend-locally — the missing consumer of `radix/docs/design/operation-fusion.md` Unit 3. This is the re-admission of operation-fusion `OF-3`, deferred 2026-08-18 behind R-PACK-05; the reopen package (operator post-pause direction, memo `cbc68961`) is the re-admission authority, and the owning spec stays `radix/docs/factory/operation-fusion/{goal,delivery}.md` — this card does not re-lower it or duplicate its units. No wall claim: structural oracle only (condition-B rider). |
+| `write_scope` | Packet `worktrees/pgc-r6/`, branch `factory/pgc-r6` (radix only). `radix-mir-metal/src/emit/elementwise.rs` + `emit/tests/elementwise.rs`; the elementwise path of `emit/mod.rs` and `emit/recipes.rs` (owned by this card in `R-W3`); additive accessors on `radix-mir/src/elementwise_plan.rs` + `elementwise_plan_test.rs` as the consumer requires. Consult-only (never edit this wave): `kernel_plan/`, `device_program_plans.rs`, `kernel_decomposition.rs`. New focused fixtures per design §11.4–11.6. |
+| `done_when` | Design §11 proofs 4–6 green on Metal: **backend source proof** (one output store per elementwise-only subchain, no intermediate buffer/launch for the focused fixture); **unfused comparison** (planning-disabled vs enabled under the operation's declared tolerance — byte equality only where the contract promises it, per the two-class oracle); **no accidental scope expansion** (reduction, matmul, quantized unpack, fragment-call, and control-flow fixtures hit named barriers). Old backend-local builder removed in the same scoped migration once equivalence coverage exists. No proba tuple may change (radix-side change is emit-internal). Evidence under `evidence/PGC-R6/`. |
+| `depends_on` | none (architecture lane; runs parallel with R4/R5 — CTO#2 Q3.5) |
+| `sanity` | `cargo test -p radix-mir-metal elementwise` green at the packet; plan summary reports barrier reasons without parsing MSL. |
+| `non_goals` | No new inliner (landed law §7.0), no MSL device-fn rung, no NVVM/WGSL migration (OF-4 territory), no driver flag unification (OF-5), no recipe-seam widening, no Gradus corpus change (R7), no performance receipt. |
+| `risk` | medium — the old builder removal must carry equivalence coverage; fail-closed barrier reasons must not become silent fallbacks. |
+| `integrable` | yes — one emit path, packet fold |
+| `parallel_group` | `R-W3` |
+
+#### PGC-R7 — bounded Gradus corpus adoption, wave 1 (public→private helper redesignation)
+
+| Field | Value |
+| --- | --- |
+| `id` | `PGC-R7` |
+| `outcome` | Redesignate one compatible-launch-graph family of Gradus public launch-ABI entries as private device helpers with composites exercising the landed semantic composition plus the R6 launch-fusion consumer; regenerate the frozen identities, resource maps, descriptors, launch plans, and parity evidence for that family. Wave-sized by compatible launch graph (per the R3 census), not a broad annotation cleanup — the corpus today is 48 flat `@ kernel`/`@ public` pairs with no helper call graph (CTO#2 Q4). KPC owns the purity definition; wave 1 stays monomorphic concrete instantiation, so SGR is not a gate (it hard-gates only the generic case). |
+| `write_scope` | Packet `worktrees/pgc-r7/`, branch `factory/pgc-r7`. `gradus/src/kernel.fab` only the selected family's entry regions (family named in the dispatch from the R3 census; default candidate: one decode elementwise/epilogue family, e.g. the swiglu→residual neighborhood); `gradus/src/kernel.proba` only that family's live cases (named at dispatch from `src/kernel.proba`; no phantom identifiers). Radix/hosts: new additive-only `gea3_pipeline_pgc_r7_test.rs` and `hosts/macos-arm64/tests/gea3_decode_pgc_r7.rs`; regenerated export pins for the family's entries inside `gea3_pipeline_test.rs` region-ownership rules. |
+| `done_when` | The five fused-unit oracle classes (CTO#2 Q4) all carry committed evidence under `evidence/PGC-R7/`: (a) unfused-vs-fused output oracle under the two-class numeric law (byte identity only where the contract proves no observable rounding/contraction — e.g. pure elementwise chains; else frozen per-family tolerance vs the unfused output, never widened); (b) intermediate visibility/materialization checks (an elided intermediate leaves device memory only with no live external consumer — otherwise the store is retained); (c) launch/resource/version graph pins (launch counts, geometries, slot maps, resource versions as receipt columns); (d) negative barrier cases (alias, control flow, multi-consumer, recipe-boundary fixtures refuse with typed reasons); (e) at least one physical family-keyed A/B receipt vs the R3 family — structural launch-count delta primary, wall L1-gated secondary. Certified outputs unchanged. |
+| `depends_on` | `PGC-R3` (census + family key), `PGC-R6` (consumer) |
+| `sanity` | One family, one packet: the redesignated entries' proba tuples stay byte-identical where semantics are untouched; composites fail closed on budget overflow (no silent unfused drift). |
+| `non_goals` | No broad annotation sweep, no shape-generic `@kernel` (KPC waves 2–3 + SGR gate), no multi-family wave, no new fusion barriers beyond the design doc's set, no wall target. |
+| `risk` | high — migration can temporarily enlarge composed MIR and cross recipe/storage/geometry barriers without reducing a launch; the oracle classes are the containment, and a wave that reduces no launch is an honest reportable result, not a failure to hide. |
+| `integrable` | yes — one family, packet fold |
+| `parallel_group` | `R-W4` |
+
+#### PGC-R8 — L13 encoder-construction reduction (hosts)
+
+| Field | Value |
+| --- | --- |
+| `id` | `PGC-R8` |
+| `outcome` | Cut the 2,115 per-step encoder constructions: batch compatible launches into fewer compute encoders and/or reuse pre-encoded command state with persistent bindings where the ABI permits (`hosts/macos-arm64/src/metal_host.rs` `launch_kernel_bound`: one `new_compute_command_encoder` + bind-every-resource + `end_encoding` per launch). The host already submits once and waits once per step — this is construction cost, not a sync bubble, and it is **not** launch fusion (R6/R7 own launch-graph shape). Evidence: encode 9.15 ms prefill / 4.4–5.5 ms decode (~2.09–4.3 µs per launch × 2,115), `5f3b144d`/`b1c7f917`. |
+| `write_scope` | Direct mode, hosts path-limited. `hosts/macos-arm64/src/metal_host.rs` (launch site: encoder construction/batching, binding-vector reuse); new additive-only `hosts/macos-arm64/tests/gea3_decode_pgc_r8.rs` (encoder-count census before/after, certified outputs). Radix ABI read-only unless a typed launch fact must extend — then named in the report and folded through the Mind. No kernel source, no Gradus change. |
+| `done_when` | Encoder count per step drops measurably (receipt column, L13 law: keep launch/blocking-wait/readback counts first-class); certified outputs 1000/1000; one fixed-1000 paired capture (both phases) vs the R3 family with encode-ms as the primary delta and wall as L1-attributed secondary. Evidence under `evidence/PGC-R8/`. |
+| `measurement_commands` | From `/Users/ianzepp/work/faberlang/radix`: `scripta/parity run --stage full --output-dir /Users/ianzepp/work/faberlang/gradus/docs/factory/perf-gap-closure/evidence/PGC-R8/parity-raw`; then `scripta/parity reduce /Users/ianzepp/work/faberlang/gradus/docs/factory/perf-gap-closure/evidence/PGC-R8/parity-raw --out /Users/ianzepp/work/faberlang/gradus/docs/factory/perf-gap-closure/evidence/PGC-R8/parity-receipt.json`; then append-only candidate `scripta/parity baseline /Users/ianzepp/work/faberlang/gradus/docs/factory/perf-gap-closure/evidence/PGC-R8/parity-raw --baselines-dir /Users/ianzepp/work/faberlang/gradus/docs/factory/perf-gap-closure/evidence/PGC-R8/baseline-candidate --receipt-out /Users/ianzepp/work/faberlang/gradus/docs/factory/perf-gap-closure/evidence/PGC-R8/baseline-candidate.md`. Raw capture, reduced receipt, candidate baseline, and the encoder-count census evidence live under `gradus/docs/factory/perf-gap-closure/evidence/PGC-R8/`; a lesser stage is not baseline-grade. |
+| `depends_on` | `PGC-R3` |
+| `sanity` | Ordered-binding validation (`metal_host.rs:810-864`) still proves per-launch resource order inside a batched encoder; no cross-launch hazard introduced by batching. |
+| `non_goals` | No launch fusion, no kernel entry change, no sync-structure change (already one submit/wait), no CPU pipelining ahead of the GPU. |
+| `risk` | medium — batching must not weaken the ordered-binding law or observability of per-launch validation. |
+| `integrable` | yes — hosts direct-mode, path-limited commit |
+| `parallel_group` | `R-W5` |
+
+### 7.5 Baseline re-key and the gradus-pin question (operator draft)
+
+The parity protocol pins gradus at `de687a4` (pre-B3); B3 folded to gradus
+main (`d942388`, selected-row KV writes), and B2-RETUNE kept the original
+`kv_append` frozen-sha pins as protocol truth (radix `7d302c35f`), routing
+the pin lag to Mind for the next baseline regeneration — which is `PGC-R3`.
+The re-pin decision is operator-owned (it changes the parity protocol's
+identity law). Default until ruled: keep the pre-B3 pin; R3 records both
+pin postures in its receipt.
+
+Draft operator mail (Mind routes; planner does not mail the operator
+directly):
+
+> **Subject: PGC re-key — gradus parity pin posture (decision needed before
+> PGC-R3 certifies the new baseline family)**
+>
+> The parity protocol pins gradus at `de687a4` (pre-B3) while gradus main
+> carries B3 (`d942388`, selected-row KV appends). The R3 re-key must pick a
+> posture:
+>
+> 1. **Re-pin to post-B3 main** (planner default): regenerate the
+>    `kv_append` frozen identities, certify the new family on post-B3
+>    truth. Cost: one pin regeneration + re-certification. Benefit: every
+>    later delta keys against the tree that actually ships; B3's KV-write
+>    change is inside the measured family.
+> 2. **Keep pre-B3 pin**: cheaper now, but the family of record excludes a
+>    folded main change and the protocol-vs-main drift compounds per
+>    capture.
+> 3. **Staged dual-family**: certify at the pre-B3 pin, then immediately
+>    re-pin and take one confirmation capture. Cleanest record, two
+>    captures.
+>
+> Recommendation: option 1 — truth over continuity; a baseline family that
+> excludes a folded main change mis-keys every later wall delta.
+
+### 7.6 Open questions for Mind
+
+1. **Gradus-pin ruling** (§7.5) — gates R3's certification; operator
+   decision requested.
+2. **OF-3..OF-5 re-admission bookkeeping**: `PGC-R6` re-admits OF-3 under
+   the reopen authority; the operation-fusion goal
+   (`radix/docs/factory/operation-fusion/goal.md`) Status line and phase
+   table are stale against landed OF-0/OF-1/OF-2 and the R6 re-admission —
+   Mind owns advancing them in the same reconciliation turn.
+3. **R-PACK-05 residual gate**: OF-3's original defer was "behind
+   R-PACK-05"; EXEC-02 §8b re-lowered that surface 2026-08-22 and its
+   completion state is not re-verified here. Mind confirms the emit-arm
+   exclusivity concern is discharged (no live R-PACK emit wave) before R6
+   dispatches.
+4. **Goal Status advance**: this amendment supersedes C1/C3/C4 and folds
+   the B/C residuals — the goal.md Status line and §5 tables need the
+   matching Mind advance (planner annotated §5 below; the Status line is
+   Mind-owned).
+5. **L13 sequencing latitude**: CTO#1 ranked L13 earlier than CTO#2; the
+   amended order (L13 last) governs, but R8 has no structural dependency on
+   R4–R7 — Mind may pull it forward for seat-availability reasons without
+   amending this delivery, provided its capture still keys against the R3
+   family.
