@@ -1,0 +1,833 @@
+{
+  "blocks": [
+    {
+      "gradus_tps": {
+        "decode": {
+          "max": 33.623617,
+          "median": 33.468322,
+          "min": 31.479332,
+          "runs": 3,
+          "status": "measured",
+          "value": 33.468322
+        },
+        "prefill": {
+          "max": 496.695595,
+          "median": 493.82716,
+          "min": 475.096999,
+          "runs": 3,
+          "status": "measured",
+          "value": 493.82716
+        }
+      },
+      "llama_tps": {
+        "decode": {
+          "max": 244.798042,
+          "median": 178.970917,
+          "min": 178.09439,
+          "runs": 3,
+          "status": "measured",
+          "value": 178.970917
+        },
+        "prefill": {
+          "max": 1584.507042,
+          "median": 959.744068,
+          "min": 909.550278,
+          "runs": 3,
+          "status": "measured",
+          "value": 959.744068
+        }
+      },
+      "power_class": "battery",
+      "ratio": {
+        "decode": {
+          "basis": "llama median t/s / gradus median t/s",
+          "median": 5.347472,
+          "status": "measured",
+          "value": 5.347472
+        },
+        "prefill": {
+          "basis": "llama median t/s / gradus median t/s",
+          "median": 1.943482,
+          "status": "measured",
+          "value": 1.943482
+        }
+      },
+      "rows": [
+        {
+          "arms": {
+            "gradus": {
+              "certified_count": 8,
+              "completion_status": "natural_completion",
+              "count_certified": true,
+              "phases": {
+                "decode": {
+                  "basis": "sum of this arm's measured GEA3 per-step decode walls over its certified count",
+                  "status": "measured",
+                  "time_ms": 254.135,
+                  "tokens": 8,
+                  "ts": 31.479332,
+                  "value": 31.479332
+                },
+                "prefill": {
+                  "basis": "GEA3 execution.prefill_wall_us over the effective prompt tokens",
+                  "status": "measured",
+                  "time_ms": 75.774,
+                  "tokens": 36,
+                  "ts": 475.096999,
+                  "value": 475.096999
+                }
+              },
+              "status": "measured"
+            },
+            "llama": {
+              "certified_count": 8,
+              "completion_status": "natural_completion",
+              "count_certified": true,
+              "phases": {
+                "decode": {
+                  "basis": "llama-cli stable timing line; decode count is this arm's certified count",
+                  "status": "measured",
+                  "time_ms": 32.68,
+                  "tokens": 8,
+                  "ts": 244.798042,
+                  "value": 244.798042
+                },
+                "prefill": {
+                  "basis": "llama-cli stable timing line; decode count is this arm's certified count",
+                  "status": "measured",
+                  "time_ms": 22.72,
+                  "tokens": 36,
+                  "ts": 1584.507042,
+                  "value": 1584.507042
+                }
+              },
+              "status": "measured"
+            }
+          },
+          "power_class": "battery",
+          "ratio": {
+            "decode": {
+              "basis": "llama t/s divided by gradus t/s, each on its own certified count and phase wall",
+              "status": "measured",
+              "value": 7.776469
+            },
+            "prefill": {
+              "basis": "llama t/s divided by gradus t/s, each on its own certified count and phase wall",
+              "status": "measured",
+              "value": 3.335123
+            }
+          },
+          "run": 1,
+          "status": "comparable"
+        },
+        {
+          "arms": {
+            "gradus": {
+              "certified_count": 8,
+              "completion_status": "natural_completion",
+              "count_certified": true,
+              "phases": {
+                "decode": {
+                  "basis": "sum of this arm's measured GEA3 per-step decode walls over its certified count",
+                  "status": "measured",
+                  "time_ms": 237.928,
+                  "tokens": 8,
+                  "ts": 33.623617,
+                  "value": 33.623617
+                },
+                "prefill": {
+                  "basis": "GEA3 execution.prefill_wall_us over the effective prompt tokens",
+                  "status": "measured",
+                  "time_ms": 72.479,
+                  "tokens": 36,
+                  "ts": 496.695595,
+                  "value": 496.695595
+                }
+              },
+              "status": "measured"
+            },
+            "llama": {
+              "certified_count": 8,
+              "completion_status": "natural_completion",
+              "count_certified": true,
+              "phases": {
+                "decode": {
+                  "basis": "llama-cli stable timing line; decode count is this arm's certified count",
+                  "status": "measured",
+                  "time_ms": 44.7,
+                  "tokens": 8,
+                  "ts": 178.970917,
+                  "value": 178.970917
+                },
+                "prefill": {
+                  "basis": "llama-cli stable timing line; decode count is this arm's certified count",
+                  "status": "measured",
+                  "time_ms": 37.51,
+                  "tokens": 36,
+                  "ts": 959.744068,
+                  "value": 959.744068
+                }
+              },
+              "status": "measured"
+            }
+          },
+          "power_class": "battery",
+          "ratio": {
+            "decode": {
+              "basis": "llama t/s divided by gradus t/s, each on its own certified count and phase wall",
+              "status": "measured",
+              "value": 5.322774
+            },
+            "prefill": {
+              "basis": "llama t/s divided by gradus t/s, each on its own certified count and phase wall",
+              "status": "measured",
+              "value": 1.932258
+            }
+          },
+          "run": 2,
+          "status": "comparable"
+        },
+        {
+          "arms": {
+            "gradus": {
+              "certified_count": 8,
+              "completion_status": "natural_completion",
+              "count_certified": true,
+              "phases": {
+                "decode": {
+                  "basis": "sum of this arm's measured GEA3 per-step decode walls over its certified count",
+                  "status": "measured",
+                  "time_ms": 239.032,
+                  "tokens": 8,
+                  "ts": 33.468322,
+                  "value": 33.468322
+                },
+                "prefill": {
+                  "basis": "GEA3 execution.prefill_wall_us over the effective prompt tokens",
+                  "status": "measured",
+                  "time_ms": 72.9,
+                  "tokens": 36,
+                  "ts": 493.82716,
+                  "value": 493.82716
+                }
+              },
+              "status": "measured"
+            },
+            "llama": {
+              "certified_count": 8,
+              "completion_status": "natural_completion",
+              "count_certified": true,
+              "phases": {
+                "decode": {
+                  "basis": "llama-cli stable timing line; decode count is this arm's certified count",
+                  "status": "measured",
+                  "time_ms": 44.92,
+                  "tokens": 8,
+                  "ts": 178.09439,
+                  "value": 178.09439
+                },
+                "prefill": {
+                  "basis": "llama-cli stable timing line; decode count is this arm's certified count",
+                  "status": "measured",
+                  "time_ms": 39.58,
+                  "tokens": 36,
+                  "ts": 909.550278,
+                  "value": 909.550278
+                }
+              },
+              "status": "measured"
+            }
+          },
+          "power_class": "battery",
+          "ratio": {
+            "decode": {
+              "basis": "llama t/s divided by gradus t/s, each on its own certified count and phase wall",
+              "status": "measured",
+              "value": 5.321282
+            },
+            "prefill": {
+              "basis": "llama t/s divided by gradus t/s, each on its own certified count and phase wall",
+              "status": "measured",
+              "value": 1.841839
+            }
+          },
+          "run": 3,
+          "status": "comparable"
+        }
+      ],
+      "runs": 3,
+      "status": "comparable",
+      "test": "metal-m5max"
+    },
+    {
+      "gradus_tps": {
+        "decode": {
+          "max": 16.098184,
+          "median": 15.482267,
+          "min": 13.155937,
+          "runs": 3,
+          "status": "measured",
+          "value": 15.482267
+        },
+        "prefill": {
+          "max": 477.897252,
+          "median": 475.165978,
+          "min": 244.593465,
+          "runs": 3,
+          "status": "measured",
+          "value": 475.165978
+        }
+      },
+      "llama_tps": {
+        "decode": {
+          "max": 247.724035,
+          "median": 180.554302,
+          "min": 85.320592,
+          "runs": 3,
+          "status": "measured",
+          "value": 180.554302
+        },
+        "prefill": {
+          "max": 1776.02368,
+          "median": 1673.640167,
+          "min": 1507.537688,
+          "runs": 3,
+          "status": "measured",
+          "value": 1673.640167
+        }
+      },
+      "power_class": "battery",
+      "ratio": {
+        "decode": {
+          "basis": "llama median t/s / gradus median t/s",
+          "median": 11.662007,
+          "status": "measured",
+          "value": 11.662007
+        },
+        "prefill": {
+          "basis": "llama median t/s / gradus median t/s",
+          "median": 3.522222,
+          "status": "measured",
+          "value": 3.522222
+        }
+      },
+      "rows": [
+        {
+          "arms": {
+            "gradus": {
+              "certified_count": 1000,
+              "completion_status": "natural_completion",
+              "count_certified": true,
+              "phases": {
+                "decode": {
+                  "basis": "sum of this arm's measured GEA3 per-step decode walls over its certified count",
+                  "status": "measured",
+                  "time_ms": 64590.026,
+                  "tokens": 1000,
+                  "ts": 15.482267,
+                  "value": 15.482267
+                },
+                "prefill": {
+                  "basis": "GEA3 execution.prefill_wall_us over the effective prompt tokens",
+                  "status": "measured",
+                  "time_ms": 75.763,
+                  "tokens": 36,
+                  "ts": 475.165978,
+                  "value": 475.165978
+                }
+              },
+              "status": "measured"
+            },
+            "llama": {
+              "certified_count": 40,
+              "completion_status": "natural_completion",
+              "count_certified": true,
+              "phases": {
+                "decode": {
+                  "basis": "llama-cli stable timing line; decode count is this arm's certified count",
+                  "status": "measured",
+                  "time_ms": 468.82,
+                  "tokens": 40,
+                  "ts": 85.320592,
+                  "value": 85.320592
+                },
+                "prefill": {
+                  "basis": "llama-cli stable timing line; decode count is this arm's certified count",
+                  "status": "measured",
+                  "time_ms": 23.88,
+                  "tokens": 36,
+                  "ts": 1507.537688,
+                  "value": 1507.537688
+                }
+              },
+              "status": "measured"
+            }
+          },
+          "power_class": "battery",
+          "ratio": {
+            "decode": {
+              "basis": "llama t/s divided by gradus t/s, each on its own certified count and phase wall",
+              "status": "measured",
+              "value": 5.510859
+            },
+            "prefill": {
+              "basis": "llama t/s divided by gradus t/s, each on its own certified count and phase wall",
+              "status": "measured",
+              "value": 3.172655
+            }
+          },
+          "run": 1,
+          "status": "comparable"
+        },
+        {
+          "arms": {
+            "gradus": {
+              "certified_count": 1000,
+              "completion_status": "natural_completion",
+              "count_certified": true,
+              "phases": {
+                "decode": {
+                  "basis": "sum of this arm's measured GEA3 per-step decode walls over its certified count",
+                  "status": "measured",
+                  "time_ms": 76011.307,
+                  "tokens": 1000,
+                  "ts": 13.155937,
+                  "value": 13.155937
+                },
+                "prefill": {
+                  "basis": "GEA3 execution.prefill_wall_us over the effective prompt tokens",
+                  "status": "measured",
+                  "time_ms": 147.183,
+                  "tokens": 36,
+                  "ts": 244.593465,
+                  "value": 244.593465
+                }
+              },
+              "status": "measured"
+            },
+            "llama": {
+              "certified_count": 40,
+              "completion_status": "natural_completion",
+              "count_certified": true,
+              "phases": {
+                "decode": {
+                  "basis": "llama-cli stable timing line; decode count is this arm's certified count",
+                  "status": "measured",
+                  "time_ms": 221.54,
+                  "tokens": 40,
+                  "ts": 180.554302,
+                  "value": 180.554302
+                },
+                "prefill": {
+                  "basis": "llama-cli stable timing line; decode count is this arm's certified count",
+                  "status": "measured",
+                  "time_ms": 21.51,
+                  "tokens": 36,
+                  "ts": 1673.640167,
+                  "value": 1673.640167
+                }
+              },
+              "status": "measured"
+            }
+          },
+          "power_class": "battery",
+          "ratio": {
+            "decode": {
+              "basis": "llama t/s divided by gradus t/s, each on its own certified count and phase wall",
+              "status": "measured",
+              "value": 13.724169
+            },
+            "prefill": {
+              "basis": "llama t/s divided by gradus t/s, each on its own certified count and phase wall",
+              "status": "measured",
+              "value": 6.842538
+            }
+          },
+          "run": 2,
+          "status": "comparable"
+        },
+        {
+          "arms": {
+            "gradus": {
+              "certified_count": 1000,
+              "completion_status": "natural_completion",
+              "count_certified": true,
+              "phases": {
+                "decode": {
+                  "basis": "sum of this arm's measured GEA3 per-step decode walls over its certified count",
+                  "status": "measured",
+                  "time_ms": 62118.807,
+                  "tokens": 1000,
+                  "ts": 16.098184,
+                  "value": 16.098184
+                },
+                "prefill": {
+                  "basis": "GEA3 execution.prefill_wall_us over the effective prompt tokens",
+                  "status": "measured",
+                  "time_ms": 75.33,
+                  "tokens": 36,
+                  "ts": 477.897252,
+                  "value": 477.897252
+                }
+              },
+              "status": "measured"
+            },
+            "llama": {
+              "certified_count": 40,
+              "completion_status": "natural_completion",
+              "count_certified": true,
+              "phases": {
+                "decode": {
+                  "basis": "llama-cli stable timing line; decode count is this arm's certified count",
+                  "status": "measured",
+                  "time_ms": 161.47,
+                  "tokens": 40,
+                  "ts": 247.724035,
+                  "value": 247.724035
+                },
+                "prefill": {
+                  "basis": "llama-cli stable timing line; decode count is this arm's certified count",
+                  "status": "measured",
+                  "time_ms": 20.27,
+                  "tokens": 36,
+                  "ts": 1776.02368,
+                  "value": 1776.02368
+                }
+              },
+              "status": "measured"
+            }
+          },
+          "power_class": "battery",
+          "ratio": {
+            "decode": {
+              "basis": "llama t/s divided by gradus t/s, each on its own certified count and phase wall",
+              "status": "measured",
+              "value": 15.388322
+            },
+            "prefill": {
+              "basis": "llama t/s divided by gradus t/s, each on its own certified count and phase wall",
+              "status": "measured",
+              "value": 3.71633
+            }
+          },
+          "run": 3,
+          "status": "comparable"
+        }
+      ],
+      "runs": 3,
+      "status": "comparable",
+      "test": "metal-m5max-fixed1000"
+    }
+  ],
+  "created_utc": "2026-08-28T03:55:28Z",
+  "identities": {
+    "metal-m5max": {
+      "cap_seconds": 60,
+      "comparator": {
+        "binary": "/Users/ianzepp/work/llama.cpp/build-gea1-c8e03ce81/bin/llama-cli",
+        "build": "b10290-c8e03ce81",
+        "generation_flags": [
+          "-n",
+          "8",
+          "--seed",
+          "0",
+          "--temp",
+          "0",
+          "--top-k",
+          "1",
+          "--top-p",
+          "1",
+          "--no-display-prompt",
+          "--no-conversation",
+          "--single-turn",
+          "--verbose-prompt",
+          "--log-verbosity",
+          "3"
+        ],
+        "sha256": "125a9512feb669abc43b6975ad2af70599b12fc01ae196c67b728554f33a5a42"
+      },
+      "expected_tokens": {
+        "comparator": 8,
+        "faber": 8,
+        "law": "46ab4e94"
+      },
+      "gguf": {
+        "bytes": 1449071552,
+        "file": "SmolLM2-360M-Instruct-f32.gguf",
+        "sha256": "4d10b02ea1b189cb9637b39ba1543c61f69a8766099076880888f4443754e128",
+        "subpath": "derived/HuggingFaceTB/SmolLM2-360M-Instruct/a10cc1512eabd3dde888204e902eca88bddb4951/SmolLM2-360M-Instruct-f32.gguf",
+        "tensor_bytes": 1447284480,
+        "tensor_values": 361821120,
+        "tensors": 290
+      },
+      "gradus": {
+        "kernel_sha256": "c9cdbb54e5bd35f0dec076f63bb67a289aae71e014360a2550d470a96bf2e08c",
+        "kernel_source": "src/kernel.fab",
+        "revision": "b762163664b65fcb3d8d71aee23b181ecdd3a1f6"
+      },
+      "machine": {
+        "backend": "metal",
+        "device": "Apple M5 Max, one virtual partition",
+        "hostname": "burgus.local"
+      },
+      "policy": {
+        "gea3_input_manifest": "docs/factory/gpu-execution-architecture/evidence/gea3-input-manifest.json",
+        "kv_bytes": 6225920,
+        "l_max": 76,
+        "l_max_formula": "prompt(36) + n_predict(8) + margin(32)",
+        "n_predict": 8,
+        "sampling": "greedy argmax, first-index tie",
+        "seed": 0
+      },
+      "prompt": {
+        "comparator_token_ids": [
+          1,
+          9690,
+          198,
+          2683,
+          359,
+          253,
+          5356,
+          5646,
+          11173,
+          3365,
+          3511,
+          308,
+          34519,
+          28,
+          7018,
+          411,
+          407,
+          19712,
+          8182,
+          2,
+          198,
+          1,
+          4093,
+          198,
+          504,
+          31469,
+          6740,
+          335,
+          2591,
+          314,
+          2,
+          198,
+          1,
+          520,
+          9531,
+          198
+        ],
+        "effective_tokens": 36,
+        "sha256": "0a8c8e2698356927060027ef2e30648a63f0c31ff869c7f14f64f4a1fbf939ea",
+        "text": "The tallest mountain on Earth is"
+      },
+      "target_id": "metal-m5max",
+      "termination_tolerance_seconds": 70,
+      "warmup_exclusion_rule": "Unchanged from the existing KV F5 harness rule: the first 16 decode steps are warmup and are discarded before the measured window (16 warmup + 128 measured stays frozen); startup, plan admission, weight residency, KV allocation, and teardown stay outside steady-state rates. The frozen short identity (n_predict = 8, l_max = 76) is byte-frozen and is never padded, extended, looped, or relaunched to fill a warmup or measurement window."
+    },
+    "metal-m5max-fixed1000": {
+      "cap_seconds": 300,
+      "comparator": {
+        "binary": "/Users/ianzepp/work/llama.cpp/build-gea1-c8e03ce81/bin/llama-cli",
+        "build": "b10290-c8e03ce81",
+        "generation_flags": [
+          "-n",
+          "1000",
+          "--seed",
+          "0",
+          "--temp",
+          "0",
+          "--top-k",
+          "1",
+          "--top-p",
+          "1",
+          "--no-display-prompt",
+          "--no-conversation",
+          "--single-turn",
+          "--verbose-prompt",
+          "--log-verbosity",
+          "3"
+        ],
+        "sha256": "125a9512feb669abc43b6975ad2af70599b12fc01ae196c67b728554f33a5a42"
+      },
+      "expected_tokens": {
+        "comparator": 1000,
+        "faber": 1000,
+        "law": "46ab4e94"
+      },
+      "gguf": {
+        "bytes": 1449071552,
+        "file": "SmolLM2-360M-Instruct-f32.gguf",
+        "sha256": "4d10b02ea1b189cb9637b39ba1543c61f69a8766099076880888f4443754e128",
+        "subpath": "derived/HuggingFaceTB/SmolLM2-360M-Instruct/a10cc1512eabd3dde888204e902eca88bddb4951/SmolLM2-360M-Instruct-f32.gguf",
+        "tensor_bytes": 1447284480,
+        "tensor_values": 361821120,
+        "tensors": 290
+      },
+      "gradus": {
+        "kernel_sha256": "c9cdbb54e5bd35f0dec076f63bb67a289aae71e014360a2550d470a96bf2e08c",
+        "kernel_source": "src/kernel.fab",
+        "revision": "b762163664b65fcb3d8d71aee23b181ecdd3a1f6"
+      },
+      "machine": {
+        "backend": "metal",
+        "device": "Apple M5 Max, one virtual partition",
+        "hostname": "burgus.local"
+      },
+      "policy": {
+        "gea3_input_manifest": "docs/factory/gpu-execution-architecture/evidence/gea3-input-manifest.json",
+        "kv_bytes": 90112000,
+        "l_max": 1100,
+        "l_max_formula": "prompt(36) + n_predict(1000) + margin(64)",
+        "n_predict": 1000,
+        "sampling": "greedy argmax, first-index tie",
+        "seed": 0
+      },
+      "prompt": {
+        "comparator_token_ids": [
+          1,
+          9690,
+          198,
+          2683,
+          359,
+          253,
+          5356,
+          5646,
+          11173,
+          3365,
+          3511,
+          308,
+          34519,
+          28,
+          7018,
+          411,
+          407,
+          19712,
+          8182,
+          2,
+          198,
+          1,
+          4093,
+          198,
+          504,
+          31469,
+          6740,
+          335,
+          2591,
+          314,
+          2,
+          198,
+          1,
+          520,
+          9531,
+          198
+        ],
+        "effective_tokens": 36,
+        "sha256": "0a8c8e2698356927060027ef2e30648a63f0c31ff869c7f14f64f4a1fbf939ea",
+        "text": "The tallest mountain on Earth is"
+      },
+      "target_id": "metal-m5max-fixed1000",
+      "termination_tolerance_seconds": 310,
+      "warmup_exclusion_rule": "Startup, plan admission, weight residency, KV allocation (85.4 MiB fixed F32 reservation), and teardown stay outside steady-state rates; fixed-output-length generation may naturally complete before the 300s hard cap and is never padded, extended, looped, or relaunched to fill a window."
+    }
+  },
+  "provenance": {
+    "comparator": {
+      "build": "b10290-c8e03ce81",
+      "path": "/Users/ianzepp/work/llama.cpp/build-gea1-c8e03ce81/bin/llama-cli",
+      "sha256": "125a9512feb669abc43b6975ad2af70599b12fc01ae196c67b728554f33a5a42"
+    },
+    "gradus": {
+      "repo": "/Users/ianzepp/work/faberlang/worktrees/pgc-b2/gradus",
+      "revision": "b762163664b65fcb3d8d71aee23b181ecdd3a1f6"
+    },
+    "hosts": {
+      "repo": "/Users/ianzepp/work/faberlang/worktrees/pgc-b2/hosts",
+      "revision": "2c02891fa41bc739cdfce128b758875047ec4565"
+    },
+    "law": "identity and raw-byte validation precede all timing parsing and ratio arithmetic",
+    "pins": [
+      {
+        "comparator": {
+          "build": "b10290-c8e03ce81",
+          "path": "/Users/ianzepp/work/llama.cpp/build-gea1-c8e03ce81/bin/llama-cli",
+          "sha256": "125a9512feb669abc43b6975ad2af70599b12fc01ae196c67b728554f33a5a42"
+        },
+        "gguf_sha256": "4d10b02ea1b189cb9637b39ba1543c61f69a8766099076880888f4443754e128",
+        "gradus": {
+          "repo": "/Users/ianzepp/work/faberlang/worktrees/pgc-b2/gradus",
+          "revision": "b762163664b65fcb3d8d71aee23b181ecdd3a1f6"
+        },
+        "hosts": {
+          "repo": "/Users/ianzepp/work/faberlang/worktrees/pgc-b2/hosts",
+          "revision": "2c02891fa41bc739cdfce128b758875047ec4565"
+        },
+        "radix": {
+          "repo": "/Users/ianzepp/work/faberlang/worktrees/pgc-b2/radix",
+          "revision": "80981a08e0c47253f478faf660666a923b9cb792"
+        }
+      },
+      {
+        "comparator": {
+          "build": "b10290-c8e03ce81",
+          "path": "/Users/ianzepp/work/llama.cpp/build-gea1-c8e03ce81/bin/llama-cli",
+          "sha256": "125a9512feb669abc43b6975ad2af70599b12fc01ae196c67b728554f33a5a42"
+        },
+        "gguf_sha256": "4d10b02ea1b189cb9637b39ba1543c61f69a8766099076880888f4443754e128",
+        "gradus": {
+          "repo": "/Users/ianzepp/work/faberlang/worktrees/pgc-b2/gradus",
+          "revision": "b762163664b65fcb3d8d71aee23b181ecdd3a1f6"
+        },
+        "hosts": {
+          "repo": "/Users/ianzepp/work/faberlang/worktrees/pgc-b2/hosts",
+          "revision": "2c02891fa41bc739cdfce128b758875047ec4565"
+        },
+        "radix": {
+          "repo": "/Users/ianzepp/work/faberlang/worktrees/pgc-b2/radix",
+          "revision": "80981a08e0c47253f478faf660666a923b9cb792"
+        }
+      }
+    ],
+    "radix": {
+      "repo": "/Users/ianzepp/work/faberlang/worktrees/pgc-b2/radix",
+      "revision": "80981a08e0c47253f478faf660666a923b9cb792"
+    }
+  },
+  "report": {
+    "metric": "tokens per second",
+    "no_threshold_gate": true,
+    "phases": [
+      "prefill",
+      "decode"
+    ],
+    "ratio": "llama t/s / gradus t/s per phase and per power class"
+  },
+  "schema": "parity-receipt-v1",
+  "source": {
+    "baseline_grade": true,
+    "driver_schema": "parity-driver-v1",
+    "protocol": {
+      "aggregation": "median across paired runs",
+      "baseline_grade": true,
+      "breadth": 2,
+      "cap_rule": "hard cap per arm; circuit breaker only; never a metric or token target",
+      "execution_rule": "on-device Metal arms only; MIR runner excluded",
+      "paired_runs": 3,
+      "schema": "parity-stage-protocol-v1",
+      "stage": "full",
+      "stage_number": 4,
+      "target_ids": [
+        "metal-m5max",
+        "metal-m5max-fixed1000"
+      ]
+    },
+    "raw_capture": "/Users/ianzepp/work/faberlang/worktrees/pgc-b2/gradus/docs/factory/perf-gap-closure/evidence/PGC-R4/parity-raw",
+    "stage": "full",
+    "stage_number": 4,
+    "tests": [
+      "metal-m5max",
+      "metal-m5max-fixed1000"
+    ]
+  }
+}
