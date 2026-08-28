@@ -1,4 +1,13 @@
-# gradus-clean-break campaign stub
+# CAMPAIGN: gradus-clean-break — fixed-shape-to-generic conversion (3 waves)
+
+**Status**: planned — wave 1 chartered and lowered (goal READY), not implemented; waves 2-3 gated
+**Created**: 2026-08-28
+**Campaign:** `gradus-clean-break`
+**Source:** operator need `127f9fd6` + amendment `59b4074a` (settled); wave-1 lowering task `4aa2f634`
+**Repos:** `faberlang/gradus`, `faberlang/examples`
+**Related:** [`GOAL.md`](GOAL.md) · [`wave-1-delivery.md`](wave-1-delivery.md)
+
+---
 
 Routing stub for operator need `127f9fd6` (3-wave conversion order, settled).
 Wave 1 is chartered and lowered; waves 2-3 are gated successors named here so
@@ -15,3 +24,15 @@ Campaign law (operator ruling, standing): old fixed-shape sizes go away
 completely in favor of shape generics unless a named identity/receipt pin is
 an absolute requirement; a training exemplum that happens to be 2×2 or 4×4
 instantiates the generic at the call site; named overloads are the defect.
+
+## Ledger
+
+Machine-managed — wave, status (`pending` · `tasked` · `in progress` ·
+`done` · `deferred`), planner/Hand seats, receipt (commit/handle), notes.
+Wave-1 unit receipts are tracked in [`GOAL.md`](GOAL.md) §Ledger.
+
+| Wave | Status | Seats | Receipt | Notes |
+| --- | --- | --- | --- | --- |
+| 1 — collapse existing twins | pending | planner (lowered) / — (implement) | none | 6 units in [`wave-1-delivery.md`](wave-1-delivery.md); goal READY, audit `8b86bc40` repaired (`0ec9a33` + round 2) |
+| 2 — author missing twins, delete remaining zoo | deferred | — | none | gated on wave 1 close; KRS-2 branch `c419b02` is paper only |
+| 3 — kernel.fab statues to size-generic device leaves | deferred | — | none | gated on wave 1 done + SGD-1 settled |

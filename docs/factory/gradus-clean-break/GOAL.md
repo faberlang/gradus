@@ -1,4 +1,13 @@
-# Gradus clean-break — shape-generic-only public API
+# GOAL: gradus-clean-break — shape-generic-only public API (wave 1)
+
+**Status**: planned — lowered to the wave-1 unit graph, not implemented; no unit receipt yet
+**Created**: 2026-08-28
+**Campaign:** `gradus-clean-break`
+**Source:** operator need `127f9fd6` + amendment `59b4074a` (settled); lowering task `4aa2f634`
+**Repos:** `faberlang/gradus` (library src/proba, exempla, docs), `faberlang/examples` (four training packages)
+**Related:** [`wave-1-delivery.md`](wave-1-delivery.md) · [`CAMPAIGN.md`](CAMPAIGN.md) · `docs/factory/kernel-region-split/` (KRS-2 wave-2 paper)
+
+---
 
 Goal artifact for operator need `127f9fd6` (+ amendment `59b4074a`, settled — do
 not reopen). Lowering task `4aa2f634`. Wave 1 delivery lives in
@@ -229,6 +238,21 @@ green checks) proves the shape. The ordered unit graph is
   package for the rewritten proba rows.
 - Census grep (reference packet) as the no-live-caller audit.
 
+## Ledger
+
+Machine-managed — unit, status (`pending` · `tasked` · `in progress` ·
+`done` · `deferred`), Hand seat, receipt (commit/handle), notes. Cards and
+ordering live in [`wave-1-delivery.md`](wave-1-delivery.md).
+
+| Unit | Status | Seat | Receipt | Notes |
+| --- | --- | --- | --- | --- |
+| GCB-W1-U1 | pending | — | none | nn-family callers move (linear-regression, mlp, nn-bridge) |
+| GCB-W1-U2 | pending | — | none | attention/bert callers move |
+| GCB-W1-U3 | pending | — | none | optimize family collapse (`_sgd_family`) |
+| GCB-W1-U4 | pending | — | none | nn library deletion (four wrappers + `linear_from_raw`) |
+| GCB-W1-U5 | pending | — | none | attention library deletion |
+| GCB-W1-U6 | pending | — | none | docs closeout (both repos) |
+
 ## Open questions
 
 None blocking. (KRS-2 lane's `linear_2x8`/`layernorm_2x8` body-reroutes on
@@ -249,4 +273,5 @@ and must not merge it.)
 ## Handoff readiness label
 
 **Ready for delivery** — lowered in `wave-1-delivery.md` (6 units + closeout
-gate).
+gate). Planner readiness verdict only; the machine-parseable factory status
+is the `**Status**` line at the top of this file.

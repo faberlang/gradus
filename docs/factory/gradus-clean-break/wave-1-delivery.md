@@ -132,12 +132,12 @@ path-limited per repo.
 | field | value |
 | --- | --- |
 | `id` | GCB-W1-U6 |
-| `outcome` | Public-surface docs stop advertising the zoo: `README.md` (:130 prose `train_step_4x4 → optimize.sgd_step_4x4` → new delegation wording; :245 `linear_2x2, linear_4x4, gelu_4x4` → the generic leaves; :251-254 `sgd_step_2x2`/`sgd_step_4x4` paragraph → `_sgd_family` wording), `docs/api-reference.md` (:35 delete the `scaled_dot_product_2x8` entry — the `_static` entry at :36 stays; :990-995 delete the four nn entries), `docs/api-shape-policy.md` (:40 fixed-shape admitted-rows example — replace the retired names with surviving examples or the retirement note), `src/gradus.fab` facade comment (:51-52 lists `scaled_dot_product_2x8`/`gelu_2x8` as shipped — reword to the generic surface, append-only note), `src/tensor.fab` census comment (:90-95 admit-row ledger — append the retirement) |
-| `write_scope` | `gradus` repo only: `README.md`, `docs/api-reference.md`, `docs/api-shape-policy.md`, `src/gradus.fab`, `src/tensor.fab` (comment-only in the two src files) |
-| `done_when` | Cross-repo census grep returns zero live-API claims for the seven names outside frozen evidence (receipts, `docs/factory/*` historical campaign paper, archived docs, oracle `reference.json`); every touched doc names the generic leaf where it named a wrapper |
-| `depends_on` | GCB-W1-U3, GCB-W1-U4, GCB-W1-U5 (describes their end state) |
-| `sanity` | none beyond the census grep (docs + two comment-only files) |
-| `non_goals` | standing set + no edits to `docs/factory/**` (historical campaign paper stays as landed record), `docs/deep-code-review-*`, archived docs, benchmark baselines/receipts, or `faberlang/examples` oracle `reference.json` files (frozen evidence per amendment `59b4074a`) |
+| `outcome` | Public-surface docs stop advertising the zoo, in both repos. Gradus: `README.md` (:130 prose `train_step_4x4 → optimize.sgd_step_4x4` → new delegation wording; :245 `linear_2x2, linear_4x4, gelu_4x4` → the generic leaves; :251-254 `sgd_step_2x2`/`sgd_step_4x4` paragraph → `_sgd_family` wording); `docs/api-reference.md` — delete :35 `scaled_dot_product_2x8` (the `_static` entry at :36 stays), delete the four dying nn entries (:990 `linear_2x2`, :991 `linear_4x4`, :992 `gelu_4x4`, :995 `gelu_2x8` — :993-994 `linear_2x8`/`layernorm_2x8` stay, wave 2), delete :998 `linear_from_raw` (private helper orphaned with `linear_2x2`, deleted by U4), and **add** the missing typed generic entry `fn gelu<size M, size N>(tensor<f32, [M, N]> x) → tensor<f32, [M, N]>` (`@ kernel @ public`, infallible — `src/nn.fab:434-437`); the :1000 staged-carrier `gelu(NumericBlock)` entry stays (carrier residual, distinct surface). `docs/api-shape-policy.md` — correct the carrier-vs-typed distinction: the "What it means for signatures" table (:40-41) currently types **Production (shape-generic)** as the `tensor.NumericBlock` staged carrier with `nn.linear`/`attention.scaled_dot_product` examples; reclassify so the typed generic leaves (`nn.linear<M,K,N>`, `nn.gelu<M,N>`, `attention.scaled_dot_product_static<B,D>`, `math.add<M,N>`) are the production shape-generic surface and the NumericBlock form is the staged/runtime-shape tier (SEM014/SEM005 load-edge posture, `*_carrier` residuals); the :40 admitted-rows example swaps retired `linear_2x2` for a surviving admitted row (`linear_2x8`, `mse_4x4`, `bert_tiny_block_2x8` all stay); the staged-carrier posture section (:12-28) keeps its PML1 rationale as history but stops presenting the carrier as the production form for families whose typed twin ships. `src/gradus.fab` facade comment (:51-52 lists `scaled_dot_product_2x8`/`gelu_2x8` as shipped — reword to the generic surface, append-only note); `src/tensor.fab` census comment (:90-95 admit-row ledger — append the retirement). Examples repo: `examples/training/linear-regression/oracle/README.md` (:23) and `examples/training/mlp/oracle/README.md` (:26) — reword the dying names to their generic destination (`nn.linear_2x2`/`nn.linear_4x4` → `nn.linear`, `nn.gelu_4x4` → `nn.gelu`); the surviving names in those rows (`train.train_step_2x2`/`_4x4`, `loss.mse_2x2`/`_4x4`) stay (wave-1 non-goals) |
+| `write_scope` | Both repos. `gradus`: `README.md`, `docs/api-reference.md`, `docs/api-shape-policy.md`, `src/gradus.fab`, `src/tensor.fab` (comment-only in the two src files). `faberlang/examples`: `examples/training/linear-regression/oracle/README.md`, `examples/training/mlp/oracle/README.md` |
+| `done_when` | Cross-repo census grep (reference packet pattern, both repos, `*.fab`/`*.proba`/`*.md`/`*.toml`) returns **zero current public-surface claims** for the seven names outside the enumerated exclusion set: (a) frozen evidence — oracle `reference.json`/receipt files, benchmark baselines/receipts, `docs/factory/**` landed campaign paper, `docs/archived/**`, `docs/deep-code-review-*`, `docs/shape-generic-kernels.md` historical design prose; (b) explicitly-marked retirement provenance in src ledger comments (owned by the U3/U4/U5 done-whens); (c) the nn-bridge baseline-red record (:33, U1 keeps it). Every replacement names the correct destination: nn wrappers → typed `nn.linear<M,K,N>` / `nn.gelu<M,N>`, attention wrapper → `attention.scaled_dot_product_static<B,D>`, sgd wrappers → `optimize._sgd_family` list form. `docs/api-reference.md` has no entry for any deleted symbol — the seven wrappers **plus** `linear_from_raw` — while listing typed `gelu<M,N>` alongside the surviving staged-carrier `gelu(NumericBlock)` entry. `docs/api-shape-policy.md` names the typed generic leaves as the production shape-generic surface with the carrier as the staged tier |
+| `depends_on` | GCB-W1-U3, GCB-W1-U4, GCB-W1-U5 (describes their end state; transitively after U1/U2) |
+| `sanity` | the cross-repo census grep with current-claim classification (docs + two comment-only files; no product suite) |
+| `non_goals` | standing set + no edits to `docs/factory/**` (historical campaign paper stays as landed record), `docs/deep-code-review-*`, archived docs, benchmark baselines/receipts, or `faberlang/examples` oracle `reference.json` files (frozen evidence per amendment `59b4074a`); no bert oracle README edit (U2 owns `bert-tiny-fragment/oracle/README.md`); no surviving-name rewording (`train_step_*`, `mse_*`, `linear_2x8`, `layernorm_2x8`, `bert_tiny_block_2x8` stay advertised); no source-code edits beyond the two comment-only files |
 | `risk` | low |
 | `integrable` | yes |
 
@@ -221,5 +221,40 @@ above; every corrected claim was re-verified against live source at
    retirement/history. Live evidence: `attention.fab:29-34`, `:36-40`,
    `:101`, `:134-136`; twin bodies identical `:57-64` vs `:77-85`.
 
-Findings 5 (U6 docs census) and 6 (factory goal status metadata) are not
-in this repair's scope; Mind routes them separately.
+Findings 5 (U6 docs census) and 6 (factory goal status metadata) were not
+in round 1's scope; round 2 (below) closes them.
+
+## Repair record — REVISE 8b86bc40 round 2 (task 1e9f9e32, 2026-08-28)
+
+Mind task `1e9f9e32` binds the two remaining findings (5 and 6); findings
+1-4 were repaired in round 1 (`0ec9a33`). Every corrected claim below was
+re-verified against the live tree (`0ec9a33` — round 1 touched only this
+delivery spec) and `faberlang/examples` HEAD `226ab8f3` before this record:
+
+5. **U6 (interfaces)** — write scope expanded to both repos: adds
+   `examples/training/linear-regression/oracle/README.md` (:23 advertises
+   `nn.linear_2x2`) and `examples/training/mlp/oracle/README.md` (:26
+   advertises `nn.linear_4x4`/`nn.gelu_4x4`); the bert oracle README stays
+   U2's (its :22 row is in U2's write scope). Outcome adds the
+   `linear_from_raw` api-reference deletion (:998 — orphaned helper deleted
+   by U4), the missing typed `gelu<M,N>` entry (`fn gelu<size M, size N>`
+   infallible, `src/nn.fab:434-437`; the :1000 staged-carrier entry stays),
+   and the api-shape-policy carrier-vs-typed correction (:40-41 typed
+   leaves are the production shape-generic surface, NumericBlock is the
+   staged tier; posture section :12-28 demoted to history where a typed
+   twin ships). Done_when census exclusions are now enumerated exactly
+   (frozen evidence set, marked retirement provenance, nn-bridge baseline
+   record), every replacement names its destination, and the cross-repo
+   census is fulfillable from the card's own write scope. Live evidence:
+   api-reference :990/:991/:992/:995/:998/:1000, api-shape-policy :40-41,
+   the two oracle README rows; full both-repo markdown sweep at repair time
+   found no further non-frozen, non-owned claim (`exempla/nn-bridge/README.md`
+   is U1's, `exempla/training-loop-mlp/README.md` is U3's from round 1;
+   `docs/deep-code-review-*` and `docs/shape-generic-kernels.md` :25 are
+   excluded historical paper — the latter cites norma's deletion, not a
+   gradus surface claim).
+6. **Goal metadata (test-surface)** — `GOAL.md` and `CAMPAIGN.md` now carry
+   the template header (`**Status**`/Created/Campaign/Source/Repos/Related
+   per `radix/docs/factory/TEMPLATE.md`) with honest status `planned`
+   (lowered, not implemented) and a machine-managed Ledger section; the
+   GOAL ledger tracks U1-U6 receipts (all `pending` — no unit has landed).
