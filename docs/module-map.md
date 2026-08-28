@@ -97,7 +97,7 @@ evidence and boundaries are recorded in
 | `gradus:train` | `src/train.fab` | Train steps, schedules, mode, RNG, dropout, and checkpoint `Checkpoint` (PML4) |
 | `gradus:metrics` | `src/metrics.fab` | Defined metrics: `accuracy`, `Metric` (PML4) |
 | `gradus:test_util` | `src/test_util.fab` | Shared proba-support helpers: `or_default` (U4a proba do/catch deblock) |
-| `gradus:data` | `src/data.fab` | Stub — batching/shuffling/tokenization declared future |
+| `gradus:data` | `src/data.fab` | Batch leaf: deterministic shuffle over `gradus:train` Seed/Draw + order-preserving batch slicing of rank-1 i32 token-id tensors (short last batch; fail-closed empty/size bounds); tokenization still future |
 | `gradus:model/artifact` | `src/model/artifact.fab` | Pathless content identity for bounded model artifacts (GGUF-A1a) |
 | `gradus:model/capsule` | `src/model/capsule.fab` | Admitted-model capsule — the typed identity handoff (`capsule-schema-2.0.0`, PML2, C8; A1C-M1 clean break — schema 1 retired) |
 | `gradus:model/dense_llama` | `src/model/dense_llama.fab` | Typed `llama` (SmolLM2) architecture adapter — canonical tensor-name → manifest-descriptor mapping over the GGUF-A1b surface, frozen SmolLM2-360M config, fail-closed typed diagnostics (REF-01-U1.6) |

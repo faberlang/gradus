@@ -1,15 +1,151 @@
 +++
 locale = "en"
 +++
-# Data loading facade.
+# Data loading facade — the batch leaf: deterministic shuffle + batch
+# slicing of rank-1 token-id corpora.
 #
 # Public import: import from "gradus:data" data
-# Depends on: gradus:tensor
+# Depends on: gradus:tensor (token-id carrier), gradus:dtype (tag gate),
+# gradus:train (Seed/Draw — the ONLY RNG; this module advances no second
+# generator).
 #
-# Will split into nested leaves when ≥2 data concerns are implemented:
-#   gradus:data/batch     batching and shuffling
-#   gradus:data/token     tokenization (char-level, BPE)
+# Nested-leaf plan: this file splits into nested leaves when a second
+# data concern is implemented. The batch leaf is the first:
+#   gradus:data/batch     batching and shuffling  ← this file (implemented)
+#   gradus:data/token     tokenization (char-level, BPE) — still future
+# Until that split, the batch leaf is the whole implemented surface and
+# the facade keeps its public import path.
+#
+# Token-id domain: rank-1 tensors tagged i32 (the gradus:metrics
+# accuracy-target integer-domain precedent). Everything fails closed:
+# wrong rank, wrong tag, empty corpus, and out-of-range batch sizes are
+# typed DataError rejections — never partial or invented results.
 #
 # Architectural rule: data loading is separate from training. The Shakespeare
 # corpus and a future safetensors dataset feed the same training loop through
 # the same batch interface.
+
+import from "gradus:dtype" dtype
+
+import from "gradus:tensor" tensor
+
+import from "gradus:train" train
+
+# -------------------------------------------------------------------------
+# DataError — typed error vocabulary of the data surface. Every variant
+# carries a text message so consumers can render the failure without
+# matching each variant.
+# -------------------------------------------------------------------------
+
+@ public
+union DataError {
+    @ shared
+    string message
+
+    EmptyCorpus,
+    InvalidBatchSize,
+    InvalidShape,
+    InvalidDtype,
+    BlockFailure {
+        tensor.TensorError inner
+    }
+}
+
+@ conversion
+fn from_tensor_error(tensor.TensorError err) → DataError {
+    return variant BlockFailure { message = err.message, inner = err }
+}
+
+# Shared corpus gate: rank-1, i32-tagged, non-empty. Message identity is
+# the proba pin surface.
+fn _require_ids(tensor.NumericBlock ids) → void ⇥ DataError {
+    require ids.rank() ≡ 1 throw variant InvalidShape { message = "token ids must be rank-1" }
+    require dtype.name(ids.dtype()) ≡ "i32" throw variant InvalidDtype { message = "token ids must be i32" }
+    require ids.data.length() ≠ 0 throw variant EmptyCorpus { message = "corpus is empty" }
+}
+
+# -------------------------------------------------------------------------
+# shuffle — deterministic Fisher–Yates over the corpus order, driven by
+# gradus:train Seed/Draw (the training RNG; no second generator).
+#   for i in 0 ‥ n−1: one xorshift64 draw;
+#   pick j = i + ((draw ∧ MASK_63) mod (n − i)); swap positions i and j.
+# The draw is masked to its low 63 bits (sign-agnostic, the train.next_f32
+# precedent) so the modulo span is never negative. Deterministic: the same
+# (ids, seed) reproduces the same order. A single-element corpus consumes
+# no draw and the seed is returned unchanged. The advanced seed rides the
+# Shuffled carrier so an epoch loop chains shuffles without reconstructing
+# state.
+# -------------------------------------------------------------------------
+
+# Sign-bit mask: shuffle picks use only the low 63 bits of a draw.
+const int MASK_63 ← 9223372036854775807
+
+@ public
+class Shuffled {
+    tensor.NumericBlock payload
+    train.Seed seed
+
+    fn payload() → tensor.NumericBlock {
+        return self.payload
+    }
+
+    fn seed() → train.Seed {
+        return self.seed
+    }
+}
+
+@ public
+fn shuffle(tensor.NumericBlock ids, train.Seed seed) → Shuffled ⇥ DataError {
+    _require_ids(ids)
+    const list<f32> source ← ids.data
+    const int n ← source.length()
+    var list<f32> data ← source
+    var train.Seed s ← seed
+    const int last ← n - 1
+    for range 0 ‥ last const i {
+        const train.Draw d ← train.next(s)
+        s ← d.seed()
+        const int pick ← i + ((d.payload() ∧ MASK_63) % (n - i))
+        const f32 tmp ← data.get(i) coalesce 0.0 ∷ f32
+        data[i] ← data.get(pick) coalesce 0.0 ∷ f32
+        data[pick] ← tmp
+    }
+    const tensor.NumericBlock out ← tensor.construct_dtype(data, ids.shape(), ids.dtype())
+    return Shuffled { payload = out, seed = s }
+}
+
+# -------------------------------------------------------------------------
+# batch — order-preserving slicing of a rank-1 token-id corpus into
+# consecutive batches of batch_size ids; the last batch is short when the
+# length is not an exact multiple. Fail closed: empty corpus, batch size
+# < 1, and batch size > corpus length are rejections — no partial or
+# invented batches. Shuffling is the separate leaf function above;
+# callers compose batch(shuffle(ids, seed).payload(), size).
+# -------------------------------------------------------------------------
+
+@ public
+fn batch(tensor.NumericBlock ids, int batch_size) → list<tensor.NumericBlock> ⇥ DataError {
+    _require_ids(ids)
+    require batch_size ≥ 1 throw variant InvalidBatchSize { message = "batch size must be at least 1" }
+    const list<f32> source ← ids.data
+    const int n ← source.length()
+    require batch_size ≤ n throw variant InvalidBatchSize { message = "batch size exceeds corpus length" }
+    var list<tensor.NumericBlock> out ← empty
+    var int start ← 0
+    while start ≺ n {
+        var int stop ← start + batch_size
+        if stop ≻ n {
+            stop ← n
+        }
+        var list<f32> chunk ← empty
+        for range start ‥ stop const k {
+            chunk.append(source.get(k) coalesce 0.0 ∷ f32)
+        }
+        var list<int> shape ← empty
+        shape.append(stop - start)
+        const tensor.NumericBlock piece ← tensor.construct_dtype(chunk, shape, ids.dtype())
+        out.append(piece)
+        start ← stop
+    }
+    return out
+}
