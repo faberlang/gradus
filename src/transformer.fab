@@ -626,25 +626,65 @@ fn _from_block<size A, size B>(tensor.NumericBlock t) → tensor<f32, [A, B]> �
     }
 }
 
+# KRS-4 absent-bias zero vector (tree rule 6: the host supplies the tensor).
+# No typed zeros constructor exists (card hazard 1) — the zero is built
+# host-side as a fill loop + construct + list→tensor pin, mirroring
+# model/dense `_zeros_rank1` + `_pin_same_rank1`. Never a fill kernel.
+fn _zero_block(int n) → tensor.NumericBlock ⇥ TransformerError {
+    var list<f32> out ← empty
+    for range 0‥n const i {
+        out.append(0.0 ∷ f32)
+    }
+    do {
+        return tensor.construct(out, [n])
+    }
+    catch err {
+        throw variant ShapeMismatch { message = "zero bias fill failed" }
+    }
+}
+
+fn _zero_bias<size N>(tensor.NumericBlock z) → tensor<f32, [N]> ⇥ TransformerError {
+    do {
+        return z.data ↦ tensor<f32, [N]>
+    }
+    catch conv {
+        throw variant ShapeMismatch { message = "zero bias pin failed" }
+    }
+}
+
+# KRS-4 region — the shared QKV projection of both static twins. The bias
+# is ALWAYS added; the wrapper passes the real bias or a proven zero
+# (never `if has_*` inside a kernel). Tuple return per the card's exact
+# signature (card hazard 2 — first live tuple-returning @ kernel).
+@ kernel
+fn dense_qkv<size T, size D, size Q, size K>(tensor<f32, [T, D]> ln1, tensor<f32, [D, Q]> wq, tensor<f32, [Q]> bq, tensor<f32, [D, K]> wk, tensor<f32, [K]> bk, tensor<f32, [D, K]> wv, tensor<f32, [K]> bv) → tuple<tensor<f32, [T, Q]>, tensor<f32, [T, K]>, tensor<f32, [T, K]>> {
+    const tensor<f32, [T, Q]> q ← (ln1 · wq).added_bias(bq)
+    const tensor<f32, [T, K]> k ← (ln1 · wk).added_bias(bk)
+    const tensor<f32, [T, K]> v ← (ln1 · wv).added_bias(bv)
+    return tuple<tensor<f32, [T, Q]>, tensor<f32, [T, K]>, tensor<f32, [T, K]>> [q, k, v]
+}
+
+# KRS-4 wrapper-side bias policy: has_* true → the real layer bias;
+# false → a proven zero of the matching width (qwidth/kwidth are the
+# runtime [Q]/[K] widths).
+fn _bias_or_zero<size N>(bool has, tensor<f32, [N]> real, int width) → tensor<f32, [N]> ⇥ TransformerError {
+    if has {
+        return real
+    }
+    return _zero_bias(_zero_block(width))
+}
+
 @ public
 fn dense_block_static<size T, size D, size Q, size K, size F>(tensor<f32, [T, D]> x, list<int> positions, TypedDenseLayer<D, Q, K, F> layer, DenseAttentionConfig attention_config, f32 epsilon, int rows, int hidden, int qwidth, int kwidth) → tensor<f32, [T, D]> ⇥ TransformerError {
-    # --- input RMSNorm + Q/K/V projections (optional bias) ----------------
+    # --- input RMSNorm + QKV region (always-add bias; zeros on absent) ---
     const tensor<f32, [T, D]> ln1 ← nn.rmsnorm(x, layer.ln1, epsilon)
-    const tensor<f32, [T, Q]> q0 ← ln1 · layer.wq
-    var tensor<f32, [T, Q]> qb ← q0
-    if layer.has_bq {
-        qb ← q0.added_bias(layer.bq)
-    }
-    const tensor<f32, [T, K]> k0 ← ln1 · layer.wk
-    var tensor<f32, [T, K]> kb ← k0
-    if layer.has_bk {
-        kb ← k0.added_bias(layer.bk)
-    }
-    const tensor<f32, [T, K]> v0 ← ln1 · layer.wv
-    var tensor<f32, [T, K]> vb ← v0
-    if layer.has_bv {
-        vb ← v0.added_bias(layer.bv)
-    }
+    const tensor<f32, [Q]> bq ← _bias_or_zero(layer.has_bq, layer.bq, qwidth)
+    const tensor<f32, [K]> bk ← _bias_or_zero(layer.has_bk, layer.bk, kwidth)
+    const tensor<f32, [K]> bv ← _bias_or_zero(layer.has_bv, layer.bv, kwidth)
+    const tuple<tensor<f32, [T, Q]>, tensor<f32, [T, K]>, tensor<f32, [T, K]>> qkv ← dense_qkv(ln1, layer.wq, bq, layer.wk, bk, layer.wv, bv)
+    const tensor<f32, [T, Q]> qb ← qkv[0]
+    const tensor<f32, [T, K]> kb ← qkv[1]
+    const tensor<f32, [T, K]> vb ← qkv[2]
 
     # --- multi-head attention + context pin -------------------------------
     const tensor.NumericBlock ctx_b ← _multi_attention(_to_block(qb, rows, qwidth), _to_block(kb, rows, kwidth), _to_block(vb, rows, kwidth), _to_block(layer.wo, qwidth, hidden), attention_config.num_heads, attention_config.num_kv_heads, attention_config.scale, positions, attention_config.rope_dim, attention_config.rope_config)
@@ -664,23 +704,15 @@ fn dense_block_static<size T, size D, size Q, size K, size F>(tensor<f32, [T, D]
 
 @ public
 fn dense_block_cached_static<size T, size D, size Q, size K, size F>(tensor<f32, [T, D]> x, list<int> positions, kv.KVCache cache, list<int> tokens, TypedDenseLayer<D, Q, K, F> layer, DenseAttentionConfig attention_config, f32 epsilon, int rows, int hidden, int qwidth, int kwidth) → TypedCachedBlock<T, D> ⇥ TransformerError {
-    # --- input RMSNorm + Q/K/V projections (optional bias) ----------------
+    # --- input RMSNorm + QKV region (always-add bias; zeros on absent) ---
     const tensor<f32, [T, D]> ln1 ← nn.rmsnorm(x, layer.ln1, epsilon)
-    const tensor<f32, [T, Q]> q0 ← ln1 · layer.wq
-    var tensor<f32, [T, Q]> qb ← q0
-    if layer.has_bq {
-        qb ← q0.added_bias(layer.bq)
-    }
-    const tensor<f32, [T, K]> k0 ← ln1 · layer.wk
-    var tensor<f32, [T, K]> kb ← k0
-    if layer.has_bk {
-        kb ← k0.added_bias(layer.bk)
-    }
-    const tensor<f32, [T, K]> v0 ← ln1 · layer.wv
-    var tensor<f32, [T, K]> vb ← v0
-    if layer.has_bv {
-        vb ← v0.added_bias(layer.bv)
-    }
+    const tensor<f32, [Q]> bq ← _bias_or_zero(layer.has_bq, layer.bq, qwidth)
+    const tensor<f32, [K]> bk ← _bias_or_zero(layer.has_bk, layer.bk, kwidth)
+    const tensor<f32, [K]> bv ← _bias_or_zero(layer.has_bv, layer.bv, kwidth)
+    const tuple<tensor<f32, [T, Q]>, tensor<f32, [T, K]>, tensor<f32, [T, K]>> qkv ← dense_qkv(ln1, layer.wq, bq, layer.wk, bk, layer.wv, bv)
+    const tensor<f32, [T, Q]> qb ← qkv[0]
+    const tensor<f32, [T, K]> kb ← qkv[1]
+    const tensor<f32, [T, K]> vb ← qkv[2]
 
     # --- cached multi-head attention + context pin ------------------------
     const attention.CachedAttention step ← _multi_attention_cached(_to_block(qb, rows, qwidth), _to_block(kb, rows, kwidth), _to_block(vb, rows, kwidth), _to_block(layer.wo, qwidth, hidden), cache, attention_config.num_heads, attention_config.num_kv_heads, attention_config.scale, positions, attention_config.rope_dim, attention_config.rope_config, tokens)
