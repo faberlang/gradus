@@ -1,6 +1,6 @@
 # GOAL: kernel-region-split — convert mixed Gradus functions into wrapper + device region
 
-**Status**: planned — census landed (this commit); conversion units carded, none dispatched
+**Status**: planned — census landed (`f494db2`) and reissued 2026-08-28 under REVISE `1ddc4077` (one-row ledger, `gradient.fab` admitted, `linear_4x4` reclassified annotation-capable, anchors corrected); conversion units carded, none dispatched
 **Created**: 2026-08-28
 **Campaign:** `kernel-region-split`
 **Source:** operator need `3b9e5796` (kernel-region-split conversions — census then unit cards, operator-settled 2026-08-28); lowering task `c78bb834`
@@ -15,7 +15,7 @@ Every Gradus function that mixes admit/policy (`⇥`, bags, `require`, `source`,
 
 ## Problem
 
-The live source (verified 2026-08-28, census below) carries mixed functions whose math can never fuse because it lives inside policy signatures: `dense_block_static` / `dense_block_cached_static` inline an identical SwiGLU+residual tail and an identical QKV-with-optional-bias prologue (`src/transformer.fab` 630–699); legacy fixed-shape adapters in `src/nn.fab` detour typed tensors through staged carriers to reach math that already exists as typed `@ kernel` leaves (`nn.linear`, `nn.gelu`); and attention's per-head core exists as `@ kernel` (`scaled_dot_product_static`) while the multi-head parents remain bag walks with an illegal `list.append` head loop. Standing law: `$canonical-faber` pattern `kernel-region-split` (tentative, operator 2026-08-28) at `~/work/ianzepp/skills/faber/canonical-faber/references/patterns.md` §kernel-region-split, with the review note in that skill's `SKILL.md` §14.
+The live source (verified 2026-08-28, census below; anchors corrected in the REVISE `1ddc4077` reissue) carries mixed functions whose math can never fuse because it lives inside policy signatures: `dense_block_static` / `dense_block_cached_static` share the same typed QKV-with-optional-bias prologue (`if has_bq/bk/bv`, 632–647 / 668–683) and the same SwiGLU+residual arithmetic core (658–662 / 694–698 — same statements, different return wrappers: tensor vs `TypedCachedBlock { output, state }`) inline in both bodies (`src/transformer.fab` 630–699); legacy fixed-shape adapters in `src/nn.fab` detour typed tensors through staged carriers to reach math that already exists as typed `@ kernel` leaves (`nn.linear`, `nn.gelu`), and `linear_4x4` — public, `⇥`-free, its whole body one call to `@ kernel linear` — carries no `@ kernel` annotation itself; and attention's per-head core exists as `@ kernel` (`scaled_dot_product_static`) while the multi-head parents remain carrier bag walks that never call it (an illegal `list.append` head loop over `list<NumericBlock>`). Standing law: `$canonical-faber` pattern `kernel-region-split` (tentative, operator 2026-08-28) at `~/work/ianzepp/skills/faber/canonical-faber/references/patterns.md` §kernel-region-split, with the review note in that skill's `SKILL.md` §14.
 
 ## Proposal
 
@@ -44,14 +44,14 @@ This supersedes `dense-typed-assembly` §3b ("no in-body call / assemblers stay 
 
 | Unit | Scope | Depends on | Hand evidence |
 | --- | --- | --- | --- |
-| KRS-1 | Census artifact over the seven named files + tensor-math siblings, every function one row | — | this commit (planner) |
-| KRS-2 | `src/nn.fab` legacy fixed-shape adapters call typed leaves directly (one family) | — | none |
+| KRS-1 | Census artifact over the seven named files + tensor-math siblings, every function one row | — | `f494db2` (planner); reissued in this commit (REVISE `1ddc4077`) |
+| KRS-2 | `src/nn.fab` fixed-shape adapter family — five carrier-detour reroutes + `linear_4x4` `@ kernel` annotation | — | none |
 | KRS-3 | `src/transformer.fab` extract named private `@ kernel dense_mlp` shared by both static block twins | — | none |
-| KRS-4 | `src/transformer.fab` named private `@ kernel` QKV always-add region; wrapper supplies zeros | KRS-3 (same file) | none |
-| KRS-5 | `src/transformer.fab` `bert_tiny_block_2x8` marked `@ kernel` (pure glyph body, no `⇥`) | KRS-4 (same file) | none |
-| KRS-6 (deferred) | `src/attention.fab` multi-head static parent (static `H`, no `list.append`); wrapper may still launch per head | KRS-3 green + column-slice admission + export-seam amendment for any launch claim | none |
+| KRS-4 | `src/transformer.fab` named private `@ kernel dense_qkv` QKV always-add region; wrapper supplies zeros | KRS-3 (same file) | none |
+| KRS-5 | `src/transformer.fab` `bert_tiny_block_2x8` marked `@ kernel` (+ canonical `ᵀ` transpose spelling) | KRS-4 (same file) | none |
+| KRS-6 (deferred, blocked) | `src/attention.fab` multi-head static parent `multi_head_attention_static` (placeholder contract; static `H`, no `list.append`); wrappers keep the carrier per-head loop — no typed leaf launch exists today | KRS-3 green + column-slice admission + export-seam amendment for any launch claim | none |
 
-Kernel-closure class (tree rule 3): zero live sites in the census — every carded region has a second caller or is a direct leaf call. The `ef103950` gate therefore blocks nothing in this campaign today; conversion hands that discover a genuine one-off note it on the card and defer (mind routing for need `3b9e5796`).
+Kernel-closure class (tree rule 3): zero live sites in the reissued census (one-row ledger, REVISE `1ddc4077`) — every carded region has a second caller or is a direct leaf call, and the admitted `gradient.fab` autograd-companion rows are a different lowering family, not closure candidates. The `ef103950` gate therefore blocks nothing in this campaign today; conversion hands that discover a genuine one-off note it on the card and defer (mind routing for need `3b9e5796`).
 
 ## Validation
 
@@ -70,16 +70,16 @@ Per-card oracle (need `3b9e5796` binds this on every conversion task): focused p
 
 | Unit | Status | Seat | Receipt | Notes |
 | --- | --- | --- | --- | --- |
-| KRS-1 census | done | planner | this commit | [`census.md`](census.md); starter rows verified live — corrections recorded in §0 |
-| KRS-2 nn adapters | pending | — | — | no compiler dependency |
+| KRS-1 census | done | planner | `f494db2` | [`census.md`](census.md); starter rows verified live — corrections recorded in §0. **Reissued 2026-08-28 (REVISE `1ddc4077`)** as a one-row-per-declaration ledger; `gradient.fab` admitted; `linear_4x4` reclassified; dense-tail/attention anchors corrected — §0a |
+| KRS-2 nn adapters | pending | — | — | no compiler dependency; six functions (five reroutes + `linear_4x4` annotation); proof = `exempla/nn-bridge` run with the pre-existing `linear_2x2` red carried as baseline |
 | KRS-3 dense_mlp | pending | — | — | named private; two callers |
-| KRS-4 QKV always-add | pending | — | — | serialized after KRS-3 (same file) |
-| KRS-5 bert_tiny @ kernel | pending | — | — | glyph-leaf law; serialized (same file) |
+| KRS-4 QKV always-add | pending | — | — | named private `dense_qkv`; serialized after KRS-3 (same file) |
+| KRS-5 bert_tiny @ kernel | pending | — | — | glyph-leaf law; serialized (same file); + canonical `ᵀ` spelling |
 | KRS-6 attention parent | deferred | — | — | hole class; open questions in card |
 | pattern promotion | deferred | — | — | after first green conversion; milestone, not a conversion unit |
 
 ## Open questions
 
-1. **Attention parent slicing** — a static-`H` multi-head parent needs per-head column splits of packed `[T, H·D]` tensors; no slice glyph is admitted today (`_head` is a carrier walk; `for from grid at [i, j]` noted pending in `src/attention.fab`). Default: KRS-6 stays deferred until an admission exists; wrapper keeps per-head launches and says so in the receipt.
+1. **Attention parent slicing** — a static-`H` multi-head parent needs per-head column splits of packed `[T, H·D]` tensors; no slice glyph is admitted today (`_head` is a carrier walk; `for from grid at [i, j]` noted pending in `src/attention.fab`). Default: KRS-6 stays deferred and **blocked** until an admission exists; until then the wrappers keep the **carrier per-head loop** (there is no typed per-head launch today to keep or count) and the receipt says so.
 2. **Export seam ownership** — any launch-count claim requires a program-plan export change (radix-owned surface, e.g. the GEA wire-plan export family). Default: no gradus card carries a launch claim in this campaign unless the operator amends scope to name the seam.
 3. **Bag-route retirement** — census records the carrier-twin bag routes as SEM014/SEM016/SEM008-blocked; `dense-typed-assembly` unit 5 owns their retirement. Default: out of scope here; recorded, not converted.
