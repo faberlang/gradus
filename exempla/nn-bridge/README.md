@@ -2,7 +2,7 @@
 
 This package is the executed proof of the six admitted typed-tensor
 bridges on `gradus:nn`. The co-located `src/nn.proba` suite pins the
-staged carrier family (`linear_carrier` / `gelu` / `layernorm`) only:
+staged carrier family (`linear_carrier` / `gelu_carrier` / `layernorm_carrier`) only:
 the proba file-interface degrades typed-tensor signatures. This package
 constructs the accepted-proof typed tensors and calls each bridged row
 against those same pins.
