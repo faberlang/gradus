@@ -120,6 +120,13 @@ Two blockers recorded, neither fixed here:
 | `risk` | low |
 | `integrable` | yes |
 
+**KRS-5 receipt (2026-08-28, lane `factory/krs-5`).** `bert_tiny_block_2x8` now carries `@ kernel` above its kept `@ public` (glyph-leaf law, tree rule 1; annotation order `@ kernel` first, matching `nn.linear`); the rank-2 transpose at :81 is the canonical postfix spelling `kt ← kbᵀ` (settled `tensor-glyph-transpose` rule; no other call site touched). A focused `transformer.proba` describe block now invokes the function — its first pinned caller — with the accepted fragment's 20 typed-tensor inputs (the card's "21" is the fragment ledger's 21 tensor params incl. `target`, which the function does not take; the signature takes the other 20) and pins the 16 output bytes exact (`≡`, not tolerance).
+
+Two boundaries recorded, neither fixed here, matching the KRS-2 receipt:
+
+1. **Post-change runtime run is runner-blocked at tip.** The FMIR runner refuses `@ kernel` execution (radix `65f2d7d6b` "refuse device kernel execution", post-dates the kernel twins): `faber run` and `faber test` on the annotated function fail with `runner refuses execution of @ kernel function` — the same known boundary as the pre-existing nn.proba `nn.linear` rows. The committed proba row therefore refuses at runtime under `faber test` after this commit (a documented kernel-refusal row, not a value failure); the card's before/after run comparison is not executable at this tip and is not claimed. Byte-identity acceptance instead rests on three facts: (a) the pins are the function's real pre-change bytes, recorded by running the un-annotated function before the change; (b) normalized `faber mir` text dumps of `src/transformer.fab` before vs after differ by **zero** (only `sym#` numbering shifts; every operation/type/def reference identical) — `kb.transpose()` and `kbᵀ` lower to the same operation, and the annotation is body-inert; (c) the annotation is marker-only by construction (the runner's refusal itself proves it lowers to the compute shader stage).
+2. **`faber check src/transformer.proba` pre-existing red recorded.** The file carries 6 SEM010 rows at HEAD in the `tene_i32`/`config_p` helpers (the documented `test_util.or_default` closure wall); the error set is byte-identical before/after this commit. `faber check src/transformer.fab` is green on both sides (pre-existing WARN003 unused-function rows only; the static twins remain uncalled by the proba surface). No launch claim (no export seam); no caller minted beyond the focused proba test; no `⇥`-function annotation; no `do kernel`.
+
 ---
 
 ## KRS-6 (DEFERRED, BLOCKED) — `attention.fab` multi-head static parent
