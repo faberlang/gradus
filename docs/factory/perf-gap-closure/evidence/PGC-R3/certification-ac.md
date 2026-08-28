@@ -11,7 +11,7 @@
   completion. Both blocks `status: comparable`.
 - Reduced receipt: `parity-receipt-ac.json`.
 - Baseline append (append-only, standing family untouched):
-  `radix/docs/factory/gradus-llama-parity/baselines/parity-baseline-20260828-r783e0b9-h848a24b-gb762163-cmpb10290-c8e03ce81.{json,md}`;
+  `radix/scripta/parity-baselines/parity-baseline-20260828-r783e0b9-h848a24b-gb762163-cmpb10290-c8e03ce81.{json,md}`;
   receipt copy `baseline-candidate-ac.md` here.
 
 ## Pins (three-repo)
