@@ -1,6 +1,6 @@
 # GOAL: gradus-clean-break — shape-generic-only public API (wave 1)
 
-**Status**: planned — lowered to the wave-1 unit graph, not implemented; no unit receipt yet
+**Status**: active — wave-1 units U1-U6 done at factory/w1-u* lane branches (receipts in §Ledger); fold to main pending
 **Created**: 2026-08-28
 **Campaign:** `gradus-clean-break`
 **Source:** operator need `127f9fd6` + amendment `59b4074a` (settled); lowering task `4aa2f634`
@@ -246,12 +246,12 @@ ordering live in [`wave-1-delivery.md`](wave-1-delivery.md).
 
 | Unit | Status | Seat | Receipt | Notes |
 | --- | --- | --- | --- | --- |
-| GCB-W1-U1 | pending | — | none | nn-family callers move (linear-regression, mlp, nn-bridge) |
-| GCB-W1-U2 | pending | — | none | attention/bert callers move |
-| GCB-W1-U3 | pending | — | none | optimize family collapse (`_sgd_family`) |
-| GCB-W1-U4 | pending | — | none | nn library deletion (four wrappers + `linear_from_raw`) |
-| GCB-W1-U5 | pending | — | none | attention library deletion |
-| GCB-W1-U6 | pending | — | none | docs closeout (both repos) |
+| GCB-W1-U1 | done | hand | examples `3aa262a8` (factory/w1-u1) · gradus `9dc8b0f` (factory/w1-u1) | nn-family callers move (linear-regression, mlp, nn-bridge) |
+| GCB-W1-U2 | done | hand | examples `1eaaedbc` (factory/w1-u2) | attention/bert callers move |
+| GCB-W1-U3 | done | hand | gradus `12321d4` (factory/w1-u3) | optimize family collapse (`_sgd_family`) |
+| GCB-W1-U4 | done | hand | gradus `d71ce7d` (factory/w1-u4) | nn library deletion (four wrappers + `linear_from_raw`) |
+| GCB-W1-U5 | done | hand | gradus `d087bfc` (factory/w1-u5) | attention library deletion |
+| GCB-W1-U6 | done | hand | gradus `88fa5f8` (factory/w1-u6) · examples `3a5ea13` (factory/w1-u6) | docs closeout (both repos); fold to main pending |
 
 ## Open questions
 
