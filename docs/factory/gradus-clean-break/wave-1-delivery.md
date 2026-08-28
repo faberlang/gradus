@@ -54,7 +54,7 @@ path-limited per repo.
 | `id` | GCB-W1-U1 |
 | `outcome` | Every non-bert caller of the dying nn wrappers names the generic leaf: `nn.linear_2x2`→`nn.linear` (shape params unify from `[2,2]` argument types), `nn.linear_4x4`→`nn.linear`, `nn.gelu_4x4`→`nn.gelu`; nn-bridge's `gelu_2x8` row → `nn.gelu`. The twins are infallible — delete the `fac {} cape {}` error arms around former `⇥` calls (`linear-regression/src/train.fab:93-97`; `nn-bridge` bridge wrappers), do not preserve them. nn-bridge keeps its `linear_2x8` / `layernorm_2x8` rows untouched (wave 2) |
 | `write_scope` | `faberlang/examples` repo: `examples/training/linear-regression/src/train.fab`, `examples/training/linear-regression/oracle/capture.fab`, `examples/training/mlp/src/train.fab`, `examples/training/mlp/oracle/capture.fab`. `gradus` repo: `exempla/nn-bridge/src/main.fab`, `exempla/nn-bridge/README.md` (row list + run-command status wording) |
-| `done_when` | Zero live calls to the three names in those files (grep); `faber check` green on `linear-regression`, `mlp` (Latin surface preserved — no keyword conversions); `faber check exempla/nn-bridge` green; bridge printed pins unchanged in value (pin labels may keep the historical row names as provenance or rename — Hand's choice, README row list must match reality); the bridge's known `linear_2x2` matmul red stays recorded as baseline in the README, not claimed green |
+| `done_when` | Zero live calls to **all four** retiring names this card moves — `nn.linear_2x2`, `nn.linear_4x4`, `nn.gelu_4x4`, and the nn-bridge `nn.gelu_2x8` row (bridge wrapper `main.fab:133-140` + pin row `:231-245`) — across the named caller surfaces: the two `linear-regression` files, the two `mlp` files, and `exempla/nn-bridge/src/main.fab` (grep; pin labels may keep the historical row names as provenance — labels are not calls). `faber check` green on `linear-regression`, `mlp` (Latin surface preserved — no keyword conversions); `faber check exempla/nn-bridge` green; bridge printed pins unchanged in value (README row list must match reality); the bridge's known `linear_2x2` matmul red stays recorded as baseline in the README, not claimed green. Deletion dependency stays explicit: U4 deletes exactly these four nn names and only after this unit (plus U2) lands — no consumer may keep a live call to any of them |
 | `depends_on` | none |
 | `sanity` | `faber check` on the three touched packages (requires a built radix `faber`; if the workspace binary is absent, build radix first — environment precondition, report if blocked) |
 | `non_goals` | standing set + no library edits (nn.fab untouched here — wrappers still exist and still work; that is the point of callers-first), no bert exempla edits (U2), no oracle `reference.json`/receipt edits |
@@ -84,9 +84,9 @@ path-limited per repo.
 | field | value |
 | --- | --- |
 | `id` | GCB-W1-U3 |
-| `outcome` | One repo, one family, atomic: (a) `src/train.fab` — `train_step_2x2` and `train_step_4x4` delegate through `optimize._sgd_family` list form (the proven `train_step_bert_linear` pattern at train.fab:98-99): one `_sgd_family([weight, bias], [grad_weight, grad_bias], lr)` call for 2x2, one 4-element list call for 4x4, tuple re-packed as today; (b) `src/optimize.fab` — delete `sgd_step_2x2` (:130-140) and `sgd_step_4x4` (:142-152) with their section comments, and update the header ledger note (:17-19) append-only; (c) `src/optimize.proba` — replace the two direct `sgd_step_2x2`/`sgd_step_4x4` tests (:527-543) with `_sgd_family` single-element-list pins of the same `param − lr·grad` oracle values; (d) `src/train.proba` — test names/comments at :768-769, :875, :891 say "through optimize.sgd_step_2x2/4x4"; reword to the `_sgd_family` delegation (values/pins unchanged); (e) `exempla/training-loop-mlp/src/main.fab` comment-only touches (:22, :39, :321) — same rewording, no code change |
-| `write_scope` | `gradus` repo only: `src/train.fab`, `src/optimize.fab`, `src/optimize.proba`, `src/train.proba`, `exempla/training-loop-mlp/src/main.fab` |
-| `done_when` | Zero live calls or true claims naming `sgd_step_2x2`/`sgd_step_4x4` in gradus src/proba/exempla (grep; historical ledger text that explicitly records the retirement is fine); `train_step_2x2`/`train_step_4x4` signatures and tuple contracts unchanged; `faber check` green on gradus and `exempla/training-loop-mlp`; rewritten optimize.proba rows pass on the stepper |
+| `outcome` | One repo, one family, atomic: (a) `src/train.fab` — `train_step_2x2` and `train_step_4x4` delegate through `optimize._sgd_family` list form (the proven `train_step_bert_linear` pattern at train.fab:98-99): one `_sgd_family([weight, bias], [grad_weight, grad_bias], lr)` call for 2x2, one 4-element list call for 4x4, tuple re-packed as today; (b) `src/optimize.fab` — delete `sgd_step_2x2` (:130-140) and `sgd_step_4x4` (:142-152) with their section comments, and update the header ledger note (:17-19) append-only; (c) `src/optimize.proba` — replace the two direct `sgd_step_2x2`/`sgd_step_4x4` tests with their section comment (:523-543) by `_sgd_family` single-element-list pins of the same `param − lr·grad` oracle values, and reword the evidence-honesty header comment (:40, "(sgd_step_2x2/_4x4 and optimize.step)") to the surviving surfaces; (d) `src/train.proba` — test names/comments at :768-769, :875, :891 say "through optimize.sgd_step_2x2/4x4"; reword to the `_sgd_family` delegation (values/pins unchanged); (e) `exempla/training-loop-mlp/src/main.fab` comment-only touches (:22, :39, :321) — same rewording, no code change; (f) `src/optimize.fab` `_sgd_family` block comment (:113-116) — "Fixed-shape sgd_step_* and train_step_bert_* both delegate through this" is false after (b); reword to the post-deletion delegation truth; (g) `exempla/training-loop-mlp/README.md` — the three `train.train_step_4x4` → `optimize.sgd_step_4x4` route claims (:11, :21, :47) reworded to the `_sgd_family` list-form delegation. (e)-(g) are comment/prose-only: no code change |
+| `write_scope` | `gradus` repo only: `src/train.fab`, `src/optimize.fab`, `src/optimize.proba`, `src/train.proba`, `exempla/training-loop-mlp/src/main.fab`, `exempla/training-loop-mlp/README.md` |
+| `done_when` | Cross-reference grep over the **six** surfaces — `src/optimize.fab`, `src/optimize.proba`, `src/train.fab`, `src/train.proba`, `exempla/training-loop-mlp/src/main.fab`, `exempla/training-loop-mlp/README.md` — finds no active `sgd_step_2x2`/`sgd_step_4x4` call and no current delegation claim; the only remaining occurrences are explicitly marked retirement provenance (the `optimize.fab` header ledger note, updated append-only); `train_step_2x2`/`train_step_4x4` signatures and tuple contracts unchanged; `faber check` green on gradus and `exempla/training-loop-mlp`; rewritten optimize.proba rows pass on the stepper |
 | `depends_on` | none (parallel-safe with U1: disjoint files) |
 | `sanity` | `faber check` on gradus package root + `exempla/training-loop-mlp` |
 | `non_goals` | standing set + no new public `sgd_step<Figura>` (locked default in GOAL §Architecture direction — the need's alternative is not taken), no `train_step_*` renames or signature changes, no SgdState/step/wire surface changes, no bert train_step changes |
@@ -100,9 +100,9 @@ path-limited per repo.
 | field | value |
 | --- | --- |
 | `id` | GCB-W1-U4 |
-| `outcome` | Delete from `src/nn.fab`: `linear_2x2` (:98-116), `linear_4x4` (:119-125), `gelu_4x4` (:128-139), `gelu_2x8` (:178-189), and `linear_from_raw` (:366-381 — orphaned with `linear_2x2`, its only caller). Update the file header ledger (PML0-U3 admission note :23-33) append-only: rows 1-3 and 6 retired by this wave; `_staged` **stays** (live callers `linear_2x8`/`layernorm_2x8`, wave 2) |
+| `outcome` | Delete from `src/nn.fab`: `linear_2x2` (:98-116), `linear_4x4` (:119-125), `gelu_4x4` (:128-139), `gelu_2x8` (:178-189), and `linear_from_raw` (:366-381 — orphaned with `linear_2x2`, its only caller). Update the file header ledger (PML0-U3 admission note :23-33) append-only: rows 1-3 and 6 retired by this wave — the historical row text stays but each retired row is explicitly marked retired/historical; `_staged` **stays** (live callers `linear_2x8`/`layernorm_2x8`, wave 2). Also update the two current-prose surfaces that name deleted wrappers as live contracts: the S6-G1 header note (:13-15) drops `gelu_2x8` from the shipped-surface list (the generic `gelu` is the current surface; the S6-G1 row survives only as marked history), and the linear formula comment (:55-57) stops calling the same-shape `[M,N]` bias form "the linear_2x2 / linear_4x4 contract" (name the generic `linear<M,K,N>` same-shape bias form instead) |
 | `write_scope` | `gradus` repo only: `src/nn.fab` |
-| `done_when` | `grep -n "linear_2x2\|linear_4x4\|gelu_4x4\|gelu_2x8\|linear_from_raw" src/nn.fab` returns only the retirement ledger note; no alias or same-contract wrapper remains; `_staged`, `linear_carrier`, `gelu_carrier`, `linear_2x8`, `layernorm_2x8` untouched; `faber check` green on gradus package and `exempla/nn-bridge` |
+| `done_when` | `grep -n "linear_2x2\|linear_4x4\|gelu_4x4\|gelu_2x8\|linear_from_raw" src/nn.fab` returns exactly the enumerated retirement provenance — the PML0-U3 ledger rows 1-3 and 6, each explicitly marked retired/historical by the append-only ledger update, plus any appended retirement note — and nothing else; no current surface or contract comment names a deleted wrapper (the S6-G1 header note :13-15 and the linear formula comment :55-57 name the generic surface); no alias or same-contract wrapper remains; `_staged`, `linear_carrier`, `gelu_carrier`, `linear_2x8`, `layernorm_2x8` untouched; `faber check` green on gradus package and `exempla/nn-bridge` |
 | `depends_on` | GCB-W1-U1 (nn callers moved; nn-bridge no longer names the four), GCB-W1-U2 (bert gelu_2x8 rows moved) |
 | `sanity` | `faber check` on gradus package root + `exempla/nn-bridge` |
 | `non_goals` | standing set + no `@ kernel` annotation experiments on dying wrappers (KRS-2 blocker #1 is moot once deleted), no carrier deletions, no nn.proba edits (it never calls the fixed-shape rows — SEM006/SEM010; its header/test-name references to "accepted linear_2x2 proof" are oracle provenance and stay) |
@@ -116,9 +116,9 @@ path-limited per repo.
 | field | value |
 | --- | --- |
 | `id` | GCB-W1-U5 |
-| `outcome` | Delete `scaled_dot_product_2x8` from `src/attention.fab` (:50-64) with its section comment; update the header ledger (PML0-U3 row-12 admission note :36-40) and the compiler-boundary note (:134-135 "legacy scaled_dot_product_2x8 stays caller-backed") append-only: retired by this wave, `scaled_dot_product_static<B,D>` is the surface |
+| `outcome` | Delete `scaled_dot_product_2x8` from `src/attention.fab` (:50-64) with its section comment; update the header ledger (PML0-U3 row-12 admission note :36-40), the compiler-boundary note (:134-136, "legacy scaled_dot_product_2x8 stays caller-backed"), the PML3-U2 formula comment (:100-103, "the accepted scaled_dot_product_2x8 arithmetic"), and the top TOOLCHAIN NOTE (:29-34, "the legacy fixed-shape function below") so every current claim names `scaled_dot_product_static<B,D>` as the sole current typed surface — its body is identical statement-for-statement to the deleted wrapper (:57-64 vs :77-85), so the arithmetic description transfers unchanged; every retained mention of the old name is explicitly marked retirement/history, append-only |
 | `write_scope` | `gradus` repo only: `src/attention.fab` |
-| `done_when` | `grep -n "scaled_dot_product_2x8" src/attention.fab` returns only the retirement ledger note; `scaled_dot_product_static` untouched; `faber check` green on gradus package and both bert example packages |
+| `done_when` | No current claim or callable declaration for `scaled_dot_product_2x8` remains in `src/attention.fab`; every occurrence from `grep -n "scaled_dot_product_2x8" src/attention.fab` is explicitly marked retirement/history — the PML0-U3 row-12 ledger note (updated append-only), plus at most the capture-provenance mention in the formula comment if kept explicitly labeled historical — and the formula comment, compiler-boundary note, and TOOLCHAIN NOTE document `scaled_dot_product_static<B,D>` as the sole current typed surface; `scaled_dot_product_static` body untouched; `faber check` green on gradus package and both bert example packages |
 | `depends_on` | GCB-W1-U2 |
 | `sanity` | `faber check` on gradus package root |
 | `non_goals` | standing set + no attention.proba edits (its :20 reference is oracle-provenance comment; it never calls the wrapper — verified), no carrier attention surface changes, no KRS-6 work |
@@ -183,3 +183,43 @@ GOAL §Acceptance criteria).
    routing (no new public `sgd_step<Figura>`), callers-before-deletion
    ordering, Latin-surface example edits, KRS-2 lane branch `factory/krs-2`
    stays unmerged (its surviving value is wave-2 paper only).
+
+## Repair record — REVISE 8b86bc40 (task abddbbf0, 2026-08-28)
+
+Auditor report `8b86bc40` (assignment `e404f64f`, frozen head `f454dbb`)
+returned `revise` with six P2 findings; Mind task `abddbbf0` binds four
+(U1, U3, U4, U5 — the other two route elsewhere). Cards repaired in place
+above; every corrected claim was re-verified against live source at
+`f454dbb` (clean tree) before this record:
+
+1. **U1 (test-surface)** — done_when now enumerates all four retiring
+   symbols (`linear_2x2`, `linear_4x4`, `gelu_4x4`, nn-bridge `gelu_2x8`)
+   and requires zero live calls across the three training-file pairs and
+   nn-bridge, with the U4 deletion dependency explicit. Live evidence:
+   `exempla/nn-bridge/src/main.fab:133-140` (`nn.gelu_2x8` bridge call at
+   `:135`) and pin row `:231-245`.
+2. **U3 (interfaces)** — write scope adds
+   `exempla/training-loop-mlp/README.md`; outcome adds the `optimize.fab`
+   `_sgd_family` comment (:113-116), the `optimize.proba` header (:40) and
+   section comment (:523), and the README route claims; done_when is the
+   six-surface cross-reference grep with only marked retirement provenance.
+   Live evidence: `optimize.fab:115` ("Fixed-shape sgd_step_* … delegate
+   through this"), `optimize.proba:40`, README `:11`/`:21`/`:47`
+   (`train.train_step_4x4 → optimize.sgd_step_4x4`).
+3. **U4 (interfaces)** — done_when reconciled with the append-only ledger:
+   an enumerated explicitly-historical retirement set (PML0-U3 rows 1-3
+   and 6, marked retired) replaces "only the retirement ledger note"; no
+   current surface/contract comment may name a deleted wrapper; outcome
+   adds the S6-G1 header (:13-15 lists `gelu_2x8`) and the linear formula
+   comment (:55-57, "the linear_2x2 / linear_4x4 contract") updates.
+   Live evidence: `nn.fab:15`, `:55-57`, ledger `:21-33`, `linear_from_raw`
+   `:369-381`.
+4. **U5 (interfaces)** — same reconciliation: formula comment (:100-103),
+   compiler-boundary note (:134-136), and TOOLCHAIN NOTE (:29-34) must name
+   `scaled_dot_product_static<B,D>` as the sole current typed surface;
+   retained old-name occurrences are enumerated, explicitly marked
+   retirement/history. Live evidence: `attention.fab:29-34`, `:36-40`,
+   `:101`, `:134-136`; twin bodies identical `:57-64` vs `:77-85`.
+
+Findings 5 (U6 docs census) and 6 (factory goal status metadata) are not
+in this repair's scope; Mind routes them separately.
