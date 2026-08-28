@@ -1,6 +1,6 @@
 # GOAL: gradus-clean-break — shape-generic-only public API (wave 1)
 
-**Status**: active — wave-1 units U1-U6 done at factory/w1-u* lane branches (receipts in §Ledger); fold to main pending
+**Status**: active — wave 1 folded to main (arc #5); wave 2 in progress: twin bank U1-U5 + U8/U9 on main (arcs #8/#10), U6/U7 and the U10-U14 deletion chain gated on the MIR monomorphization fix (need cb6c7466, goal-forge in flight; U6 run-gate evidence 4ad678e6); wave 3 gated on wave-2 completion + SGD-1/2
 **Created**: 2026-08-28
 **Campaign:** `gradus-clean-break`
 **Source:** operator need `127f9fd6` + amendment `59b4074a` (settled); lowering task `4aa2f634`
