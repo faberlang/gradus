@@ -1,29 +1,16 @@
-+++
-locale = "en"
-+++
-# M6-U1 capstone scaffold + LIB-02-U4-1 tokenizer phase.
+# Qwen3.6 35B admission and tokenizer-phase exemplar.
 #
-# This is the public-Gradus application surface for the Qwen3.6 campaign. The
-# application owns the path and I/O: it resolves the operator-supplied model
-# path, measures the artifact size, validates the operator-supplied content
-# digest form and the pinned byte length, reads the independently bounded
-# header/table prefix once, admits the GGUF v3 manifest through the public
-# gradus:model/artifact and gradus:model/gguf_manifest surfaces, and fails
-# closed on any identity mismatch, short table-prefix read, or read that
-# would enter the tensor data region. Observed facts go to the optional
-# --receipt path.
+# Public entry: the `qwen36-35b-inference` executable package.
+# Depends on: gradus:model/artifact, gradus:model/gguf_manifest,
+# gradus:tokenizer, norma:process, norma:fs.
 #
-# LIB-02-U4-1 adds the TOKENIZER phase: after admission, the application
-# builds the artifact-backed runtime through the public `gradus:tokenizer`
-# surface (build), encodes the two pinned probes (raw-prompt rows, never
-# through the chat template) with the scanner + BPE core, decodes both id
-# lists back, and prints PASS rows when the observed rows equal the pinned
-# oracle. Any divergence names the first divergent id/character and fails
-# closed (campaign rule 5 divergence receipt). This unit performs no tensor
-# materialization, model forward, GPU execution, or full-capstone code beyond
-# the tokenizer phase. --prompt / --max-new-tokens / --seed belong to later
-# M6 capstone units; they are reserved in the CLI contract below and refused
-# here so this phase never claims their semantics.
+# The application owns the model path and file I/O. Gradus owns pathless model
+# semantics. The range seam keeps manifest inspection inside one bounded table
+# prefix so a parser request cannot read the tensor data region.
+#
+# WHY: this phase compares artifact-backed tokenizer observations with the
+# pinned probes, while refusing later capstone flags instead of claiming their
+# semantics before those phases exist.
 
 import from "gradus:model/artifact" artifact
 import from "gradus:model/gguf_manifest" gguf_manifest
@@ -31,11 +18,8 @@ import from "gradus:tokenizer" tokenizer
 import from "norma:process" process
 import from "norma:fs" fs
 
-# Campaign-pinned oracle facts for the exact artifact (independent GGUF
-# reader and the GGUF-A1b receipt; byte identity measured with `stat` and
-# `shasum -a 256`). The content digest arrives on the CLI because the FMIR
-# surface has no sha-256 primitive; the documented command re-derives it
-# with `shasum -a 256` and compares it to the pinned value.
+# --- pinned oracle ----------------
+
 const int ORACLE_LENGTH ← 22663387424
 const int ORACLE_VERSION ← 3
 const int ORACLE_ALIGNMENT ← 32
@@ -44,53 +28,42 @@ const int ORACLE_METADATA ← 55
 const int ORACLE_TENSORS ← 753
 const string ORACLE_ARCHITECTURE ← "qwen35moe"
 
-# LIB-02 pinned two-probe oracle (llama-tokenize 10150 `dee2a846b`, target
-# artifact; rows deterministic — see the delivery oracle section). The probes
-# are the operator text inputs; the observed id lists come from the runtime,
-# never from these pinned values (the stop-condition invariant).
 const string PROBE_A ← "สวัสดีครับ ผมชื่ออเล็กซ์"
 const string PROBE_B ← "你好，世界！今天是2026年8月13日 🎉"
 const list<int> PINNED_PROBE_A ← [34469, 168607, 153295, 173922, 153380, 22216, 151752, 172769]
 const list<int> PINNED_PROBE_B ← [109266, 3709, 96748, 6115, 113128, 17, 15, 17, 21, 95859, 23, 96212, 16, 18, 95971, 10838, 236, 231]
 
+# --- errors ----------------------
+
 union CapstoneError {
-    BadArguments { string message },
-    BadDigest { string message },
-    BadLength { string message },
-    ShortPrefix { string message },
-    BadManifest { string message },
-    AdmissionRejected { string message },
-    Divergence { string message }
+    @ shared
+    string message
+
+    BadArguments,
+    BadDigest,
+    BadLength,
+    ShortPrefix,
+    BadManifest,
+    AdmissionRejected,
+    Divergence
 }
 
-fn message(CapstoneError e) → string {
-    match e {
-        case BadArguments const message { return message }
-        case BadDigest const message { return message }
-        case BadLength const message { return message }
-        case ShortPrefix const message { return message }
-        case BadManifest const message { return message }
-        case AdmissionRejected const message { return message }
-        case Divergence const message { return message }
-    }
-}
+# --- artifact admission ----------
 
-# Application-owned range seam over the bounded table prefix. Gradus receives
-# only this function over the caller-owned buffer — never the path, the file
-# handle, or the prefix itself. A request whose end exceeds the prefix is a
-# tensor-data read and fails closed.
-fn _range(list<int> prefix, int start, int length) → bytes ⇥ gguf_manifest.GgufManifestError {
+# Keep the callback over caller-owned bytes. A request outside the prefix is a
+# tensor-data read and must fail before slicing.
+fn range(list<int> prefix, int start, int length) → bytes ⇥ gguf_manifest.GgufManifestError {
     if start < 0 or length < 0 or start > prefix.length() - length {
         throw variant BadSource {message = "read request exceeds the bounded table prefix — would enter the tensor data region"}
     }
     const list<int> segment ← prefix.slice(start, start + length)
-    const bytes bytes ← segment ↦ bytes
-    return bytes
+    const bytes segment_bytes ↤ segment
+    return segment_bytes
 }
 
-# Only ASCII digits are accepted for the operator offset operand; a malformed
-# number is a typed argument failure instead of a conversion panic.
-fn _digits(string s) → bool {
+# Restrict the operator offset to ASCII decimal text before conversion so a
+# malformed operand becomes a typed argument failure rather than a panic.
+fn digits(string s) → bool {
     if s.length() ≡ 0 then return false
     for from s const c {
         if not ((c ↦ string) between "0123456789") then return false
@@ -98,20 +71,16 @@ fn _digits(string s) → bool {
     return true
 }
 
-# Map the pathless identity validator's failure into the application error
-# vocabulary.
-fn _identity(string digest, int length) → artifact.ContentIdentity ⇥ CapstoneError {
+fn build_identity(string digest, int length) → artifact.ContentIdentity ⇥ CapstoneError {
     do {
         return artifact.identity("sha-256", digest, length)
     }
     catch err {
-        throw variant BadDigest { message = "content identity invalid: " + err.message }
+        throw variant BadDigest { message = "content identity invalid: §"(err.message) }
     }
 }
 
-# Admit the manifest through the public range seam. The failure is wrapped so
-# the application boundary names the manifest stage with the library cause.
-fn _admission(
+fn admission(
     (int, int) → bytes ⇥ gguf_manifest.GgufManifestError source,
     int artifact_length,
     artifact.ContentIdentity identity
@@ -120,61 +89,86 @@ fn _admission(
         return gguf_manifest.inspect(source, artifact_length, identity)
     }
     catch err {
-        throw variant BadManifest { message = "manifest admission failed: " + err.message }
+        throw variant BadManifest { message = "manifest admission failed: §"(err.message) }
     }
 }
 
-fn _architecture(gguf_manifest.GgufManifest m) → string ⇥ CapstoneError {
+fn read_architecture(gguf_manifest.GgufManifest m) → string ⇥ CapstoneError {
     do {
         return gguf_manifest.text(m, "general.architecture")
     }
     catch err {
-        throw variant BadManifest { message = "architecture fact read failed: " + err.message }
+        throw variant BadManifest { message = "architecture fact read failed: §"(err.message) }
     }
 }
 
-# Render an observed id list for the probe rows.
-fn _repr_ids(list<int> ids) → string {
+# --- tokenizer oracle ----------
+
+fn repr_ids(list<int> ids) → string {
     var string out ← "["
-    var int i ← 0
-    while i < ids.length() {
-        if i > 0 { out ← out + ", " }
-        out ← out + (ids.get(i) coalesce 0 ↦ string)
-        i ↑
+    var bool first ← true
+    for from ids const id {
+        if not first { out ← out + ", " }
+        out ← "§§"(out, id ↦ string)
+        first ← false
     }
-    return out + "]"
+    return "§]"(out)
 }
 
-# Divergence receipt for an id-list row: the first divergent id/character
-# names itself (campaign rule 5); identical rows return "" (PASS).
-fn _explain_divergence_ids(list<int> observed, list<int> pinned, string name) → string {
+fn explain_divergence_ids(list<int> observed, list<int> pinned, string name) → string {
     if observed.length() ≠ pinned.length() {
-        return "DIVERGENCE " + name + " length: expected " + (pinned.length() ↦ string) + ", observed " + (observed.length() ↦ string)
+        return "DIVERGENCE §{name} length: expected §{expected}, observed §{observed}"(
+            name: name,
+            expected: pinned.length() ↦ string,
+            observed: observed.length() ↦ string
+        )
     }
     var int i ← 0
-    while i < observed.length() {
-        if (observed.get(i) coalesce 0) ≠ (pinned.get(i) coalesce 0) {
-            return "DIVERGENCE " + name + " first divergent id at index " + (i ↦ string) + ": expected " + ((pinned.get(i) coalesce 0) ↦ string) + ", observed " + ((observed.get(i) coalesce 0) ↦ string)
+    for from observed, pinned const observed_id, pinned_id {
+        if observed_id ≠ pinned_id {
+            return "DIVERGENCE §{name} first divergent id at index §{index}: expected §{expected}, observed §{observed}"(
+                name: name,
+                index: i ↦ string,
+                expected: pinned_id ↦ string,
+                observed: observed_id ↦ string
+            )
         }
         i ↑
     }
     return ""
 }
 
-# Divergence receipt for a decoded-text row (byte-level round-trip).
-fn _explain_divergence_text(string observed, string pinned, string name) → string {
-    if observed ≡ pinned {
-        return ""
-    }
+fn explain_divergence_text(string observed, string pinned, string name) → string {
+    if observed ≡ pinned then return ""
     var int i ← 0
-    while i < pinned.length() and i < observed.length() {
-        if observed.slice(i, i + 1) ≠ pinned.slice(i, i + 1) {
-            return "DIVERGENCE " + name + " first divergent character at index " + (i ↦ string) + ": expected '" + pinned.slice(i, i + 1) + "', observed '" + observed.slice(i, i + 1) + "'"
+    for from pinned const expected_character {
+        if i ≥ observed.length() {
+            return "DIVERGENCE §{name} length: expected §{expected}, observed §{observed}"(
+                name: name,
+                expected: pinned.length() ↦ string,
+                observed: observed.length() ↦ string
+            )
+        }
+        const string observed_character ← observed.slice(i, i + 1)
+        const string expected_text ← expected_character ↦ string
+        if observed_character ≠ expected_text {
+            return "DIVERGENCE §{name} first divergent character at index §{index}: expected '§{expected}', observed '§{observed}'"(
+                name: name,
+                index: i ↦ string,
+                expected: expected_text,
+                observed: observed_character
+            )
         }
         i ↑
     }
-    return "DIVERGENCE " + name + " length: expected " + (pinned.length() ↦ string) + ", observed " + (observed.length() ↦ string)
+    return "DIVERGENCE §{name} length: expected §{expected}, observed §{observed}"(
+        name: name,
+        expected: pinned.length() ↦ string,
+        observed: observed.length() ↦ string
+    )
 }
+
+# --- executable phase -----------
 
 main {
     do {
@@ -203,15 +197,15 @@ main {
                     throw variant BadArguments { message = "--oracle-offset requires a numeric operand" }
                 }
                 const string operand ← args.get(i + 1) coalesce ""
-                if not (_digits(operand)) {
-                    throw variant BadArguments { message = "--oracle-offset must be a non-negative integer: " + operand }
+                if not (digits(operand)) {
+                    throw variant BadArguments { message = "--oracle-offset must be a non-negative integer: §"(operand) }
                 }
                 var int offset_lectum ← 0
                 do {
-                    offset_lectum ← operand ↦ int
+                    offset_lectum ↤ operand
                 }
                 catch err {
-                    throw variant BadArguments { message = "--oracle-offset could not be read as an integer: " + err }
+                    throw variant BadArguments { message = "--oracle-offset could not be read as an integer: §"(err.message) }
                 }
                 oracle_offset ← offset_lectum
                 i ← i + 2
@@ -222,11 +216,11 @@ main {
                 receptum ← args.get(i + 1) coalesce ""
                 i ← i + 2
             } elif arg ≡ "--prompt" or arg ≡ "--max-new-tokens" or arg ≡ "--seed" {
-                throw variant BadArguments { message = arg + " is reserved for later M6 capstone units and is not implemented by the tokenizer phase" }
+                throw variant BadArguments { message = "§ is reserved for later M6 capstone units and is not implemented by the tokenizer phase"(arg) }
             } elif arg.starts_with("--") {
-                throw variant BadArguments { message = "unknown flag: " + arg }
+                throw variant BadArguments { message = "unknown flag: §"(arg) }
             } else {
-                throw variant BadArguments { message = "unexpected positional argument: " + arg }
+                throw variant BadArguments { message = "unexpected positional argument: §"(arg) }
             }
         }
         if digest ≡ "" {
@@ -234,145 +228,147 @@ main {
         }
 
         const int total ← fs.byte_length(via)
-        const artifact.ContentIdentity identity ← _identity(digest, total)
+        const artifact.ContentIdentity identity ← build_identity(digest, total)
         const bytes prefix_bytes ← fs.read_range(via, 0, oracle_offset)
         if prefix_bytes.length() ≠ oracle_offset {
-            throw variant ShortPrefix { message = "short table-prefix read: expected " + (oracle_offset ↦ string) + " bytes, observed " + (prefix_bytes.length() ↦ string) }
+            throw variant ShortPrefix { message = "short table-prefix read: expected § bytes, observed §"(oracle_offset ↦ string, prefix_bytes.length() ↦ string) }
         }
         if total ≠ ORACLE_LENGTH {
-            throw variant BadLength { message = "byte length mismatch: expected " + (ORACLE_LENGTH ↦ string) + ", observed " + (total ↦ string) }
+            throw variant BadLength { message = "byte length mismatch: expected §, observed §"(ORACLE_LENGTH ↦ string, total ↦ string) }
         }
         const value prefix_payload ← prefix_bytes ↦ value
         var list<int> prefix ← empty
         do {
-            prefix ← prefix_payload ↦ list<int>
+            prefix ↤ prefix_payload
         }
         catch err {
-            throw variant BadManifest { message = "table-prefix carrier conversion failed: " + err }
+            throw variant BadManifest { message = "table-prefix carrier conversion failed: §"(err.message) }
         }
-        const gguf_manifest.GgufManifest m ← _admission(
-            (int start, int length) → bytes ⇥ gguf_manifest.GgufManifestError ∴ _range(prefix, start, length),
+        const gguf_manifest.GgufManifest m ← admission(
+            (int start, int length) → bytes ⇥ gguf_manifest.GgufManifestError ∴ range(prefix, start, length),
             total,
             identity
         )
 
         if m.version ≠ ORACLE_VERSION {
-            throw variant AdmissionRejected { message = "first mismatched fact: version — expected " + (ORACLE_VERSION ↦ string) + ", observed " + (m.version ↦ string) }
+            throw variant AdmissionRejected { message = "first mismatched fact: version — expected §, observed §"(ORACLE_VERSION ↦ string, m.version ↦ string) }
         }
         if m.alignment ≠ ORACLE_ALIGNMENT {
-            throw variant AdmissionRejected { message = "first mismatched fact: alignment — expected " + (ORACLE_ALIGNMENT ↦ string) + ", observed " + (m.alignment ↦ string) }
+            throw variant AdmissionRejected { message = "first mismatched fact: alignment — expected §, observed §"(ORACLE_ALIGNMENT ↦ string, m.alignment ↦ string) }
         }
         if m.data_start ≠ oracle_offset {
-            throw variant AdmissionRejected { message = "first mismatched fact: data offset — expected " + (oracle_offset ↦ string) + ", observed " + (m.data_start ↦ string) }
+            throw variant AdmissionRejected { message = "first mismatched fact: data offset — expected §, observed §"(oracle_offset ↦ string, m.data_start ↦ string) }
         }
         if m.metadata.length() ≠ ORACLE_METADATA {
-            throw variant AdmissionRejected { message = "first mismatched fact: metadata count — expected " + (ORACLE_METADATA ↦ string) + ", observed " + (m.metadata.length() ↦ string) }
+            throw variant AdmissionRejected { message = "first mismatched fact: metadata count — expected §, observed §"(ORACLE_METADATA ↦ string, m.metadata.length() ↦ string) }
         }
         if m.tensors.length() ≠ ORACLE_TENSORS {
-            throw variant AdmissionRejected { message = "first mismatched fact: tensor count — expected " + (ORACLE_TENSORS ↦ string) + ", observed " + (m.tensors.length() ↦ string) }
+            throw variant AdmissionRejected { message = "first mismatched fact: tensor count — expected §, observed §"(ORACLE_TENSORS ↦ string, m.tensors.length() ↦ string) }
         }
-        const string architecture ← _architecture(m)
+        const string architecture ← read_architecture(m)
         if architecture ≠ ORACLE_ARCHITECTURE {
-            throw variant AdmissionRejected { message = "first mismatched fact: architecture — expected " + ORACLE_ARCHITECTURE + ", observed " + architecture }
+            throw variant AdmissionRejected { message = "first mismatched fact: architecture — expected §, observed §"(ORACLE_ARCHITECTURE, architecture) }
         }
 
-        print "PASS version=" + (m.version ↦ string)
-            + " alignment=" + (m.alignment ↦ string)
-            + " data=" + (m.data_start ↦ string)
-            + " metadata=" + (m.metadata.length() ↦ string)
-            + " tensors=" + (m.tensors.length() ↦ string)
-            + " architecture=" + architecture
-        print "PASS bytes=" + (total ↦ string)
-        print "RECORDED sha256=" + digest + " (content re-derived externally via shasum -a 256)"
+        print "PASS version=§{version} alignment=§{alignment} data=§{data} metadata=§{metadata} tensors=§{tensors} architecture=§{architecture}"(
+            version: m.version ↦ string,
+            alignment: m.alignment ↦ string,
+            data: m.data_start ↦ string,
+            metadata: m.metadata.length() ↦ string,
+            tensors: m.tensors.length() ↦ string,
+            architecture: architecture
+        )
+        print "PASS bytes=§"(total ↦ string)
+        print "RECORDED sha256=§ (content re-derived externally via shasum -a 256)"(digest)
         print "ADMISSION PASS"
 
-        # --- Tokenizer phase (LIB-02-U4-1) ---
+        # --- tokenizer phase ----------------
+
         var tokenizer.Tokenizer t ← tokenizer.Tokenizer {words = empty, vocab = empty, concursus = empty, special_texts = empty, specialia_ids = empty, eog = empty, add_bos = false, chat_template = "", multitudo = 0}
         do {
             t ← tokenizer.build(m)
         }
         catch err {
-            throw variant BadManifest { message = "tokenizer runtime build failed" }
+            throw variant BadManifest { message = "tokenizer runtime build failed: §"(err.message) }
         }
-        print "TOKENIZER vocab=" + (t.multitudo ↦ string) + " (artifact-backed runtime, public gradus:tokenizer surface)"
+        print "TOKENIZER vocab=§ (artifact-backed runtime, public gradus:tokenizer surface)"(t.multitudo ↦ string)
 
         var list<int> ids_a ← empty
         do {
             ids_a ← tokenizer.encode_prompt(t, PROBE_A)
         }
         catch err {
-            throw variant BadManifest { message = "Probe A encode failed" }
+            throw variant BadManifest { message = "Probe A encode failed: §"(err.message) }
         }
-        const string div_a ← _explain_divergence_ids(ids_a, PINNED_PROBE_A, "Probe A encode")
+        const string div_a ← explain_divergence_ids(ids_a, PINNED_PROBE_A, "Probe A encode")
         if not (div_a ≡ "") {
             throw variant Divergence { message = div_a }
         }
-        print "PASS Probe A encode -> " + _repr_ids(ids_a)
+        print "PASS Probe A encode -> §"(repr_ids(ids_a))
 
         var list<int> ids_b ← empty
         do {
             ids_b ← tokenizer.encode_prompt(t, PROBE_B)
         }
         catch err {
-            throw variant BadManifest { message = "Probe B encode failed" }
+            throw variant BadManifest { message = "Probe B encode failed: §"(err.message) }
         }
-        const string div_b ← _explain_divergence_ids(ids_b, PINNED_PROBE_B, "Probe B encode")
+        const string div_b ← explain_divergence_ids(ids_b, PINNED_PROBE_B, "Probe B encode")
         if not (div_b ≡ "") {
             throw variant Divergence { message = div_b }
         }
-        print "PASS Probe B encode -> " + _repr_ids(ids_b)
+        print "PASS Probe B encode -> §"(repr_ids(ids_b))
 
         var string dec_a ← ""
         do {
             dec_a ← tokenizer.decode(t, ids_a)
         }
         catch err {
-            throw variant BadManifest { message = "Probe A decode failed" }
+            throw variant BadManifest { message = "Probe A decode failed: §"(err.message) }
         }
-        const string div_dec_a ← _explain_divergence_text(dec_a, PROBE_A, "Probe A decode")
+        const string div_dec_a ← explain_divergence_text(dec_a, PROBE_A, "Probe A decode")
         if not (div_dec_a ≡ "") {
             throw variant Divergence { message = div_dec_a }
         }
-        print "PASS Probe A decode -> " + dec_a
+        print "PASS Probe A decode -> §"(dec_a)
 
         var string dec_b ← ""
         do {
             dec_b ← tokenizer.decode(t, ids_b)
         }
         catch err {
-            throw variant BadManifest { message = "Probe B decode failed" }
+            throw variant BadManifest { message = "Probe B decode failed: §"(err.message) }
         }
-        const string div_dec_b ← _explain_divergence_text(dec_b, PROBE_B, "Probe B decode")
+        const string div_dec_b ← explain_divergence_text(dec_b, PROBE_B, "Probe B decode")
         if not (div_dec_b ≡ "") {
             throw variant Divergence { message = div_dec_b }
         }
-        print "PASS Probe B decode -> " + dec_b
+        print "PASS Probe B decode -> §"(dec_b)
 
         print "TOKENIZER PHASE PASS"
 
         if not (receptum ≡ "") {
-            var string contentum ← "qwen36-35b-inference tokenizer-phase receipt\n"
-                + "artifact: " + via + "\n"
-                + "bytes: " + (total ↦ string) + "\n"
-                + "sha256: " + digest + "\n"
-                + "version: " + (m.version ↦ string) + "\n"
-                + "alignment: " + (m.alignment ↦ string) + "\n"
-                + "data offset: " + (m.data_start ↦ string) + "\n"
-                + "metadata: " + (m.metadata.length() ↦ string) + "\n"
-                + "tensors: " + (m.tensors.length() ↦ string) + "\n"
-                + "architecture: " + architecture + "\n"
-                + "tokenizer vocab: " + (t.multitudo ↦ string) + "\n"
-                + "Probe A: " + _repr_ids(ids_a) + "\n"
-                + "Probe B: " + _repr_ids(ids_b) + "\n"
-                + "Probe A decode: " + dec_a + "\n"
-                + "Probe B decode: " + dec_b + "\n"
-                + "result: PASS\n"
-                + "reserved flags (--prompt/--max-new-tokens/--seed) are not implemented by the tokenizer phase\n"
+            const string contentum ← "qwen36-35b-inference tokenizer-phase receipt\nartifact: §{artifact}\nbytes: §{bytes}\nsha256: §{sha256}\nversion: §{version}\nalignment: §{alignment}\ndata offset: §{data_offset}\nmetadata: §{metadata}\ntensors: §{tensors}\narchitecture: §{architecture}\ntokenizer vocab: §{vocab}\nProbe A: §{probe_a}\nProbe B: §{probe_b}\nProbe A decode: §{decode_a}\nProbe B decode: §{decode_b}\nresult: PASS\nreserved flags (--prompt/--max-new-tokens/--seed) are not implemented by the tokenizer phase\n"(
+                artifact: via,
+                bytes: total ↦ string,
+                sha256: digest,
+                version: m.version ↦ string,
+                alignment: m.alignment ↦ string,
+                data_offset: m.data_start ↦ string,
+                metadata: m.metadata.length() ↦ string,
+                tensors: m.tensors.length() ↦ string,
+                architecture: architecture,
+                vocab: t.multitudo ↦ string,
+                probe_a: repr_ids(ids_a),
+                probe_b: repr_ids(ids_b),
+                decode_a: dec_a,
+                decode_b: dec_b
+            )
             fs.write_file(receptum, contentum)
-            print "RECEIPT " + receptum
+            print "RECEIPT §"(receptum)
         }
     }
     catch err {
-        panic "capstone run failed: " + message(err)
+        panic "capstone run failed: §"(err.message)
     }
 }
