@@ -37,56 +37,38 @@ const int QWEN36_DATA ← 10991392
 # Band: Delta = clamp(10·R, 1e-5, 5e-4) with R = 6.37256e-08 (U2 oracle
 # header). Tolerances are never widened; any mismatch is a divergence
 # receipt naming the first divergent element.
-const f32 DELTA ← 0.00001 ∷ f32
+const f32 DELTA ← 0.00001
 
 union ProbeError {
-    BadArguments { string message },
-    BadIdentity { string message },
-    BadAdmission { string message },
-    BadProbeWindow { string message },
-    BadDivergence { string message }
-}
+    @ shared
+    string message
 
-fn message(ProbeError e) → string {
-    match e {
-        case BadArguments const message { return message }
-        case BadIdentity const message { return message }
-        case BadAdmission const message { return message }
-        case BadProbeWindow const message { return message }
-        case BadDivergence const message { return message }
-    }
+    BadArguments,
+    BadIdentity,
+    BadAdmission,
+    BadProbeWindow,
+    BadDivergence
 }
 
 # Application-owned range source: one bounded read, checked against the
 # artifact length (the gguf-materialize pattern).
-fn _range(string via, int total, int start, int length) → bytes ⇥ gguf_manifest.GgufManifestError {
-    if start < 0 or length < 0 or start > total - length {
-        throw variant BadSource {message = "range request exceeds the artifact"}
-    }
+fn bounded_read(string via, int total, int start, int length) → bytes ⇥ gguf_manifest.GgufManifestError {
+    reject start ≺ 0 or length ≺ 0 or start ≻ total - length throw variant BadSource { message = "range request exceeds the artifact" }
     const bytes bytes ← fs.read_range(via, start, length)
-    if bytes.length() ≠ length {
-        throw variant BadSource {message = "short range read"}
-    }
+    require bytes.length() ≡ length throw variant BadSource { message = "short range read" }
     return bytes
-}
-
-fn _ends_with(string s, string suffix) → bool {
-    if s.length() < suffix.length() {
-        return false
-    }
-    return s.slice(s.length() - suffix.length(), s.length()) ≡ suffix
 }
 
 # Carrier shape per canonical name (delivery §3 layout contract; the module
 # checks the returned shape, so this mapping is the adapter's declaration).
-fn _carrier_shape(string name) → list<int> {
-    if _ends_with(name, "ffn_gate_inp_shexp") {
+fn carrier_shape(string name) → list<int> {
+    if name.ends_with("ffn_gate_inp_shexp") {
         return [2048]
     }
-    if _ends_with(name, "ffn_gate_inp") {
+    if name.ends_with("ffn_gate_inp") {
         return [256, 2048]
     }
-    if _ends_with(name, "ffn_down_exps") or _ends_with(name, "ffn_down_shexp") {
+    if name.ends_with("ffn_down_exps") or name.ends_with("ffn_down_shexp") {
         return [2048, 512]
     }
     # ffn_gate_exps / ffn_up_exps / ffn_gate_shexp / ffn_up_shexp
@@ -95,34 +77,37 @@ fn _carrier_shape(string name) → list<int> {
 
 # Wrappers: each library error type maps to the single app-level ProbeError
 # so every do/catch handler sees one union (the gguf-materialize pattern).
-fn _identity(string digest, int length) → artifact.ContentIdentity ⇥ ProbeError {
+# Not @ conversion rows: one source union feeds different variants with
+# per-call context (which tensor, which stage), which a single seam row
+# cannot express.
+fn content_identity(string digest, int length) → artifact.ContentIdentity ⇥ ProbeError {
     do {
         return artifact.identity("sha-256", digest, length)
     }
     catch err {
-        throw variant BadIdentity { message = "content identity invalid: " + err.message }
+        throw variant BadIdentity { message = "content identity invalid: §"(err.message) }
     }
 }
 
-fn _plimit(gguf_manifest.GgufManifest m, string name) → tuple<int, int> ⇥ ProbeError {
+fn payload_window(gguf_manifest.GgufManifest m, string name) → tuple<int, int> ⇥ ProbeError {
     do {
         return gguf_manifest.payload_limit(m, name)
     }
     catch err {
-        throw variant BadProbeWindow { message = "payload range failed for " + name + ": " + err.message }
+        throw variant BadProbeWindow { message = "payload range failed for §{tensor}: §{detail}"(tensor: name, detail: err.message) }
     }
 }
 
-fn _links(gguf_manifest.GgufManifest m, tensor_payload.TensorPayload p) → tensor_view.TensorView ⇥ ProbeError {
+fn links(gguf_manifest.GgufManifest m, tensor_payload.TensorPayload p) → tensor_view.TensorView ⇥ ProbeError {
     do {
         return tensor_view.links(m, p)
     }
     catch err {
-        throw variant BadProbeWindow { message = "view bind failed for " + p.name + ": " + err.message }
+        throw variant BadProbeWindow { message = "view bind failed for §{tensor}: §{detail}"(tensor: p.name, detail: err.message) }
     }
 }
 
-fn _slice(
+fn slice(
     tensor_view.TensorView v,
     int start,
     int length,
@@ -132,16 +117,16 @@ fn _slice(
         return tensor_view.materialize_slice(v, start, length, source)
     }
     catch err {
-        throw variant BadProbeWindow { message = "window materialize failed for " + v.name + ": " + err.message }
+        throw variant BadProbeWindow { message = "window materialize failed for §{tensor}: §{detail}"(tensor: v.name, detail: err.message) }
     }
 }
 
-fn _construct(list<f32> y, list<int> shape) → tensor.NumericBlock ⇥ ProbeError {
+fn construct(list<f32> y, list<int> shape) → tensor.NumericBlock ⇥ ProbeError {
     do {
         return tensor.construct(y, shape)
     }
     catch err {
-        throw variant BadProbeWindow { message = "carrier construction failed" }
+        throw variant BadProbeWindow { message = "carrier construction failed: §"(err.message) }
     }
 }
 
@@ -149,38 +134,35 @@ fn _construct(list<f32> y, list<int> shape) → tensor.NumericBlock ⇥ ProbeErr
 # tensor's payload as a view, materialize the requested element window
 # (bounded byte sub-reads + dequant inside tensor_view), and wrap the
 # storage-order window as the declared carrier.
-fn _moe_window(string via, int total, gguf_manifest.GgufManifest m, string name, int start, int length) → tensor.NumericBlock ⇥ moe.MoeError {
-    const (int, int) → bytes ⇥ gguf_manifest.GgufManifestError reader ← (int begin, int span) → bytes ⇥ gguf_manifest.GgufManifestError ∴ _range(via, total, begin, span)
+fn moe_window(string via, int total, gguf_manifest.GgufManifest m, string name, int start, int length) → tensor.NumericBlock ⇥ moe.MoeError {
+    const _ reader ← (int begin, int span) → bytes ⇥ gguf_manifest.GgufManifestError ∴ bounded_read(via, total, begin, span)
     do {
-        const tuple<int, int> limit ← _plimit(m, name + ".weight")
+        const tuple<start: int, span: int> window ← payload_window(m, name + ".weight")
         const tensor_payload.TensorPayload p ← tensor_payload.TensorPayload {
             name = name + ".weight",
-            absolute_start = limit[0],
-            length = limit[1],
+            absolute_start = window.start,
+            length = window.span,
             bytes = ||
         }
-        const tensor_view.TensorView v ← _links(m, p)
-        const list<f32> y ← _slice(v, start, length, reader)
-        var tensor.NumericBlock carrier ← tensor.default()
-        carrier ← _construct(y, _carrier_shape(name))
-        return carrier
+        const tensor_view.TensorView v ← links(m, p)
+        const list<f32> y ← slice(v, start, length, reader)
+        return construct(y, carrier_shape(name))
     }
     catch err {
-        const string detail ← message(err)
-        throw variant BadWindow { message = detail }
+        throw variant BadWindow { message = err.message }
     }
 }
 
-fn _parse_number(string s) → int ⇥ ProbeError {
+fn parse_number(string s) → int ⇥ ProbeError {
     do {
         return s ↦ int
     }
     catch err {
-        throw variant BadArguments { message = "data-offset operand is not a number: " + s }
+        throw variant BadArguments { message = "data-offset operand is not a number: §"(s) }
     }
 }
 
-fn _admit(gguf_manifest.GgufCorpus corpus, string digest, int total) → qwen35moe.Qwen35moeAdmission ⇥ ProbeError {
+fn admit(gguf_manifest.GgufCorpus corpus, string digest, int total) → qwen35moe.Qwen35moeAdmission ⇥ ProbeError {
     do {
         return qwen35moe.admit(corpus, digest, total)
     }
@@ -189,13 +171,11 @@ fn _admit(gguf_manifest.GgufCorpus corpus, string digest, int total) → qwen35m
     }
 }
 
-fn _corpus(string via, int total, string digest) → gguf_manifest.GgufCorpus ⇥ ProbeError {
+fn corpus(string via, int total, string digest) → gguf_manifest.GgufCorpus ⇥ ProbeError {
     do {
-        const artifact.ContentIdentity identity ← _identity(digest, total)
+        const artifact.ContentIdentity identity ← content_identity(digest, total)
         const bytes prefix_bytes ← fs.read_range(via, 0, QWEN36_DATA)
-        if prefix_bytes.length() ≠ QWEN36_DATA {
-            throw variant BadAdmission { message = "short table-prefix read" }
-        }
+        require prefix_bytes.length() ≡ QWEN36_DATA throw variant BadAdmission { message = "short table-prefix read" }
         return gguf_manifest.GgufCorpus {
             table = prefix_bytes,
             artifact_length = total,
@@ -203,11 +183,11 @@ fn _corpus(string via, int total, string digest) → gguf_manifest.GgufCorpus �
         }
     }
     catch err {
-        throw variant BadAdmission { message = message(err) }
+        throw variant BadAdmission { message = err.message }
     }
 }
 
-fn _route(
+fn route(
     tensor.NumericBlock x,
     int layer,
     string via,
@@ -216,14 +196,14 @@ fn _route(
     moe.MoeConfig cfg
 ) → moe.MoeSelection ⇥ ProbeError {
     do {
-        return moe.route(x, layer, (string name, int start, int length) → tensor.NumericBlock ⇥ moe.MoeError ∴ _moe_window(via, total, m, name, start, length), cfg)
+        return moe.route(x, layer, (string name, int start, int length) → tensor.NumericBlock ⇥ moe.MoeError ∴ moe_window(via, total, m, name, start, length), cfg)
     }
     catch err {
         throw variant BadProbeWindow { message = err.message }
     }
 }
 
-fn _ffn_moe(
+fn ffn_moe(
     tensor.NumericBlock x,
     int layer,
     string via,
@@ -232,14 +212,14 @@ fn _ffn_moe(
     moe.MoeConfig cfg
 ) → tensor.NumericBlock ⇥ ProbeError {
     do {
-        return moe.ffn_moe(x, layer, (string name, int start, int length) → tensor.NumericBlock ⇥ moe.MoeError ∴ _moe_window(via, total, m, name, start, length), cfg)
+        return moe.ffn_moe(x, layer, (string name, int start, int length) → tensor.NumericBlock ⇥ moe.MoeError ∴ moe_window(via, total, m, name, start, length), cfg)
     }
     catch err {
         throw variant BadProbeWindow { message = err.message }
     }
 }
 
-fn _config(qwen35moe.Qwen35moeConfig c) → moe.MoeConfig {
+fn config(qwen35moe.Qwen35moeConfig c) → moe.MoeConfig {
     return moe.MoeConfig {
         expert_count = c.expert_count,
         expert_used_count = c.expert_used_count,
@@ -249,7 +229,7 @@ fn _config(qwen35moe.Qwen35moeConfig c) → moe.MoeConfig {
     }
 }
 
-fn _manifest(
+fn manifest(
     (int, int) → bytes ⇥ gguf_manifest.GgufManifestError source,
     int total,
     artifact.ContentIdentity identity
@@ -258,121 +238,87 @@ fn _manifest(
         return gguf_manifest.inspect(source, total, identity)
     }
     catch err {
-        throw variant BadAdmission { message = "manifest admission failed: " + err.message }
+        throw variant BadAdmission { message = "manifest admission failed: §"(err.message) }
     }
 }
 
-fn _hidden(list<f32> probe) → tensor.NumericBlock ⇥ ProbeError {
-    return _construct(probe, [1, 2048])
+fn hidden(list<f32> probe_input) → tensor.NumericBlock ⇥ ProbeError {
+    return construct(probe_input, [1, 2048])
 }
 
-fn _abs(f32 v) → f32 {
-    if v < 0.0 ∷ f32 {
-        return -v
-    }
-    return v
-}
-
-fn _int_list(list<int> xs) → string {
+fn int_list(list<int> xs) → string {
     var string out ← "["
-    var int i ← 0
-    while i < xs.length() {
-        if i > 0 { out ← out + "," }
-        out ← out + ((xs.get(i) coalesce 0) ↦ string)
-        i ↑
+    var bool first ← true
+    for from xs const x {
+        if not first { out ← out + "," }
+        out ← out + (x ↦ string)
+        first ← false
     }
     return out + "]"
 }
 
-fn _f32_list(list<f32> xs) → string {
+fn f32_list(list<f32> xs) → string {
     var string out ← "["
-    var int i ← 0
-    while i < xs.length() {
-        if i > 0 { out ← out + "," }
-        out ← out + ((xs.get(i) coalesce (0.0 ∷ f32)) ↦ string)
-        i ↑
+    var bool first ← true
+    for from xs const x {
+        if not first { out ← out + "," }
+        out ← out + (x ↦ string)
+        first ← false
     }
     return out + "]"
 }
 
 # One (layer, probe) row: route + ffn_moe on the real artifact, indices
 # exact, weights and FFN output under Delta, first divergence named.
-fn _probe(
+fn probe(
     string via,
     int total,
     gguf_manifest.GgufManifest m,
     moe.MoeConfig cfg,
     int layer,
     string probe_name,
-    list<f32> probe,
+    list<f32> probe_input,
     list<int> golden_indices,
     list<f32> golden_weights,
     list<f32> golden_ffn
 ) → string ⇥ ProbeError {
     do {
-        const tensor.NumericBlock x ← _hidden(probe)
-        const moe.MoeSelection selection ← _route(x, layer, via, total, m, cfg)
-        const tensor.NumericBlock out ← _ffn_moe(x, layer, via, total, m, cfg)
+        const tensor.NumericBlock x ← hidden(probe_input)
+        const moe.MoeSelection selection ← route(x, layer, via, total, m, cfg)
+        const tensor.NumericBlock out ← ffn_moe(x, layer, via, total, m, cfg)
 
-        # Router indices: exact, in selection order.
-        if selection.indices.length() ≠ golden_indices.length() {
-            throw variant BadDivergence { message = "index count mismatch at layer " + (layer ↦ string) + " probe " + probe_name }
-        }
-        var int i ← 0
-        while i < golden_indices.length() {
-            if (selection.indices.get(i) coalesce -1) ≠ (golden_indices.get(i) coalesce -1) {
-                throw variant BadDivergence { message = "index divergence at slot " + (i ↦ string) + " of layer " + (layer ↦ string) + " probe " + probe_name + ": observed " + ((selection.indices.get(i) coalesce -1) ↦ string) + " expected " + ((golden_indices.get(i) coalesce -1) ↦ string) }
-            }
-            i ← i + 1
+        # --- router indices (exact, selection order) -----------------------
+        reject selection.indices.length() ≠ golden_indices.length() throw variant BadDivergence { message = "index count mismatch at layer §{layer} probe §{probe}"(layer: layer, probe: probe_name) }
+        for from selection.indices, golden_indices at [slot] const observed, expected {
+            reject observed ≠ expected throw variant BadDivergence { message = "index divergence at slot §{slot} of layer §{layer} probe §{probe}: observed §{observed} expected §{expected}"(slot: slot, layer: layer, probe: probe_name, observed: observed, expected: expected) }
         }
 
-        # Weights: under Delta.
-        i ← 0
-        while i < golden_weights.length() {
-            const f32 observed ← selection.weights.get(i) coalesce (0.0 ∷ f32)
-            const f32 expected ← golden_weights.get(i) coalesce (0.0 ∷ f32)
-            if _abs(observed - expected) ≻ DELTA {
-                throw variant BadDivergence { message = "weight divergence at slot " + (i ↦ string) + " of layer " + (layer ↦ string) + " probe " + probe_name + ": observed " + (observed ↦ string) + " expected " + (expected ↦ string) }
-            }
-            i ← i + 1
+        # --- router weights (under Delta) ----------------------------------
+        reject selection.weights.length() ≠ golden_weights.length() throw variant BadDivergence { message = "weight count mismatch at layer §{layer} probe §{probe}"(layer: layer, probe: probe_name) }
+        for from selection.weights, golden_weights at [slot] const observed, expected {
+            reject (observed - expected).abs() ≻ DELTA throw variant BadDivergence { message = "weight divergence at slot §{slot} of layer §{layer} probe §{probe}: observed §{observed} expected §{expected}"(slot: slot, layer: layer, probe: probe_name, observed: observed, expected: expected) }
         }
 
-        # FFN output: under Delta, first divergence named, max deviation kept.
-        if out.data.length() ≠ golden_ffn.length() {
-            throw variant BadDivergence { message = "FFN output length mismatch at layer " + (layer ↦ string) + " probe " + probe_name }
-        }
-        i ← 0
-        var f32 max_dev ← 0.0 ∷ f32
-        while i < golden_ffn.length() {
-            const f32 observed ← out.data.get(i) coalesce (0.0 ∷ f32)
-            const f32 expected ← golden_ffn.get(i) coalesce (0.0 ∷ f32)
-            const f32 dev ← _abs(observed - expected)
-            if dev ≻ max_dev {
-                max_dev ← dev
-            }
-            if dev ≻ DELTA {
-                throw variant BadDivergence { message = "FFN divergence at element " + (i ↦ string) + " of layer " + (layer ↦ string) + " probe " + probe_name + ": observed " + (observed ↦ string) + " expected " + (expected ↦ string) }
-            }
-            i ← i + 1
+        # --- FFN output (under Delta, first divergence named) --------------
+        reject out.data.length() ≠ golden_ffn.length() throw variant BadDivergence { message = "FFN output length mismatch at layer §{layer} probe §{probe}"(layer: layer, probe: probe_name) }
+        var f32 max_dev ← 0.0
+        for from out.data, golden_ffn at [element] const observed, expected {
+            const f32 dev ← (observed - expected).abs()
+            max_dev ← max_dev ⤒ dev
+            reject dev ≻ DELTA throw variant BadDivergence { message = "FFN divergence at element §{element} of layer §{layer} probe §{probe}: observed §{observed} expected §{expected}"(element: element, layer: layer, probe: probe_name, observed: observed, expected: expected) }
         }
 
-        return "PASS layer=" + (layer ↦ string)
-            + " probe=" + probe_name
-            + " indices=" + _int_list(selection.indices)
-            + " weights=" + _f32_list(selection.weights)
-            + " first-divergence=none"
-            + " max-dev=" + (max_dev ↦ string)
+        return "PASS layer=§{layer} probe=§{probe} indices=§{indices} weights=§{weights} first-divergence=none max-dev=§{max_dev}"(layer: layer, probe: probe_name, indices: int_list(selection.indices), weights: f32_list(selection.weights), max_dev: max_dev)
     }
     catch err {
-        throw variant BadDivergence { message = message(err) }
+        throw variant BadDivergence { message = err.message }
     }
 }
 
-# ----------------------------------------------------------------------
-# Committed probes + goldens (fixtures/gguf/gguf-moe-probes.json and
-# gguf-moe-goldens.json, MODEL-02-U2, schema gguf-moe-probes-v1 /
-# gguf-moe-goldens-v1; u32 LE bit hex decoded to round-trip f32 decimal).
-# ----------------------------------------------------------------------
+# --- committed probes + goldens (MODEL-02-U2) ---------------------------
+# fixtures/gguf/gguf-moe-probes.json + gguf-moe-goldens.json, schema
+# gguf-moe-probes-v1 / gguf-moe-goldens-v1; u32 LE bit hex decoded to
+# round-trip f32 decimal.
 
 const list<f32> PROBE_0_P1 ← [
     2.42311335, 0.954412401, 0.00216613407, 1.18023694, -0.651971042, 0.581620097, 1.28931308, 1.79291105,
@@ -4568,49 +4514,52 @@ const list<f32> FFN_40_P2 ← [
 
 main {
     do {
+        # --- argv + pinned identity (fail closed) --------------------------
         const list<string> args ← process.argv() ↦ list<string>
         if args.length() ≠ 3 {
             throw variant BadArguments { message = "usage: moe-probe <path> <expected-data-offset> <sha256>" }
         }
-        const string via ← args.get(0) coalesce ""
-        const int expected_data ← _parse_number(args.get(1) coalesce "0")
-        const string digest ← args.get(2) coalesce ""
+        const string via ← args[0]
+        const int expected_data ← parse_number(args[1])
+        const string digest ← args[2]
         if digest ≠ QWEN36_DIGEST {
             throw variant BadIdentity { message = "sha256 does not match the pinned Qwen3.6 identity" }
         }
         const int total ← fs.byte_length(via)
         if total ≠ QWEN36_LENGTH {
-            throw variant BadIdentity { message = "byte length mismatch: expected " + (QWEN36_LENGTH ↦ string) + ", observed " + (total ↦ string) }
+            throw variant BadIdentity { message = "byte length mismatch: expected §{expected}, observed §{observed}"(expected: QWEN36_LENGTH, observed: total) }
         }
-        const artifact.ContentIdentity identity ← _identity(digest, total)
-        const gguf_manifest.GgufManifest m ← _manifest(
-            (int start, int length) → bytes ⇥ gguf_manifest.GgufManifestError ∴ _range(via, total, start, length),
+        const artifact.ContentIdentity identity ← content_identity(digest, total)
+
+        # --- manifest + corpus admission (fail closed) ---------------------
+        const gguf_manifest.GgufManifest m ← manifest(
+            (int start, int length) → bytes ⇥ gguf_manifest.GgufManifestError ∴ bounded_read(via, total, start, length),
             total,
             identity
         )
         if m.data_start ≠ expected_data {
-            throw variant BadAdmission { message = "data offset mismatch: expected " + (expected_data ↦ string) + ", observed " + (m.data_start ↦ string) }
+            throw variant BadAdmission { message = "data offset mismatch: expected §{expected}, observed §{observed}"(expected: expected_data, observed: m.data_start) }
         }
-        const qwen35moe.Qwen35moeAdmission admission ← _admit(_corpus(via, total, digest), digest, total)
+        const qwen35moe.Qwen35moeAdmission admission ← admit(corpus(via, total, digest), digest, total)
         print "ADMIT qwen35moe"
-        const moe.MoeConfig cfg ← _config(admission.config)
-        print "CONFIG moe experts=" + (cfg.expert_count ↦ string)
-            + " used=" + (cfg.expert_used_count ↦ string)
-            + " ffn=" + (cfg.expert_ffn_length ↦ string)
-            + " shared=" + (cfg.shared_ffn_length ↦ string)
-            + " embedding=" + (cfg.embedding_length ↦ string)
-        print "BAND delta=" + (DELTA ↦ string)
-        print _probe(via, total, m, cfg, 0, "p1", PROBE_0_P1, INDEX_0_P1, WEIGHT_0_P1, FFN_0_P1)
-        print _probe(via, total, m, cfg, 0, "p2", PROBE_0_P2, INDEX_0_P2, WEIGHT_0_P2, FFN_0_P2)
-        print _probe(via, total, m, cfg, 3, "p1", PROBE_3_P1, INDEX_3_P1, WEIGHT_3_P1, FFN_3_P1)
-        print _probe(via, total, m, cfg, 3, "p2", PROBE_3_P2, INDEX_3_P2, WEIGHT_3_P2, FFN_3_P2)
-        print _probe(via, total, m, cfg, 39, "p1", PROBE_39_P1, INDEX_39_P1, WEIGHT_39_P1, FFN_39_P1)
-        print _probe(via, total, m, cfg, 39, "p2", PROBE_39_P2, INDEX_39_P2, WEIGHT_39_P2, FFN_39_P2)
-        print _probe(via, total, m, cfg, 40, "p1", PROBE_40_P1, INDEX_40_P1, WEIGHT_40_P1, FFN_40_P1)
-        print _probe(via, total, m, cfg, 40, "p2", PROBE_40_P2, INDEX_40_P2, WEIGHT_40_P2, FFN_40_P2)
+
+        # --- config + band receipt -----------------------------------------
+        const moe.MoeConfig cfg ← config(admission.config)
+        print "CONFIG moe experts=§{experts} used=§{used} ffn=§{ffn} shared=§{shared} embedding=§{embedding}"(experts: cfg.expert_count, used: cfg.expert_used_count, ffn: cfg.expert_ffn_length, shared: cfg.shared_ffn_length, embedding: cfg.embedding_length)
+        print "BAND delta=§"(DELTA)
+
+        # --- probe rows: layers 0/3/39/40 x p1/p2 against the goldens ------
+        print probe(via, total, m, cfg, 0, "p1", PROBE_0_P1, INDEX_0_P1, WEIGHT_0_P1, FFN_0_P1)
+        print probe(via, total, m, cfg, 0, "p2", PROBE_0_P2, INDEX_0_P2, WEIGHT_0_P2, FFN_0_P2)
+        print probe(via, total, m, cfg, 3, "p1", PROBE_3_P1, INDEX_3_P1, WEIGHT_3_P1, FFN_3_P1)
+        print probe(via, total, m, cfg, 3, "p2", PROBE_3_P2, INDEX_3_P2, WEIGHT_3_P2, FFN_3_P2)
+        print probe(via, total, m, cfg, 39, "p1", PROBE_39_P1, INDEX_39_P1, WEIGHT_39_P1, FFN_39_P1)
+        print probe(via, total, m, cfg, 39, "p2", PROBE_39_P2, INDEX_39_P2, WEIGHT_39_P2, FFN_39_P2)
+        print probe(via, total, m, cfg, 40, "p1", PROBE_40_P1, INDEX_40_P1, WEIGHT_40_P1, FFN_40_P1)
+        print probe(via, total, m, cfg, 40, "p2", PROBE_40_P2, INDEX_40_P2, WEIGHT_40_P2, FFN_40_P2)
         print "PASS real-file moe probe receipt"
     }
     catch err {
-        panic "moe-probe failed: " + message(err)
+        panic "moe-probe failed: §"(err.message)
     }
 }
