@@ -1,0 +1,130 @@
+# Cache identity key and versioned identity wire.
+#
+# Public import: import from "gradus:cache/identity" identity
+# Depends on: gradus:cache/kv (KVCache, CacheError).
+
+import from "gradus:cache/kv" kv
+import from "gradus:tensor" tensor
+
+fn append_f32(list<f32> base, list<f32> values) → list<f32> {
+    return values.reduce((list<f32> out, f32 value) ∴ out.added(value), base)
+}
+
+# "/" and ";" are reserved in the identity wire fields (the U3 wire-safety
+# rule).
+fn contains_separator(string s) → bool {
+    return s.contains("/") or s.contains(";")
+}
+
+fn digit(string c) → bool {
+    return c between "0123456789"
+}
+
+fn numeric(string s) → bool {
+    if s.length() ≡ 0 then return false
+    if s.length() ≻ 18 then return false
+    # Keep: validation must short-circuit on the first invalid character;
+    # filter/map would change that failable boundary and still need a scan.
+    for from s const c {
+        if not digit(c ↦ string) then return false
+    }
+    return true
+}
+
+@ public
+class CacheIdentity {
+    string model
+    string model_version
+    string config
+    string tokenizer
+    string history
+    string position
+    int layers
+    string dtype
+    string layout
+}
+
+# Field-wise identity equality — the key-reuse predicate.
+@ public
+fn cache_identity_equal(CacheIdentity a, CacheIdentity b) → bool {
+    if a.model ≠ b.model then return false
+    if a.model_version ≠ b.model_version then return false
+    if a.config ≠ b.config then return false
+    if a.tokenizer ≠ b.tokenizer then return false
+    if a.history ≠ b.history then return false
+    if a.position ≠ b.position then return false
+    if a.layers ≠ b.layers then return false
+    if a.dtype ≠ b.dtype then return false
+    if a.layout ≠ b.layout then return false
+    return true
+}
+
+# Derive the identity key from a cache state: the prefix is the
+# comma-joined token history; the position span is "0..<count>".
+@ public
+fn cache_identity(kv.KVCache c) → CacheIdentity {
+    const string history ← c.history.reduce((string out, int token) ∴ out.length() ≡ 0 yields (token ↦ string) else "§,§"(out, token ↦ string), "")
+    return CacheIdentity { model = c.model, model_version = c.model_version, config = c.config, tokenizer = c.tokenizer, history = history, position = "0..§"(c.length() ↦ string), layers = c.layers, dtype = c.dtype, layout = c.layout }
+}
+
+# -------------------------------------------------------------------------
+# Identity wire — versioned, exact round-trip. The empty-prefix segment
+# uses the documented sentinel "-" (divide/split behavior must not depend
+# on empty segments).
+# -------------------------------------------------------------------------
+
+@ public
+fn serialize_identity(CacheIdentity i) → string {
+    var string history ← i.history
+    if history.length() ≡ 0 {
+        history ← "-"
+    }
+    return "cache/identity/§/§/§/§/§/§/§/§/§/§"(kv.SCHEMA_VERSION, i.model, i.model_version, i.config, i.tokenizer, history, i.position, i.layers ↦ string, i.dtype, i.layout)
+}
+
+# Convert-or-record: wire validation and conversion must retain the exact
+# first-failure error order; no closure intrinsic covers this failable parser.
+@ public
+fn deserialize_identity(string wire) → CacheIdentity ⇥ kv.CacheError {
+    # --- wire header (fail closed) -------------------------------------------
+    const list<string> parts ← wire.split("/")
+    require parts.length() ≡ 12 throw variant kv.CacheError.BadWire { message = "malformed cache identity wire" }
+    require parts.get(0) coalesce "" ≡ "cache" throw variant kv.CacheError.BadWire { message = "unknown cache marker" }
+    require parts.get(1) coalesce "" ≡ "identity" throw variant kv.CacheError.BadWire { message = "unknown cache marker" }
+    require parts.get(2) coalesce "" ≡ kv.SCHEMA_VERSION throw variant kv.CacheError.UnknownVersion { message = "unknown cache schema version" }
+    # --- field admission (fail closed) ---------------------------------------
+    const string model ← parts.get(3) coalesce ""
+    const string model_version ← parts.get(4) coalesce ""
+    const string config ← parts.get(5) coalesce ""
+    const string tokenizer ← parts.get(6) coalesce ""
+    var string history ← parts.get(7) coalesce ""
+    const string position ← parts.get(8) coalesce ""
+    const string layers_text ← parts.get(9) coalesce ""
+    const string dtype ← parts.get(10) coalesce ""
+    const string layout ← parts.get(11) coalesce ""
+    require model.length() ≠ 0 throw variant kv.CacheError.BadWire { message = "empty model name in cache identity" }
+    require model_version.length() ≠ 0 throw variant kv.CacheError.BadWire { message = "empty model version in cache identity" }
+    require config.length() ≠ 0 throw variant kv.CacheError.BadWire { message = "empty execution config in cache identity" }
+    require tokenizer.length() ≠ 0 throw variant kv.CacheError.BadWire { message = "empty tokenizer identity in cache identity" }
+    if history ≡ "-" {
+        history ← ""
+    }
+    require position.length() ≠ 0 throw variant kv.CacheError.BadWire { message = "malformed position span in cache identity" }
+    require numeric(layers_text) throw variant kv.CacheError.BadWire { message = "malformed layer count in cache identity" }
+    var int layers ← 0
+    do {
+        layers ↤ layers_text
+    }
+    catch err {
+        throw variant kv.CacheError.BadWire { message = "malformed layer count in cache identity" }
+    }
+    require layers ≥ 1 throw variant kv.CacheError.BadWire { message = "invalid layer count in cache identity" }
+    require dtype.length() ≠ 0 throw variant kv.CacheError.BadWire { message = "empty dtype in cache identity" }
+    require layout.length() ≠ 0 throw variant kv.CacheError.BadWire { message = "empty layout in cache identity" }
+    return CacheIdentity { model = model, model_version = model_version, config = config, tokenizer = tokenizer, history = history, position = position, layers = layers, dtype = dtype, layout = layout }
+}
+
+# -------------------------------------------------------------------------
+# KVStructure — W2-U1 typed descriptor (design §4.3). Semantic facts
+# Gradus owns; Radix consumes them into the attention-recipe bundle;
+# Hosts still consume GI4 KvCacheLayout bytes, never re-derived here.

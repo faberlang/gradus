@@ -1,0 +1,607 @@
+# Hybrid session state — conv, recurrent, KV, reset, identity.
+#
+# Public import: import from "gradus:model/qwen35moe_state/session" session
+# Depends on: gradus:model/qwen35moe_state/schedule, gradus:model/qwen35moe.
+
+import from "gradus:model/qwen35moe_state/schedule" schedule
+import from "gradus:model/qwen35moe" qwen35moe
+import from "gradus:tensor" tensor
+import from "gradus:dtype" dtype
+
+# -------------------------------------------------------------------------
+# S1 — state values (F2, F3, F8). Three separate typed families.
+# -------------------------------------------------------------------------
+
+# Depthwise-causal-convolution state: the last conv_kernel - 1 channel
+# slices of the conv channel space (3 x 8192 on the pinned row), stored
+# row-major [conv_kernel - 1][channels].
+@ public
+class ConvState {
+    list<f32> channels
+    int kernel
+    int channels_count
+}
+
+# Gated DeltaNet recurrent state per SSM layer: [value_heads][key_dim x
+# value_dim] cells stored in the comparator's transposed layout — cell
+# (h, j, i) holds S[i][j] so row j of one head is column j of S and the
+# delta recurrence reads contiguous rows.
+@ public
+class RecurrentState {
+    list<f32> cells
+    int value_heads
+    int key_dim
+    int value_dim
+}
+
+# Per-layer attention KV state on full-attention layers only:
+# [capacity][kv_heads][key_dim] keys and the same-shaped values, with the
+# exact filled length.
+@ public
+class KeyValueState {
+    list<f32> keys
+    list<f32> values
+    int kv_heads
+    int key_dim
+    int value_dim
+    int capacity
+    int length
+}
+
+@ public
+fn fresh_conv_state(qwen35moe.Qwen35moeConfig c) → ConvState ⇥ schedule.Qwen35moeStateError {
+    require c.conv_kernel ≥ 2 throw variant schedule.Qwen35moeStateError.BadConfig {message = "conv kernel must leave a state slice"}
+    const int channels ← c.inner_size + 2 * c.group_count * c.state_size
+    const int rows ← c.conv_kernel - 1
+    var list<f32> cells ← empty
+    for range 0‥rows * channels const _ {
+        cells.append(0.0 ∷ f32)
+    }
+    return ConvState {channels = cells, kernel = rows, channels_count = channels}
+}
+
+@ public
+fn fresh_recurrent_state(qwen35moe.Qwen35moeConfig c) → RecurrentState {
+    const int heads ← c.gradus_temporis
+    const int dim ← c.state_size
+    var list<f32> cells ← empty
+    for range 0‥heads * dim * dim const _ {
+        cells.append(0.0 ∷ f32)
+    }
+    return RecurrentState {cells = cells, value_heads = heads, key_dim = dim, value_dim = dim}
+}
+
+@ public
+fn fresh_kv_state(qwen35moe.Qwen35moeConfig c, int capacity) → KeyValueState ⇥ schedule.Qwen35moeStateError {
+    require capacity ≥ 1 throw variant schedule.Qwen35moeStateError.BadConfig {message = "kv capacity must be at least one"}
+    return KeyValueState {keys = empty, values = empty, kv_heads = c.head_count_kv, key_dim = c.key_length, value_dim = c.value_length, capacity = capacity, length = 0}
+}
+
+@ public
+fn conv_equal(ConvState a, ConvState b) → bool {
+    if a.kernel ≠ b.kernel then return false
+    if a.channels_count ≠ b.channels_count then return false
+    return a.channels ≡ b.channels
+}
+
+@ public
+fn recurrent_equal(RecurrentState a, RecurrentState b) → bool {
+    if a.value_heads ≠ b.value_heads then return false
+    if a.key_dim ≠ b.key_dim then return false
+    if a.value_dim ≠ b.value_dim then return false
+    return a.cells ≡ b.cells
+}
+
+@ public
+fn kv_equal(KeyValueState a, KeyValueState b) → bool {
+    if a.kv_heads ≠ b.kv_heads then return false
+    if a.key_dim ≠ b.key_dim then return false
+    if a.value_dim ≠ b.value_dim then return false
+    if a.length ≠ b.length then return false
+    if not (a.keys ≡ b.keys) then return false
+    return a.values ≡ b.values
+}
+
+# Whole-trunk hybrid session: one conv + recurrent pair per SSM layer, one
+# KV value per full-attention layer, the generation counter, and the
+# identity key. The schedule is carried so state slots map to block
+# indices; dtype is the reference row ("f32").
+@ public
+class HybridSession {
+    schedule.Qwen35moeSchedule schedule
+    list<ConvState> conv
+    list<RecurrentState> recurrent
+    list<KeyValueState> kv
+    int generation
+    string model
+    string model_version
+    string execution_config
+    string tokenizer
+    string state_types
+    string dtype
+}
+
+const string IDENTITY_SCHEMA ← "1.0.0"
+
+# Decimal digit parse for the identity wire (the runner has no direct
+# ascii-to-number conversion on for-from characters).
+fn _digit(string c) → int {
+    switch c {
+        case "0" { return 0 }
+        case "1" { return 1 }
+        case "2" { return 2 }
+        case "3" { return 3 }
+        case "4" { return 4 }
+        case "5" { return 5 }
+        case "6" { return 6 }
+        case "7" { return 7 }
+        case "8" { return 8 }
+        case "9" { return 9 }
+        default { return -1 }
+    }
+}
+
+fn _execution_config(qwen35moe.Qwen35moeConfig c) → string {
+    # "/" and ";" never appear in these rendered fields.
+    return "embd=§:heads=§:kv=§:key=§:conv=§:state=§:group=§:dt=§:inner=§:interval=§:rope=§:base=§"(c.embedding_length ↦ string, c.head_count ↦ string, c.head_count_kv ↦ string, c.key_length ↦ string, c.conv_kernel ↦ string, c.state_size ↦ string, c.group_count ↦ string, c.gradus_temporis ↦ string, c.inner_size ↦ string, c.full_attention_interval ↦ string, c.rope_dimension_count ↦ string, (c.freq_base ↦ string))
+}
+
+fn _schedule_wire(schedule.Qwen35moeSchedule s) → string {
+    var string out ← ""
+    for from s.kinds const kind {
+        out ← out + (kind ↦ string)
+    }
+    return out
+}
+
+@ public
+fn fresh_session(qwen35moe.Qwen35moeConfig c) → HybridSession ⇥ schedule.Qwen35moeStateError {
+    const schedule.Qwen35moeSchedule s ← schedule.schedule(c)
+    var list<ConvState> convs ← empty
+    var list<RecurrentState> recs ← empty
+    var list<KeyValueState> kvs ← empty
+    for range 0‥s.linear_layers const _ {
+        convs.append(fresh_conv_state(c))
+        recs.append(fresh_recurrent_state(c))
+    }
+    for range 0‥s.full_layers const _ {
+        kvs.append(fresh_kv_state(c, c.context_length))
+    }
+    return HybridSession {schedule = s, conv = convs, recurrent = recs, kv = kvs, generation = 0, model = c.architecture, model_version = "file-type-§"(c.file_type ↦ string), execution_config = _execution_config(c), tokenizer = "§:pre=§:tokens=§"(c.tokenizer_model, c.tokenizer_pre, c.token_count ↦ string), state_types = "conv=§x§;recurrent=§x§x§;kv=§x§"(c.conv_kernel - 1 ↦ string, (c.inner_size + 2 * c.group_count * c.state_size) ↦ string, c.gradus_temporis ↦ string, c.state_size ↦ string, c.state_size ↦ string, c.head_count_kv ↦ string, c.key_length ↦ string), dtype = "f32"}
+}
+
+# Reset: a fresh-session construction — empty conv state, zero recurrent
+# state, empty KV, generation counter restart — with the same identity.
+@ public
+fn reset_session(HybridSession s) → HybridSession {
+    return HybridSession {schedule = s.schedule, conv = s.conv, recurrent = s.recurrent, kv = s.kv, generation = 0, model = s.model, model_version = s.model_version, execution_config = s.execution_config, tokenizer = s.tokenizer, state_types = s.state_types, dtype = s.dtype}
+}
+
+# State equality across the whole trunk (identity fields are equal by the
+# wire comparison; this compares the state families and generation).
+@ public
+fn session_state_equal(HybridSession a, HybridSession b) → bool {
+    if a.generation ≠ b.generation then return false
+    if a.conv.length() ≠ b.conv.length() then return false
+    for from a.conv, b.conv const ca, cb {
+        if not conv_equal(ca, cb) then return false
+    }
+    if a.recurrent.length() ≠ b.recurrent.length() then return false
+    for from a.recurrent, b.recurrent const ra, rb {
+        if not recurrent_equal(ra, rb) then return false
+    }
+    if a.kv.length() ≠ b.kv.length() then return false
+    for from a.kv, b.kv const ka, kb {
+        if not kv_equal(ka, kb) then return false
+    }
+    return true
+}
+
+# The identity key wire: schema / model / version / execution config /
+# tokenizer / schedule / per-layer state types / dtype, mirroring the
+# `gradus:cache` identity-key precedent so EXEC-03 can bind two prompts to
+# one resident session without reload.
+@ public
+fn session_identity_key(HybridSession s) → string {
+    return "qwen35moe-state/identity/§/§/§/§/§/§/§/§/§"(IDENTITY_SCHEMA, s.model, s.model_version, s.execution_config, s.tokenizer, _schedule_wire(s.schedule), s.state_types, s.dtype, s.generation ↦ string)
+}
+
+# Parse an identity wire back into a session-shaped record. Round-trips
+# through session_identity_key.
+@ public
+fn deserialize_session_identity(string wire) → HybridSession ⇥ schedule.Qwen35moeStateError {
+    const list<string> parts ← wire.split("/")
+    require parts.length() ≡ 11 throw variant BadState {message = "malformed qwen35moe state identity wire"}
+    require (parts.get(0) coalesce "") ≡ "qwen35moe-state" throw variant BadState {message = "unknown identity marker"}
+    require (parts.get(1) coalesce "") ≡ "identity" throw variant BadState {message = "unknown identity marker"}
+    require (parts.get(2) coalesce "") ≡ IDENTITY_SCHEMA throw variant BadState {message = "unknown identity schema"}
+    var list<int> kinds ← empty
+    const string schedule_wire ← parts.get(7) coalesce ""
+    for from schedule_wire const c {
+        const int kind ← _digit(c ↦ string)
+        require kind ≥ 0 and kind ≤ 2 throw variant BadState {message = "malformed schedule wire"}
+        kinds.append(kind)
+    }
+    var int generation ← 0
+    const string generation_wire ← parts.get(10) coalesce "0"
+    for from generation_wire const c {
+        const int digit ← _digit(c ↦ string)
+        require digit ≥ 0 throw variant BadState {message = "malformed generation wire"}
+        generation ← generation * 10 + digit
+    }
+    var int linear ← 0
+    var int full ← 0
+    var int nextn ← 0
+    for from kinds const kind {
+        switch kind {
+            case 0 { linear ↑ }
+            case 1 { full ↑ }
+            case 2 { nextn ↑ }
+        }
+    }
+    const schedule.Qwen35moeSchedule s ← schedule.Qwen35moeSchedule {trunk_layers = linear + full, linear_layers = linear, full_layers = full, nextn_layers = nextn, kinds = kinds}
+    return HybridSession {schedule = s, conv = empty, recurrent = empty, kv = empty, generation = generation, model = parts.get(3) coalesce "", model_version = parts.get(4) coalesce "", execution_config = parts.get(5) coalesce "", tokenizer = parts.get(6) coalesce "", state_types = parts.get(8) coalesce "", dtype = parts.get(9) coalesce ""}
+}
+# -------------------------------------------------------------------------
+# Scalar primitives (self-hosted per the nn/moe precedent).
+# -------------------------------------------------------------------------
+
+const f32 E ← 2.718281828459045 ∷ f32
+
+@ public
+fn _exp(f32 x) → f32 {
+    return E.power(x)
+}
+
+@ public
+fn _sigmoid(f32 x) → f32 {
+    return 1.0 / (1.0 + _exp(-x))
+}
+
+@ public
+fn _silu(f32 x) → f32 {
+    return x / (1.0 + _exp(-x))
+}
+
+@ public
+fn _softplus(f32 x) → f32 {
+    # The comparator's form: identity above 20, log(1 + exp(x)) below.
+    if x ≻ 20.0 then return x
+    return _log(1.0 + _exp(x))
+}
+
+# ln(x) for x > 0 (callers guarantee x > 0): range-reduce into [1, 2) then
+# the atanh series (loss.fab precedent).
+@ public
+fn _log(f32 x) → f32 {
+    var f32 m ← x
+    var int k ← 0
+    while m ≻ 2.0 {
+        m ← m / 2.0
+        k ↑
+    }
+    while m ≺ 1.0 {
+        m ← m * 2.0
+        k ↓
+    }
+    const f32 y ← (m - 1.0) / (m + 1.0)
+    const f32 y2 ← y * y
+    var f32 sum ← 0.0 ∷ f32
+    var f32 term ← y
+    for range 0‥16 const n {
+        if n ≻ 0 {
+            term ← term * y2
+        }
+        sum ← sum + term / ((2 * n + 1) ↦ f32)
+    }
+    return 2.0 * sum + (k ↦ f32) * 0.6931471805599453 ∷ f32
+}
+
+const f32 TAU ← 6.283185307179586 ∷ f32
+
+const f32 SEMITAU ← 3.141592653589793 ∷ f32
+
+@ public
+fn _reduce_angle(f32 x) → f32 {
+    const f32 shifted ← x + SEMITAU
+    const int k ← (shifted / TAU).floor()
+    return x - TAU * (k ↦ f32)
+}
+
+@ public
+fn _sin(f32 x) → f32 {
+    const f32 a ← _reduce_angle(x)
+    var f32 term ← a
+    var f32 sum ← a
+    const f32 x2 ← a * a
+    for range 1‥12 const n {
+        term ← (term * -x2) / ((2 * n ↦ f32) * ((2 * n + 1) ↦ f32))
+        sum ← sum + term
+    }
+    return sum
+}
+
+@ public
+fn _cos(f32 x) → f32 {
+    const f32 a ← _reduce_angle(x)
+    var f32 term ← 1.0
+    var f32 sum ← 1.0
+    const f32 x2 ← a * a
+    for range 1‥14 const n {
+        term ← (term * -x2) / (((2 * n - 1) ↦ f32) * ((2 * n) ↦ f32))
+        sum ← sum + term
+    }
+    return sum
+}
+
+# sqrt via Newton iteration (calibration.fab precedent; x ≥ 0 assumed —
+# callers pass non-negative sums).
+@ public
+fn _sqrt(f32 x) → f32 {
+    if x ≤ 0.0 then return 0.0
+    var f32 guess ← x / 2.0
+    if guess ≤ 0.0 {
+        guess ← x
+    }
+    for range 0‥16 const _ {
+        guess ← (guess + x / guess) / 2.0
+    }
+    return guess
+}
+
+# RMSNorm over one row (the comparator accumulates the squared sum in
+# double; the reference row accumulates in f32 and the oracle band carries
+# the difference).
+@ public
+fn _rms_norm_row(list<f32> x, list<f32> weight, f32 eps) → list<f32> ⇥ schedule.Qwen35moeStateError {
+    require x.length() ≡ weight.length() throw variant schedule.Qwen35moeStateError.BadShape {message = "norm row and weight lengths differ"}
+    require x.length() ≥ 1 throw variant schedule.Qwen35moeStateError.BadShape {message = "norm row is empty"}
+    var f32 sum ← 0.0 ∷ f32
+    for from x const v {
+        sum ← sum + v * v
+    }
+    const f32 scale ← 1.0 / _sqrt(sum / (x.length() ↦ f32) + eps)
+    var list<f32> out ← empty
+    for range 0‥x.length() const i {
+        out.append((x.get(i) coalesce 0.0 ∷ f32) * scale * (weight.get(i) coalesce 0.0 ∷ f32))
+    }
+    return out
+}
+
+# L2 norm over one row (the GDN q/k normalization): x / max(|x|_2, eps).
+@ public
+fn _l2_norm_row(list<f32> x, f32 eps) → list<f32> ⇥ schedule.Qwen35moeStateError {
+    var f32 sum ← 0.0 ∷ f32
+    for from x const v {
+        sum ← sum + v * v
+    }
+    const f32 norm ← _sqrt(sum)
+    var f32 scale ← 1.0 / norm
+    if norm ≺ eps {
+        scale ← 1.0 / eps
+    }
+    var list<f32> out ← empty
+    for from x const v {
+        out.append(v * scale)
+    }
+    return out
+}
+
+# -------------------------------------------------------------------------
+# Weight windows. The adapter owns the read and the ".weight"/".bias"
+# suffix per canonical name; every window is checked shape-exact before a
+# compute unit consumes it (the moe.fab contract).
+# -------------------------------------------------------------------------
+
+@ public
+fn _window((string, int, int) → tensor.NumericBlock ⇥ schedule.Qwen35moeStateError source, string name, int start, int length, list<int> expected) → tensor.NumericBlock ⇥ schedule.Qwen35moeStateError {
+    require start ≥ 0 throw variant schedule.Qwen35moeStateError.BadWindow {message = "tensor window start must be non-negative"}
+    require length ≥ 1 throw variant schedule.Qwen35moeStateError.BadWindow {message = "tensor window length must be positive"}
+    const tensor.NumericBlock value ← source(name, start, length)
+    require value.valid() throw variant schedule.Qwen35moeStateError.BadShape {message = "tensor window carrier is invalid: §"(name)}
+    require value.shape ≡ expected throw variant schedule.Qwen35moeStateError.BadShape {message = "tensor window carrier has the wrong shape: §"(name)}
+    require value.data.length() ≡ length throw variant schedule.Qwen35moeStateError.BadWindow {message = "tensor window length does not match the carrier: §"(name)}
+    for from value.data const v {
+        require dtype.finite(v) throw variant schedule.Qwen35moeStateError.NonFinite {message = "tensor window contains a non-finite value: §"(name)}
+    }
+    return value
+}
+
+@ public
+fn _prefix(int layer) → string {
+    return "blk.§"(layer ↦ string)
+}
+
+# Empty row coalesce target for nested-list reads (structure only).
+@ public
+fn _empty_f32_row() → list<f32> {
+    return empty
+}
+
+# [out, in] x [in, 1] -> out column as a plain list (GEMV row walk).
+@ public
+fn _gemv(tensor.NumericBlock weight, list<f32> x, int in_dim, int out_dim) → list<f32> ⇥ schedule.Qwen35moeStateError {
+    require weight.data.length() ≡ out_dim * in_dim throw variant schedule.Qwen35moeStateError.BadShape {message = "projection weight window has the wrong length"}
+    require x.length() ≡ in_dim throw variant schedule.Qwen35moeStateError.BadShape {message = "projection input has the wrong length"}
+    var list<f32> out ← empty
+    for range 0‥out_dim const o {
+        var f32 sum ← 0.0 ∷ f32
+        for range 0‥in_dim const i {
+            sum ← sum + (weight.data.get(o * in_dim + i) coalesce 0.0 ∷ f32) * (x.get(i) coalesce 0.0 ∷ f32)
+        }
+        require dtype.finite(sum) throw variant schedule.Qwen35moeStateError.NonFinite {message = "projection produced a non-finite value"}
+        out.append(sum)
+    }
+    return out
+}
+
+# [out, in] x [in, T] -> [T][out] rows (one projection over a whole window;
+# each weight row is read once per layer call).
+@ public
+fn _gemm_rows(tensor.NumericBlock weight, list<f32> x_rows, int in_dim, int out_dim, int tokens) → list<f32> ⇥ schedule.Qwen35moeStateError {
+    require weight.data.length() ≡ out_dim * in_dim throw variant schedule.Qwen35moeStateError.BadShape {message = "projection weight window has the wrong length"}
+    require x_rows.length() ≡ tokens * in_dim throw variant schedule.Qwen35moeStateError.BadShape {message = "projection input rows have the wrong length"}
+    var list<f32> out ← empty
+    for range 0‥tokens const t {
+        const int base ← t * in_dim
+        for range 0‥out_dim const o {
+            var f32 sum ← 0.0 ∷ f32
+            for range 0‥in_dim const i {
+                sum ← sum + (weight.data.get(o * in_dim + i) coalesce 0.0 ∷ f32) * (x_rows.get(base + i) coalesce 0.0 ∷ f32)
+            }
+            require dtype.finite(sum) throw variant schedule.Qwen35moeStateError.NonFinite {message = "projection produced a non-finite value"}
+            out.append(sum)
+        }
+    }
+    return out
+}
+
+# -------------------------------------------------------------------------
+# S4 — multi-section RoPE (F4).
+# -------------------------------------------------------------------------
+
+# RoPE over one head row. Pair j (0..pairs-1) is (element j, element j +
+# dims/2) — the comparator's half-split layout; elements at or beyond dims
+# pass through untouched. The angle series is theta_j = pos * base^(-2 *
+# j / dims). The four section lengths are carried for the multi-section
+# wire: on the qwen35moe text row every section reads the same text
+# position, so the per-section theta selection collapses to the shared
+# series (the pinned comparator computes the identical value either way).
+@ public
+fn rope_head(list<f32> head, int dims, int pairs, f32 base, list<int> sections, int pos, int pass_through) → list<f32> ⇥ schedule.Qwen35moeStateError {
+    require dims ≡ pairs * 2 throw variant schedule.Qwen35moeStateError.BadShape {message = "rope dims must be twice the pair count"}
+    require sections.length() ≥ 4 throw variant schedule.Qwen35moeStateError.BadShape {message = "rope needs four section lengths"}
+    require head.length() ≥ dims throw variant schedule.Qwen35moeStateError.BadShape {message = "head row is shorter than the rope dims"}
+    require pass_through ≡ head.length() throw variant schedule.Qwen35moeStateError.BadShape {message = "pass-through width must be the head width"}
+    var list<f32> out ← empty
+    const int half ← dims / 2
+    # Angle table first ([cos, sin] per pair), then one append-order walk.
+    var list<f32> table ← empty
+    for range 0‥half const j {
+        const f32 angle ← (pos ↦ f32) * base.power((-(2.0 * (j ↦ f32))) / (dims ↦ f32))
+        table.append(_cos(angle))
+        table.append(_sin(angle))
+    }
+    for range 0‥pass_through const i {
+        if i ≺ half {
+            const f32 x0 ← head.get(i) coalesce 0.0 ∷ f32
+            const f32 x1 ← head.get(i + half) coalesce 0.0 ∷ f32
+            out.append(x0 * (table.get(i * 2) coalesce 1.0 ∷ f32) - x1 * (table.get(i * 2 + 1) coalesce 0.0 ∷ f32))
+        }
+        else {
+            if i ≺ dims {
+                const int pair ← i - half
+                const f32 x0 ← head.get(pair) coalesce 0.0 ∷ f32
+                const f32 x1 ← head.get(pair + half) coalesce 0.0 ∷ f32
+                out.append(x0 * (table.get(pair * 2 + 1) coalesce 0.0 ∷ f32) + x1 * (table.get(pair * 2) coalesce 1.0 ∷ f32))
+            }
+            else {
+                out.append(head.get(i) coalesce 0.0 ∷ f32)
+            }
+        }
+    }
+    return out
+}
+
+# -------------------------------------------------------------------------
+# S2 — the Gated DeltaNet core recurrence (F2).
+# -------------------------------------------------------------------------
+
+# One head, one token: decay -> delta -> outer update -> output read, in
+# the comparator's exact stage order. The head span (key_dim * value_dim
+# cells of the transposed state) is consumed as an immutable list and a new
+# span is returned with the output row. Stages never interleave: the delta
+# row reads the decayed state, the outer update writes it, and the output
+# row reads the updated state.
+@ public
+fn _delta_step(list<f32> span, list<f32> q, list<f32> k, list<f32> v, f32 decay, f32 beta, int dim) → tuple<updated: list<f32>, out: list<f32>> ⇥ schedule.Qwen35moeStateError {
+    # 1. decay: every cell scaled by exp(g).
+    var list<f32> decayed ← empty
+    for from span const cell {
+        decayed.append(cell * decay)
+    }
+    # 2. delta[j] = (v[j] - dot(state row j, k)) * beta
+    var list<f32> delta ← empty
+    for range 0‥dim const j {
+        var f32 sum ← 0.0 ∷ f32
+        const int row ← j * dim
+        for range 0‥dim const i {
+            sum ← sum + (decayed.get(row + i) coalesce 0.0 ∷ f32) * (k.get(i) coalesce 0.0 ∷ f32)
+        }
+        delta.append(((v.get(j) coalesce 0.0 ∷ f32) - sum) * beta)
+    }
+    # 3. outer update: state row j += k * delta[j]
+    var list<f32> updated ← empty
+    for range 0‥dim const j {
+        const f32 d ← delta.get(j) coalesce 0.0 ∷ f32
+        const int row ← j * dim
+        for range 0‥dim const i {
+            updated.append((decayed.get(row + i) coalesce 0.0 ∷ f32) + (k.get(i) coalesce 0.0 ∷ f32) * d)
+        }
+    }
+    # 4. output read from the updated state, scaled by 1/sqrt(dim).
+    const f32 scale ← 1.0 / _sqrt((dim ↦ f32))
+    var list<f32> out ← empty
+    for range 0‥dim const j {
+        var f32 sum ← 0.0 ∷ f32
+        const int row ← j * dim
+        for range 0‥dim const i {
+            sum ← sum + (updated.get(row + i) coalesce 0.0 ∷ f32) * (q.get(i) coalesce 0.0 ∷ f32)
+        }
+        require dtype.finite(sum) throw variant schedule.Qwen35moeStateError.NonFinite {message = "gated delta net output is non-finite"}
+        out.append(sum * scale)
+    }
+    return tuple<updated: list<f32>, out: list<f32>> [updated, out]
+}
+
+# Advance one head of a RecurrentState by one token (public single-head
+# form; the window path below drives the same core per head per token).
+@ public
+fn recurrent_update(RecurrentState s, list<f32> q, list<f32> k, list<f32> v, f32 g, f32 beta, int head) → RecurrentState ⇥ schedule.Qwen35moeStateError {
+    require head ≥ 0 and head ≺ s.value_heads throw variant BadState {message = "recurrent head index outside the state"}
+    const int dim ← s.key_dim
+    require q.length() ≡ dim and k.length() ≡ dim and v.length() ≡ dim throw variant schedule.Qwen35moeStateError.BadShape {message = "delta rule rows must match the state dim"}
+    const int span ← dim * dim
+    const int base ← head * span
+    var list<f32> cells ← empty
+    for range 0‥head const h {
+        for range 0‥span const i {
+            cells.append(s.cells.get(h * span + i) coalesce 0.0 ∷ f32)
+        }
+    }
+    var list<f32> head_cells ← empty
+    for range 0‥span const i {
+        head_cells.append(s.cells.get(base + i) coalesce 0.0 ∷ f32)
+    }
+    const tuple<updated: list<f32>, out: list<f32>> step ← _delta_step(head_cells, q, k, v, _exp(g), beta, dim)
+    const list<f32> advanced ← step.updated
+    for from advanced const cell {
+        cells.append(cell)
+    }
+    for range (head + 1)‥s.value_heads const h {
+        for range 0‥span const i {
+            cells.append(s.cells.get(h * span + i) coalesce 0.0 ∷ f32)
+        }
+    }
+    return RecurrentState {cells = cells, value_heads = s.value_heads, key_dim = s.key_dim, value_dim = s.value_dim}
+}
+
+# Read one head of a RecurrentState against a query row (no update).
+@ public
+fn recurrent_output(RecurrentState s, list<f32> q, int head) → list<f32> ⇥ schedule.Qwen35moeStateError {
+    require head ≥ 0 and head ≺ s.value_heads throw variant BadState {message = "recurrent head index outside the state"}
+    const int dim ← s.key_dim
+    require q.length() ≡ dim throw variant schedule.Qwen35moeStateError.BadShape {message = "query row must match the state dim"}
+    const f32 scale ← 1.0 / _sqrt((dim ↦ f32))
+    const int base ← head * dim * dim
+    var list<f32> out ← empty
+    for range 0‥dim const j {
+        var f32 sum ← 0.0 ∷ f32
+        const int row ← base + j * dim
+        for range 0‥dim const i {
+            sum ← sum + (s.cells.get(row + i) coalesce 0.0 ∷ f32) * (q.get(i) coalesce 0.0 ∷ f32)
+        }
+        out.append(sum * scale)
+    }
+    return out
+}

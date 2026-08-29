@@ -1,0 +1,198 @@
+# qwen35moe trunk schedule — linear vs full-attention layer kinds.
+#
+# Public import: import from "gradus:model/qwen35moe_state/schedule" schedule
+# Owns Qwen35moeStateError.
+# Depends on: gradus:model/qwen35moe, gradus:model/gguf_manifest.
+
+import from "gradus:model/qwen35moe" qwen35moe
+import from "gradus:model/gguf_manifest" gguf_manifest
+
+@ public
+union Qwen35moeStateError {
+    @ shared
+    string message
+
+    BadConfig,
+    BadShape,
+    BadWindow,
+    BadSchedule,
+    BadState,
+    NonFinite
+}
+
+@ public
+fn state_message(Qwen35moeStateError e) → string {
+    return e.message
+}
+
+# -------------------------------------------------------------------------
+# S0 — layer schedule (F1, F7).
+# -------------------------------------------------------------------------
+
+@ public
+union LayerKind {
+    LinearAttention,
+    FullAttention,
+    Nextn
+}
+
+@ public
+class Qwen35moeSchedule {
+    int trunk_layers
+    int linear_layers
+    int full_layers
+    int nextn_layers
+    list<int> kinds
+}
+
+fn _kind_code(int block, int trunk, int interval) → int {
+    # 0 = linear attention, 1 = full attention, 2 = nextn.
+    if block ≥ trunk then return 2
+    if (block + 1) % interval ≡ 0 then return 1
+    return 0
+}
+
+# Derive the per-block schedule from the frozen configuration alone: the
+# trunk is block_count - nextn_predict_layers blocks, full attention at
+# (i + 1) % full_attention_interval == 0, the trailing nextn_predict_layers
+# blocks are NextN/MTP. Holds for the pinned 41-block row and the local
+# 40-block rows (nextn_predict_layers 0).
+@ public
+fn schedule(qwen35moe.Qwen35moeConfig c) → Qwen35moeSchedule ⇥ Qwen35moeStateError {
+    require c.block_count ≥ 1 throw variant BadConfig {message = "block count must be at least one"}
+    require c.nextn_predict_layers ≥ 0 throw variant BadConfig {message = "nextn layer count must be non-negative"}
+    require c.nextn_predict_layers ≺ c.block_count throw variant BadConfig {message = "nextn layers must sit inside the block stack"}
+    require c.full_attention_interval ≥ 1 throw variant BadConfig {message = "full attention interval must be at least one"}
+    const int trunk ← c.block_count - c.nextn_predict_layers
+    var list<int> kinds ← empty
+    var int linear ← 0
+    var int full ← 0
+    for range 0‥c.block_count const b {
+        const int kind ← _kind_code(b, trunk, c.full_attention_interval)
+        kinds.append(kind)
+        switch kind {
+            case 0 { linear ↑ }
+            case 1 { full ↑ }
+        }
+    }
+    return Qwen35moeSchedule {trunk_layers = trunk, linear_layers = linear, full_layers = full, nextn_layers = c.nextn_predict_layers, kinds = kinds}
+}
+
+@ public
+fn layer_kind(Qwen35moeSchedule s, int block) → LayerKind ⇥ Qwen35moeStateError {
+    require block ≥ 0 and block ≺ s.kinds.length() throw variant BadConfig {message = "block index outside the schedule"}
+    const int kind ← s.kinds.get(block) coalesce -1
+    if kind ≡ 2 then return variant Nextn
+    if kind ≡ 1 then return variant FullAttention
+    return variant LinearAttention
+}
+
+@ public
+fn layer_kind_name(LayerKind k) → string {
+    match k {
+        case LinearAttention {
+            return "linear_attention"
+        }
+        case FullAttention {
+            return "full_attention"
+        }
+        case Nextn {
+            return "nextn"
+        }
+    }
+}
+
+@ public
+fn layer_kind_eq(LayerKind a, LayerKind b) → bool {
+    return layer_kind_name(a) ≡ layer_kind_name(b)
+}
+
+@ public
+fn is_trunk(Qwen35moeSchedule s, int block) → bool {
+    return block ≥ 0 and block ≺ s.trunk_layers
+}
+
+# Index of one linear-attention layer inside the SSM state list (0..29 on
+# the pinned row). A full-attention or nextn block fails closed.
+@ public
+fn linear_index(Qwen35moeSchedule s, int block) → int ⇥ Qwen35moeStateError {
+    require block ≥ 0 and block ≺ s.kinds.length() throw variant BadConfig {message = "block index outside the schedule"}
+    require (s.kinds.get(block) coalesce -1) ≡ 0 throw variant BadConfig {message = "block is not a linear-attention layer"}
+    var int index ← 0
+    for range 0‥block const b {
+        if (s.kinds.get(b) coalesce -1) ≡ 0 {
+            index ↑
+        }
+    }
+    return index
+}
+
+# Index of one full-attention layer inside the KV state list (0..9).
+@ public
+fn attention_index(Qwen35moeSchedule s, int block) → int ⇥ Qwen35moeStateError {
+    require block ≥ 0 and block ≺ s.kinds.length() throw variant BadConfig {message = "block index outside the schedule"}
+    require (s.kinds.get(block) coalesce -1) ≡ 1 throw variant BadConfig {message = "block is not a full-attention layer"}
+    var int index ← 0
+    for range 0‥block const b {
+        if (s.kinds.get(b) coalesce -1) ≡ 1 {
+            index ↑
+        }
+    }
+    return index
+}
+
+fn _tensor(gguf_manifest.GgufManifest m, string name) → gguf_manifest.GgufTensorDescriptor ⇥ Qwen35moeStateError {
+    do {
+        return gguf_manifest.find_tensor(m, name)
+    }
+    catch err {
+        throw variant BadSchedule {message = "schedule contradiction at §"(name)}
+    }
+}
+
+fn _find_shape(gguf_manifest.GgufManifest m, string name, int index, int expected) → bool ⇥ Qwen35moeStateError {
+    const gguf_manifest.GgufTensorDescriptor t ← _tensor(m, name)
+    require t.shape.length() ≻ index throw variant BadSchedule {message = "schedule contradiction at §"(name)}
+    require (t.shape.get(index) coalesce 0) ≡ expected throw variant BadSchedule {message = "schedule contradiction at §"(name)}
+    return true
+}
+
+fn _exists(gguf_manifest.GgufManifest m, string name) → bool ⇥ Qwen35moeStateError {
+    _tensor(m, name)
+    return true
+}
+
+# Validate the derived schedule against each block's tensor inventory. The
+# class-defining tensors are checked per block: the SSM family must carry
+# attn_qkv [., qkv] and the ssm set, the full-attention family attn_q/attn_k
+# with the kv projection width, and each nextn block its nextn.eh_proj. A
+# block whose inventory contradicts the derived kind fails closed naming the
+# block and the first contradictory tensor.
+@ public
+fn validate_schedule(gguf_manifest.GgufManifest m, Qwen35moeSchedule s, qwen35moe.Qwen35moeConfig c) → bool ⇥ Qwen35moeStateError {
+    require s.kinds.length() ≡ c.block_count throw variant BadConfig {message = "schedule does not match the configuration"}
+    const int kv_projection ← c.head_count_kv * c.key_length
+    const int conv_channels ← c.inner_size + 2 * c.group_count * c.state_size
+    for range 0‥c.block_count const b {
+        const string p ← "blk.§"(b ↦ string)
+        const int kind ← s.kinds.get(b) coalesce -1
+        if kind ≡ 2 {
+            _find_shape(m, p + ".nextn.eh_proj.weight", 0, c.inner_size)
+            _exists(m, p + ".attn_q.weight")
+        }
+        else {
+            if kind ≡ 0 {
+                _find_shape(m, p + ".attn_qkv.weight", 1, conv_channels)
+                _exists(m, p + ".ssm_conv1d.weight")
+                _exists(m, p + ".ssm_a")
+                _exists(m, p + ".ssm_norm.weight")
+            }
+            else {
+                _find_shape(m, p + ".attn_k.weight", 1, kv_projection)
+                _exists(m, p + ".attn_q.weight")
+                _exists(m, p + ".attn_v.weight")
+            }
+        }
+    }
+    return true
+}

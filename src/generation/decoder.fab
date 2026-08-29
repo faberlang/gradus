@@ -1,0 +1,270 @@
+# Decoder-session generation: cursor, stop policy, generate loops.
+#
+# Public import: import from "gradus:generation/decoder" decoder
+# Depends on: gradus:generation/config, gradus:decode, gradus:sampling,
+#   gradus:tokenizer/identity, gradus:train, gradus:tensor.
+
+import from "gradus:generation/config" config
+import from "gradus:decode" decode
+import from "gradus:sampling" sampling
+import from "gradus:tensor" tensor
+import from "gradus:tokenizer/identity" identity
+import from "gradus:train" train
+
+# --- generation cursor ---------------------------------------------------
+# Cursor advancement rejects rather than truncates when either the context or
+# generated-token limit is reached. Reset preserves the session context.
+
+
+@ public
+class GenerationCursor {
+    decode.Session session
+    int emitted
+}
+
+# A fresh cursor at position 0 with count 0 over the config's context.
+@ public
+fn fresh_cursor(config.GenerationConfig g) → GenerationCursor ⇥ config.GenerationError {
+    var decode.Session s ← decode.default_session()
+    do {
+        s ← decode.fresh_session(g.context)
+        return GenerationCursor {session = s, emitted = 0}
+    }
+    catch err {
+        throw variant config.GenerationError.InvalidConfig {message = err.message}
+    }
+    throw variant config.GenerationError.InvalidConfig {message = "unreachable"}
+}
+
+# Placeholder Default for `var GenerationCursor` bindings (var on structs).
+# Empty session (not a valid cursor). Only a placeholder the caller
+# overwrites, or returns from an unreachable cape arm.
+@ public
+fn default_cursor() → GenerationCursor {
+    return GenerationCursor {session = decode.default_session(), emitted = 0}
+}
+
+# The explicit limit-policy predicate: another token is allowed iff the
+# session position is below the context limit AND the generated count is
+# below the maximum-generated-tokens limit.
+@ public
+fn token_allowed(config.GenerationConfig g, GenerationCursor c) → bool {
+    if c.session.position ≥ g.context then return false
+    if c.emitted ≥ g.max_tokens then return false
+    return true
+}
+
+# The next step — REJECTS (never truncates) when the step would exceed the
+# max-tokens limit or the context limit; otherwise advances the session
+# position by one and the count by one.
+@ public
+fn cursor_advance(config.GenerationConfig g, GenerationCursor c) → GenerationCursor ⇥ config.GenerationError {
+    require c.emitted ≺ g.max_tokens throw variant config.GenerationError.LimitReached {message = "maximum generated tokens reached"}
+    require c.session.position ≺ g.context throw variant config.GenerationError.LimitReached {message = "context limit reached"}
+    return GenerationCursor {session = decode.Session {position = c.session.position + 1, context = c.session.context}, emitted = c.emitted + 1}
+}
+
+# Reset the cursor to the fresh state: session position 0 (the U1
+# reset precedent, context preserved) with the count cleared.
+@ public
+fn cursor_reset(GenerationCursor c) → GenerationCursor {
+    return GenerationCursor {session = decode.Session {position = 0, context = c.session.context}, emitted = 0}
+}
+
+# --- stop policy ----------------------------------------------------------
+# IgnoreEos masks the admitted EOG ids with a finite negative logit so the
+# sampler's finite-value contract remains intact.
+
+@ public
+union StopPolicy {
+    Eog,
+    IgnoreEos
+}
+
+@ public
+fn eog_stop() → StopPolicy {
+    return variant Eog
+}
+
+@ public
+fn ignore_eos() → StopPolicy {
+    return variant IgnoreEos
+}
+
+@ public
+fn stop_policy_name(StopPolicy p) → string {
+    match p {
+        case Eog {
+            return "eog"
+        }
+        case IgnoreEos {
+            return "ignore_eos"
+        }
+    }
+}
+
+@ public
+fn stops_on_eog(StopPolicy p) → bool {
+    match p {
+        case Eog {
+            return true
+        }
+        case IgnoreEos {
+            return false
+        }
+    }
+}
+
+# Finite EOG mask. Sampling rejects non-finite logits, so this is a
+# large negative rather than -inf. Any real vocab logit wins over it.
+fn suppress_eog(list<f32> logits) → list<f32> {
+    var list<f32> out ← empty
+    # The index is the vocabulary id consumed by identity.is_eog.
+    for range 0‥logits.length() const i {
+        if identity.is_eog(i) {
+            out.append((-1000000000.0) ∷ f32)
+        }
+        else {
+            out.append(logits.get(i) coalesce 0.0 ∷ f32)
+        }
+    }
+    return out
+}
+
+@ public
+fn sample_logits(list<f32> logits, StopPolicy stop) → list<f32> {
+    if stops_on_eog(stop) {
+        return logits
+    }
+    return suppress_eog(logits)
+}
+
+# Cursor sitting just after a prompt of length prompt_len: next decode
+# position is the prompt length, generated count is 0. Rejects an empty
+# prompt and a prompt that leaves no room in the context.
+@ public
+fn cursor_after_prompt(config.GenerationConfig g, int prompt_len) → GenerationCursor ⇥ config.GenerationError {
+    require prompt_len ≥ 1 throw variant config.GenerationError.InvalidConfig {message = "needs at least one prompt token"}
+    require prompt_len ≺ g.context throw variant config.GenerationError.InvalidConfig {message = "prompt length does not fit context"}
+    return GenerationCursor {session = decode.Session {position = prompt_len, context = g.context}, emitted = 0}
+}
+
+# --- decoder generation --------------------------------------------------
+
+@ public
+fn observe(decode.Cancellation cancel) → void ⇥ config.GenerationError {
+    do {
+        const decode.Cancellation _ ← decode.observe_cancellation(cancel)
+        return
+    }
+    catch err {
+        throw variant config.GenerationError.Cancelled {message = err.message}
+    }
+}
+
+@ public
+fn sample(list<f32> logits, sampling.Config c, list<int> history, train.Seed seed) → sampling.Sampler ⇥ config.GenerationError {
+    do {
+        return sampling.sample(logits, c, history, seed)
+    }
+    catch err {
+        throw variant config.GenerationError.DecodeFailure {message = err.message}
+    }
+}
+
+fn prefill(list<int> prompt_ids, decode.Decoder m) → tensor.NumericBlock ⇥ config.GenerationError {
+    do {
+        return decode.prefill(prompt_ids, m)
+    }
+    catch err {
+        throw variant config.GenerationError.DecodeFailure {message = err.message}
+    }
+}
+
+fn decode_one(int token_id, int position, decode.Decoder m) → tensor.NumericBlock ⇥ config.GenerationError {
+    do {
+        return decode.decode_data(token_id, position, m)
+    }
+    catch err {
+        throw variant config.GenerationError.DecodeFailure {message = err.message}
+    }
+}
+
+@ public
+fn last_logits(tensor.NumericBlock logits, int vocab) → list<f32> ⇥ config.GenerationError {
+    # NumericBlock carries a runtime shape; validate its rank before indexing.
+    const list<int> shape ← logits.shape
+    if shape.length() ≡ 1 {
+        return logits.data
+    }
+    require shape.length() ≡ 2 throw variant config.GenerationError.DecodeFailure {message = "decode logits must be rank-1 or rank-2"}
+    const int rows ← shape.get(0) coalesce 0
+    const int cols ← shape.get(1) coalesce 0
+    require rows ≥ 1 throw variant config.GenerationError.DecodeFailure {message = "decode logits shape does not match the vocabulary"}
+    require cols ≡ vocab throw variant config.GenerationError.DecodeFailure {message = "decode logits shape does not match the vocabulary"}
+    var list<f32> row ← empty
+    # NumericBlock data is flat; the row index selects the final row.
+    for range 0‥vocab const i {
+        do {
+            row.append(logits.get([rows - 1, i]))
+        }
+        catch err {
+            throw variant config.GenerationError.DecodeFailure {message = err.message}
+        }
+    }
+    return row
+}
+
+@ public
+fn generate(config.GenerationConfig g, list<int> prompt_ids, decode.Decoder m) → list<int> ⇥ config.GenerationError {
+    return generate_cancelled(g, prompt_ids, m, decode.fresh_cancellation())
+}
+
+@ public
+fn generate_with_stop(config.GenerationConfig g, list<int> prompt_ids, decode.Decoder m, StopPolicy stop) → list<int> ⇥ config.GenerationError {
+    return generate_cancelled_with_stop(g, prompt_ids, m, decode.fresh_cancellation(), stop)
+}
+
+@ public
+fn generate_cancelled(config.GenerationConfig g, list<int> prompt_ids, decode.Decoder m, decode.Cancellation cancel) → list<int> ⇥ config.GenerationError {
+    return generate_cancelled_with_stop(g, prompt_ids, m, cancel, eog_stop())
+}
+
+@ public
+fn generate_cancelled_with_stop(config.GenerationConfig g, list<int> prompt_ids, decode.Decoder m, decode.Cancellation cancel, StopPolicy stop) → list<int> ⇥ config.GenerationError {
+    observe(cancel)
+    require prompt_ids.length() ≥ 1 throw variant config.GenerationError.InvalidConfig {message = "needs at least one prompt token"}
+    require prompt_ids.length() ≺ g.context throw variant config.GenerationError.InvalidConfig {message = "prompt length does not fit context"}
+    require prompt_ids.length() ≤ m.context throw variant config.GenerationError.InvalidConfig {message = "prompt length does not fit context"}
+    const sampling.Config drawn ← config.config(g)
+    var train.Seed rng ← config.seed(g)
+    const tensor.NumericBlock pref ← prefill(prompt_ids, m)
+    var list<f32> last ← last_logits(pref, m.vocabulary)
+    var GenerationCursor cursor ← cursor_after_prompt(g, prompt_ids.length())
+    var list<int> tokens ← empty
+    var list<int> history ← empty
+    var bool finished ← false
+    while token_allowed(g, cursor) and not finished {
+        observe(cancel)
+        const sampling.Sampler outcome ← sample(sample_logits(last, stop), drawn, history, rng)
+        const int token ← outcome.token_id
+        tokens.append(token)
+        history.append(token)
+        rng ← outcome.seed
+        cursor ← cursor_advance(g, cursor)
+        if identity.is_eog(token) and stops_on_eog(stop) {
+            finished ← true
+        }
+        else {
+            if token_allowed(g, cursor) {
+                const tensor.NumericBlock step ← decode_one(token, cursor.session.position - 1, m)
+                last ← last_logits(step, m.vocabulary)
+            }
+            else {
+                finished ← true
+            }
+        }
+    }
+    return tokens
+}
+

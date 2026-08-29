@@ -1,0 +1,458 @@
+# Dense-engine generation over gradus:model/dense and the KV cache.
+#
+# Public import: import from "gradus:generation/dense" dense_gen
+# Depends on: gradus:generation/config, gradus:generation/decoder,
+#   gradus:attention/rope, gradus:cache/kv, gradus:model/dense.
+
+import from "gradus:generation/config" config
+import from "gradus:generation/decoder" decoder
+import from "gradus:attention/rope" rope
+import from "gradus:cache/kv" kv
+import from "gradus:decode" decode
+import from "gradus:model/dense" dense
+import from "gradus:sampling" sampling
+import from "gradus:tensor" tensor
+import from "gradus:tokenizer/identity" identity
+import from "gradus:train" train
+
+fn dense_one(DenseEngine engine, (string, int) → tensor.NumericBlock ⇥ dense.DenseError source, int token_id, int position, list<kv.KVCache> layers) → dense.DenseStep ⇥ config.GenerationError {
+    do {
+        return dense.decode_step(engine.architecture, source, token_id, position, engine.epsilon, engine.scale, engine.rope_dim, engine.rope, layers)
+    }
+    catch err {
+        throw variant config.GenerationError.DecodeFailure {message = err.message}
+    }
+}
+
+fn dense_prefill(DenseEngine engine, (string, int) → tensor.NumericBlock ⇥ dense.DenseError source, list<int> prompt_ids, list<kv.KVCache> layers) → dense.DenseStep ⇥ config.GenerationError {
+    do {
+        return dense.prefill_cached(engine.architecture, source, prompt_ids, engine.epsilon, engine.scale, engine.rope_dim, engine.rope, layers)
+    }
+    catch err {
+        throw variant config.GenerationError.DecodeFailure {message = err.message}
+    }
+}
+
+fn copy_prefix(list<int> base, list<int> ids, int count) → list<int> {
+    var list<int> out ← empty
+    for from base const token {
+        out.append(token)
+    }
+    # The count selects a prefix, so the source list cannot be walked to its end.
+    for range 0‥count const i {
+        out.append(ids.get(i) coalesce 0)
+    }
+    return out
+}
+
+fn advance_n(config.GenerationConfig g, decoder.GenerationCursor start, int count) → decoder.GenerationCursor ⇥ config.GenerationError {
+    var decoder.GenerationCursor out ← start
+    for range 0‥count const i {
+        out ← decoder.cursor_advance(g, out)
+    }
+    return out
+}
+
+fn logit_row(tensor.NumericBlock logits, int row, int vocab) → list<f32> ⇥ config.GenerationError {
+    require logits.rank() ≡ 2 throw variant config.GenerationError.DecodeFailure {message = "decode logits must be rank two"}
+    # NumericBlock carries a runtime shape; validate its rank before indexing.
+    const list<int> shape ← logits.shape
+    const int rows ← shape.get(0) coalesce 0
+    const int cols ← shape.get(1) coalesce 0
+    require row ≥ 0 and row ≺ rows throw variant config.GenerationError.DecodeFailure {message = "decode logits row is outside the block"}
+    require cols ≡ vocab throw variant config.GenerationError.DecodeFailure {message = "decode logits shape does not match the vocabulary"}
+    var list<f32> out ← empty
+    # NumericBlock data is flat; the row index selects the requested value.
+    for range 0‥vocab const i {
+        out.append(logits.data.get(row * vocab + i) coalesce 0.0 ∷ f32)
+    }
+    return out
+}
+
+fn draw_target_ids(tensor.NumericBlock logits, int rows, int vocab, sampling.Config drawn, train.Seed rng, decoder.StopPolicy stop) → list<int> ⇥ config.GenerationError {
+    var list<int> out ← empty
+    for range 0‥rows const row {
+        const list<f32> values ← logit_row(logits, row, vocab)
+        const sampling.Sampler target ← decoder.sample(decoder.sample_logits(values, stop), drawn, empty, rng)
+        out.append(target.token_id)
+    }
+    return out
+}
+
+fn accepted_prefix(list<int> ids, int count, decoder.StopPolicy stop) → int {
+    if not decoder.stops_on_eog(stop) {
+        return count
+    }
+    # The count selects a prefix, so the source list cannot be walked to its end.
+    for range 0‥count const i {
+        if identity.is_eog(ids.get(i) coalesce (-1)) {
+            return i + 1
+        }
+    }
+    return count
+}
+
+fn lookup_context(list<int> prompt, list<int> history) → list<int> {
+    var list<int> context ← empty
+    for from prompt const token {
+        context.append(token)
+    }
+    for from history const token {
+        context.append(token)
+    }
+    return context
+}
+
+fn accepted_target_count(list<int> target_ids, list<int> candidate_ids) → int {
+    var int bound ← target_ids.length()
+    if candidate_ids.length() ≺ bound {
+        bound ← candidate_ids.length()
+    }
+    # The bound is the shorter list; a full lockstep walk would require equal lengths.
+    for range 0‥bound const count {
+        if target_ids.get(count) coalesce (-1) ≠ candidate_ids.get(count) coalesce (-1) {
+            return count
+        }
+    }
+    return bound
+}
+
+fn lookup_candidates(list<int> prompt, list<int> history, int block_size) → list<int> {
+    const list<int> context ← lookup_context(prompt, history)
+    const int available ← context.length()
+    if available ≺ 2 {
+        return empty
+    }
+    var int match_length ← block_size
+    if match_length ≻ available - 1 {
+        match_length ← available - 1
+    }
+    while match_length ≥ 1 {
+        const int suffix_start ← available - match_length
+        const int source_limit ← available - match_length
+        for range 0‥(source_limit + 1) const source_offset {
+            var bool matches ← true
+            # Both windows use computed offsets into the flat context.
+            for range 0‥match_length const i {
+                if context.get(source_offset + i) coalesce (-1) ≠ context.get(suffix_start + i) coalesce (-1) {
+                    matches ← false
+                }
+            }
+            if matches {
+                const int following ← source_offset + match_length
+                var int extension ← block_size
+                if extension ≻ available - following {
+                    extension ← available - following
+                }
+                if extension ≥ 1 {
+                    var list<int> candidates ← empty
+                    # This range extracts a computed suffix from the flat context.
+                    for range 0‥extension const i {
+                        candidates.append(context.get(following + i) coalesce (-1))
+                    }
+                    return candidates
+                }
+            }
+        }
+        match_length ← match_length - 1
+    }
+    return empty
+}
+
+fn slice_rows(tensor.NumericBlock value, int start, int rows, int dimension) → tensor.NumericBlock ⇥ config.GenerationError {
+    require value.shape ≡ ([start + rows, dimension] ↦ list<int>) throw variant config.GenerationError.DecodeFailure {message = "verified cache shape does not match the candidate block"}
+    var list<f32> data ← empty
+    # NumericBlock data is flat; these coordinates select a row window.
+    for range start‥(start + rows) const row {
+        for range 0‥dimension const column {
+            data.append(value.data.get(row * dimension + column) coalesce 0.0 ∷ f32)
+        }
+    }
+    do {
+        return tensor.construct(data, [rows, dimension])
+    }
+    catch err {
+        throw variant config.GenerationError.DecodeFailure {message = err.message}
+    }
+}
+
+fn commit_dense_block(list<kv.KVCache> base, dense.DenseStep verified, list<int> candidate_ids, int accepted_count) → list<kv.KVCache> ⇥ config.GenerationError {
+    require accepted_count ≥ 1 throw variant config.GenerationError.DecodeFailure {message = "accepted candidate block must not be empty"}
+    require accepted_count ≤ candidate_ids.length() throw variant config.GenerationError.DecodeFailure {message = "accepted candidate block exceeds the proposal"}
+    require verified.layers.length() ≡ base.length() throw variant config.GenerationError.DecodeFailure {message = "verified cache layer count does not match the base"}
+    var list<kv.KVCache> committed ← empty
+    const kv.KVCache first ← base.get(0) coalesce kv.default()
+    const int prefix ← first.length()
+    const list<int> accepted_ids ← copy_prefix(empty, candidate_ids, accepted_count)
+    for from base, verified.layers const before, after {
+        const tensor.NumericBlock key ← slice_rows(after.key, prefix, accepted_count, before.dimension)
+        const tensor.NumericBlock payload ← slice_rows(after.payload, prefix, accepted_count, before.dimension)
+        do {
+            committed.append(kv.extend(before, accepted_ids, key, payload))
+        }
+        catch err {
+            throw variant config.GenerationError.DecodeFailure {message = err.message}
+        }
+    }
+    return committed
+}
+
+# Public generate: config + prompt ids + the admitted decoder.
+# Prefill produces the last-row logits; each later step is
+# decode_data + sampling.sample. Default stop is Eog: halt after the
+# first EOG token (identity.is_eog — set {0, 2}) or at the cursor
+# ceiling. generate_with_stop / generate_cancelled_with_stop take an
+# explicit decoder.StopPolicy. The KV-wired loop is generate_dense.
+# --- dense generation ----------------------------------------------------
+@ public
+class DenseEngine {
+    dense.DenseConfig architecture
+    f32 epsilon
+    f32 scale
+    int rope_dim
+    rope.RopeConfig rope
+}
+
+@ public
+fn construct_dense_engine(dense.DenseConfig architecture, f32 epsilon, f32 scale, int rope_dim, rope.RopeConfig rope) → DenseEngine {
+    return DenseEngine {architecture = architecture, epsilon = epsilon, scale = scale, rope_dim = rope_dim, rope = rope}
+}
+
+@ public
+fn default_dense_engine() → DenseEngine {
+    return DenseEngine {architecture = dense.DenseConfig {layers = 0, heads = 0, kv_heads = 0, head_dim = 0, hidden_dim = 0, vocab = 0, tied = false}, epsilon = 0.0, scale = 0.0, rope_dim = 0, rope = rope.default()}
+}
+
+# Same loop as generate, over dense.decode_step and a per-layer KV cache.
+# Used by the SmolLM2 oracle example. Default EOG-stop applies: SmolLM2
+# EOS=2 is in the admitted set {0, 2}, so a greedy continuation that
+# would have been G1's unrestrained [30, 2, 198] becomes [30, 2].
+# generate_dense_with_stop(IgnoreEos) suppresses EOG from sampling and
+# runs to max_tokens — the U5 / llama.cpp ignore_eos row.
+@ public
+fn generate_dense(config.GenerationConfig g, list<int> prompt_ids, DenseEngine engine, (string, int) → tensor.NumericBlock ⇥ dense.DenseError source, list<kv.KVCache> layers, decode.Cancellation cancel) → list<int> ⇥ config.GenerationError {
+    return generate_dense_with_stop(g, prompt_ids, engine, source, layers, cancel, decoder.eog_stop())
+}
+
+@ public
+fn generate_dense_with_stop(config.GenerationConfig g, list<int> prompt_ids, DenseEngine engine, (string, int) → tensor.NumericBlock ⇥ dense.DenseError source, list<kv.KVCache> layers, decode.Cancellation cancel, decoder.StopPolicy stop) → list<int> ⇥ config.GenerationError {
+    decoder.observe(cancel)
+    require prompt_ids.length() ≥ 1 throw variant config.GenerationError.InvalidConfig {message = "needs at least one prompt token"}
+    require prompt_ids.length() ≺ g.context throw variant config.GenerationError.InvalidConfig {message = "prompt length does not fit context"}
+    const string acceleration_mode ← config.acceleration_mode_name(g.acceleration.mode)
+    if acceleration_mode ≡ "context_lookup" {
+        if g.temperature ≻ 0.0 or g.top_k ≻ 0 or (g.top_p ≻ 0.0 and g.top_p ≺ 1.0) or g.min_p ≻ 0.0 {
+            throw variant config.GenerationError.SampledAccelerationRejected {message = "sampled acceleration is not supported"}
+        }
+    }
+    const sampling.Config drawn ← config.config(g)
+    var train.Seed rng ← config.seed(g)
+    decoder.observe(cancel)
+    const dense.DenseStep pref ← dense_prefill(engine, source, prompt_ids, layers)
+    var list<kv.KVCache> state ← pref.layers
+    var list<f32> last ← decoder.last_logits(pref.logits, engine.architecture.vocab)
+    var decoder.GenerationCursor cursor ← decoder.cursor_after_prompt(g, prompt_ids.length())
+    var list<int> tokens ← empty
+    var list<int> history ← empty
+    var bool finished ← false
+    while decoder.token_allowed(g, cursor) and not finished {
+        decoder.observe(cancel)
+        if acceleration_mode ≡ "disabled" {
+            const sampling.Sampler outcome ← decoder.sample(decoder.sample_logits(last, stop), drawn, history, rng)
+            const int token ← outcome.token_id
+            tokens.append(token)
+            history.append(token)
+            rng ← outcome.seed
+            cursor ← decoder.cursor_advance(g, cursor)
+            if identity.is_eog(token) and decoder.stops_on_eog(stop) {
+                finished ← true
+            }
+            else {
+                if decoder.token_allowed(g, cursor) {
+                    const dense.DenseStep step ← dense_one(engine, source, token, cursor.session.position - 1, state)
+                    last ← decoder.last_logits(step.logits, engine.architecture.vocab)
+                    state ← step.layers
+                }
+                else {
+                    finished ← true
+                }
+            }
+        }
+        else {
+            const int block_size ← g.acceleration.max_block
+            const list<int> candidate_ids ← lookup_candidates(prompt_ids, history, block_size)
+            if candidate_ids.length() ≡ 0 {
+                const sampling.Sampler outcome ← decoder.sample(decoder.sample_logits(last, stop), drawn, history, rng)
+                const int token ← outcome.token_id
+                tokens.append(token)
+                history.append(token)
+                rng ← outcome.seed
+                cursor ← decoder.cursor_advance(g, cursor)
+                if identity.is_eog(token) and decoder.stops_on_eog(stop) {
+                    finished ← true
+                }
+                else {
+                    if decoder.token_allowed(g, cursor) {
+                        const dense.DenseStep step ← dense_one(engine, source, token, cursor.session.position - 1, state)
+                        last ← decoder.last_logits(step.logits, engine.architecture.vocab)
+                        state ← step.layers
+                    }
+                    else {
+                        finished ← true
+                    }
+                }
+            }
+            else {
+                var dense.DenseStep verified ← dense.default_step()
+                var bool attempt_ok ← true
+                do {
+                    verified ← dense.decode_block(engine.architecture, source, candidate_ids, engine.epsilon, engine.scale, engine.rope_dim, engine.rope, state)
+                }
+                catch err {
+                    attempt_ok ← false
+                }
+                var list<int> target_ids ← empty
+                if attempt_ok {
+                    do {
+                        target_ids ← draw_target_ids(verified.logits, candidate_ids.length(), engine.architecture.vocab, drawn, rng, stop)
+                    }
+                    catch err {
+                        attempt_ok ← false
+                    }
+                }
+                if not attempt_ok {
+                    const sampling.Sampler outcome ← decoder.sample(decoder.sample_logits(last, stop), drawn, history, rng)
+                    const int token ← outcome.token_id
+                    tokens.append(token)
+                    history.append(token)
+                    rng ← outcome.seed
+                    cursor ← decoder.cursor_advance(g, cursor)
+                    if identity.is_eog(token) and decoder.stops_on_eog(stop) {
+                        finished ← true
+                    }
+                    else {
+                        if decoder.token_allowed(g, cursor) {
+                            const dense.DenseStep step ← dense_one(engine, source, token, cursor.session.position - 1, state)
+                            last ← decoder.last_logits(step.logits, engine.architecture.vocab)
+                            state ← step.layers
+                        }
+                        else {
+                            finished ← true
+                        }
+                    }
+                }
+                else {
+                    const int raw_accepted ← accepted_target_count(target_ids, candidate_ids)
+                    const int remaining ← g.max_tokens - cursor.emitted
+                    var int accepted_count ← raw_accepted
+                    if accepted_count ≻ remaining {
+                        accepted_count ← remaining
+                    }
+                    accepted_count ← accepted_prefix(candidate_ids, accepted_count, stop)
+                    var decoder.GenerationCursor staged_cursor ← cursor
+                    var bool staging_ok ← true
+                    do {
+                        staged_cursor ← advance_n(g, cursor, accepted_count)
+                    }
+                    catch err {
+                        staging_ok ← false
+                    }
+                    var list<f32> staged_last ← last
+                    if staging_ok and accepted_count ≻ 0 {
+                        do {
+                            staged_last ← logit_row(verified.logits, accepted_count - 1, engine.architecture.vocab)
+                        }
+                        catch err {
+                            staging_ok ← false
+                        }
+                    }
+                    var list<kv.KVCache> committed ← empty
+                    if staging_ok and accepted_count ≻ 0 {
+                        do {
+                            committed ← commit_dense_block(state, verified, candidate_ids, accepted_count)
+                        }
+                        catch err {
+                            staging_ok ← false
+                        }
+                    }
+                    if not staging_ok {
+                        const sampling.Sampler outcome ← decoder.sample(decoder.sample_logits(last, stop), drawn, history, rng)
+                        const int token ← outcome.token_id
+                        tokens.append(token)
+                        history.append(token)
+                        rng ← outcome.seed
+                        cursor ← decoder.cursor_advance(g, cursor)
+                        if identity.is_eog(token) and decoder.stops_on_eog(stop) {
+                            finished ← true
+                        }
+                        else {
+                            if decoder.token_allowed(g, cursor) {
+                                const dense.DenseStep step ← dense_one(engine, source, token, cursor.session.position - 1, state)
+                                last ← decoder.last_logits(step.logits, engine.architecture.vocab)
+                                state ← step.layers
+                            }
+                            else {
+                                finished ← true
+                            }
+                        }
+                    }
+                    else {
+                        if accepted_count ≡ 0 {
+                            const sampling.Sampler outcome ← decoder.sample(decoder.sample_logits(last, stop), drawn, history, rng)
+                        const int token ← outcome.token_id
+                        tokens.append(token)
+                        history.append(token)
+                        rng ← outcome.seed
+                        cursor ← decoder.cursor_advance(g, cursor)
+                        if identity.is_eog(token) and decoder.stops_on_eog(stop) {
+                            finished ← true
+                        }
+                        else {
+                            if decoder.token_allowed(g, cursor) {
+                                const dense.DenseStep step ← dense_one(engine, source, token, cursor.session.position - 1, state)
+                                last ← decoder.last_logits(step.logits, engine.architecture.vocab)
+                                state ← step.layers
+                            }
+                            else {
+                                finished ← true
+                            }
+                        }
+                    }
+                    else {
+                        state ← committed
+                        tokens ← copy_prefix(tokens, candidate_ids, accepted_count)
+                        history ← copy_prefix(history, candidate_ids, accepted_count)
+                        cursor ← staged_cursor
+                        last ← staged_last
+                        if decoder.stops_on_eog(stop) and identity.is_eog(candidate_ids.get(accepted_count - 1) coalesce (-1)) {
+                            finished ← true
+                        }
+                        if raw_accepted ≺ candidate_ids.length() and accepted_count ≡ raw_accepted and decoder.token_allowed(g, cursor) and not finished {
+                            const sampling.Sampler outcome ← decoder.sample(decoder.sample_logits(last, stop), drawn, history, rng)
+                            const int token ← outcome.token_id
+                            tokens.append(token)
+                            history.append(token)
+                            rng ← outcome.seed
+                            cursor ← decoder.cursor_advance(g, cursor)
+                            if identity.is_eog(token) and decoder.stops_on_eog(stop) {
+                                finished ← true
+                            }
+                            else {
+                                if decoder.token_allowed(g, cursor) {
+                                    const dense.DenseStep step ← dense_one(engine, source, token, cursor.session.position - 1, state)
+                                    last ← decoder.last_logits(step.logits, engine.architecture.vocab)
+                                    state ← step.layers
+                                }
+                                else {
+                                    finished ← true
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    }
+    return tokens
+}

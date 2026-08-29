@@ -1,0 +1,254 @@
+# Gated DeltaNet linear-attention path (conv + recurrent).
+#
+# Public import: import from "gradus:model/qwen35moe_state/linear_attn" linear_attn
+# Depends on: schedule, session, qwen35moe, tensor.
+
+import from "gradus:model/qwen35moe_state/schedule" schedule
+import from "gradus:model/qwen35moe_state/session" session
+import from "gradus:model/qwen35moe" qwen35moe
+import from "gradus:tensor" tensor
+import from "gradus:dtype" dtype
+
+# -------------------------------------------------------------------------
+# The linear-attention (SSM) layer window (F2, F5).
+# -------------------------------------------------------------------------
+
+# Per-token intermediates of one SSM layer window, kept for the per-layer
+# first-divergence comparison. All lists are [tokens][width] row-major:
+# normed is the attn_norm output [T][2048]; qkv_mixed the qkv projection
+# [T][8192]; gate_proj the z projection [T][4096]; beta_sigmoid and gate
+# are [T][32]; conv_input is [rows + T][8192]; conv_output is the
+# post-SiLU conv [T][8192]; q_conv/k_conv are the L2-normed head-repeated
+# rows [T][32][128]; v_conv matches; core_out is the delta-net output
+# [T][32][128]; final_output is the z-gated normed row [T][4096].
+@ public
+class LinearAttentionTrace {
+    list<f32> normed
+    list<f32> qkv_mixed
+    list<f32> gate_proj
+    list<f32> beta_sigmoid
+    list<f32> gate
+    list<f32> conv_input
+    list<f32> conv_output
+    list<f32> q_conv
+    list<f32> k_conv
+    list<f32> v_conv
+    list<f32> core_out
+    list<f32> final_output
+}
+
+@ public
+class LinearAttentionOutcome {
+    LinearAttentionTrace trace
+    list<f32> out
+    session.ConvState conv
+    session.RecurrentState recurrent
+}
+
+# Run one SSM layer over T input rows [T][2048]: attn_norm -> qkv/z/beta/
+# alpha/gate projections -> causal depthwise conv (state-carried) -> L2
+# norms + head repeat -> the delta recurrence per head per token -> z-gated
+# RMSNorm -> output projection -> residual add. The recurrence order (heads
+# outer, tokens inner, per head sequential) mirrors the comparator's fused
+# kernel; batching over tokens and feeding tokens one at a time produce the
+# same values (F5), and the returned states are the terminal state family.
+@ public
+fn linear_attention(list<f32> x_rows, int layer, session.ConvState conv_in, session.RecurrentState recurrent_in, (string, int, int) → tensor.NumericBlock ⇥ schedule.Qwen35moeStateError source, qwen35moe.Qwen35moeConfig c) → LinearAttentionOutcome ⇥ schedule.Qwen35moeStateError {
+    const int tokens ← x_rows.length() / c.embedding_length
+    # --- window gates (fail closed) ---------------------------------------
+    require tokens ≥ 1 and x_rows.length() ≡ tokens * c.embedding_length throw variant BadShape {message = "linear attention input rows must be [T][embedding]"}
+    require layer ≥ 0 throw variant BadConfig {message = "layer index must be non-negative"}
+    const int embd ← c.embedding_length
+    const int conv_channels ← c.inner_size + 2 * c.group_count * c.state_size
+    const int key_dim ← c.state_size
+    const int value_heads ← c.gradus_temporis
+    const int value_dim ← c.state_size
+    const int head_v_dim ← c.inner_size / value_heads
+    const string p ← session._prefix(layer)
+
+    # --- weights (each read once per layer call) --------------------------
+    const tensor.NumericBlock attn_norm ← session._window(source, p + ".attn_norm", 0, embd, [embd])
+    const tensor.NumericBlock wqkv ← session._window(source, p + ".attn_qkv", 0, conv_channels * embd, [conv_channels, embd])
+    const tensor.NumericBlock wgate ← session._window(source, p + ".attn_gate", 0, c.inner_size * embd, [c.inner_size, embd])
+    const tensor.NumericBlock conv_weight ← session._window(source, p + ".ssm_conv1d", 0, c.conv_kernel * conv_channels, [conv_channels, c.conv_kernel])
+    const tensor.NumericBlock dt_bias ← session._window(source, p + ".ssm_dt", 0, value_heads, [value_heads])
+    const tensor.NumericBlock a_row ← session._window(source, p + ".ssm_a", 0, value_heads, [value_heads])
+    const tensor.NumericBlock wbeta ← session._window(source, p + ".ssm_beta", 0, value_heads * embd, [value_heads, embd])
+    const tensor.NumericBlock walpha ← session._window(source, p + ".ssm_alpha", 0, value_heads * embd, [value_heads, embd])
+    const tensor.NumericBlock ssm_norm ← session._window(source, p + ".ssm_norm", 0, head_v_dim, [head_v_dim])
+    const tensor.NumericBlock wout ← session._window(source, p + ".ssm_out", 0, embd * c.inner_size, [embd, c.inner_size])
+
+    var list<f32> out_rows ← empty
+
+    # --- attn_norm + projections over the whole window --------------------
+    var list<f32> normed_rows ← empty
+    for range 0‥tokens const t {
+        var list<f32> row ← empty
+        for range 0‥embd const d {
+            row.append(x_rows.get(t * embd + d) coalesce 0.0 ∷ f32)
+        }
+        const list<f32> normed ← session._rms_norm_row(row, attn_norm.data, c.rms_norm_epsilon)
+        for from normed const v {
+            normed_rows.append(v)
+        }
+    }
+    const list<f32> qkv_rows ← session._gemm_rows(wqkv, normed_rows, embd, conv_channels, tokens)
+    const list<f32> z_rows ← session._gemm_rows(wgate, normed_rows, embd, c.inner_size, tokens)
+    const list<f32> beta_rows ← session._gemm_rows(wbeta, normed_rows, embd, value_heads, tokens)
+    const list<f32> alpha_rows ← session._gemm_rows(walpha, normed_rows, embd, value_heads, tokens)
+    var list<f32> beta_sigmoid_rows ← empty
+    for range 0‥tokens const t {
+        for range 0‥value_heads const h {
+            beta_sigmoid_rows.append(session._sigmoid(beta_rows.get(t * value_heads + h) coalesce 0.0 ∷ f32))
+        }
+    }
+    var list<f32> gate_rows ← empty
+    for range 0‥tokens const t {
+        for range 0‥value_heads const h {
+            const f32 alpha ← alpha_rows.get(t * value_heads + h) coalesce 0.0 ∷ f32
+            const f32 bias ← dt_bias.data.get(h) coalesce 0.0 ∷ f32
+            const f32 a ← a_row.data.get(h) coalesce 0.0 ∷ f32
+            gate_rows.append(session._softplus(alpha + bias) * a)
+        }
+    }
+
+    # --- causal depthwise conv (state-carried) ----------------------------
+    # input = conv state rows ++ qkv rows; output[t][ch] is the 4-tap
+    # causal dot then SiLU. The advanced state is the last conv_kernel - 1
+    # rows of the input.
+    var list<f32> conv_input ← empty
+    for from conv_in.channels const v {
+        conv_input.append(v)
+    }
+    for from qkv_rows const v {
+        conv_input.append(v)
+    }
+    var list<f32> conv_out ← empty
+    for range 0‥tokens const t {
+        for range 0‥conv_channels const ch {
+            var f32 sum ← 0.0 ∷ f32
+            for range 0‥c.conv_kernel const tap {
+                sum ← sum + (conv_input.get((t + tap) * conv_channels + ch) coalesce 0.0 ∷ f32) * (conv_weight.data.get(ch * c.conv_kernel + tap) coalesce 0.0 ∷ f32)
+            }
+            conv_out.append(session._silu(sum))
+        }
+    }
+    var list<f32> conv_state_cells ← empty
+    for range 0‥conv_in.kernel const r {
+        for range 0‥conv_channels const ch {
+            conv_state_cells.append(conv_input.get((tokens + r) * conv_channels + ch) coalesce 0.0 ∷ f32)
+        }
+    }
+    const session.ConvState conv_out_state ← session.ConvState {channels = conv_state_cells, kernel = conv_in.kernel, channels_count = conv_channels}
+
+    # --- head views: L2-normed q/k repeated to value heads ----------------
+    # q/k per group head, v per value head.
+    var list<f32> q_rows ← empty
+    var list<f32> k_rows ← empty
+    var list<f32> v_rows ← empty
+    const int group_heads ← c.group_count
+    const f32 l2_eps ← c.rms_norm_epsilon
+    for range 0‥tokens const t {
+        const int tbase ← t * conv_channels
+        # L2 norm each group head of q and k, then repeat to value heads.
+        var list<list<f32>> q_normed_heads ← empty
+        var list<list<f32>> k_normed_heads ← empty
+        for range 0‥group_heads const h {
+            var list<f32> qhead ← empty
+            var list<f32> khead ← empty
+            for range 0‥key_dim const d {
+                qhead.append(conv_out.get(tbase + h * key_dim + d) coalesce 0.0 ∷ f32)
+                khead.append(conv_out.get(tbase + group_heads * key_dim + h * key_dim + d) coalesce 0.0 ∷ f32)
+            }
+            const list<f32> qnormed ← session._l2_norm_row(qhead, l2_eps)
+            const list<f32> knormed ← session._l2_norm_row(khead, l2_eps)
+            q_normed_heads.append(qnormed)
+            k_normed_heads.append(knormed)
+        }
+        for range 0‥value_heads const h {
+            const int src_head ← h % group_heads
+            const list<f32> qsrc ← q_normed_heads.get(src_head) coalesce session._empty_f32_row()
+            const list<f32> ksrc ← k_normed_heads.get(src_head) coalesce session._empty_f32_row()
+            for range 0‥key_dim const d {
+                q_rows.append(qsrc.get(d) coalesce 0.0 ∷ f32)
+                k_rows.append(ksrc.get(d) coalesce 0.0 ∷ f32)
+                v_rows.append(conv_out.get(tbase + 2 * group_heads * key_dim + h * head_v_dim + d) coalesce 0.0 ∷ f32)
+            }
+        }
+    }
+
+    # --- delta recurrence: heads outer, tokens sequential -----------------
+    # The fused kernel's order; the recurrent state advances across the
+    # window.
+    const int span ← key_dim * value_dim
+    var list<f32> cells ← empty
+    var list<f32> core_rows ← empty
+    for range 0‥value_heads const h {
+        var list<f32> head_cells ← empty
+        for range 0‥span const i {
+            head_cells.append(recurrent_in.cells.get(h * span + i) coalesce 0.0 ∷ f32)
+        }
+        for range 0‥tokens const t {
+            var list<f32> qhead ← empty
+            var list<f32> khead ← empty
+            var list<f32> vhead ← empty
+            for range 0‥key_dim const d {
+                qhead.append(q_rows.get(t * value_heads * key_dim + h * key_dim + d) coalesce 0.0 ∷ f32)
+                khead.append(k_rows.get(t * value_heads * key_dim + h * key_dim + d) coalesce 0.0 ∷ f32)
+                vhead.append(v_rows.get(t * value_heads * key_dim + h * key_dim + d) coalesce 0.0 ∷ f32)
+            }
+            const f32 beta ← beta_sigmoid_rows.get(t * value_heads + h) coalesce 0.0 ∷ f32
+            const f32 g ← gate_rows.get(t * value_heads + h) coalesce 0.0 ∷ f32
+            const tuple<updated: list<f32>, out: list<f32>> step ← session._delta_step(head_cells, qhead, khead, vhead, session._exp(g), beta, key_dim)
+            const list<f32> advanced ← step.updated
+            const list<f32> core ← step.out
+            head_cells ← advanced
+            for from core const v {
+                core_rows.append(v)
+            }
+        }
+        for from head_cells const cell {
+            cells.append(cell)
+        }
+    }
+    const session.RecurrentState recurrent_out ← session.RecurrentState {cells = cells, value_heads = value_heads, key_dim = key_dim, value_dim = value_dim}
+    # core_rows were appended head-major; re-index to token-major for the
+    # trace and the gated norm.
+    var list<f32> core_token_major ← empty
+    for range 0‥tokens const t {
+        for range 0‥value_heads const h {
+            for range 0‥key_dim const d {
+                core_token_major.append(core_rows.get(h * tokens * key_dim + t * key_dim + d) coalesce 0.0 ∷ f32)
+            }
+        }
+    }
+
+    # --- z-gated RMSNorm, output projection, residual add -----------------
+    var list<f32> final_rows ← empty
+    for range 0‥tokens const t {
+        for range 0‥value_heads const h {
+            var list<f32> head_out ← empty
+            for range 0‥head_v_dim const d {
+                head_out.append(core_token_major.get(t * value_heads * head_v_dim + h * head_v_dim + d) coalesce 0.0 ∷ f32)
+            }
+            const list<f32> normed ← session._rms_norm_row(head_out, ssm_norm.data, c.rms_norm_epsilon)
+            for range 0‥head_v_dim const d {
+                final_rows.append((normed.get(d) coalesce 0.0 ∷ f32) * session._silu(z_rows.get(t * c.inner_size + h * head_v_dim + d) coalesce 0.0 ∷ f32))
+            }
+        }
+    }
+    const list<f32> projected ← session._gemm_rows(wout, final_rows, c.inner_size, embd, tokens)
+    for range 0‥tokens * embd const i {
+        const f32 v ← projected.get(i) coalesce 0.0 ∷ f32
+        require dtype.finite(v) throw variant schedule.Qwen35moeStateError.NonFinite {message = "linear attention output is non-finite"}
+        out_rows.append(v + (x_rows.get(i) coalesce 0.0 ∷ f32))
+    }
+    const LinearAttentionTrace trace ← LinearAttentionTrace {normed = normed_rows, qkv_mixed = qkv_rows, gate_proj = z_rows, beta_sigmoid = beta_sigmoid_rows, gate = gate_rows, conv_input = conv_input, conv_output = conv_out, q_conv = q_rows, k_conv = k_rows, v_conv = v_rows, core_out = core_token_major, final_output = final_rows}
+    return LinearAttentionOutcome {trace = trace, out = out_rows, conv = conv_out_state, recurrent = recurrent_out}
+}
+
+# One-token incremental form (F5's decode side; identical math, T = 1).
+@ public
+fn linear_attention_step(list<f32> x_row, int layer, session.ConvState conv_in, session.RecurrentState recurrent_in, (string, int, int) → tensor.NumericBlock ⇥ schedule.Qwen35moeStateError source, qwen35moe.Qwen35moeConfig c) → LinearAttentionOutcome ⇥ schedule.Qwen35moeStateError {
+    return linear_attention(x_row, layer, conv_in, recurrent_in, source, c)
+}

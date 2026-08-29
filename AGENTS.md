@@ -37,7 +37,17 @@ One `.fab` file → one import path. Nested dirs for packages.
 | `gradus:loss` | Loss functions (MSE, cross-entropy) |
 | `gradus:optimize` | Optimizers (SGD) and learning-rate schedules |
 | `gradus:nn` | Differentiable primitives: Linear, activation, norm, embedding, dropout |
-| `gradus:attention` | Scaled dot-product attention, causal masking, multi-head |
+| `gradus:attention/rope` | RopeConfig, RopePolicy, AttentionError |
+| `gradus:attention/gqa` | SDPA, causal, rotary, multi-head, cached attention |
+| `gradus:cache/kv` | KVCache, CacheError, append/extend/reset |
+| `gradus:cache/identity` | CacheIdentity and identity wire |
+| `gradus:cache/structure` | KVStructure, profiles, GI4 unions |
+| `gradus:tokenizer/identity` | TokenizerIdentity, probes, EOG predicate |
+| `gradus:tokenizer/unicode` | Unicode categories and scanners |
+| `gradus:tokenizer/bpe` | Tokenizer runtime, encode/decode |
+| `gradus:generation/config` | GenerationConfig, GenerationError, acceleration |
+| `gradus:generation/decoder` | Cursor, stop policy, decoder generate |
+| `gradus:generation/dense` | DenseEngine and dense generate |
 | `gradus:mlp` | Two-layer MLP forward + training-path companion |
 | `gradus:transformer` | Transformer block, positional encoding, output head |
 | `gradus:train` | Training loop, metrics, checkpointing |

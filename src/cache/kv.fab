@@ -1,0 +1,264 @@
+# Logical KV-cache values and mutation rules.
+#
+# Public import: import from "gradus:cache/kv" kv
+# Depends on: gradus:dtype, gradus:tensor.
+# Owns CacheError.
+
+import from "gradus:dtype" dtype
+import from "gradus:tensor" tensor
+
+@ public
+union CacheError {
+    @ shared
+    string message
+
+    EmptyName,
+    IdOutOfRange,
+    ShapeMismatch,
+    DtypeMismatch,
+    InvalidDimension,
+    ElementMismatch,
+    UnknownVersion,
+    BadWire,
+    InvalidCombination,
+    Overflow,
+    Gap,
+    ProfileUnavailable,
+    TensorFailure {
+        tensor.TensorError inner
+    }
+}
+
+@ conversion
+fn from_tensor_error(tensor.TensorError err) → CacheError {
+    return variant TensorFailure { message = err.message, inner = err }
+}
+
+# The cache's schema version (the identity wire form).
+@ public
+const string SCHEMA_VERSION ← "1.0.0"
+
+# -------------------------------------------------------------------------
+# Private helpers.
+# -------------------------------------------------------------------------
+
+# Immutable typed concatenation keeps source order while exposing the list
+# shape to the collection reducer.
+fn append_f32(list<f32> base, list<f32> values) → list<f32> {
+    return values.reduce((list<f32> out, f32 value) ∴ out.added(value), base)
+}
+
+# "/" and ";" are reserved in the identity wire fields (the U3 wire-safety
+# rule).
+fn contains_separator(string s) → bool {
+    return s.contains("/") or s.contains(";")
+}
+
+fn digit(string c) → bool {
+    return c between "0123456789"
+}
+
+fn numeric(string s) → bool {
+    if s.length() ≡ 0 then return false
+    if s.length() ≻ 18 then return false
+    # Keep: validation must short-circuit on the first invalid character;
+    # filter/map would change that failable boundary and still need a scan.
+    for from s const c {
+        if not digit(c ↦ string) then return false
+    }
+    return true
+}
+
+# NumericBlock field-wise equality (shape + flat data).
+fn tensor_equal(tensor.NumericBlock a, tensor.NumericBlock b) → bool {
+    if not (a.shape ≡ b.shape) then return false
+    if not (a.data ≡ b.data) then return false
+    return true
+}
+
+# -------------------------------------------------------------------------
+# KVCache — the typed logical value.
+# -------------------------------------------------------------------------
+
+@ public
+class KVCache {
+    # Model name (identity).
+    string model
+    # Model version (identity).
+    string model_version
+    # Execution configuration tag (identity; carries the RoPE/scale facts).
+    string config
+    # Tokenizer identity (identity).
+    string tokenizer
+    # The exact token history (prefix) appended so far.
+    list<int> history
+    # Layer count of the forward row (the identity's layer field).
+    int layers
+    # Element dtype name (identity; "f32" — the admitted row).
+    string dtype
+    # Layout tag (identity; "staged").
+    string layout
+    # The cached K tensor [positions, dimension].
+    tensor.NumericBlock key
+    # The cached V tensor [positions, dimension].
+    tensor.NumericBlock payload
+    # Generation (starts 1; bumps on successful append, extend, or reset).
+    int version
+    # The cached feature width.
+    int dimension
+    # Immutable admission bound copied from KVStructure.context_length.
+    int capacity
+
+
+    # Cached position count (= the history length). Distinct from capacity.
+    fn length() → int {
+        return self.history.length()
+    }
+}
+
+# Field-wise cache equality — the determinism/round-trip predicate.
+# Convert-or-record: this is a small typed pure leaf whose ordered checks span
+# heterogeneous fields; no collection intrinsic covers the short-circuit shape.
+@ public
+fn cache_equal(KVCache a, KVCache b) → bool {
+    if a.model ≠ b.model then return false
+    if a.model_version ≠ b.model_version then return false
+    if a.config ≠ b.config then return false
+    if a.tokenizer ≠ b.tokenizer then return false
+    if not (a.history ≡ b.history) then return false
+    if a.layers ≠ b.layers then return false
+    if a.dtype ≠ b.dtype then return false
+    if a.layout ≠ b.layout then return false
+    if not tensor_equal(a.key, b.key) then return false
+    if not tensor_equal(a.payload, b.payload) then return false
+    if a.version ≠ b.version then return false
+    if a.dimension ≠ b.dimension then return false
+    if a.capacity ≠ b.capacity then return false
+    return true
+}
+
+# Unstructured empty_cache helper bound. Structure-aware construction
+# (empty_layers) copies KVStructure.context_length instead.
+const int HELPER_CAPACITY ← 2048
+
+fn row_count(tensor.NumericBlock t) → int {
+    if t.shape.length() ≺ 1 then return 0
+    return t.shape.get(0) coalesce 0
+}
+
+# Gap and overflow reject before any new rows are assembled.
+fn admit_write(KVCache c, int added) → bool ⇥ CacheError {
+    const int write_position ← c.length()
+    require write_position ≡ row_count(c.key) throw variant Gap { message = "cache write leaves a gap" }
+    require write_position ≡ row_count(c.payload) throw variant Gap { message = "cache write leaves a gap" }
+    require write_position + added ≤ c.capacity throw variant Overflow { message = "cache overflow" }
+    return true
+}
+
+fn keep(KVCache c, list<int> history, tensor.NumericBlock key, tensor.NumericBlock payload, int version) → KVCache {
+    return KVCache { model = c.model, model_version = c.model_version, config = c.config, tokenizer = c.tokenizer, history = history, layers = c.layers, dtype = c.dtype, layout = c.layout, key = key, payload = payload, version = version, dimension = c.dimension, capacity = c.capacity }
+}
+
+@ public
+fn empty_cache_with_capacity(string model, string model_version, string config, string tokenizer, int layers, int dimension, int capacity) → KVCache ⇥ CacheError {
+    require model.length() ≠ 0 throw variant EmptyName { message = "empty model name" }
+    require model_version.length() ≠ 0 throw variant EmptyName { message = "empty model version" }
+    require config.length() ≠ 0 throw variant EmptyName { message = "empty execution config" }
+    require tokenizer.length() ≠ 0 throw variant EmptyName { message = "empty tokenizer identity" }
+    reject contains_separator(model) or contains_separator(model_version) or contains_separator(config) or contains_separator(tokenizer) throw variant EmptyName { message = "reserved wire character in identity" }
+    require layers ≥ 1 throw variant InvalidDimension { message = "layer count must be at least one" }
+    require dimension ≥ 1 throw variant InvalidDimension { message = "embedding dimension must be at least one" }
+    require capacity ≥ 1 throw variant InvalidDimension { message = "capacity must be at least one" }
+    const tensor.NumericBlock key ← tensor.construct([], [0, dimension])
+    const tensor.NumericBlock payload ← tensor.construct([], [0, dimension])
+    return KVCache { model = model, model_version = model_version, config = config, tokenizer = tokenizer, history = empty, layers = layers, dtype = "f32", layout = "staged", key = key, payload = payload, version = 1, dimension = dimension, capacity = capacity }
+}
+
+# -------------------------------------------------------------------------
+# empty_cache — a fresh cache: the identity fields, an empty history, an
+# empty K/V [0, dimension], version 1. Identity fields are non-empty and
+# wire-safe (fail closed); the layers/dimension/capacity are positive.
+# The 6-arg helper uses HELPER_CAPACITY. empty_layers copies
+# KVStructure.context_length as the immutable admission bound.
+# -------------------------------------------------------------------------
+
+@ public
+fn empty_cache(string model, string model_version, string config, string tokenizer, int layers, int dimension) → KVCache ⇥ CacheError {
+    return empty_cache_with_capacity(model, model_version, config, tokenizer, layers, dimension, HELPER_CAPACITY)
+}
+
+# Placeholder Default for `var KVCache` bindings (var on structs).
+# Empty identity and empty staged payloads; not a valid cache.
+@ public
+fn default() → KVCache {
+    const tensor.NumericBlock t ← tensor.default()
+    return KVCache { model = "", model_version = "", config = "", tokenizer = "", history = empty, layers = 0, dtype = "", layout = "", key = t, payload = t, version = 0, dimension = 0, capacity = 0 }
+}
+
+# -------------------------------------------------------------------------
+# append — the ONE mutation: extend the cache by exactly one position.
+# The token joins the exact history; the [1, dimension] f32 K/V extends
+# each cached tensor; the generation bumps by 1. Write position is the
+# current length. Gaps and overflow reject before any new rows exist.
+# -------------------------------------------------------------------------
+
+@ public
+fn append(KVCache c, int token_id, tensor.NumericBlock key, tensor.NumericBlock payload) → KVCache ⇥ CacheError {
+    require token_id ≥ 0 throw variant IdOutOfRange { message = "token id must be non-negative" }
+    require key.shape ≡ ([1, c.dimension] ↦ list<int>) throw variant ShapeMismatch { message = "K must be [1, dim]" }
+    require payload.shape ≡ ([1, c.dimension] ↦ list<int>) throw variant ShapeMismatch { message = "V must be [1, dim]" }
+    require dtype.name(key.dtype) ≡ "f32" throw variant DtypeMismatch { message = "unsupported dtype for cache" }
+    require dtype.name(payload.dtype) ≡ "f32" throw variant DtypeMismatch { message = "unsupported dtype for cache" }
+    admit_write(c, 1)
+    const list<int> new_history ← c.history.added(token_id)
+    const list<f32> new_key ← append_f32(c.key.data, key.data)
+    const list<f32> new_payload ← append_f32(c.payload.data, payload.data)
+    const int new_len ← c.length() + 1
+    return keep(c, new_history, tensor.construct(new_key, [new_len, c.dimension]), tensor.construct(new_payload, [new_len, c.dimension]), c.version + 1)
+}
+
+# -------------------------------------------------------------------------
+# extend — append T new positions in one mutation (the prefill write).
+# tokens, key, and payload must share length T; each new K/V row is [T, dim].
+# Generation bumps by 1 (one write). Write position is the current length.
+# Gaps and overflow reject before any new rows exist.
+# -------------------------------------------------------------------------
+
+@ public
+fn extend(KVCache c, list<int> tokens, tensor.NumericBlock key, tensor.NumericBlock payload) → KVCache ⇥ CacheError {
+    require tokens.length() ≠ 0 throw variant ElementMismatch { message = "empty token list" }
+    require key.shape ≡ ([tokens.length(), c.dimension] ↦ list<int>) throw variant ShapeMismatch { message = "K must be [T, dim]" }
+    require payload.shape ≡ ([tokens.length(), c.dimension] ↦ list<int>) throw variant ShapeMismatch { message = "V must be [T, dim]" }
+    require dtype.name(key.dtype) ≡ "f32" throw variant DtypeMismatch { message = "unsupported dtype for cache" }
+    require dtype.name(payload.dtype) ≡ "f32" throw variant DtypeMismatch { message = "unsupported dtype for cache" }
+    admit_write(c, tokens.length())
+    # Keep: token validation must reject the first bad id before any new
+    # collection is assembled; a transform cannot preserve this boundary.
+    for from tokens const token_id {
+        require token_id ≥ 0 throw variant IdOutOfRange { message = "token id must be non-negative" }
+    }
+    const list<int> new_history ← tokens.reduce((list<int> out, int token_id) ∴ out.added(token_id), c.history)
+    const list<f32> new_key ← append_f32(c.key.data, key.data)
+    const list<f32> new_payload ← append_f32(c.payload.data, payload.data)
+    const int new_len ← c.length() + tokens.length()
+    return keep(c, new_history, tensor.construct(new_key, [new_len, c.dimension]), tensor.construct(new_payload, [new_len, c.dimension]), c.version + 1)
+}
+
+# -------------------------------------------------------------------------
+# reset — logical prompt reset: empty history and empty K/V, same
+# identity fields and immutable capacity, generation advanced by 1.
+# -------------------------------------------------------------------------
+
+@ public
+fn reset(KVCache c) → KVCache ⇥ CacheError {
+    const tensor.NumericBlock key ← tensor.construct([], [0, c.dimension])
+    const tensor.NumericBlock payload ← tensor.construct([], [0, c.dimension])
+    return keep(c, empty, key, payload, c.version + 1)
+}
+
+# -------------------------------------------------------------------------
+# CacheIdentity — the typed cache identity key (MD-A9 precedent). The
+# fields gradus owns: model, model version, execution configuration,
+# tokenizer identity, exact token prefix, positions/RoPE facts, layer
+# count, dtype, layout. Field-wise equality; a versioned wire round-trip.
+# -------------------------------------------------------------------------

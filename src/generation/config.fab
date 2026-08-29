@@ -1,0 +1,319 @@
+# Generation configuration, acceleration policy, and versioned wire.
+#
+# Public import: import from "gradus:generation/config" config
+# Owns GenerationError.
+
+import from "gradus:dtype" dtype
+import from "gradus:sampling" sampling
+import from "gradus:train" train
+
+# --- error vocabulary ----------------------------------------------------
+# Every variant carries a text message exposed through the shared field.
+
+@ public
+union GenerationError {
+    @ shared
+    string message
+
+    InvalidConfig,
+    ElementMismatch,
+    DtypeMismatch,
+    Incompatible,
+    UnknownVersion,
+    BadWire,
+    LimitReached,
+    Cancelled,
+    DecodeFailure,
+    SampledAccelerationRejected
+}
+
+
+
+# --- wire schema ----------------------------------------------------------
+# Schema 1.1.0 carries one AccelerationPolicy segment; legacy 1.0.0 records
+# decode to the disabled policy.
+const string SCHEMA_VERSION_LEGACY ← "1.0.0"
+
+const string SCHEMA_VERSION ← "1.1.0"
+
+const string POLICY_VERSION ← "1.0.0"
+
+# --- acceleration policy -------------------------------------------------
+# The policy records mode and block bounds; lookup and candidate execution
+# remain outside this configuration module.
+
+@ public
+union AccelerationMode {
+    Disabled,
+    ContextLookup
+}
+
+@ public
+fn acceleration_disabled() → AccelerationMode {
+    return variant Disabled
+}
+
+@ public
+fn acceleration_context_lookup() → AccelerationMode {
+    return variant ContextLookup
+}
+
+@ public
+fn acceleration_mode_name(AccelerationMode m) → string {
+    match m {
+        case Disabled {
+            return "disabled"
+        }
+        case ContextLookup {
+            return "context_lookup"
+        }
+    }
+}
+
+fn acceleration_mode_from_name(string s) → AccelerationMode ⇥ GenerationError {
+    if s ≡ "disabled" then return variant Disabled
+    if s ≡ "context_lookup" then return variant ContextLookup
+    throw variant BadWire {message = "unknown acceleration mode"}
+}
+
+@ public
+class AccelerationPolicy {
+    string version
+    AccelerationMode mode
+    int min_block
+    int max_block
+}
+
+@ public
+fn construct_acceleration(string version, AccelerationMode mode, int min_block, int max_block) → AccelerationPolicy ⇥ GenerationError {
+    require version ≡ POLICY_VERSION throw variant UnknownVersion {message = "unknown acceleration policy version"}
+    require min_block ≥ 1 throw variant InvalidConfig {message = "acceleration block size must be at least one"}
+    require max_block ≥ 1 throw variant InvalidConfig {message = "acceleration block size must be at least one"}
+    require min_block ≤ max_block throw variant InvalidConfig {message = "acceleration block size minimum must not exceed the maximum"}
+    return AccelerationPolicy {version = version, mode = mode, min_block = min_block, max_block = max_block}
+}
+
+@ public
+fn default_acceleration() → AccelerationPolicy {
+    return AccelerationPolicy {version = "", mode = variant Disabled, min_block = 0, max_block = 0}
+}
+
+@ public
+fn acceleration_equal(AccelerationPolicy a, AccelerationPolicy b) → bool {
+    if a.version ≠ b.version then return false
+    if acceleration_mode_name(a.mode) ≠ acceleration_mode_name(b.mode) then return false
+    if a.min_block ≠ b.min_block then return false
+    if a.max_block ≠ b.max_block then return false
+    return true
+}
+
+# --- generation configuration --------------------------------------------
+
+
+@ public
+class GenerationConfig {
+    int context
+    int max_prompt
+    int max_tokens
+    int seed
+    f32 temperature
+    int top_k
+    f32 top_p
+    f32 min_p
+    f32 repetition_penalty
+    AccelerationPolicy acceleration
+}
+
+# Config equality is the round-trip and deterministic-mapping predicate.
+@ public
+fn generation_equal(GenerationConfig a, GenerationConfig b) → bool {
+    if a.context ≠ b.context then return false
+    if a.max_prompt ≠ b.max_prompt then return false
+    if a.max_tokens ≠ b.max_tokens then return false
+    if a.seed ≠ b.seed then return false
+    if a.temperature ≠ b.temperature then return false
+    if a.top_k ≠ b.top_k then return false
+    if a.top_p ≠ b.top_p then return false
+    if a.min_p ≠ b.min_p then return false
+    if a.repetition_penalty ≠ b.repetition_penalty then return false
+    if not acceleration_equal(a.acceleration, b.acceleration) then return false
+    return true
+}
+
+# --- configuration admission (fail closed) -------------------------------
+
+@ public
+fn construct_generation_with_policy(int context, int max_prompt, int max_tokens, int seed, f32 temperature, int top_k, f32 top_p, f32 min_p, f32 repetition_penalty, AccelerationPolicy acceleration) → GenerationConfig ⇥ GenerationError {
+    require context ≥ 1 throw variant InvalidConfig {message = "context length must be at least one"}
+    require max_prompt ≥ 1 throw variant InvalidConfig {message = "prompt batch size must be at least one"}
+    require max_tokens ≥ 1 throw variant InvalidConfig {message = "maximum generated tokens must be at least one"}
+    require max_tokens ≤ context throw variant InvalidConfig {message = "maximum generated tokens must fit within the context"}
+    require seed ≥ 1 throw variant InvalidConfig {message = "seed must be at least one"}
+    require dtype.finite(temperature) throw variant InvalidConfig {message = "temperature must be non-negative"}
+    require temperature ≥ 0.0 throw variant InvalidConfig {message = "temperature must be non-negative"}
+    require top_k ≥ 0 throw variant InvalidConfig {message = "top-k must be non-negative"}
+    require dtype.finite(top_p) throw variant InvalidConfig {message = "top-p must be within [0, 1]"}
+    require top_p ≥ 0.0 throw variant InvalidConfig {message = "top-p must be within [0, 1]"}
+    require top_p ≤ 1.0 throw variant InvalidConfig {message = "top-p must be within [0, 1]"}
+    require dtype.finite(min_p) throw variant InvalidConfig {message = "min-p must be within [0, 1]"}
+    require min_p ≥ 0.0 throw variant InvalidConfig {message = "min-p must be within [0, 1]"}
+    require min_p ≤ 1.0 throw variant InvalidConfig {message = "min-p must be within [0, 1]"}
+    require dtype.finite(repetition_penalty) throw variant InvalidConfig {message = "repetition penalty must be at least one"}
+    require repetition_penalty ≥ 1.0 throw variant InvalidConfig {message = "repetition penalty must be at least one"}
+    const AccelerationPolicy checked ← construct_acceleration(acceleration.version, acceleration.mode, acceleration.min_block, acceleration.max_block)
+    return GenerationConfig {context = context, max_prompt = max_prompt, max_tokens = max_tokens, seed = seed, temperature = temperature, top_k = top_k, top_p = top_p, min_p = min_p, repetition_penalty = repetition_penalty, acceleration = checked}
+}
+
+@ public
+fn construct_generation(int context, int max_prompt, int max_tokens, int seed, f32 temperature, int top_k, f32 top_p, f32 min_p, f32 repetition_penalty) → GenerationConfig ⇥ GenerationError {
+    const AccelerationPolicy disabled ← construct_acceleration(POLICY_VERSION, variant Disabled, 1, 1)
+    return construct_generation_with_policy(context, max_prompt, max_tokens, seed, temperature, top_k, top_p, min_p, repetition_penalty, disabled)
+}
+
+# Placeholder Default for `var GenerationConfig` bindings (var on structs).
+# Zero fields (not a valid config). Only a placeholder the caller
+# overwrites, or returns from an unreachable cape arm.
+@ public
+fn default() → GenerationConfig {
+    return GenerationConfig {context = 0, max_prompt = 0, max_tokens = 0, seed = 0, temperature = 0.0, top_k = 0, top_p = 0.0, min_p = 0.0, repetition_penalty = 0.0, acceleration = default_acceleration()}
+}
+
+# --- neutral configuration fallback -------------------------------------
+
+@ public
+fn generation_failure(int context, int max_prompt, int max_tokens, int seed) → GenerationConfig ⇥ GenerationError {
+    return construct_generation(context, max_prompt, max_tokens, seed, 1.0, 0, 1.0, 0.0, 1.0)
+}
+
+# --- supported controls --------------------------------------------------
+
+@ public
+fn support_flags() → list<string> {
+    return ["context", "max_prompt", "max_tokens", "seed", "temperature", "top_k", "top_p", "min_p", "repetition_penalty", "acceleration"]
+}
+
+# Admission predicate: true iff the control name is a supported field.
+@ public
+fn admitted_features(string name) → bool {
+    return name between support_flags()
+}
+
+# --- runtime projections -------------------------------------------------
+
+# The five sampling fields project exactly onto the U3 Config (the
+# config validated the same domains — the mapping never fails).
+@ public
+fn config(GenerationConfig g) → sampling.Config ⇥ GenerationError {
+    do {
+        return sampling.construct_config(g.temperature, g.top_k, g.top_p, g.min_p, g.repetition_penalty)
+    }
+    catch err {
+        const string c ← err.message
+        throw variant InvalidConfig {message = c}
+    }
+    throw variant InvalidConfig {message = "unreachable"}
+}
+
+# The seed projects exactly onto the U5 Seed (the config validated
+# seed ≥ 1 — the mapping never fails).
+@ public
+fn seed(GenerationConfig g) → train.Seed ⇥ GenerationError {
+    do {
+        return train.construct_seed(g.seed)
+    }
+    catch err {
+        const string c ← err.message
+        throw variant InvalidConfig {message = c}
+    }
+    throw variant InvalidConfig {message = "unreachable"}
+}
+
+# --- versioned configuration wire ---------------------------------------
+
+fn serialize_acceleration(AccelerationPolicy p) → string {
+    return "§:§:§:§"(p.version, acceleration_mode_name(p.mode), p.min_block ↦ string, p.max_block ↦ string)
+}
+
+@ public
+fn serialize_generation(GenerationConfig g) → string {
+    const string head ← "generation/config/§/§/§/§/§/§/§/§/§/§"(SCHEMA_VERSION, g.context ↦ string, g.max_prompt ↦ string, g.max_tokens ↦ string, g.seed ↦ string, g.temperature ↦ string, g.top_k ↦ string, g.top_p ↦ string, g.min_p ↦ string, g.repetition_penalty ↦ string)
+    return "§/§"(head, serialize_acceleration(g.acceleration))
+}
+
+fn digit(string c) → bool {
+    return c between "0123456789"
+}
+
+fn numeric(string s) → bool {
+    if s.length() ≡ 0 then return false
+    if s.length() ≻ 18 then return false
+    for from s const c {
+        # String iteration binds a one-character value; convert before comparing.
+        if not digit(c ↦ string) then return false
+    }
+    return true
+}
+
+fn wire_int(string text, string detail) → int ⇥ GenerationError {
+    require numeric(text) throw variant BadWire {message = detail}
+    do {
+        return text ↦ int
+    }
+    catch err {
+        throw variant BadWire {message = detail}
+    }
+    throw variant BadWire {message = detail}
+}
+
+fn wire_f32(string text, string detail) → f32 ⇥ GenerationError {
+    do {
+        return text ↦ f32
+    }
+    catch err {
+        throw variant BadWire {message = detail}
+    }
+    throw variant BadWire {message = detail}
+}
+
+fn deserialize_acceleration(string segment) → AccelerationPolicy ⇥ GenerationError {
+    const list<string> bits ← segment.split(":")
+    require bits.length() ≡ 4 throw variant BadWire {message = "malformed acceleration policy"}
+    const string version ← bits.get(0) coalesce ""
+    const AccelerationMode mode ← acceleration_mode_from_name(bits.get(1) coalesce "")
+    const int min_block ← wire_int(bits.get(2) coalesce "", "malformed acceleration block size in generation wire")
+    const int max_block ← wire_int(bits.get(3) coalesce "", "malformed acceleration block size in generation wire")
+    return construct_acceleration(version, mode, min_block, max_block)
+}
+
+@ public
+fn deserialize_generation(string wire) → GenerationConfig ⇥ GenerationError {
+    const list<string> parts ← wire.split("/")
+    require parts.length() ≥ 12 throw variant BadWire {message = "malformed generation config wire"}
+    require parts.length() ≤ 13 throw variant BadWire {message = "malformed generation config wire"}
+    require parts.get(0) coalesce "" ≡ "generation" throw variant BadWire {message = "unknown generation marker"}
+    require parts.get(1) coalesce "" ≡ "config" throw variant BadWire {message = "unknown generation marker"}
+    const string version ← parts.get(2) coalesce ""
+    if version ≡ SCHEMA_VERSION_LEGACY {
+        require parts.length() ≡ 12 throw variant BadWire {message = "malformed generation config wire"}
+    }
+    if version ≡ SCHEMA_VERSION {
+        require parts.length() ≡ 13 throw variant BadWire {message = "malformed generation config wire"}
+    }
+    if version ≠ SCHEMA_VERSION_LEGACY {
+        require version ≡ SCHEMA_VERSION throw variant UnknownVersion {message = "unknown generation schema version"}
+    }
+    const int context ← wire_int(parts.get(3) coalesce "", "malformed context length in generation wire")
+    const int max_prompt ← wire_int(parts.get(4) coalesce "", "malformed prompt batch in generation wire")
+    const int max_tokens ← wire_int(parts.get(5) coalesce "", "malformed max tokens in generation wire")
+    const int seed ← wire_int(parts.get(6) coalesce "", "malformed seed in generation wire")
+    const f32 temperature ← wire_f32(parts.get(7) coalesce "", "malformed temperature in generation wire")
+    const int top_k ← wire_int(parts.get(8) coalesce "", "malformed top-k in generation wire")
+    const f32 top_p ← wire_f32(parts.get(9) coalesce "", "malformed top-p in generation wire")
+    const f32 min_p ← wire_f32(parts.get(10) coalesce "", "malformed min-p in generation wire")
+    const f32 penalty ← wire_f32(parts.get(11) coalesce "", "malformed repetition penalty in generation wire")
+    if version ≡ SCHEMA_VERSION_LEGACY {
+        return construct_generation(context, max_prompt, max_tokens, seed, temperature, top_k, top_p, min_p, penalty)
+    }
+    return construct_generation_with_policy(context, max_prompt, max_tokens, seed, temperature, top_k, top_p, min_p, penalty, deserialize_acceleration(parts.get(12) coalesce ""))
+}
+

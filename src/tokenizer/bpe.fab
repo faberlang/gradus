@@ -1,0 +1,800 @@
+# Byte-level BPE runtime — table construction, merge, encode, decode.
+#
+# Public import: import from "gradus:tokenizer/bpe" bpe
+# Depends on: gradus:tokenizer/identity, gradus:tokenizer/unicode,
+#   gradus:model/gguf_manifest.
+
+import from "gradus:tokenizer/identity" identity
+import from "gradus:tokenizer/unicode" unicode
+import from "gradus:model/gguf_manifest" gguf_manifest
+
+
+# Byte-level BPE capability contract. The runtime only implements the gpt2
+# byte-to-unicode convention, so the manifest's declared tokenizer model must
+# be the byte-level family. Independent of the identity contract's pinned
+# SmolLM2 kind constant (clean break posture).
+const string TOKENIZER_CAPABLE ← "gpt2"
+
+# Sentinel rank for a pair absent from the merge table (never merges).
+const int MERGE_ABSENS ← 9223372036854775807
+
+# llama.cpp llama_token_type NORMAL — the special-cache boundary: every
+# vocab entry whose token_type is not NORMAL is special (the
+# llama_vocab::init_special rule; U3-4).
+const int KIND_NORMAL ← 1
+
+# GGUF metadata wire type for tokenizer.ggml.add_bos_token (bool) — mirrors
+# the manifest module's private GGUF_BOOL constant (7).
+const int KIND_BOOL ← 7
+
+# EOG text names (llama-vocab.cpp llm_load_vocab, pinned oracle 10150
+# `dee2a846b`): every vocab token whose text is one of these names is an
+# end-of-generation token (U3-5). The final name is the DeepSeek-OCR form
+# with fullwidth bars and U+2581 lower-one-eighth-block separators.
+const list<string> EOG_NAMES ← ["<|eot_id|>", "<|im_end|>", "<|end|>", "<|return|>", "<|call|>", "<|flush|>", "<|calls|>", "<end_of_turn>", "<|endoftext|>", "</s>", "<|eom_id|>", "<EOT>", "_<EOT>", "[EOT]", "[EOS]", "<|end_of_text|>", "<end_of_utterance>", "<eos>", "<turn|>", "<|tool_response>", "<｜end▁of▁sentence｜>", "[e~["]
+
+# FIM token text-name fallbacks — llama.cpp only falls back to these when
+# the tokenizer.ggml.fim_*_token_id metadata keys are absent.
+const list<string> FIM_PAD_NAMES ← ["<|fim_pad|>", "<fim-pad>", "<fim_pad>", "<PAD>", "[PAD]"]
+
+const list<string> FIM_REP_NAMES ← ["<|fim_repo|>", "<|repo_name|>", "<fim-repo>", "<REPO>", "<reponame>"]
+
+const list<string> FIM_SEP_NAMES ← ["<|file_sep|>"]
+
+# The artifact-backed runtime record. `words` is the vocab array indexed
+# by token id (decode path); `vocab` is the display-token → id map and
+# `concursus` the "left right" merge-pair → rank map (encode path).
+# `special_texts`/`specialia_ids` are the artifact special-token cache
+# (parallel lists; every non-NORMAL token_type entry, U3-4) that drives the
+# parse-special on/off policy. `eog` is the artifact EOG stop set and
+# `add_bos` the artifact's add_bos_token flag (U3-5). `chat_template` is
+# the artifact's tokenizer.chat_template string (U3-6; absent → empty —
+# no hard-coded fallback).
+
+
+@ public
+class Tokenizer {
+    list<string> words
+    map<string, int> vocab
+    map<string, int> concursus
+    list<string> special_texts
+    list<int> specialia_ids
+    list<int> eog
+    bool add_bos
+    string chat_template
+    int multitudo
+}
+
+# --- Byte ↔ display-codepoint mapping (gpt2 convention) --------------------
+
+# Byte value → display codepoint. Bytes in the printable/Latin-1 ranges map
+# to themselves; the remaining 68 bytes map to 0x100+n in ascending byte
+# order (0x00 → U+0100, 0x20 → U+0120, 0x7F → U+0121, …, 0xAD → U+0143).
+fn _code_from_byte(int byte) → int ⇥ identity.TokenizerError {
+    reject byte ≺ 0 or byte ≻ 255 throw variant identity.TokenizerError.BadWire { message = "byte value outside 0..255" }
+    if byte ≥ 33 and byte ≤ 126 then return byte
+    if byte ≥ 161 and byte ≤ 172 then return byte
+    if byte ≥ 174 and byte ≤ 255 then return byte
+    if byte ≤ 32 then return 256 + byte
+    if byte ≤ 160 then return byte + 162
+    return 323
+}
+
+# Display codepoint → byte value (inverse mapping). Unmappable codepoints
+# are malformed vocab content and fail closed.
+fn _byte_from_code(int cpt) → int ⇥ identity.TokenizerError {
+    if cpt ≥ 33 and cpt ≤ 126 then return cpt
+    if cpt ≥ 161 and cpt ≤ 172 then return cpt
+    if cpt ≥ 174 and cpt ≤ 255 then return cpt
+    if cpt ≥ 256 and cpt ≤ 288 then return cpt - 256
+    if cpt ≥ 289 and cpt ≤ 322 then return cpt - 162
+    if cpt ≡ 323 then return 173
+    throw variant identity.TokenizerError.UnknownTrace { message = "display character has no byte mapping (codepoint §)"(cpt ↦ string) }
+}
+
+# --- Codepoint ↔ text helpers -------------------------------------------
+
+fn _text_from_bytes(list<int> bs) → string ⇥ identity.TokenizerError {
+    const list<int<u8>> u8s ← bs.map(int b ∴ b ∷ int<u8>)
+    const bytes o ↤ u8s
+    do {
+        return o ↦ string
+    }
+    catch err {
+        throw variant identity.TokenizerError.BadUtf8 { message = "display character bytes are not valid UTF-8" }
+    }
+    throw variant identity.TokenizerError.BadUtf8 { message = "unreachable display character conversion" }
+}
+
+# UTF-8 encode one codepoint to its single-character text. Display
+# codepoints are ≤ 0x143, so the 1- and 2-byte arms cover the mapping; the
+# longer arms keep the helper total for arbitrary vocab content.
+fn _text_from_code(int cpt) → string ⇥ identity.TokenizerError {
+    require cpt ≥ 0 throw variant identity.TokenizerError.BadWire { message = "negative codepoint" }
+    if cpt ≺ 128 then return _text_from_bytes([cpt])
+    if cpt ≺ 2048 {
+        const int b0 ← 192 ∨ cpt ⇒ 6
+        const int b1 ← 128 ∨ cpt ∧ 63
+        return _text_from_bytes([b0, b1])
+    }
+    if cpt ≺ 65536 {
+        const int b0 ← 224 ∨ cpt ⇒ 12
+        const int b1 ← 128 ∨ cpt ⇒ 6 ∧ 63
+        const int b2 ← 128 ∨ cpt ∧ 63
+        return _text_from_bytes([b0, b1, b2])
+    }
+    if cpt ≺ 1114112 {
+        const int b0 ← 240 ∨ cpt ⇒ 18
+        const int b1 ← 128 ∨ cpt ⇒ 12 ∧ 63
+        const int b2 ← 128 ∨ cpt ⇒ 6 ∧ 63
+        const int b3 ← 128 ∨ cpt ∧ 63
+        return _text_from_bytes([b0, b1, b2, b3])
+    }
+    throw variant identity.TokenizerError.BadWire { message = "codepoint exceeds the Unicode range" }
+}
+
+# UTF-8 decode one character back to its codepoint. A single character is
+# one to four bytes.
+fn _code_from_trace(string c) → int ⇥ identity.TokenizerError {
+    const list<int> bs ← _number_bytes(c ↦ bytes)
+    const int n ← bs.length()
+    const int b0 ← bs.get(0) coalesce 0
+    if n ≡ 1 then return b0
+    const int b1 ← bs.get(1) coalesce 0
+    if n ≡ 2 then return (b0 ∧ 31) ⇐ 6 ∨ b1 ∧ 63
+    const int b2 ← bs.get(2) coalesce 0
+    if n ≡ 3 then return (b0 ∧ 15) ⇐ 12 ∨ (b1 ∧ 63) ⇐ 6 ∨ b2 ∧ 63
+    const int b3 ← bs.get(3) coalesce 0
+    if n ≡ 4 then return (b0 ∧ 7) ⇐ 18 ∨ (b1 ∧ 63) ⇐ 12 ∨ (b2 ∧ 63) ⇐ 6 ∨ b3 ∧ 63
+    throw variant identity.TokenizerError.UnknownTrace { message = "malformed display character" }
+}
+
+# Bulk bytes → byte-value bridge (the runtime's analogue of the manifest
+# module's `byte-list helper`; error-free by construction — the input always
+# comes from a text UTF-8 encode, so the payload carrier is a byte list).
+fn _number_bytes(bytes o) → list<int> {
+    const value v ↤ o
+    return v ↦ list<int>
+}
+
+# One display character (the byte-level BPE symbol for a single source byte).
+fn _trace_from_byte(int byte) → string ⇥ identity.TokenizerError {
+    return _text_from_code(_code_from_byte(byte))
+}
+
+# --- Manifest reads and merge-table construction ---------------------------
+
+fn _artifact_text(gguf_manifest.GgufManifest m, string key) → string ⇥ identity.TokenizerError {
+    do {
+        return gguf_manifest.text(m, key)
+    }
+    catch err {
+        throw variant identity.TokenizerError.BadArtifact { message = "tokenizer metadata is unavailable: §"(err.message) }
+    }
+    throw variant identity.TokenizerError.BadArtifact { message = "unreachable tokenizer metadata read" }
+}
+
+fn _artifact_texts(gguf_manifest.GgufManifest m, string key) → list<string> ⇥ identity.TokenizerError {
+    do {
+        return gguf_manifest.texts(m, key)
+    }
+    catch err {
+        throw variant identity.TokenizerError.BadArtifact { message = "tokenizer array is unavailable: §"(err.message) }
+    }
+    throw variant identity.TokenizerError.BadArtifact { message = "unreachable tokenizer array read" }
+}
+
+# tokenizer.ggml.token_type is OPTIONAL in GGUF: llama.cpp defaults absent
+# types to NORMAL (→ an empty special cache). A PRESENT but malformed
+# token_type fails closed.
+fn _artifact_optional_types(gguf_manifest.GgufManifest m) → list<int> ⇥ identity.TokenizerError {
+    do {
+        return gguf_manifest.numbers(m, "tokenizer.ggml.token_type")
+    }
+    catch err {
+        match err {
+            case gguf_manifest.GgufManifestError.NotFound const message {
+                return empty
+            }
+            case _ {
+                throw variant identity.TokenizerError.BadArtifact { message = "tokenizer token_type is malformed: §"(err.message) }
+            }
+        }
+    }
+    throw variant identity.TokenizerError.BadArtifact { message = "unreachable tokenizer token_type read" }
+}
+
+# Merge-entry well-formedness: exactly "left right" with a single space
+# separator and non-empty halves (llama.cpp's find_bpe_rank asserts the same
+# no-space-in-token invariant).
+fn _pair_ok(string par) → bool {
+    if par.length() ≡ 0 then return false
+    const list<string> partes ← par.split(" ")
+    if partes.length() ≠ 2 then return false
+    if (partes.get(0) coalesce "").length() ≡ 0 then return false
+    if (partes.get(1) coalesce "").length() ≡ 0 then return false
+    return true
+}
+
+# --- BPE merge loop (llama.cpp one-at-a-time semantics) --------------------
+
+# Repeatedly merge the adjacent pair with the lowest merge rank (ties broken
+# by the leftmost position), one occurrence per step, until no pair merges.
+# Matches the pinned reference's priority-queue behavior; a fresh scan each
+# step makes stale entries impossible.
+# W0 stay: this compound (rank, leftmost-position) key has no covering twin;
+# retain its sentinel guard pending a future operator ruling.
+fn _bpe_merge(map<string, int> concursus, list<string> symbola) → list<string> {
+    var list<string> cur ← symbola
+    while true {
+        const int n ← cur.length()
+        if n ≺ 2 {
+            break
+        }
+        var int melior_rank ← MERGE_ABSENS
+        var int melior_pos ← -1
+        var int i ← 0
+        while i + 1 ≺ n {
+            const string l ← cur.get(i) coalesce ""
+            const string r ← cur.get(i + 1) coalesce ""
+            const int rank ← concursus.get(l + " " + r) coalesce MERGE_ABSENS
+            if rank ≺ melior_rank or rank ≡ melior_rank and melior_pos ≥ 0 and i ≺ melior_pos {
+                melior_rank ← rank
+                melior_pos ← i
+            }
+            i ↑
+        }
+        if melior_pos ≺ 0 {
+            break
+        }
+        const string cohaesum ← "§§"(cur.get(melior_pos) coalesce "", cur.get(melior_pos + 1) coalesce "")
+        var list<string> next ← empty
+        var int j ← 0
+        while j ≺ n {
+            if j ≡ melior_pos {
+                next.append(cohaesum)
+                j ← j + 2
+            }
+            else {
+                next.append(cur.get(j) coalesce "")
+                j ← j + 1
+            }
+        }
+        cur ← next
+    }
+    return cur
+}
+
+# --- Runtime construction, encode, decode -----------------------------------
+
+# Build the runtime from a parsed manifest. The vocab and merge arrays come
+# from the artifact; the declared model must be the byte-level BPE family.
+# W0 stay: artifact construction must validate and populate maps in source
+# order, preserving fail-closed error timing; no fold covers these effects.
+@ public
+fn build(gguf_manifest.GgufManifest m) → Tokenizer ⇥ identity.TokenizerError {
+    const string merge_kind ← _artifact_text(m, "tokenizer.ggml.model")
+    require merge_kind ≡ TOKENIZER_CAPABLE throw variant identity.TokenizerError.UnknownMergeKind { message = "tokenizer runtime is byte-level BPE; manifest declares: §"(merge_kind) }
+    const list<string> words ← _artifact_texts(m, "tokenizer.ggml.tokens")
+    require words.length() ≠ 0 throw variant identity.TokenizerError.BadArtifact { message = "tokenizer vocabulary is empty" }
+    const list<string> merges ← _artifact_texts(m, "tokenizer.ggml.merges")
+    var map<string, int> vocab ← empty
+    for range 0 ‥ words.length() const i {
+        vocab.put(words.get(i) coalesce "", i)
+    }
+    var map<string, int> concursus ← empty
+    var int j ← 0
+    while j ≺ merges.length() {
+        const string par ← merges.get(j) coalesce ""
+        require _pair_ok(par) throw variant identity.TokenizerError.BadMerges { message = "malformed merge entry: §"(par) }
+        concursus.put(par, j)
+        j ↑
+    }
+    # Special-token cache (U3-4): every vocab entry whose token_type is not
+    # NORMAL is special (llama.cpp llama_vocab::init_special); absent
+    # token_type means no specials (the reference defaults to NORMAL).
+    const list<int> kinds ← _artifact_optional_types(m)
+    reject kinds.length() ≻ 0 and kinds.length() ≠ words.length() throw variant identity.TokenizerError.BadArtifact { message = "tokenizer token_type length does not match the vocabulary" }
+    var list<string> special_texts ← empty
+    var list<int> specialia_ids ← empty
+    var int k ← 0
+    while k ≺ words.length() {
+        const int kind ← kinds.get(k) coalesce KIND_NORMAL
+        if kind ≠ KIND_NORMAL {
+            special_texts.append(words.get(k) coalesce "")
+            specialia_ids.append(k)
+        }
+        k ↑
+    }
+    # EOG stop set + BOS policy (U3-5), derived from the artifact exactly
+    # like llama.cpp llm_load_vocab: the declared eos id, the reference EOG
+    # text names, and the FIM pad/rep/sep ids (metadata first, else the
+    # text-name fallback); add_bos reads tokenizer.ggml.add_bos_token.
+    # The chat template (U3-6) reads tokenizer.chat_template (absent →
+    # empty, the no-template state).
+    const list<int> eog ← _artifact_eog(m, words)
+    const bool add_bos ← _artifact_add_bos(m)
+    const string chat_template ← _artifact_chat_template(m)
+    return Tokenizer { words = words, vocab = vocab, concursus = concursus, special_texts = special_texts, specialia_ids = specialia_ids, eog = eog, add_bos = add_bos, chat_template = chat_template, multitudo = words.length() }
+}
+
+# Sparse table constructor — the provider builds a runtime over the model's
+# vocab/merge arrays without wrapping them in a GGUF corpus. `ids`/`tokens`
+# are parallel (token `tokens[i]` lives at id `ids[i]`); `special_ids` are
+# the parse-special cache (must appear in `ids`). Unmapped bytes fail
+# closed at encode time (UnknownTrace).
+# W0 stay: sparse admission interleaves ordered validation, map population,
+# and sentinel filling; no fold preserves those effects and error timing.
+@ public
+fn build_tables(list<int> ids, list<string> tokens, list<string> merges, list<int> special_ids) → Tokenizer ⇥ identity.TokenizerError {
+    require ids.length() ≡ tokens.length() throw variant identity.TokenizerError.BadArtifact { message = "tokenizer table ids and tokens are different lengths" }
+    require ids.length() ≠ 0 throw variant identity.TokenizerError.BadArtifact { message = "tokenizer vocabulary is empty" }
+    var map<int, string> per_id ← empty
+    var map<string, int> vocab ← empty
+    for range 0 ‥ ids.length() const i {
+        const int id ← ids.get(i) coalesce (-1)
+        require id ≥ 0 throw variant identity.TokenizerError.IdExtra { message = "tokenizer table id is negative" }
+        const string token ← tokens.get(i) coalesce ""
+        per_id.put(id, token)
+        vocab.put(token, id)
+    }
+    # The validated, non-empty id collection supplies the max-id position;
+    # read the value back after argmax, preserving the existing defensive
+    # default for the nullable read.
+    const int max_index ← ids.argmax() coalesce 0
+    const int max_id ← ids.get(max_index) coalesce (-1)
+    var list<string> words ← empty
+    var int k ← 0
+    while k ≤ max_id {
+        words.append(per_id.get(k) coalesce "")
+        k ↑
+    }
+    var map<string, int> concursus ← empty
+    var int j ← 0
+    while j ≺ merges.length() {
+        const string par ← merges.get(j) coalesce ""
+        require _pair_ok(par) throw variant identity.TokenizerError.BadMerges { message = "malformed merge entry: §"(par) }
+        concursus.put(par, j)
+        j ↑
+    }
+    var list<string> special_texts ← empty
+    var list<int> specialia_ids ← empty
+    for from special_ids const sid {
+        reject sid ≺ 0 or sid ≻ max_id throw variant identity.TokenizerError.BadArtifact { message = "special token id is outside the table: §"(sid ↦ string) }
+        const string txt ← words.get(sid) coalesce ""
+        require txt.length() ≠ 0 throw variant identity.TokenizerError.BadArtifact { message = "special token id has no table entry: §"(sid ↦ string) }
+        special_texts.append(txt)
+        specialia_ids.append(sid)
+    }
+    var list<int> eog_cand ← empty
+    var int e ← 0
+    while e ≺ ids.length() {
+        const string v ← tokens.get(e) coalesce ""
+        if _in_name(v, EOG_NAMES) {
+            eog_cand.append(ids.get(e) coalesce (-1))
+        }
+        e ↑
+    }
+    return Tokenizer { words = words, vocab = vocab, concursus = concursus, special_texts = special_texts, specialia_ids = specialia_ids, eog = _sort_ascending(eog_cand), add_bos = false, chat_template = "", multitudo = words.length() }
+}
+
+# -------------------------------------------------------------------------
+# GEA3-U2 — census-bound tokenizer table admission (GEA3 full-model route).
+#
+# The vocab/merge tables admit from the pinned GGUF through the EXISTING
+# typed artifact accessors (the same `texts`/`numbers` seams `build` reads)
+# with the frozen GEA3 census rows checked against the pinned constants
+# above: kind gpt2, pre-tokenizer smollm, 49,152 tokens, 48,900 merges,
+# 49,152 token_type rows, BOS-free, and the artifact EOG set {0, 2, 4}
+# (eos 2 + <|endoftext|> 0 + <|im_end|> 2 + <|fim_pad|> 4, ascending — the
+# U1 manifest census `eog_set`). Any drift fails closed before runtime
+# construction; `build` stays the unconstrained artifact constructor.
+# -------------------------------------------------------------------------
+
+# The frozen GEA3 artifact EOG census row.
+const int GEA3_EOG_FIRST ← 0
+
+const int GEA3_EOG_SECOND ← 2
+
+const int GEA3_EOG_THIRD ← 4
+
+# W0 stay: this explicit admission matrix preserves each typed rejection
+# boundary and its order; no collection construct covers the sequence.
+@ public
+fn admit_gea3_tables(gguf_manifest.GgufManifest m) → Tokenizer ⇥ identity.TokenizerError {
+    const string kind ← _artifact_text(m, "tokenizer.ggml.model")
+    require kind ≡ identity.TOKENIZER_KIND throw variant identity.TokenizerError.UnknownMergeKind { message = "GEA3 tokenizer table kind does not match the pinned census row: §"(kind) }
+    const string pre ← _artifact_text(m, "tokenizer.ggml.pre")
+    require pre ≡ identity.TOKENIZER_PRE throw variant identity.TokenizerError.UnknownPreTokenizer { message = "GEA3 tokenizer pre-tokenizer does not match the pinned census row: §"(pre) }
+    const list<string> tokens ← _artifact_texts(m, "tokenizer.ggml.tokens")
+    require tokens.length() ≡ identity.VOCAB throw variant identity.TokenizerError.BadVocab { message = "GEA3 tokenizer vocabulary count does not match the pinned census row" }
+    const list<string> merges ← _artifact_texts(m, "tokenizer.ggml.merges")
+    require merges.length() ≡ identity.MERGES throw variant identity.TokenizerError.BadVocab { message = "GEA3 tokenizer merge count does not match the pinned census row" }
+    const list<int> kinds ← _artifact_optional_types(m)
+    require kinds.length() ≡ identity.VOCAB throw variant identity.TokenizerError.BadVocab { message = "GEA3 tokenizer token_type count does not match the pinned census row" }
+    const Tokenizer t ← build(m)
+    reject add_bos(t) throw variant identity.TokenizerError.BadArtifact { message = "GEA3 pinned tokenizer is BOS-free; add_bos_token drifted" }
+    const list<int> eog ← artifact_eog(t)
+    require eog.length() ≡ 3 throw variant identity.TokenizerError.BadArtifact { message = "GEA3 artifact EOG set does not match the pinned census row" }
+    require eog.get(0) coalesce (-1) ≡ GEA3_EOG_FIRST throw variant identity.TokenizerError.BadArtifact { message = "GEA3 artifact EOG set does not match the pinned census row" }
+    require eog.get(1) coalesce (-1) ≡ GEA3_EOG_SECOND throw variant identity.TokenizerError.BadArtifact { message = "GEA3 artifact EOG set does not match the pinned census row" }
+    require eog.get(2) coalesce (-1) ≡ GEA3_EOG_THIRD throw variant identity.TokenizerError.BadArtifact { message = "GEA3 artifact EOG set does not match the pinned census row" }
+    return t
+}
+
+# Word-level encode: UTF-8 bytes → display symbols → BPE merges → vocab ids.
+# A final piece missing from the vocab falls back to its single-byte display
+# characters; a missing byte token is malformed vocab and fails closed.
+# W0 stay: ordered BPE output expansion has a failable trace path and a
+# failable fallback path; no map/flat-map form preserves either branch.
+@ public
+fn encode(Tokenizer t, string word) → list<int> ⇥ identity.TokenizerError {
+    const list<int> byte_values ← _number_bytes(word ↦ bytes)
+    var list<string> symbola ← empty
+    for from byte_values const b {
+        symbola.append(_trace_from_byte(b))
+    }
+    const list<string> end ← _bpe_merge(t.concursus, symbola)
+    var list<int> ids ← empty
+    for from end const piece {
+        const int id ← t.vocab.get(piece) coalesce (-1)
+        if id ≥ 0 {
+            ids.append(id)
+        }
+        else {
+            for range 0 ‥ piece.length() const i {
+                const string c ← piece.slice(i, i + 1)
+                const int cid ← t.vocab.get(c) coalesce (-1)
+                require cid ≥ 0 throw variant identity.TokenizerError.UnknownTrace { message = "byte piece missing from the vocabulary: §"(c) }
+                ids.append(cid)
+            }
+        }
+    }
+    return ids
+}
+
+# Word-level decode: ids → vocab display strings → inverse display mapping →
+# bytes → UTF-8 text. Unknown ids, unmappable display characters, and byte
+# sequences that are not valid UTF-8 fail with typed errors.
+# W0 stay: ordered decoding carries typed failures from each nested character;
+# map cannot propagate the error channel and reduce would obscure first failure.
+@ public
+fn decode(Tokenizer t, list<int> ids) → string ⇥ identity.TokenizerError {
+    var list<int<u8>> bytes ← empty
+    for from ids const id {
+        reject id ≺ 0 or id ≥ t.multitudo throw variant identity.TokenizerError.UnknownId { message = "token id outside the vocabulary range: §"(id ↦ string) }
+        const string trace ← t.words.get(id) coalesce ""
+        for range 0 ‥ trace.length() const i {
+            const string c ← trace.slice(i, i + 1)
+            const int cpt ← _code_from_trace(c)
+            const int byte ← _byte_from_code(cpt)
+            bytes.append(byte ∷ int<u8>)
+        }
+    }
+    const bytes o ↤ bytes
+    do {
+        return o ↦ string
+    }
+    catch err {
+        throw variant identity.TokenizerError.BadUtf8 { message = "decoded byte sequence is not valid UTF-8" }
+    }
+    throw variant identity.TokenizerError.BadUtf8 { message = "unreachable decode conversion" }
+}
+
+fn _encode_words_kind(Tokenizer t, string text, bool smollm) → list<int> ⇥ identity.TokenizerError {
+    var list<string> words ← empty
+    if smollm {
+        words ← unicode.scan_smollm(text)
+    }
+    else {
+        words ← unicode.scan_words(text)
+    }
+    var list<int> ids ← empty
+    for from words const word {
+        const list<int> partes ← encode(t, word)
+        for from partes const id {
+            ids.append(id)
+        }
+    }
+    return ids
+}
+
+# Shared literal path of both parse policies (qwen35 scanner).
+fn _encode_words(Tokenizer t, string text) → list<int> ⇥ identity.TokenizerError {
+    return _encode_words_kind(t, text, false)
+}
+
+# Full-prompt encode, parse_special = falsum: the whole prompt goes
+# through scanner + BPE (specials read as their literal bytes).
+@ public
+fn encode_prompt(Tokenizer t, string text) → list<int> ⇥ identity.TokenizerError {
+    return _encode_words(t, text)
+}
+
+# Full-prompt encode with an explicit scanner. `specials` splits on the
+# artifact special cache first; `smollm` selects the SMOLLM scanner.
+# W0 stay: special selection uses the compound (position, length) key, not
+# an admitted unmasked argmax form.
+fn _encode_prompt_kind(Tokenizer t, string text, bool specials, bool smollm) → list<int> ⇥ identity.TokenizerError {
+    if not specials then return _encode_words_kind(t, text, smollm)
+    var list<int> ids ← empty
+    var int pos ← 0
+    while pos ≺ text.length() {
+        var int melior_pos ← -1
+        var int melior_id ← -1
+        var int melior_length ← -1
+        for range 0 ‥ t.special_texts.length() const i {
+            const string specialis ← t.special_texts.get(i) coalesce ""
+            if specialis.length() ≻ 0 {
+                const int p ← unicode.find_span(text, specialis, pos)
+                if p ≥ 0 and (melior_pos ≺ 0 or p ≺ melior_pos or p ≡ melior_pos and specialis.length() ≻ melior_length) {
+                    melior_pos ← p
+                    melior_id ← t.specialia_ids.get(i) coalesce (-1)
+                    melior_length ← specialis.length()
+                }
+            }
+        }
+        if melior_pos ≺ 0 {
+            const list<int> partes ← _encode_words_kind(t, text.slice(pos, text.length()), smollm)
+            for from partes const id {
+                ids.append(id)
+            }
+            break
+        }
+        if melior_pos ≻ pos {
+            const list<int> partes ← _encode_words_kind(t, text.slice(pos, melior_pos), smollm)
+            for from partes const id {
+                ids.append(id)
+            }
+        }
+        ids.append(melior_id)
+        pos ← melior_pos + melior_length
+    }
+    return ids
+}
+
+# Full-prompt encode, parse_special = verum: split the prompt on the
+# artifact special cache BEFORE the scanner (llama.cpp
+# split_special_tokens/find_special_token — earliest match, longest text
+# on ties), emitting each special's single id and scanning each plain
+# slice independently. A prompt with no specials encodes identically to
+# encode_prompt.
+@ public
+fn encode_prompt_special(Tokenizer t, string text) → list<int> ⇥ identity.TokenizerError {
+    return _encode_prompt_kind(t, text, true, false)
+}
+
+# Provider encode route (G3): text → ids over the model's tables.
+# SMOLLM scanner + parse-special on (llama-tokenize default; P5/P7/P8/P9).
+# BOS is never prepended. Detokenize is deferred.
+@ public
+fn tokenize(Tokenizer t, string text) → list<int> ⇥ identity.TokenizerError {
+    return _encode_prompt_kind(t, text, true, true)
+}
+
+# Provider encode, parse-special off (P6 literal BPE bytes).
+@ public
+fn tokenize_literal(Tokenizer t, string text) → list<int> ⇥ identity.TokenizerError {
+    return _encode_prompt_kind(t, text, false, true)
+}
+
+# -------------------------------------------------------------------------
+# EOG + BOS-free policy (LIB-02-U3-5, GGUF-A2).
+#
+# The runtime EOG stop set mirrors llama-vocab.cpp llm_load_vocab (pinned
+# oracle 10150 `dee2a846b`): the declared tokenizer.ggml.eos_token_id is
+# always a member, every vocab token whose text is in the reference EOG
+# name list is a member, and the FIM pad/rep/sep ids join when the metadata
+# key or a reference text-name match resolves them. For the pinned artifact
+# this is exactly {248044, 248046, 248063, 248064, 248065}. The BOS policy
+# reads tokenizer.ggml.add_bos_token (absent → falsum, the llama.cpp bool
+# default): encode never prepends a BOS, so the falsum artifact is BOS-free
+# (empty prompt → empty sequence). An artifact without EOG metadata yields
+# an empty EOG set — no hard-coded SmolLM2 fallback (the stop-condition
+# invariant).
+# -------------------------------------------------------------------------
+
+# Contains-check over a name list (the EOG/FIM text-name scans).
+fn _in_name(string v, list<string> names) → bool {
+    return v between names
+}
+
+# Dedupe + ascending sort (the reference's EOG set order; -1 slots from the
+# FIM fallback are dropped).
+# W0 stay: this is an insertion-point bound scan, not a best-index reduction.
+fn _sort_ascending(list<int> a) → list<int> {
+    var list<int> out ← empty
+    for from a const v {
+        if v ≺ 0 {
+            continue
+        }
+        if v between out {
+            continue
+        }
+        var int pos ← 0
+        while pos ≺ out.length() {
+            if out.get(pos) coalesce 0 ≻ v {
+                break
+            }
+            pos ← pos + 1
+        }
+        var list<int> next ← empty
+        var int j ← 0
+        while j ≺ out.length() {
+            if j ≡ pos {
+                next.append(v)
+            }
+            next.append(out.get(j) coalesce 0)
+            j ← j + 1
+        }
+        if pos ≥ out.length() {
+            next.append(v)
+        }
+        out ← next
+    }
+    return out
+}
+
+# One FIM slot: the metadata key first, else the reference text-name
+# fallback (first matching vocab entry in id order). -1 when nothing
+# resolves; a present-but-malformed key fails closed.
+# W0 stay: the fallback returns the first matching index, so filter/map do
+# not replace this order-sensitive search.
+fn _artifact_end(gguf_manifest.GgufManifest m, list<string> words, string key, list<string> names) → int ⇥ identity.TokenizerError {
+    var int id ← -1
+    var bool adest ← false
+    do {
+        id ← gguf_manifest.number(m, key)
+        adest ← true
+    }
+    catch err {
+        match err {
+            case gguf_manifest.GgufManifestError.NotFound const message {
+                adest ← false
+            }
+            case _ {
+                throw variant identity.TokenizerError.BadArtifact { message = "tokenizer FIM metadata is malformed: §"(err.message) }
+            }
+        }
+    }
+    if adest {
+        reject id ≺ 0 or id ≥ words.length() throw variant identity.TokenizerError.BadArtifact { message = "tokenizer FIM id is outside the vocabulary" }
+        return id
+    }
+    for range 0 ‥ words.length() const i {
+        if _in_name(words.get(i) coalesce "", names) then return i
+    }
+    return -1
+}
+
+# The artifact EOG set: declared eos id + the EOG-name scan + the FIM
+# pad/rep/sep slots, deduped and ascending.
+# W0 stay: candidates arrive from ordered metadata and name scans before a
+# separate dedupe/sort pass; no single closure intrinsic covers this shape.
+fn _artifact_eog(gguf_manifest.GgufManifest m, list<string> words) → list<int> ⇥ identity.TokenizerError {
+    var list<int> candidati ← empty
+    var int eos ← -1
+    var bool eos_adest ← false
+    do {
+        eos ← gguf_manifest.number(m, "tokenizer.ggml.eos_token_id")
+        eos_adest ← true
+    }
+    catch err {
+        match err {
+            case gguf_manifest.GgufManifestError.NotFound const message {
+                eos_adest ← false
+            }
+            case _ {
+                throw variant identity.TokenizerError.BadArtifact { message = "tokenizer EOG metadata is malformed: §"(err.message) }
+            }
+        }
+    }
+    if eos_adest {
+        reject eos ≺ 0 or eos ≥ words.length() throw variant identity.TokenizerError.BadArtifact { message = "tokenizer eos_token_id is outside the vocabulary" }
+        candidati.append(eos)
+    }
+    for range 0 ‥ words.length() const i {
+        if _in_name(words.get(i) coalesce "", EOG_NAMES) {
+            candidati.append(i)
+        }
+    }
+    candidati.append(_artifact_end(m, words, "tokenizer.ggml.fim_pad_token_id", FIM_PAD_NAMES))
+    candidati.append(_artifact_end(m, words, "tokenizer.ggml.fim_rep_token_id", FIM_REP_NAMES))
+    candidati.append(_artifact_end(m, words, "tokenizer.ggml.fim_sep_token_id", FIM_SEP_NAMES))
+    return _sort_ascending(candidati)
+}
+
+# The artifact's add_bos_token (GGUF bool; absent → falsum, the llama.cpp
+# kv_bool default). A present non-bool value fails closed.
+fn _artifact_add_bos(gguf_manifest.GgufManifest m) → bool ⇥ identity.TokenizerError {
+    var gguf_manifest.GgufMetadata x ← gguf_manifest.GgufMetadata { key = "", dtype = -1, payload_wire = || }
+    var bool adest ← false
+    do {
+        x ← gguf_manifest.metadata(m, "tokenizer.ggml.add_bos_token")
+        adest ← true
+    }
+    catch err {
+        match err {
+            case gguf_manifest.GgufManifestError.NotFound const message {
+                adest ← false
+            }
+            case _ {
+                throw variant identity.TokenizerError.BadArtifact { message = "tokenizer.add_bos_token is malformed: §"(err.message) }
+            }
+        }
+    }
+    if not adest then return false
+    require x.dtype ≡ KIND_BOOL throw variant identity.TokenizerError.BadArtifact { message = "tokenizer.add_bos_token is not a GGUF bool" }
+    const list<int> bs ← _number_bytes(x.payload_wire)
+    return bs.get(0) coalesce 0 ≡ 1
+}
+
+# The artifact's chat template (U3-6). tokenizer.chat_template is OPTIONAL
+# in GGUF: absent → empty string (the artifact declares no template — the
+# renderer fails closed instead of inventing one). A PRESENT but malformed
+# value fails closed.
+fn _artifact_chat_template(gguf_manifest.GgufManifest m) → string ⇥ identity.TokenizerError {
+    do {
+        return gguf_manifest.text(m, "tokenizer.chat_template")
+    }
+    catch err {
+        match err {
+            case gguf_manifest.GgufManifestError.NotFound const message {
+                return ""
+            }
+            case _ {
+                throw variant identity.TokenizerError.BadArtifact { message = "tokenizer.chat_template is malformed: §"(err.message) }
+            }
+        }
+    }
+    throw variant identity.TokenizerError.BadArtifact { message = "unreachable tokenizer.chat_template read" }
+}
+
+# The runtime EOG stop set (ascending; mirrors the reference's set order).
+@ public
+fn artifact_eog(Tokenizer t) → list<int> {
+    return t.eog
+}
+
+# EOG-membership predicate — the runtime generation stop-policy binding
+# (the artifact-set equivalent of the identity contract's is_eog).
+@ public
+fn is_artifact_eog(Tokenizer t, int id) → bool {
+    return id between t.eog
+}
+
+# The artifact's add_bos_token flag (falsum for the pinned artifact — the
+# BOS-free policy: encode never prepends a BOS).
+@ public
+fn add_bos(Tokenizer t) → bool {
+    return t.add_bos
+}
+
+# -------------------------------------------------------------------------
+# Chat-template policy (LIB-02-U3-6, GGUF-A2).
+#
+# `tokenizer.chat_template` loads from artifact metadata (empty when the
+# artifact declares none — the no-template state). The MINIMAL Qwen3-ChatML
+# user-turn render applies the pinned shape `<|im_start|>user\n{content}
+# <|im_end|>\n` — the executed subset of the artifact's Jinja template, NOT
+# a universal template engine (the delivery forbids one). Full vision/tool-
+# calling branches of the template are recorded, not executed (stop-
+# condition scope). Rendering fails closed when the artifact declares no
+# template — no hard-coded fallback (the artifact-backed invariant).
+# -------------------------------------------------------------------------
+
+# The artifact's chat template (the minimal ChatML subset the renderer
+# applies; empty when the artifact declares none).
+@ public
+fn chat_template(Tokenizer t) → string {
+    return t.chat_template
+}
+
+# Minimal Qwen3-ChatML user-turn render: `<|im_start|>user\n{content}
+# <|im_end|>\n`. The content embeds verbatim, so encoding the rendered turn
+# composes without changing the content's pinned ids (R1, U3-6 oracle).
+@ public
+fn render_user_turn(Tokenizer t, string content) → string ⇥ identity.TokenizerError {
+    require t.chat_template.length() ≠ 0 throw variant identity.TokenizerError.BadArtifact { message = "artifact declares no chat template" }
+    return "<|im_start|>user\n§<|im_end|>\n"(content)
+}

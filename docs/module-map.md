@@ -60,13 +60,12 @@ starts at [`exempla/dense-prefill-smollm2/`](../exempla/dense-prefill-smollm2/).
 
 ## Live modules (post-PML1–5 + correctness wave)
 
-The live documented tree has 40 modules (the GEA3 `gradus:model/full_model_view`
-leaf added after the GEA2 `gradus:model/block_view` leaf, which followed the
-GEA1 `gradus:kernel` leaf; the U4a `gradus:test_util` proba-support module
-added on 2026-08-25). Module
-names are unchanged. This inventory is verified against the live
-`src/**/*.fab` tree after the no-latin
-conversion (U1–U6); it does not reuse a pre-conversion name map. The source
+The live documented tree has 62 modules (verified against `src/**/*.fab`).
+Five former single-file packages are nested leaves plus a docs-only facade:
+`tokenizer`, `cache`, `attention`, `generation`, and `model/qwen35moe_state`.
+Prefer the leaf import that owns the type. This inventory is verified against
+the live `src/**/*.fab` tree after the no-latin conversion (U1–U6); it does
+not reuse a pre-conversion name map. The source
 surface includes the A1C capsule-schema-2.0.0 surface, LIB-02 tokenizer
 runtime, GGUF-A3 tensor payload/view and widened dequant rows, REF-01
 architecture adapters and dense assembly, MODEL-01 qwen35moe admission, and
@@ -91,7 +90,9 @@ evidence and boundaries are recorded in
 | `gradus:loss` | `src/loss.fab` | Losses: `mse`, `cross_entropy` + fixed-shape MSE rows (PML4) |
 | `gradus:optimize` | `src/optimize.fab` | SGD optimizer state: slots, step, wires (PML4) |
 | `gradus:nn` | `src/nn.fab` | Primitives: `linear`, `gelu`, `layernorm`, `rmsnorm`, `silu`, `swiglu` + fixed-shape rows (PML3; RMSNorm REF-01-U1.1, SiLU/SwiGLU REF-01-U1.2) |
-| `gradus:attention` | `src/attention.fab` | SDPA + RoPE (fixed-shape row + staged surface, PML3); configurable RoPE — frequency base/scale/pair policy, consecutive-pair vs interleaved-pair (REF-01-U1.3); multi-head attention with GQA KV-head sharing, causal + RoPE, output projection (REF-01-U1.4) |
+| `gradus:attention` | `src/attention.fab` | Docs-only facade — import `attention/rope` or `attention/gqa` |
+| `gradus:attention/rope` | `src/attention/rope.fab` | RopeConfig, RopePolicy, AttentionError; configurable RoPE (REF-01-U1.3) |
+| `gradus:attention/gqa` | `src/attention/gqa.fab` | SDPA, causal, rotary, multi-head, cached attention (REF-01-U1.4) |
 | `gradus:transformer` | `src/transformer.fab` | Transformer block (fixed-shape row + staged surface, PML3); generic dense transformer block — input RMSNorm → GQA attention (causal + RoPE) → residual → post-attn RMSNorm → SwiGLU MLP → residual, composing the U1.1/U1.2/U1.4 rows (REF-01-U1.5) |
 | `gradus:mlp` | `src/mlp.fab` | Two-layer MLP: staged `forward_mlp` + annotated `forward_mlp_loss` companion (PML3-U4) |
 | `gradus:train` | `src/train.fab` | Train steps, schedules, mode, RNG, dropout, and checkpoint `Checkpoint` (PML4) |
@@ -113,13 +114,26 @@ evidence and boundaries are recorded in
 | `gradus:model/dense` | `src/model/dense.fab` | Dense model assembly — the complete ordered dense forward graph (`forward`): embedding gather → N ordered U1.5 `dense_block` rows → final RMSNorm → output projection, assembled from the typed architecture config (`DenseConfig`) and materialized stored-weight views via canonical names; tied/untied embedding handling; zero per-row constants (REF-01-U1.8). Real-file Qwen2.5-0.5B prefill consumer: `exempla/dense-prefill-qwen2` (REF-01-U1.10; FINAL stop at radix `2ed9914e4`: packet `faber` green; PKG001 closed; rustc cargo-101, first `E0015` const `vec!`) |
 | `gradus:model/qwen35moe` | `src/model/qwen35moe.fab` | qwen35moe architecture admission: frozen config + canonical 753-tensor map + dimension/storage cross-reference validation + identity-precondition admission (MODEL-01, read through the `gguf_manifest` typed accessors) |
 | `gradus:model/moe` | `src/model/moe.fab` | MODEL-02 carrier-tier MoE router, deterministic top-k selection, bounded rank-3 expert dispatch, weighted accumulation, and gated shared-expert FFN |
-| `gradus:model/qwen35moe_state` | `src/model/qwen35moe_state.fab` | MODEL-03 hybrid SSM/attention state: trunk schedule derivation (linear iff `(i+1)%4≠0`), `ConvState`/`RecurrentState`/`KeyValueState` values with reset/replay/identity, Gated DeltaNet one-chunk step, depthwise conv window, NEOX RoPE, and per-layer attention-subblock execution against admitted MODEL-01 config + tensors; executed probe `exempla/qwen35moe-layer-probe` (oracle: trials `m3-ssm-attention-oracle.py`, llama.cpp `dee2a846b`) |
-| `gradus:tokenizer` | `src/tokenizer.fab` | Tokenizer identity + probe parity + `is_eog` (PML2/PML5) + artifact-backed byte-level BPE runtime with the composed qwen35 pre-tokenizer and special/EOG/BOS/chat policy surface (LIB-02-U2/U3; completion oracle pinned in `fixtures/tokenizer/pinned-probe-oracle.md`) + GEA3-U2 census-bound table admission `admit_gea3_tables` (gpt2/smollm/49,152 tokens/48,900 merges/BOS-free/EOG {0,2,4}); capstone tokenizer phase run by `exempla/qwen36-35b-inference` (LIB-02-U4-1) |
-| `gradus:cache` | `src/cache.fab` | KV-cache values + mutation rules (PML5) |
+| `gradus:model/qwen35moe_state` | `src/model/qwen35moe_state.fab` | Docs-only facade — import schedule/session/linear_attn/full_attn |
+| `gradus:model/qwen35moe_state/schedule` | `src/model/qwen35moe_state/schedule.fab` | MODEL-03 trunk schedule, LayerKind, Qwen35moeStateError |
+| `gradus:model/qwen35moe_state/session` | `src/model/qwen35moe_state/session.fab` | ConvState, RecurrentState, KeyValueState, HybridSession |
+| `gradus:model/qwen35moe_state/linear_attn` | `src/model/qwen35moe_state/linear_attn.fab` | Gated DeltaNet linear-attention path |
+| `gradus:model/qwen35moe_state/full_attn` | `src/model/qwen35moe_state/full_attn.fab` | Full-attention KV path |
+| `gradus:tokenizer` | `src/tokenizer.fab` | Docs-only facade — import identity/unicode/bpe |
+| `gradus:tokenizer/identity` | `src/tokenizer/identity.fab` | TokenizerIdentity, probes, `is_eog` (PML2/PML5) |
+| `gradus:tokenizer/unicode` | `src/tokenizer/unicode.fab` | Unicode categories and scanners |
+| `gradus:tokenizer/bpe` | `src/tokenizer/bpe.fab` | Artifact-backed BPE runtime (LIB-02-U2/U3; GEA3-U2 `admit_gea3_tables`); capstone `exempla/qwen36-35b-inference` |
+| `gradus:cache` | `src/cache.fab` | Docs-only facade — import kv/identity/structure |
+| `gradus:cache/kv` | `src/cache/kv.fab` | KVCache, CacheError, append/extend/reset (PML5) |
+| `gradus:cache/identity` | `src/cache/identity.fab` | CacheIdentity and identity wire |
+| `gradus:cache/structure` | `src/cache/structure.fab` | KVStructure, profiles, GI4 unions |
 | `gradus:calibration` | `src/calibration.fab` | Residual-energy calibration bake (W5d-U1) — per-expert output-energy scores, K-recommendation curve, overlap census, 75e4ab98 provenance; measurement artifact, not a weight transform |
 | `gradus:decode` | `src/decode.fab` | Decode/prefill/session/cancel + replica loop (PML5) |
 | `gradus:sampling` | `src/sampling.fab` | Sampling pipeline: greedy + filters + draw (PML5) |
-| `gradus:generation` | `src/generation.fab` | Generation config + cursor (PML5) |
+| `gradus:generation` | `src/generation.fab` | Docs-only facade — import config/decoder/dense |
+| `gradus:generation/config` | `src/generation/config.fab` | GenerationConfig, GenerationError, acceleration (PML5) |
+| `gradus:generation/decoder` | `src/generation/decoder.fab` | Cursor, stop policy, decoder generate |
+| `gradus:generation/dense` | `src/generation/dense.fab` | DenseEngine and dense generate |
 | `gradus:gradus` | `src/gradus.fab` | Facade map — no genera |
 
 ### GEA2 block device entries
