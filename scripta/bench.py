@@ -1335,7 +1335,7 @@ def cmd_capture(args: argparse.Namespace) -> int:
     with tempfile.TemporaryDirectory(prefix="bench-capture-") as tmp:
         full_out = Path(tmp) / "full.json"
         print(
-            f"bench: pinned --stage full run starting (expect ~30-35 min)",
+            "bench: pinned --stage full run starting (expect ~30-35 min)",
             file=sys.stderr,
         )
         code, transcript, wall_s = run_pinned_stream(
