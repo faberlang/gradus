@@ -1,13 +1,16 @@
-+++
-locale = "en"
-+++
-# MODEL-02-U6 — full-layer MoE FFN completion.
+# Mixture-of-experts routing and full-layer FFN over typed carriers.
 #
-# The U3 carrier boundary remains fail-closed while the router (U4), expert
-# dispatch (U5), and this unit complete the frozen surface: weighted expert
-# accumulation plus the gated shared expert. Accumulation order is pinned to
-# ascending expert index — f32 addition is order-sensitive, so the order is
-# deterministic here and mirrored in proba.
+# Public import: import from "gradus:model/moe" moe
+# Depends on: gradus:dtype (finite-value checks), gradus:math (carrier
+# arithmetic), gradus:nn (SwiGLU and transpose carriers), and
+# gradus:tensor (carrier construction).
+#
+# The module validates the routed windows before arithmetic, preserves
+# deterministic lowest-index ties, normalizes selected weights, and combines
+# the weighted experts with the gated shared expert. Expert accumulation is
+# ordered by ascending expert index because f32 addition is order-sensitive.
+# Source callbacks remain the caller's seam; this module owns no backend,
+# model registry, or device handle.
 
 import from "gradus:dtype" dtype
 
@@ -63,14 +66,11 @@ class MoeSelection {
 
 # Every tensor crossing the adapter boundary is checked before a future math
 # unit can consume it. A non-finite value is never treated as a zero default.
-fn _finite_tensor(tensor.NumericBlock value) → bool {
-    for from value.data const item {
-        if not dtype.finite(item) then return false
-    }
-    return true
+fn finite_tensor(tensor.NumericBlock value) → bool {
+    return value.data.all(f32 item ∴ dtype.finite(item))
 }
 
-fn _validate_config(MoeConfig cfg) → bool ⇥ MoeError {
+fn validate_config(MoeConfig cfg) → bool ⇥ MoeError {
     require cfg.expert_count ≥ 1 throw variant BadConfig { message = "expert count must be at least one" }
     require cfg.expert_used_count ≥ 1 throw variant BadConfig { message = "expert used count must be at least one" }
     require cfg.expert_used_count ≤ cfg.expert_count throw variant BadConfig { message = "expert used count cannot exceed expert count" }
@@ -80,63 +80,61 @@ fn _validate_config(MoeConfig cfg) → bool ⇥ MoeError {
     return true
 }
 
-fn _validate_input(tensor.NumericBlock x, MoeConfig cfg) → tensor.NumericBlock ⇥ MoeError {
+fn validate_input(tensor.NumericBlock x, MoeConfig cfg) → tensor.NumericBlock ⇥ MoeError {
     require x.valid() throw variant BadShape { message = "hidden state carrier is invalid" }
     require x.shape ≡ ([1, cfg.embedding_length] ↦ list<int>) throw variant BadShape { message = "hidden state must have shape [1, embedding_length]" }
-    require _finite_tensor(x) throw variant NonFinite { message = "hidden state contains a non-finite value" }
+    require finite_tensor(x) throw variant NonFinite { message = "hidden state contains a non-finite value" }
     return x
 }
 
 # The adapter owns the read and returns a storage-order carrier. This helper
 # keeps the requested byte-free element window and returned carrier shape in
 # one fail-closed check for every public entry point.
-fn _window((string, int, int) → tensor.NumericBlock ⇥ MoeError source, string name, int start, int length, list<int> expected) → tensor.NumericBlock ⇥ MoeError {
+fn window((string, int, int) → tensor.NumericBlock ⇥ MoeError source, string name, int start, int length, list<int> expected) → tensor.NumericBlock ⇥ MoeError {
     require start ≥ 0 throw variant BadWindow { message = "tensor window start must be non-negative" }
     require length ≥ 1 throw variant BadWindow { message = "tensor window length must be positive" }
     const tensor.NumericBlock value ← source(name, start, length)
     require value.valid() throw variant BadShape { message = "tensor window carrier is invalid" }
     require value.shape ≡ expected throw variant BadShape { message = "tensor window carrier has the wrong shape" }
     require value.data.length() ≡ length throw variant BadWindow { message = "tensor window length does not match the carrier" }
-    require _finite_tensor(value) throw variant NonFinite { message = "tensor window contains a non-finite value" }
+    require finite_tensor(value) throw variant NonFinite { message = "tensor window contains a non-finite value" }
     return value
 }
 
-fn _prefix(int layer) → string {
+fn layer_prefix(int layer) → string {
     return "blk.§"(layer ↦ string)
 }
 
 # Router source: GGUF [embedding, experts] is exposed as [experts,
 # embedding] without copying the storage-order window.
-fn _router_weights((string, int, int) → tensor.NumericBlock ⇥ MoeError source, int layer, MoeConfig cfg) → tensor.NumericBlock ⇥ MoeError {
+fn router_weights((string, int, int) → tensor.NumericBlock ⇥ MoeError source, int layer, MoeConfig cfg) → tensor.NumericBlock ⇥ MoeError {
     const int length ← cfg.expert_count * cfg.embedding_length
-    return _window(source, _prefix(layer) + ".ffn_gate_inp", 0, length, [cfg.expert_count, cfg.embedding_length])
+    return window(source, layer_prefix(layer) + ".ffn_gate_inp", 0, length, [cfg.expert_count, cfg.embedding_length])
 }
 
 const f32 ROUTER_WEIGHT_FLOOR ← 0.00006103515625 ∷ f32
 
 # The nn precedent self-hosts exponentiation rather than adding a public
 # scalar primitive. Route only supplies non-positive max-subtracted exponents.
-fn _exp(f32 x) → f32 {
+fn exp(f32 x) → f32 {
     return (2.718281828459045 ∷ f32).power(x)
 }
 
-fn _column(tensor.NumericBlock x, MoeConfig cfg) → tensor.NumericBlock {
+fn column(tensor.NumericBlock x, MoeConfig cfg) → tensor.NumericBlock {
     var list<f32> data ← empty
-    for range 0 ‥ cfg.embedding_length const i {
-        data.append(x.data.get(i) coalesce 0.0 ∷ f32)
+    for from x.data const item {
+        data.append(item)
     }
     return tensor.stage(x.dtype, [cfg.embedding_length, 1], data)
 }
 
-fn _router_logits(tensor.NumericBlock weights, tensor.NumericBlock x_column) → tensor.NumericBlock ⇥ MoeError {
-    return math.matmul(weights, x_column)
-}
-
-fn _softmax(list<f32> logits) → list<f32> ⇥ MoeError {
+fn softmax(list<f32> logits) → list<f32> ⇥ MoeError {
     require logits.length() ≥ 1 throw variant BadConfig { message = "router logits must be non-empty" }
     for from logits const value {
         require dtype.finite(value) throw variant NonFinite { message = "router logits contain a non-finite value" }
     }
+    # The list reduction has no shaped iterable contract; this scan also
+    # preserves the list-index form used by the router's later selections.
     var f32 maximum ← logits.get(0) coalesce 0.0 ∷ f32
     for range 1 ‥ logits.length() const i {
         const f32 value ← logits.get(i) coalesce 0.0 ∷ f32
@@ -147,7 +145,7 @@ fn _softmax(list<f32> logits) → list<f32> ⇥ MoeError {
     var list<f32> exponents ← empty
     var f32 total ← 0.0 ∷ f32
     for from logits const value {
-        const f32 exponent ← _exp(value - maximum)
+        const f32 exponent ← exp(value - maximum)
         require dtype.finite(exponent) throw variant NonFinite { message = "router softmax produced a non-finite value" }
         exponents.append(exponent)
         total ← total + exponent
@@ -160,12 +158,9 @@ fn _softmax(list<f32> logits) → list<f32> ⇥ MoeError {
     return probabilities
 }
 
-# Select the largest probability, preserving the lowest index on exact ties.
-# W0 named residual: participation masking has no covering argmax form
-# (ruling 3 decouples the twin from `where`), so the −1 sentinel and this
-# hand-derived first-index tie remain accepted-for-now pending a future
-# operator ruling.
-fn _best_index(list<f32> probabilities, list<int> selected) → int {
+# Select the largest unconsumed probability. The selected-position mask means
+# the plain argmax method cannot express this scan.
+fn best_index(list<f32> probabilities, list<int> selected) → int {
     var int best ← -1
     for range 0 ‥ probabilities.length() const i {
         if not (i between selected) {
@@ -187,30 +182,30 @@ fn _best_index(list<f32> probabilities, list<int> selected) → int {
 @ public
 fn route(tensor.NumericBlock x, int layer, (string, int, int) → tensor.NumericBlock ⇥ MoeError source, MoeConfig cfg) → MoeSelection ⇥ MoeError {
     # --- config + input (fail closed) -------------------------------------
-    _validate_config(cfg)
+    validate_config(cfg)
     require layer ≥ 0 throw variant BadConfig { message = "layer index must be non-negative" }
-    _validate_input(x, cfg)
+    validate_input(x, cfg)
 
     # --- router weights + logits (fail closed) ----------------------------
-    const tensor.NumericBlock weights ← _router_weights(source, layer, cfg)
-    const tensor.NumericBlock matrix ← _router_logits(weights, _column(x, cfg))
+    const tensor.NumericBlock weights ← router_weights(source, layer, cfg)
+    const tensor.NumericBlock matrix ← math.matmul(weights, column(x, cfg))
     require matrix.valid() throw variant BadShape { message = "router logits carrier is invalid" }
     require matrix.shape ≡ ([cfg.expert_count, 1] ↦ list<int>) throw variant BadShape { message = "router logits carrier has the wrong shape" }
-    require _finite_tensor(matrix) throw variant NonFinite { message = "router logits contain a non-finite value" }
+    require finite_tensor(matrix) throw variant NonFinite { message = "router logits contain a non-finite value" }
 
     # --- softmax over expert logits ---------------------------------------
     var list<f32> logits ← empty
-    for range 0 ‥ cfg.expert_count const i {
-        logits.append(matrix.data.get(i) coalesce 0.0 ∷ f32)
+    for from matrix.data const value {
+        logits.append(value)
     }
-    const list<f32> probabilities ← _softmax(logits)
+    const list<f32> probabilities ← softmax(logits)
 
     # --- top-k selection (lowest index on ties) ---------------------------
     var list<int> indices ← empty
     var list<f32> selected_probabilities ← empty
     var f32 selected_total ← 0.0 ∷ f32
     for range 0 ‥ cfg.expert_used_count const _ {
-        const int index ← _best_index(probabilities, indices)
+        const int index ← best_index(probabilities, indices)
         require index ≥ 0 throw variant BadConfig { message = "router selection index is unavailable" }
         indices.append(index)
         const f32 probability ← probabilities.get(index) coalesce 0.0 ∷ f32
@@ -231,20 +226,15 @@ fn route(tensor.NumericBlock x, int layer, (string, int, int) → tensor.Numeric
     return MoeSelection { indices = indices, weights = weights_out, logits = logits, probabilities = probabilities }
 }
 
-fn _project(tensor.NumericBlock weights, tensor.NumericBlock x_column) → tensor.NumericBlock ⇥ MoeError {
-    return math.matmul(weights, x_column)
-}
-
-# The storage-order GEMV produces a column. nn.swiglu_carrier follows the
-# dense carrier convention and consumes a single row, so this is a checked
-# carrier view over the same values, not a second weight read.
-fn _row(tensor.NumericBlock column, int width) → tensor.NumericBlock ⇥ MoeError {
+# The storage-order GEMV produces a column, while nn.swiglu_carrier consumes
+# a row. This view changes only the carrier shape; it does not reread weights.
+fn row(tensor.NumericBlock column, int width) → tensor.NumericBlock ⇥ MoeError {
     require column.valid() throw variant BadShape { message = "projection carrier is invalid" }
     require column.shape ≡ ([width, 1] ↦ list<int>) throw variant BadShape { message = "projection carrier has the wrong shape" }
     require column.data.length() ≡ width throw variant BadWindow { message = "projection carrier has the wrong length" }
     var list<f32> data ← empty
-    for range 0 ‥ width const i {
-        data.append(column.data.get(i) coalesce 0.0 ∷ f32)
+    for from column.data const item {
+        data.append(item)
     }
     return tensor.stage(column.dtype, [1, width], data)
 }
@@ -252,34 +242,17 @@ fn _row(tensor.NumericBlock column, int width) → tensor.NumericBlock ⇥ MoeEr
 # A stored down matrix is [embedding, expert_ffn]. The bias-free dense
 # SwiGLU call consumes [expert_ffn, embedding]; transpose only the bounded
 # materialized window, after its storage-order shape and length are checked.
-fn _linear_weight(tensor.NumericBlock stored) → tensor.NumericBlock ⇥ MoeError {
-    require stored.valid() throw variant BadShape { message = "down projection carrier is invalid" }
-    const list<int> f ← stored.shape
-    require f.length() ≡ 2 throw variant BadShape { message = "down projection must be rank 2" }
-    const int rows ← f.get(0) coalesce 0
-    const int cols ← f.get(1) coalesce 0
-    require rows ≥ 1 and cols ≥ 1 throw variant BadShape { message = "down projection must be non-empty" }
-    require stored.data.length() ≡ rows * cols throw variant BadWindow { message = "down projection has the wrong length" }
-    var list<f32> data ← empty
-    for range 0 ‥ cols const j {
-        for range 0 ‥ rows const i {
-            data.append(stored.data.get(i * cols + j) coalesce 0.0 ∷ f32)
-        }
-    }
-    return tensor.stage(stored.dtype, [cols, rows], data)
-}
-
-fn _swiglu_no_bias(tensor.NumericBlock gate, tensor.NumericBlock up, tensor.NumericBlock down) → tensor.NumericBlock ⇥ MoeError {
+fn swiglu_no_bias(tensor.NumericBlock gate, tensor.NumericBlock up, tensor.NumericBlock down) → tensor.NumericBlock ⇥ MoeError {
     return nn.swiglu_carrier(gate, up, down, tensor.default())
 }
 
-fn _flatten_row(tensor.NumericBlock row, int width) → tensor.NumericBlock ⇥ MoeError {
+fn flatten_row(tensor.NumericBlock row, int width) → tensor.NumericBlock ⇥ MoeError {
     require row.valid() throw variant BadShape { message = "expert output carrier is invalid" }
     require row.shape ≡ ([1, width] ↦ list<int>) throw variant BadShape { message = "expert output carrier has the wrong shape" }
     require row.data.length() ≡ width throw variant BadWindow { message = "expert output has the wrong length" }
     var list<f32> data ← empty
-    for range 0 ‥ width const i {
-        data.append(row.data.get(i) coalesce 0.0 ∷ f32)
+    for from row.data const item {
+        data.append(item)
     }
     return tensor.stage(row.dtype, [width], data)
 }
@@ -287,49 +260,46 @@ fn _flatten_row(tensor.NumericBlock row, int width) → tensor.NumericBlock ⇥ 
 @ public
 fn expert_out(tensor.NumericBlock x, int layer, int expert_index, (string, int, int) → tensor.NumericBlock ⇥ MoeError source, MoeConfig cfg) → tensor.NumericBlock ⇥ MoeError {
     # --- config + input (fail closed) -------------------------------------
-    _validate_config(cfg)
+    validate_config(cfg)
     require layer ≥ 0 throw variant BadConfig { message = "layer index must be non-negative" }
     require expert_index ≥ 0 and expert_index ≺ cfg.expert_count throw variant BadConfig { message = "expert index is outside the configured range" }
-    _validate_input(x, cfg)
+    validate_input(x, cfg)
 
     # --- expert windows (storage-order reads) -----------------------------
     const int length ← cfg.expert_ffn_length * cfg.embedding_length
     const int start ← expert_index * length
-    const string prefix ← _prefix(layer)
-    const tensor.NumericBlock gate_window ← _window(source, prefix + ".ffn_gate_exps", start, length, [cfg.expert_ffn_length, cfg.embedding_length])
-    const tensor.NumericBlock up_window ← _window(source, prefix + ".ffn_up_exps", start, length, [cfg.expert_ffn_length, cfg.embedding_length])
-    const tensor.NumericBlock down_window ← _window(source, prefix + ".ffn_down_exps", start, length, [cfg.embedding_length, cfg.expert_ffn_length])
+    const string prefix ← layer_prefix(layer)
+    const tensor.NumericBlock gate_window ← window(source, prefix + ".ffn_gate_exps", start, length, [cfg.expert_ffn_length, cfg.embedding_length])
+    const tensor.NumericBlock up_window ← window(source, prefix + ".ffn_up_exps", start, length, [cfg.expert_ffn_length, cfg.embedding_length])
+    const tensor.NumericBlock down_window ← window(source, prefix + ".ffn_down_exps", start, length, [cfg.embedding_length, cfg.expert_ffn_length])
 
     # --- projections + SwiGLU ---------------------------------------------
-    const tensor.NumericBlock x_column ← _column(x, cfg)
-    const tensor.NumericBlock gate ← _row(_project(gate_window, x_column), cfg.expert_ffn_length)
-    const tensor.NumericBlock up ← _row(_project(up_window, x_column), cfg.expert_ffn_length)
-    const tensor.NumericBlock output_row ← _swiglu_no_bias(gate, up, _linear_weight(down_window))
+    const tensor.NumericBlock x_column ← column(x, cfg)
+    const tensor.NumericBlock gate ← row(math.matmul(gate_window, x_column), cfg.expert_ffn_length)
+    const tensor.NumericBlock up ← row(math.matmul(up_window, x_column), cfg.expert_ffn_length)
+    const tensor.NumericBlock output_row ← swiglu_no_bias(gate, up, nn.transpose_carrier(down_window))
 
     # --- flatten + finite check -------------------------------------------
-    const tensor.NumericBlock output ← _flatten_row(output_row, cfg.embedding_length)
-    require _finite_tensor(output) throw variant NonFinite { message = "expert output contains a non-finite value" }
+    const tensor.NumericBlock output ← flatten_row(output_row, cfg.embedding_length)
+    require finite_tensor(output) throw variant NonFinite { message = "expert output contains a non-finite value" }
     return output
 }
 
-# Shared-expert sigmoid gate: self-hosted on _exp per the nn precedent (no
-# public nn.fab addition; a public sigmoid waits for a second caller).
-fn _sigmoid(f32 x) → f32 {
-    return 1.0 / (1.0 + _exp(-x))
+# The shared-expert gate is scalar, so it stays local to this carrier path.
+fn sigmoid(f32 x) → f32 {
+    return 1.0 / (1.0 + exp(-x))
 }
 
-fn _dot(tensor.NumericBlock a, tensor.NumericBlock b, int width) → f32 ⇥ MoeError {
+fn dot(tensor.NumericBlock a, tensor.NumericBlock b) → f32 ⇥ MoeError {
     var f32 out ← 0.0 ∷ f32
-    for range 0 ‥ width const i {
-        const f32 left ← a.data.get(i) coalesce 0.0 ∷ f32
-        const f32 right ← b.data.get(i) coalesce 0.0 ∷ f32
+    for from a.data, b.data const left, right {
         out ← out + left * right
     }
     require dtype.finite(out) throw variant NonFinite { message = "shared expert gate dot product is non-finite" }
     return out
 }
 
-fn _scalar(f32 value) → tensor.NumericBlock {
+fn scalar(f32 value) → tensor.NumericBlock {
     var tensor.NumericBlock out ← tensor.default()
     do {
         out ← tensor.construct([value], [1])
@@ -340,7 +310,7 @@ fn _scalar(f32 value) → tensor.NumericBlock {
     return out
 }
 
-fn _zeros(int width, tensor.NumericBlock like) → tensor.NumericBlock {
+fn zeros(int width, tensor.NumericBlock like) → tensor.NumericBlock {
     var list<f32> data ← empty
     for range 0 ‥ width const _ {
         data.append(0.0 ∷ f32)
@@ -358,33 +328,33 @@ fn _zeros(int width, tensor.NumericBlock like) → tensor.NumericBlock {
 @ public
 fn ffn_moe(tensor.NumericBlock x, int layer, (string, int, int) → tensor.NumericBlock ⇥ MoeError source, MoeConfig cfg) → tensor.NumericBlock ⇥ MoeError {
     # --- config + input (fail closed) -------------------------------------
-    _validate_config(cfg)
+    validate_config(cfg)
     require layer ≥ 0 throw variant BadConfig { message = "layer index must be non-negative" }
-    _validate_input(x, cfg)
+    validate_input(x, cfg)
 
     # --- router selection -------------------------------------------------
     const MoeSelection selection ← route(x, layer, source, cfg)
 
     # --- shared expert (SwiGLU + sigmoid gate) ----------------------------
-    const string prefix ← _prefix(layer)
-    const tensor.NumericBlock x_column ← _column(x, cfg)
+    const string prefix ← layer_prefix(layer)
+    const tensor.NumericBlock x_column ← column(x, cfg)
     const int shared_length ← cfg.shared_ffn_length * cfg.embedding_length
-    const tensor.NumericBlock gate_shexp ← _window(source, prefix + ".ffn_gate_shexp", 0, shared_length, [cfg.shared_ffn_length, cfg.embedding_length])
-    const tensor.NumericBlock up_shexp ← _window(source, prefix + ".ffn_up_shexp", 0, shared_length, [cfg.shared_ffn_length, cfg.embedding_length])
-    const tensor.NumericBlock down_shexp ← _window(source, prefix + ".ffn_down_shexp", 0, shared_length, [cfg.embedding_length, cfg.shared_ffn_length])
-    const tensor.NumericBlock gate_shexp_row ← _row(_project(gate_shexp, x_column), cfg.shared_ffn_length)
-    const tensor.NumericBlock up_shexp_row ← _row(_project(up_shexp, x_column), cfg.shared_ffn_length)
-    const tensor.NumericBlock shexp_row ← _swiglu_no_bias(gate_shexp_row, up_shexp_row, _linear_weight(down_shexp))
-    const tensor.NumericBlock shexp ← _flatten_row(shexp_row, cfg.embedding_length)
-    require _finite_tensor(shexp) throw variant NonFinite { message = "shared expert output contains a non-finite value" }
-    const tensor.NumericBlock gate_input ← _window(source, prefix + ".ffn_gate_inp_shexp", 0, cfg.embedding_length, [cfg.embedding_length])
-    const f32 gate ← _sigmoid(_dot(x, gate_input, cfg.embedding_length))
+    const tensor.NumericBlock gate_shexp ← window(source, prefix + ".ffn_gate_shexp", 0, shared_length, [cfg.shared_ffn_length, cfg.embedding_length])
+    const tensor.NumericBlock up_shexp ← window(source, prefix + ".ffn_up_shexp", 0, shared_length, [cfg.shared_ffn_length, cfg.embedding_length])
+    const tensor.NumericBlock down_shexp ← window(source, prefix + ".ffn_down_shexp", 0, shared_length, [cfg.embedding_length, cfg.shared_ffn_length])
+    const tensor.NumericBlock gate_shexp_row ← row(math.matmul(gate_shexp, x_column), cfg.shared_ffn_length)
+    const tensor.NumericBlock up_shexp_row ← row(math.matmul(up_shexp, x_column), cfg.shared_ffn_length)
+    const tensor.NumericBlock shexp_row ← swiglu_no_bias(gate_shexp_row, up_shexp_row, nn.transpose_carrier(down_shexp))
+    const tensor.NumericBlock shexp ← flatten_row(shexp_row, cfg.embedding_length)
+    require finite_tensor(shexp) throw variant NonFinite { message = "shared expert output contains a non-finite value" }
+    const tensor.NumericBlock gate_input ← window(source, prefix + ".ffn_gate_inp_shexp", 0, cfg.embedding_length, [cfg.embedding_length])
+    const f32 gate ← sigmoid(dot(x, gate_input))
     require dtype.finite(gate) throw variant NonFinite { message = "shared expert gate is non-finite" }
 
     # --- weighted accumulation (ascending expert index) -------------------
     const list<int> selected ← selection.indices
     var list<int> consumed ← empty
-    var tensor.NumericBlock moe_out ← _zeros(cfg.embedding_length, x)
+    var tensor.NumericBlock moe_out ← zeros(cfg.embedding_length, x)
     for range 0 ‥ cfg.expert_used_count const _ {
         var int slot ← -1
         for range 0 ‥ selected.length() const j {
@@ -406,15 +376,15 @@ fn ffn_moe(tensor.NumericBlock x, int layer, (string, int, int) → tensor.Numer
         const int expert ← selected.get(slot) coalesce 0
         const f32 weight ← selection.weights.get(slot) coalesce 0.0 ∷ f32
         const tensor.NumericBlock output ← expert_out(x, layer, expert, source, cfg)
-        moe_out ← math.add_carrier(moe_out, math.mul_carrier(output, _scalar(weight)))
+        moe_out ← math.add_carrier(moe_out, math.mul_carrier(output, scalar(weight)))
     }
 
     # --- combine + fail-closed output -------------------------------------
     var tensor.NumericBlock result ← tensor.default()
-    const tensor.NumericBlock gated_shared ← math.mul_carrier(shexp, _scalar(gate))
+    const tensor.NumericBlock gated_shared ← math.mul_carrier(shexp, scalar(gate))
     result ← math.add_carrier(moe_out, gated_shared)
     require result.valid() throw variant BadShape { message = "FFN output carrier is invalid" }
     require result.shape ≡ ([cfg.embedding_length] ↦ list<int>) throw variant BadShape { message = "FFN output carrier has the wrong shape" }
-    require _finite_tensor(result) throw variant NonFinite { message = "FFN output contains a non-finite value" }
+    require finite_tensor(result) throw variant NonFinite { message = "FFN output contains a non-finite value" }
     return result
 }
