@@ -1,12 +1,12 @@
-+++
-locale = "en"
-+++
-# GGUF-A5 first slice: wire the per-layer KV cache into one dense decode
-# step and run a short greedy autoregressive loop on SmolLM2-360M.
+# SmolLM2-360M dense decode and KV-cache exemplar.
 #
-# Oracle: after the pinned prompt, the first sampled token is GOLDEN_TOP1
-# 30 — the GATE 13 / GI2 prefill continuation at prompt-end. Tokens must
-# be finite vocabulary ids. Compiled rust tier.
+# Public entry: the `dense-decode-smollm2` executable package.
+# Depends on: Gradus attention, cache, dtype, model, sampling, and tensor
+# leaves, plus Norma process and filesystem I/O.
+#
+# WHY: the driver makes bounded artifact loading, prompt prefill, incremental
+# KV-cache updates, and greedy continuation observable without claiming the
+# higher-level generation API or a performance result.
 
 import from "gradus:attention" attention
 import from "gradus:cache" kv
@@ -21,6 +21,8 @@ import from "gradus:tensor" tensor
 import from "norma:process" process
 import from "norma:fs" fs
 
+# --- pinned oracle ----------------
+
 const string PINNED_PATH ← "/Users/ianzepp/ai/models/SmolLM2-360M-Instruct-Q4_K_M.gguf"
 const string PINNED_DIGEST ← "2fa3f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2"
 const int PINNED_BYTES ← 270590880
@@ -32,77 +34,71 @@ const int SLICE_CAP ← 16777216
 const int GENERATE ← 3
 
 union DecodeRunError {
-    BadArguments { string message },
-    BadManifest { string message },
-    BadAdapter { string message },
-    BadBinding { string message },
-    BadSlice { string message },
-    BadForward { string message }
+    @ shared
+    string message
+
+    BadArguments,
+    BadManifest,
+    BadAdapter,
+    BadBinding,
+    BadSlice,
+    BadForward
 }
 
-fn message(DecodeRunError e) → string {
-    match e {
-        case BadArguments const message { return message }
-        case BadManifest const message { return message }
-        case BadAdapter const message { return message }
-        case BadBinding const message { return message }
-        case BadSlice const message { return message }
-        case BadForward const message { return message }
-    }
-}
+# --- artifact admission ----------
 
-fn _range(string via, int total, int start, int length) → bytes ⇥ gguf_manifest.GgufManifestError {
+fn read_range(string via, int total, int start, int length) → bytes ⇥ gguf_manifest.GgufManifestError {
     if start < 0 or length < 0 or start > total - length {
         throw variant BadSource {message = "range request exceeds the artifact"}
     }
-    const bytes bytes ← fs.read_range(via, start, length)
-    if bytes.length() ≠ length {
+    const bytes data ← fs.read_range(via, start, length)
+    if data.length() ≠ length {
         throw variant BadSource {message = "short range read"}
     }
-    return bytes
+    return data
 }
 
-fn _prefix_range(list<int> prefix, int start, int length) → bytes ⇥ gguf_manifest.GgufManifestError {
+fn prefix_range(list<int> prefix, int start, int length) → bytes ⇥ gguf_manifest.GgufManifestError {
     if start < 0 or length < 0 or start > prefix.length() - length {
         throw variant BadSource {message = "inspection attempted to read the tensor data region"}
     }
     const list<int> segment ← prefix.slice(start, start + length)
-    const bytes bytes ← segment ↦ bytes
-    return bytes
+    const bytes segment_bytes ↤ segment
+    return segment_bytes
 }
 
-fn _ends(string s, string tail) → bool {
+fn ends_with(string s, string tail) → bool {
     if tail.length() ≻ s.length() then return false
     return s.slice(s.length() - tail.length(), s.length()) ≡ tail
 }
 
-fn _slot(string name) → int {
-    if _ends(name, ".input_layernorm") then return 0
-    if _ends(name, ".self_attn.q_proj") then return 1
-    if _ends(name, ".self_attn.k_proj") then return 2
-    if _ends(name, ".self_attn.v_proj") then return 3
-    if _ends(name, ".self_attn.o_proj") then return 4
-    if _ends(name, ".post_attention_layernorm") then return 5
-    if _ends(name, ".mlp.gate_proj") then return 6
-    if _ends(name, ".mlp.up_proj") then return 7
-    if _ends(name, ".mlp.down_proj") then return 8
+fn tensor_slot(string name) → int {
+    if ends_with(name, ".input_layernorm") then return 0
+    if ends_with(name, ".self_attn.q_proj") then return 1
+    if ends_with(name, ".self_attn.k_proj") then return 2
+    if ends_with(name, ".self_attn.v_proj") then return 3
+    if ends_with(name, ".self_attn.o_proj") then return 4
+    if ends_with(name, ".post_attention_layernorm") then return 5
+    if ends_with(name, ".mlp.gate_proj") then return 6
+    if ends_with(name, ".mlp.up_proj") then return 7
+    if ends_with(name, ".mlp.down_proj") then return 8
     return -1
 }
 
-fn _ids_text(list<int> ids) → string {
+# --- tensor loading ---------------
+
+fn ids_text(list<int> ids) → string {
     var string out ← "["
-    var int i ← 0
-    while i ≺ ids.length() {
-        if i ≻ 0 {
-            out ← out + ", "
-        }
-        out ← out + ((ids.get(i) coalesce 0) ↦ string)
-        i ← i + 1
+    var bool first ← true
+    for from ids const id {
+        if not first { out ← out + ", " }
+        out ← "§§"(out, id ↦ string)
+        first ← false
     }
-    return out + "]"
+    return "§]"(out)
 }
 
-fn _block_elements(tensor_view.TensorView v) → int {
+fn block_elements(tensor_view.TensorView v) → int {
     match v.layout {
         case gguf_manifest.Known const elements_per_block, bytes_per_block, byte_length {
             return elements_per_block
@@ -113,32 +109,32 @@ fn _block_elements(tensor_view.TensorView v) → int {
     }
 }
 
-fn _window(int remaining, int block) → int {
+fn slice_window(int remaining, int block) → int {
     if remaining ≤ SLICE_CAP then return remaining
     const int aligned ← (SLICE_CAP / block) * block
     if aligned ≺ block then return block
     return aligned
 }
 
-fn _limits(gguf_manifest.GgufManifest m, string gguf_name) → tuple<int, int> ⇥ DecodeRunError {
+fn payload_limits(gguf_manifest.GgufManifest m, string gguf_name) → tuple<int, int> ⇥ DecodeRunError {
     do {
         return gguf_manifest.payload_limit(m, gguf_name)
     }
     catch err {
-        throw variant BadManifest {message = "payload range failed for " + gguf_name + ": " + err.message}
+        throw variant BadManifest {message = "payload range failed for §: §"(gguf_name, err.message)}
     }
 }
 
-fn _bind(gguf_manifest.GgufManifest m, tensor_payload.TensorPayload p) → tensor_view.TensorView ⇥ DecodeRunError {
+fn bind_view(gguf_manifest.GgufManifest m, tensor_payload.TensorPayload p) → tensor_view.TensorView ⇥ DecodeRunError {
     do {
         return tensor_view.links(m, p)
     }
     catch err {
-        throw variant BadBinding {message = "view bind failed for " + p.name + ": " + err.message}
+        throw variant BadBinding {message = "view bind failed for §: §"(p.name, err.message)}
     }
 }
 
-fn _slice(
+fn materialize_slice(
     tensor_view.TensorView v,
     int off,
     int n,
@@ -148,75 +144,108 @@ fn _slice(
         return tensor_view.materialize_slice(v, off, n, source)
     }
     catch err {
-        throw variant BadSlice {message = "window materialize failed for " + v.name + ": " + err.message}
+        throw variant BadSlice {message = "window materialize failed for §: §"(v.name, err.message)}
     }
 }
 
-fn _tensor(list<f32> data, list<int> shape) → tensor.NumericBlock ⇥ DecodeRunError {
+fn stage_tensor(list<f32> data, list<int> shape) → tensor.NumericBlock ⇥ DecodeRunError {
     do {
         return tensor.construct(data, shape)
     }
     catch err {
-        throw variant BadSlice {message = "tensor construct failed: " + err.message}
+        throw variant BadSlice {message = "tensor construct failed: §"(err.message)}
     }
 }
 
-fn _materialize(
+fn materialize_tensor(
     string via,
     int total,
     gguf_manifest.GgufManifest m,
     string gguf_name
 ) → tensor.NumericBlock ⇥ DecodeRunError {
-    const tuple<int, int> limit ← _limits(m, gguf_name)
+    const tuple<int, int> limit ← payload_limits(m, gguf_name)
     const tensor_payload.TensorPayload p ← tensor_payload.TensorPayload {
         name = gguf_name,
         absolute_start = limit[0],
         length = limit[1],
         bytes = ||
     }
-    const tensor_view.TensorView v ← _bind(m, p)
-    const int block ← _block_elements(v)
+    const tensor_view.TensorView v ← bind_view(m, p)
+    const int block ← block_elements(v)
     if block ≺ 1 {
-        throw variant BadSlice {message = "tensor layout has no block size: " + gguf_name}
+        throw variant BadSlice {message = "tensor layout has no block size: §"(gguf_name)}
     }
     var list<f32> data ← empty
     var int off ← 0
     while off ≺ v.elements {
-        const int n ← _window(v.elements - off, block)
-        const list<f32> part ← _slice(
+        const int n ← slice_window(v.elements - off, block)
+        const list<f32> part ← materialize_slice(
             v,
             off,
             n,
-            (int start, int length) → bytes ⇥ gguf_manifest.GgufManifestError ∴ _range(via, total, start, length)
+            (int start, int length) → bytes ⇥ gguf_manifest.GgufManifestError ∴ read_range(via, total, start, length)
         )
         for from part const x {
             data.append(x)
         }
         off ← off + n
     }
-    return _tensor(data, v.shape)
+    return stage_tensor(data, v.shape)
 }
 
-fn _gguf_name(string family, int layer) → string ⇥ DecodeRunError {
-    if family ≡ "model.embed_tokens" then return "token_embd.weight"
-    if family ≡ "model.norm" then return "output_norm.weight"
-    if family ≡ "lm_head" then return "token_embd.weight"
-    if layer ≺ 0 or layer ≥ 32 {
-        throw variant BadAdapter {message = "layer index outside the frozen llama layer range: " + (layer ↦ string)}
+fn canonical_name(string family, int layer) → string ⇥ DecodeRunError {
+    switch family {
+        case "model.embed_tokens" {
+            return "token_embd.weight"
+        }
+        case "model.norm" {
+            return "output_norm.weight"
+        }
+        case "lm_head" {
+            return "token_embd.weight"
+        }
+        default {
+        }
     }
-    if family ≡ "model.layers.input_layernorm" then return ("blk." + (layer ↦ string)) + ".attn_norm.weight"
-    if family ≡ "model.layers.self_attn.q_proj" then return ("blk." + (layer ↦ string)) + ".attn_q.weight"
-    if family ≡ "model.layers.self_attn.k_proj" then return ("blk." + (layer ↦ string)) + ".attn_k.weight"
-    if family ≡ "model.layers.self_attn.v_proj" then return ("blk." + (layer ↦ string)) + ".attn_v.weight"
-    if family ≡ "model.layers.self_attn.o_proj" then return ("blk." + (layer ↦ string)) + ".attn_output.weight"
-    if family ≡ "model.layers.post_attention_layernorm" then return ("blk." + (layer ↦ string)) + ".ffn_norm.weight"
-    if family ≡ "model.layers.mlp.gate_proj" then return ("blk." + (layer ↦ string)) + ".ffn_gate.weight"
-    if family ≡ "model.layers.mlp.up_proj" then return ("blk." + (layer ↦ string)) + ".ffn_up.weight"
-    if family ≡ "model.layers.mlp.down_proj" then return ("blk." + (layer ↦ string)) + ".ffn_down.weight"
-    throw variant BadAdapter {message = "unknown canonical tensor name: " + family}
+    if layer ≺ 0 or layer ≥ 32 {
+        throw variant BadAdapter {message = "layer index outside the frozen llama layer range: §"(layer ↦ string)}
+    }
+    const string block ← "blk.§"(layer ↦ string)
+    switch family {
+        case "model.layers.input_layernorm" {
+            return "§.attn_norm.weight"(block)
+        }
+        case "model.layers.self_attn.q_proj" {
+            return "§.attn_q.weight"(block)
+        }
+        case "model.layers.self_attn.k_proj" {
+            return "§.attn_k.weight"(block)
+        }
+        case "model.layers.self_attn.v_proj" {
+            return "§.attn_v.weight"(block)
+        }
+        case "model.layers.self_attn.o_proj" {
+            return "§.attn_output.weight"(block)
+        }
+        case "model.layers.post_attention_layernorm" {
+            return "§.ffn_norm.weight"(block)
+        }
+        case "model.layers.mlp.gate_proj" {
+            return "§.ffn_gate.weight"(block)
+        }
+        case "model.layers.mlp.up_proj" {
+            return "§.ffn_up.weight"(block)
+        }
+        case "model.layers.mlp.down_proj" {
+            return "§.ffn_down.weight"(block)
+        }
+        default {
+            throw variant BadAdapter {message = "unknown canonical tensor name: §"(family)}
+        }
+    }
 }
 
-fn _kmajor_to_linear(tensor.NumericBlock t) → tensor.NumericBlock ⇥ DecodeRunError {
+fn kmajor_to_linear(tensor.NumericBlock t) → tensor.NumericBlock ⇥ DecodeRunError {
     const list<int> f ← t.shape
     if f.length() ≠ 2 {
         throw variant BadAdapter {message = "linear weight must be rank 2"}
@@ -228,42 +257,42 @@ fn _kmajor_to_linear(tensor.NumericBlock t) → tensor.NumericBlock ⇥ DecodeRu
     while i ≺ k {
         var int j ← 0
         while j ≺ n {
-            out.append(t.data.get(j * k + i) coalesce 0.0 ∷ f32)
+            out.append(t.data.get(j * k + i) coalesce 0.0)
             j ← j + 1
         }
         i ← i + 1
     }
-    return _tensor(out, [k, n])
+    return stage_tensor(out, [k, n])
 }
 
-fn _linear_family(string family) → bool {
+fn linear_family(string family) → bool {
     if family ≡ "lm_head" then return true
-    if _ends(family, ".self_attn.q_proj") then return true
-    if _ends(family, ".self_attn.k_proj") then return true
-    if _ends(family, ".self_attn.v_proj") then return true
-    if _ends(family, ".self_attn.o_proj") then return true
-    if _ends(family, ".mlp.gate_proj") then return true
-    if _ends(family, ".mlp.up_proj") then return true
-    if _ends(family, ".mlp.down_proj") then return true
+    if ends_with(family, ".self_attn.q_proj") then return true
+    if ends_with(family, ".self_attn.k_proj") then return true
+    if ends_with(family, ".self_attn.v_proj") then return true
+    if ends_with(family, ".self_attn.o_proj") then return true
+    if ends_with(family, ".mlp.gate_proj") then return true
+    if ends_with(family, ".mlp.up_proj") then return true
+    if ends_with(family, ".mlp.down_proj") then return true
     return false
 }
 
-fn _load_one(
+fn load_tensor(
     string via,
     int total,
     gguf_manifest.GgufManifest m,
     string family,
     int layer
 ) → tensor.NumericBlock ⇥ DecodeRunError {
-    const string gguf_name ← _gguf_name(family, layer)
-    const tensor.NumericBlock stored ← _materialize(via, total, m, gguf_name)
-    if _linear_family(family) {
-        return _kmajor_to_linear(stored)
+    const string gguf_name ← canonical_name(family, layer)
+    const tensor.NumericBlock stored ← materialize_tensor(via, total, m, gguf_name)
+    if linear_family(family) {
+        return kmajor_to_linear(stored)
     }
     return stored
 }
 
-fn _lookup(
+fn lookup_tensor(
     string name,
     int layer,
     tensor.NumericBlock embed,
@@ -273,48 +302,48 @@ fn _lookup(
     if name ≡ "model.embed_tokens" then return embed
     if name ≡ "model.norm" then return norm_s
     if layer ≺ 0 or layer ≥ strata.length() {
-        throw variant MissingTensor {message = "layer out of range: " + (layer ↦ string)}
+        throw variant MissingTensor {message = "layer out of range: §"(layer ↦ string)}
     }
-    const int slot ← _slot(name)
+    const int slot ← tensor_slot(name)
     if slot ≺ 0 {
-        throw variant MissingTensor {message = "unknown canonical tensor: " + name}
+        throw variant MissingTensor {message = "unknown canonical tensor: §"(name)}
     }
-    var list<tensor.NumericBlock> missing ← empty
+    const list<tensor.NumericBlock> missing ← empty
     const list<tensor.NumericBlock> row ← strata.get(layer) coalesce missing
     if slot ≥ row.length() {
-        throw variant MissingTensor {message = "layer slot missing: " + name}
+        throw variant MissingTensor {message = "layer slot missing: §"(name)}
     }
     const tensor.NumericBlock t ← row.get(slot) coalesce embed
     return t
 }
 
-fn _logit(tensor.NumericBlock logits, int tok) → f32 {
+# --- dense decode -----------------
+
+fn logit(tensor.NumericBlock logits, int tok) → f32 {
     do {
         return logits.get([0, tok])
     }
     catch err {
-        return 0.0 ∷ f32
+        return 0.0
     }
 }
 
-fn _all_finite(tensor.NumericBlock logits) → bool {
-    var int i ← 0
-    while i ≺ VOCAB {
-        if not dtype.finite(_logit(logits, i)) then return false
-        i ← i + 1
+fn all_finite(tensor.NumericBlock logits) → bool {
+    for range 0 ‥ VOCAB const i {
+        if not dtype.finite(logit(logits, i)) then return false
     }
     return true
 }
 
-fn _indices(int n) → list<int> {
+fn indices(int n) → list<int> {
     var list<int> out ← empty
-    var int i ← 0
-    while i ≺ n {
+    for range 0 ‥ n const i {
         out.append(i)
-        i ← i + 1
     }
     return out
 }
+
+# --- decode driver ----------------
 
 main {
     const list<string> args ← process.argv() ↦ list<string>
@@ -332,15 +361,17 @@ main {
         }
     }
 
+    # --- manifest admission ------------
+
     print "policy: GGUF-A5 first decode/KV wiring slice"
     print "oracle: first greedy token == 30 (GATE 13 / GI2 prefill continuation)"
     print "engine: compiled rust (faber build --target rust; execute the printed binary)"
-    print "model.path=" + via
+    print "model.path=§"(via)
 
     const int total ← fs.byte_length(via)
-    print "model.bytes=" + (total ↦ string)
+    print "model.bytes=§"(total ↦ string)
     if total ≠ PINNED_BYTES {
-        panic "model byte length mismatch: observed=" + (total ↦ string) + " expected=" + (PINNED_BYTES ↦ string)
+        panic "model byte length mismatch: observed=§ expected=§"(total ↦ string, PINNED_BYTES ↦ string)
     }
 
     const bytes prefix_bytes ← fs.read_range(via, 0, expected_data)
@@ -366,24 +397,26 @@ main {
     }
     do {
         admitted ← gguf_manifest.inspect(
-            (int start, int length) → bytes ⇥ gguf_manifest.GgufManifestError ∴ _prefix_range(prefix, start, length),
+            (int start, int length) → bytes ⇥ gguf_manifest.GgufManifestError ∴ prefix_range(prefix, start, length),
             total,
             identity
         )
     }
     catch err {
-        panic "manifest admission failed: " + err.message
+        panic "manifest admission failed: §"(err.message)
     }
 
     var tensor.NumericBlock embed ← tensor.default()
     var tensor.NumericBlock norm_s ← tensor.default()
     do {
-        embed ← _load_one(via, total, admitted, "model.embed_tokens", 0)
-        norm_s ← _load_one(via, total, admitted, "model.norm", 0)
+        embed ← load_tensor(via, total, admitted, "model.embed_tokens", 0)
+        norm_s ← load_tensor(via, total, admitted, "model.norm", 0)
     }
     catch err {
-        panic "embed/norm load failed: " + message(err)
+        panic "embed/norm load failed: §"(err.message)
     }
+
+    # --- tensor loading ----------------
 
     const list<string> families ← [
         "model.layers.input_layernorm",
@@ -397,30 +430,28 @@ main {
         "model.layers.mlp.down_proj"
     ]
     var list<list<tensor.NumericBlock>> strata ← empty
-    var int layer ← 0
-    while layer ≺ 32 {
+    for range 0 ‥ 32 const layer {
         var list<tensor.NumericBlock> row ← empty
-        var int f ← 0
-        while f ≺ families.length() {
+        for from families const family {
             do {
-                row.append(_load_one(via, total, admitted, families.get(f) coalesce "", layer))
+                row.append(load_tensor(via, total, admitted, family, layer))
             }
             catch err {
-                panic ("layer " + (layer ↦ string)) + " " + message(err)
+                panic "layer § §"(layer ↦ string, err.message)
             }
-            f ← f + 1
         }
         strata.append(row)
-        print "loaded layer " + (layer ↦ string)
-        layer ← layer + 1
+        print "loaded layer §"(layer ↦ string)
     }
+
+    # --- engine configuration -----------
 
     var attention.RopeConfig rope ← attention.default()
     do {
-        rope ← attention.construct_rope_config(100000.0 ∷ f32, 1.0 ∷ f32, attention.consecutive_policy())
+        rope ← attention.construct_rope_config(100000.0, 1.0, attention.consecutive_policy())
     }
     catch err {
-        panic "rope config failed: " + err.message
+        panic "rope config failed: §"(err.message)
     }
 
     const dense.DenseConfig cfg ← dense.DenseConfig {
@@ -435,7 +466,7 @@ main {
 
     var kv.KVStructure structure ← kv.default_kv_structure()
     do {
-        const kv.LayerSet set ← kv.construct_layer_set(_indices(32), kv.dense_structure(), 5, 64)
+        const kv.LayerSet set ← kv.construct_layer_set(indices(32), kv.dense_structure(), 5, 64)
         var list<kv.LayerSet> sets ← empty
         sets.append(set)
         structure ← kv.construct_kv_structure(
@@ -451,7 +482,7 @@ main {
         )
     }
     catch err {
-        panic "kv structure failed: " + err.message
+        panic "kv structure failed: §"(err.message)
     }
 
     var list<kv.KVCache> layers ← empty
@@ -459,23 +490,27 @@ main {
         layers ← dense.empty_caches(structure, "smollm2", "360m", "f32-staged", "smollm")
     }
     catch err {
-        panic "empty caches failed: " + err.message
+        panic "empty caches failed: §"(err.message)
     }
-    print "cache layers=" + (layers.length() ↦ string) + " dim=" + (((layers.get(0) coalesce kv.default()).dimension) ↦ string)
+    print "cache layers=§{layers} dim=§{dimension}"(
+        layers: layers.length() ↦ string,
+        dimension: ((layers.get(0) coalesce kv.default()).dimension) ↦ string
+    )
+
+    # --- prompt prefill ----------------
 
     var tensor.NumericBlock last ← tensor.default()
     var int pos ← 0
-    while pos ≺ PINNED_TOKENS.length() {
-        const int tok ← PINNED_TOKENS.get(pos) coalesce 0
-        print "decode_step prompt pos=" + (pos ↦ string) + " token=" + (tok ↦ string)
+    for from PINNED_TOKENS const tok {
+        print "decode_step prompt pos=§ token=§"(pos ↦ string, tok ↦ string)
         do {
             const dense.DenseStep step ← dense.decode_step(
                 cfg,
-                (string n, int s) → tensor.NumericBlock ⇥ dense.DenseError ∴ _lookup(n, s, embed, norm_s, strata),
+                (string n, int s) → tensor.NumericBlock ⇥ dense.DenseError ∴ lookup_tensor(n, s, embed, norm_s, strata),
                 tok,
                 pos,
-                0.00001 ∷ f32,
-                0.125 ∷ f32,
+                0.00001,
+                0.125,
                 64,
                 rope,
                 layers
@@ -484,47 +519,46 @@ main {
             layers ← step.layers
         }
         catch err {
-            panic "prompt decode_step failed: " + err.message
+            panic "prompt decode_step failed: §"(err.message)
         }
         pos ← pos + 1
     }
 
-    if not _all_finite(last) {
+    if not all_finite(last) {
         panic "prompt-end logits are not finite"
     }
 
     var list<f32> row ← empty
-    var int li ← 0
-    while li ≺ VOCAB {
-        row.append(_logit(last, li))
-        li ← li + 1
+    for range 0 ‥ VOCAB const i {
+        row.append(logit(last, i))
     }
 
-    var int first ← 0 - 1
+    var int first ← -1
     do {
         first ← sampling.max(row)
     }
     catch err {
-        panic "sample failed: " + err.message
+        panic "sample failed: §"(err.message)
     }
-    print "first_sampled=" + (first ↦ string)
-    print "golden_top1=" + (GOLDEN_TOP1 ↦ string)
-    print "first_matches=" + ((first ≡ GOLDEN_TOP1) ↦ string)
+    print "first_sampled=§"(first ↦ string)
+    print "golden_top1=§"(GOLDEN_TOP1 ↦ string)
+    print "first_matches=§"((first ≡ GOLDEN_TOP1) ↦ string)
+
+    # --- greedy continuation ------------
 
     var list<int> generated ← empty
     generated.append(first)
     var int next ← first
-    var int g ← 1
-    while g ≺ GENERATE {
-        print "decode_step generate pos=" + (pos ↦ string) + " token=" + (next ↦ string)
+    for range 1 ‥ GENERATE const g {
+        print "decode_step generate pos=§ token=§"(pos ↦ string, next ↦ string)
         do {
             const dense.DenseStep step ← dense.decode_step(
                 cfg,
-                (string n, int s) → tensor.NumericBlock ⇥ dense.DenseError ∴ _lookup(n, s, embed, norm_s, strata),
+                (string n, int s) → tensor.NumericBlock ⇥ dense.DenseError ∴ lookup_tensor(n, s, embed, norm_s, strata),
                 next,
                 pos,
-                0.00001 ∷ f32,
-                0.125 ∷ f32,
+                0.00001,
+                0.125,
                 64,
                 rope,
                 layers
@@ -533,41 +567,38 @@ main {
             layers ← step.layers
         }
         catch err {
-            panic "generate decode_step failed: " + err.message
+            panic "generate decode_step failed: §"(err.message)
         }
-        if not _all_finite(last) {
+        if not all_finite(last) {
             panic "generated logits are not finite"
         }
         var list<f32> grow ← empty
-        var int gi ← 0
-        while gi ≺ VOCAB {
-            grow.append(_logit(last, gi))
-            gi ← gi + 1
+        for range 0 ‥ VOCAB const i {
+            grow.append(logit(last, i))
         }
         do {
             next ← sampling.max(grow)
         }
         catch err {
-            panic "sample failed: " + err.message
+            panic "sample failed: §"(err.message)
         }
         if next ≺ 0 or next ≥ VOCAB {
-            panic "sampled token out of vocabulary: " + (next ↦ string)
+            panic "sampled token out of vocabulary: §"(next ↦ string)
         }
         generated.append(next)
         pos ← pos + 1
-        g ← g + 1
     }
 
-    print "generated=" + _ids_text(generated)
-    print "n=" + (generated.length() ↦ string)
+    print "generated=§"(ids_text(generated))
+    print "n=§"(generated.length() ↦ string)
     const kv.KVCache layer0 ← layers.get(0) coalesce kv.default()
-    print "cache_len=" + (layer0.length() ↦ string)
+    print "cache_len=§"(layer0.length() ↦ string)
 
     var string divergence ← "none"
     if first ≠ GOLDEN_TOP1 {
-        divergence ← (("first token " + (first ↦ string)) + " vs golden ") + (GOLDEN_TOP1 ↦ string)
+        divergence ← "first token § vs golden §"(first ↦ string, GOLDEN_TOP1 ↦ string)
     }
-    print "first_divergence=" + divergence
+    print "first_divergence=§"(divergence)
     if divergence ≡ "none" {
         print "DECODE: PASS"
     }
