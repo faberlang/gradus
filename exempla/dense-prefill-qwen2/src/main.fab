@@ -1,6 +1,3 @@
-+++
-locale = "en"
-+++
 # REF-01-U1.10 — Qwen2.5-0.5B full-model prefill logit receipt.
 #
 # Application-owned file adapter over the operator-local
@@ -15,6 +12,7 @@ locale = "en"
 # binary. The MIR stepper is not the receipt-tier engine.
 
 import from "gradus:attention" attention
+import from "gradus:dtype" dtype
 import from "gradus:model/artifact" artifact
 import from "gradus:model/dequant" dequant
 import from "gradus:model/dense" dense
@@ -28,11 +26,13 @@ import from "gradus:tokenizer" tokenizer
 import from "norma:process" process
 import from "norma:fs" fs
 
+# --- pinned oracle identity and golden paths ------------------------------
+
 const int SLICE_CAP ← 16777216
 const int ORACLE_BYTES ← 397808192
 const int ORACLE_DATA ← 5948480
 const string ORACLE_DIGEST ← "6eb923e7d26e9cea28811e1a8e852009b21242fb157b26149d3b188f3a8c8653"
-const f32 TRACE_BAND ← 0.000001 ∷ f32
+const f32 TRACE_BAND ← 0.000001
 const string GOLDEN_Q_HEAD ← "/Users/ianzepp/work/faberlang/worktrees/hand-25/gradus/exempla/dense-prefill-qwen2/gi2-1-blk_0_attn_q_weight-stored-head.txt"
 const string GOLDEN_Q_ROW0 ← "/Users/ianzepp/work/faberlang/worktrees/hand-25/gradus/exempla/dense-prefill-qwen2/gi2-1-blk_0_attn_q_weight-linear-row0.txt"
 const string GOLDEN_K_HEAD ← "/Users/ianzepp/work/faberlang/worktrees/hand-25/gradus/exempla/dense-prefill-qwen2/gi2-1-blk_0_attn_k_weight-stored-head.txt"
@@ -51,45 +51,26 @@ const string GOLDEN_E_HEAD ← "/Users/ianzepp/work/faberlang/worktrees/hand-25/
 const string PROMPT ← "The capital of France is Paris and the capital of Japan is Tokyo. The next city"
 const list<int> PINNED_TOKENS ← [785, 6722, 315, 9625, 374, 12095, 323, 279, 6722, 315, 6323, 374, 26194, 13, 576, 1790, 3283]
 
-union PrefillError {
-    ArgumentError { string message },
-    LengthError { string message },
-    ManifestError { string message },
-    AdapterError { string message },
-    TokenizerError { string message },
-    MaterializeError { string message },
-    ForwardError { string message },
-    CompareError { string message }
-}
+# --- error surface --------------------------------------------------------
 
-fn render(PrefillError e) → string {
-    match e {
-        case ArgumentError const message { return message }
-        case LengthError const message { return message }
-        case ManifestError const message { return message }
-        case AdapterError const message { return message }
-        case TokenizerError const message { return message }
-        case MaterializeError const message { return message }
-        case ForwardError const message { return message }
-        case CompareError const message { return message }
-    }
+union PrefillError {
+    @ shared
+    string message
+
+    ArgumentError,
+    MaterializeError,
+    AdapterError
 }
 
 fn file_range(string path, int total, int start, int length) → bytes ⇥ gguf_manifest.GgufManifestError {
-    if start < 0 or length < 0 or start > total - length {
-        throw variant BadSource {message = "range request exceeds the artifact"}
-    }
+    reject start < 0 or length < 0 or start > total - length throw variant BadSource {message = "range request exceeds the artifact"}
     const bytes bytes ← fs.read_range(path, start, length)
-    if bytes.length() ≠ length {
-        throw variant BadSource {message = "short range read"}
-    }
+    reject bytes.length() ≠ length throw variant BadSource {message = "short range read"}
     return bytes
 }
 
 fn prefix_range(list<int> prefix, int start, int length) → bytes ⇥ gguf_manifest.GgufManifestError {
-    if start < 0 or length < 0 or start > prefix.length() - length {
-        throw variant BadSource {message = "inspection attempted to read the tensor data region"}
-    }
+    reject start < 0 or length < 0 or start > prefix.length() - length throw variant BadSource {message = "inspection attempted to read the tensor data region"}
     const list<int> segment ← prefix.slice(start, start + length)
     const bytes bytes ← segment ↦ bytes
     return bytes
@@ -102,48 +83,47 @@ fn as_ints(string s) → int {
     catch err {
         panic "malformed integer operand"
     }
-    return 0
 }
 
-fn _ends(string s, string tail) → bool {
+fn ends_with(string s, string tail) → bool {
     if tail.length() ≻ s.length() then return false
     return s.slice(s.length() - tail.length(), s.length()) ≡ tail
 }
 
-fn _gguf_linear(string gguf_name) → bool {
+fn is_gguf_linear(string gguf_name) → bool {
     if gguf_name ≡ "output.weight" then return true
-    if _ends(gguf_name, ".attn_q.weight") then return true
-    if _ends(gguf_name, ".attn_k.weight") then return true
-    if _ends(gguf_name, ".attn_v.weight") then return true
-    if _ends(gguf_name, ".attn_output.weight") then return true
-    if _ends(gguf_name, ".ffn_gate.weight") then return true
-    if _ends(gguf_name, ".ffn_up.weight") then return true
-    if _ends(gguf_name, ".ffn_down.weight") then return true
+    if ends_with(gguf_name, ".attn_q.weight") then return true
+    if ends_with(gguf_name, ".attn_k.weight") then return true
+    if ends_with(gguf_name, ".attn_v.weight") then return true
+    if ends_with(gguf_name, ".attn_output.weight") then return true
+    if ends_with(gguf_name, ".ffn_gate.weight") then return true
+    if ends_with(gguf_name, ".ffn_up.weight") then return true
+    if ends_with(gguf_name, ".ffn_down.weight") then return true
     return false
 }
 
 fn slot_of(string suffix) → int {
-    if suffix ≡ ".input_layernorm" then return 0
-    if suffix ≡ ".self_attn.q_proj" then return 1
-    if suffix ≡ ".self_attn.k_proj" then return 2
-    if suffix ≡ ".self_attn.v_proj" then return 3
-    if suffix ≡ ".self_attn.o_proj" then return 4
-    if suffix ≡ ".post_attention_layernorm" then return 5
-    if suffix ≡ ".mlp.gate_proj" then return 6
-    if suffix ≡ ".mlp.up_proj" then return 7
-    if suffix ≡ ".mlp.down_proj" then return 8
-    if suffix ≡ ".self_attn.q_proj.bias" then return 9
-    if suffix ≡ ".self_attn.k_proj.bias" then return 10
-    if suffix ≡ ".self_attn.v_proj.bias" then return 11
-    return -1
+    switch suffix {
+        case ".input_layernorm" { return 0 }
+        case ".self_attn.q_proj" { return 1 }
+        case ".self_attn.k_proj" { return 2 }
+        case ".self_attn.v_proj" { return 3 }
+        case ".self_attn.o_proj" { return 4 }
+        case ".post_attention_layernorm" { return 5 }
+        case ".mlp.gate_proj" { return 6 }
+        case ".mlp.up_proj" { return 7 }
+        case ".mlp.down_proj" { return 8 }
+        case ".self_attn.q_proj.bias" { return 9 }
+        case ".self_attn.k_proj.bias" { return 10 }
+        case ".self_attn.v_proj.bias" { return 11 }
+        default { return -1 }
+    }
 }
 
-fn find_dot(string text, int from) → int {
+fn find_dot(string text, int start) → int {
     const int n ← text.length()
-    var int i ← from
-    while i ≺ n {
+    for range start‥n const i {
         if text.slice(i, i + 1) ≡ "." then return i
-        i ← i + 1
     }
     return -1
 }
@@ -160,10 +140,10 @@ fn lookup_one(string name, int layer, tensor.NumericBlock embed, tensor.NumericB
     if name ≡ "lm_head" then return embed
     const string suffix ← layer_suffix(name)
     const int slot ← slot_of(suffix)
-    if slot ≺ 0 then throw variant BadShape {message = "unknown canonical tensor: " + name}
+    if slot ≺ 0 then throw variant BadShape {message = "unknown canonical tensor: §"(name)}
     const int index ← (layer * 12) + slot
     if index ≺ 0 or index ≥ weights.length() {
-        throw variant BadShape {message = "layer index out of range for canonical tensor: " + name}
+        throw variant BadShape {message = "layer index out of range for canonical tensor: §"(name)}
     }
     const tensor.NumericBlock t ← weights.get(index) coalesce embed
     return t
@@ -174,13 +154,13 @@ fn payload_bounds(gguf_manifest.GgufManifest m, string gguf_name) → tuple<int,
         return gguf_manifest.payload_limit(m, gguf_name)
     }
     catch err {
-        throw variant MaterializeError { message = "payload range failed for " + gguf_name }
+        throw variant MaterializeError { message = "payload range failed for §"(gguf_name) }
     }
 }
 
 fn bind_view(gguf_manifest.GgufManifest m, string gguf_name) → tensor_view.TensorView ⇥ PrefillError {
     const tuple<int, int> bounds ← payload_bounds(m, gguf_name)
-    const tensor_payload.TensorPayload p ← tensor_payload.TensorPayload {
+    const _ p ← tensor_payload.TensorPayload {
         name = gguf_name,
         absolute_start = bounds[0],
         length = bounds[1],
@@ -190,7 +170,7 @@ fn bind_view(gguf_manifest.GgufManifest m, string gguf_name) → tensor_view.Ten
         return tensor_view.links(m, p)
     }
     catch err {
-        throw variant MaterializeError { message = "view bind failed for " + gguf_name }
+        throw variant MaterializeError { message = "view bind failed for §"(gguf_name) }
     }
 }
 
@@ -210,7 +190,7 @@ fn materialize_named(
     const tensor_view.TensorView view ← bind_view(m, gguf_name)
     const int block ← dequant.block_elements(view.dtype_ggml)
     if block ≺ 1 {
-        throw variant MaterializeError { message = "un-admitted GGML type for " + gguf_name }
+        throw variant MaterializeError { message = "un-admitted GGML type for §"(gguf_name) }
     }
     var list<f32> data ← empty
     var int off ← 0
@@ -228,19 +208,16 @@ fn materialize_named(
             }
         }
         catch err {
-            throw variant MaterializeError { message = "slice materialize failed for " + gguf_name + ": " + err.message }
+            throw variant MaterializeError { message = "slice materialize failed for §{name}: §{detail}"(name: gguf_name, detail: err.message) }
         }
         off ← off + n
     }
-    var tensor.NumericBlock t ← tensor.default()
     do {
-        t ← tensor.construct(data, view.shape)
-        return t
+        return tensor.construct(data, view.shape)
     }
     catch err {
-        throw variant MaterializeError { message = "tensor construct failed for " + gguf_name }
+        throw variant MaterializeError { message = "tensor construct failed for §"(gguf_name) }
     }
-    return t
 }
 
 # GGUF linear weights are K-major: stored[n * K + k] = W[k, n].
@@ -253,14 +230,10 @@ fn kmajor_to_linear(tensor.NumericBlock t) → tensor.NumericBlock ⇥ PrefillEr
     const int k ← f.get(0) coalesce 1
     const int n ← f.get(1) coalesce 1
     var list<f32> out ← empty
-    var int i ← 0
-    while i ≺ k {
-        var int j ← 0
-        while j ≺ n {
-            out.append(t.data.get(j * k + i) coalesce 0.0 ∷ f32)
-            j ← j + 1
+    for range 0‥k const i {
+        for range 0‥n const j {
+            out.append(t.data.get(j * k + i) coalesce 0.0)
         }
-        i ← i + 1
     }
     do {
         return tensor.construct(out, [k, n])
@@ -271,60 +244,10 @@ fn kmajor_to_linear(tensor.NumericBlock t) → tensor.NumericBlock ⇥ PrefillEr
 }
 
 fn load_as_linear(tensor.NumericBlock stored, string gguf_name) → tensor.NumericBlock ⇥ PrefillError {
-    if _gguf_linear(gguf_name) {
+    if is_gguf_linear(gguf_name) {
         return kmajor_to_linear(stored)
     }
     return stored
-}
-
-fn materialize_head(
-    string path,
-    int total,
-    gguf_manifest.GgufManifest m,
-    string gguf_name,
-    int n
-) → list<f32> ⇥ PrefillError {
-    const tensor_view.TensorView view ← bind_view(m, gguf_name)
-    const int block ← dequant.block_elements(view.dtype_ggml)
-    if block ≺ 1 {
-        throw variant MaterializeError { message = "un-admitted GGML type for " + gguf_name }
-    }
-    var int take ← n
-    if take ≺ block {
-        take ← block
-    }
-    if take ≻ view.elements {
-        take ← view.elements
-    }
-    const int aligned ← (take / block) * block
-    do {
-        const list<f32> part ← tensor_view.materialize_slice(
-            view,
-            0,
-            aligned,
-            (int start, int length) → bytes ⇥ gguf_manifest.GgufManifestError ∴ file_range(path, total, start, length)
-        )
-        var list<f32> out ← empty
-        var int i ← 0
-        while i ≺ n and i ≺ part.length() {
-            out.append(part.get(i) coalesce 0.0 ∷ f32)
-            i ← i + 1
-        }
-        return out
-    }
-    catch err {
-        throw variant MaterializeError { message = "head materialize failed for " + gguf_name + ": " + err.message }
-    }
-}
-
-fn resolve_gguf(dense_qwen2.DenseQwen2Config cfg, gguf_manifest.GgufManifest m, string name) → string ⇥ PrefillError {
-    do {
-        const gguf_manifest.GgufTensorDescriptor d ← dense_qwen2.resolve(cfg, m, name)
-        return d.name
-    }
-    catch err {
-        throw variant AdapterError { message = err.message }
-    }
 }
 
 fn load_layer(
@@ -334,21 +257,21 @@ fn load_layer(
     dense_qwen2.DenseQwen2Config cfg,
     int layer
 ) → list<tensor.NumericBlock> ⇥ PrefillError {
-    const string prefix ← "model.layers." + (layer ↦ string)
+    const string prefix ← "model.layers.§"(layer ↦ string)
     var list<tensor.NumericBlock> out ← empty
     const list<string> names ← [
-        prefix + ".input_layernorm",
-        prefix + ".self_attn.q_proj",
-        prefix + ".self_attn.k_proj",
-        prefix + ".self_attn.v_proj",
-        prefix + ".self_attn.o_proj",
-        prefix + ".post_attention_layernorm",
-        prefix + ".mlp.gate_proj",
-        prefix + ".mlp.up_proj",
-        prefix + ".mlp.down_proj",
-        prefix + ".self_attn.q_proj.bias",
-        prefix + ".self_attn.k_proj.bias",
-        prefix + ".self_attn.v_proj.bias"
+        "§.input_layernorm"(prefix),
+        "§.self_attn.q_proj"(prefix),
+        "§.self_attn.k_proj"(prefix),
+        "§.self_attn.v_proj"(prefix),
+        "§.self_attn.o_proj"(prefix),
+        "§.post_attention_layernorm"(prefix),
+        "§.mlp.gate_proj"(prefix),
+        "§.mlp.up_proj"(prefix),
+        "§.mlp.down_proj"(prefix),
+        "§.self_attn.q_proj.bias"(prefix),
+        "§.self_attn.k_proj.bias"(prefix),
+        "§.self_attn.v_proj.bias"(prefix)
     ]
     for from names const name {
         const string gguf_name ← resolve_gguf(cfg, m, name)
@@ -360,32 +283,22 @@ fn load_layer(
 
 fn ids_text(list<int> ids) → string {
     var string out ← "["
-    var int i ← 0
-    while i ≺ ids.length() {
-        if i ≻ 0 {
+    var bool first ← true
+    for from ids const id {
+        if not first {
             out ← out + ","
         }
-        out ← out + ((ids.get(i) coalesce 0) ↦ string)
-        i ← i + 1
+        out ← out + (id ↦ string)
+        first ← false
     }
     return out + "]"
 }
 
 fn same_ids(list<int> a, list<int> b) → bool {
     if a.length() ≠ b.length() then return false
-    var int i ← 0
-    while i ≺ a.length() {
+    for range 0‥a.length() const i {
         if (a.get(i) coalesce -1) ≠ (b.get(i) coalesce -2) then return false
-        i ← i + 1
     }
-    return true
-}
-
-fn is_finite(f32 x) → bool {
-    if x ≠ x then return false
-    const f32 huge ← 100000000000000000000000000000000000000.0 ∷ f32
-    if x ≻ huge then return false
-    if (0.0 ∷ f32) - x ≻ huge then return false
     return true
 }
 
@@ -394,7 +307,7 @@ fn logit_at(tensor.NumericBlock logits, int row, int col) → f32 {
         return logits.get([row, col])
     }
     catch err {
-        return 0.0 ∷ f32
+        return 0.0
     }
 }
 
@@ -404,9 +317,9 @@ fn render_f32(f32 x) → string {
         const int n ← (x * 1000000.0) ↦ int
         return n ↦ string
     }
-    const f32 abs ← (0.0 ∷ f32) - x
+    const f32 abs ← -x
     const int n ← (abs * 1000000.0) ↦ int
-    return "-" + (n ↦ string)
+    return "-§"(n ↦ string)
 }
 
 fn print_position(tensor.NumericBlock logits, int row, int vocab) → bool {
@@ -415,11 +328,10 @@ fn print_position(tensor.NumericBlock logits, int row, int vocab) → bool {
     var list<int> top_ids ← [0, 0, 0, 0, 0]
     var list<f32> top_vals ← [best, best, best, best, best]
     var int filled ← 1
-    var bool finite ← is_finite(best)
-    var int col ← 1
-    while col ≺ vocab {
+    var bool finite ← dtype.finite(best)
+    for range 1‥vocab const col {
         const f32 v ← logit_at(logits, row, col)
-        if not is_finite(v) {
+        if not dtype.finite(v) {
             finite ← false
         }
         if v ≻ best {
@@ -427,24 +339,23 @@ fn print_position(tensor.NumericBlock logits, int row, int vocab) → bool {
             best_id ← col
         }
         if filled ≺ 5 {
-            top_ids ← _insert_id(top_ids, top_vals, filled, col, v)
-            top_vals ← _insert_val(top_vals, filled, v)
+            top_ids ← insert_id(top_ids, top_vals, filled, col, v)
+            top_vals ← insert_val(top_vals, filled, v)
             filled ← filled + 1
         }
         elif v ≻ (top_vals.get(4) coalesce best) {
-            top_ids ← _insert_id(top_ids, top_vals, 5, col, v)
-            top_vals ← _insert_val(top_vals, 5, v)
+            top_ids ← insert_id(top_ids, top_vals, 5, col, v)
+            top_vals ← insert_val(top_vals, 5, v)
         }
-        col ← col + 1
     }
-    print "pos=" + (row ↦ string)
-    print "top1=" + (best_id ↦ string)
-    print "top1_logit_u6=" + render_f32(best)
-    print "top5_0=" + ((top_ids.get(0) coalesce 0) ↦ string)
-    print "top5_1=" + ((top_ids.get(1) coalesce 0) ↦ string)
-    print "top5_2=" + ((top_ids.get(2) coalesce 0) ↦ string)
-    print "top5_3=" + ((top_ids.get(3) coalesce 0) ↦ string)
-    print "top5_4=" + ((top_ids.get(4) coalesce 0) ↦ string)
+    print "pos=§"(row ↦ string)
+    print "top1=§"(best_id ↦ string)
+    print "top1_logit_u6=§"(render_f32(best))
+    print "top5_0=§"((top_ids.get(0) coalesce 0) ↦ string)
+    print "top5_1=§"((top_ids.get(1) coalesce 0) ↦ string)
+    print "top5_2=§"((top_ids.get(2) coalesce 0) ↦ string)
+    print "top5_3=§"((top_ids.get(3) coalesce 0) ↦ string)
+    print "top5_4=§"((top_ids.get(4) coalesce 0) ↦ string)
     if finite {
         print "finite=PASS"
     }
@@ -454,11 +365,10 @@ fn print_position(tensor.NumericBlock logits, int row, int vocab) → bool {
     return finite
 }
 
-fn _insert_id(list<int> ids, list<f32> vals, int n, int id, f32 v) → list<int> {
+fn insert_id(list<int> ids, list<f32> vals, int n, int id, f32 v) → list<int> {
     var list<int> out ← empty
     var bool placed ← false
-    var int i ← 0
-    while i ≺ n {
+    for range 0‥n const i {
         const f32 cur ← vals.get(i) coalesce v
         if (not placed) and v ≻ cur {
             out.append(id)
@@ -467,7 +377,6 @@ fn _insert_id(list<int> ids, list<f32> vals, int n, int id, f32 v) → list<int>
         if out.length() ≺ 5 {
             out.append(ids.get(i) coalesce 0)
         }
-        i ← i + 1
     }
     if (not placed) and out.length() ≺ 5 {
         out.append(id)
@@ -478,11 +387,10 @@ fn _insert_id(list<int> ids, list<f32> vals, int n, int id, f32 v) → list<int>
     return out
 }
 
-fn _insert_val(list<f32> vals, int n, f32 v) → list<f32> {
+fn insert_val(list<f32> vals, int n, f32 v) → list<f32> {
     var list<f32> out ← empty
     var bool placed ← false
-    var int i ← 0
-    while i ≺ n {
+    for range 0‥n const i {
         const f32 cur ← vals.get(i) coalesce v
         if (not placed) and v ≻ cur {
             out.append(v)
@@ -491,141 +399,101 @@ fn _insert_val(list<f32> vals, int n, f32 v) → list<f32> {
         if out.length() ≺ 5 {
             out.append(vals.get(i) coalesce v)
         }
-        i ← i + 1
     }
     if (not placed) and out.length() ≺ 5 {
         out.append(v)
     }
     while out.length() ≺ 5 {
-        out.append(0.0 ∷ f32)
+        out.append(0.0)
     }
     return out
 }
 
 fn rope_cfg() → attention.RopeConfig {
-    var attention.RopeConfig c ← attention.default()
     do {
-        c ← attention.construct_rope_config(1000000.0 ∷ f32, 1.0 ∷ f32, attention.interleaved_policy())
-        return c
+        return attention.construct_rope_config(1000000.0, 1.0, attention.interleaved_policy())
     }
     catch err {
         panic err.message
     }
-    return c
 }
 
-fn _flat_slice(tensor.NumericBlock t, int off, int n) → list<f32> {
-    var list<f32> out ← empty
-    var int i ← 0
-    while i ≺ n {
-        out.append(t.data.get(off + i) coalesce 0.0 ∷ f32)
-        i ← i + 1
-    }
-    return out
-}
-
-fn _linear_row0(tensor.NumericBlock stored, int n) → list<f32> {
-    const list<int> f ← stored.shape
-    const int k ← f.get(0) coalesce 1
-    var list<f32> out ← empty
-    var int j ← 0
-    while j ≺ n {
-        out.append(stored.data.get(j * k) coalesce 0.0 ∷ f32)
-        j ← j + 1
-    }
-    return out
-}
-
-fn _list_max_delta(list<f32> a, list<f32> b) → f32 {
-    var f32 maxd ← 0.0 ∷ f32
+fn list_max_delta(list<f32> a, list<f32> b) → f32 {
+    var f32 maxd ← 0.0
     var int n ← a.length()
     if b.length() ≺ n {
         n ← b.length()
     }
-    var int i ← 0
-    while i ≺ n {
-        var f32 d ← (a.get(i) coalesce 0.0 ∷ f32) - (b.get(i) coalesce 0.0 ∷ f32)
+    for range 0‥n const i {
+        var f32 d ← (a.get(i) coalesce 0.0) - (b.get(i) coalesce 0.0)
         if d ≺ 0.0 {
-            d ← 0.0 - d
+            d ← -d
         }
-        if d ≻ maxd {
-            maxd ← d
-        }
-        i ← i + 1
+        maxd ← maxd ⤒ d
     }
     return maxd
 }
 
-fn _list_n_above(list<f32> a, list<f32> b, f32 band) → int {
+fn list_n_above(list<f32> a, list<f32> b, f32 band) → int {
     var int n ← a.length()
     if b.length() ≺ n {
         n ← b.length()
     }
     var int above ← 0
-    var int i ← 0
-    while i ≺ n {
-        var f32 d ← (a.get(i) coalesce 0.0 ∷ f32) - (b.get(i) coalesce 0.0 ∷ f32)
+    for range 0‥n const i {
+        var f32 d ← (a.get(i) coalesce 0.0) - (b.get(i) coalesce 0.0)
         if d ≺ 0.0 {
-            d ← 0.0 - d
+            d ← -d
         }
         if d ≻ band {
             above ← above + 1
         }
-        i ← i + 1
     }
     return above
 }
 
-fn _load_floats(string via, int expected) → list<f32> ⇥ PrefillError {
+fn load_floats(string via, int expected) → list<f32> ⇥ PrefillError {
     var bool present ← false
     do {
         present ← fs.exists(via)
     }
     catch err {
-        throw variant ArgumentError { message = "float file missing: " + via }
+        present ← false
     }
-    if not present {
-        throw variant ArgumentError { message = "float file missing: " + via }
-    }
+    require present throw variant ArgumentError { message = "float file missing: §"(via) }
     var list<string> lines ← empty
     do {
         lines ← fs.read_lines(via)
     }
     catch err {
-        throw variant ArgumentError { message = "float file unreadable: " + via }
+        throw variant ArgumentError { message = "float file unreadable: §"(via) }
     }
-    if lines.length() ≠ expected {
-        throw variant ArgumentError { message = "float line count is not " + (expected ↦ string) }
-    }
+    require lines.length() ≡ expected throw variant ArgumentError { message = "float line count is not §"(expected ↦ string) }
     var list<f32> out ← empty
-    var int i ← 0
-    while i ≺ expected {
+    for range 0‥expected const i {
         do {
             out.append((lines.get(i) coalesce "0") ↦ f32)
         }
         catch err {
-            throw variant ArgumentError { message = "float parse failed at " + (i ↦ string) }
+            throw variant ArgumentError { message = "float parse failed at §"(i ↦ string) }
         }
-        i ← i + 1
     }
     return out
 }
 
-fn _read_u8(string path, int start, int length) → list<int<u8>> {
+fn read_u8(string path, int start, int length) → list<int<u8>> {
     const bytes raw ← fs.read_range(path, start, length)
     const value payload ← raw ↦ value
     const list<int> xs ← payload ↦ list<int>
     var list<int<u8>> out ← empty
-    var int i ← 0
-    while i ≺ xs.length() {
+    for range 0‥xs.length() const i {
         out.append((xs.get(i) coalesce 0) ∷ int<u8>)
-        i ← i + 1
     }
     return out
 }
 
-fn _dequant_bytes(dequant.GgmlKind kind, string path, int start, int length) → list<f32> ⇥ PrefillError {
-    const list<int<u8>> bytes ← _read_u8(path, start, length)
+fn dequant_bytes(dequant.GgmlKind kind, string path, int start, int length) → list<f32> ⇥ PrefillError {
+    const list<int<u8>> bytes ← read_u8(path, start, length)
     do {
         return dequant.dequantize_order(kind, bytes)
     }
@@ -634,63 +502,48 @@ fn _dequant_bytes(dequant.GgmlKind kind, string path, int start, int length) →
     }
 }
 
-fn _row0_from_blocks(dequant.GgmlKind kind, int k, int block_elems, int block_bytes, string path, int abs0, int n) → list<f32> ⇥ PrefillError {
+fn row0_from_blocks(dequant.GgmlKind kind, int k, int block_elems, int block_bytes, string path, int abs0, int n) → list<f32> ⇥ PrefillError {
     var list<f32> out ← empty
-    var int j ← 0
-    while j ≺ n {
+    for range 0‥n const j {
         const int idx ← j * k
         const int bi ← idx / block_elems
         const int within ← idx - (bi * block_elems)
-        const list<f32> blk ← _dequant_bytes(kind, path, abs0 + (bi * block_bytes), block_bytes)
-        out.append(blk.get(within) coalesce 0.0 ∷ f32)
-        j ← j + 1
+        const list<f32> blk ← dequant_bytes(kind, path, abs0 + (bi * block_bytes), block_bytes)
+        out.append(blk.get(within) coalesce 0.0)
     }
     return out
 }
 
-fn _band_row(string tagged, list<f32> observed, string via, int expected, f32 band) → string {
+fn band_row(string tagged, list<f32> observed, string via, int expected, f32 band) → string {
     do {
-        const list<f32> golden ← _load_floats(via, expected)
-        const f32 maxd ← _list_max_delta(observed, golden)
-        const int above ← _list_n_above(observed, golden, band)
-        const int n ← observed.length()
-        if maxd ≺ band {
-            return (((((tagged + ": PASS max_delta=") + (maxd ↦ string)) + " n_above=") + (above ↦ string)) + "/") + (n ↦ string)
-        }
-        return (((((tagged + ": FAIL max_delta=") + (maxd ↦ string)) + " n_above=") + (above ↦ string)) + "/") + (n ↦ string)
+        return probe_lists(tagged, observed, load_floats(via, expected), band)
     }
     catch err {
-        return tagged + ": FAIL " + render(err)
+        return "§: FAIL §"(tagged, err.message)
     }
 }
 
-fn _row_at(tensor.NumericBlock t, int row) → list<f32> {
+fn row_at(tensor.NumericBlock t, int row) → list<f32> {
     const list<int> f ← t.shape
     const int cols ← f.get(1) coalesce 0
     var list<f32> out ← empty
-    var int j ← 0
-    while j ≺ cols {
-        out.append(t.data.get((row * cols) + j) coalesce 0.0 ∷ f32)
-        j ← j + 1
+    for range 0‥cols const j {
+        out.append(t.data.get((row * cols) + j) coalesce 0.0)
     }
     return out
 }
 
-fn _tile_bias(int rows, tensor.NumericBlock b) → tensor.NumericBlock ⇥ PrefillError {
+fn tile_bias(int rows, tensor.NumericBlock b) → tensor.NumericBlock ⇥ PrefillError {
     const list<int> fb ← b.shape
     if fb.length() ≠ 1 {
         throw variant AdapterError { message = "QKV bias must be rank 1" }
     }
     const int n ← fb.get(0) coalesce 0
     var list<f32> out ← empty
-    var int i ← 0
-    while i ≺ rows {
-        var int j ← 0
-        while j ≺ n {
-            out.append(b.data.get(j) coalesce 0.0 ∷ f32)
-            j ← j + 1
+    for range 0‥rows const i {
+        for range 0‥n const j {
+            out.append(b.data.get(j) coalesce 0.0)
         }
-        i ← i + 1
     }
     do {
         return tensor.construct(out, [rows, n])
@@ -700,18 +553,9 @@ fn _tile_bias(int rows, tensor.NumericBlock b) → tensor.NumericBlock ⇥ Prefi
     }
 }
 
-fn _zeros2(int rows, int cols) → tensor.NumericBlock ⇥ PrefillError {
-    do {
-        return tensor.fill([rows, cols], 0.0 ∷ f32)
-    }
-    catch err {
-        throw variant MaterializeError { message = err.message }
-    }
-}
-
 # GI2-1 CPU linear: y[n] = (sum_k x[k] * W[k, n]) + b[n] over one token row.
 # Same textbook dense+add the GI2 decoder_ops row uses (matmul then add).
-fn _ref_linear_row(list<f32> x, tensor.NumericBlock w, tensor.NumericBlock b) → list<f32> ⇥ PrefillError {
+fn ref_linear_row(list<f32> x, tensor.NumericBlock w, tensor.NumericBlock b) → list<f32> ⇥ PrefillError {
     const list<int> fw ← w.shape
     const list<int> fb ← b.shape
     if fw.length() ≠ 2 {
@@ -726,61 +570,53 @@ fn _ref_linear_row(list<f32> x, tensor.NumericBlock w, tensor.NumericBlock b) �
         throw variant AdapterError { message = "reference linear inner dimensions mismatch" }
     }
     var list<f32> out ← empty
-    var int j ← 0
-    while j ≺ n {
-        var f32 acc ← 0.0 ∷ f32
-        var int i ← 0
-        while i ≺ k {
-            acc ← acc + ((x.get(i) coalesce 0.0 ∷ f32) * (w.data.get((i * n) + j) coalesce 0.0 ∷ f32))
-            i ← i + 1
+    for range 0‥n const j {
+        var f32 acc ← 0.0
+        for range 0‥k const i {
+            acc ← acc + ((x.get(i) coalesce 0.0) * (w.data.get((i * n) + j) coalesce 0.0))
         }
-        out.append(acc + (b.data.get(j) coalesce 0.0 ∷ f32))
-        j ← j + 1
+        out.append(acc + (b.data.get(j) coalesce 0.0))
     }
     return out
 }
 
-fn _probe_lists(string tagged, list<f32> observed, list<f32> expected, f32 band) → string {
-    const f32 maxd ← _list_max_delta(observed, expected)
-    const int above ← _list_n_above(observed, expected, band)
+fn probe_lists(string tagged, list<f32> observed, list<f32> expected, f32 band) → string {
+    const f32 maxd ← list_max_delta(observed, expected)
+    const int above ← list_n_above(observed, expected, band)
     const int n ← observed.length()
     if maxd ≺ band {
-        return (((((tagged + ": PASS max_delta=") + (maxd ↦ string)) + " n_above=") + (above ↦ string)) + "/") + (n ↦ string)
+        return "§{tag}: PASS max_delta=§{delta} n_above=§{above}/§{n}"(tag: tagged, delta: maxd ↦ string, above: above ↦ string, n: n ↦ string)
     }
-    return (((((tagged + ": FAIL max_delta=") + (maxd ↦ string)) + " n_above=") + (above ↦ string)) + "/") + (n ↦ string)
+    return "§{tag}: FAIL max_delta=§{delta} n_above=§{above}/§{n}"(tag: tagged, delta: maxd ↦ string, above: above ↦ string, n: n ↦ string)
 }
 
-fn _rmsnorm_ok(tensor.NumericBlock x, tensor.NumericBlock s) → tensor.NumericBlock {
+fn rmsnorm_ok(tensor.NumericBlock x, tensor.NumericBlock s) → tensor.NumericBlock {
     do {
-        return nn.rmsnorm_carrier(x, s, 0.00001 ∷ f32)
+        return nn.rmsnorm_carrier(x, s, 0.00001)
     }
     catch err {
-        panic "trace rmsnorm failed: " + err.message
+        panic "trace rmsnorm failed: §"(err.message)
     }
-    return x
 }
 
-fn _linear_ok(tensor.NumericBlock x, tensor.NumericBlock w, tensor.NumericBlock b) → tensor.NumericBlock {
+fn linear_ok(tensor.NumericBlock x, tensor.NumericBlock w, tensor.NumericBlock b) → tensor.NumericBlock {
     do {
         return nn.linear_carrier(x, w, b)
     }
     catch err {
-        panic "trace qkv linear failed: " + err.message
+        panic "trace qkv linear failed: §"(err.message)
     }
-    return x
 }
 
-fn _prompt_positions() → list<int> {
+fn prompt_positions() → list<int> {
     var list<int> positions ← empty
-    var int p ← 0
-    while p ≺ PINNED_TOKENS.length() {
+    for range 0‥PINNED_TOKENS.length() const p {
         positions.append(p)
-        p ← p + 1
     }
     return positions
 }
 
-fn _slice_cols(tensor.NumericBlock t, int start, int width) → tensor.NumericBlock ⇥ PrefillError {
+fn slice_cols(tensor.NumericBlock t, int start, int width) → tensor.NumericBlock ⇥ PrefillError {
     const list<int> f ← t.shape
     const int rows ← f.get(0) coalesce 0
     const int cols ← f.get(1) coalesce 0
@@ -788,39 +624,33 @@ fn _slice_cols(tensor.NumericBlock t, int start, int width) → tensor.NumericBl
         throw variant AdapterError { message = "column slice out of range" }
     }
     var list<f32> out ← empty
-    var int r ← 0
-    while r ≺ rows {
-        var int c ← 0
-        while c ≺ width {
-            out.append(t.data.get(((r * cols) + start) + c) coalesce 0.0 ∷ f32)
-            c ← c + 1
+    for range 0‥rows const r {
+        for range 0‥width const c {
+            out.append(t.data.get(((r * cols) + start) + c) coalesce 0.0)
         }
-        r ← r + 1
     }
-    return _tensor_from(out, [rows, width])
+    return tensor_from(out, [rows, width])
 }
 
-fn _rope_ok(tensor.NumericBlock x, list<int> positions, int dim) → tensor.NumericBlock {
+fn rope_ok(tensor.NumericBlock x, list<int> positions, int dim) → tensor.NumericBlock {
     do {
         return attention.rotary_position_embedding_config(x, positions, dim, rope_cfg())
     }
     catch err {
-        panic "trace rope failed: " + err.message
+        panic "trace rope failed: §"(err.message)
     }
-    return x
 }
 
-fn _causal_ok(tensor.NumericBlock q, tensor.NumericBlock k, tensor.NumericBlock v, f32 scale) → tensor.NumericBlock {
+fn causal_ok(tensor.NumericBlock q, tensor.NumericBlock k, tensor.NumericBlock v, f32 scale) → tensor.NumericBlock {
     do {
         return attention.scaled_dot_product_causal(q, k, v, scale)
     }
     catch err {
-        panic "trace causal failed: " + err.message
+        panic "trace causal failed: §"(err.message)
     }
-    return q
 }
 
-fn _tensor_from(list<f32> data, list<int> shape) → tensor.NumericBlock ⇥ PrefillError {
+fn tensor_from(list<f32> data, list<int> shape) → tensor.NumericBlock ⇥ PrefillError {
     do {
         return tensor.construct(data, shape)
     }
@@ -829,26 +659,35 @@ fn _tensor_from(list<f32> data, list<int> shape) → tensor.NumericBlock ⇥ Pre
     }
 }
 
-fn _stored_linear(dequant.GgmlKind kind, int k, int n, int block_elems, int block_bytes, string path, int abs0) → tensor.NumericBlock ⇥ PrefillError {
+fn stored_linear(dequant.GgmlKind kind, int k, int n, int block_elems, int block_bytes, string path, int abs0) → tensor.NumericBlock ⇥ PrefillError {
     const int elements ← k * n
     const int nbytes ← (elements / block_elems) * block_bytes
-    const list<f32> stored ← _dequant_bytes(kind, path, abs0, nbytes)
-    const tensor.NumericBlock t ← _tensor_from(stored, [k, n])
+    const list<f32> stored ← dequant_bytes(kind, path, abs0, nbytes)
+    const tensor.NumericBlock t ← tensor_from(stored, [k, n])
     return kmajor_to_linear(t)
 }
 
-fn _gather_prompt(string path) → tensor.NumericBlock ⇥ PrefillError {
+fn gather_prompt(string path) → tensor.NumericBlock ⇥ PrefillError {
     var list<f32> out ← empty
     for from PINNED_TOKENS const tok {
-        const int abs0 ← 5948480 + ((tok * 896) / 32) * 34
-        const list<f32> row ← _dequant_bytes(dequant.GgmlKind.Q8_0, path, abs0, 952)
-        var int j ← 0
-        while j ≺ 896 {
-            out.append(row.get(j) coalesce 0.0 ∷ f32)
-            j ← j + 1
+        # Q8_0 embed row: 28 blocks of 32 elems × 34 bytes per 896-wide row.
+        const int abs0 ← ORACLE_DATA + ((tok * 896) / 32) * 34
+        const list<f32> row ← dequant_bytes(dequant.GgmlKind.Q8_0, path, abs0, 952)
+        for range 0‥896 const j {
+            out.append(row.get(j) coalesce 0.0)
         }
     }
-    return _tensor_from(out, [PINNED_TOKENS.length(), 896])
+    return tensor_from(out, [PINNED_TOKENS.length(), 896])
+}
+
+fn resolve_gguf(dense_qwen2.DenseQwen2Config cfg, gguf_manifest.GgufManifest m, string name) → string ⇥ PrefillError {
+    do {
+        const gguf_manifest.GgufTensorDescriptor d ← dense_qwen2.resolve(cfg, m, name)
+        return d.name
+    }
+    catch err {
+        throw variant AdapterError { message = err.message }
+    }
 }
 
 fn admit_manifest(list<int> prefix, int total, artifact.ContentIdentity identity) → gguf_manifest.GgufManifest {
@@ -897,8 +736,8 @@ fn run_forward(dense.DenseConfig cfg, tensor.NumericBlock embed, tensor.NumericB
             cfg,
             (string name, int layer_i) → tensor.NumericBlock ⇥ dense.DenseError ∴ lookup_one(name, layer_i, embed, norm, weights),
             ids,
-            0.00001 ∷ f32,
-            0.125 ∷ f32,
+            0.00001,
+            0.125,
             positions,
             rope_dim,
             rope_cfg()
@@ -910,6 +749,8 @@ fn run_forward(dense.DenseConfig cfg, tensor.NumericBlock embed, tensor.NumericB
 }
 
 main {
+    # --- argument admission (fail closed) ------------------------------------
+
     const list<string> args ← process.argv() ↦ list<string>
     if args.length() ≺ 3 or args.length() ≻ 4 {
         panic "usage: dense-prefill-qwen2 <path> <expected-data-offset> <sha256> [trace]"
@@ -934,194 +775,206 @@ main {
     if total ≠ ORACLE_BYTES {
         panic "artifact byte length is not the pinned Qwen2.5-0.5B identity"
     }
+
     if trace {
+        # --- trace: layer-0 dequant + k-major receipt ------------------------
+
         print "trace: Qwen2 layer-0 GI2-1 dequant + K-major row0 (no inspect)"
         print "model=Qwen2.5-0.5B-Instruct-Q4_K_M.gguf"
-        print "bytes=" + (total ↦ string)
-        print "sha256=" + digest
+        print "bytes=§"(total ↦ string)
+        print "sha256=§"(digest)
         do {
-            print _band_row("q_dequant_head", _dequant_bytes(dequant.GgmlKind.Q5_0, path, 160801088, 22), GOLDEN_Q_HEAD, 32, TRACE_BAND)
-            print _band_row("q_linear_row0", _row0_from_blocks(dequant.GgmlKind.Q5_0, 896, 32, 22, path, 160801088, 32), GOLDEN_Q_ROW0, 32, TRACE_BAND)
-            print _band_row("k_dequant_head", _dequant_bytes(dequant.GgmlKind.Q5_0, path, 160166720, 22), GOLDEN_K_HEAD, 32, TRACE_BAND)
-            print _band_row("k_linear_row0", _row0_from_blocks(dequant.GgmlKind.Q5_0, 896, 32, 22, path, 160166720, 32), GOLDEN_K_ROW0, 32, TRACE_BAND)
-            print _band_row("v_dequant_head", _dequant_bytes(dequant.GgmlKind.Q8_0, path, 161353536, 34), GOLDEN_V_HEAD, 32, TRACE_BAND)
-            print _band_row("v_linear_row0", _row0_from_blocks(dequant.GgmlKind.Q8_0, 896, 32, 34, path, 161353536, 32), GOLDEN_V_ROW0, 32, TRACE_BAND)
-            print _band_row("o_dequant_head", _dequant_bytes(dequant.GgmlKind.Q5_0, path, 160245568, 22), GOLDEN_O_HEAD, 32, TRACE_BAND)
-            print _band_row("o_linear_row0", _row0_from_blocks(dequant.GgmlKind.Q5_0, 896, 32, 22, path, 160245568, 32), GOLDEN_O_ROW0, 32, TRACE_BAND)
-            print _band_row("g_dequant_head", _dequant_bytes(dequant.GgmlKind.Q5_0, path, 154170176, 22), GOLDEN_G_HEAD, 32, TRACE_BAND)
-            print _band_row("g_linear_row0", _row0_from_blocks(dequant.GgmlKind.Q5_0, 896, 32, 22, path, 154170176, 32), GOLDEN_G_ROW0, 32, TRACE_BAND)
-            print _band_row("u_dequant_head", _dequant_bytes(dequant.GgmlKind.Q5_0, path, 157166400, 22), GOLDEN_U_HEAD, 32, TRACE_BAND)
-            print _band_row("u_linear_row0", _row0_from_blocks(dequant.GgmlKind.Q5_0, 896, 32, 22, path, 157166400, 32), GOLDEN_U_ROW0, 32, TRACE_BAND)
-            print _band_row("d_dequant_head", _dequant_bytes(dequant.GgmlKind.Q6_K, path, 150595136, 210), GOLDEN_D_HEAD, 32, TRACE_BAND)
-            print _band_row("d_linear_row0", _row0_from_blocks(dequant.GgmlKind.Q6_K, 4864, 256, 210, path, 150595136, 32), GOLDEN_D_ROW0, 32, TRACE_BAND)
-            print _band_row("embed_dequant_head", _dequant_bytes(dequant.GgmlKind.Q8_0, path, 5948480, 34), GOLDEN_E_HEAD, 32, TRACE_BAND)
+            print band_row("q_dequant_head", dequant_bytes(dequant.GgmlKind.Q5_0, path, 160801088, 22), GOLDEN_Q_HEAD, 32, TRACE_BAND)
+            print band_row("q_linear_row0", row0_from_blocks(dequant.GgmlKind.Q5_0, 896, 32, 22, path, 160801088, 32), GOLDEN_Q_ROW0, 32, TRACE_BAND)
+            print band_row("k_dequant_head", dequant_bytes(dequant.GgmlKind.Q5_0, path, 160166720, 22), GOLDEN_K_HEAD, 32, TRACE_BAND)
+            print band_row("k_linear_row0", row0_from_blocks(dequant.GgmlKind.Q5_0, 896, 32, 22, path, 160166720, 32), GOLDEN_K_ROW0, 32, TRACE_BAND)
+            print band_row("v_dequant_head", dequant_bytes(dequant.GgmlKind.Q8_0, path, 161353536, 34), GOLDEN_V_HEAD, 32, TRACE_BAND)
+            print band_row("v_linear_row0", row0_from_blocks(dequant.GgmlKind.Q8_0, 896, 32, 34, path, 161353536, 32), GOLDEN_V_ROW0, 32, TRACE_BAND)
+            print band_row("o_dequant_head", dequant_bytes(dequant.GgmlKind.Q5_0, path, 160245568, 22), GOLDEN_O_HEAD, 32, TRACE_BAND)
+            print band_row("o_linear_row0", row0_from_blocks(dequant.GgmlKind.Q5_0, 896, 32, 22, path, 160245568, 32), GOLDEN_O_ROW0, 32, TRACE_BAND)
+            print band_row("g_dequant_head", dequant_bytes(dequant.GgmlKind.Q5_0, path, 154170176, 22), GOLDEN_G_HEAD, 32, TRACE_BAND)
+            print band_row("g_linear_row0", row0_from_blocks(dequant.GgmlKind.Q5_0, 896, 32, 22, path, 154170176, 32), GOLDEN_G_ROW0, 32, TRACE_BAND)
+            print band_row("u_dequant_head", dequant_bytes(dequant.GgmlKind.Q5_0, path, 157166400, 22), GOLDEN_U_HEAD, 32, TRACE_BAND)
+            print band_row("u_linear_row0", row0_from_blocks(dequant.GgmlKind.Q5_0, 896, 32, 22, path, 157166400, 32), GOLDEN_U_ROW0, 32, TRACE_BAND)
+            print band_row("d_dequant_head", dequant_bytes(dequant.GgmlKind.Q6_K, path, 150595136, 210), GOLDEN_D_HEAD, 32, TRACE_BAND)
+            print band_row("d_linear_row0", row0_from_blocks(dequant.GgmlKind.Q6_K, 4864, 256, 210, path, 150595136, 32), GOLDEN_D_ROW0, 32, TRACE_BAND)
+            print band_row("embed_dequant_head", dequant_bytes(dequant.GgmlKind.Q8_0, path, 5948480, 34), GOLDEN_E_HEAD, 32, TRACE_BAND)
             print "lm_head: tied=true — token-major embed, dense.forward transposes to [D,V]"
         }
         catch err {
-            panic render(err)
+            panic err.message
         }
+
+        # --- trace: pos-0 vs pos-16 layer-0 probe ----------------------------
+
         print "trace: Qwen2 layer-0 pos-0 vs pos-16 (Q/K/V+bias, RoPE, mask, cache, frame)"
         do {
-            const tensor.NumericBlock gathered ← _gather_prompt(path)
-            const list<f32> ln1_w ← _dequant_bytes(dequant.GgmlKind.F32, path, 150591552, 3584)
-            const tensor.NumericBlock ln1_s ← _tensor_from(ln1_w, [896])
-            const tensor.NumericBlock wq ← _stored_linear(dequant.GgmlKind.Q5_0, 896, 896, 32, 22, path, 160801088)
-            const tensor.NumericBlock wk ← _stored_linear(dequant.GgmlKind.Q5_0, 896, 128, 32, 22, path, 160166720)
-            const tensor.NumericBlock wv ← _stored_linear(dequant.GgmlKind.Q8_0, 896, 128, 32, 34, path, 161353536)
-            const tensor.NumericBlock bq_ch ← _tensor_from(_dequant_bytes(dequant.GgmlKind.F32, path, 160797504, 3584), [896])
-            const tensor.NumericBlock bk_ch ← _tensor_from(_dequant_bytes(dequant.GgmlKind.F32, path, 160166208, 512), [128])
-            const tensor.NumericBlock bv_ch ← _tensor_from(_dequant_bytes(dequant.GgmlKind.F32, path, 161353024, 512), [128])
-            print "bias_q_shape=" + ids_text(bq_ch.shape)
-            print "bias_k_shape=" + ids_text(bk_ch.shape)
-            print "bias_v_shape=" + ids_text(bv_ch.shape)
-            print "token0=" + ((PINNED_TOKENS.get(0) coalesce -1) ↦ string)
-            print "token16=" + ((PINNED_TOKENS.get(16) coalesce -1) ↦ string)
+            const tensor.NumericBlock gathered ← gather_prompt(path)
+            const list<f32> ln1_w ← dequant_bytes(dequant.GgmlKind.F32, path, 150591552, 3584)
+            const tensor.NumericBlock ln1_s ← tensor_from(ln1_w, [896])
+            const tensor.NumericBlock wq ← stored_linear(dequant.GgmlKind.Q5_0, 896, 896, 32, 22, path, 160801088)
+            const tensor.NumericBlock wk ← stored_linear(dequant.GgmlKind.Q5_0, 896, 128, 32, 22, path, 160166720)
+            const tensor.NumericBlock wv ← stored_linear(dequant.GgmlKind.Q8_0, 896, 128, 32, 34, path, 161353536)
+            const tensor.NumericBlock bq_ch ← tensor_from(dequant_bytes(dequant.GgmlKind.F32, path, 160797504, 3584), [896])
+            const tensor.NumericBlock bk_ch ← tensor_from(dequant_bytes(dequant.GgmlKind.F32, path, 160166208, 512), [128])
+            const tensor.NumericBlock bv_ch ← tensor_from(dequant_bytes(dequant.GgmlKind.F32, path, 161353024, 512), [128])
+            print "bias_q_shape=§"(ids_text(bq_ch.shape))
+            print "bias_k_shape=§"(ids_text(bk_ch.shape))
+            print "bias_v_shape=§"(ids_text(bv_ch.shape))
+            print "token0=§"((PINNED_TOKENS.get(0) coalesce -1) ↦ string)
+            print "token16=§"((PINNED_TOKENS.get(16) coalesce -1) ↦ string)
             print "bos_guess_504_present=false"
             print "add_bos=false"
             print "frame=17 tokens --no-bos, pos0=785 The, not BOS 504 (SmolLM2 first id)"
-            const tensor.NumericBlock ln1 ← _rmsnorm_ok(gathered, ln1_s)
+            const tensor.NumericBlock ln1 ← rmsnorm_ok(gathered, ln1_s)
             const list<int> probe_rows ← [0, 16]
-            const tensor.NumericBlock bq ← _tile_bias(PINNED_TOKENS.length(), bq_ch)
-            const tensor.NumericBlock bk ← _tile_bias(PINNED_TOKENS.length(), bk_ch)
-            const tensor.NumericBlock bv ← _tile_bias(PINNED_TOKENS.length(), bv_ch)
-            const tensor.NumericBlock qb ← _linear_ok(ln1, wq, bq)
-            const tensor.NumericBlock kb ← _linear_ok(ln1, wk, bk)
-            const tensor.NumericBlock vb ← _linear_ok(ln1, wv, bv)
+            const tensor.NumericBlock bq ← tile_bias(PINNED_TOKENS.length(), bq_ch)
+            const tensor.NumericBlock bk ← tile_bias(PINNED_TOKENS.length(), bk_ch)
+            const tensor.NumericBlock bv ← tile_bias(PINNED_TOKENS.length(), bv_ch)
+            const tensor.NumericBlock qb ← linear_ok(ln1, wq, bq)
+            const tensor.NumericBlock kb ← linear_ok(ln1, wk, bk)
+            const tensor.NumericBlock vb ← linear_ok(ln1, wv, bv)
             for from probe_rows const row {
-                const string tag ← "pos" + (row ↦ string)
-                const list<f32> x_row ← _row_at(ln1, row)
-                const list<f32> q_ref ← _ref_linear_row(x_row, wq, bq_ch)
-                const list<f32> k_ref ← _ref_linear_row(x_row, wk, bk_ch)
-                const list<f32> v_ref ← _ref_linear_row(x_row, wv, bv_ch)
-                print _probe_lists("q_linear_with_bias_" + tag, _row_at(qb, row), q_ref, TRACE_BAND)
-                print _probe_lists("k_linear_with_bias_" + tag, _row_at(kb, row), k_ref, TRACE_BAND)
-                print _probe_lists("v_linear_with_bias_" + tag, _row_at(vb, row), v_ref, TRACE_BAND)
+                const string tag ← "pos§"(row ↦ string)
+                const list<f32> x_row ← row_at(ln1, row)
+                const list<f32> q_ref ← ref_linear_row(x_row, wq, bq_ch)
+                const list<f32> k_ref ← ref_linear_row(x_row, wk, bk_ch)
+                const list<f32> v_ref ← ref_linear_row(x_row, wv, bv_ch)
+                print probe_lists("q_linear_with_bias_§"(tag), row_at(qb, row), q_ref, TRACE_BAND)
+                print probe_lists("k_linear_with_bias_§"(tag), row_at(kb, row), k_ref, TRACE_BAND)
+                print probe_lists("v_linear_with_bias_§"(tag), row_at(vb, row), v_ref, TRACE_BAND)
             }
             print "ordering: linear+bias then rope(q/k); v is not roped"
-            const list<int> positions ← _prompt_positions()
-            const tensor.NumericBlock qh0 ← _slice_cols(qb, 0, 64)
-            const tensor.NumericBlock kh0 ← _slice_cols(kb, 0, 64)
-            const tensor.NumericBlock qr ← _rope_ok(qh0, positions, 64)
-            const tensor.NumericBlock kr ← _rope_ok(kh0, positions, 64)
-            print _probe_lists("rope_q_pos0_vs_identity", _row_at(qr, 0), _row_at(qh0, 0), TRACE_BAND)
-            print _probe_lists("rope_k_pos0_vs_identity", _row_at(kr, 0), _row_at(kh0, 0), TRACE_BAND)
-            print _probe_lists("rope_q_pos16_vs_identity", _row_at(qr, 16), _row_at(qh0, 16), TRACE_BAND)
-            print _probe_lists("rope_k_pos16_vs_identity", _row_at(kr, 16), _row_at(kh0, 16), TRACE_BAND)
-            const tensor.NumericBlock toy_q ← _tensor_from([1.0 ∷ f32, 0.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32], [2, 2])
-            const tensor.NumericBlock toy_k ← _tensor_from([1.0 ∷ f32, 0.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32], [2, 2])
-            const tensor.NumericBlock toy_v ← _tensor_from([3.0 ∷ f32, 4.0 ∷ f32, 30.0 ∷ f32, 40.0 ∷ f32], [2, 2])
-            const tensor.NumericBlock toy_ctx ← _causal_ok(toy_q, toy_k, toy_v, 1.0 ∷ f32)
-            const list<f32> mask_row0 ← _row_at(toy_ctx, 0)
-            const list<f32> mask_self ← [3.0 ∷ f32, 4.0 ∷ f32]
-            print _probe_lists("causal_mask_row0_self_only", mask_row0, mask_self, TRACE_BAND)
+            const list<int> positions ← prompt_positions()
+            const tensor.NumericBlock qh0 ← slice_cols(qb, 0, 64)
+            const tensor.NumericBlock kh0 ← slice_cols(kb, 0, 64)
+            const tensor.NumericBlock qr ← rope_ok(qh0, positions, 64)
+            const tensor.NumericBlock kr ← rope_ok(kh0, positions, 64)
+            print probe_lists("rope_q_pos0_vs_identity", row_at(qr, 0), row_at(qh0, 0), TRACE_BAND)
+            print probe_lists("rope_k_pos0_vs_identity", row_at(kr, 0), row_at(kh0, 0), TRACE_BAND)
+            print probe_lists("rope_q_pos16_vs_identity", row_at(qr, 16), row_at(qh0, 16), TRACE_BAND)
+            print probe_lists("rope_k_pos16_vs_identity", row_at(kr, 16), row_at(kh0, 16), TRACE_BAND)
+            const tensor.NumericBlock toy_q ← tensor_from([1.0, 0.0, 0.0, 1.0], [2, 2])
+            const tensor.NumericBlock toy_k ← tensor_from([1.0, 0.0, 0.0, 1.0], [2, 2])
+            const tensor.NumericBlock toy_v ← tensor_from([3.0, 4.0, 30.0, 40.0], [2, 2])
+            const tensor.NumericBlock toy_ctx ← causal_ok(toy_q, toy_k, toy_v, 1.0)
+            const list<f32> mask_row0 ← row_at(toy_ctx, 0)
+            const list<f32> mask_self ← [3.0, 4.0]
+            print probe_lists("causal_mask_row0_self_only", mask_row0, mask_self, TRACE_BAND)
             print "kv_cache=none — dense.forward prefill is uncached full-sequence attention (no first-write path)"
             print "gi0_note: GATE 9 golden 304 is llama-server /completion generation pos 0 (prompt-end), not prefill row 0"
             print "TRACE: STOP after Qwen2 pos-0 vs pos-16 layer-0 probe"
         }
         catch err {
-            panic render(err)
+            panic err.message
         }
     }
+
     if not trace {
-    const bytes prefix_bytes ← fs.read_range(path, 0, data_expected)
-    if prefix_bytes.length() ≠ data_expected {
-        panic "file adapter returned a short table-prefix read"
-    }
-    const value prefix_value ← prefix_bytes ↦ value
-    const list<int> prefix ← prefix_value ↦ list<int>
-    const artifact.ContentIdentity identity ← artifact.ContentIdentity {
-        algorithm = "sha-256",
-        digest = digest,
-        length = total
-    }
-    print "policy=gi0-numeric-contract v1.0.0 finite/top-1-exact/top-5-overlap>=4/5/delta=1e-5 window=0..16"
-    print "backend=CPU/reference"
-    print "model=Qwen2.5-0.5B-Instruct-Q4_K_M.gguf"
-    print "bytes=" + (total ↦ string)
-    print "sha256=" + digest
-    print "prompt=" + PROMPT
-    print "admitting manifest..."
-    const gguf_manifest.GgufManifest m ← admit_manifest(prefix, total, identity)
-    print "admit done"
-    if m.data_start ≠ data_expected {
-        panic "Gradus data offset disagrees with the independent GGUF oracle"
-    }
-    print "architecture=qwen2"
-    print "tensors=" + (m.tensors.length() ↦ string)
-    const dense_qwen2.DenseQwen2Config qcfg ← admit_config(m)
-    print "layers=" + (qcfg.layers ↦ string)
-    print "heads=" + (qcfg.heads ↦ string)
-    print "kv_heads=" + (qcfg.kv_heads ↦ string)
-    print "head_dim=" + (qcfg.head_dim ↦ string)
-    print "hidden_dim=" + (qcfg.hidden_dim ↦ string)
-    print "vocab=" + (qcfg.vocab ↦ string)
-    if qcfg.tied {
-        print "tied=true"
-    }
-    else {
-        print "tied=false"
-    }
-    const tokenizer.Tokenizer tok ← admit_tokenizer(m)
-    const list<int> ids ← encode_ids(tok, PROMPT)
-    print "observed_token_ids=" + ids_text(ids)
-    if not same_ids(ids, PINNED_TOKENS) {
-        panic "tokenizer ids diverge from the pinned llama.cpp probe"
-    }
-    print "tokenizer_ids=PASS"
-    print "loading stored-weight views through the U1.8 resolver"
-    do {
-        const tensor.NumericBlock embed ← materialize_named(path, total, m, resolve_gguf(qcfg, m, "model.embed_tokens"))
-        const tensor.NumericBlock norm ← materialize_named(path, total, m, resolve_gguf(qcfg, m, "model.norm"))
-        var list<tensor.NumericBlock> weights ← empty
-        var int layer ← 0
-        while layer ≺ qcfg.layers {
-            const list<tensor.NumericBlock> one ← load_layer(path, total, m, qcfg, layer)
-            for from one const t {
-                weights.append(t)
-            }
-            print "loaded_layer=" + (layer ↦ string)
-            layer ← layer + 1
+        # --- manifest + config admission (fail closed) ------------------------
+
+        const bytes prefix_bytes ← fs.read_range(path, 0, data_expected)
+        if prefix_bytes.length() ≠ data_expected {
+            panic "file adapter returned a short table-prefix read"
         }
-        const dense.DenseConfig cfg ← dense.DenseConfig {
-            layers = qcfg.layers,
-            heads = qcfg.heads,
-            kv_heads = qcfg.kv_heads,
-            head_dim = qcfg.head_dim,
-            hidden_dim = qcfg.hidden_dim,
-            vocab = qcfg.vocab,
-            tied = qcfg.tied
+        const value prefix_value ← prefix_bytes ↦ value
+        const list<int> prefix ← prefix_value ↦ list<int>
+        const _ identity ← artifact.ContentIdentity {
+            algorithm = "sha-256",
+            digest = digest,
+            length = total
         }
-        var list<int> positions ← empty
-        var int p ← 0
-        while p ≺ ids.length() {
-            positions.append(p)
-            p ← p + 1
+        print "policy=gi0-numeric-contract v1.0.0 finite/top-1-exact/top-5-overlap>=4/5/delta=1e-5 window=0..16"
+        print "backend=CPU/reference"
+        print "model=Qwen2.5-0.5B-Instruct-Q4_K_M.gguf"
+        print "bytes=§"(total ↦ string)
+        print "sha256=§"(digest)
+        print "prompt=§"(PROMPT)
+        print "admitting manifest..."
+        const gguf_manifest.GgufManifest m ← admit_manifest(prefix, total, identity)
+        print "admit done"
+        if m.data_start ≠ data_expected {
+            panic "Gradus data offset disagrees with the independent GGUF oracle"
         }
-        const tensor.NumericBlock logits ← run_forward(cfg, embed, norm, weights, ids, positions, qcfg.head_dim)
-        print "logits_shape=" + ids_text(logits.shape)
-        var bool all_finite ← true
-        var int row ← 0
-        while row ≺ ids.length() {
-            if not print_position(logits, row, qcfg.vocab) {
-                all_finite ← false
-            }
-            row ← row + 1
-        }
-        if all_finite {
-            print "finite_gate=PASS"
+        print "architecture=qwen2"
+        print "tensors=§"(m.tensors.length() ↦ string)
+        const dense_qwen2.DenseQwen2Config qcfg ← admit_config(m)
+        print "layers=§"(qcfg.layers ↦ string)
+        print "heads=§"(qcfg.heads ↦ string)
+        print "kv_heads=§"(qcfg.kv_heads ↦ string)
+        print "head_dim=§"(qcfg.head_dim ↦ string)
+        print "hidden_dim=§"(qcfg.hidden_dim ↦ string)
+        print "vocab=§"(qcfg.vocab ↦ string)
+        if qcfg.tied {
+            print "tied=true"
         }
         else {
-            print "finite_gate=FAIL"
+            print "tied=false"
         }
-        const int end_row ← ids.length() - 1
-        print "gi0_position=0 (prompt end, last prefill row " + (end_row ↦ string) + ")"
-        print "gi0_golden_top1=304"
-        print "gi0_note=GATE 9 llama-server /completion generation pos 0; not prefill row 0"
-        print "no Metal/CUDA execution claim"
-        print "no full-model payload-residency claim"
-    }
-    catch err {
-        panic render(err)
-    }
+
+        # --- tokenizer pin check ----------------------------------------------
+
+        const tokenizer.Tokenizer tok ← admit_tokenizer(m)
+        const list<int> ids ← encode_ids(tok, PROMPT)
+        print "observed_token_ids=§"(ids_text(ids))
+        if not same_ids(ids, PINNED_TOKENS) {
+            panic "tokenizer ids diverge from the pinned llama.cpp probe"
+        }
+        print "tokenizer_ids=PASS"
+
+        # --- stored-weight load + forward -------------------------------------
+
+        print "loading stored-weight views through the U1.8 resolver"
+        do {
+            const tensor.NumericBlock embed ← materialize_named(path, total, m, resolve_gguf(qcfg, m, "model.embed_tokens"))
+            const tensor.NumericBlock norm ← materialize_named(path, total, m, resolve_gguf(qcfg, m, "model.norm"))
+            var list<tensor.NumericBlock> weights ← empty
+            for range 0‥qcfg.layers const layer {
+                const list<tensor.NumericBlock> one ← load_layer(path, total, m, qcfg, layer)
+                for from one const t {
+                    weights.append(t)
+                }
+                print "loaded_layer=§"(layer ↦ string)
+            }
+            const _ cfg ← dense.DenseConfig {
+                layers = qcfg.layers,
+                heads = qcfg.heads,
+                kv_heads = qcfg.kv_heads,
+                head_dim = qcfg.head_dim,
+                hidden_dim = qcfg.hidden_dim,
+                vocab = qcfg.vocab,
+                tied = qcfg.tied
+            }
+            var list<int> positions ← empty
+            for range 0‥ids.length() const p {
+                positions.append(p)
+            }
+            const tensor.NumericBlock logits ← run_forward(cfg, embed, norm, weights, ids, positions, qcfg.head_dim)
+            print "logits_shape=§"(ids_text(logits.shape))
+
+            # --- per-position receipt -----------------------------------------
+
+            var bool all_finite ← true
+            for range 0‥ids.length() const row {
+                if not print_position(logits, row, qcfg.vocab) {
+                    all_finite ← false
+                }
+            }
+            if all_finite {
+                print "finite_gate=PASS"
+            }
+            else {
+                print "finite_gate=FAIL"
+            }
+            const int end_row ← ids.length() - 1
+            print "gi0_position=0 (prompt end, last prefill row §)"(end_row ↦ string)
+            print "gi0_golden_top1=304"
+            print "gi0_note=GATE 9 llama-server /completion generation pos 0; not prefill row 0"
+            print "no Metal/CUDA execution claim"
+            print "no full-model payload-residency claim"
+        }
+        catch err {
+            panic err.message
+        }
     }
 }
