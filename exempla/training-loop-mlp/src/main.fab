@@ -1,45 +1,13 @@
-+++
-locale = "en"
-+++
-# training-loop-mlp — the PML4-U6 composed training loop (bounded MLP 4×4
-# convergence + resume proof).
+# 4×4 MLP training-loop exemplar.
 #
-# The accepted training-proof workload (examples/training/mlp, the pinned
-# CPU/FMIR oracle): a 4×4 two-layer MLP (linear → GELU → linear → MSE),
-# 100 steps, lr 0.1, initial loss 1.576448169383708 → final
-# 0.017928625511508454 (convergence ratio 0.01137 < 0.1).
+# Public entry: the `training-loop-mlp` executable package.
+# Depends on: gradus:mlp, gradus:gradient, gradus:optimize,
+# gradus:train, gradus:metrics, gradus:parameter, gradus:tensor.
 #
-# What this loop composes (the U6 residual from PML4-U5):
-#   1. The U4→U3 binding: the learning-rate schedule (train.Schedule)
-#      feeds the optimizer-state slot's rate (optimize.SgdState) —
-#      the accepted proof uses the constant lr 0.1, expressed as the
-#      schedule vertex == end (scheduled_rate(s, k) = 0.1 ∀k).
-#   2. The training path through the shared-layer forward: the loss comes
-#      from mlp.forward_mlp_loss and the gradients from its compiler-
-#      generated companion forward_mlp_loss_backward (the U2 contract);
-#      the per-parameter gradients are packaged as Gradient records
-#      (identity + generation = the parameter version at the backward).
-#   3. The SGD update (train_step_4x4 → optimize._sgd_family list form) plus the
-#      U3 optimizer-state step: fresh-gradient rules fail closed,
-#      parameter.mutate bumps version, the state advances.
-#   4. Per-step Metric logging (U5 metrics): loss = the loss (the
-#      accepted trajectory), accuratezza = the documented regression-match
-#      rate (|pred − target| ≤ 0.1 over the 16 output elements), with the
-#      output read from the bare shared forward (forward_mlp) — the same
-#      composition the training path differentiates.
-#   5. Checkpoint in/out around the epoch (U5 Checkpoint): the RNG state
-#      (Seed — this workload has no stochastic element, so it is carried
-#      and checkpointed) + the whole-optimizer state wire (U3
-#      serialize) + epoch/step; serialize_checkpoint → deserialize_checkpoint is
-#      the resume round-trip (checkpoint_equal).
-#
-# EXECUTION (train-step-optimizer-call unit 4): the 100-step loop runs on
-# the FMIR stepper (radix 43c0102ba; regression-locked by 2e8042ae7). The
-# tensor SGD update is train.train_step_4x4, which
-# delegates to optimize._sgd_family list form (param' = param − lr·grad). Printed
-# per-step losses match the PML4 pins (final 0.017928625511508454).
-# optimize.step still advances Parameter + SgdState for the checkpoint
-# composition; it does not overwrite the train_step tensors.
+# WHY: the workload keeps the differentiable tensor update, optimizer-state
+# update, per-step metric, and checkpoint round-trip visible in one driver.
+# Fixed data and a constant schedule make the convergence trace reproducible;
+# the builder adapters keep the executable boundary non-failable for that proof.
 
 import from "gradus:mlp" mlp
 import from "gradus:gradient" gradient
@@ -49,13 +17,9 @@ import from "gradus:metrics" metrics
 import from "gradus:parameter" parameter
 import from "gradus:tensor" tensor
 
-# -------------------------------------------------------------------------
-# Swallowing builders (single-error-type fac; test data is always valid,
-# the cape fallback is unreachable — the proba pattern).
-# -------------------------------------------------------------------------
+# --- builder adapters -------------
 
-# Staged tensor.
-fn tene(list<f32> data, list<int> shape) → tensor.NumericBlock {
+fn stage_tensor(list<f32> data, list<int> shape) → tensor.NumericBlock {
     var tensor.NumericBlock t ← tensor.default()
     do {
         t ← tensor.construct(data, shape)
@@ -66,8 +30,7 @@ fn tene(list<f32> data, list<int> shape) → tensor.NumericBlock {
     return t
 }
 
-# The MLP parameter (PML1-U5 surface; owner "model.mlp", f32, 4×4).
-fn para(string name, list<f32> data) → parameter.Parameter {
+fn build_parameter(string name, list<f32> data) → parameter.Parameter {
     var parameter.Parameter p ← parameter.default()
     do {
         p ← parameter.construct(name, "model.mlp", "f32", [4, 4], data)
@@ -78,9 +41,9 @@ fn para(string name, list<f32> data) → parameter.Parameter {
     return p
 }
 
-# The U4→U3 binding: an optimizer-state slot with the scheduled lr and the
-# parameter's current generation.
-fn state_p(string name, int version, f32 rate) → optimize.SgdState {
+# The schedule rate is copied into each optimizer-state slot at its current
+# parameter generation.
+fn build_state(string name, int version, f32 rate) → optimize.SgdState {
     var optimize.SgdState s ← optimize.default()
     do {
         s ← optimize.construct(name, "model.mlp", version, rate)
@@ -91,8 +54,7 @@ fn state_p(string name, int version, f32 rate) → optimize.SgdState {
     return s
 }
 
-# A per-parameter gradient record (U2): identity + generation.
-fn grad_p(string name, int version, tensor.NumericBlock value) → gradient.Gradient {
+fn build_gradient(string name, int version, tensor.NumericBlock value) → gradient.Gradient {
     var gradient.Gradient g ← gradient.default()
     do {
         g ← gradient.construct(name, "model.mlp", version, value)
@@ -103,8 +65,7 @@ fn grad_p(string name, int version, tensor.NumericBlock value) → gradient.Grad
     return g
 }
 
-# An optimizer step (U3 step).
-fn step_p(optimize.SgdState s, parameter.Parameter p, gradient.Gradient g) → optimize.StepResult {
+fn optimizer_step(optimize.SgdState s, parameter.Parameter p, gradient.Gradient g) → optimize.StepResult {
     var optimize.StepResult r ← optimize.default_step()
     do {
         r ← optimize.step(s, p, g)
@@ -115,11 +76,11 @@ fn step_p(optimize.SgdState s, parameter.Parameter p, gradient.Gradient g) → o
     return r
 }
 
-# The accepted constant-lr schedule (vertex == end → lr = 0.1 ∀ step).
-fn schedule_p() → train.Schedule {
+# Vertex and end are equal, so every step receives the pinned learning rate.
+fn build_schedule() → train.Schedule {
     var train.Schedule s ← train.default_schedule()
     do {
-        s ← train.construct_schedule((0.1 ∷ f32), 0, 1, (0.1 ∷ f32))
+        s ← train.construct_schedule(0.1, 0, 1, 0.1)
     }
     catch err {
         return s
@@ -127,8 +88,7 @@ fn schedule_p() → train.Schedule {
     return s
 }
 
-# The deterministic RNG state (U5 seed).
-fn seed_p(int seed) → train.Seed {
+fn build_seed(int seed) → train.Seed {
     var train.Seed s ← train.default()
     do {
         s ← train.construct_seed(seed)
@@ -139,9 +99,8 @@ fn seed_p(int seed) → train.Seed {
     return s
 }
 
-# The scheduled lr at a step (U4 evaluation).
-fn rate_p(train.Schedule s, int step) → f32 {
-    var f32 v ← (0.0 ∷ f32)
+fn scheduled_rate(train.Schedule s, int step) → f32 {
+    var f32 v ← 0.0
     do {
         v ← train.scheduled_rate(s, step)
     }
@@ -151,8 +110,7 @@ fn rate_p(train.Schedule s, int step) → f32 {
     return v
 }
 
-# The checkpoint envelope (U5 Checkpoint).
-fn checkpoint_p(int age, int step, train.Seed rng, string state_wire) → train.Checkpoint {
+fn build_checkpoint(int age, int step, train.Seed rng, string state_wire) → train.Checkpoint {
     var train.Checkpoint t ← train.default_checkpoint()
     do {
         t ← train.construct_checkpoint(age, step, rng, state_wire)
@@ -163,8 +121,7 @@ fn checkpoint_p(int age, int step, train.Seed rng, string state_wire) → train.
     return t
 }
 
-# The checkpoint-wire resume (U5 deserialize).
-fn deserialize_checkpoint_p(string wire) → train.Checkpoint {
+fn restore_checkpoint(string wire) → train.Checkpoint {
     var train.Checkpoint t ← train.default_checkpoint()
     do {
         t ← train.deserialize_checkpoint(wire)
@@ -175,13 +132,12 @@ fn deserialize_checkpoint_p(string wire) → train.Checkpoint {
     return t
 }
 
-# The whole-optimizer registry (U3 Sgd) from the four advanced slots.
-fn sgd_p(optimize.SgdState a, optimize.SgdState b, optimize.SgdState c, optimize.SgdState d) → optimize.Sgd {
+fn build_sgd(optimize.SgdState a, optimize.SgdState b, optimize.SgdState c, optimize.SgdState d) → optimize.Sgd {
     var optimize.Sgd o ← optimize.default_sgd()
     do {
-        const optimize.Sgd o1 ← optimize.add(optimize.empty_sgd(), a)
-        const optimize.Sgd o2 ← optimize.add(o1, b)
-        const optimize.Sgd o3 ← optimize.add(o2, c)
+        const _ o1 ← optimize.add(optimize.empty_sgd(), a)
+        const _ o2 ← optimize.add(o1, b)
+        const _ o3 ← optimize.add(o2, c)
         o ← optimize.add(o3, d)
     }
     catch err {
@@ -190,11 +146,10 @@ fn sgd_p(optimize.SgdState a, optimize.SgdState b, optimize.SgdState c, optimize
     return o
 }
 
-# The per-step metric record (U5 Metric).
-fn metrica_p(f32 loss, f32 accuratezza) → metrics.Metric {
+fn build_metric(f32 loss, f32 accuracy) → metrics.Metric {
     var metrics.Metric m ← metrics.default()
     do {
-        m ← metrics.metric(loss, accuratezza)
+        m ← metrics.metric(loss, accuracy)
     }
     catch err {
         return m
@@ -202,9 +157,7 @@ fn metrica_p(f32 loss, f32 accuratezza) → metrics.Metric {
     return m
 }
 
-# The bare shared forward (the observation path — same composition the
-# training path differentiates).
-fn forward_mlp_p(tensor.NumericBlock x, tensor.NumericBlock w1, tensor.NumericBlock b1, tensor.NumericBlock w2, tensor.NumericBlock b2) → tensor.NumericBlock {
+fn forward_mlp(tensor.NumericBlock x, tensor.NumericBlock w1, tensor.NumericBlock b1, tensor.NumericBlock w2, tensor.NumericBlock b2) → tensor.NumericBlock {
     var tensor.NumericBlock y ← tensor.default()
     do {
         y ← mlp.forward_mlp(x, w1, b1, w2, b2)
@@ -215,151 +168,132 @@ fn forward_mlp_p(tensor.NumericBlock x, tensor.NumericBlock w1, tensor.NumericBl
     return y
 }
 
-# The documented regression-match rate: the fraction of output elements
-# with |pred − target| ≤ 0.1 (a defined, deterministic value for the
-# Metric's accuracy field on this regression row).
-fn _convenientia(tensor.NumericBlock output, tensor.NumericBlock target) → f32 {
-    const list<f32> o ← output.data
-    const list<f32> t ← target.data
-    var int recta ← 0
-    for range 0‥o.length() const i {
-        var f32 diff ← (o.get(i) coalesce (0.0 ∷ f32)) - (t.get(i) coalesce (0.0 ∷ f32))
-        if diff < (0.0 ∷ f32) {
-            diff ← 0.0 - diff
+# Accuracy is the fraction of the 16 regression outputs within 0.1 of target.
+fn match_rate(tensor.NumericBlock output, tensor.NumericBlock target) → f32 {
+    const list<f32> predictions ← output.data
+    const list<f32> targets ← target.data
+    var int matches ← 0
+    for from predictions, targets const predicted, expected {
+        var f32 difference ← predicted - expected
+        if difference < 0.0 {
+            difference ← -difference
         }
-        if diff ≤ (0.1 ∷ f32) {
-            recta ← recta + 1
+        if difference ≤ 0.1 {
+            matches ← matches + 1
         }
     }
-    return (recta ↦ f32) / (o.length() ↦ f32)
+    return (matches ↦ f32) / (predictions.length() ↦ f32)
 }
 
-# -------------------------------------------------------------------------
-# The composed training loop — the accepted MLP 4×4 workload.
-# -------------------------------------------------------------------------
+# --- pinned workload --------------
 
 main {
-    # The accepted initial data (examples/training/mlp oracle).
-    const list<f32> data_input ← [0.5, 0.0 - 0.3, 1.2, 0.0 - 0.7,
-                                   0.0 - 0.4, 0.8, 0.0 - 1.0, 0.3,
-                                   0.7, 0.0 - 0.2, 0.0 - 0.6, 1.0,
-                                   0.0 - 0.9, 1.3, 0.1, 0.0 - 0.5]
-    const list<f32> data_weight1 ← [0.2, 0.0 - 0.4, 0.7, 0.0 - 0.2,
-                                     0.0 - 0.6, 0.3, 0.0 - 0.8, 0.5,
-                                     0.0 - 0.3, 0.9, 0.0 - 0.1, 0.0 - 0.5,
-                                     0.4, 0.0 - 0.7, 0.6, 0.0 - 0.9]
-    const list<f32> data_bias1 ← [0.1, 0.0 - 0.1, 0.0, 0.1,
-                                   0.2, 0.0 - 0.2, 0.1, 0.0 - 0.1,
-                                   0.0, 0.1, 0.0 - 0.1, 0.2,
-                                   0.0 - 0.2, 0.0, 0.1, 0.0 - 0.1]
-    const list<f32> data_weight2 ← [0.0 - 0.5, 0.4, 0.0 - 0.3, 0.8,
-                                     0.0 - 0.1, 0.0 - 0.7, 0.6, 0.0 - 0.4,
-                                     0.3, 0.0 - 0.8, 0.0 - 0.2, 0.5,
-                                     0.0 - 0.6, 0.2, 0.0 - 0.9, 0.1]
-    const list<f32> data_bias2 ← [0.1, 0.0 - 0.2, 0.1, 0.0,
-                                   0.0, 0.1, 0.0 - 0.1, 0.2,
-                                   0.0 - 0.1, 0.0, 0.2, 0.0 - 0.1,
-                                   0.1, 0.0 - 0.1, 0.0, 0.1]
+    # These arrays are the fixed 4×4 convergence workload.
+    const list<f32> data_input ← [0.5, -0.3, 1.2, -0.7,
+                                   -0.4, 0.8, -1.0, 0.3,
+                                   0.7, -0.2, -0.6, 1.0,
+                                   -0.9, 1.3, 0.1, -0.5]
+    const list<f32> data_weight1 ← [0.2, -0.4, 0.7, -0.2,
+                                     -0.6, 0.3, -0.8, 0.5,
+                                     -0.3, 0.9, -0.1, -0.5,
+                                     0.4, -0.7, 0.6, -0.9]
+    const list<f32> data_bias1 ← [0.1, -0.1, 0.0, 0.1,
+                                   0.2, -0.2, 0.1, -0.1,
+                                   0.0, 0.1, -0.1, 0.2,
+                                   -0.2, 0.0, 0.1, -0.1]
+    const list<f32> data_weight2 ← [-0.5, 0.4, -0.3, 0.8,
+                                     -0.1, -0.7, 0.6, -0.4,
+                                     0.3, -0.8, -0.2, 0.5,
+                                     -0.6, 0.2, -0.9, 0.1]
+    const list<f32> data_bias2 ← [0.1, -0.2, 0.1, 0.0,
+                                   0.0, 0.1, -0.1, 0.2,
+                                   -0.1, 0.0, 0.2, -0.1,
+                                   0.1, -0.1, 0.0, 0.1]
     const list<f32> data_target ← [1.0, 1.0, 1.0, 1.0,
                                     1.0, 1.0, 1.0, 1.0,
                                     1.0, 1.0, 1.0, 1.0,
                                     1.0, 1.0, 1.0, 1.0]
 
-    # Fixed-shape tensors for the training-path forward + companion.
+    # The public training path is fixed-shape; the observation path uses its
+    # flexible NumericBlock carrier for the shared forward.
     const tensor<f32, []> blank ← empty
-    const tensor<f32, [4,4]> input ← blank.from_flat(data_input, [4, 4])
-    var tensor<f32, [4,4]> w1 ← blank.from_flat(data_weight1, [4, 4])
-    var tensor<f32, [4,4]> b1 ← blank.from_flat(data_bias1, [4, 4])
-    var tensor<f32, [4,4]> w2 ← blank.from_flat(data_weight2, [4, 4])
-    var tensor<f32, [4,4]> b2 ← blank.from_flat(data_bias2, [4, 4])
-    const tensor<f32, [4,4]> target ← blank.from_flat(data_target, [4, 4])
+    const tensor<f32, [4, 4]> input ← blank.from_flat(data_input, [4, 4])
+    var tensor<f32, [4, 4]> w1 ← blank.from_flat(data_weight1, [4, 4])
+    var tensor<f32, [4, 4]> b1 ← blank.from_flat(data_bias1, [4, 4])
+    var tensor<f32, [4, 4]> w2 ← blank.from_flat(data_weight2, [4, 4])
+    var tensor<f32, [4, 4]> b2 ← blank.from_flat(data_bias2, [4, 4])
+    const tensor<f32, [4, 4]> target ← blank.from_flat(data_target, [4, 4])
 
-    # Staged tensors for the observation path (bare shared forward).
-    const tensor.NumericBlock s_input ← tene(data_input, [4, 4])
-    const tensor.NumericBlock s_target ← tene(data_target, [4, 4])
+    const tensor.NumericBlock staged_input ← stage_tensor(data_input, [4, 4])
+    const tensor.NumericBlock staged_target ← stage_tensor(data_target, [4, 4])
 
-    # The parameters (PML1-U5 surface) — the optimizer state composes with
-    # these; the fixed-shape tensors stay in sync with their values.
-    var parameter.Parameter p_w1 ← para("w1", data_weight1)
-    var parameter.Parameter p_b1 ← para("b1", data_bias1)
-    var parameter.Parameter p_w2 ← para("w2", data_weight2)
-    var parameter.Parameter p_b2 ← para("b2", data_bias2)
+    # Parameter versions advance with optimizer.step while tensor values move
+    # through train_step_4x4, so both paths remain observable.
+    var parameter.Parameter p_w1 ← build_parameter("w1", data_weight1)
+    var parameter.Parameter p_b1 ← build_parameter("b1", data_bias1)
+    var parameter.Parameter p_w2 ← build_parameter("w2", data_weight2)
+    var parameter.Parameter p_b2 ← build_parameter("b2", data_bias2)
 
-    # The controls: schedule (accepted constant lr 0.1) and the seed.
-    const train.Schedule schedule ← schedule_p()
-    const train.Seed seed ← seed_p(1)
+    const train.Schedule schedule ← build_schedule()
+    const train.Seed seed ← build_seed(1)
     const f32 upstream ← 1.0
     const int steps ← 100
-
     var list<f32> loss_trace ← empty
 
-    # The step results are carried across the loop so the checkpoint
-    # after the epoch captures the ADVANCED optimizer state slots.
     var optimize.StepResult r_w1 ← optimize.default_step()
     var optimize.StepResult r_b1 ← optimize.default_step()
     var optimize.StepResult r_w2 ← optimize.default_step()
     var optimize.StepResult r_b2 ← optimize.default_step()
 
+    # --- training steps --------------
+
     for range 0‥steps const step {
-        # 1. Training-path forward (the shared-layer composition): the loss.
         const f32 loss ← mlp.forward_mlp_loss(input, w1, b1, w2, b2, target)
         loss_trace.append(loss)
 
-        # 2. The U4→U3 binding: the scheduled lr feeds the state slots.
-        const f32 lr_k ← rate_p(schedule, step)
-        const optimize.SgdState s_w1 ← state_p("w1", p_w1.version(), lr_k)
-        const optimize.SgdState s_b1 ← state_p("b1", p_b1.version(), lr_k)
-        const optimize.SgdState s_w2 ← state_p("w2", p_w2.version(), lr_k)
-        const optimize.SgdState s_b2 ← state_p("b2", p_b2.version(), lr_k)
+        const f32 lr_k ← scheduled_rate(schedule, step)
+        const optimize.SgdState s_w1 ← build_state("w1", p_w1.version(), lr_k)
+        const optimize.SgdState s_b1 ← build_state("b1", p_b1.version(), lr_k)
+        const optimize.SgdState s_w2 ← build_state("w2", p_w2.version(), lr_k)
+        const optimize.SgdState s_b2 ← build_state("b2", p_b2.version(), lr_k)
 
-        # 3. The backward companion (the U2 contract surface).
         const _ grads ← mlp.forward_mlp_loss_backward(input, w1, b1, w2, b2,
                                                          target, mlp.nil(), upstream)
         const [_, gw1, gb1, gw2, gb2, _] ← grads
 
-        # 4. SGD update through the delegating stepper
-        #    (train_step_4x4 → optimize._sgd_family list form). The next forward
-        #    uses these tensors; the printed loss trajectory is this path.
         const [nw1, nb1, nw2, nb2] ← train.train_step_4x4(w1, b1, w2, b2, gw1, gb1, gw2, gb2, lr_k)
         w1 ← nw1
         b1 ← nb1
         w2 ← nw2
         b2 ← nb2
 
-        # 5. Package the per-parameter gradients (U2 records — the fixed
-        #    gradient tensors bridge into the staged carrier).
-        const gradient.Gradient g_w1 ← grad_p("w1", p_w1.version(), tene(gw1 ↦ list<f32>, [4, 4]))
-        const gradient.Gradient g_b1 ← grad_p("b1", p_b1.version(), tene(gb1 ↦ list<f32>, [4, 4]))
-        const gradient.Gradient g_w2 ← grad_p("w2", p_w2.version(), tene(gw2 ↦ list<f32>, [4, 4]))
-        const gradient.Gradient g_b2 ← grad_p("b2", p_b2.version(), tene(gb2 ↦ list<f32>, [4, 4]))
+        const gradient.Gradient g_w1 ← build_gradient("w1", p_w1.version(), stage_tensor(gw1 ↦ list<f32>, [4, 4]))
+        const gradient.Gradient g_b1 ← build_gradient("b1", p_b1.version(), stage_tensor(gb1 ↦ list<f32>, [4, 4]))
+        const gradient.Gradient g_w2 ← build_gradient("w2", p_w2.version(), stage_tensor(gw2 ↦ list<f32>, [4, 4]))
+        const gradient.Gradient g_b2 ← build_gradient("b2", p_b2.version(), stage_tensor(gb2 ↦ list<f32>, [4, 4]))
 
-        # 6. Optimizer-state composition (U3 step — Parameter/checkpoint).
-        #    Does not overwrite the train_step tensors.
-        r_w1 ← step_p(s_w1, p_w1, g_w1)
-        r_b1 ← step_p(s_b1, p_b1, g_b1)
-        r_w2 ← step_p(s_w2, p_w2, g_w2)
-        r_b2 ← step_p(s_b2, p_b2, g_b2)
+        r_w1 ← optimizer_step(s_w1, p_w1, g_w1)
+        r_b1 ← optimizer_step(s_b1, p_b1, g_b1)
+        r_w2 ← optimizer_step(s_w2, p_w2, g_w2)
+        r_b2 ← optimizer_step(s_b2, p_b2, g_b2)
         p_w1 ← r_w1.fresh
         p_b1 ← r_b1.fresh
         p_w2 ← r_w2.fresh
         p_b2 ← r_b2.fresh
 
-        # 7. Per-step Metric logging (U5 metrics): the loss + the
-        #    regression-match rate from the bare shared forward.
-        const tensor.NumericBlock output ← forward_mlp_p(s_input, p_w1.payload, p_b1.payload,
-                                                   p_w2.payload, p_b2.payload)
-        const metrics.Metric metrica ← metrica_p(loss, _convenientia(output, s_target))
-        print metrica.loss
+        const tensor.NumericBlock output ← forward_mlp(staged_input, p_w1.payload, p_b1.payload,
+                                                        p_w2.payload, p_b2.payload)
+        const metrics.Metric metric ← build_metric(loss, match_rate(output, staged_target))
+        print metric.loss
     }
 
-    # 8. Checkpoint in/out around the epoch (U5 Checkpoint): the whole-
-    #    optimizer state wire + the RNG state + epoch/step; the resume
-    #    round-trip is checkpoint_equal over the versioned wire.
-    const optimize.Sgd sgd ← sgd_p(r_w1.state, r_b1.state, r_w2.state, r_b2.state)
-    const train.Checkpoint map ← checkpoint_p(0, steps, seed, optimize.serialize(sgd))
-    const string wire ← train.serialize_checkpoint(map)
-    const train.Checkpoint checkpoint2 ← deserialize_checkpoint_p(wire)
+    # --- checkpoint round-trip --------
 
-    print train.checkpoint_equal(map, checkpoint2)
+    const optimize.Sgd sgd ← build_sgd(r_w1.state, r_b1.state, r_w2.state, r_b2.state)
+    const train.Checkpoint checkpoint ← build_checkpoint(0, steps, seed, optimize.serialize(sgd))
+    const string wire ← train.serialize_checkpoint(checkpoint)
+    const train.Checkpoint restored ← restore_checkpoint(wire)
+
+    print train.checkpoint_equal(checkpoint, restored)
     print loss_trace
 }
