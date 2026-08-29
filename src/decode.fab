@@ -12,8 +12,8 @@ locale = "en"
 #
 # Terminology (W0 rename, first touch): the carrier class is
 # tensor.NumericBlock — the staged numeric envelope (flat data + shape).
-# "Block" everywhere else in this module (transformer_block, _block,
-# _block_cached, the Weights' block weights) is the TRANSFORMER sense.
+# "Block" everywhere else in this module (transformer_block, forward_block,
+# forward_block_cached, the Weights' block weights) is the TRANSFORMER sense.
 # The two senses never merge.
 #
 # Architectural rule: gradus owns computation and logical state — NOT
@@ -178,6 +178,11 @@ fn from_tensor_error(tensor.TensorError err) → DecodeError {
     return variant TensorFailure { message = err.message, inner = err }
 }
 
+@ conversion
+fn from_sampling_error(sampling.SamplingError err) → DecodeError {
+    return variant SamplingFailure { message = err.message }
+}
+
 
 
 # The attention mode of the shared forward row: 2 = causal + RoPE (the
@@ -288,12 +293,12 @@ fn default() → Decoder {
 # -------------------------------------------------------------------------
 
 # Staged-tensor construction (the never-firing shape check, re-mapped).
-fn _tensor(list<f32> data, list<int> shape) → tensor.NumericBlock ⇥ DecodeError {
+fn staged(list<f32> data, list<int> shape) → tensor.NumericBlock ⇥ DecodeError {
     return tensor.construct(data, shape)
 }
 
 # The embedding gather: the token's row of the embedding table, flat.
-fn _embedding(tensor.NumericBlock table, int id, int dim) → list<f32> {
+fn embedding(tensor.NumericBlock table, int id, int dim) → list<f32> {
     var list<f32> row ← empty
     for range 0 ‥ dim const i {
         row.append(table.data.get(id * dim + i) coalesce 0.0 ∷ f32)
@@ -303,13 +308,13 @@ fn _embedding(tensor.NumericBlock table, int id, int dim) → list<f32> {
 
 # The shared forward row: the transformer block (mode 2 — causal + RoPE)
 # over the staged carrier, positions explicit.
-fn _block(Decoder m, tensor.NumericBlock x, list<int> positions) → tensor.NumericBlock ⇥ DecodeError {
+fn forward_block(Decoder m, tensor.NumericBlock x, list<int> positions) → tensor.NumericBlock ⇥ DecodeError {
     const Weights p ← m.weights
     return transformer.transformer_block(x, p.ln1_s, p.ln1_o, p.wq, p.bq, p.wk, p.bk, p.wv, p.bv, p.wo, p.bo, p.ln2_s, p.ln2_o, p.wf1, p.bf1, p.wf2, p.bf2, p.ln3_s, p.ln3_o, m.scale, INFERENCE_MODE, positions, m.dimension)
 }
 
 # The output projection: the block output → full-vocab logits.
-fn _project(Decoder m, tensor.NumericBlock h) → tensor.NumericBlock ⇥ DecodeError {
+fn project(Decoder m, tensor.NumericBlock h) → tensor.NumericBlock ⇥ DecodeError {
     return nn.linear_carrier(h, m.projection, m.projection_bias)
 }
 
@@ -327,15 +332,15 @@ fn decode_data(int token_id, int position, Decoder m) → tensor.NumericBlock �
     reject position ≺ 0 or position ≥ m.context throw variant InvalidPosition { message = "position out of context" }
 
     # --- embedding gather + staged row ------------------------------------
-    const list<f32> row ← _embedding(m.table, token_id, m.dimension)
-    const tensor.NumericBlock x ← _tensor(row, [1, m.dimension])
+    const list<f32> row ← embedding(m.table, token_id, m.dimension)
+    const tensor.NumericBlock x ← staged(row, [1, m.dimension])
 
     # --- shared forward block ---------------------------------------------
-    const tensor.NumericBlock h ← _block(m, x, [position])
+    const tensor.NumericBlock h ← forward_block(m, x, [position])
 
     # --- output projection + flatten to full-vocab logits -----------------
-    const tensor.NumericBlock logits ← _project(m, h)
-    return _tensor(logits.data, [m.vocabulary])
+    const tensor.NumericBlock logits ← project(m, h)
+    return staged(logits.data, [m.vocabulary])
 }
 
 # -------------------------------------------------------------------------
@@ -356,7 +361,7 @@ fn default_step() → DecodeStep {
     return DecodeStep { logits = tensor.default(), state = kv.default() }
 }
 
-fn _block_cached(Decoder m, tensor.NumericBlock x, list<int> positions, kv.KVCache layer, list<int> tokens) → transformer.CachedBlock ⇥ DecodeError {
+fn forward_block_cached(Decoder m, tensor.NumericBlock x, list<int> positions, kv.KVCache layer, list<int> tokens) → transformer.CachedBlock ⇥ DecodeError {
     const Weights p ← m.weights
     return transformer.transformer_block_cached(x, p.ln1_s, p.ln1_o, p.wq, p.bq, p.wk, p.bk, p.wv, p.bv, p.wo, p.bo, p.ln2_s, p.ln2_o, p.wf1, p.bf1, p.wf2, p.bf2, p.ln3_s, p.ln3_o, m.scale, positions, m.dimension, layer, tokens)
 }
@@ -369,15 +374,15 @@ fn decode_cached(int token_id, int position, Decoder m, kv.KVCache layer) → De
     require layer.dimension ≡ m.dimension throw variant ShapeMismatch { message = "cache dimension must equal the decoder dimension" }
 
     # --- embedding gather + staged row ------------------------------------
-    const list<f32> row ← _embedding(m.table, token_id, m.dimension)
-    const tensor.NumericBlock x ← _tensor(row, [1, m.dimension])
+    const list<f32> row ← embedding(m.table, token_id, m.dimension)
+    const tensor.NumericBlock x ← staged(row, [1, m.dimension])
 
     # --- cached forward block (read/write layer) --------------------------
-    const transformer.CachedBlock block ← _block_cached(m, x, [position], layer, [token_id])
+    const transformer.CachedBlock block ← forward_block_cached(m, x, [position], layer, [token_id])
 
     # --- output projection + decode step ----------------------------------
-    const tensor.NumericBlock projected ← _project(m, block.output)
-    return DecodeStep { logits = _tensor(projected.data, [m.vocabulary]), state = block.state }
+    const tensor.NumericBlock projected ← project(m, block.output)
+    return DecodeStep { logits = staged(projected.data, [m.vocabulary]), state = block.state }
 }
 
 # -------------------------------------------------------------------------
@@ -398,20 +403,20 @@ fn prefill(list<int> tokens, Decoder m) → tensor.NumericBlock ⇥ DecodeError 
     # --- embed gather → staged rows + positions ---------------------------
     var list<f32> flat ← empty
     for from tokens const t {
-        const list<f32> row ← _embedding(m.table, t, m.dimension)
+        const list<f32> row ← embedding(m.table, t, m.dimension)
         for from row const v {
             flat.append(v)
         }
     }
-    const tensor.NumericBlock x ← _tensor(flat, [tokens.length(), m.dimension])
+    const tensor.NumericBlock x ← staged(flat, [tokens.length(), m.dimension])
     var list<int> positions ← empty
     for range 0 ‥ tokens.length() const i {
         positions.append(i)
     }
 
     # --- shared forward block + output projection -------------------------
-    const tensor.NumericBlock h ← _block(m, x, positions)
-    return _project(m, h)
+    const tensor.NumericBlock h ← forward_block(m, x, positions)
+    return project(m, h)
 }
 
 # -------------------------------------------------------------------------
@@ -507,10 +512,6 @@ fn observe_cancellation(Cancellation c) → Cancellation ⇥ DecodeError {
 # in. Sampling errors map to SamplingFailure (the message text preserved).
 # -------------------------------------------------------------------------
 
-fn _sampling_map(sampling.SamplingError e) → DecodeError {
-    return variant SamplingFailure { message = e.message }
-}
-
 @ public
 fn replay(list<list<f32>> logit_rows, sampling.Config c, list<int> history, train.Seed seed, Cancellation cancellation) → list<int> ⇥ DecodeError {
     # --- entry cancellation (fail closed) ---------------------------------
@@ -527,13 +528,7 @@ fn replay(list<list<f32>> logit_rows, sampling.Config c, list<int> history, trai
     # --- per-step sampling (cancellation observed) ------------------------
     for from logit_rows const row {
         observe_cancellation(cancellation)
-        var sampling.Sampler outcome ← sampling.default()
-        do {
-            outcome ← sampling.sample(row, c, running, current)
-        }
-        catch err {
-            throw _sampling_map(err)
-        }
+        const sampling.Sampler outcome ← sampling.sample(row, c, running, current)
         const int token ← outcome.token_id
         result.append(token)
         running.append(token)
