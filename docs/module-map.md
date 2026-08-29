@@ -81,7 +81,7 @@ evidence and boundaries are recorded in
 | Import | File | Role |
 | --- | --- | --- |
 | `gradus:dtype` | `src/dtype.fab` | Versioned dtype tag + cast/round/serialize (`dtype-schema-1.0.0`), including BF16 storage width |
-| `gradus:kernel` | `src/kernel.fab` | GEA1 paired BF16/F32 `[320,960]` GEMV entries with F32 accumulation plus thirteen GEA2 F32 block entries (T=8, D=960, F=2560) and fifteen GEA3-U3a decode entries (T=1, `L_max`=76) and fifteen GEA3-U3b prefill entries (T_p=36, `L_max`=76); host-validated typed resident views |
+| `gradus:kernel` | `src/kernel.fab` | GEA1 paired BF16/F32 `[320,960]` GEMV entries with F32 accumulation plus thirteen GEA2 F32 block entries (T=8, D=960, F=2560), thirteen GEA3-U3a decode entries (T=1, `L_max`=76), and thirteen GEA3-U3b prefill entries (T_p=36, `L_max`=76), including direct-op MLP parents; host-validated typed resident views |
 | `gradus:shape` | `src/shape.fab` | Shape rules: broadcast/reshape/expand, bounded product |
 | `gradus:tensor` | `src/tensor.fab` | Staged-carrier tensor construction/shape/ops (not autograd-aware) |
 | `gradus:math` | `src/math.fab` | Pure operation families (elementwise/reduce/matmul/cast/concat/slice) |
@@ -151,7 +151,7 @@ are `0.125`; the RoPE table is the committed `[8,32,3]` angle/cos/sin input.
 
 ### GEA3-U3a decode device entries
 
-Fifteen independently selectable F32 entries for single-token decode at
+Thirteen independently selectable F32 entries for single-token decode at
 T=1 with the GEA3-U1 freezes (`L_max`=76, declared history length, mask
 beyond L; CTO ruling 0891c09b — fixed-capacity buffers, append-in-place).
 Per-head windows and the 32× layer repetition are plan-time facts
@@ -171,8 +171,7 @@ consecutive pairs (dim=64), not history capacity.
 | `decode_rmsnorm` | `rms_norm(1, 1e-5, weight)` | `[1,960]`, `[960]` → `[1,960]` |
 | `decode_gemv_qo` | `input · weights` | `[1,960]`, `[960,960]` → `[1,960]` |
 | `decode_gemv_kv` | `input · weights` | `[1,960]`, `[960,320]` → `[1,320]` |
-| `decode_gemv_gate_up` | `input · weights` | `[1,960]`, `[960,2560]` → `[1,2560]` |
-| `decode_gemv_down` | `input · weights` | `[1,2560]`, `[2560,960]` → `[1,960]` |
+| `decode_mlp` | inline `input · gate_weights`, `input · up_weights`, `gate.silu() ⊙ up`, and `hidden · down_weights` | `[1,960]`, `[960,2560]`, `[960,2560]`, `[2560,960]` → `[1,960]` |
 | `decode_rope_q` | `rope_norm(0, 64)` with table input | `[1,960]`, table `[1,32,3]` → `[1,960]` |
 | `decode_rope_k` | `rope_norm(0, 64)` with table input | `[1,320]`, table `[1,32,3]` → `[1,320]` |
 | `kv_append_k` | `history + slot · row` | `[76,320]`, slot `[76,1]`, row `[1,320]` → `[76,320]` |
@@ -181,7 +180,6 @@ consecutive pairs (dim=64), not history capacity.
 | `decode_score_gemm` | `(query · key_transposed) ⊙ attention_scale` | `[1,64]`, `[64,76]`, scale `[1,76]` → `[1,76]` |
 | `decode_masked_softmax` | `(scores + length_mask).softmax()` | `[1,76]`, mask `[1,76]` → `[1,76]` |
 | `decode_context_gemm` | `probabilities · values` | `[1,76]`, `[76,64]` → `[1,64]` |
-| `decode_swiglu` | `gate.silu() ⊙ up` | `[1,2560]`, `[1,2560]` → `[1,2560]` |
 | `decode_residual_add` | `left + right` | `[1,960]`, `[1,960]` → `[1,960]` |
 
 The `slot` input is the resident one-hot `[76,1]` row selector at the
@@ -192,7 +190,7 @@ length L, negative beyond it) feeding softmax.
 
 ### GEA3-U3b prefill device entries
 
-Fifteen independently selectable F32 entries for the prefill shape family
+Thirteen independently selectable F32 entries for the prefill shape family
 at `T_p`=36. The frozen prompt tokenizes to 36 tokens (GEA3-U1 fixture
 `fixtures/tokenizer/gea3-prompt-tokens.manifest.json`), not the exact-8
 reuse case, so the GEA2 13-entry block identities are re-shaped at
@@ -210,15 +208,13 @@ slice, failable construct, or in-body call.
 | `prefill_rmsnorm` | `rms_norm(1, 1e-5, weight)` | `[36,960]`, `[960]` → `[36,960]` |
 | `prefill_gemm_qo` | `input · weights` | `[36,960]`, `[960,960]` → `[36,960]` |
 | `prefill_gemm_kv` | `input · weights` | `[36,960]`, `[960,320]` → `[36,320]` |
-| `prefill_gemm_gate_up` | `input · weights` | `[36,960]`, `[960,2560]` → `[36,2560]` |
-| `prefill_gemm_down` | `input · weights` | `[36,2560]`, `[2560,960]` → `[36,960]` |
+| `prefill_mlp` | inline `input · gate_weights`, `input · up_weights`, `gate.silu() ⊙ up`, and `hidden · down_weights` | `[36,960]`, `[960,2560]`, `[960,2560]`, `[2560,960]` → `[36,960]` |
 | `prefill_rope_q` | `rope_norm(0, 64)` with table input | `[36,960]`, table `[36,32,3]` → `[36,960]` |
 | `prefill_rope_k` | `rope_norm(0, 64)` with table input | `[36,320]`, table `[36,32,3]` → `[36,320]` |
 | `prefill_key_transpose` | `input.transpose()` | `[36,64]` → `[64,36]` |
 | `prefill_score_gemm` | `(query · key_transposed) ⊙ attention_scale` | `[36,64]`, `[64,36]`, scale `[36,36]` → `[36,36]` |
 | `prefill_causal_softmax` | `scores.softmax()` | `[36,36]` → `[36,36]` |
 | `prefill_context_gemm` | `probabilities · values` | `[36,36]`, `[36,64]` → `[36,64]` |
-| `prefill_swiglu` | `gate.silu() ⊙ up` | `[36,2560]`, `[36,2560]` → `[36,2560]` |
 | `prefill_residual_add` | `left + right` | `[36,960]`, `[36,960]` → `[36,960]` |
 | `prefill_kv_write_k` | `history + block · rows` | `[76,320]`, block `[76,36]`, rows `[36,320]` → `[76,320]` |
 | `prefill_kv_write_v` | `history + block · rows` | `[76,320]`, block `[76,36]`, rows `[36,320]` → `[76,320]` |

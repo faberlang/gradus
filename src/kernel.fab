@@ -308,8 +308,7 @@ fn residual_add(tensor<f32, [8, 960]> left, tensor<f32, [8, 960]> right, mut ten
 #   decode_rmsnorm        [1,960] · [960]              → [1,960]
 #   decode_gemv_qo        [1,960] · [960,960]          → [1,960]
 #   decode_gemv_kv        [1,960] · [960,320]          → [1,320]
-#   decode_gemv_gate_up   [1,960] · [960,2560]         → [1,2560]
-#   decode_gemv_down      [1,2560] · [2560,960]        → [1,960]
+#   decode_mlp            [1,960] · [960,2560] · [960,2560] · [2560,960] → [1,960]
 #   decode_rope_q         [1,960] · table [1,32,3]     → [1,960]
 #   decode_rope_k         [1,320] · table [1,32,3]     → [1,320]
 #   kv_append_k           row view [320] · row [320] → row view [320]
@@ -318,7 +317,6 @@ fn residual_add(tensor<f32, [8, 960]> left, tensor<f32, [8, 960]> right, mut ten
 #   decode_score_gemm     [1,64] · [64,76] · scale [1,76] → [1,76]
 #   decode_masked_softmax [1,76] · mask [1,76]         → [1,76]
 #   decode_context_gemm   [1,76] · [76,64]             → [1,64]
-#   decode_swiglu         [1,2560] · [1,2560]          → [1,2560]
 #   decode_residual_add   [1,960] · [1,960]            → [1,960]
 #
 # KV geometry (CTO ruling 0891c09b): fixed-capacity buffers at L_max=76,
@@ -350,15 +348,25 @@ fn decode_gemv_kv(tensor<f32, [1, 960]> input, tensor<f32, [960, 320]> weights, 
 }
 
 @ kernel
-@ public
 fn decode_gemv_gate_up(tensor<f32, [1, 960]> input, tensor<f32, [960, 2560]> weights, mut tensor<f32, [1, 2560]> output) → void {
     output ← input · weights
 }
 
 @ kernel
-@ public
 fn decode_gemv_down(tensor<f32, [1, 2560]> input, tensor<f32, [2560, 960]> weights, mut tensor<f32, [1, 960]> output) → void {
     output ← input · weights
+}
+
+# GEA3-A2g direct-op MLP parent. The three matmul producers and the SwiGLU
+# consumer stay inline so lowering retains the source-local stage identities.
+@ kernel
+@ public
+fn decode_mlp(tensor<f32, [1, 960]> input, tensor<f32, [960, 2560]> gate_weights, tensor<f32, [960, 2560]> up_weights, tensor<f32, [2560, 960]> down_weights, mut tensor<f32, [1, 960]> output) → void {
+    const tensor<f32, [1, 2560]> gate ← input · gate_weights
+    const tensor<f32, [1, 2560]> up ← input · up_weights
+    const tensor<f32, [1, 2560]> activated ← gate.silu()
+    const tensor<f32, [1, 2560]> fused ← activated ⊙ up
+    output ← fused · down_weights
 }
 
 # GEA3-U3a bodies 6–7 — RoPE at the decode position. The [1,32,3] table is
@@ -428,7 +436,6 @@ fn decode_context_gemm(tensor<f32, [1, 76]> probabilities, tensor<f32, [76, 64]>
 
 # GEA3-U3a body 14 — SwiGLU at query-1.
 @ kernel
-@ public
 fn decode_swiglu(tensor<f32, [1, 2560]> gate, tensor<f32, [1, 2560]> up, mut tensor<f32, [1, 2560]> output) → void {
     const tensor<f32, [1, 2560]> activated ← gate.silu()
     output ← activated ⊙ up
@@ -458,15 +465,13 @@ fn decode_residual_add(tensor<f32, [1, 960]> left, tensor<f32, [1, 960]> right, 
 #   prefill_rmsnorm        [36,960] · [960]              → [36,960]
 #   prefill_gemm_qo        [36,960] · [960,960]          → [36,960]
 #   prefill_gemm_kv        [36,960] · [960,320]          → [36,320]
-#   prefill_gemm_gate_up   [36,960] · [960,2560]         → [36,2560]
-#   prefill_gemm_down      [36,2560] · [2560,960]        → [36,960]
+#   prefill_mlp            [36,960] · [960,2560] · [960,2560] · [2560,960] → [36,960]
 #   prefill_rope_q         [36,960] · table [36,32,3]    → [36,960]
 #   prefill_rope_k         [36,320] · table [36,32,3]    → [36,320]
 #   prefill_key_transpose  [36,64]                       → [64,36]
 #   prefill_score_gemm     [36,64] · [64,36] · scale [36,36] → [36,36]
 #   prefill_causal_softmax [36,36]                       → [36,36]
 #   prefill_context_gemm   [36,36] · [36,64]             → [36,64]
-#   prefill_swiglu         [36,2560] · [36,2560]         → [36,2560]
 #   prefill_residual_add   [36,960] · [36,960]           → [36,960]
 #   prefill_kv_write_k     [76,320] · block [76,36] · rows [36,320] → [76,320]
 #   prefill_kv_write_v     [76,320] · block [76,36] · rows [36,320] → [76,320]
@@ -497,15 +502,25 @@ fn prefill_gemm_kv(tensor<f32, [36, 960]> input, tensor<f32, [960, 320]> weights
 }
 
 @ kernel
-@ public
 fn prefill_gemm_gate_up(tensor<f32, [36, 960]> input, tensor<f32, [960, 2560]> weights, mut tensor<f32, [36, 2560]> output) → void {
     output ← input · weights
 }
 
 @ kernel
-@ public
 fn prefill_gemm_down(tensor<f32, [36, 2560]> input, tensor<f32, [2560, 960]> weights, mut tensor<f32, [36, 960]> output) → void {
     output ← input · weights
+}
+
+# GEA3-A2g direct-op MLP parent. The three matmul producers and the SwiGLU
+# consumer remain in one source body for the composed plan.
+@ kernel
+@ public
+fn prefill_mlp(tensor<f32, [36, 960]> input, tensor<f32, [960, 2560]> gate_weights, tensor<f32, [960, 2560]> up_weights, tensor<f32, [2560, 960]> down_weights, mut tensor<f32, [36, 960]> output) → void {
+    const tensor<f32, [36, 2560]> gate ← input · gate_weights
+    const tensor<f32, [36, 2560]> up ← input · up_weights
+    const tensor<f32, [36, 2560]> activated ← gate.silu()
+    const tensor<f32, [36, 2560]> fused ← activated ⊙ up
+    output ← fused · down_weights
 }
 
 # GEA3-U3b bodies 6–7 — RoPE at positions 0..T_p-1. The [36,32,3] table is
@@ -560,7 +575,6 @@ fn prefill_context_gemm(tensor<f32, [36, 36]> probabilities, tensor<f32, [36, 64
 
 # GEA3-U3b body 12 — SwiGLU at T_p rows.
 @ kernel
-@ public
 fn prefill_swiglu(tensor<f32, [36, 2560]> gate, tensor<f32, [36, 2560]> up, mut tensor<f32, [36, 2560]> output) → void {
     const tensor<f32, [36, 2560]> activated ← gate.silu()
     output ← activated ⊙ up
