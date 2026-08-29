@@ -1,60 +1,20 @@
-+++
-locale = "en"
-+++
-# Metrics facade — defined values with a deterministic contract (PML4-U5).
+# Defined metrics over the tensor value surface.
 #
 # Public import: import from "gradus:metrics" metrics
-# Depends on: gradus:dtype (tags/finite), gradus:tensor (value carrier).
+# Depends on: gradus:dtype (dtype names and finite checks),
+#   gradus:tensor (numeric value carriers).
 #
-# Architectural rule: a metric is a defined VALUE over the tensor surface,
-# never a training-loop concern and never a hidden-state holder. This
-# module must not import from gradus:optimize, gradus:gradient, or
-# gradus:train. No module owns a backend or device handle.
-#
-# =========================================================================
-# The metric contract (pml4-delivery.md PML4-U5)
-# =========================================================================
-#
-# --- Defined values, deterministic --------------------------------------
-#   * accuracy(prediction, target) = (1/N)·Σ_n [argmax_c pred[n,c] ==
-#     target[n]] — top-1 classification accuracy over the class axis.
-#     Deterministic: fixed row-major iteration, no RNG, no hidden state;
-#     ties in argmax go to the LOWEST class index (documented tie-break —
-#     strict greater-than keeps the first maximal class). Equal inputs
-#     produce bit-identical output. Fails closed (typed MetricError) on
-#     rank/dtype/shape/empty/non-finite/class-range violations — the
-#     capsule rule.
-#   * Metric — the per-step metric record: loss (loss) + accuracy
-#     (accuracy). The loss is the loss surface's value (gradus:loss —
-#     mse / cross_entropy), carried as a defined value; this module does
-#     not re-derive it. The record validates its fields fail-closed
-#     (finite loss, accuracy in [0, 1]).
-#
-# --- Shared with the GPU-training lane's accepted facts -----------------
-#   * the classification path's target vocabulary is the cross_entropy
-#     contract (rank-1 i32 class indices, in [0, C)); prediction is rank-2
-#     [N, C] f32 — the next-token / classification rows.
-#   * per-step loss + accuracy are the accepted training-proof metrics
-#     (the exit gate's per-step loss trace; accuracy is the classification
-#     evaluation metric).
-#
-# --- Evidence honesty (CTO Q2, hard) ------------------------------------
-# This surface is the STRUCTURAL proof: the accuracy formula (argmax +
-# tie-break + deterministic iteration) and the record contract are
-# compile-validated and proven by the co-located proba (f64 oracle pins).
-# Library-to-library calls execute on the FMIR stepper (radix 43c0102ba;
-# regression-locked by 2e8042ae7). PML4-U5 is PARTIAL: metric numeric
-# identity remains deferred to a runtime-evidence gate (auditor-owned
-# faber test path; oracle pins recorded in metrics.proba).
+# The module owns top-1 accuracy and the per-step Metric record. Accuracy is
+# deterministic: rows are visited in order and equal maxima choose the lowest
+# class index. Loss is carried in from gradus:loss; this module does not
+# recompute it. No training loop, hidden state, backend, or device handle
+# belongs here.
+
 import from "gradus:dtype" dtype
 
 import from "gradus:tensor" tensor
 
-# -------------------------------------------------------------------------
-# MetricError — typed error vocabulary of the metric contract.
-# Every variant carries a text message (render via message).
-# -------------------------------------------------------------------------
-
+# --- metric error vocabulary ---------------------------------------------
 
 @ public
 union MetricError {
@@ -70,16 +30,9 @@ union MetricError {
     Invalid
 }
 
-
-
-# -------------------------------------------------------------------------
-# accuracy — top-1 classification accuracy over the class axis.
-#   prediction: rank-2 [N, C] f32 logits/probabilities;
-#   target:     rank-1 [N] i32 class indices (the cross_entropy contract).
-# Returns the fraction of rows whose argmax class equals the target.
-# Deterministic: fixed row-major iteration; ties go to the lowest class
-# index (strict greater-than argmax). Fails closed on every violation.
-# -------------------------------------------------------------------------
+# --- top-1 accuracy -------------------------------------------------------
+# Prediction is rank-2 [N, C] f32 data. Target is rank-1 [N] i32 class data,
+# matching the cross-entropy classification contract.
 
 @ public
 fn accuracy(tensor.NumericBlock prediction, tensor.NumericBlock target) → f32 ⇥ MetricError {
@@ -94,19 +47,20 @@ fn accuracy(tensor.NumericBlock prediction, tensor.NumericBlock target) → f32 
     require ft.length() ≡ 1 throw variant GradusMismatch { message = "accuracy target must be rank-1" }
     require ft.get(0) coalesce 1 ≡ n throw variant ShapeMismatch { message = "target length does not match predictions rows" }
     require dtype.name(target.dtype) ≡ "i32" throw variant DtypeMismatch { message = "accuracy target must be i32 class indices" }
-    for from prediction.data const v {
-        require dtype.finite(v) throw variant NonFinite { message = "non-finite prediction" }
+    for from prediction.data const value {
+        require dtype.finite(value) throw variant NonFinite { message = "non-finite prediction" }
     }
     var int correct ← 0
+    # NumericBlock data is flat, and row drives the prediction stride.
     for range 0 ‥ n const row {
-        const f32 lbl ← target.data.get(row) coalesce 0.0 ∷ f32
-        require dtype.finite(lbl) throw variant NonFinite { message = "non-finite target" }
-        const int k ← lbl.truncate()
-        require (k ↦ f32) ≡ lbl throw variant Incompatible { message = "target must be integer class indices" }
+        const f32 label ← target.data.get(row) coalesce 0.0
+        require dtype.finite(label) throw variant NonFinite { message = "non-finite target" }
+        const int k ← label.truncate()
+        require (k ↦ f32) ≡ label throw variant Incompatible { message = "target must be integer class indices" }
         reject k ≺ 0 or k ≥ c throw variant Incompatible { message = "target class out of range" }
         var list<f32> row_values ← empty
         for range 0 ‥ c const j {
-            row_values.append(prediction.data.get(row * c + j) coalesce 0.0 ∷ f32)
+            row_values.append(prediction.data.get(row * c + j) coalesce 0.0)
         }
         const int best ← row_values.argmax() coalesce 0
         if best ≡ k {
@@ -116,23 +70,14 @@ fn accuracy(tensor.NumericBlock prediction, tensor.NumericBlock target) → f32 
     return (correct ↦ f32) / (n ↦ f32)
 }
 
-# -------------------------------------------------------------------------
-# Metric — the per-step metric record: loss (loss) + accuracy.
-# Defined values with a validated, deterministic contract; equal inputs
-# produce equal records.
-# -------------------------------------------------------------------------
-
+# --- per-step metric -----------------------------------------------------
 
 @ public
 class Metric {
-    # The step's loss (the loss surface's value, carried).
     f32 loss
-    # The step's accuracy.
     f32 accuracy
 }
 
-# Build a per-step metric record. Fail closed: the loss must be finite,
-# the accuracy finite and in [0, 1].
 @ public
 fn metric(f32 loss, f32 accuracy) → Metric ⇥ MetricError {
     require dtype.finite(loss) throw variant Invalid { message = "loss must be finite" }
@@ -141,15 +86,12 @@ fn metric(f32 loss, f32 accuracy) → Metric ⇥ MetricError {
     return Metric { loss = loss, accuracy = accuracy }
 }
 
-# Placeholder Default for `var Metric` bindings (varia on structs).
-# Zero loss/accuracy. Only a placeholder the caller overwrites, or
-# returns from an unreachable cape arm.
+# Placeholder for mutable Metric bindings and unreachable recovery arms.
 @ public
 fn default() → Metric {
     return Metric { loss = 0.0, accuracy = 0.0 }
 }
 
-# Field-wise metric equality.
 @ public
 fn metric_equal(Metric a, Metric b) → bool {
     if a.loss ≠ b.loss then return false
