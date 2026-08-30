@@ -94,26 +94,24 @@ mir-swarm rungs, not grow workarounds.
 
 ## Benchmarks
 
-Benchmarks are pinned to the **radix + hosts + gradus triple**. Every
-number attaches to three full commit SHAs and is reproducible from those
-hashes alone: `scripta/bench materialize` checks out detached worktrees of
-the three repos at explicit hashes into a scratch root outside all repos
-and `build` makes a release `faber` from the pinned radix. A speed number
-not carrying the triple is not a gradus benchmark. Operative method:
-[`docs/benchmark-method.md`](docs/benchmark-method.md) (v1.1.0); goal law:
-[`docs/factory/bench-harness/goal.md`](docs/factory/bench-harness/goal.md).
+Same law as unit tests: time the **current tree**. `./scripta/bench run`
+uses the live sibling checkouts (HEAD of radix, hosts, gradus). A leftover
+isolated snapshot is never auto-selected. Artifacts record the HEADs that
+ran; they do not become the next run's input. If you want last week's
+number, check out last week's repos. Operative method:
+[`docs/benchmark-method.md`](docs/benchmark-method.md) (v1.1.0).
 
 ### Commands
 
 ```bash
-./scripta/bench materialize --radix <sha> --hosts <sha> --gradus <sha>  # pin the triple into a scratch root
-./scripta/bench build                                                  # release faber from the pinned radix
-./scripta/bench run                                                    # no flags = stage 2 dev (the dev default)
+./scripta/bench run                                                    # live HEAD, stage 2 dev
 ./scripta/bench run --stage smoke|dev|rough|full                       # stage tokens ≡ 1|2|3|4; --full aliases 4
 ./scripta/bench run --label <label>                                    # explicit subset, repeatable; signal only
-./scripta/bench capture                                                # dated 3-hash baseline (AC-gated, stage full)
+./scripta/bench capture                                                # snapshot of *now* (HEAD), dated JSON + receipt
 ./scripta/bench gate CURRENT_JSON [--baseline BASELINE_JSON]           # comparability wrapper → radix checker
-./scripta/bench clean [--all]                                          # tear down worktrees + scratch root — always
+./scripta/bench materialize                                            # optional isolated HEAD snapshot
+./scripta/bench build                                                  # release faber inside that snapshot
+./scripta/bench clean [--all]                                          # tear down isolated snapshots
 ```
 
 `run` with no stage flag is **stage 2 dev** — the operator's default dev
@@ -166,21 +164,17 @@ mode, never a full sweep.
 
 ### Baselines
 
-- Home: `bench/baselines/` — dated 3-hash stems
-  `baseline-YYYYMMDD-<r7>-<h7>-<g7>.json` plus same-stem `.md` receipt.
-- **Append-only**: a re-baseline is a new committed file at a new triple;
-  never edit, overwrite, or delete an existing baseline.
-- Baseline of record:
+- Home: `bench/baselines/` — dated receipts that record the HEADs they
+  ran. A receipt is a log, not a pin for the next `run`.
+- **Append-only**: never edit, overwrite, or delete an existing baseline.
+- Latest receipt:
   [`bench/baselines/baseline-20260827-re792964-hc9cfb5a-g536b7ab.json`](bench/baselines/baseline-20260827-re792964-hc9cfb5a-g536b7ab.json)
-  (radix `e7929640` · hosts `c9cfb5a` · gradus `536b7ab`) with its
-  same-stem receipt and the GB-U5 reproduction rider — gate PASS
-  reproduced from the recorded triple alone.
 
 ### Environment identity and thresholds
 
-- Every baseline and run records the full environment-identity metadata
-  (machine, cpu/cores/memory/os/arch, triple SHAs, faber binary identity,
-  protocol, power); a missing field voids the claim (benchmark-method §5).
+- Every run records machine, cpu/cores/memory/os/arch, the HEADs that
+  ran, faber binary identity, protocol, power; a missing field voids the
+  claim (benchmark-method §5).
 - Gate default **10 %**; `BENCH_REGRESSION_THRESHOLD` overrides. Advisory
   until the operator wires it into merges. Never widen a threshold after
   an observation to force green (L21); a same-machine regression is

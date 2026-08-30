@@ -21,6 +21,11 @@ that order. Operative bench law: [`AGENTS.md`](../AGENTS.md) §Benchmarks.
 The §1 claim-tier law and §5 hardware-discipline are unchanged and carry
 into the harness unchanged.
 
+Benchmarks follow the same law as unit tests: they time the **current
+tree**. `./scripta/bench run` uses live HEAD. A leftover isolated snapshot
+is never auto-selected. Artifacts record what ran; they are not a pin for
+the next run. To see last week, check out last week.
+
 This document pins **how** a Gradus benchmark is run and claimed. It does
 **not** publish a speed number. No committed bench binary landed in the
 PML6 phase (pml6-delivery.md Open Question 5) — **superseded in v1.1.0**

@@ -1,24 +1,17 @@
 #!/usr/bin/env python3
-"""Bench pin-and-build driver (bench-harness delivery GB-U1), run
-loop + JSON emitter (GB-U3), stage ladder (GB-U3b), and per-row
-power-state capture (GB-U3c).
+"""Current-tree Gradus microbench (same law as unit tests: time HEAD).
 
-materialize  detached git worktrees of radix/hosts/gradus at explicit
-             hashes into a scratch root outside all repos
-build        release faber from the pinned radix worktree
-run          sample the pinned bench manifest on the four-stage ladder
-             (goal §Stage ladder) and emit
-             check-benchmark-regression-format JSON with the
-             environment-identity metadata block, per-row `power_state`
-             (sampled at each row's execution), and the
-             `metadata.power_class` run summary (ea4dd0a3)
-capture      first-baseline capture (GB-U4): AC-gated (pmset) materialize
-             + build at the current triple, ordering-invariant
-             verification (the recorded gradus_sha resolves the full
-             subcommand set, all four stage tokens, and row-level
-             power_state in a smoke output) BEFORE any baseline write, a
-             pinned --stage full run (~35 min), then the dated 3-hash
-             baseline JSON + same-stem receipt under bench/baselines/
+`run` with no --scratch times the live sibling checkouts. Isolation
+snapshots (`materialize`/`build`/`--scratch`) are optional, like checking
+out last week to see last week. Artifacts record what ran; they are not
+the thing being timed next time.
+
+materialize  optional detached HEAD (or given refs) snapshot
+build        release faber inside an isolated radix snapshot
+run          sample bench/cases.toml on the stage ladder against the live
+             tree (default) or --scratch; emit checker-format JSON
+capture      snapshot of *now*: AC-gated materialize+build at current HEAD,
+             then --stage full, dated JSON + receipt under bench/baselines/
 gate         comparability wrapper (GB-U4): refuses non-comparable inputs
              BEFORE the checker — environment mismatch (exit 3),
              lesser-stage protocol (exit 4), cross-power-class (exit 5),
@@ -46,12 +39,13 @@ Laws (gradus/docs/factory/bench-harness/delivery.md GB-U1):
   worktree, `git worktree prune` in each source repo, then scratch-root
   removal, verified registration-free before exit.
 
-Run laws (delivery.md GB-U3; goal §Run loop + §Perf-taxonomy):
+Run laws:
 
-* the manifest, the bench package, and every `gradus:*` import resolve
-  from the pinned gradus worktree inside the scratch root, so a run is
-  attached to the recorded triple (reproducibility law); the harness
-  itself may run from a dev checkout — the pinned tree is what is timed;
+* default `run` times the live workspace (current radix/hosts/gradus HEAD),
+  same as `faber check` / `cargo test`. A leftover `.bench/gradus/` snapshot
+  is never auto-selected;
+* `--scratch` is an explicit isolated tree, not the default;
+* artifacts record the HEADs that ran; they do not become the next run's input;
 * protocol is pinned at the top stage: 3 discarded warmups + 10 measured
   samples of `faber run`/`faber check` wall time per case, K iterations
   per case from the manifest (benchmark-method §4.3; K calibrated so the
@@ -123,7 +117,7 @@ BYTES_PER_GIB = 1024**3
 WARMUPS = 3
 SAMPLES = 10
 CHECKER_FORMAT_VERSION = "1"
-BENCH_MANIFEST = Path("bench") / "cases.toml"  # inside the pinned gradus worktree
+BENCH_MANIFEST = Path("bench") / "cases.toml"  # under the Gradus tree being timed
 DEFAULT_CAP_S = 60  # per goal §Perf-taxonomy; overridable per case in the manifest
 
 # Stage ladder (GB-U3b; goal §Stage ladder): both knobs per stage — label
@@ -178,6 +172,53 @@ class BenchError(Exception):
     def __init__(self, kind: str, message: str):
         super().__init__(message)
         self.kind = kind
+
+
+def live_triple() -> dict[str, str]:
+    """HEADs of the sibling checkouts. This is what `run` times by default."""
+    return {name: resolve_commit(source_repo(name), name, "HEAD") for name in REPOS}
+
+
+def find_faber() -> Path:
+    """The faber binary from the live radix tree, same as any other test."""
+    env_bin = os.environ.get("FABER_BIN")
+    if env_bin:
+        path = Path(env_bin).expanduser()
+        if path.is_file() and os.access(path, os.X_OK):
+            return path
+        raise BenchError("no-build", f"FABER_BIN={env_bin} is not an executable")
+    radix = source_repo("radix")
+    for candidate in (
+        radix / "target" / "release" / "faber",
+        radix / "target" / "debug" / "faber",
+    ):
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate
+    raise BenchError(
+        "no-build",
+        f"no faber binary under {radix}/target/{{release,debug}}/faber; "
+        "run `cargo build --release -p faber` in radix/ or set FABER_BIN",
+    )
+
+
+def resolve_run_tree(explicit_scratch: str | None) -> tuple[Path, dict[str, str], Path, str]:
+    """Live sibling checkouts unless --scratch names an isolated tree.
+
+    Default is the current workspace, like unit tests. A leftover
+    `.bench/gradus/` snapshot is never auto-selected: that would time last
+    week's tree while claiming to test today.
+    """
+    if explicit_scratch:
+        scratch = Path(explicit_scratch).resolve()
+        triple = load_triple(scratch)
+        verify_triple(scratch, triple)
+        faber = scratch / "radix" / "target" / "release" / "faber"
+        if not (faber.is_file() and os.access(faber, os.X_OK)):
+            raise BenchError(
+                "no-build", f"{faber} is missing; run `bench build --scratch {scratch}`"
+            )
+        return scratch, triple, faber, "scratch"
+    return WORKSPACE, live_triple(), find_faber(), "live"
 
 
 def source_repo(name: str) -> Path:
@@ -493,17 +534,12 @@ def sysctl(name: str) -> str | None:
 
 
 def load_manifest(scratch: Path) -> dict:
-    """Read bench/cases.toml from the pinned gradus worktree (the run is
-    attached to the recorded triple) and fail closed on taxonomy gaps.
-    Returns the case list plus the ladder label-breadth fields
-    (`smoke_label` / `dev_labels`; goal-table defaults when the pinned
-    manifest predates GB-U3b)."""
+    """Read bench/cases.toml from the Gradus tree being timed."""
     path = scratch / "gradus" / BENCH_MANIFEST
     if not path.is_file():
         raise BenchError(
             "manifest-missing",
-            f"{path} is missing in the pinned gradus worktree (gradus sha "
-            f"predates the GB-U2 bench package?)",
+            f"{path} is missing (no bench/cases.toml in this Gradus tree)",
         )
     try:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
@@ -570,9 +606,8 @@ def load_manifest(scratch: Path) -> dict:
 
 
 def case_command(faber: Path, scratch: Path, case: dict) -> list[str]:
-    """The sampled command: `faber run` over the pinned bench package (MIR
-    runner, package route — single-file scripts reject kernel imports) or
-    `faber check` on the pinned library for check-route labels."""
+    """The sampled command: `faber run` over the bench package or
+    `faber check` on the library in the tree being timed."""
     if case["route"] == "check":
         target = (scratch / "gradus" / case["target"]).resolve()
         return [str(faber), "check", str(target)]
@@ -941,45 +976,37 @@ def cmd_run(args: argparse.Namespace) -> int:
     spec = STAGE_LADDER[stage]
     warmups, samples = spec["warmups"], spec["samples"]
 
-    scratch = single_scratch(args.scratch)
-    triple = load_triple(scratch)
-    verify_triple(scratch, triple)
-    faber = scratch / "radix" / "target" / "release" / "faber"
-    if not (faber.is_file() and os.access(faber, os.X_OK)):
-        raise BenchError(
-            "no-build", f"{faber} is missing; run `bench build` before `bench run`"
-        )
-    manifest = load_manifest(scratch)
+    tree, triple, faber, mode = resolve_run_tree(args.scratch)
+    manifest = load_manifest(tree)
     cases = manifest["cases"]
     if any(case["route"] == "run" for case in cases) and not (
-        scratch / "gradus" / "bench" / "faber.toml"
+        tree / "gradus" / "bench" / "faber.toml"
     ).is_file():
         raise BenchError(
             "no-bench-package",
-            f"{scratch / 'gradus' / 'bench'} has no faber.toml (pinned gradus "
-            f"predates the GB-U2 bench package)",
+            f"{tree / 'gradus' / 'bench'} has no faber.toml",
         )
     labels, label_mode = select_labels(stage, manifest, args.label)
     selected = [case for case in cases if case["label"] in labels]
 
     env = os.environ.copy()
-    # gradus:* imports resolve to the pinned gradus worktree (check-compile seam).
-    env["FABER_LIBRARY_HOME"] = str(scratch)
+    env["FABER_LIBRARY_HOME"] = str(tree)
     # compiled-arm-only seam (runtime_sources.rs); keep the MIR arm deterministic
     env.pop("FABER_SUPPORT_PATH_OVERRIDE", None)
 
     metadata = collect_metadata(
-        scratch, triple, faber, cases, stage, warmups, samples, labels, label_mode
+        tree, triple, faber, cases, stage, warmups, samples, labels, label_mode
     )
+    metadata["run_mode"] = mode
     print(
-        f"bench: run stage {stage} ({spec['number']}) — {len(selected)} label(s) "
+        f"bench: run {mode} stage {stage} ({spec['number']}) — {len(selected)} label(s) "
         f"[{label_mode} selection], {warmups} warmup + {samples} sample(s) per "
         f"label, K per manifest; radix {triple['radix'][:7]} "
         f"hosts {triple['hosts'][:7]} gradus {triple['gradus'][:7]}",
         file=sys.stderr,
     )
     rows = [
-        run_case(scratch, faber, case, env, warmups, samples) for case in selected
+        run_case(tree, faber, case, env, warmups, samples) for case in selected
     ]
     # power_class summarizes the emitted rows (ea4dd0a3) — appended after
     # collect_metadata because only the rows know their classes
@@ -1632,17 +1659,16 @@ def cmd_clean(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="bench",
-        description="Bench pin-and-build driver: pin the radix/hosts/gradus "
-        "triple into a scratch root, build the pinned faber, run the "
-        "stage-ladder benchmark, capture the dated baseline, gate "
-        "comparability, tear down clean. Errors are typed "
-        "(`bench: <kind>: <message>`, exit 1).",
+        description="Current-tree Gradus microbench. `run` times the live "
+        "sibling checkouts (HEAD), same as unit tests. Isolation snapshots "
+        "(`materialize`/`build`) are optional. Artifacts record what ran. "
+        "Errors are typed (`bench: <kind>: <message>`, exit 1).",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
     materialize = sub.add_parser(
         "materialize",
-        help="detached worktrees of radix/hosts/gradus at pinned hashes",
+        help="optional isolated snapshot of the sibling HEADs (or given refs)",
     )
     for name in REPOS:
         materialize.add_argument(
@@ -1682,11 +1708,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = sub.add_parser(
         "run",
-        help="sample the pinned bench manifest on the stage ladder and "
-        "emit checker-format JSON with per-row power_state + the "
-        "metadata.power_class run summary (ea4dd0a3; default: stage 2 dev)",
+        help="time the live sibling checkouts (default) or an explicit "
+        "--scratch snapshot; emit checker-format JSON (default: stage 2 dev)",
     )
-    run.add_argument("--scratch", metavar="DIR", help="scratch root to run against")
+    run.add_argument(
+        "--scratch",
+        metavar="DIR",
+        help="optional isolated tree; default is the current workspace HEAD",
+    )
     run.add_argument(
         "--stage",
         choices=sorted(STAGE_TOKENS),
