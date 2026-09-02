@@ -189,7 +189,7 @@ Same unit shape; oracle: ONE paired-parity prefill delta + per-kernel FMA/receip
 | `outcome` | Convert hand-rolled loops and folds to language constructs per the A0 law; deterministic work list from `faber check --air --json` (ADMISSIBLE-ONE-AWAY rows first, then WOULD-REJECT triage) and WARN027 complexity rows; zero closure-intrinsic usage today is the starting count. Cross-references the kernel-purity-census campaign as the purity-definition owner. |
 | `write_scope` | One gradus module (its `.fab` + `.proba`) per batch; packets; cheap seats welcome — the done-oracle is mechanical. |
 | `done_when` | Batch: proba outcomes byte-identical (case path/status + stderr); WARN027 rows in the module drop to zero or each survivor carries an in-code reason; tier counts move (one-away → admissible) in the committed census rows; no semantic drift (no tolerance/order changes). |
-| `fusion metric` | The L1 payoff is measured at the goal level: encoders per decode step (2,115 → target: hundreds) via AIR fusion absorbing pure leaves — re-measured after each landed A wave. |
+| `fusion metric` | A-wave AIR fusion absorbing pure leaves is this goal's lever. The per-head attention launch collapse (~1,440 score/softmax/context clones) is **not** this lever — it is owned by radix `docs/factory/head-axis-attention/` (consumes device-executor M3 on the GEA3 Gradus graph). Do not credit A-wave receipts for that movement (L84). |
 
 ### M-series — measurement checkpoints (Mind-owned, not units)
 After each landed track: one AC paired-parity run (full stage) recorded
@@ -204,7 +204,8 @@ No MIR-runner execution of anything (L86); no quantization work (f32 parity
 is the contract); no CUDA arm (blocked on hosts need `411b16f3`, carried by
 the parity goal); no llama.cpp changes (comparator is pinned); no new model
 rungs (larger models are a later goal — this goal closes the 360M rung's
-gaps and builds the method).
+gaps and builds the method). No head-axis / batched-attention recipe work
+on GEA3 `kernel.fab` entries — that is `head-axis-attention`, not PGC.
 
 ## 7. Sources (all six reports, on the Vivi record)
 
