@@ -1,6 +1,6 @@
 # DELIVERY: shape-generic-device-route — clean-break library geometry
 
-**Status**: active — U2+U2-R1+U3 on radix main `88b5c6a01`; spike2 residual planner `b4316689`; U4+U5 not dispatched
+**Status**: active — U1–U3 + U2-R* on radix main `7e0225565`; U4 planner `d84ad723`; U5 waits U4
 **Goal:** [`goal.md`](goal.md)
 **Source:** operator 2026-09-03 (clean break; SmolLM2 stays a fixture); goal rewrite gradus `084f4de`
 **Repos:** `radix/` (U1–U3, U5, U7 compiler/export), `gradus/` (U4 library kernels, U7 ratchet)

@@ -1,6 +1,6 @@
 # GOAL: shape-generic-device-route — Gradus is an AI library, not a SmolLM2 library
 
-**Status**: active — U1 done; U2+U2-R1 on radix main `88b5c6a01` (spike3 green); U3 on main `aa27a9a21`; spike2 residual planner `b4316689`; U4+U5 not dispatched
+**Status**: active — U1–U3 + U2-R1/R2 on radix main `7e0225565` (spike2+spike3 green); U4 planner `d84ad723` splitting kernel.fab statues; U5 waits U4
 **Created**: 2026-08-27
 **Rewritten**: 2026-09-03
 **Campaign:** `—` (standalone; sibling of [`../gradus-clean-break/GOAL.md`](../gradus-clean-break/GOAL.md), which already deleted named `_NxM` wrappers; this goal deletes the remaining **device-kernel statues** in `src/kernel.fab`)
@@ -137,8 +137,8 @@ New generic-source or new bindings mint a **new** identity family. Byte-equality
 | --- | --- | --- | --- | --- |
 | SGR-U0 | done (2026-08-27) | — | radix `4245ce35e`; auditor `0f6d0faa`; CTO `1dd6fa4d` | admission + fail-closed bindings; **not** SGD-1 closeout |
 | SGD-0 | pending — not lowered | — | none | break inventory + identity rules |
-| SGD-1 | done with residual | `d19c0f0a` / U2-R1 `e94236b7` / merge `89ed5b16` | radix main `88b5c6a01` | spike3 receipted; spike2 planner `b4316689` (need `f323c4eb`) |
-| SGD-2 | done | hand `40c0b006` / merge `b625b403` | radix main `aa27a9a21` (`20cfd1845`) | `export_device_instance`; splice gone |
+| SGD-1 | done | U2 `720625356` / U2-R1 `e1bef1b00` / U2-R2 `df9a347e9` | radix main `7e0225565` | spike2+spike3 metal-text green in package lane |
+| SGD-2 | done | hand `40c0b006` | radix main `aa27a9a21` (`20cfd1845`) | `export_device_instance`; splice gone |
 | SGD-3 | pending — not lowered | — | none | **clean-break library statues** |
 | SGD-4 | pending — not lowered | — | none | second model; acceptance |
 | SGD-5 | pending — not lowered | — | none | v2 files only |
