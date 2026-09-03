@@ -1,6 +1,6 @@
 # GOAL: shape-generic-device-route — Gradus is an AI library, not a SmolLM2 library
 
-**Status**: active — U1 done; U2 on main `720625356` + U2-R1 packet `e1bef1b00` (spike3 emit/build green; spike2 package-lane residual); U3 on radix main `aa27a9a21`; U4+U5 wait U2-R1 merge + spike2 residual disposition
+**Status**: active — U1 done; U2+U2-R1 on radix main `88b5c6a01` (spike3 green); U3 on main `aa27a9a21`; spike2 residual planner `b4316689`; U4+U5 not dispatched
 **Created**: 2026-08-27
 **Rewritten**: 2026-09-03
 **Campaign:** `—` (standalone; sibling of [`../gradus-clean-break/GOAL.md`](../gradus-clean-break/GOAL.md), which already deleted named `_NxM` wrappers; this goal deletes the remaining **device-kernel statues** in `src/kernel.fab`)
@@ -137,7 +137,7 @@ New generic-source or new bindings mint a **new** identity family. Byte-equality
 | --- | --- | --- | --- | --- |
 | SGR-U0 | done (2026-08-27) | — | radix `4245ce35e`; auditor `0f6d0faa`; CTO `1dd6fa4d` | admission + fail-closed bindings; **not** SGD-1 closeout |
 | SGD-0 | pending — not lowered | — | none | break inventory + identity rules |
-| SGD-1 | done with residual | `d19c0f0a` / U2-R1 `e94236b7` | main `720625356`; packet `e1bef1b00` | spike3 `kernel void add(` receipted; spike2 `mir_metal_text_unsupported` in package lane |
+| SGD-1 | done with residual | `d19c0f0a` / U2-R1 `e94236b7` / merge `89ed5b16` | radix main `88b5c6a01` | spike3 receipted; spike2 planner `b4316689` (need `f323c4eb`) |
 | SGD-2 | done | hand `40c0b006` / merge `b625b403` | radix main `aa27a9a21` (`20cfd1845`) | `export_device_instance`; splice gone |
 | SGD-3 | pending — not lowered | — | none | **clean-break library statues** |
 | SGD-4 | pending — not lowered | — | none | second model; acceptance |
