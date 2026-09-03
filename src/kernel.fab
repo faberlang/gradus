@@ -11,25 +11,27 @@ locale = "en"
 #   gemv_bf16_f32acc  bf16 [N,K] · f32 [K]  → f32 [N]
 #   gemv_f32_f32acc   f32  [N,K] · f32 [K]  → f32 [N]
 #
-# GEA2 block geometry is frozen at T=8, D=960, H=15, K=5, d=64, and F=2560.
-# The thirteen new entries below are all F32 and position-independent. Their
-# signatures are the device contract; host admission stays in ordinary
-# functions and the nine tensor views remain path/container-free.
+# GEA2 block family — size-symbolic entries. The extents <T, D, K, F, d, P>
+# are the caller's declared shapes (P is the RoPE pair count); no model
+# geometry is pinned in these signatures. The thirteen entries are all F32
+# and position-independent. Their signatures are the device contract; host
+# admission stays in ordinary functions and the nine tensor views remain
+# path/container-free.
 #
 # Entry inventory (input shapes → output shape):
-#   rmsnorm       [8,960] · [960]                 → [8,960]
-#   gemm_qo       [8,960] · [960,960]             → [8,960]
-#   gemm_kv       [8,960] · [960,320]             → [8,320]
-#   gemm_gate_up  [8,960] · [960,2560]            → [8,2560]
-#   gemm_down     [8,2560] · [2560,960]           → [8,960]
-#   rope_q        [8,960] · table [8,32,3]        → [8,960]
-#   rope_k        [8,320] · table [8,32,3]        → [8,320]
-#   transpose     [8,64]                          → [64,8]
-#   score_gemm    [8,64] · [64,8] · scale [8,8]   → [8,8]
-#   causal_softmax [8,8]                          → [8,8]
-#   context_gemm  [8,8] · [8,64]                  → [8,64]
-#   swiglu       [8,2560] · [8,2560]              → [8,2560]
-#   residual_add [8,960] · [8,960]                → [8,960]
+#   rmsnorm       [T,D] · [D]                     → [T,D]
+#   gemm_qo       [T,D] · [D,D]                   → [T,D]
+#   gemm_kv       [T,D] · [D,K]                   → [T,K]
+#   gemm_gate_up  [T,D] · [D,F]                   → [T,F]
+#   gemm_down     [T,F] · [F,D]                   → [T,D]
+#   rope_q        [T,D] · table [T,P,3]           → [T,D]
+#   rope_k        [T,K] · table [T,P,3]           → [T,K]
+#   transpose     [T,d]                           → [d,T]
+#   score_gemm    [T,d] · [d,T] · scale [T,T]     → [T,T]
+#   causal_softmax [T,T]                          → [T,T]
+#   context_gemm  [T,T] · [T,d]                   → [T,d]
+#   swiglu        [T,F] · [T,F]                   → [T,F]
+#   residual_add  [T,D] · [T,D]                   → [T,D]
 #
 # Glyph law: · is rank-2 matmul and ⊙ is same-shape elementwise product.
 # RMSNorm, RoPE, softmax, SiLU, transpose, and add use their method twins,
@@ -157,64 +159,65 @@ fn gemv_f32_f32acc<size N, size K>(tensor<f32, [N, K]> weights, tensor<f32, [K]>
 # GEA2-U3 body 1 — RMSNorm over the last axis with the frozen epsilon.
 @ kernel
 @ public
-fn rmsnorm(tensor<f32, [8, 960]> input, tensor<f32, [960]> weight, mut tensor<f32, [8, 960]> output) → void {
+fn rmsnorm<size T, size D>(tensor<f32, [T, D]> input, tensor<f32, [D]> weight, mut tensor<f32, [T, D]> output) → void {
     output ← input.rms_norm(1, 0.00001, weight)
 }
 
 # GEA2-U3 bodies 2–5 — the four projection GEMM shapes. q/o share one
-# [960,960] entry, k/v share [960,320], and gate/up share [960,2560].
+# <D,D> entry, k/v share <D,K>, and gate/up share <D,F>.
 @ kernel
 @ public
-fn gemm_qo(tensor<f32, [8, 960]> input, tensor<f32, [960, 960]> weights, mut tensor<f32, [8, 960]> output) → void {
+fn gemm_qo<size T, size D>(tensor<f32, [T, D]> input, tensor<f32, [D, D]> weights, mut tensor<f32, [T, D]> output) → void {
     output ← input · weights
 }
 
 @ kernel
 @ public
-fn gemm_kv(tensor<f32, [8, 960]> input, tensor<f32, [960, 320]> weights, mut tensor<f32, [8, 320]> output) → void {
+fn gemm_kv<size T, size D, size K>(tensor<f32, [T, D]> input, tensor<f32, [D, K]> weights, mut tensor<f32, [T, K]> output) → void {
     output ← input · weights
 }
 
 @ kernel
 @ public
-fn gemm_gate_up(tensor<f32, [8, 960]> input, tensor<f32, [960, 2560]> weights, mut tensor<f32, [8, 2560]> output) → void {
+fn gemm_gate_up<size T, size D, size F>(tensor<f32, [T, D]> input, tensor<f32, [D, F]> weights, mut tensor<f32, [T, F]> output) → void {
     output ← input · weights
 }
 
 @ kernel
 @ public
-fn gemm_down(tensor<f32, [8, 2560]> input, tensor<f32, [2560, 960]> weights, mut tensor<f32, [8, 960]> output) → void {
+fn gemm_down<size T, size F, size D>(tensor<f32, [T, F]> input, tensor<f32, [F, D]> weights, mut tensor<f32, [T, D]> output) → void {
     output ← input · weights
 }
 
-# GEA2-U3 bodies 6–7 — packed RoPE with the committed [T,32,3]
-# angle/cos/sin table input. RopePlan consumes the table at lowering time;
-# the source intrinsic keeps the frozen consecutive-pair dim=64 contract.
+# GEA2-U3 bodies 6–7 — packed RoPE with the [T,P,3] angle/cos/sin table
+# input. RopePlan consumes the table at lowering time; the source intrinsic
+# keeps the consecutive-pair dim=d contract.
 @ kernel
 @ public
-fn rope_q(tensor<f32, [8, 960]> input, tensor<f32, [8, 32, 3]> rope_table, mut tensor<f32, [8, 960]> output) → void {
-    output ← input.rope_norm(0, 64)
+fn rope_q<size T, size D, size d, size P>(tensor<f32, [T, D]> input, tensor<f32, [T, P, 3]> rope_table, mut tensor<f32, [T, D]> output) → void {
+    output ← input.rope_norm(0, d)
 }
 
 @ kernel
 @ public
-fn rope_k(tensor<f32, [8, 320]> input, tensor<f32, [8, 32, 3]> rope_table, mut tensor<f32, [8, 320]> output) → void {
-    output ← input.rope_norm(0, 64)
+fn rope_k<size T, size K, size d, size P>(tensor<f32, [T, K]> input, tensor<f32, [T, P, 3]> rope_table, mut tensor<f32, [T, K]> output) → void {
+    output ← input.rope_norm(0, d)
 }
 
 # GEA2-U3 body 8 — explicit head transpose for q_h · k_g^T.
 @ kernel
 @ public
-fn transpose(tensor<f32, [8, 64]> input, mut tensor<f32, [64, 8]> output) → void {
+fn transpose<size T, size d>(tensor<f32, [T, d]> input, mut tensor<f32, [d, T]> output) → void {
     output ← input.transpose()
 }
 
 # GEA2-U3 body 9 — score GEMM followed by the frozen 0.125 scale. The
-# scale view is a [T,T] resident constant filled with 1/sqrt(64)=0.125;
-# using a shaped peer keeps the elementwise operation broadcast-free.
+# scale view is a [T,T] resident constant carrying the caller's 1/sqrt(d)
+# softmax scale; using a shaped peer keeps the elementwise operation
+# broadcast-free.
 @ kernel
 @ public
-fn score_gemm(tensor<f32, [8, 64]> query, tensor<f32, [64, 8]> key_transposed, tensor<f32, [8, 8]> attention_scale, mut tensor<f32, [8, 8]> output) → void {
+fn score_gemm<size T, size d>(tensor<f32, [T, d]> query, tensor<f32, [d, T]> key_transposed, tensor<f32, [T, T]> attention_scale, mut tensor<f32, [T, T]> output) → void {
     output ← (query · key_transposed) ⊙ attention_scale
 }
 
@@ -223,7 +226,7 @@ fn score_gemm(tensor<f32, [8, 64]> query, tensor<f32, [64, 8]> key_transposed, t
 # row-wise max-subtract/exp/sum recipe and causal masking at lowering.
 @ kernel
 @ public
-fn causal_softmax(tensor<f32, [8, 8]> scores, mut tensor<f32, [8, 8]> output) → void {
+fn causal_softmax<size T>(tensor<f32, [T, T]> scores, mut tensor<f32, [T, T]> output) → void {
     const f32 _stability_max ← max from scores at [i, j] coalesce 0.0
     output ← scores.softmax()
 }
@@ -231,7 +234,7 @@ fn causal_softmax(tensor<f32, [8, 8]> scores, mut tensor<f32, [8, 8]> output) �
 # GEA2-U3 body 11 — per-head context GEMM.
 @ kernel
 @ public
-fn context_gemm(tensor<f32, [8, 8]> probabilities, tensor<f32, [8, 64]> values, mut tensor<f32, [8, 64]> output) → void {
+fn context_gemm<size T, size d>(tensor<f32, [T, T]> probabilities, tensor<f32, [T, d]> values, mut tensor<f32, [T, d]> output) → void {
     output ← probabilities · values
 }
 
@@ -239,15 +242,15 @@ fn context_gemm(tensor<f32, [8, 8]> probabilities, tensor<f32, [8, 64]> values, 
 # tensor method spelling admitted by the device surface; no host helper call.
 @ kernel
 @ public
-fn swiglu(tensor<f32, [8, 2560]> gate, tensor<f32, [8, 2560]> up, mut tensor<f32, [8, 2560]> output) → void {
-    const tensor<f32, [8, 2560]> activated ← gate.silu()
+fn swiglu<size T, size F>(tensor<f32, [T, F]> gate, tensor<f32, [T, F]> up, mut tensor<f32, [T, F]> output) → void {
+    const tensor<f32, [T, F]> activated ← gate.silu()
     output ← activated ⊙ up
 }
 
 # GEA2-U3 body 13 — residual stream addition.
 @ kernel
 @ public
-fn residual_add(tensor<f32, [8, 960]> left, tensor<f32, [8, 960]> right, mut tensor<f32, [8, 960]> output) → void {
+fn residual_add<size T, size D>(tensor<f32, [T, D]> left, tensor<f32, [T, D]> right, mut tensor<f32, [T, D]> output) → void {
     output ← left + right
 }
 
