@@ -34,7 +34,7 @@ This delivery covers the whole admitted goal (SGD-1…6). It does not leave stat
 | Host import of `math.add` does not produce a Metal kernel entry | `spike3-host-caller.fab` → `metal-text requires at least one @ nucleum function` |
 | Package path **does** call device-aware instantiate (SGR-U0 / KPC-WIRE) | `radix-program/src/mir/lower.rs:1983–2021` `instantiate_merged_generic_calls_with_devices_and_metadata`; registrations stored |
 | Single-unit lower still sets `imported_device_registrations: Vec::new()` | `radix-module/src/mir/lower.rs:421` |
-| Routes are collected | `radix-module/src/mir/lower.rs:396`; `context.rs` `imported_device_routes` |
+| Routes are collected | `radix-module/src/mir/lower.rs:396`; `radix-module/src/mir/lower/context.rs` `imported_device_routes` |
 | GEA3 export splices `[76,` | `mir-emit-harness/src/gea3_pipeline_test.rs:849–852` (`canonical_entry_at_with_work_extent`) |
 | `kernel.fab` is SmolLM2 literals | decode/prefill signatures e.g. `[1,960]`, `[76,64]`, `[36,960]` (`gradus/src/kernel.fab:282–550`) |
 | Generic twins already exist for nn/math | `nn.linear<size M,K,N>` `nn.fab:331` |
@@ -53,6 +53,7 @@ This delivery covers the whole admitted goal (SGD-1…6). It does not leave stat
 | **U5** | GEA3 / product fixtures instantiate the SmolLM2 tuple (`D=960, H=15, KV=5, d=64, C=76, T_p=36`, …) against generic kernels. Export uses U3 API. No new Rust signature table | `radix/crates/mir-emit-harness/src/gea3_pipeline_test.rs` (+ support); tests only | U3, U4 | decode/prefill programs still export; census derived from instantiated program; `kernel.fab` untouched in this unit; `[76,` splice not reintroduced | focused gea3 tests | No second GGUF | **no** — pair with U4 |
 | **U6** | Second-config proof: different geometry + capacity/extent, zero `gradus/src/kernel*` edits, no signature table | radix harness **fixture** (or a new test file); not library src | U5 | second tuple metal-text or device compile; `git diff` on `gradus/src/kernel*` empty of new literals/forms | focused test for the second fixture | No CUDA physical; no new attention family | yes |
 | **U7** | Ratchet + product splice deletion: named check that `gradus/src/**/*.fab` public kernel signatures have no model-geometry literals; live product path does not splice | `gradus/scripta/` or `radix/scripta/` ratchet; leftover splice call sites | U5 | ratchet fails if a signature reintroduces `960`/`76`/`36` as library types; splice gone from non-test manufacture | ratchet self-test | No parity `--stage smoke` on this Hand | yes |
+| **U8** | SGD-5: v2 identity/parity files only (new files; v1 rows untouched) | radix `scripta/perf-parity-targets/` and/or `scripta/parity-baselines/` as named at dispatch; no library src | U6 | v2 identity family exists; v1 rows unchanged | focused identity tests or receipt pin | No library edits | yes |
 
 U0 from the goal (record the break) **is this delivery**. No Hand.
 
