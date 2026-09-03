@@ -1,6 +1,6 @@
 # GOAL: shape-generic-device-route — Gradus is an AI library, not a SmolLM2 library
 
-**Status**: active — U1 check-first done (HEAD already unifies); U2 next (spike3 metal-text)
+**Status**: active — U1 done; U2 first bag refused (wrong seam); U2 refiled on `use_package_compiler`
 **Created**: 2026-08-27
 **Rewritten**: 2026-09-03
 **Campaign:** `—` (standalone; sibling of [`../gradus-clean-break/GOAL.md`](../gradus-clean-break/GOAL.md), which already deleted named `_NxM` wrappers; this goal deletes the remaining **device-kernel statues** in `src/kernel.fab`)
