@@ -1,6 +1,6 @@
 # GOAL: shape-generic-device-route — Gradus is an AI library, not a SmolLM2 library
 
-**Status**: planned — operator rewrite 2026-09-03 (clean-break of library-hardcoded geometry); drafted-not-lowered; SGR-U0 previously landed (`4245ce35e`: imported-device route admission + fail-closed `imported_device_bindings_unresolved`)
+**Status**: active — P3 lowered 2026-09-03 (`delivery.md`); Hands wait delivery audit then U1
 **Created**: 2026-08-27
 **Rewritten**: 2026-09-03
 **Campaign:** `—` (standalone; sibling of [`../gradus-clean-break/GOAL.md`](../gradus-clean-break/GOAL.md), which already deleted named `_NxM` wrappers; this goal deletes the remaining **device-kernel statues** in `src/kernel.fab`)
