@@ -1,6 +1,6 @@
 # GOAL: shape-generic-device-route — Gradus is an AI library, not a SmolLM2 library
 
-**Status**: active — U1 done; U2 on radix main `720625356` (spike3 emits `kernel void add(`); U3 next (planner `450c84ed` naming the splice seam)
+**Status**: active — U1 done; U2 on radix main `720625356` (U2-R1 emit repair `e94236b7` in flight); U3 packet radix `20cfd1845` (`export_device_instance`; splice deleted); U4+U5 wait U2-R1 + U3 merge
 **Created**: 2026-08-27
 **Rewritten**: 2026-09-03
 **Campaign:** `—` (standalone; sibling of [`../gradus-clean-break/GOAL.md`](../gradus-clean-break/GOAL.md), which already deleted named `_NxM` wrappers; this goal deletes the remaining **device-kernel statues** in `src/kernel.fab`)
@@ -138,7 +138,7 @@ New generic-source or new bindings mint a **new** identity family. Byte-equality
 | SGR-U0 | done (2026-08-27) | — | radix `4245ce35e`; auditor `0f6d0faa`; CTO `1dd6fa4d` | admission + fail-closed bindings; **not** SGD-1 closeout |
 | SGD-0 | pending — not lowered | — | none | break inventory + identity rules |
 | SGD-1 | done (U1+U2) | `534d7a6d` / `d19c0f0a` / merge `8534af3a` | radix main `720625356` | imported generic metal-text route; spike3 emits `kernel void add(` |
-| SGD-2 | pending — U3 | planner `450c84ed` | none | export API; splice still in `gea3_pipeline_test.rs` |
+| SGD-2 | done on packet (U3) | hand `40c0b006` | packet radix `20cfd1845` | `export_device_instance`; `.replace("[76,"` gone; merge pending |
 | SGD-3 | pending — not lowered | — | none | **clean-break library statues** |
 | SGD-4 | pending — not lowered | — | none | second model; acceptance |
 | SGD-5 | pending — not lowered | — | none | v2 files only |

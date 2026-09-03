@@ -1,6 +1,6 @@
 # DELIVERY: shape-generic-device-route — clean-break library geometry
 
-**Status**: active — U1 done; U2 on radix main `720625356`; U3 re-lowering to a named-edit bag (planner `450c84ed`)
+**Status**: active — U1 done; U2 on main `720625356` (U2-R1 in flight); U3 packet `20cfd1845`; U4+U5 not dispatched
 **Goal:** [`goal.md`](goal.md)
 **Source:** operator 2026-09-03 (clean break; SmolLM2 stays a fixture); goal rewrite gradus `084f4de`
 **Repos:** `radix/` (U1–U3, U5, U7 compiler/export), `gradus/` (U4 library kernels, U7 ratchet)
