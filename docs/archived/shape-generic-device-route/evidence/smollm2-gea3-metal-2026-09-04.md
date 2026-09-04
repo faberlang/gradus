@@ -30,8 +30,8 @@ the bundle was regenerated from the live source and admitted through Hosts.
 - KV residency: 64 allocations, 6,225,920 bytes.
 - Weight residency: 290 allocations, 1,447,284,480 bytes.
 
-The receipt measured 62,948 µs prefill and 276,863 µs decode wall time.
-Per-step GPU-body samples were `[12688, 12682, 12596, 12616, 12759,
-12652, 12637, 12609]` µs, each with explicit 1,024/2,115 encoder coverage.
+The receipt measured 53,659 µs prefill and 270,926 µs decode wall time.
+Per-step GPU-body samples were `[12762, 12766, 12859, 12707, 12729,
+12698, 12740, 12798]` µs, each with explicit 1,024/2,115 encoder coverage.
 Those samples are retained as measured device timings, not presented as a
 whole-graph performance total or a comparison against another revision.
