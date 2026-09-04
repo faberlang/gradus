@@ -1,6 +1,6 @@
 # DELIVERY: shape-generic-device-route — clean-break library geometry
 
-**Status**: done — SGD-0–SGD-6 complete. Closeout 2026-09-04: Gradus `9f64d41`; Radix `64df90f09`.
+**Status**: done — SGD-0–SGD-6 complete. Closeout 2026-09-04: Gradus source `9f64d41`; Radix `dd6457888` plus cache record `0fa7274ce`; Hosts `dc64d4c`.
 **Goal:** [`goal.md`](goal.md)
 **Source:** operator 2026-09-03 (clean break; SmolLM2 stays a fixture); goal rewrite gradus `084f4de`
 **Repos:** `radix/` (U1–U3, U5, U7 compiler/export), `gradus/` (U4 library kernels, U7 ratchet)
@@ -64,7 +64,7 @@ One logical change: the export API and the harness flip are producer and consume
 **Add (product, non-test):** `radix/crates/radix-module/src/device_export.rs`
 
 - `pub fn export_device_instance(session: &Session, name: &str, entry_source: &str, bindings: &[(String, u64)]) -> Result<DeviceInstanceExport, …diagnostics>` — compiles a size-parametric entry source at ordered size bindings; no string splicing anywhere.
-- `pub struct DeviceInstanceExport { instances, bindings, code, reflection, identity }` — instance table (entry + concrete shapes/substitutions, shaped from `MirMonomorphizationKey` / `ImportedDeviceRegistration`), ordered bindings echo, emitted Metal source, `MirGpuReflection`, identity digest over entry-source digest + ordered bindings + target + emitted digest (U8 mints the v2 identity files from this).
+- `pub struct DeviceInstanceExport { instances, bindings, code, reflection, recipe_plan, resource_plan, identity }` — instance table (entry + concrete shapes/substitutions, shaped from `MirMonomorphizationKey` / `ImportedDeviceRegistration`), ordered bindings echo, emitted Metal source, typed reflection/resource/recipe plans, and an identity digest over compiler/ABI + generic source + ordered bindings + target + those plans + emitted bytes (U8 mints the v2 identity files from this).
 - Declared from `crates/radix-module/src/lib.rs`; feature-gated to match the driver's metal-text path; pinned by sibling `device_export_test.rs`.
 - Instantiate through the device-aware machinery U1/U2 opened — `instantiate_merged_generic_calls_with_devices_and_metadata` (`radix-program/src/mir/lower.rs:1983–2021`) with the driver's registration join (`radix-module/src/driver/mod.rs:690`). A request-level bindings field inside this new module is equally in-scope; inventing a new lane is not.
 - **Q2 settled:** `radix-mir` placement is DAG-impossible (`radix-module` → `radix-mir`; the API must compile source and return emitted text). `radix-module` owns `Session`, `compile`, the registrations, and `MetalTextOutput` — the one obvious crate, no new repo, no new crate.
@@ -134,14 +134,26 @@ Goal.md §Validation. Delivery adds: spike2 green throughout; spike3 is the U2 o
   `check-shape-generic-kernels --self-test` ratchet is wired into
   `check-source`; `check-compile` and direct `kernel.fab`/`kernel.proba`
   checks pass.
-- Radix `export_device_instance` is the live GEA3 route. The full GEA3
-  harness passes 61 tests, and the `radix-module` export suite passes 8 tests,
-  including the second `(D,C,E)` configuration proof.
+- Radix `export_device_instance` is the live GEA3 route. The focused GEA3
+  export, producer-link, package-route, staged-walk, and `radix-module`
+  export tests pass. The `radix-module` export suite passes 10 tests,
+  including the second `(D,C,E)` configuration proof and the cached-export
+  miss→hit round trip.
+- The generated GEA3 bundle has 39 entries and 32 layers, with 2,115 decode
+  and 2,115 prefill launches and 2,146 declared edges for each route. The
+  staged SmolLM2 walk reaches logits with no first bad or non-finite stage.
+  The physical Metal receipt is green on Apple M5 Max and reproduces the
+  pinned greedy sequence; it records zero intermediate readbacks, zero CPU
+  bridges, and zero CPU substitutes. Sampled GPU-body timing coverage remains
+  explicitly 1,024/2,115 encoders per decode step, so this is a device and
+  correctness receipt, not a whole-graph performance claim.
 - `scripta/parity-baselines/shape-generic-device-route-v2.{json,md}` records
-  the two concrete identities. Existing v1 measurement rows are untouched.
+  the two concrete identities and the caller-provided AOT cache contract.
+  Existing v1 measurement rows are untouched.
 - The admitted delivery closes the compiler/export route and source clean
-  break. An on-disk AOT cache remains a separate follow-on; this closeout does
-  not claim a cache hit or physical Metal performance measurement.
+  break. The cache is tested as an export-time/admission seam; decode does not
+  compile or JIT. The physical receipt is correctness/device evidence only,
+  not a comparative performance claim.
 
 ## 8. Companion skill plan
 
