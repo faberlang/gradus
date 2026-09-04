@@ -1,6 +1,6 @@
 # DELIVERY: shape-generic-device-route — clean-break library geometry
 
-**Status**: done — SGD-0–SGD-6 complete. Closeout 2026-09-04: Gradus source `9f64d41`; Radix `dd6457888` plus cache record `0fa7274ce`; Hosts `dc64d4c`.
+**Status**: done — SGD-0–SGD-6 complete. Closeout 2026-09-04: Gradus source `9f64d41`; Radix `b93f132ff` (export route `dd6457888`, cache record `0fa7274ce`); Hosts `dc64d4c`.
 **Goal:** [`goal.md`](goal.md)
 **Source:** operator 2026-09-03 (clean break; SmolLM2 stays a fixture); goal rewrite gradus `084f4de`
 **Repos:** `radix/` (U1–U3, U5, U7 compiler/export), `gradus/` (U4 library kernels, U7 ratchet)
@@ -51,7 +51,7 @@ This delivery covers the whole admitted goal (SGD-1…6). It does not leave stat
 | **U3** | Compiler-owned export: GEA3 manufacture does not splice `[76,` / `,76]` in `#[cfg(test)]`. A non-test API returns instance table + ordered size bindings + emitted source + identity. Existing harness **calls** it for the SmolLM2 fixture tuple — named seam in §4a | `radix/crates/radix-module/src/device_export.rs` (new) + `src/lib.rs` module decl + sibling `device_export_test.rs`; `radix/crates/mir-emit-harness/src/gea3_pipeline_test.rs` (rewire + splice delete) | — (after U2; U2 landed) | `rg '\.replace\("\[76,"|\.replace\(",76\]"' radix/crates` → 0 hits; `export_device_instance` pinned by a radix-module test (record fields concrete, identity changes when bindings change); frozen-76 statue entries compile unchanged with sha pins intact; GEA3 non-frozen extent tests (PGC-B1/B2 family) green through the API | `cargo test -p mir-emit-harness gea3` | No `kernel.fab` edit (U4); no second model (U6); no v2 identity files (U8); no generic twins beyond entries exercised at non-frozen extents | yes — statue bytes stay a test-owned fixture on the frozen path; non-frozen path is generic twin + ordered bindings, no library law |
 | **U4a–U4e** | Clean-break `gradus/src/kernel.fab` (+ `kernel.proba`) in **five named family slices** — every `@ kernel` entry (public or not) moves to `size` params; statue signatures deleted (batched `[5,76,64]` head-axis forms never enter). Full named-edit graph: **§4b** | `gradus/src/kernel.fab`, `gradus/src/kernel.proba` (family rows only) | U1, U2; slices serial U4a→U4e (one file, one packet) | per slice, §4b; file-level oracle lands on U4e | one `faber test src/kernel.proba <family>` per slice | No prefill/decode algorithm change; no new glyphs; no entry renames | **no** — U4e merges with U5 |
 | **U5** | GEA3 / product fixtures instantiate the SmolLM2 tuple (`D=960, H=15, KV=5, d=64, C=76, T_p=36`, …) against generic kernels. Export uses U3 API. No new Rust signature table | `radix/crates/mir-emit-harness/src/gea3_pipeline_test.rs` (+ support); tests only | U3, U4 | decode/prefill programs still export; census derived from instantiated program; `kernel.fab` untouched in this unit; `[76,` splice not reintroduced | focused gea3 tests | No second GGUF | **no** — pair with U4 |
-| **U6** | Second-config proof: different geometry + capacity/extent, zero `gradus/src/kernel*` edits, no signature table | radix harness **fixture** (or a new test file); not library src | U5 | second tuple metal-text or device compile; `git diff` on `gradus/src/kernel*` empty of new literals/forms | focused test for the second fixture | No CUDA physical; no new attention family | yes |
+| **U6** | Second-config proof: different geometry + capacity/extent, zero `gradus/src/kernel*` edits, no signature table | radix harness **fixture** (or a new test file); not library src | U5 | second tuple compiles and runs through concrete Metal export; `git diff` on `gradus/src/kernel*` empty of new literals/forms | focused test for the second fixture | No CUDA physical; no new attention family | yes |
 | **U7** | Ratchet + product splice deletion: named check that `gradus/src/**/*.fab` public kernel signatures have no model-geometry literals; live product path does not splice | `gradus/scripta/` or `radix/scripta/` ratchet; leftover splice call sites | U5 | ratchet fails if a signature reintroduces `960`/`76`/`36` as library types; splice gone from non-test manufacture | ratchet self-test | No parity `--stage smoke` on this Hand | yes |
 | **U8** | SGD-5: v2 identity/parity files only (new files; v1 rows untouched) | radix `scripta/perf-parity-targets/` and/or `scripta/parity-baselines/` as named at dispatch; no library src | U6 | v2 identity family exists; v1 rows unchanged | focused identity tests or receipt pin | No library edits | yes |
 
@@ -136,9 +136,14 @@ Goal.md §Validation. Delivery adds: spike2 green throughout; spike3 is the U2 o
   checks pass.
 - Radix `export_device_instance` is the live GEA3 route. The focused GEA3
   export, producer-link, package-route, staged-walk, and `radix-module`
-  export tests pass. The `radix-module` export suite passes 10 tests,
-  including the second `(D,C,E)` configuration proof and the cached-export
-  miss→hit round trip.
+  export tests pass. The `radix-module` export suite passes 11 tests,
+  including the second `(D,C,E)` configuration's direct Metal dispatch and
+  the cached-export miss→hit round trip.
+- The synthetic second configuration `(D,C,E)=(6,10,3)` compiles its
+  emitted Metal source into a device pipeline, dispatches 60 elements, and
+  verifies that all 60 results are `1.0`. The companion `(9,14,5)` instance
+  has a distinct pinned identity; neither configuration edits Gradus source
+  or uses a Rust signature table.
 - The generated GEA3 bundle has 39 entries and 32 layers, with 2,115 decode
   and 2,115 prefill launches and 2,146 declared edges for each route. The
   staged SmolLM2 walk reaches logits with no first bad or non-finite stage.
@@ -163,7 +168,7 @@ Goal.md §Validation. Delivery adds: spike2 green throughout; spike3 is the U2 o
 
 1. **spike3 still red on HEAD?** Default: U1/U2 assume yes (2026-08-26 proof). Check-first at dispatch. Decider: Hand U1.
 2. **Export crate (U3).** Default: keep in `radix-mir` / a small leaf used by harness, not a new repo. Decider: U3 Hand if one crate is obvious; else Mind.
-3. **Second model (U6).** Default: Qwen-class dims already in Gradus GGUF corpus if admitted; else a synthetic second fixture with different `H/d`. Decider: operator if a real GGUF is required for U6; synthetic fixture is enough to prove “no library edit.”
+3. **Second model (U6).** Resolved: the synthetic second fixture has different geometry and is physically dispatched through the Metal export; a real second GGUF is not required for U6.
 4. **Head-axis packet `6506c03`.** Do not merge as API. U4 deletes those signatures.
 5. **Rope pair extent (U4b/c/d).** `P` (table rows `[T,P,3]`) is an independent size param because `d/2` is not assumed to be size arithmetic; `rope_norm<d>(0)` supplies the compile-time dimension. The intrinsic-generic-params delivery replaces the former CTO option (a) size-as-value admission with catalog generics and pre-AIR typed-HIR specialization. AIR remains literal-only after specialization; no `IndexParam` value admission or `ShapeSize` runtime carrier is used. Do not re-freeze `64/32`.
 6. **Decode `T=1` stays literal.** The `1` in `[1,·]` is the decode-step contract, not model geometry (cut list is `D/H/kv/d/F/L_max/T_p`). Decider: Mind at U4 dispatch; head-axis batched `[5,…]` forms remain banned either way.

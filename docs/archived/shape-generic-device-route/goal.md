@@ -1,6 +1,6 @@
 # GOAL: shape-generic-device-route — Gradus is an AI library, not a SmolLM2 library
 
-**Status**: done — SGD-0–SGD-6 complete; the 50-entry `kernel.fab` device surface is shape-generic, Radix exports and caches concrete instances through the compiler-owned API, and SmolLM2 has staged plus physical Metal receipts. Closeout 2026-09-04: Gradus source `9f64d41`; Radix `dd6457888`, cache record `0fa7274ce`; Hosts `dc64d4c`.
+**Status**: done — SGD-0–SGD-6 complete; the 50-entry `kernel.fab` device surface is shape-generic, Radix exports and caches concrete instances through the compiler-owned API, the second geometry executes on Metal, and SmolLM2 has staged plus physical Metal receipts. Closeout 2026-09-04: Gradus source `9f64d41`; Radix `b93f132ff` (export route `dd6457888`, cache record `0fa7274ce`); Hosts `dc64d4c`.
 **Created**: 2026-08-27
 **Rewritten**: 2026-09-04
 **Campaign:** `—` (standalone; sibling of [`../gradus-clean-break/GOAL.md`](../gradus-clean-break/GOAL.md), which already deleted named `_NxM` wrappers; this goal deletes the remaining **device-kernel statues** in `src/kernel.fab`)
@@ -117,7 +117,7 @@ New generic-source or new bindings mint a **new** identity family. Byte-equality
 1. **Library ratchet.** All 50 `gradus:kernel` `@ kernel` entries have named `size` parameters and no model-geometry integer literal in their signatures. Enforcement is the named `check-shape-generic-kernels` ratchet wired into `check-source`, plus `faber check` on `src/kernel.fab`. Fixtures and tests **may** contain `960`, `76`, `15`. Legacy fixed-shape training callers in `loss.fab` and `transformer.fab` are outside this GEA3 device-surface cut and remain explicitly documented as such.
 2. **Hard gate (SGD-1).** Imported generic Gradus entry → concrete Metal with substitutions in the identity. `ignotum` / unwired discovery gone. No source-specialization fallback.
 3. **SmolLM2 still runs (SGD-3).** The current tuple instantiates from fixture/admission, not from library types. The staged walk reaches logits with no first bad or non-finite stage, and the physical Metal receipt is green with the pinned greedy sequence, 2,115 launches per step, zero intermediate readbacks, zero CPU bridges, and zero CPU substitutes. Byte-equality to v1 is not demanded.
-4. **Second model (SGD-4).** Different geometry and capacity/extent pairs compile through the device export with no `gradus/src/kernel*` edit and no Rust signature table. The admitted delivery's synthetic second configuration is the compile/device-text proof; the physical run is the SmolLM2 acceptance receipt.
+4. **Second model (SGD-4).** Different geometry and capacity/extent pairs compile and execute through the device export with no `gradus/src/kernel*` edit and no Rust signature table. Config A `(D,C,E)=(6,10,3)` is physically dispatched on Metal and checked numerically; config B `(9,14,5)` independently mints a distinct identity.
 5. **Identity and cache.** The export identity is stable for identical source and ordered bindings; a new binding or generic-source edit mints a new identity; v1 measurement rows replay. The caller-provided on-disk AOT cache is tested miss→hit, atomically persisted, and fail-closed on identity/binding mismatch. Cache identity covers compiler/ABI, source, bindings, target, recipe/resource plans, reflection, and emitted bytes.
 6. **KV names.** Distinct `C/L/E/p`; `0 <= p < C`, `L <= E <= C`; no `declared_history_length=capacity` conflation.
 7. **Leaf law.** Pure leaves `@ kernel` and call-free; no mega-kernel; no runtime shape interpreter.
@@ -145,13 +145,13 @@ New generic-source or new bindings mint a **new** identity family. Byte-equality
 | SGD-1 | done | U2 `720625356` / U2-R1 `e1bef1b00` / U2-R2 `df9a347e9` | radix main `7e0225565` | spike2+spike3 metal-text green in package lane |
 | SGD-2 | done | hand `40c0b006` | radix `dd6457888`; cache `0fa7274ce` | `export_device_instance` plus caller-provided cached export; splice gone |
 | SGD-3 | done (2026-09-04) | — | gradus `9f64d41` | all 50 `kernel.fab` entries use named `size` parameters; proba callers instantiate the SmolLM2 fixture |
-| SGD-4 | done (2026-09-04) | — | radix `dd6457888` | `export_accepts_a_second_geometry_and_capacity_extent_configuration` compiles `(D,C,E)=(6,10,3)` and `(9,14,5)` without a Gradus library edit; physical SmolLM2 route is separately receipt-backed |
+| SGD-4 | done (2026-09-04) | — | radix `b93f132ff` | `export_second_geometry_compiles_and_runs_on_metal` dispatches config A `(D,C,E)=(6,10,3)` and checks 60 numeric results; config B `(9,14,5)` independently compiles and mints a distinct identity without a Gradus library edit |
 | SGD-5 | done (2026-09-04) | — | radix `0fa7274ce` | v2 identity/parity JSON and Markdown records; v1 measurement rows untouched; cache contract recorded |
 | SGD-6 | done (2026-09-04) | — | radix `dd6457888`; hosts `dc64d4c` | GEA3 uses `export_device_instance`; signature/statue manufacture is deleted from the product harness; dynamic position windows are admitted by Hosts |
 
 ## Open questions
 
-1. **Second model for SGD-4.** Resolved by the lowered delivery: the synthetic second configuration is sufficient to prove generic export and zero library-source edits. A live GGUF remains outside this goal.
+1. **Second model for SGD-4.** Resolved by the synthetic config A/B fixtures plus direct Metal execution of config A, proving generic export, device dispatch, and zero library-source edits. A second live GGUF remains outside this goal.
 2. **Export API crate placement (SGD-2).** Resolved: `radix-module/src/device_export.rs` owns the compiler/product seam.
 3. **AOT cache layout.** Resolved by the caller-provided `export_device_instance_cached` API. It uses a schema-versioned base-key directory, an identity-named artifact, atomic artifact/index replacement, and complete identity validation on hit. No global default cache root or per-token cache is introduced.
 4. **Head-axis packet (`6506c03`) vs this break.** Resolved: no concrete head-axis signatures entered `kernel.fab`; future launch collapse must use generic signatures.

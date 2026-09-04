@@ -14,8 +14,8 @@ the bundle was regenerated from the live source and admitted through Hosts.
   `4d10b02ea1b189cb9637b39ba1543c61f69a8766099076880888f4443754e128`
 - Bundle census: 39 entries, 32 layers, 2,115 decode launches, 2,115
   prefill launches, and 2,146 declared edges on each route.
-- Code revisions: Radix `dd6457888` plus cache record `0fa7274ce`; Hosts
-  `dc64d4c`.
+- Code revisions: Radix export route `dd6457888`, second-geometry Metal
+  proof `b93f132ff`, and cache record `0fa7274ce`; Hosts `dc64d4c`.
 
 ## Staged and physical proof
 
