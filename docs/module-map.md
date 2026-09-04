@@ -150,8 +150,8 @@ The English package surface renders the canonical `@ nucleum` identity as
 | `gemm_kv` | `input · weights` | `[8,960]`, `[960,320]` → `[8,320]` |
 | `gemm_gate_up` | `input · weights` | `[8,960]`, `[960,2560]` → `[8,2560]` |
 | `gemm_down` | `input · weights` | `[8,2560]`, `[2560,960]` → `[8,960]` |
-| `rope_q` | `rope_norm(0, 64)` with table input | `[8,960]`, table `[8,32,3]` → `[8,960]` |
-| `rope_k` | `rope_norm(0, 64)` with table input | `[8,320]`, table `[8,32,3]` → `[8,320]` |
+| `rope_q` | `rope_norm<d>(0)` with table input | generic `[T,D]`, table `[T,P,3]` → `[T,D]` |
+| `rope_k` | `rope_norm<d>(0)` with table input | generic `[T,K]`, table `[T,P,3]` → `[T,K]` |
 | `transpose` | `input.transpose()` | `[8,64]` → `[64,8]` |
 | `score_gemm` | `(query · key_transposed) ⊙ attention_scale` | `[8,64]`, `[64,8]`, scale `[8,8]` → `[8,8]` |
 | `causal_softmax` | `max from … at [i,j] coalesce 0.0`; `scores.softmax()` | `[8,8]` → `[8,8]` |
@@ -186,8 +186,8 @@ consecutive pairs (dim=64), not history capacity.
 | `decode_gemv_qo` | `input · weights` | `[1,960]`, `[960,960]` → `[1,960]` |
 | `decode_gemv_kv` | `input · weights` | `[1,960]`, `[960,320]` → `[1,320]` |
 | `decode_mlp` | inline `input · gate_weights`, `input · up_weights`, `gate.silu() ⊙ up`, and `hidden · down_weights` | `[1,960]`, `[960,2560]`, `[960,2560]`, `[2560,960]` → `[1,960]` |
-| `decode_rope_q` | `rope_norm(0, 64)` with table input | `[1,960]`, table `[1,32,3]` → `[1,960]` |
-| `decode_rope_k` | `rope_norm(0, 64)` with table input | `[1,320]`, table `[1,32,3]` → `[1,320]` |
+| `decode_rope_q` | `rope_norm<d>(0)` with table input | generic `[1,D]`, table `[1,P,3]` → `[1,D]` |
+| `decode_rope_k` | `rope_norm<d>(0)` with table input | generic `[1,K]`, table `[1,P,3]` → `[1,K]` |
 | `kv_append_k` | `history + slot · row` | `[76,320]`, slot `[76,1]`, row `[1,320]` → `[76,320]` |
 | `kv_append_v` | `history + slot · row` | `[76,320]`, slot `[76,1]`, row `[1,320]` → `[76,320]` |
 | `decode_key_transpose` | `input.transpose()` | `[76,64]` → `[64,76]` |
@@ -223,8 +223,8 @@ slice, failable construct, or in-body call.
 | `prefill_gemm_qo` | `input · weights` | `[36,960]`, `[960,960]` → `[36,960]` |
 | `prefill_gemm_kv` | `input · weights` | `[36,960]`, `[960,320]` → `[36,320]` |
 | `prefill_mlp` | inline `input · gate_weights`, `input · up_weights`, `gate.silu() ⊙ up`, and `hidden · down_weights` | `[36,960]`, `[960,2560]`, `[960,2560]`, `[2560,960]` → `[36,960]` |
-| `prefill_rope_q` | `rope_norm(0, 64)` with table input | `[36,960]`, table `[36,32,3]` → `[36,960]` |
-| `prefill_rope_k` | `rope_norm(0, 64)` with table input | `[36,320]`, table `[36,32,3]` → `[36,320]` |
+| `prefill_rope_q` | `rope_norm<d>(0)` with table input | generic `[T,D]`, table `[T,P,3]` → `[T,D]` |
+| `prefill_rope_k` | `rope_norm<d>(0)` with table input | generic `[T,K]`, table `[T,P,3]` → `[T,K]` |
 | `prefill_key_transpose` | `input.transpose()` | `[36,64]` → `[64,36]` |
 | `prefill_score_gemm` | `(query · key_transposed) ⊙ attention_scale` | `[36,64]`, `[64,36]`, scale `[36,36]` → `[36,36]` |
 | `prefill_causal_softmax` | `scores.softmax()` | `[36,36]` → `[36,36]` |
