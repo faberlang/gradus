@@ -1,6 +1,6 @@
 # DELIVERY: shape-generic-device-route — clean-break library geometry
 
-**Status**: active — U1–U3 + U2-R* on radix main `7e0225565`; U4 planner `d84ad723`; U5 waits U4
+**Status**: done — SGD-0–SGD-6 complete. Closeout 2026-09-04: Gradus `9f64d41`; Radix `64df90f09`.
 **Goal:** [`goal.md`](goal.md)
 **Source:** operator 2026-09-03 (clean break; SmolLM2 stays a fixture); goal rewrite gradus `084f4de`
 **Repos:** `radix/` (U1–U3, U5, U7 compiler/export), `gradus/` (U4 library kernels, U7 ratchet)
@@ -126,6 +126,22 @@ Do not dispatch U4 while U1/U2 are red: generic `kernel.fab` would not be a devi
 ## 7. Validation (goal closeout)
 
 Goal.md §Validation. Delivery adds: spike2 green throughout; spike3 is the U2 oracle then remains a regression pin.
+
+## 7a. Closeout (2026-09-04)
+
+- Gradus `src/kernel.fab` has 50 `@ kernel` entries with named `size`
+  parameters and no forbidden model geometry in their signatures. The
+  `check-shape-generic-kernels --self-test` ratchet is wired into
+  `check-source`; `check-compile` and direct `kernel.fab`/`kernel.proba`
+  checks pass.
+- Radix `export_device_instance` is the live GEA3 route. The full GEA3
+  harness passes 61 tests, and the `radix-module` export suite passes 8 tests,
+  including the second `(D,C,E)` configuration proof.
+- `scripta/parity-baselines/shape-generic-device-route-v2.{json,md}` records
+  the two concrete identities. Existing v1 measurement rows are untouched.
+- The admitted delivery closes the compiler/export route and source clean
+  break. An on-disk AOT cache remains a separate follow-on; this closeout does
+  not claim a cache hit or physical Metal performance measurement.
 
 ## 8. Companion skill plan
 
