@@ -7,14 +7,6 @@ locale = "en"
 # Depends on: gradus:tensor, gradus:math, gradus:nn, gradus:attention/rope,
 #             gradus:attention/gqa, gradus:cache/kv
 #
-# S6-G1 (gpu-training-lowering stage-6-delivery.md): first concrete
-# static-shape transformer block for the BERT-tiny fragment shapes
-# (B=2, D=8, H=1). The fragment's block:
-#   pre-LN → attention → output projection → residual →
-#   post-LN → FFN (linear → GELU → linear) → residual → pre-loss LN
-# Biases are per-channel [8] via the S6-C2 added_bias contract (the
-# fragment's [2,8] workaround is removed — U8 owns the consumer migration).
-#
 # Will split into nested leaves when ≥2 transformer components are
 # implemented:
 #   gradus:transformer/block      block = attn + ffn + residual + norm
@@ -25,23 +17,9 @@ locale = "en"
 # It does not own its training loop. This module must not import from
 # gradus:train. No module owns a backend or device handle.
 #
-# LEGACY FIXED-SHAPE NOTE: the function below (bert_tiny_block_2x8) remains
-# self-contained (typed-tensor ops only, no calls to other Gradus functions).
-# Its attention + FFN math is intentionally inlined from the S4-A
-# train_step_4x4 precedent; this legacy shape is not a current FMIR limitation.
-# Library-to-library calls execute on FMIR since radix 43c0102ba
-# (regression-locked by 2e8042ae7). The PML3-U3 production surface (bottom of
-# this module) instead composes the gradus:nn / gradus:attention / gradus:math
-# families over the staged carrier — the same posture as the nn.fab and
-# attention.fab production surfaces (see nn.fab "Compiler-boundary notes").
-#
-# PML0-U3 ledger disposition (pml0-proof-api-ledger.md, gradus 33df687) —
-# executed at PML1-U6: RETIRE attention_block_2x8 (row 13) and ffn_block_2x8
-# (row 14). Neither had a live caller anywhere in the container; their math
-# is fully inlined in bert_tiny_block_2x8 (row 15, ADMITTED — caller-backed:
-# examples/training/bert-gradus-probe/src/train.fab:351). The standalone
-# sub-block definitions are removed; the inlined copies below are the
-# surviving surface.
+# The production block composes the gradus:nn / gradus:attention / gradus:math
+# families over the staged carrier. Exact architecture fixtures belong in the
+# co-located proba or in exempla, rather than in this public module.
 
 import from "gradus:attention/rope" rope
 
@@ -56,59 +34,6 @@ import from "gradus:nn" nn
 import from "gradus:dtype" dtype
 
 import from "gradus:tensor" tensor
-
-# -------------------------------------------------------------------------
-# bert_tiny_block_2x8 — the fragment's full transformer block (B=2, D=8):
-#   pre-LN → attention → output proj → residual → post-LN → FFN → residual →
-#   pre-loss LN. Returns ln3 [2,8].
-#   18 trainable params + frozen dk_scale in; the pre-loss LN output out.
-#   Inlines the attention + FFN sub-block math (legacy admitted shape; library-
-#   to-library calls execute on FMIR, above).
-# -------------------------------------------------------------------------
-
-@ kernel
-@ public
-fn bert_tiny_block_2x8(tensor<f32, [2, 8]> x, tensor<f32, [8]> ln1_s, tensor<f32, [8]> ln1_o, tensor<f32, [8, 8]> wq, tensor<f32, [8]> bq, tensor<f32, [8, 8]> wk, tensor<f32, [8]> bk, tensor<f32, [8, 8]> wv, tensor<f32, [8]> bv, tensor<f32, [8, 8]> wo, tensor<f32, [8]> bo, tensor<f32, [8]> ln2_s, tensor<f32, [8]> ln2_o, tensor<f32, [8, 8]> wf1, tensor<f32, [8]> bf1, tensor<f32, [8, 8]> wf2, tensor<f32, [8]> bf2, tensor<f32, [8]> ln3_s, tensor<f32, [8]> ln3_o, tensor<f32, [2, 2]> scale) → tensor<f32, [2, 8]> {
-    # --- pre-LN -----------------------------------------------------------
-    const _ ln1 ← x.layer_norm(1, 0.00001, ln1_s, ln1_o)
-
-    # --- Q/K/V projections (per-channel [8] biases) -----------------------
-    const _ q ← ln1 · wq
-    const _ qb ← q.added_bias(bq)
-    const _ k ← ln1 · wk
-    const _ kb ← k.added_bias(bk)
-    const _ v ← ln1 · wv
-    const _ vb ← v.added_bias(bv)
-
-    # --- scaled dot-product attention -------------------------------------
-    const _ kt ← kbᵀ
-    const _ scores ← qb · kt
-    const _ scaled ← scores ⊙ scale
-    const _ attn ← scaled.softmax()
-    const _ context ← attn · vb
-
-    # --- output projection + residual 1 -----------------------------------
-    const _ ao ← context · wo
-    const _ aob ← ao.added_bias(bo)
-    const _ r1 ← x + aob
-
-    # --- post-LN ----------------------------------------------------------
-    const _ ln2 ← r1.layer_norm(1, 0.00001, ln2_s, ln2_o)
-
-    # --- FFN (linear → GELU → linear) -------------------------------------
-    const _ h1 ← ln2 · wf1
-    const _ h1b ← h1.added_bias(bf1)
-    const _ a1 ← h1b.gelu()
-    const _ h2 ← a1 · wf2
-    const _ h2b ← h2.added_bias(bf2)
-
-    # --- residual 2 -------------------------------------------------------
-    const _ r2 ← ln2 + h2b
-
-    # --- pre-loss LN ------------------------------------------------------
-    const _ ln3 ← r2.layer_norm(1, 0.00001, ln3_s, ln3_o)
-    return ln3
-}
 
 # =========================================================================
 # PML3-U3 — production surface (shape-generic transformer block, forward-only,
@@ -131,9 +56,8 @@ fn bert_tiny_block_2x8(tensor<f32, [2, 8]> x, tensor<f32, [8]> ln1_s, tensor<f32
 #   h1  = linear(ln2, wf1, bf1); a1 = gelu(h1); h2 = linear(a1, wf2, bf2)
 #   r2  = r1 + h2                                       # residual 2 (residual stream + FFN)
 #   return ln3 = layernorm(r2, ln3_s, ln3_o)             # pre-loss LN -> block output
-# Residual-2 matches dense_block / llama GI2-1 (add to the residual stream,
-# not the post-LN). bert_tiny_block_2x8 keeps the fragment's accepted
-# ln2 + h2b arithmetic. The attention sub-block is mode-selected so the
+# Residual-2 matches dense_block / llama GI2-1 (add to the residual stream).
+# The attention sub-block is mode-selected so the
 # same block serves the selected inference row (causal + RoPE, mode 2)
 # and the causal row (mode 1).
 #
@@ -353,8 +277,7 @@ fn attention_for_mode(tensor.NumericBlock q, tensor.NumericBlock k, tensor.Numer
 #   positions RoPE positions (mode 2)
 #   dim      RoPE rotation width over the last axis (mode 2)
 #
-# Returns ln3 — the pre-loss LN output (the block's surviving contract from
-# bert_tiny_block_2x8). Shape-generic at runtime (R3).
+# Returns ln3 — the pre-loss LN output. Shape-generic at runtime (R3).
 # -------------------------------------------------------------------------
 
 @ public
@@ -385,10 +308,10 @@ fn transformer_block(tensor.NumericBlock x, tensor.NumericBlock ln1_s, tensor.Nu
 }
 
 # =========================================================================
-# REF-01-U1.5 — the generic dense transformer block (dense_block).
+# Generic dense transformer block (dense_block).
 # =========================================================================
 #
-# --- Contract (pml5-ref01-dense-reference-delivery.md REF-01-U1.5) --------
+# --- Contract -------------------------------------------------------------
 # The ordered dense transformer block in gradus:transformer:
 #   ln1  = rmsnorm(x, ln1_s, ε)                 # input RMSNorm (U1.1)
 #   qb   = linear(ln1, wq, bq)                  # [T, H*D]
@@ -406,7 +329,7 @@ fn transformer_block(tensor.NumericBlock x, tensor.NumericBlock ln1_s, tensor.Nu
 # shape derives from the runtime tensors and the head counts. The F32 row
 # is the admitted row (the composed rows' contract). The output is the
 # final residual r2 [T, D]; a final norm / output projection is model
-# assembly (REF-01-U1.8), not the block.
+# assembly, not the block.
 #
 # --- Autograd independence (PML3 thesis, forward-without-autograd) --------
 # Same posture as transformer_block: no autograd import, no gradient path.
@@ -616,7 +539,7 @@ class TypedCachedBlock<size T, size D> {
 }
 
 fn to_block<size A, size B>(tensor<f32, [A, B]> t, int a, int b) → tensor.NumericBlock {
-    return tensor.stage(dtype.f32(), [a, b], t ↦ list<f32>)
+    return tensor.stage_f32([a, b], t ↦ list<f32>)
 }
 
 fn from_block<size A, size B>(tensor.NumericBlock t) → tensor<f32, [A, B]> ⇥ TransformerError {

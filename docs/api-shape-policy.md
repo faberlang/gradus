@@ -9,48 +9,45 @@ question answered by PML0; PML1-U3 implements it), the PML1 closeout R1
 record 1, the live source headers, and for error identity the 2026-08-21
 operator session recorded in faber `docs/design/typed-error-union.md`.
 
-## Posture: typed generics are the production surface; the staged carrier is the load-edge tier
+## Posture: typed generics are the production surface; the decoded carrier is the load-edge tier
 
 The production shape-generic surface is the **typed generic leaves**
-(`nn.linear<M,K,N>`, `nn.gelu<M,N>`,
-`attention.scaled_dot_product_static<B,D>`, `math.add<M,N>`): shapes are
+(`nn.linear<M,K,N>`, `nn.gelu<M,N>`, `nn.rmsnorm<T,D>`,
+`math.add<M,N>`): shapes are
 static `tensor<f32, [M, N]>` facts at the boundary, instantiated at the call
-site. The **staged carrier** — shape as a runtime dimension list inside the
-value carrier (`NumericBlock.shape`), the static shape pinned by the
-consumer at materialization — is the staged/runtime-shape tier only: the
+site. The **decoded carrier** — shape as a runtime dimension list inside the
+`NumericBlock` value — is the load-edge/runtime-shape tier only: the
 SEM014/SEM005 load-edge posture and the `*_carrier` residuals. It is not
-the production form for families whose typed twin ships.
+the production form for families whose typed twin ships. Encoded model bytes
+use `storage.EncodedStorage`, where representation identity and block
+metadata remain separate from decoded compute values.
 
-- **Why the carrier exists (PML1 history)**: the generic shape genus
-  (`genus NumericBlock<magnitudo F>` type-argument application) is
-  `PARSE001` and the shape-hole `tensor<f32, _>` genus fields / returns are
-  `SEM014` in standalone library context. The staged carrier compiles today
-  (PML1 closeout R1 record 1; compiler evidence recorded in `src/shape.fab`
-  and `src/tensor.fab`); the typed leaves supersede it wherever one ships.
-- **Boundary unchanged**: the interface packet v1 shape facts (compile-time
-  class — shapes are static facts at the boundary) stand. The runtime list is
-  the value-carrier representation; the boundary still carries static
-  `tensor<f32, [2,2]>` types. This is a representation decision, not a
-  boundary revision.
+- **Why the carrier exists (PML1 history)**: a generic NumericBlock wrapper
+  and shape-hole tensor fields were rejected by the compiler in standalone
+  library context. The concrete decoded F32 carrier is the current load-edge
+  form (compiler evidence recorded in `src/shape.fab` and `src/tensor.fab`);
+  typed leaves supersede it wherever one ships.
+- **Boundary unchanged**: shapes remain compile-time facts at typed generic
+  boundaries. Runtime lists are the decoded carrier representation; dimensions
+  such as `[2,2]` belong to examples and fixtures, not dedicated API rows.
 
 ## Executed tier of record
 
-Gradus's executed tier of record is the CPU/reference tier — f32 host-list
-carrier (`src/tensor.fab` `class NumericBlock` `list<f32> data`), reference
-kernels, and FMIR stepper receipts. Device residency and emission are
-Radix and hosts scope.
+Gradus's executed tier of record is the CPU/reference tier — decoded F32
+host-list carrier (`src/tensor.fab` `class NumericBlock`), reference kernels,
+and FMIR stepper receipts. `NumericBlock` construction and trusted staging
+produce F32 compute values; encoded bytes and representation metadata live in
+`gradus:storage`.
 
 ## What it means for signatures
 
 | Surface | Signature form | Example |
 | --- | --- | --- |
-| **Production (shape-generic)** | `tensor<f32, [..]>` typed tensors with shape parameters | `nn.linear<M,K,N>`, `nn.gelu<M,N>`, `attention.scaled_dot_product_static<B,D>`, `math.add<M,N>` — static shape facts, instantiated at the call site |
-| **Fixed-shape admitted rows** | `tensor<f32, [..]>` typed tensors | `linear_2x8`, `mse_4x4`, `bert_tiny_block_2x8` — surviving caller-backed rows (wave-2 targets) |
-| **Staged carrier (runtime-shape tier)** | `tensor.NumericBlock` staged carrier | `linear_carrier` / `gelu(NumericBlock)` load-edge forms — SEM014/SEM005 posture, `*_carrier` residuals |
+| **Production (shape-generic)** | `tensor<f32, [..]>` typed tensors with shape parameters | `nn.linear<M,K,N>`, `nn.gelu<M,N>`, `nn.rmsnorm<T,D>`, `math.add<M,N>` — static shape facts, instantiated at the call site |
+| **Decoded carrier (runtime-shape tier)** | `tensor.NumericBlock` decoded F32 carrier | `linear_carrier` / `gelu_carrier` load-edge forms — SEM014/SEM005 posture, `*_carrier` residuals |
 
-The concrete-overload precedent (norma:optimizer) governs the surviving
-fixed-shape rows; the staged carrier keeps shapes as runtime facts, while
-the production shape-generic leaves carry static shape facts.
+The decoded carrier keeps shapes as runtime facts, while the production
+shape-generic leaves carry static shape facts.
 
 ## R3 — no one-row / one-shape narrowing in the public API
 
@@ -85,9 +82,10 @@ PML1). Consequences:
   `reshape` / `expand`) does not apply the per-dimension cap, so
   128k–152k vocab rows stay expressible. NumericBlock construction routes the
   element product through ONE validator: `shape.numel`.
-- The serialize mirror was aligned to `shape.numel` (no per-dimension
-  cap; element ceiling 1_000_000_000 and negative-dim rejection retained;
-  wire schema unchanged — `serialize-schema-1.0.0`).
+- General shape arithmetic checks negative dimensions and signed integer
+  overflow. It has no general `1_000_000_000` element ceiling. Format parsers
+  and admission paths may retain separate resource bounds; those are not
+  shape arithmetic rules.
 
 ## Rules of the road
 

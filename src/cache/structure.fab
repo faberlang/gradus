@@ -4,6 +4,7 @@
 # Depends on: gradus:cache/kv (kv.CacheError).
 
 import from "gradus:cache/kv" kv
+import from "gradus:storage" storage
 import from "gradus:tensor" tensor
 
 fn append_f32(list<f32> base, list<f32> values) → list<f32> {
@@ -57,7 +58,10 @@ union KvDtype {
     F32,
     F16,
     Q8_0,
-    Q4_K
+    Q4_K,
+    Custom {
+        string name
+    }
 }
 
 @ public
@@ -140,6 +144,9 @@ fn kv_dtype_name(KvDtype t) → string {
         case Q4_K {
             return "q4_k"
         }
+        case Custom const name {
+            return name
+        }
     }
 }
 
@@ -181,6 +188,9 @@ fn kv_dtype_quantized(KvDtype t) → bool {
         }
         case Q4_K {
             return true
+        }
+        case Custom const name {
+            return false
         }
     }
 }
@@ -540,6 +550,9 @@ fn profile_dtype_block(KVProfile profile, KvDtype t) → int {
         case Q4_K {
             return profile.q4_k_block
         }
+        case Custom const name {
+            return 1
+        }
     }
 }
 
@@ -606,6 +619,14 @@ class KVStructure {
     list<LayerSet> layers
     KvDtype kv_dtype_k
     KvDtype kv_dtype_v
+    # Open physical descriptors copied into each KVCache. The KvDtype fields
+    # retain today's wire vocabulary plus Custom for descriptor-first callers;
+    # shared storage owns the identity and block geometry without a closed
+    # cache-local union.
+    storage.Representation key_representation
+    storage.BlockMetadata key_block
+    storage.Representation value_representation
+    storage.BlockMetadata value_block
     VLayout v_layout
     KvSharing sharing
     AttentionFamily attention_family
@@ -618,7 +639,52 @@ class KVStructure {
 
 @ public
 fn default_kv_structure() → KVStructure {
-    return KVStructure { layers = empty, kv_dtype_k = kv_dtype_f16(), kv_dtype_v = kv_dtype_f16(), v_layout = v_layout_transposed(), sharing = sharing_single(), attention_family = attention_classic(), query_heads = 0, slots = 0, context_length = 0, reserve_policy = RESERVE_GI4, partitions = empty }
+    return KVStructure { layers = empty, kv_dtype_k = kv_dtype_f16(), kv_dtype_v = kv_dtype_f16(), key_representation = kv.representation_f16(), key_block = kv.block_f16(), value_representation = kv.representation_f16(), value_block = kv.block_f16(), v_layout = v_layout_transposed(), sharing = sharing_single(), attention_family = attention_classic(), query_heads = 0, slots = 0, context_length = 0, reserve_policy = RESERVE_GI4, partitions = empty }
+}
+
+fn representation_for_dtype(KvDtype t) → storage.Representation ⇥ kv.CacheError {
+    match t {
+        case F32 {
+            return kv.representation_f32()
+        }
+        case F16 {
+            return kv.representation_f16()
+        }
+        case Q8_0 {
+            return kv.representation_q8_0()
+        }
+        case Q4_K {
+            return kv.representation_q4_k()
+        }
+        case Custom const name {
+            return kv.representation_from_name(name)
+        }
+    }
+}
+
+fn block_for_dtype(KvDtype t) → storage.BlockMetadata ⇥ kv.CacheError {
+    match t {
+        case F32 {
+            return kv.block_f32()
+        }
+        case F16 {
+            return kv.block_f16()
+        }
+        case Q8_0 {
+            return kv.block_q8_0()
+        }
+        case Q4_K {
+            return kv.block_q4_k()
+        }
+        case Custom const name {
+            throw variant kv.CacheError.DtypeMismatch { message = "custom KV representation requires an open descriptor" }
+        }
+    }
+}
+
+@ public
+fn kv_representation(KvDtype t) → storage.Representation ⇥ kv.CacheError {
+    return representation_for_dtype(t)
 }
 
 fn layer_set_eq(LayerSet a, LayerSet b) → bool {
@@ -673,6 +739,10 @@ fn kv_structure_equal(KVStructure a, KVStructure b) → bool {
     }
     if not kv_dtype_eq(a.kv_dtype_k, b.kv_dtype_k) then return false
     if not kv_dtype_eq(a.kv_dtype_v, b.kv_dtype_v) then return false
+    if not kv.representation_equal(a.key_representation, b.key_representation) then return false
+    if not kv.block_equal(a.key_block, b.key_block) then return false
+    if not kv.representation_equal(a.value_representation, b.value_representation) then return false
+    if not kv.block_equal(a.value_block, b.value_block) then return false
     if not v_layout_eq(a.v_layout, b.v_layout) then return false
     if not sharing_eq(a.sharing, b.sharing) then return false
     if not attention_family_eq(a.attention_family, b.attention_family) then return false
@@ -812,7 +882,7 @@ fn construct_kv_structure_with_profile_and_partitions(KVProfile profile, list<La
             }
         }
     }
-    return KVStructure { layers = layers, kv_dtype_k = kv_dtype_k, kv_dtype_v = kv_dtype_v, v_layout = v_layout, sharing = sharing, attention_family = attention_family, query_heads = query_heads, slots = slots, context_length = context_length, reserve_policy = profile.reserve_policy, partitions = partitions }
+    return KVStructure { layers = layers, kv_dtype_k = kv_dtype_k, kv_dtype_v = kv_dtype_v, key_representation = representation_for_dtype(kv_dtype_k), key_block = block_for_dtype(kv_dtype_k), value_representation = representation_for_dtype(kv_dtype_v), value_block = block_for_dtype(kv_dtype_v), v_layout = v_layout, sharing = sharing, attention_family = attention_family, query_heads = query_heads, slots = slots, context_length = context_length, reserve_policy = profile.reserve_policy, partitions = partitions }
 }
 
 @ public
@@ -823,6 +893,64 @@ fn construct_kv_structure_with_profile(KVProfile profile, list<LayerSet> layers,
 @ public
 fn construct_kv_structure(list<LayerSet> layers, KvDtype kv_dtype_k, KvDtype kv_dtype_v, VLayout v_layout, KvSharing sharing, AttentionFamily attention_family, int query_heads, int slots, int context_length) → KVStructure ⇥ kv.CacheError {
     return construct_kv_structure_with_partitions(layers, kv_dtype_k, kv_dtype_v, v_layout, sharing, attention_family, query_heads, slots, context_length, empty)
+}
+
+fn dtype_for_representation(storage.Representation representation) → KvDtype {
+    switch representation.name {
+        case "f32" {
+            return kv_dtype_f32()
+        }
+        case "f16" {
+            return kv_dtype_f16()
+        }
+        case "q8_0" {
+            return kv_dtype_q8_0()
+        }
+        case "q4_k" {
+            return kv_dtype_q4_k()
+        }
+        default {
+            return variant Custom { name = representation.name }
+        }
+    }
+}
+
+fn check_open_representation(storage.Representation representation, storage.BlockMetadata block, list<LayerSet> layers, VLayout v_layout, bool value) → bool ⇥ kv.CacheError {
+    require representation.namespace.length() ≠ 0 throw variant kv.CacheError.EmptyName { message = "empty KV representation namespace" }
+    require representation.name.length() ≠ 0 throw variant kv.CacheError.EmptyName { message = "empty KV representation name" }
+    require representation.version.length() ≠ 0 throw variant kv.CacheError.EmptyName { message = "empty KV representation version" }
+    require block.known throw variant kv.CacheError.InvalidCombination { message = "KV representation requires known block geometry" }
+    require block.elements_per_block ≥ 1 throw variant kv.CacheError.InvalidDimension { message = "representation block elements must be at least one" }
+    require block.bytes_per_block ≥ 1 throw variant kv.CacheError.InvalidDimension { message = "representation block bytes must be at least one" }
+    for from layers const layer {
+        if not is_indexer_structure(layer.structure) {
+            const int width ← layer.kv_heads * layer.head_dim
+            require width % block.elements_per_block ≡ 0 throw variant kv.CacheError.InvalidCombination { message = "block size does not divide head_dim" }
+        }
+    }
+    if value and block.elements_per_block ≠ 1 {
+        match v_layout {
+            case Straight {
+                return true
+            }
+            case Transposed {
+                throw variant kv.CacheError.InvalidCombination { message = "quantized V requires the flash-attention family" }
+            }
+        }
+    }
+    return true
+}
+
+# Descriptor-first structure construction keeps the storage contract open to
+# future formats. The legacy KvDtype constructor remains the wire/profile
+# admission path; this entry point carries the exact descriptors through to
+# empty_layers without reducing them to the four-name enum.
+@ public
+fn construct_kv_structure_with_representations(list<LayerSet> layers, storage.Representation key_representation, storage.BlockMetadata key_block, storage.Representation value_representation, storage.BlockMetadata value_block, VLayout v_layout, KvSharing sharing, AttentionFamily attention_family, int query_heads, int slots, int context_length) → KVStructure ⇥ kv.CacheError {
+    check_open_representation(key_representation, key_block, layers, v_layout, false)
+    check_open_representation(value_representation, value_block, layers, v_layout, true)
+    const KVStructure base ← construct_kv_structure(layers, kv_dtype_f32(), kv_dtype_f32(), v_layout, sharing, attention_family, query_heads, slots, context_length)
+    return KVStructure { layers = base.layers, kv_dtype_k = dtype_for_representation(key_representation), kv_dtype_v = dtype_for_representation(value_representation), key_representation = key_representation, key_block = key_block, value_representation = value_representation, value_block = value_block, v_layout = base.v_layout, sharing = base.sharing, attention_family = base.attention_family, query_heads = base.query_heads, slots = slots, context_length = base.context_length, reserve_policy = base.reserve_policy, partitions = base.partitions }
 }
 
 @ public
@@ -1097,7 +1225,7 @@ fn empty_layers(KVStructure s, string model, string model_version, string config
     # Keep: this is a count-like address walk whose body can fail while
     # constructing each cache; map cannot carry the existing error channel.
     for range 0 ‥ count const idx {
-        out.append(kv.empty_cache_with_capacity(model, model_version, config, tokenizer, 1, layer_width(s, idx), capacity))
+        out.append(kv.empty_cache_with_capacity_representations(model, model_version, config, tokenizer, 1, layer_width(s, idx), capacity, s.key_representation, s.key_block, s.value_representation, s.value_block))
     }
     return out
 }

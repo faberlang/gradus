@@ -7,12 +7,12 @@ Same admitted weights and pinned prompt as G1 (`dense-decode-smollm2`).
 G1's unrestrained greedy continuation after the prompt was `[30, 2, 198]`;
 that slice deliberately skipped EOG-stop. The default route applies it.
 `IgnoreEos` is the llama.cpp `ignore_eos` row used to capture the U5
-16-token golden: admitted EOG ids are suppressed from sampling and the
-loop runs to `max_tokens`.
+16-token golden: artifact-derived EOG ids carried by `GenerationConfig` are
+suppressed from sampling and the loop runs to `max_tokens`.
 
 **Oracle (honest):**
 - First greedy token = GATE 13 / GI2 continuation `30`.
-- Token `2` is SmolLM2 EOS and is in the admitted EOG set `{0, 2}`.
+- Token `2` is SmolLM2 EOS and is in the artifact-derived EOG set.
 - With EOG-stop, generation emits the EOS token and halts: `[30, 2]`.
 - `max_tokens=3` is a ceiling, not a promise. If EOS did not fire the
   N-token path would be `[30, 2, 198]` (G1's unrestrained record).

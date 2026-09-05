@@ -19,9 +19,12 @@ device-neutral contracts. Foundation modules (`gradus:dtype`,
 `gradus:shape`, `gradus:tensor`, `gradus:math`) feed loss, optimizers, and
 neural-network primitives; those compose into attention and transformer
 blocks; model-admission modules bind GGUF and Safetensors artifacts into
-typed capsules without retaining paths or whole-model payloads; decode,
-cache, sampling, and generation sit on the same forward row. Import the
-leaf that owns the type you use — the façade does not re-export genera.
+typed capsules without retaining paths or whole-model payloads. The tensor
+module provides decoded F32 compute carriers; `gradus:storage` keeps opaque
+encoded bytes, representation identity, and block metadata as separate
+values. Decode, cache, sampling, and generation sit on the same forward row.
+Import the leaf that owns the type you use — the façade does not re-export
+genera.
 
 The smallest useful program, a numbered learning path, and which demo to
 open first per capability are in
@@ -102,7 +105,7 @@ main {
     const list<int> shape_2x2 ← [2, 2]
     const tensor<f32, [2, 2]> prediction ← seed.from_flat([1.0, 2.0, 3.0, 4.0], shape_2x2)
     const tensor<f32, [2, 2]> target ← seed.from_flat([1.0, 2.0, 3.0, 3.0], shape_2x2)
-    const f32 value ← loss.mse_2x2(prediction, target)
+    const f32 value ← loss.mse(prediction, target)
     print value
 }
 ```
@@ -111,7 +114,7 @@ main {
 faber check .
 ```
 
-`loss.mse_2x2` is mean squared error over a 2×2 f32 pair; the snippet's
+`loss.mse` is mean squared error over the 2×2 f32 fixture; the snippet's
 inputs yield `0.25`. `faber check` is the standing proof that the import
 and call type-check. The training-loop exemplum is an executed package proof:
 `faber run` executes its library-to-library calls on the FMIR stepper (radix
@@ -127,14 +130,15 @@ Gradus is pre-1.0 with a clean-break posture; APIs may change. See
 
 What ships today is the **structural** surface: compile-validated,
 proba-pinned source contracts, plus an executed 100-step MLP training
-loop through `train_step_4x4` → `optimize._sgd_family` (list-form SGD) whose final loss
+loop through explicit optimizer state and updates whose final loss
 matches the f64 oracle (`0.017928625511508454`). Broader model-forward
 identity, GPU training, and executed performance are not claimed here.
 
-Gradus's executed tier of record is the CPU/reference tier — f32 host-list
-carrier (`src/tensor.fab` `class Tensor` `list<f32> data`), reference
-kernels, and FMIR stepper receipts. Device residency and emission are
-Radix and hosts scope.
+Gradus's executed tier of record is the CPU/reference tier — decoded F32
+host-list compute carriers (`src/tensor.fab` `class NumericBlock`), reference
+kernels, and FMIR stepper receipts. Encoded model bytes belong to the open
+`gradus:storage` representation; device residency and emission are Radix and
+hosts scope.
 
 | Layer | State |
 | --- | --- |
@@ -151,6 +155,9 @@ Radix and hosts scope.
 KV-cache writes fail closed on gap and overflow against an immutable
 capacity; cached-attention positions are absolute and include the
 just-written row.
+
+Generation stop handling reads `GenerationConfig.eog_ids`; the decoder's EOG
+membership and suppression rules use that configured list.
 
 Campaign ledgers, unit receipts, and per-symbol coverage live in
 [`docs/api-reference.md`](docs/api-reference.md),
@@ -186,7 +193,7 @@ range proofs live in `exempla/gguf-manifest/` and `exempla/gguf-inspect/`.
 
 - **Faber model authors** who want to define differentiable models, compute
   gradients, and train neural networks using library calls instead of raw
-  compiler annotations — through the staged-carrier tensor surface, the
+  compiler annotations — through the decoded F32 carrier surface, the
   loss/optimizer/train layers, and the model-admission capsule.
 - **Compiler integrators** validating the Radix autograd pipeline through a
   clean library surface.
@@ -222,12 +229,12 @@ below.
 | Capability | Status | Owner |
 | --- | --- | --- |
 | Reverse-mode AD (differentiable AIR tensor ops) | Shipped (compiler) | Radix |
-| Staged-carrier tensor, shape rules, math families | Shipped | Gradus |
+| Decoded F32 compute carrier, shape rules, math families | Shipped | Gradus |
 | `gradus:gradient` wrapper | Shipped — one companion-call entry | Gradus |
 | Linear regression + finite-difference gradient proof | Shipped (structural) — `exempla/gradient-seam` | Gradus |
 | SGD, loss, training, checkpoint `Checkpoint` | Shipped | Gradus |
 | NN primitives + attention/transformer | Shipped | Gradus |
-| Model admission (capsule + Safetensors + GGUF + dequant) | Shipped | Gradus |
+| Model admission (capsule + Safetensors + GGUF + dequant + open storage metadata) | Shipped | Gradus |
 | Tokenizer identity + stop binding | Shipped | Gradus |
 | Inference: decode, KV-cache, sampling, generation config | Shipped — fail-closed capacity; absolute cache positions | Gradus |
 | nanoGPT on Shakespeare (CPU) | Planned (not in-tree) | Gradus |
@@ -243,15 +250,13 @@ explicit update tuples — no universal parameter registry, model class, or
 device/backend handle:
 
 - `gradus:nn` — `linear<M,K,N>`, `gelu<M,N>` (shape-generic leaves)
-- `gradus:loss` — `mse_2x2`, `mse_4x4`
-- `gradus:train` — `train_step_2x2`, `train_step_4x4` (explicit current
-  parameters + explicit trainable gradients + scalar lr → explicit tuple of
-  updated parameters)
+- `gradus:loss` — `mse<M,N>` plus decoded-carrier `mse_carrier`
+- `gradus:train` — schedules, modes, RNG, dropout, and checkpoints; training
+  updates use explicit parameters, gradients, and optimizer state
 
-The `gradus:optimize` tensor update delegates through the
-`optimize._sgd_family` list form, alongside `SgdState` slots, `step`, and
-wires. The fixed-shape MSE rows and train steps remain the admitted caller
-surface; `train_step_*` delegates its tensor update to that list form.
+The `gradus:optimize` surface carries explicit `SgdState` slots, steps, and
+wires. Dimensions such as 2×2 remain fixture choices in examples rather than
+separate library entry points.
 
 The seam proof for this surface is `exempla/gradient-seam/`. The
 `@ radix backward` annotation lives in `gradus:gradient`; that exemplum

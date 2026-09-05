@@ -5,6 +5,7 @@
 # Owns CacheError.
 
 import from "gradus:dtype" dtype
+import from "gradus:storage" storage
 import from "gradus:tensor" tensor
 
 @ public
@@ -37,6 +38,8 @@ fn from_tensor_error(tensor.TensorError err) → CacheError {
 # The cache's schema version (the identity wire form).
 @ public
 const string SCHEMA_VERSION ← "1.0.0"
+
+const int MAX_NUMBER ← 9223372036854775807
 
 # -------------------------------------------------------------------------
 # Private helpers.
@@ -76,6 +79,164 @@ fn tensor_equal(tensor.NumericBlock a, tensor.NumericBlock b) → bool {
     return true
 }
 
+fn bytes_equal(bytes a, bytes b) → bool {
+    if a.length() ≠ b.length() then return false
+    for range 0 ‥ a.length() const i {
+        if (a.get(i) coalesce 0 ∷ int<u8>) ≠ (b.get(i) coalesce 0 ∷ int<u8>) then return false
+    }
+    return true
+}
+
+# The shared storage contract owns representation identity and block
+# geometry. Cache code only adds the logical row shape/count and the decoded
+# F32 capability; encoded bytes remain in storage.EncodedStorage.
+@ public
+fn representation_named(string namespace, string name, string version, int code) → storage.Representation ⇥ CacheError {
+    require namespace.length() ≠ 0 throw variant EmptyName { message = "empty cache representation namespace" }
+    require name.length() ≠ 0 throw variant EmptyName { message = "empty cache representation name" }
+    require version.length() ≠ 0 throw variant EmptyName { message = "empty cache representation version" }
+    reject contains_separator(namespace) or contains_separator(name) or contains_separator(version) throw variant EmptyName { message = "reserved wire character in cache representation" }
+    return storage.representation(namespace, name, version, code)
+}
+
+@ public
+fn representation_f32() → storage.Representation {
+    return storage.representation("ggml", "f32", "unspecified", 0)
+}
+
+@ public
+fn representation_f16() → storage.Representation {
+    return storage.representation("ggml", "f16", "unspecified", 1)
+}
+
+@ public
+fn representation_q8_0() → storage.Representation {
+    return storage.representation("ggml", "q8_0", "unspecified", 8)
+}
+
+@ public
+fn representation_q4_k() → storage.Representation {
+    return storage.representation("ggml", "q4_k", "unspecified", 12)
+}
+
+@ public
+fn representation_equal(storage.Representation a, storage.Representation b) → bool {
+    if a.namespace ≠ b.namespace then return false
+    if a.name ≠ b.name then return false
+    if a.version ≠ b.version then return false
+    if a.code ≠ b.code then return false
+    return true
+}
+
+@ public
+fn representation_from_name(string name) → storage.Representation ⇥ CacheError {
+    switch name {
+        case "f32" {
+            return representation_f32()
+        }
+        case "f16" {
+            return representation_f16()
+        }
+        case "q8_0" {
+            return representation_q8_0()
+        }
+        case "q4_k" {
+            return representation_q4_k()
+        }
+        default {
+            throw variant DtypeMismatch { message = "unknown cache representation" }
+        }
+    }
+}
+
+@ public
+fn block_f32() → storage.BlockMetadata {
+    return storage.known_block(1, 4, 1, 4)
+}
+
+@ public
+fn block_f16() → storage.BlockMetadata {
+    return storage.known_block(1, 2, 1, 2)
+}
+
+@ public
+fn block_q8_0() → storage.BlockMetadata {
+    return storage.known_block(32, 34, 1, 34)
+}
+
+@ public
+fn block_q4_k() → storage.BlockMetadata {
+    return storage.known_block(256, 144, 1, 144)
+}
+
+@ public
+fn block_equal(storage.BlockMetadata a, storage.BlockMetadata b) → bool {
+    if a.known ≠ b.known then return false
+    if a.elements_per_block ≠ b.elements_per_block then return false
+    if a.bytes_per_block ≠ b.bytes_per_block then return false
+    if a.block_count ≠ b.block_count then return false
+    if a.byte_length ≠ b.byte_length then return false
+    return true
+}
+
+fn row_bytes(storage.BlockMetadata block, int dimension) → int ⇥ CacheError {
+    require dimension ≥ 1 throw variant InvalidDimension { message = "embedding dimension must be at least one" }
+    require block.known throw variant InvalidCombination { message = "cache representation has unknown block geometry" }
+    require block.elements_per_block ≥ 1 throw variant InvalidDimension { message = "representation block elements must be at least one" }
+    require block.bytes_per_block ≥ 1 throw variant InvalidDimension { message = "representation block bytes must be at least one" }
+    require dimension % block.elements_per_block ≡ 0 throw variant InvalidCombination { message = "representation block does not divide cache dimension" }
+    const int blocks_per_row ← dimension / block.elements_per_block
+    require blocks_per_row ≤ MAX_NUMBER / block.bytes_per_block throw variant Overflow { message = "representation row byte count overflow" }
+    return blocks_per_row * block.bytes_per_block
+}
+
+# A storage identity keeps physical bytes separate from the decoded F32
+# consumer carrier. `decoded` is a capability bit, not a dtype tag over a
+# list<f32>; packed storage always lives in `encoded.payload`, while the
+# shared representation and block metadata live beside those bytes.
+@ public
+class KVStorage {
+    storage.EncodedStorage encoded
+    list<int> shape
+    int count
+    # True only when the decoded F32 NumericBlock carrier is materialized;
+    # an encoded F32 cache deliberately leaves this false until decoding.
+    bool decoded
+}
+
+fn storage_block(storage.BlockMetadata template, int dimension, int count) → storage.BlockMetadata ⇥ CacheError {
+    # The callers validate the template and dimension through row_bytes before
+    # reaching this helper; repeat the arithmetic guards here because this
+    # function is also used by every subsequent cache mutation.
+    const int blocks_per_row ← dimension / template.elements_per_block
+    if count ≠ 0 {
+        require count ≤ MAX_NUMBER / blocks_per_row throw variant Overflow { message = "representation block count overflow" }
+    }
+    const int block_count ← count * blocks_per_row
+    if block_count ≡ 0 {
+        return storage.known_block(template.elements_per_block, template.bytes_per_block, 0, 0)
+    }
+    if block_count ≻ MAX_NUMBER / template.bytes_per_block {
+        throw variant Overflow { message = "representation byte count overflow" }
+    }
+    return storage.known_block(template.elements_per_block, template.bytes_per_block, block_count, block_count * template.bytes_per_block)
+}
+
+fn decoded_storage(storage.Representation representation, storage.BlockMetadata template, tensor.NumericBlock block) → KVStorage ⇥ CacheError {
+    const storage.BlockMetadata metadata ← storage_block(template, block.shape.get(1) coalesce 0, row_count(block))
+    return KVStorage { encoded = storage.encoded(||, representation, metadata), shape = block.shape, count = row_count(block), decoded = representation_equal(representation, representation_f32()) }
+}
+
+fn empty_storage(storage.Representation representation, storage.BlockMetadata template, list<int> shape) → KVStorage ⇥ CacheError {
+    const storage.BlockMetadata metadata ← storage_block(template, shape.get(1) coalesce 0, 0)
+    return KVStorage { encoded = storage.encoded(||, representation, metadata), shape = shape, count = 0, decoded = representation_equal(representation, representation_f32()) }
+}
+
+fn encoded_storage(storage.Representation representation, storage.BlockMetadata template, bytes payload, list<int> shape, int count) → KVStorage ⇥ CacheError {
+    const storage.BlockMetadata metadata ← storage_block(template, shape.get(1) coalesce 0, count)
+    return KVStorage { encoded = storage.encoded(payload, representation, metadata), shape = shape, count = count, decoded = false }
+}
+
 # -------------------------------------------------------------------------
 # KVCache — the typed logical value.
 # -------------------------------------------------------------------------
@@ -94,14 +255,17 @@ class KVCache {
     list<int> history
     # Layer count of the forward row (the identity's layer field).
     int layers
-    # Element dtype name (identity; "f32" — the admitted row).
-    string dtype
     # Layout tag (identity; "staged").
     string layout
     # The cached K tensor [positions, dimension].
     tensor.NumericBlock key
     # The cached V tensor [positions, dimension].
     tensor.NumericBlock payload
+    # Physical storage identities. F32 decoded caches keep the old NumericBlock
+    # fields populated; encoded caches keep bytes here and expose explicit
+    # decoded-access failures.
+    KVStorage key_storage
+    KVStorage value_storage
     # Generation (starts 1; bumps on successful append, extend, or reset).
     int version
     # The cached feature width.
@@ -116,6 +280,31 @@ class KVCache {
     }
 }
 
+@ public
+fn key_representation(KVCache c) → storage.Representation {
+    return c.key_storage.encoded.representation
+}
+
+@ public
+fn value_representation(KVCache c) → storage.Representation {
+    return c.value_storage.encoded.representation
+}
+
+@ public
+fn key_block(KVCache c) → storage.BlockMetadata {
+    return c.key_storage.encoded.block
+}
+
+@ public
+fn value_block(KVCache c) → storage.BlockMetadata {
+    return c.value_storage.encoded.block
+}
+
+@ public
+fn decoded_f32(KVCache c) → bool {
+    return representation_equal(key_representation(c), representation_f32()) and representation_equal(value_representation(c), representation_f32()) and c.key_storage.decoded and c.value_storage.decoded
+}
+
 # Field-wise cache equality — the determinism/round-trip predicate.
 # Convert-or-record: this is a small typed pure leaf whose ordered checks span
 # heterogeneous fields; no collection intrinsic covers the short-circuit shape.
@@ -127,10 +316,21 @@ fn cache_equal(KVCache a, KVCache b) → bool {
     if a.tokenizer ≠ b.tokenizer then return false
     if not (a.history ≡ b.history) then return false
     if a.layers ≠ b.layers then return false
-    if a.dtype ≠ b.dtype then return false
     if a.layout ≠ b.layout then return false
     if not tensor_equal(a.key, b.key) then return false
     if not tensor_equal(a.payload, b.payload) then return false
+    if not representation_equal(a.key_storage.encoded.representation, b.key_storage.encoded.representation) then return false
+    if not representation_equal(a.value_storage.encoded.representation, b.value_storage.encoded.representation) then return false
+    if not block_equal(a.key_storage.encoded.block, b.key_storage.encoded.block) then return false
+    if not block_equal(a.value_storage.encoded.block, b.value_storage.encoded.block) then return false
+    if not (a.key_storage.shape ≡ b.key_storage.shape) then return false
+    if not (a.value_storage.shape ≡ b.value_storage.shape) then return false
+    if a.key_storage.count ≠ b.key_storage.count then return false
+    if a.value_storage.count ≠ b.value_storage.count then return false
+    if a.key_storage.decoded ≠ b.key_storage.decoded then return false
+    if a.value_storage.decoded ≠ b.value_storage.decoded then return false
+    if not bytes_equal(a.key_storage.encoded.payload, b.key_storage.encoded.payload) then return false
+    if not bytes_equal(a.value_storage.encoded.payload, b.value_storage.encoded.payload) then return false
     if a.version ≠ b.version then return false
     if a.dimension ≠ b.dimension then return false
     if a.capacity ≠ b.capacity then return false
@@ -149,18 +349,46 @@ fn row_count(tensor.NumericBlock t) → int {
 # Gap and overflow reject before any new rows are assembled.
 fn admit_write(KVCache c, int added) → bool ⇥ CacheError {
     const int write_position ← c.length()
-    require write_position ≡ row_count(c.key) throw variant Gap { message = "cache write leaves a gap" }
-    require write_position ≡ row_count(c.payload) throw variant Gap { message = "cache write leaves a gap" }
+    require write_position ≡ c.key_storage.count throw variant Gap { message = "cache write leaves a gap in the key storage" }
+    require write_position ≡ c.value_storage.count throw variant Gap { message = "cache write leaves a gap in the value storage" }
+    if c.key_storage.decoded {
+        require write_position ≡ row_count(c.key) throw variant Gap { message = "cache write leaves a gap in the decoded key" }
+    }
+    if c.value_storage.decoded {
+        require write_position ≡ row_count(c.payload) throw variant Gap { message = "cache write leaves a gap in the decoded value" }
+    }
     require write_position + added ≤ c.capacity throw variant Overflow { message = "cache overflow" }
     return true
 }
 
-fn keep(KVCache c, list<int> history, tensor.NumericBlock key, tensor.NumericBlock payload, int version) → KVCache {
-    return KVCache { model = c.model, model_version = c.model_version, config = c.config, tokenizer = c.tokenizer, history = history, layers = c.layers, dtype = c.dtype, layout = c.layout, key = key, payload = payload, version = version, dimension = c.dimension, capacity = c.capacity }
+fn keep(KVCache c, list<int> history, tensor.NumericBlock key, tensor.NumericBlock payload, int version) → KVCache ⇥ CacheError {
+    const KVStorage key_storage ← decoded_storage(c.key_storage.encoded.representation, c.key_storage.encoded.block, key)
+    const KVStorage value_storage ← decoded_storage(c.value_storage.encoded.representation, c.value_storage.encoded.block, payload)
+    return KVCache { model = c.model, model_version = c.model_version, config = c.config, tokenizer = c.tokenizer, history = history, layers = c.layers, layout = c.layout, key = key, payload = payload, key_storage = key_storage, value_storage = value_storage, version = version, dimension = c.dimension, capacity = c.capacity }
+}
+
+fn keep_encoded(KVCache c, list<int> history, bytes key_bytes, bytes value_bytes, int version) → KVCache ⇥ CacheError {
+    const list<int> shape ← [history.length(), c.dimension]
+    const KVStorage key_storage ← encoded_storage(c.key_storage.encoded.representation, c.key_storage.encoded.block, key_bytes, shape, history.length())
+    const KVStorage value_storage ← encoded_storage(c.value_storage.encoded.representation, c.value_storage.encoded.block, value_bytes, shape, history.length())
+    const tensor.NumericBlock empty ← tensor.default()
+    return KVCache { model = c.model, model_version = c.model_version, config = c.config, tokenizer = c.tokenizer, history = history, layers = c.layers, layout = c.layout, key = empty, payload = empty, key_storage = key_storage, value_storage = value_storage, version = version, dimension = c.dimension, capacity = c.capacity }
 }
 
 @ public
 fn empty_cache_with_capacity(string model, string model_version, string config, string tokenizer, int layers, int dimension, int capacity) → KVCache ⇥ CacheError {
+    return empty_cache_with_capacity_representations(model, model_version, config, tokenizer, layers, dimension, capacity, representation_f32(), block_f32(), representation_f32(), block_f32())
+}
+
+fn empty_block(storage.Representation representation, int dimension) → tensor.NumericBlock ⇥ CacheError {
+    if representation_equal(representation, representation_f32()) {
+        return tensor.construct([], [0, dimension])
+    }
+    return tensor.default()
+}
+
+@ public
+fn empty_cache_with_capacity_representations(string model, string model_version, string config, string tokenizer, int layers, int dimension, int capacity, storage.Representation key_representation, storage.BlockMetadata key_block, storage.Representation value_representation, storage.BlockMetadata value_block) → KVCache ⇥ CacheError {
     require model.length() ≠ 0 throw variant EmptyName { message = "empty model name" }
     require model_version.length() ≠ 0 throw variant EmptyName { message = "empty model version" }
     require config.length() ≠ 0 throw variant EmptyName { message = "empty execution config" }
@@ -169,9 +397,14 @@ fn empty_cache_with_capacity(string model, string model_version, string config, 
     require layers ≥ 1 throw variant InvalidDimension { message = "layer count must be at least one" }
     require dimension ≥ 1 throw variant InvalidDimension { message = "embedding dimension must be at least one" }
     require capacity ≥ 1 throw variant InvalidDimension { message = "capacity must be at least one" }
-    const tensor.NumericBlock key ← tensor.construct([], [0, dimension])
-    const tensor.NumericBlock payload ← tensor.construct([], [0, dimension])
-    return KVCache { model = model, model_version = model_version, config = config, tokenizer = tokenizer, history = empty, layers = layers, dtype = "f32", layout = "staged", key = key, payload = payload, version = 1, dimension = dimension, capacity = capacity }
+    row_bytes(key_block, dimension)
+    row_bytes(value_block, dimension)
+    const tensor.NumericBlock key ← empty_block(key_representation, dimension)
+    const tensor.NumericBlock payload ← empty_block(value_representation, dimension)
+    const list<int> shape ← [0, dimension]
+    const KVStorage key_storage ← empty_storage(key_representation, key_block, shape)
+    const KVStorage value_storage ← empty_storage(value_representation, value_block, shape)
+    return KVCache { model = model, model_version = model_version, config = config, tokenizer = tokenizer, history = empty, layers = layers, layout = "staged", key = key, payload = payload, key_storage = key_storage, value_storage = value_storage, version = 1, dimension = dimension, capacity = capacity }
 }
 
 # -------------------------------------------------------------------------
@@ -192,7 +425,11 @@ fn empty_cache(string model, string model_version, string config, string tokeniz
 @ public
 fn default() → KVCache {
     const tensor.NumericBlock t ← tensor.default()
-    return KVCache { model = "", model_version = "", config = "", tokenizer = "", history = empty, layers = 0, dtype = "", layout = "", key = t, payload = t, version = 0, dimension = 0, capacity = 0 }
+    const storage.Representation representation ← representation_f32()
+    const storage.BlockMetadata block ← block_f32()
+    const storage.EncodedStorage encoded ← storage.encoded(||, representation, block)
+    const KVStorage kv_storage ← KVStorage { encoded = encoded, shape = empty, count = 0, decoded = false }
+    return KVCache { model = "", model_version = "", config = "", tokenizer = "", history = empty, layers = 0, layout = "", key = t, payload = t, key_storage = kv_storage, value_storage = kv_storage, version = 0, dimension = 0, capacity = 0 }
 }
 
 # -------------------------------------------------------------------------
@@ -205,6 +442,8 @@ fn default() → KVCache {
 @ public
 fn append(KVCache c, int token_id, tensor.NumericBlock key, tensor.NumericBlock payload) → KVCache ⇥ CacheError {
     require token_id ≥ 0 throw variant IdOutOfRange { message = "token id must be non-negative" }
+    require representation_equal(c.key_storage.encoded.representation, representation_f32()) and representation_equal(c.value_storage.encoded.representation, representation_f32()) throw variant DtypeMismatch { message = "decoded append requires F32 K/V representations" }
+    require c.key_storage.decoded and c.value_storage.decoded throw variant DtypeMismatch { message = "decoded append requires decoded F32 storage" }
     require key.shape ≡ ([1, c.dimension] ↦ list<int>) throw variant ShapeMismatch { message = "K must be [1, dim]" }
     require payload.shape ≡ ([1, c.dimension] ↦ list<int>) throw variant ShapeMismatch { message = "V must be [1, dim]" }
     require dtype.name(key.dtype) ≡ "f32" throw variant DtypeMismatch { message = "unsupported dtype for cache" }
@@ -227,6 +466,8 @@ fn append(KVCache c, int token_id, tensor.NumericBlock key, tensor.NumericBlock 
 @ public
 fn extend(KVCache c, list<int> tokens, tensor.NumericBlock key, tensor.NumericBlock payload) → KVCache ⇥ CacheError {
     require tokens.length() ≠ 0 throw variant ElementMismatch { message = "empty token list" }
+    require representation_equal(c.key_storage.encoded.representation, representation_f32()) and representation_equal(c.value_storage.encoded.representation, representation_f32()) throw variant DtypeMismatch { message = "decoded extend requires F32 K/V representations" }
+    require c.key_storage.decoded and c.value_storage.decoded throw variant DtypeMismatch { message = "decoded extend requires decoded F32 storage" }
     require key.shape ≡ ([tokens.length(), c.dimension] ↦ list<int>) throw variant ShapeMismatch { message = "K must be [T, dim]" }
     require payload.shape ≡ ([tokens.length(), c.dimension] ↦ list<int>) throw variant ShapeMismatch { message = "V must be [T, dim]" }
     require dtype.name(key.dtype) ≡ "f32" throw variant DtypeMismatch { message = "unsupported dtype for cache" }
@@ -244,6 +485,67 @@ fn extend(KVCache c, list<int> tokens, tensor.NumericBlock key, tensor.NumericBl
     return keep(c, new_history, tensor.construct(new_key, [new_len, c.dimension]), tensor.construct(new_payload, [new_len, c.dimension]), c.version + 1)
 }
 
+fn validate_encoded(KVCache c, bytes key, bytes value, int rows) → bool ⇥ CacheError {
+    require rows ≥ 1 throw variant ElementMismatch { message = "encoded write must contain at least one row" }
+    const int key_row_bytes ← row_bytes(c.key_storage.encoded.block, c.dimension)
+    const int value_row_bytes ← row_bytes(c.value_storage.encoded.block, c.dimension)
+    require key.length() ≡ rows * key_row_bytes throw variant ElementMismatch { message = "encoded K byte count does not match shape" }
+    require value.length() ≡ rows * value_row_bytes throw variant ElementMismatch { message = "encoded V byte count does not match shape" }
+    return true
+}
+
+# Append one physical encoded K/V row. The input bytes are retained verbatim;
+# no list<f32> widening or dtype-only masquerade occurs. A F32 representation
+# may use this route for an explicitly encoded cache, but decoded access then
+# rejects until a real decode/materialization operation exists.
+@ public
+fn append_encoded(KVCache c, int token_id, bytes key, bytes value) → KVCache ⇥ CacheError {
+    require token_id ≥ 0 throw variant IdOutOfRange { message = "token id must be non-negative" }
+    require c.key_storage.count ≡ 0 or not c.key_storage.decoded throw variant DtypeMismatch { message = "encoded append cannot follow decoded key storage" }
+    require c.value_storage.count ≡ 0 or not c.value_storage.decoded throw variant DtypeMismatch { message = "encoded append cannot follow decoded value storage" }
+    validate_encoded(c, key, value, 1)
+    admit_write(c, 1)
+    const list<int> new_history ← c.history.added(token_id)
+    return keep_encoded(c, new_history, join_bytes(c.key_storage.encoded.payload, key), join_bytes(c.value_storage.encoded.payload, value), c.version + 1)
+}
+
+# Append a physical encoded prefill block. Each byte buffer is row-major in
+# the representation's own block format; the logical shape remains [rows,
+# dimension] and the row/count metadata advances by exactly rows.
+@ public
+fn extend_encoded(KVCache c, list<int> tokens, bytes key, bytes value) → KVCache ⇥ CacheError {
+    require tokens.length() ≠ 0 throw variant ElementMismatch { message = "empty encoded token list" }
+    require c.key_storage.count ≡ 0 or not c.key_storage.decoded throw variant DtypeMismatch { message = "encoded extend cannot follow decoded key storage" }
+    require c.value_storage.count ≡ 0 or not c.value_storage.decoded throw variant DtypeMismatch { message = "encoded extend cannot follow decoded value storage" }
+    validate_encoded(c, key, value, tokens.length())
+    admit_write(c, tokens.length())
+    for from tokens const token_id {
+        require token_id ≥ 0 throw variant IdOutOfRange { message = "token id must be non-negative" }
+    }
+    const list<int> new_history ← tokens.reduce((list<int> out, int token_id) ∴ out.added(token_id), c.history)
+    return keep_encoded(c, new_history, join_bytes(c.key_storage.encoded.payload, key), join_bytes(c.value_storage.encoded.payload, value), c.version + 1)
+}
+
+@ public
+fn decoded_key(KVCache c) → tensor.NumericBlock ⇥ CacheError {
+    require representation_equal(c.key_storage.encoded.representation, representation_f32()) and c.key_storage.decoded throw variant DtypeMismatch { message = "decoded K access is unavailable for encoded storage" }
+    return c.key
+}
+
+@ public
+fn decoded_value(KVCache c) → tensor.NumericBlock ⇥ CacheError {
+    require representation_equal(c.value_storage.encoded.representation, representation_f32()) and c.value_storage.decoded throw variant DtypeMismatch { message = "decoded V access is unavailable for encoded storage" }
+    return c.payload
+}
+
+fn join_bytes(bytes base, bytes extra) → bytes {
+    var bytes out ← base
+    for range 0 ‥ extra.length() const i {
+        out.append(extra.get(i) coalesce 0 ∷ int<u8>)
+    }
+    return out
+}
+
 # -------------------------------------------------------------------------
 # reset — logical prompt reset: empty history and empty K/V, same
 # identity fields and immutable capacity, generation advanced by 1.
@@ -251,14 +553,15 @@ fn extend(KVCache c, list<int> tokens, tensor.NumericBlock key, tensor.NumericBl
 
 @ public
 fn reset(KVCache c) → KVCache ⇥ CacheError {
-    const tensor.NumericBlock key ← tensor.construct([], [0, c.dimension])
-    const tensor.NumericBlock payload ← tensor.construct([], [0, c.dimension])
-    return keep(c, empty, key, payload, c.version + 1)
+    if representation_equal(c.key_storage.encoded.representation, representation_f32()) and representation_equal(c.value_storage.encoded.representation, representation_f32()) {
+        const tensor.NumericBlock key ← tensor.construct([], [0, c.dimension])
+        const tensor.NumericBlock payload ← tensor.construct([], [0, c.dimension])
+        return keep(c, empty, key, payload, c.version + 1)
+    }
+    return keep_encoded(c, empty, ||, ||, c.version + 1)
 }
 
 # -------------------------------------------------------------------------
-# CacheIdentity — the typed cache identity key (MD-A9 precedent). The
-# fields gradus owns: model, model version, execution configuration,
-# tokenizer identity, exact token prefix, positions/RoPE facts, layer
-# count, dtype, layout. Field-wise equality; a versioned wire round-trip.
+# CacheIdentity is owned by cache/identity. Its identity includes the
+# independent K/V representation names carried by the storage descriptors.
 # -------------------------------------------------------------------------

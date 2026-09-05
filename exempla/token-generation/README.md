@@ -25,9 +25,10 @@ scale 1/√4, RoPE dim 4 — the oracle-pinned model), prompt `[0]`, config
 | Seeded stochastic | temperature 1.0, neutral knobs, seed `8742514861359412281` | `[1, 1]` | no EOG token — runs to cursor ceiling |
 
 The greedy run emits **`[0]`** — not `[0, 0]` — because of the **EOG-stop
-policy** (the CTO9-4 correctness fix, binding generation to the admitted
-tokenizer identity): the first drawn token `0` is an admitted EOG token
-(EOG set `{0, 2}` — `tokenizer.fab`, `tokenizer.is_eog`), so
+policy** (the CTO9-4 correctness fix, binding generation to the configured
+fixture EOG set): the first drawn token `0` is an admitted EOG token
+(EOG set `{0, 2}` carried by `GenerationConfig` and checked by
+`decoder.is_eog`), so
 generation terminates after it. `max_tokens` is a **ceiling**, not a
 promise to emit exactly that many tokens. The seeded run draws `[1, 1]`
 (no EOG token), so it runs to the cursor ceiling.
@@ -49,7 +50,7 @@ before every step (honored: a cancelled flag stops the run).
 | Token decode | `decode.decode_data(prev, position, m)` — one-token decode over the shared forward row (embedding gather → transformer block → output projection) |
 | Greedy selection | `sampling.max` — the exact argmax path (temperature 0) |
 | Seeded draw | `sampling.sample` — the deterministic pipeline (rep-penalty → temperature → top-k → softmax → top-p → min-p) + one `train.next_f32` draw per step, walking the cumulative distribution (first-index rule) |
-| Bounded loop | `generation.fresh_cursor` / `token_allowed` / `cursor_advance` — the cursor limits (reject, never truncate) + the EOG-stop policy (`tokenizer.is_eog` — terminate at the first EOG token `0`/`2`) drive the loop |
+| Bounded loop | `generation.fresh_cursor` / `token_allowed` / `cursor_advance` — the cursor limits (reject, never truncate) + the configured EOG-stop policy (`decoder.is_eog` — terminate at the first EOG token `0`/`2`) drive the loop |
 | Cancellation | `decode.observe_cancellation` per step — the cooperative checkpoint (fail closed) |
 | Determinism | pure composition: same model + config + seed → same tokens; the advanced `Seed` is carried explicitly |
 

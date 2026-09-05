@@ -39,10 +39,10 @@ One `.fab` file → one import path. Nested dirs for packages.
 | `gradus:nn` | Differentiable primitives: Linear, activation, norm, embedding, dropout |
 | `gradus:attention/rope` | RopeConfig, RopePolicy, AttentionError |
 | `gradus:attention/gqa` | SDPA, causal, rotary, multi-head, cached attention |
-| `gradus:cache/kv` | KVCache, CacheError, append/extend/reset |
+| `gradus:cache/kv` | KVCache, open encoded representations, append/extend/reset |
 | `gradus:cache/identity` | CacheIdentity and identity wire |
 | `gradus:cache/structure` | KVStructure, profiles, GI4 unions |
-| `gradus:tokenizer/identity` | TokenizerIdentity, probes, EOG predicate |
+| `gradus:tokenizer/identity` | Generic TokenizerIdentity structure and wire |
 | `gradus:tokenizer/unicode` | Unicode categories and scanners |
 | `gradus:tokenizer/bpe` | Tokenizer runtime, encode/decode |
 | `gradus:generation/config` | GenerationConfig, GenerationError, acceleration |

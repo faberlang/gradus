@@ -18,7 +18,7 @@ locale = "en"
 #     immutable KVCache.capacity.
 #   * the cache identity key per the MD-A9 precedent (CacheIdentity:
 #     model, version, execution config, tokenizer, exact prefix, position
-#     span, layer count, dtype, layout) — exact field pins + the versioned
+#     span, layer count, independent K/V representations, layout) — exact field pins + the versioned
 #     wire round-trip (with the documented "-" sentinel for the empty
 #     history) + fail-closed rejections.
 #   * determinism — equal inputs produce equal caches (pure, no hidden
@@ -38,6 +38,8 @@ locale = "en"
 # compile-level proof; no runtime value identity is claimed here.
 
 import from "gradus:cache" cache
+
+import from "gradus:storage" storage
 
 import from "gradus:tensor" tensor
 
@@ -148,7 +150,10 @@ test "empty_cache builds a fresh cache with full identity and empty state" {
     assert c.config ≡ "causal-rope-d4"
     assert c.tokenizer ≡ "smollm"
     assert c.layers ≡ 1
-    assert c.dtype ≡ "f32"
+    assert c.key_storage.encoded.representation.name ≡ "f32"
+    assert c.value_storage.encoded.representation.name ≡ "f32"
+    assert c.key_storage.decoded
+    assert c.value_storage.decoded
     assert c.layout ≡ "staged"
     assert c.dimension ≡ 4
     assert c.length() ≡ 0
@@ -297,7 +302,7 @@ test "equal append sequences produce equal caches (pure, no hidden state)" {
 
 # ---- the cache identity key (MD-A9 precedent)
 
-test "cache_identity derives the full key (prefix, position span, layer, dtype, layout)" {
+test "cache_identity derives the full key (prefix, position span, layer, K/V representations, layout)" {
     const _ trap_result_11 ← trap {
         const cache.KVCache c0 ← cache_p()
         const cache.KVCache c1 ← cache.append(c0, 5, hold([1.0, 0.5, 0.2, 0.0 - 0.5], [1, 4]), hold([0.1, 0.2, 0.3, 0.4], [1, 4]))
@@ -310,7 +315,8 @@ test "cache_identity derives the full key (prefix, position span, layer, dtype, 
         assert i.history ≡ "5,2"
         assert i.position ≡ "0..2"
         assert i.layers ≡ 1
-        assert i.dtype ≡ "f32"
+        assert i.key_representation.name ≡ "f32"
+        assert i.value_representation.name ≡ "f32"
         assert i.layout ≡ "staged"
     }
     assert trap_result_11 is void
@@ -330,9 +336,34 @@ test "the identity wire round-trips exactly" {
         const cache.KVCache c1 ← cache.append(c0, 5, hold([1.0, 0.5, 0.2, 0.0 - 0.5], [1, 4]), hold([0.1, 0.2, 0.3, 0.4], [1, 4]))
         const cache.CacheIdentity i ← cache.cache_identity(c1)
         assert roundtrip_identity(i)
-        assert cache.serialize_identity(i) ≡ "cache/identity/1.0.0/tiny-mlp/1.0.0/causal-rope-d4/smollm/5/0..1/1/f32/staged"
+        assert cache.serialize_identity(i) ≡ "cache/identity/3.0.0/tiny-mlp/1.0.0/causal-rope-d4/smollm/5/0..1/1/ggml/f32/unspecified/0/1/1/4/4/16/ggml/f32/unspecified/0/1/1/4/4/16/staged"
     }
     assert trap_result_10 is void
+}
+
+test "the identity wire retains independent K/V representations" {
+    const cache.KVCache c ← test_util.or_default(() → cache.KVCache ⇥ cache.CacheError ∴ cache.empty_cache_with_capacity_representations("tiny-mlp", "1.0.0", "causal-rope-d4", "smollm", 1, 32, 8, cache.representation_f16(), cache.block_f16(), cache.representation_q8_0(), cache.block_q8_0()), cache.default())
+    const cache.CacheIdentity i ← cache.cache_identity(c)
+    assert i.key_representation.name ≡ "f16"
+    assert i.value_representation.name ≡ "q8_0"
+    assert cache.serialize_identity(i) ≡ "cache/identity/3.0.0/tiny-mlp/1.0.0/causal-rope-d4/smollm/-/0..0/1/ggml/f16/unspecified/1/1/1/2/1/2/ggml/q8_0/unspecified/8/1/32/34/1/34/staged"
+    const cache.CacheIdentity j ← test_util.or_default(() → cache.CacheIdentity ⇥ cache.CacheError ∴ cache.deserialize_identity(cache.serialize_identity(i)), i)
+    assert cache.cache_identity_equal(i, j)
+}
+
+test "the identity wire preserves an unknown future representation descriptor" {
+    const storage.Representation future ← storage.representation("vendor", "future_blob", "2026", -77)
+    const storage.BlockMetadata block ← storage.known_block(8, 10, 1, 10)
+    const cache.KVCache c0 ← test_util.or_default(() → cache.KVCache ⇥ cache.CacheError ∴ cache.empty_cache_with_capacity_representations("tiny-mlp", "1.0.0", "causal-rope-d4", "smollm", 1, 8, 4, future, block, cache.representation_f16(), cache.block_f16()), cache.default())
+    const cache.CacheIdentity i ← cache.cache_identity(c0)
+    assert i.key_representation.namespace ≡ "vendor"
+    assert i.key_representation.name ≡ "future_blob"
+    assert i.key_representation.version ≡ "2026"
+    assert i.key_representation.code ≡ -77
+    assert i.key_block.elements_per_block ≡ 8
+    assert i.key_block.bytes_per_block ≡ 10
+    const cache.CacheIdentity j ← test_util.or_default(() → cache.CacheIdentity ⇥ cache.CacheError ∴ cache.deserialize_identity(cache.serialize_identity(i)), i)
+    assert cache.cache_identity_equal(i, j)
 }
 
 test "the empty-history identity wire uses the documented sentinel" {
@@ -346,11 +377,13 @@ test "the empty-history identity wire uses the documented sentinel" {
 }
 
 test "the identity wire rejects unknown markers, schema, and malformed fields" {
-    assert deserialize_detail("tensor/identity/1.0.0/tiny-mlp/1.0.0/causal-rope-d4/smollm/5/0..1/1/f32/staged") ≡ "unknown cache marker"
-    assert deserialize_detail("cache/identity/9.9.9/tiny-mlp/1.0.0/causal-rope-d4/smollm/5/0..1/1/f32/staged") ≡ "unknown cache schema version"
-    assert deserialize_detail("cache/identity/1.0.0/tiny-mlp/1.0.0/causal-rope-d4/smollm/5/0..1/1/f32") ≡ "malformed cache identity wire"
-    assert deserialize_detail("cache/identity/1.0.0//1.0.0/causal-rope-d4/smollm/5/0..1/1/f32/staged") ≡ "empty model name in cache identity"
-    assert deserialize_detail("cache/identity/1.0.0/tiny-mlp/1.0.0/causal-rope-d4/smollm/5/0..1/0/f32/staged") ≡ "invalid layer count in cache identity"
+    assert deserialize_detail("tensor/identity/3.0.0/tiny-mlp/1.0.0/causal-rope-d4/smollm/5/0..1/1/ggml/f32/unspecified/0/1/1/4/4/16/ggml/f32/unspecified/0/1/1/4/4/16/staged") ≡ "unknown cache marker"
+    assert deserialize_detail("cache/identity/1.0.0/tiny-mlp/1.0.0/causal-rope-d4/smollm/5/0..1/1/ggml/f32/unspecified/0/1/1/4/4/16/ggml/f32/unspecified/0/1/1/4/4/16/staged") ≡ "unknown cache schema version"
+    assert deserialize_detail("cache/identity/9.9.9/tiny-mlp/1.0.0/causal-rope-d4/smollm/5/0..1/1/ggml/f32/unspecified/0/1/1/4/4/16/ggml/f32/unspecified/0/1/1/4/4/16/staged") ≡ "unknown cache schema version"
+    assert deserialize_detail("cache/identity/3.0.0/tiny-mlp/1.0.0/causal-rope-d4/smollm/5/0..1/1/ggml/f32/unspecified/0/1/1/4/4/16/ggml/f32/unspecified/0/1/1/4/4/staged") ≡ "malformed cache identity wire"
+    assert deserialize_detail("cache/identity/3.0.0//1.0.0/causal-rope-d4/smollm/5/0..1/1/ggml/f32/unspecified/0/1/1/4/4/16/ggml/f32/unspecified/0/1/1/4/4/16/staged") ≡ "empty model name in cache identity"
+    assert deserialize_detail("cache/identity/3.0.0/tiny-mlp/1.0.0/causal-rope-d4/smollm/5/0..1/1/ggml/f32/unspecified/0/1/1/4/4/16/ggml/f32/unspecified/0/1/1/4/4/16/staged") ≡ "ok"
+    assert deserialize_detail("cache/identity/3.0.0/tiny-mlp/1.0.0/causal-rope-d4/smollm/5/0..1/0/ggml/f32/unspecified/0/1/1/4/4/16/ggml/f32/unspecified/0/1/1/4/4/16/staged") ≡ "invalid layer count in cache identity"
 }
 
 # ---- KVStructure (W2-U1): identity pins + fail-closed mismatch negatives

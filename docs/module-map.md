@@ -60,8 +60,8 @@ starts at [`exempla/dense-prefill-smollm2/`](../exempla/dense-prefill-smollm2/).
 
 ## Live modules (post-PML1–5 + correctness wave)
 
-The live documented tree has 62 modules (verified against `src/**/*.fab`).
-Five former single-file packages are nested leaves plus a docs-only facade:
+The live documented tree follows the current `src/**/*.fab` tree. Five former
+single-file packages are nested leaves plus a docs-only facade:
 `tokenizer`, `cache`, `attention`, `generation`, and `model/qwen35moe_state`.
 Prefer the leaf import that owns the type. This inventory is verified against
 the live `src/**/*.fab` tree after the no-latin conversion (U1–U6); it does
@@ -80,22 +80,23 @@ evidence and boundaries are recorded in
 | Import | File | Role |
 | --- | --- | --- |
 | `gradus:dtype` | `src/dtype.fab` | Versioned dtype tag + cast/round/serialize (`dtype-schema-1.0.0`), including BF16 storage width |
-| `gradus:kernel` | `src/kernel.fab` | GEA1 paired BF16/F32 `[320,960]` GEMV entries with F32 accumulation plus thirteen GEA2 F32 block entries (T=8, D=960, F=2560), thirteen GEA3-U3a decode entries (T=1, `L_max`=76), and thirteen GEA3-U3b prefill entries (T_p=36, `L_max`=76), including direct-op MLP parents; host-validated typed resident views |
-| `gradus:shape` | `src/shape.fab` | Shape rules: broadcast/reshape/expand, bounded product |
-| `gradus:tensor` | `src/tensor.fab` | Staged-carrier tensor construction/shape/ops (not autograd-aware) |
+| `gradus:kernel` | `src/kernel.fab` | Shape-parameterized BF16/F32 GEMV, normalization, attention, MLP, decode, prefill, and head entries with F32 accumulation; callers supply geometry and normalization epsilon |
+| `gradus:shape` | `src/shape.fab` | Shape rules: broadcast/reshape/expand with checked products |
+| `gradus:tensor` | `src/tensor.fab` | Decoded F32 `NumericBlock` compute carrier with runtime shape and indexed access (not autograd-aware) |
+| `gradus:storage` | `src/storage.fab` | Open encoded storage: opaque bytes plus representation identity and block metadata |
 | `gradus:math` | `src/math.fab` | Pure operation families (elementwise/reduce/matmul/cast/concat/slice) |
 | `gradus:parameter` | `src/parameter.fab` | Parameter identity + traversal (`parameter-identity-schema-1.0.0`) |
 | `gradus:serialize` | `src/serialize.fab` | Versioned bytes wire contract (`serialize-schema-1.0.0`) |
 | `gradus:gradient` | `src/gradient.fab` | Autograd wrapper — the ONE companion-call entry (PML4) |
-| `gradus:loss` | `src/loss.fab` | Losses: `mse`, `cross_entropy` + fixed-shape MSE rows (PML4) |
+| `gradus:loss` | `src/loss.fab` | Shape-generic typed `mse<M,N>`, decoded-carrier `mse_carrier`, and `cross_entropy` (PML4) |
 | `gradus:optimize` | `src/optimize.fab` | SGD optimizer state: slots, step, wires (PML4) |
-| `gradus:nn` | `src/nn.fab` | Primitives: `linear`, `gelu`, `layernorm`, `rmsnorm`, `silu`, `swiglu` + fixed-shape rows (PML3; RMSNorm REF-01-U1.1, SiLU/SwiGLU REF-01-U1.2) |
+| `gradus:nn` | `src/nn.fab` | Shape-generic typed and decoded-carrier primitives: `linear`, `gelu`, `layernorm`, `rmsnorm`, `silu`, `swiglu` (PML3; RMSNorm REF-01-U1.1, SiLU/SwiGLU REF-01-U1.2) |
 | `gradus:attention` | `src/attention.fab` | Docs-only facade — import `attention/rope` or `attention/gqa` |
 | `gradus:attention/rope` | `src/attention/rope.fab` | RopeConfig, RopePolicy, AttentionError; configurable RoPE (REF-01-U1.3) |
 | `gradus:attention/gqa` | `src/attention/gqa.fab` | SDPA, causal, rotary, multi-head, cached attention (REF-01-U1.4) |
-| `gradus:transformer` | `src/transformer.fab` | Transformer block (fixed-shape row + staged surface, PML3); generic dense transformer block — input RMSNorm → GQA attention (causal + RoPE) → residual → post-attn RMSNorm → SwiGLU MLP → residual, composing the U1.1/U1.2/U1.4 rows (REF-01-U1.5) |
-| `gradus:mlp` | `src/mlp.fab` | Two-layer MLP: staged `forward_mlp` + annotated `forward_mlp_loss` companion (PML3-U4) |
-| `gradus:train` | `src/train.fab` | Train steps, schedules, mode, RNG, dropout, and checkpoint `Checkpoint` (PML4) |
+| `gradus:transformer` | `src/transformer.fab` | Generic runtime-carrier and typed dense transformer blocks — input RMSNorm → GQA attention (causal + RoPE) → residual → post-attn RMSNorm → SwiGLU MLP → residual, composing the U1.1/U1.2/U1.4 rows (REF-01-U1.5) |
+| `gradus:mlp` | `src/mlp.fab` | Two-layer MLP: decoded-carrier `forward_mlp` + annotated `forward_mlp_loss` companion (PML3-U4) |
+| `gradus:train` | `src/train.fab` | Schedules, modes, RNG, dropout, and checkpoint `Checkpoint` (PML4) |
 | `gradus:metrics` | `src/metrics.fab` | Defined metrics: `accuracy`, `Metric` (PML4) |
 | `gradus:test_util` | `src/test_util.fab` | Shared proba-support helpers: `or_default` (U4a proba do/catch deblock) |
 | `gradus:data` | `src/data.fab` | Batch leaf: deterministic shuffle over `gradus:train` Seed/Draw + order-preserving batch slicing of rank-1 i32 token-id tensors (short last batch; fail-closed empty/size bounds); tokenization still future |
@@ -105,11 +106,9 @@ evidence and boundaries are recorded in
 | `gradus:model/gguf_manifest` | `src/model/gguf_manifest.fab` | Format-general GGUF v3 bounded-corpus parser plus pathless range inspection, checked tensor fragments, and typed tokenizer metadata array accessors (`texts`/`numbers`, LIB-02-U1) |
 | `gradus:model/gguf` | `src/model/gguf.fab` | GGUF row admission → capsule (PML2) |
 | `gradus:model/safetensors` | `src/model/safetensors.fab` | Safetensors row admission → capsule (PML2) |
-| `gradus:model/dequant` | `src/model/dequant.fab` | CPU dequant of the admitted GGML block types — union set F32/F16/BF16/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K (PML2; GGUF-A3 widens to BF16 + Q5_K; W1-U3 admits F16 via NativeF16Convert) |
+| `gradus:model/dequant` | `src/model/dequant.fab` | CPU F32 decoding for supported GGML representations; the encoded storage model remains open (PML2; GGUF-A3 widens to BF16 + Q5_K; W1-U3 admits F16 via NativeF16Convert) |
 | `gradus:model/tensor_payload` | `src/model/tensor_payload.fab` | `TensorPayload` value + `PayloadError` diagnostics — pathless payload carrier (name, absolute start, length, bytes) (GGUF-A3) |
-| `gradus:model/tensor_view` | `src/model/tensor_view.fab` | `TensorView` typed view + `ViewError` + `links` bind + bounded windowed materializers `materialize_slice`/`materialize_block` (GGUF-A3) |
-| `gradus:model/block_view` | `src/model/block_view.fab` | GEA2 nine typed F32 layer-0 block tensor views, manifest-bound absolute ranges, and host-side boundary validation |
-| `gradus:model/full_model_view` | `src/model/full_model_view.fab` | GEA3-U2 290 typed F32 full-model tensor views (9 families × 32 layers via verbatim lexicographic layer starts + `token_embd.weight` + `output_norm.weight` + the tied `lm_head → token_embd.weight` row), manifest-bound ranges/digests, and host-side boundary validation |
+| `gradus:model/tensor_view` | `src/model/tensor_view.fab` | `TensorView` typed view + `ViewError` + `links` bind from open encoded storage + bounded windowed materializers `materialize_slice`/`materialize_block` (GGUF-A3) |
 | `gradus:model/dense_qwen2` | `src/model/dense_qwen2.fab` | Typed `qwen2` (Qwen2.5) architecture adapter — canonical dense tensor-name → manifest-descriptor resolution (`config`/`resolve`/`render_description`) with the qwen2 deltas: tensor-set tie status, GQA head config, rope_theta 1000000 (REF-01-U1.7) |
 | `gradus:model/dense` | `src/model/dense.fab` | Dense model assembly — the complete ordered dense forward graph (`forward`): embedding gather → N ordered U1.5 `dense_block` rows → final RMSNorm → output projection, assembled from the typed architecture config (`DenseConfig`) and materialized stored-weight views via canonical names; tied/untied embedding handling; zero per-row constants (REF-01-U1.8). Real-file Qwen2.5-0.5B prefill consumer: `exempla/dense-prefill-qwen2` (REF-01-U1.10; FINAL stop at radix `2ed9914e4`: packet `faber` green; PKG001 closed; rustc cargo-101, first `E0015` const `vec!`) |
 | `gradus:model/qwen35moe` | `src/model/qwen35moe.fab` | qwen35moe architecture admission: frozen config + canonical 753-tensor map + dimension/storage cross-reference validation + identity-precondition admission (MODEL-01, read through the `gguf_manifest` typed accessors) |
@@ -120,7 +119,7 @@ evidence and boundaries are recorded in
 | `gradus:model/qwen35moe_state/linear_attn` | `src/model/qwen35moe_state/linear_attn.fab` | Gated DeltaNet linear-attention path |
 | `gradus:model/qwen35moe_state/full_attn` | `src/model/qwen35moe_state/full_attn.fab` | Full-attention KV path |
 | `gradus:tokenizer` | `src/tokenizer.fab` | Docs-only facade — import identity/unicode/bpe |
-| `gradus:tokenizer/identity` | `src/tokenizer/identity.fab` | TokenizerIdentity, probes, `is_eog` (PML2/PML5) |
+| `gradus:tokenizer/identity` | `src/tokenizer/identity.fab` | TokenizerIdentity, probes, and caller-supplied EOG-set validation (PML2/PML5) |
 | `gradus:tokenizer/unicode` | `src/tokenizer/unicode.fab` | Unicode categories and scanners |
 | `gradus:tokenizer/bpe` | `src/tokenizer/bpe.fab` | Artifact-backed BPE runtime (LIB-02-U2/U3; GEA3-U2 `admit_gea3_tables`); capstone `exempla/qwen36-35b-inference` |
 | `gradus:cache` | `src/cache.fab` | Docs-only facade — import kv/identity/structure |
@@ -136,136 +135,101 @@ evidence and boundaries are recorded in
 | `gradus:generation/dense` | `src/generation/dense.fab` | DenseEngine and dense generate |
 | `gradus:gradus` | `src/gradus.fab` | Facade map — no genera |
 
-### GEA2 block device entries
+### Shape-generic device entries
 
-`gradus:kernel` extends the GEA1 leaf with thirteen independently selectable,
-position-independent F32 entries for the frozen SmolLM2-360M layer-0 block.
-The English package surface renders the canonical `@ nucleum` identity as
-`@ kernel`; the signatures below are the source/device contract.
-
-| Entry | Idiom | Declared input shape(s) → output shape |
-| --- | --- | --- |
-| `rmsnorm` | `rms_norm(1, 1e-5, weight)` | `[8,960]`, `[960]` → `[8,960]` |
-| `gemm_qo` | `input · weights` | `[8,960]`, `[960,960]` → `[8,960]` |
-| `gemm_kv` | `input · weights` | `[8,960]`, `[960,320]` → `[8,320]` |
-| `gemm_gate_up` | `input · weights` | `[8,960]`, `[960,2560]` → `[8,2560]` |
-| `gemm_down` | `input · weights` | `[8,2560]`, `[2560,960]` → `[8,960]` |
-| `rope_q` | `rope_norm<d>(0)` with table input | generic `[T,D]`, table `[T,P,3]` → `[T,D]` |
-| `rope_k` | `rope_norm<d>(0)` with table input | generic `[T,K]`, table `[T,P,3]` → `[T,K]` |
-| `transpose` | `input.transpose()` | `[8,64]` → `[64,8]` |
-| `score_gemm` | `(query · key_transposed) ⊙ attention_scale` | `[8,64]`, `[64,8]`, scale `[8,8]` → `[8,8]` |
-| `causal_softmax` | `max from … at [i,j] coalesce 0.0`; `scores.softmax()` | `[8,8]` → `[8,8]` |
-| `context_gemm` | `probabilities · values` | `[8,8]`, `[8,64]` → `[8,64]` |
-| `swiglu` | `gate.silu() ⊙ up` | `[8,2560]`, `[8,2560]` → `[8,2560]` |
-| `residual_add` | `left.added(right)` | `[8,960]`, `[8,960]` → `[8,960]` |
-
-All GEA2 tensor parameters and outputs are `tf32`; no GEA2 entry has a
-lane/id parameter. The scale input is the frozen `[8,8]` F32 constant whose elements
-are `0.125`; the RoPE table is the committed `[8,32,3]` angle/cos/sin input.
-
-### GEA3-U3a decode device entries
-
-Thirteen independently selectable F32 entries for single-token decode at
-T=1 with the GEA3-U1 freezes (`L_max`=76, declared history length, mask
-beyond L; CTO ruling 0891c09b — fixed-capacity buffers, append-in-place).
-Per-head windows and the 32× layer repetition are plan-time facts
-(GEA2-U7 inheritance); the bodies carry no loop, slice, failable
-construct, or in-body call.
-
-Geometry amended from the original `L_max`=32 (U3a-amend `cc3981c8`,
-following U3b's residual): U1 froze `l_max`=76 and the 36-token prefill
-writes positions 0..35, so decode covers positions 36..75 — 40 steps —
-before overflow. The per-entry SHA table recorded with the original U3a
-landing (`a0262e7`) is **superseded**; the amended entry bodies carry new
-digests. The `[1,32,3]` rope tables are unchanged: their 32 is d/2
-consecutive pairs (dim=64), not history capacity.
+`gradus:kernel` exposes independently selectable, position-independent F32
+entries. The signatures are shape-parameterized source/device contracts;
+model widths, sequence lengths, head geometry, and KV capacity are caller or
+plan facts. RMSNorm receives its epsilon from the caller.
 
 | Entry | Idiom | Declared input shape(s) → output shape |
 | --- | --- | --- |
-| `decode_rmsnorm` | `rms_norm(1, 1e-5, weight)` | `[1,960]`, `[960]` → `[1,960]` |
-| `decode_gemv_qo` | `input · weights` | `[1,960]`, `[960,960]` → `[1,960]` |
-| `decode_gemv_kv` | `input · weights` | `[1,960]`, `[960,320]` → `[1,320]` |
-| `decode_mlp` | inline `input · gate_weights`, `input · up_weights`, `gate.silu() ⊙ up`, and `hidden · down_weights` | `[1,960]`, `[960,2560]`, `[960,2560]`, `[2560,960]` → `[1,960]` |
-| `decode_rope_q` | `rope_norm<d>(0)` with table input | generic `[1,D]`, table `[1,P,3]` → `[1,D]` |
-| `decode_rope_k` | `rope_norm<d>(0)` with table input | generic `[1,K]`, table `[1,P,3]` → `[1,K]` |
-| `kv_append_k` | `history + slot · row` | `[76,320]`, slot `[76,1]`, row `[1,320]` → `[76,320]` |
-| `kv_append_v` | `history + slot · row` | `[76,320]`, slot `[76,1]`, row `[1,320]` → `[76,320]` |
-| `decode_key_transpose` | `input.transpose()` | `[76,64]` → `[64,76]` |
-| `decode_score_gemm` | `(query · key_transposed) ⊙ attention_scale` | `[1,64]`, `[64,76]`, scale `[1,76]` → `[1,76]` |
-| `decode_masked_softmax` | `(scores + length_mask).softmax()` | `[1,76]`, mask `[1,76]` → `[1,76]` |
-| `decode_context_gemm` | `probabilities · values` | `[1,76]`, `[76,64]` → `[1,64]` |
-| `decode_residual_add` | `left + right` | `[1,960]`, `[1,960]` → `[1,960]` |
+| `rmsnorm<T,D>` | `rms_norm(input, epsilon, weight)` | `[T,D]`, `[D]` → `[T,D]` |
+| `gemm_qo<T,D>` | `input · weights` | `[T,D]`, `[D,D]` → `[T,D]` |
+| `gemm_kv<T,D,K>` | `input · weights` | `[T,D]`, `[D,K]` → `[T,K]` |
+| `gemm_gate_up<T,D,F>` | `input · weights` | `[T,D]`, `[D,F]` → `[T,F]` |
+| `gemm_down<T,F,D>` | `input · weights` | `[T,F]`, `[F,D]` → `[T,D]` |
+| `rope_q` | `rope_norm<d>(0, rope_table)` | generic `[T,D]`, table `[T,P,3]` → `[T,D]` |
+| `rope_k` | `rope_norm<d>(0, rope_table)` | generic `[T,K]`, table `[T,P,3]` → `[T,K]` |
+| `transpose<T,d>` | `input.transpose()` | `[T,d]` → `[d,T]` |
+| `score_gemm<T,d>` | `(query · key_transposed) ⊙ attention_scale` | `[T,d]`, `[d,T]`, scale `[T,T]` → `[T,T]` |
+| `causal_softmax<T>` | causal masking then `scores.softmax()` | `[T,T]` → `[T,T]` |
+| `context_gemm<T,d>` | `probabilities · values` | `[T,T]`, `[T,d]` → `[T,d]` |
+| `swiglu<T,F>` | `gate.silu() ⊙ up` | `[T,F]`, `[T,F]` → `[T,F]` |
+| `residual_add<T,D>` | `left + right` | `[T,D]`, `[T,D]` → `[T,D]` |
 
-The `slot` input is the resident one-hot `[76,1]` row selector at the
-declared decode position; `slot · row` writes the incoming `[1,320]` K/V
-row into exactly that fixed-capacity slot. The `length_mask` input is the
-resident declared-length additive constant (0 within the declared history
-length L, negative beyond it) feeding softmax.
+All entries use F32 tensors and take geometry as explicit shape parameters or
+inputs. No entry embeds a model-specific width, sequence length, scale table,
+or RoPE table.
 
-### GEA3-U3b prefill device entries
+### Decode device entries
 
-Thirteen independently selectable F32 entries for the prefill shape family
-at `T_p`=36. The frozen prompt tokenizes to 36 tokens (GEA3-U1 fixture
-`fixtures/tokenizer/gea3-prompt-tokens.manifest.json`), not the exact-8
-reuse case, so the GEA2 13-entry block identities are re-shaped at
-`[T_p,·]` rather than reused byte-identically (goal open item 3; ruling
-0891c09b — natural `T_p`, never re-shaped to fit geometry). The frozen
-KV capacity is `L_max`=76 (prompt 36 + n_predict 8 + margin 32); the
-`prefill_kv_write_k`/`_v` pair places the rope'd rows at positions
-`0..T_p-1` via the resident `[76,36]` 0/1 block indicator, the block
-granularity mirror of U3a's one-hot slot append. Per-head windows and the
-32× layer repetition stay plan-time facts; the bodies carry no loop,
-slice, failable construct, or in-body call.
+The decode family is shape-parameterized for a single query row. History and
+capacity are supplied by the caller; no model-specific capacity or prompt
+length is part of a kernel identity.
 
 | Entry | Idiom | Declared input shape(s) → output shape |
 | --- | --- | --- |
-| `prefill_rmsnorm` | `rms_norm(1, 1e-5, weight)` | `[36,960]`, `[960]` → `[36,960]` |
-| `prefill_gemm_qo` | `input · weights` | `[36,960]`, `[960,960]` → `[36,960]` |
-| `prefill_gemm_kv` | `input · weights` | `[36,960]`, `[960,320]` → `[36,320]` |
-| `prefill_mlp` | inline `input · gate_weights`, `input · up_weights`, `gate.silu() ⊙ up`, and `hidden · down_weights` | `[36,960]`, `[960,2560]`, `[960,2560]`, `[2560,960]` → `[36,960]` |
-| `prefill_rope_q` | `rope_norm<d>(0)` with table input | generic `[T,D]`, table `[T,P,3]` → `[T,D]` |
-| `prefill_rope_k` | `rope_norm<d>(0)` with table input | generic `[T,K]`, table `[T,P,3]` → `[T,K]` |
-| `prefill_key_transpose` | `input.transpose()` | `[36,64]` → `[64,36]` |
-| `prefill_score_gemm` | `(query · key_transposed) ⊙ attention_scale` | `[36,64]`, `[64,36]`, scale `[36,36]` → `[36,36]` |
-| `prefill_causal_softmax` | `scores.softmax()` | `[36,36]` → `[36,36]` |
-| `prefill_context_gemm` | `probabilities · values` | `[36,36]`, `[36,64]` → `[36,64]` |
-| `prefill_residual_add` | `left + right` | `[36,960]`, `[36,960]` → `[36,960]` |
-| `prefill_kv_write_k` | `history + block · rows` | `[76,320]`, block `[76,36]`, rows `[36,320]` → `[76,320]` |
-| `prefill_kv_write_v` | `history + block · rows` | `[76,320]`, block `[76,36]`, rows `[36,320]` → `[76,320]` |
+| `decode_rmsnorm<D>` | `rms_norm(input, epsilon, weight)` | `[1,D]`, `[D]` → `[1,D]` |
+| `decode_gemv_qo<D>` | `input · weights` | `[1,D]`, `[D,D]` → `[1,D]` |
+| `decode_gemv_kv<D,K>` | `input · weights` | `[1,D]`, `[D,K]` → `[1,K]` |
+| `decode_mlp<D,F>` | inline gate/up projections, SiLU gate, and down projection | `[1,D]`, `[D,F]`, `[D,F]`, `[F,D]` → `[1,D]` |
+| `decode_rope_q` | `rope_norm<d>(0, rope_table)` | generic `[1,D]`, table `[1,P,3]` → `[1,D]` |
+| `decode_rope_k` | `rope_norm<d>(0, rope_table)` | generic `[1,K]`, table `[1,P,3]` → `[1,K]` |
+| `kv_append_k<K>` | `history + row` | `[K]`, `[K]` → `[K]` |
+| `kv_append_v<K>` | `history + row` | `[K]`, `[K]` → `[K]` |
+| `decode_key_transpose<H,C,d>` | `input.transpose()` | `[H,C,d]` → `[H,d,C]` |
+| `decode_score_gemm<H,Q,T,d,C>` | `(query · key_transposed) ⊙ attention_scale` | `[H,Q,T,d]`, `[H,d,C]`, scale `[H,Q,T,C]` → `[H,Q,T,C]` |
+| `decode_masked_softmax<H,Q,T,C>` | `(scores + length_mask).softmax()` | `[H,Q,T,C]`, mask `[1,C]` → `[H,Q,T,C]` |
+| `decode_context_gemm<H,Q,T,C,d>` | `probabilities · values` | `[H,Q,T,C]`, `[H,C,d]` → `[H,Q,T,d]` |
+| `decode_residual_add<D>` | `left + right` | `[1,D]`, `[1,D]` → `[1,D]` |
 
-### GEA3-U3c head device entries
+The caller supplies history selectors and length masks when a route needs
+them. Kernel entries do not prescribe a fixed-capacity storage layout.
 
-Three independently selectable F32 entries closing the U3
-kernel-authorship family, at the decode-step shape T=1 with the frozen
-head geometry (D=960, V=49152). The `lm_head_gemv` weights and the
-`embedding_gather` matrix are the SAME tied `token_embd.weight` in its
-resident `[V,960]` layout (GEA3-U2 typed view, digest-bound); lm_head
-consumes it transposed so the widest GEMV yet is
-`[1,960]·[960,49152] → [1,49152]` over one physical buffer (ruling
-0891c09b — no fork gate remains). Bodies carry no loop, slice, failable
-construct, or in-body call.
+### Prefill device entries
+
+The prefill family is shape-parameterized by prompt length, model widths, and
+storage capacity. Prompt and KV geometry are caller or plan facts, rather
+than frozen entry identities.
 
 | Entry | Idiom | Declared input shape(s) → output shape |
 | --- | --- | --- |
-| `head_rmsnorm` | `rms_norm(1, 1e-5, weight)` | `[1,960]`, `[960]` → `[1,960]` |
-| `lm_head_gemv` | `input · embeddings.transpose()` | `[1,960]`, `[49152,960]` → `[1,49152]` |
-| `embedding_gather` | `selector · embeddings` | `[1,49152]`, `[49152,960]` → `[1,960]` |
+| `prefill_rmsnorm<T,D>` | `rms_norm(input, epsilon, weight)` | `[T,D]`, `[D]` → `[T,D]` |
+| `prefill_gemm_qo<T,D>` | `input · weights` | `[T,D]`, `[D,D]` → `[T,D]` |
+| `prefill_gemm_kv<T,D,K>` | `input · weights` | `[T,D]`, `[D,K]` → `[T,K]` |
+| `prefill_mlp<T,D,F>` | inline gate/up projections, SiLU gate, and down projection | `[T,D]`, `[D,F]`, `[D,F]`, `[F,D]` → `[T,D]` |
+| `prefill_rope_q` | `rope_norm<d>(0, rope_table)` | generic `[T,D]`, table `[T,P,3]` → `[T,D]` |
+| `prefill_rope_k` | `rope_norm<d>(0, rope_table)` | generic `[T,K]`, table `[T,P,3]` → `[T,K]` |
+| `prefill_key_transpose<T,d>` | `input.transpose()` | `[T,d]` → `[d,T]` |
+| `prefill_score_gemm<T,d>` | `(query · key_transposed) ⊙ attention_scale` | `[T,d]`, `[d,T]`, scale `[T,T]` → `[T,T]` |
+| `prefill_causal_softmax<T>` | `scores + causal_mask`, then softmax | `[T,T]`, mask `[T,T]` → `[T,T]` |
+| `prefill_context_gemm<T,d>` | `probabilities · values` | `[T,T]`, `[T,d]` → `[T,d]` |
+| `prefill_residual_add<T,D>` | `left + right` | `[T,D]`, `[T,D]` → `[T,D]` |
+| `prefill_kv_write_k<C,T,K>` | `history + block · rows` | `[C,K]`, block `[C,T]`, rows `[T,K]` → `[C,K]` |
+| `prefill_kv_write_v<C,T,K>` | `history + block · rows` | `[C,K]`, block `[C,T]`, rows `[T,K]` → `[C,K]` |
 
-**Embedding row route (design note).** The gather is a NEW op family
-(row index → 960 values) with no precedent entry; it is designed as the
-U3a slot-selector idiom read row-wise instead of write row-wise. The
-resident `[1,49152]` one-hot token selector places the token's single 1
-over the embed matrix, so `selector · embeddings` is exactly the
-`[1,960]` embedding row — a device gather entry over the resident
-matrix with no host copy. The selector is the plan-bound token index
-materialized at row granularity, the direct mirror of U3a's `[76,1]`
-decode-position one-hot and U3b's `[76,36]` block indicator: one
-resident selection constant, one matmul, one entry.
+### Head device entries
+
+Head entries are shape-parameterized by vocabulary and hidden dimensions.
+Whether embeddings are tied is a model or plan fact supplied outside the
+kernel identity.
+
+| Entry | Idiom | Declared input shape(s) → output shape |
+| --- | --- | --- |
+| `head_rmsnorm<D>` | `rms_norm(input, epsilon, weight)` | `[1,D]`, `[D]` → `[1,D]` |
+| `lm_head_gemv<V,D>` | `input · embeddings.transpose()` | `[1,D]`, `[V,D]` → `[1,V]` |
+| `embedding_gather<V,D>` | gather rows from embeddings | `[V,D]`, ids → `[1,D]` |
+
+**Embedding row route (design note).** `embedding_gather` receives the
+embedding table and token ids; the selected row geometry is determined by
+`V` and `D` at specialization time.
 
 ## Layers
 
 ```text
-L1  Tensor foundation   gradus:dtype, gradus:shape, gradus:math, gradus:tensor
+L1  Tensor foundation   gradus:dtype, gradus:shape, gradus:math, gradus:tensor,
+                        gradus:storage
 L2  Autograd core       gradus:gradient
 L3  Loss                gradus:loss
 L4  Optimization        gradus:optimize
@@ -277,7 +241,7 @@ PML2 Model admission    gradus:model/artifact, gradus:model/capsule,
                         gradus:model/gguf_manifest, gradus:model/gguf,
                         gradus:model/safetensors, gradus:model/dequant,
                         gradus:model/tensor_payload, gradus:model/tensor_view,
-                        gradus:model/block_view, gradus:model/full_model_view
+                        gradus:storage
 REF-01 Dense reference  gradus:model/dense_llama (llama/SmolLM2 adapter,
                         REF-01-U1.6), gradus:model/dense_qwen2 (qwen2
                         adapter, REF-01-U1.7), gradus:model/dense (dense

@@ -4,7 +4,10 @@
 # Depends on: gradus:cache/kv (KVCache, CacheError).
 
 import from "gradus:cache/kv" kv
+import from "gradus:storage" storage
 import from "gradus:tensor" tensor
+
+const string IDENTITY_SCHEMA_VERSION ← "3.0.0"
 
 fn append_f32(list<f32> base, list<f32> values) → list<f32> {
     return values.reduce((list<f32> out, f32 value) ∴ out.added(value), base)
@@ -31,6 +34,50 @@ fn numeric(string s) → bool {
     return true
 }
 
+fn signed_numeric(string s) → bool {
+    if s.length() ≡ 0 then return false
+    if s ≡ "-" then return false
+    if s.get(0) coalesce "" ≡ "-" {
+        return numeric(s[1‥s.length()])
+    }
+    return numeric(s)
+}
+
+fn bool_wire(bool value) → string {
+    if value then return "1"
+    return "0"
+}
+
+fn parse_int(string text, bool signed) → int ⇥ kv.CacheError {
+    if signed {
+        require signed_numeric(text) throw variant kv.CacheError.BadWire { message = "malformed numeric cache identity field" }
+    } else {
+        require numeric(text) throw variant kv.CacheError.BadWire { message = "malformed numeric cache identity field" }
+    }
+    var int value ← 0
+    do {
+        value ↤ text
+    }
+    catch err {
+        throw variant kv.CacheError.BadWire { message = "malformed numeric cache identity field" }
+    }
+    return value
+}
+
+fn representation_wire_equal(storage.Representation a, storage.Representation b) → bool {
+    return kv.representation_equal(a, b)
+}
+
+fn block_wire_equal(storage.BlockMetadata a, storage.BlockMetadata b) → bool {
+    return kv.block_equal(a, b)
+}
+
+fn block_geometry_equal(storage.BlockMetadata a, storage.BlockMetadata b) → bool {
+    if a.known ≠ b.known then return false
+    if a.elements_per_block ≠ b.elements_per_block then return false
+    return a.bytes_per_block ≡ b.bytes_per_block
+}
+
 @ public
 class CacheIdentity {
     string model
@@ -40,7 +87,10 @@ class CacheIdentity {
     string history
     string position
     int layers
-    string dtype
+    storage.Representation key_representation
+    storage.BlockMetadata key_block
+    storage.Representation value_representation
+    storage.BlockMetadata value_block
     string layout
 }
 
@@ -54,9 +104,28 @@ fn cache_identity_equal(CacheIdentity a, CacheIdentity b) → bool {
     if a.history ≠ b.history then return false
     if a.position ≠ b.position then return false
     if a.layers ≠ b.layers then return false
-    if a.dtype ≠ b.dtype then return false
+    if not representation_wire_equal(a.key_representation, b.key_representation) then return false
+    if not block_wire_equal(a.key_block, b.key_block) then return false
+    if not representation_wire_equal(a.value_representation, b.value_representation) then return false
+    if not block_wire_equal(a.value_block, b.value_block) then return false
     if a.layout ≠ b.layout then return false
     return true
+}
+
+# Identity fields that remain fixed across an accepted append. History and
+# position are intentionally excluded because block verification advances them.
+@ public
+fn cache_identity_static_equal(CacheIdentity a, CacheIdentity b) → bool {
+    if a.model ≠ b.model then return false
+    if a.model_version ≠ b.model_version then return false
+    if a.config ≠ b.config then return false
+    if a.tokenizer ≠ b.tokenizer then return false
+    if a.layers ≠ b.layers then return false
+    if not representation_wire_equal(a.key_representation, b.key_representation) then return false
+    if not block_geometry_equal(a.key_block, b.key_block) then return false
+    if not representation_wire_equal(a.value_representation, b.value_representation) then return false
+    if not block_geometry_equal(a.value_block, b.value_block) then return false
+    return a.layout ≡ b.layout
 }
 
 # Derive the identity key from a cache state: the prefix is the
@@ -64,7 +133,7 @@ fn cache_identity_equal(CacheIdentity a, CacheIdentity b) → bool {
 @ public
 fn cache_identity(kv.KVCache c) → CacheIdentity {
     const string history ← c.history.reduce((string out, int token) ∴ out.length() ≡ 0 yields (token ↦ string) else "§,§"(out, token ↦ string), "")
-    return CacheIdentity { model = c.model, model_version = c.model_version, config = c.config, tokenizer = c.tokenizer, history = history, position = "0..§"(c.length() ↦ string), layers = c.layers, dtype = c.dtype, layout = c.layout }
+    return CacheIdentity { model = c.model, model_version = c.model_version, config = c.config, tokenizer = c.tokenizer, history = history, position = "0..§"(c.length() ↦ string), layers = c.layers, key_representation = kv.key_representation(c), key_block = kv.key_block(c), value_representation = kv.value_representation(c), value_block = kv.value_block(c), layout = c.layout }
 }
 
 # -------------------------------------------------------------------------
@@ -79,7 +148,39 @@ fn serialize_identity(CacheIdentity i) → string {
     if history.length() ≡ 0 {
         history ← "-"
     }
-    return "cache/identity/§/§/§/§/§/§/§/§/§/§"(kv.SCHEMA_VERSION, i.model, i.model_version, i.config, i.tokenizer, history, i.position, i.layers ↦ string, i.dtype, i.layout)
+    var list<string> fields ← ["cache", "identity", IDENTITY_SCHEMA_VERSION, i.model, i.model_version, i.config, i.tokenizer, history, i.position, i.layers ↦ string, i.key_representation.namespace, i.key_representation.name, i.key_representation.version, i.key_representation.code ↦ string, bool_wire(i.key_block.known), i.key_block.elements_per_block ↦ string, i.key_block.bytes_per_block ↦ string, i.key_block.block_count ↦ string, i.key_block.byte_length ↦ string, i.value_representation.namespace, i.value_representation.name, i.value_representation.version, i.value_representation.code ↦ string, bool_wire(i.value_block.known), i.value_block.elements_per_block ↦ string, i.value_block.bytes_per_block ↦ string, i.value_block.block_count ↦ string, i.value_block.byte_length ↦ string, i.layout]
+    return fields.reduce((string out, string field) ∴ out.length() ≡ 0 yields field else "§/§"(out, field), "")
+}
+
+fn parse_representation(list<string> parts, int start) → storage.Representation ⇥ kv.CacheError {
+    const string namespace ← parts.get(start) coalesce ""
+    const string name ← parts.get(start + 1) coalesce ""
+    const string version ← parts.get(start + 2) coalesce ""
+    const string code_text ← parts.get(start + 3) coalesce ""
+    require namespace.length() ≠ 0 and name.length() ≠ 0 and version.length() ≠ 0 throw variant kv.CacheError.BadWire { message = "empty cache representation identity" }
+    reject contains_separator(namespace) or contains_separator(name) or contains_separator(version) throw variant kv.CacheError.BadWire { message = "reserved wire character in cache representation" }
+    const int code ← parse_int(code_text, true)
+    return storage.representation(namespace, name, version, code)
+}
+
+fn parse_block(list<string> parts, int start) → storage.BlockMetadata ⇥ kv.CacheError {
+    const string known_text ← parts.get(start) coalesce ""
+    const string elements_text ← parts.get(start + 1) coalesce ""
+    const string bytes_text ← parts.get(start + 2) coalesce ""
+    const string count_text ← parts.get(start + 3) coalesce ""
+    const string length_text ← parts.get(start + 4) coalesce ""
+    require known_text ≡ "0" or known_text ≡ "1" throw variant kv.CacheError.BadWire { message = "malformed cache block metadata" }
+    const int elements ← parse_int(elements_text, false)
+    const int bytes ← parse_int(bytes_text, false)
+    const int count ← parse_int(count_text, false)
+    const int length ← parse_int(length_text, false)
+    if known_text ≡ "1" {
+        const storage.BlockMetadata block ← storage.known_block(elements, bytes, count, length)
+        require storage.block_valid(block) throw variant kv.CacheError.BadWire { message = "invalid known cache block metadata" }
+        return block
+    }
+    require elements ≡ 0 and bytes ≡ 0 and count ≡ 0 and length ≥ 0 throw variant kv.CacheError.BadWire { message = "invalid unknown cache block metadata" }
+    return storage.unknown_block(length)
 }
 
 # Convert-or-record: wire validation and conversion must retain the exact
@@ -88,10 +189,10 @@ fn serialize_identity(CacheIdentity i) → string {
 fn deserialize_identity(string wire) → CacheIdentity ⇥ kv.CacheError {
     # --- wire header (fail closed) -------------------------------------------
     const list<string> parts ← wire.split("/")
-    require parts.length() ≡ 12 throw variant kv.CacheError.BadWire { message = "malformed cache identity wire" }
+    require parts.length() ≡ 29 throw variant kv.CacheError.BadWire { message = "malformed cache identity wire" }
     require parts.get(0) coalesce "" ≡ "cache" throw variant kv.CacheError.BadWire { message = "unknown cache marker" }
     require parts.get(1) coalesce "" ≡ "identity" throw variant kv.CacheError.BadWire { message = "unknown cache marker" }
-    require parts.get(2) coalesce "" ≡ kv.SCHEMA_VERSION throw variant kv.CacheError.UnknownVersion { message = "unknown cache schema version" }
+    require parts.get(2) coalesce "" ≡ IDENTITY_SCHEMA_VERSION throw variant kv.CacheError.UnknownVersion { message = "unknown cache schema version" }
     # --- field admission (fail closed) ---------------------------------------
     const string model ← parts.get(3) coalesce ""
     const string model_version ← parts.get(4) coalesce ""
@@ -100,8 +201,11 @@ fn deserialize_identity(string wire) → CacheIdentity ⇥ kv.CacheError {
     var string history ← parts.get(7) coalesce ""
     const string position ← parts.get(8) coalesce ""
     const string layers_text ← parts.get(9) coalesce ""
-    const string dtype ← parts.get(10) coalesce ""
-    const string layout ← parts.get(11) coalesce ""
+    const storage.Representation key_representation ← parse_representation(parts, 10)
+    const storage.BlockMetadata key_block ← parse_block(parts, 14)
+    const storage.Representation value_representation ← parse_representation(parts, 19)
+    const storage.BlockMetadata value_block ← parse_block(parts, 23)
+    const string layout ← parts.get(28) coalesce ""
     require model.length() ≠ 0 throw variant kv.CacheError.BadWire { message = "empty model name in cache identity" }
     require model_version.length() ≠ 0 throw variant kv.CacheError.BadWire { message = "empty model version in cache identity" }
     require config.length() ≠ 0 throw variant kv.CacheError.BadWire { message = "empty execution config in cache identity" }
@@ -119,9 +223,8 @@ fn deserialize_identity(string wire) → CacheIdentity ⇥ kv.CacheError {
         throw variant kv.CacheError.BadWire { message = "malformed layer count in cache identity" }
     }
     require layers ≥ 1 throw variant kv.CacheError.BadWire { message = "invalid layer count in cache identity" }
-    require dtype.length() ≠ 0 throw variant kv.CacheError.BadWire { message = "empty dtype in cache identity" }
     require layout.length() ≠ 0 throw variant kv.CacheError.BadWire { message = "empty layout in cache identity" }
-    return CacheIdentity { model = model, model_version = model_version, config = config, tokenizer = tokenizer, history = history, position = position, layers = layers, dtype = dtype, layout = layout }
+    return CacheIdentity { model = model, model_version = model_version, config = config, tokenizer = tokenizer, history = history, position = position, layers = layers, key_representation = key_representation, key_block = key_block, value_representation = value_representation, value_block = value_block, layout = layout }
 }
 
 # -------------------------------------------------------------------------

@@ -111,8 +111,8 @@ The pre-1.0 correctness wave remains recorded as semantic history:
 | --- | --- | --- |
 | `3c295c0` | Corrected the internal big-endian serialization readers | Private-helper correctness fix — no external migration |
 | `6cc0eb5` | Restored tokenizer admission polarity for the pinned add-* flags and positive BOS/space facts | Admission-behavior correction — no public-name change |
-| `2cdc498` | Enforced the exact pinned EOG set `{0,2}` during capsule admission | Identity rule — see §4 |
-| `0d50d60` | Stopped generation after the first admitted EOG token | Semantic correction — pinned oracle/docs reconciled |
+| `2cdc498` | Enforced the then-selected fixture EOG set `{0,2}` during capsule admission | Historical fixture rule, superseded by artifact-owned EOG metadata |
+| `0d50d60` | Stopped generation after the first configured EOG token | Semantic correction; the token set is now caller supplied |
 
 Private proof-shape helper retirement is recorded in
 `docs/factory/production-ml-library/pml0-proof-api-ledger.md`. It is
@@ -122,18 +122,17 @@ bookkeeping, not an external compatibility surface.
 
 ### EOG-set identity rule
 
-A different EOG set is a different tokenizer. The admitted row pins the EOG
-set exactly: `{0,2}` (EOS 2, UNK 0). Capsule admission enforces the exact set,
-and a well-formed-but-different set fails closed as an identity rejection. The
-`tokenizer.is_eog` predicate binds the generation stop policy.
+A different EOG set is a different tokenizer identity. Tokenizer admission
+preserves any well-formed caller or artifact supplied set. Generation copies
+that set into `GenerationConfig.eog_ids`; `generation.is_eog` and the
+ignore-EOG mask consult the configuration rather than a library fixture.
 
 ### Tokenizer identity
 
-Tokenizer identity is the tuple: model (`gpt2`, byte-level BPE) + pre-tokenizer
-(`smollm`) + special-token behavior (BOS-free, space-prefix-free) + vocab
-fingerprint (pinned id lists P1–P11). Any divergence fails closed with
-`ProbeDivergent` — identity is exact, never approximate
-(`fixtures/tokenizer/tokenizer-identity-oracle.md`).
+Tokenizer identity carries the tokenizer algorithm, pre-tokenizer, special
+token behavior, vocabulary digest, and EOG set supplied by the caller. The
+wire validates structure and round-trips those distinctions. Model-specific
+probe lists remain test fixtures rather than public admission policy.
 
 ### KV-cache identity (MD-A9)
 

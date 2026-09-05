@@ -6,18 +6,19 @@ locale = "en"
 # single-block materializer probe).
 # Not importable; discovered only by the faber test path.
 #
-# Proves, at compile level: the positive bind produces a TensorView
-# carrying the manifest-derived view facts (name, physical type id, logical
-# element count, absolute payload start, stored payload length), and each of
-# the five fail-closed bind rows type-checks through the typed error render:
-# unknown name -> UnknownName, absolute-range mismatch -> BadRange,
-# stored-length mismatch -> BadLength, unknown layout -> UnknownLayout,
-# un-admitted physical type -> UnknownDtype. Imported-union variant
-# construction is blocked by the pinned compiler defect (SEM001+SEM008), so
-# the fail-closed cases flow through links's own error channel instead of
-# constructing ViewError values directly; assert assertions run under the
-# cargo-backed `faber test` harness (auditor-owned), while `faber check`
-# proves the whole surface type-checks.
+# Proves, at compile level: the positive bind produces a TensorView carrying
+# the manifest-derived view facts (name, open physical type id, logical
+# element count, absolute payload start, stored payload length), and unknown
+# representations preserve their identity, supplied bytes, and block
+# metadata. Bind errors remain typed for unknown names, range mismatch, and
+# known-layout length mismatch. Decoder failure is a separate materialization
+# concern: a known but unsupported representation binds and fails only when
+# an explicit F32 decode is requested. Imported-union variant construction is
+# blocked by the pinned compiler defect (SEM001+SEM008), so the fail-closed
+# cases flow through links's own error channel instead of constructing
+# ViewError values directly; assert assertions run under the cargo-backed
+# `faber test` harness (auditor-owned), while `faber check` proves the whole
+# surface type-checks.
 #
 # C2-U4 windowed materializer: the `_slice` helper and its cases pin the
 # window contract (whole-block reads in GGUF block order, window bounds /
@@ -42,7 +43,7 @@ import from "gradus:model/tensor_payload" tensor_payload
 
 import from "gradus:model/tensor_view" tensor_view
 
-import from "gradus:model/dequant" dequant
+import from "gradus:storage" storage
 
 const string F_DIGEST ← "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
@@ -111,8 +112,9 @@ fn _corpus_llama() → gguf_manifest.GgufCorpus {
     return _with_padding(table, 32, 336)
 }
 
-# Q4_0 (GGML id 2) stays outside the dequant admitted set. Used only as
-# the fail-closed UnknownDtype oracle after W1-U3 admitted F16 (id 1).
+# Q4_0 (GGML id 2) has known block geometry but no current F32 decoder. It
+# proves that storage binding preserves an unsupported representation and the
+# explicit materializer reports the decoder boundary.
 fn _corpus_q4_0() → gguf_manifest.GgufCorpus {
     var list<int<u8>> table ← _header(1, 0)
     table ← _join(table, _tensor("blk.0.attn_norm.weight", [32], 2, 0))
@@ -137,21 +139,6 @@ fn _corpus_q8() → gguf_manifest.GgufCorpus {
     return _with_padding(table, 32, 164)
 }
 
-# Render the admitted enum back to its pinned wire id for the structural
-# assertions. The view no longer exposes a raw integer to decode callers.
-fn _dtype_id(dequant.GgmlKind kind) → int {
-    match kind {
-        case dequant.GgmlKind.F32 { return 0 }
-        case dequant.GgmlKind.F16 { return 1 }
-        case dequant.GgmlKind.BF16 { return 30 }
-        case dequant.GgmlKind.Q5_0 { return 6 }
-        case dequant.GgmlKind.Q8_0 { return 8 }
-        case dequant.GgmlKind.Q4_K { return 12 }
-        case dequant.GgmlKind.Q5_K { return 13 }
-        case dequant.GgmlKind.Q6_K { return 14 }
-    }
-}
-
 # Render one bind attempt as "name/kind/elements/start/length" or the
 # typed ViewError render.
 fn _view(gguf_manifest.GgufCorpus corpus, string name, int start, int length) → string {
@@ -160,7 +147,29 @@ fn _view(gguf_manifest.GgufCorpus corpus, string name, int start, int length) �
         do {
             const tensor_payload.TensorPayload p ← tensor_payload.TensorPayload {name = name, absolute_start = start, length = length, bytes = ||}
             const tensor_view.TensorView v ← tensor_view.links(m, p)
-            return (((((((v.name + "/") + (_dtype_id(v.dtype_ggml) ↦ string)) + "/") + (v.elements ↦ string)) + "/") + (v.absolute_start ↦ string)) + "/") + (v.payload_length ↦ string)
+            return (((((((v.name + "/") + (v.dtype_ggml ↦ string)) + "/") + (v.elements ↦ string)) + "/") + (v.absolute_start ↦ string)) + "/") + (v.payload_length ↦ string)
+        }
+        catch err {
+            return "ERR:§"(err.message)
+        }
+    }
+    catch err {
+        return "ERR:§"(err.message)
+    }
+}
+
+# Render the open storage fields for a bind whose representation has no
+# manifest geometry. The payload bytes are intentionally shorter than the
+# caller-supplied opaque range length; both values must remain visible.
+fn _encoded_view(gguf_manifest.GgufCorpus corpus, string name, int start, int length) → string {
+    do {
+        const gguf_manifest.GgufManifest m ← gguf_manifest.parse(corpus)
+        do {
+            const list<int<u8>> supplied_list ← [17 ∷ int<u8>, 18 ∷ int<u8>, 19 ∷ int<u8>]
+            const bytes supplied ← supplied_list
+            const tensor_payload.TensorPayload p ← tensor_payload.TensorPayload {name = name, absolute_start = start, length = length, bytes = supplied}
+            const tensor_view.TensorView v ← tensor_view.links(m, p)
+            return (((((storage.identity(v.encoded.representation) + "/") + (v.encoded.payload.length() ↦ string)) + "/") + (v.encoded.block.byte_length ↦ string)) + "/") + (v.encoded.block.elements_per_block ↦ string)
         }
         catch err {
             return "ERR:§"(err.message)
@@ -267,12 +276,13 @@ test "stored-length mismatch fails closed as BadLength" {
     assert _view(_corpus_llama(), "token_embd.weight", 160, 127) ≡ "ERR:payload length does not match the stored layout length"
 }
 
-test "unknown layout fails closed as UnknownLayout" {
-    assert _view(_corpus_qwen35moe(), "blk.0.experts.0.weight", 0, 0) ≡ "ERR:tensor layout is unknown; payload range is unavailable"
+test "unknown representation binds with opaque range metadata" {
+    assert _view(_corpus_qwen35moe(), "blk.0.experts.0.weight", 128, 19) ≡ "blk.0.experts.0.weight/999/24/128/19"
+    assert _encoded_view(_corpus_qwen35moe(), "blk.0.experts.0.weight", 128, 19) ≡ "ggml/unspecified/unknown/999/3/19/0"
 }
 
-test "un-admitted physical type fails closed as UnknownDtype" {
-    assert _view(_corpus_q4_0(), "blk.0.attn_norm.weight", 0, 18) ≡ "ERR:un-admitted GGML type id: 2"
+test "unsupported decoder representation binds and fails at materialization" {
+    assert _view(_corpus_q4_0(), "blk.0.attn_norm.weight", 96, 18) ≡ "blk.0.attn_norm.weight/2/32/96/18"
 }
 
 # Render one single-block materialization as "ok:<element count>" or the
@@ -325,7 +335,7 @@ test "malformed block bytes fail closed as BadRange" {
     assert _slice(_corpus_q8(), "token_embd.weight", 96, 68, 0, 32, _source_nan) ≡ "ERR:block value decode failed: NaN half in dequant block"
 }
 
-test "first-block probe dequantizes one block in GGUF block order" {
+test "first-block probe decodes one block in GGUF block order" {
     assert _block(_corpus_q8(), "token_embd.weight", 96, 68, 0, _source_zero) ≡ "ok:32"
     assert _block(_corpus_q8(), "token_embd.weight", 96, 68, 1, _source_zero) ≡ "ok:32"
 }
@@ -376,4 +386,12 @@ test "source failure fails closed as BadRange" {
 
 test "malformed block bytes fail closed as BadRange" {
     assert _block(_corpus_q8(), "token_embd.weight", 96, 68, 0, _source_nan) ≡ "ERR:block value decode failed: NaN half in dequant block"
+}
+
+test "unsupported representation fails only at explicit F32 decode" {
+    assert _block(_corpus_q4_0(), "blk.0.attn_norm.weight", 96, 18, 0, _source_zero) ≡ "ERR:unsupported GGML representation: ggml/unspecified/q4_0/2"
+}
+
+test "unknown block geometry remains preserved but cannot materialize" {
+    assert _block(_corpus_qwen35moe(), "blk.0.experts.0.weight", 128, 19, 0, _source_zero) ≡ "ERR:tensor layout is unknown; payload range is unavailable"
 }

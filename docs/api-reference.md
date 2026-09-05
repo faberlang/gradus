@@ -1,8 +1,8 @@
 # Gradus API Reference
 
-**Surface**: final English identifier surface after the no-latin conversion (U1–U6), generated from the live `src/**/*.fab` tree.
+**Surface**: final English identifier surface after the no-latin conversion (U1–U6), tracked against the live `src/**/*.fab` tree.
 **Scope**: public Gradus module declarations and their public class methods. Import coordinates remain `gradus:*`.
-**Authority**: `scripta/inventory-public-symbols` checks the live `fn` inventory and verifies every public function name below is documented in its module section.
+**Authority**: `scripta/inventory-public-symbols` is the gate for the live `fn` inventory and public-name coverage. Its declaration baseline needs rebaselining after the current source topology change.
 
 This reference reports declarations from the live source. Private `_`-prefixed helpers are omitted from the public lists. Retained tokens are the proper noun `gradus`, established technical terms (`eog`, `silu`, `signum`, `fim`, `bpe`, `matmul`), dtype/model/format tokens, and external-format keys.
 
@@ -369,14 +369,18 @@ Dtype tags, promotion, narrowing, serialization, and finite/cast checks.
 
 Generation configuration, sampling projection, serialized config, cursor limits, and dense generate routes.
 
-**Source**: `src/generation.fab`
+**Source**: `src/generation.fab` facade; leaves `src/generation/config.fab`,
+`src/generation/decoder.fab`, and `src/generation/dense.fab`
 
 ### Public types
 
-- `union GenerationError` — InvalidConfig, ElementMismatch, DtypeMismatch, Incompatible, UnknownVersion, BadWire, LimitReached, Cancelled, DecodeFailure
-- `union StopPolicy` — Eog, IgnoreEos. `Eog` emits the first admitted EOG `{0, 2}` then halt; `IgnoreEos` suppresses EOG ids from sampling and runs to the `max_tokens` ceiling
+- `union GenerationError` — InvalidConfig, ElementMismatch, DtypeMismatch, Incompatible, UnknownVersion, BadWire, LimitReached, Cancelled, DecodeFailure, SampledAccelerationRejected
+- `union AccelerationMode` — Disabled, ContextLookup
+- `class AccelerationPolicy`
+  - fields: string version, AccelerationMode mode, int min_block, int max_block
+- `union StopPolicy` — Eog, IgnoreEos. `Eog` emits the first configured EOG id then halts; `IgnoreEos` suppresses the configured EOG ids from sampling and runs to the `max_tokens` ceiling
 - `class GenerationConfig`
-  - fields: int context, int max_prompt, int max_tokens, int seed, f32 temperature, int top_k, f32 top_p, f32 min_p, f32 repetition_penalty
+  - fields: int context, int max_prompt, int max_tokens, int seed, f32 temperature, int top_k, f32 top_p, f32 min_p, f32 repetition_penalty, list<int> eog_ids, AccelerationPolicy acceleration
   - methods:
     - `fn context() → int`
     - `fn max_prompt() → int`
@@ -398,10 +402,17 @@ Generation configuration, sampling projection, serialized config, cursor limits,
 ### Public functions
 
 - `fn message(GenerationError e) → string`
+- `fn acceleration_disabled() → AccelerationMode`
+- `fn acceleration_context_lookup() → AccelerationMode`
+- `fn acceleration_mode_name(AccelerationMode m) → string`
+- `fn construct_acceleration(string version, AccelerationMode mode, int min_block, int max_block) → AccelerationPolicy ⇥ GenerationError`
+- `fn default_acceleration() → AccelerationPolicy`
+- `fn acceleration_equal(AccelerationPolicy a, AccelerationPolicy b) → bool`
 - `fn generation_equal(GenerationConfig a, GenerationConfig b) → bool`
-- `fn construct_generation(int context, int max_prompt, int max_tokens, int seed, f32 temperature, int top_k, f32 top_p, f32 min_p, f32 repetition_penalty) → GenerationConfig ⇥ GenerationError`
+- `fn construct_generation_with_policy(int context, int max_prompt, int max_tokens, int seed, f32 temperature, int top_k, f32 top_p, f32 min_p, f32 repetition_penalty, list<int> eog_ids, AccelerationPolicy acceleration) → GenerationConfig ⇥ GenerationError`
+- `fn construct_generation(int context, int max_prompt, int max_tokens, int seed, f32 temperature, int top_k, f32 top_p, f32 min_p, f32 repetition_penalty, list<int> eog_ids) → GenerationConfig ⇥ GenerationError`
 - `fn default() → GenerationConfig`
-- `fn generation_failure(int context, int max_prompt, int max_tokens, int seed) → GenerationConfig ⇥ GenerationError`
+- `fn generation_failure(int context, int max_prompt, int max_tokens, int seed, list<int> eog_ids) → GenerationConfig ⇥ GenerationError`
 - `fn support_flags() → list<string>`
 - `fn admitted_features(string name) → bool`
 - `fn config(GenerationConfig g) → sampling.Config ⇥ GenerationError`
@@ -417,6 +428,7 @@ Generation configuration, sampling projection, serialized config, cursor limits,
 - `fn ignore_eos() → StopPolicy`
 - `fn stop_policy_name(StopPolicy p) → string`
 - `fn stops_on_eog(StopPolicy p) → bool`
+- `fn is_eog(GenerationConfig g, int id) → bool`
 - `fn cursor_after_prompt(GenerationConfig g, int prompt_len) → GenerationCursor ⇥ GenerationError`
 - `fn generate(GenerationConfig g, list<int> prompt_ids, decode.Decoder m) → list<int> ⇥ GenerationError {` — EOG-stop default
 - `fn generate_with_stop(GenerationConfig g, list<int> prompt_ids, decode.Decoder m, StopPolicy stop) → list<int> ⇥ GenerationError`
@@ -474,7 +486,7 @@ Package map facade. No genera.
 
 ## gradus:loss
 
-NumericBlock loss functions and fixed-shape MSE rows.
+Shape-generic typed loss functions and decoded-carrier losses.
 
 **Source**: `src/loss.fab`
 
@@ -485,11 +497,9 @@ NumericBlock loss functions and fixed-shape MSE rows.
 ### Public functions
 
 - `fn message(LossError e) → string`
-- `fn mse(tensor.NumericBlock prediction, tensor.NumericBlock target) → f32 ⇥ LossError`
+- `fn mse<size M, size N>(tensor<f32, [M, N]> prediction, tensor<f32, [M, N]> target) → f32`
+- `fn mse_carrier(tensor.NumericBlock prediction, tensor.NumericBlock target) → f32 ⇥ LossError`
 - `fn cross_entropy(tensor.NumericBlock logits, tensor.NumericBlock target) → f32 ⇥ LossError`
-- `fn mse_2x2(tensor<f32, [2, 2]> prediction, tensor<f32, [2, 2]> target) → f32`
-- `fn mse_4x4(tensor<f32, [4, 4]> prediction, tensor<f32, [4, 4]> target) → f32`
-- `fn mse_2x8(tensor<f32, [2, 8]> prediction, tensor<f32, [2, 8]> target) → f32`
 
 ## gradus:math
 
@@ -545,7 +555,8 @@ Classification accuracy and validated loss/accuracy metric records.
 
 ## gradus:mlp
 
-Two-layer MLP: staged `forward_mlp` over the nn carrier and the annotated training-path companion `forward_mlp_loss`.
+Two-layer MLP: decoded-carrier `forward_mlp` over the nn carrier and the
+annotated training-path companion `forward_mlp_loss`.
 
 **Source**: `src/mlp.fab`
 
@@ -713,23 +724,25 @@ Qwen2 canonical tensor-name resolution and architecture configuration.
 
 ## gradus:model/dequant
 
-CPU dequantization for the admitted GGML block formats.
+CPU F32 decoding for supported encoded representations. Encoded storage
+remains open; this module only decodes representations it understands.
 
 **Source**: `src/model/dequant.fab`
 
 ### Public types
 
-- `union DequantError` — UnknownDtype, BadBlock, BadOrder, BadPayload
+- `union DequantError` — UnsupportedRepresentation, BadBlock, BadOrder, BadPayload
 - `class MinScale`
   - fields: int sc, int m
 
 ### Public functions
 
 - `fn message(DequantError e) → string`
-- `fn block_elements(int kind) → int`
-- `fn block_bytes(int kind) → int`
-- `fn dequantize_block(int kind, list<int<u8>> blocks) → list<f32> ⇥ DequantError`
-- `fn dequantize_order(int kind, list<int<u8>> bytes) → list<f32> ⇥ DequantError`
+- `fn representation_for(int raw) → storage.Representation`
+- `fn block_elements(storage.Representation representation) → int ⇥ DequantError`
+- `fn block_bytes(storage.Representation representation) → int ⇥ DequantError`
+- `fn decode_block_f32(storage.Representation representation, bytes block) → list<f32> ⇥ DequantError`
+- `fn decode_order_f32(storage.Representation representation, bytes payload) → list<f32> ⇥ DequantError`
 
 ## gradus:model/gguf
 
@@ -761,7 +774,7 @@ Bounded GGUF v3 parsing, range inspection, typed metadata, and tensor descriptor
 - `class GgufMetadata`
   - fields: string key, int dtype, bytes payload_wire
 - `class GgufTensorDescriptor`
-  - fields: string name, list<int> shape, int dtype_ggml, int relative_offset, int elements, GgmlLayout layout
+  - fields: string name, list<int> shape, int dtype_ggml, int relative_offset, int elements, GgmlLayout layout, storage.Representation representation, storage.BlockMetadata block
 - `class GgufManifest`
   - fields: artifact.ContentIdentity identity, int version, int alignment, int data_start, int artifact_length, list<GgufMetadata> metadata, list<GgufTensorDescriptor> tensors
 
@@ -957,15 +970,17 @@ Pathless tensor payload carrier with bounded byte ranges.
 
 ## gradus:model/tensor_view
 
-Bounded typed views over tensor payloads and materialization windows.
+Bounded typed views over encoded tensor payloads and materialization windows;
+representation identity and block metadata remain attached to the view while
+decoded F32 values are produced only by materialization.
 
 **Source**: `src/model/tensor_view.fab`
 
 ### Public types
 
-- `union ViewError` — UnknownName, BadRange, BadLength, UnknownLayout, UnknownDtype, BadOrder, BadBounds
+- `union ViewError` — UnknownName, BadRange, BadLength, UnknownLayout, UnsupportedRepresentation, BadOrder, BadBounds, ManifestFailure
 - `class TensorView`
-  - fields: string name, list<int> shape, int dtype_ggml, int elements, gguf_manifest.GgmlLayout layout, int absolute_start, int payload_length
+  - fields: string name, list<int> shape, int dtype_ggml, storage.Representation representation, int elements, gguf_manifest.GgmlLayout layout, storage.BlockMetadata block, storage.EncodedStorage encoded, int absolute_start, int payload_length
 
 ### Public functions
 
@@ -986,17 +1001,24 @@ Differentiable tensor primitives: linear, GELU, LayerNorm, RMSNorm, SiLU, and Sw
 
 ### Public functions
 
-- `fn linear_2x8(tensor<f32, [2, 8]> input, tensor<f32, [8, 8]> weight, tensor<f32, [8]> bias) → tensor<f32, [2, 8]>`
-- `fn layernorm_2x8(tensor<f32, [2, 8]> x, tensor<f32, [8]> scale, tensor<f32, [8]> offset) → tensor<f32, [2, 8]>`
 - `fn message(NnError e) → string`
 - `fn linear<size M, size K, size N>(tensor<f32, [M, K]> x, tensor<f32, [K, N]> w, tensor<f32, [M, N]> b) → tensor<f32, [M, N]>`
+- `fn linear_channel<size M, size K, size N>(tensor<f32, [M, K]> x, tensor<f32, [K, N]> w, tensor<f32, [N]> b) → tensor<f32, [M, N]>`
 - `fn gelu<size M, size N>(tensor<f32, [M, N]> x) → tensor<f32, [M, N]>`
 - `fn linear_carrier(tensor.NumericBlock x, tensor.NumericBlock w, tensor.NumericBlock b) → tensor.NumericBlock ⇥ NnError`
-- `fn gelu(tensor.NumericBlock x) → tensor.NumericBlock ⇥ NnError`
-- `fn layernorm(tensor.NumericBlock x, tensor.NumericBlock scale, tensor.NumericBlock offset, f32 epsilon) → tensor.NumericBlock ⇥ NnError`
-- `fn rmsnorm(tensor.NumericBlock x, tensor.NumericBlock scale, f32 epsilon) → tensor.NumericBlock ⇥ NnError`
-- `fn silu(tensor.NumericBlock x) → tensor.NumericBlock ⇥ NnError`
-- `fn swiglu(tensor.NumericBlock gate, tensor.NumericBlock up, tensor.NumericBlock down_weight, tensor.NumericBlock down_bias) → tensor.NumericBlock ⇥ NnError`
+- `fn gelu_carrier(tensor.NumericBlock x) → tensor.NumericBlock ⇥ NnError`
+- `fn layernorm<size T, size D>(tensor<f32, [T, D]> x, tensor<f32, [D]> scale, tensor<f32, [D]> offset, f32 epsilon) → tensor<f32, [T, D]>`
+- `fn layernorm_carrier(tensor.NumericBlock x, tensor.NumericBlock scale, tensor.NumericBlock offset, f32 epsilon) → tensor.NumericBlock ⇥ NnError`
+- `fn rmsnorm<size T, size D>(tensor<f32, [T, D]> x, tensor<f32, [D]> scale, f32 epsilon) → tensor<f32, [T, D]>`
+- `fn rmsnorm_carrier(tensor.NumericBlock x, tensor.NumericBlock scale, f32 epsilon) → tensor.NumericBlock ⇥ NnError`
+- `fn silu<size M, size N>(tensor<f32, [M, N]> x) → tensor<f32, [M, N]>`
+- `fn silu_carrier(tensor.NumericBlock x) → tensor.NumericBlock ⇥ NnError`
+- `fn swiglu_hidden<size T, size F>(tensor<f32, [T, F]> gate, tensor<f32, [T, F]> up) → tensor<f32, [T, F]>`
+- `fn swiglu<size T, size F, size N>(tensor<f32, [T, F]> gate, tensor<f32, [T, F]> up, tensor<f32, [F, N]> down_weight, tensor<f32, [N]> down_bias) → tensor<f32, [T, N]>`
+- `fn swiglu_carrier(tensor.NumericBlock gate, tensor.NumericBlock up, tensor.NumericBlock down_weight, tensor.NumericBlock down_bias) → tensor.NumericBlock ⇥ NnError`
+- `fn gather<size T, size V, size D>(tensor<f32, [V, D]> table, list<int> ids) → tensor<f32, [T, D]> ⇥ NnError`
+- `fn gather_carrier(tensor.NumericBlock table, list<int> ids) → tensor.NumericBlock ⇥ NnError`
+- `fn transpose_carrier(tensor.NumericBlock t) → tensor.NumericBlock ⇥ NnError`
 
 ## gradus:optimize
 
@@ -1174,7 +1196,9 @@ Versioned byte serialization for dtype, shape, tensor, and parameter values.
 
 ## gradus:shape
 
-Runtime shape validation, rank, bounded element counts, broadcasting, reshape, and expansion.
+Runtime shape validation, rank, checked element counts, broadcasting, reshape,
+and expansion. Shape arithmetic rejects negative dimensions and signed integer
+overflow; it does not impose a general `1_000_000_000` element ceiling.
 
 **Source**: `src/shape.fab`
 
@@ -1192,17 +1216,47 @@ Runtime shape validation, rank, bounded element counts, broadcasting, reshape, a
 - `fn reshape(list<int> shape, list<int> target) → list<int> ⇥ ShapeError`
 - `fn expand(list<int> shape, int target_rank) → list<int> ⇥ ShapeError`
 
+## gradus:storage
+
+Open encoded numeric storage. `EncodedStorage` keeps opaque bytes separate
+from the representation identity and block geometry metadata, so callers can
+retain formats that the current decoder does not understand.
+
+**Source**: `src/storage.fab`
+
+### Public types
+
+- `class Representation`
+  - fields: string namespace, string name, string version, int code
+- `class BlockMetadata`
+  - fields: bool known, int elements_per_block, int bytes_per_block, int block_count, int byte_length
+- `class EncodedStorage`
+  - fields: bytes payload, Representation representation, BlockMetadata block
+
+### Public functions
+
+- `fn representation(string namespace, string name, string version, int code) → Representation`
+- `fn ggml_representation(int code) → Representation`
+- `fn identity(Representation value) → string`
+- `fn known_block(int elements_per_block, int bytes_per_block, int block_count, int byte_length) → BlockMetadata`
+- `fn unknown_block(int byte_length) → BlockMetadata`
+- `fn encoded(bytes payload, Representation representation, BlockMetadata block) → EncodedStorage`
+- `fn complete(EncodedStorage value) → bool`
+- `fn block_valid(BlockMetadata value) → bool`
+
 ## gradus:tensor
 
-The staged tensor carrier with runtime shape/dtype/data validation and indexed access.
+Decoded F32 compute carrier with runtime shape validation and indexed access.
+Encoded model bytes use `gradus:storage` and retain their representation
+metadata separately.
 
 **Source**: `src/tensor.fab`
 
 ### Public types
 
-- `union TensorError` — InvalidShape, ElementMismatch, IndexOutOfBounds
+- `union TensorError` — InvalidShape, ElementMismatch, IndexOutOfBounds, ShapeFailure
 - `class NumericBlock`
-  - fields: dtype.DType dtype, list<int> shape, list<f32> data, int numel, list<int> strides (stride/count cache, computed at construction — W0)
+  - fields: dtype.DType dtype (always F32 for this carrier), list<int> shape, list<f32> data
   - methods:
     - `fn shape() → list<int>`
     - `fn rank() → int`
@@ -1211,14 +1265,17 @@ The staged tensor carrier with runtime shape/dtype/data validation and indexed a
     - `fn valid() → bool`
     - `fn get(list<int> indices) → f32 ⇥ TensorError`
 
+  Derived element-count and stride details are implementation details and are
+  intentionally omitted from this reference.
+
 ### Public functions
 
 - `fn message(TensorError e) → string`
 - `fn default() → NumericBlock`
 - `fn construct(list<f32> data, list<int> shape) → NumericBlock ⇥ TensorError`
-- `fn construct_dtype(list<f32> data, list<int> shape, dtype.DType dtype) → NumericBlock ⇥ TensorError`
+- `fn construct_f32(list<f32> data, list<int> shape) → NumericBlock ⇥ TensorError`
 - `fn fill(list<int> shape, f32 payload) → NumericBlock ⇥ TensorError`
-- `fn stage(dtype.DType dtype, list<int> shape, list<f32> data) → NumericBlock` (trusted-input staging — W0; no validation, library-internal producers only)
+- `fn stage_f32(list<int> shape, list<f32> data) → NumericBlock` (trusted decoded-F32 staging)
 
 ## gradus:tokenizer
 
@@ -1245,7 +1302,6 @@ Tokenizer identity, pinned probes, artifact-backed encoding/decoding, Unicode ca
 
 ### Public functions
 
-- `fn is_eog(int id) → bool`
 - `fn message(TokenizerError e) → string`
 - `fn probe_equal(list<int> a, list<int> b) → bool`
 - `fn probe_id(string pinned) → list<int> ⇥ TokenizerError`
@@ -1282,7 +1338,8 @@ Tokenizer identity, pinned probes, artifact-backed encoding/decoding, Unicode ca
 
 ## gradus:train
 
-Training steps, learning-rate schedules, modes, RNG, dropout, and checkpoints.
+Learning-rate schedules, modes, RNG, dropout, and checkpoints. Parameter
+updates are composed from explicit gradients and optimizer state.
 
 **Source**: `src/train.fab`
 
@@ -1326,10 +1383,6 @@ Training steps, learning-rate schedules, modes, RNG, dropout, and checkpoints.
 
 ### Public functions
 
-- `fn train_step_2x2(tensor<f32, [2, 2]> weight, tensor<f32, [2, 2]> bias, tensor<f32, [2, 2]> grad_weight, tensor<f32, [2, 2]> grad_bias, f32 lr) → tuple<tensor<f32, [2, 2]>, tensor<f32, [2, 2]>>`
-- `fn train_step_4x4(tensor<f32, [4, 4]> weight1, tensor<f32, [4, 4]> bias1, tensor<f32, [4, 4]> weight2, tensor<f32, [4, 4]> bias2, tensor<f32, [4, 4]> grad_weight1, tensor<f32, [4, 4]> grad_bias1, tensor<f32, [4, 4]> grad_weight2, tensor<f32, [4, 4]> grad_bias2, f32 lr) → tuple<tensor<f32, [4, 4]>, tensor<f32, [4, 4]>, tensor<f32, [4, 4]>, tensor<f32, [4, 4]>>`
-- `fn train_step_bert_linear(tensor<f32, [8, 8]> wq, tensor<f32, [8]> bq, tensor<f32, [8, 8]> wk, tensor<f32, [8]> bk, tensor<f32, [8, 8]> wv, tensor<f32, [8]> bv, tensor<f32, [8, 8]> wo, tensor<f32, [8]> bo, tensor<f32, [8, 8]> wf1, tensor<f32, [8]> bf1, tensor<f32, [8, 8]> wf2, tensor<f32, [8]> bf2, tensor<f32, [8, 8]> gwq, tensor<f32, [8]> gbq, tensor<f32, [8, 8]> gwk, tensor<f32, [8]> gbk, tensor<f32, [8, 8]> gwv, tensor<f32, [8]> gbv, tensor<f32, [8, 8]> gwo, tensor<f32, [8]> gbo, tensor<f32, [8, 8]> gwf1, tensor<f32, [8]> gbf1, tensor<f32, [8, 8]> gwf2, tensor<f32, [8]> gbf2, f32 lr) → tuple<tensor<f32, [8, 8]>, tensor<f32, [8]>, tensor<f32, [8, 8]>, tensor<f32, [8]>, tensor<f32, [8, 8]>, tensor<f32, [8]>, tensor<f32, [8, 8]>, tensor<f32, [8]>, tensor<f32, [8, 8]>, tensor<f32, [8]>, tensor<f32, [8, 8]>, tensor<f32, [8]>>`
-- `fn train_step_bert_layernorm(tensor<f32, [8]> ln1_s, tensor<f32, [8]> ln1_o, tensor<f32, [8]> ln2_s, tensor<f32, [8]> ln2_o, tensor<f32, [8]> ln3_s, tensor<f32, [8]> ln3_o, tensor<f32, [8]> gln1_s, tensor<f32, [8]> gln1_o, tensor<f32, [8]> gln2_s, tensor<f32, [8]> gln2_o, tensor<f32, [8]> gln3_s, tensor<f32, [8]> gln3_o, f32 lr) → tuple<tensor<f32, [8]>, tensor<f32, [8]>, tensor<f32, [8]>, tensor<f32, [8]>, tensor<f32, [8]>, tensor<f32, [8]>>`
 - `fn message(TrainError e) → string`
 - `fn construct_schedule(f32 rate_vertex, int warmup, int total_steps, f32 rate_end) → Schedule ⇥ TrainError`
 - `fn default_schedule() → Schedule`
@@ -1354,7 +1407,8 @@ Training steps, learning-rate schedules, modes, RNG, dropout, and checkpoints.
 
 ## gradus:transformer
 
-Fixed-shape and runtime-carrier transformer blocks, including cached block evaluation.
+Generic runtime-carrier and typed transformer blocks, including block
+evaluation and optional cached routes.
 
 **Source**: `src/transformer.fab`
 
@@ -1377,7 +1431,6 @@ Fixed-shape and runtime-carrier transformer blocks, including cached block evalu
 
 ### Public functions
 
-- `fn bert_tiny_block_2x8(tensor<f32, [2, 8]> x, tensor<f32, [8]> ln1_s, tensor<f32, [8]> ln1_o, tensor<f32, [8, 8]> wq, tensor<f32, [8]> bq, tensor<f32, [8, 8]> wk, tensor<f32, [8]> bk, tensor<f32, [8, 8]> wv, tensor<f32, [8]> bv, tensor<f32, [8, 8]> wo, tensor<f32, [8]> bo, tensor<f32, [8]> ln2_s, tensor<f32, [8]> ln2_o, tensor<f32, [8, 8]> wf1, tensor<f32, [8]> bf1, tensor<f32, [8, 8]> wf2, tensor<f32, [8]> bf2, tensor<f32, [8]> ln3_s, tensor<f32, [8]> ln3_o, tensor<f32, [2, 2]> scale) → tensor<f32, [2, 8]>`
 - `fn message(TransformerError e) → string`
 - `fn transformer_block(tensor.NumericBlock x, tensor.NumericBlock ln1_s, tensor.NumericBlock ln1_o, tensor.NumericBlock wq, tensor.NumericBlock bq, tensor.NumericBlock wk, tensor.NumericBlock bk, tensor.NumericBlock wv, tensor.NumericBlock bv, tensor.NumericBlock wo, tensor.NumericBlock bo, tensor.NumericBlock ln2_s, tensor.NumericBlock ln2_o, tensor.NumericBlock wf1, tensor.NumericBlock bf1, tensor.NumericBlock wf2, tensor.NumericBlock bf2, tensor.NumericBlock ln3_s, tensor.NumericBlock ln3_o, f32 scale, int mode, list<int> positions, int dim) → tensor.NumericBlock ⇥ TransformerError`
 - `fn dense_block(tensor.NumericBlock x, list<int> positions, DenseAttentionWeights attention_weights, DenseAttentionConfig attention_config, DenseMlpWeights mlp_weights, DenseNormConfig norm_config) → tensor.NumericBlock ⇥ TransformerError`
@@ -1405,4 +1458,7 @@ Shared proba-support helpers (U4a quality wave — proba do/catch deblock).
 
 The inventory gate re-counts every live declaration and checks that every non-private public function name occurs in the corresponding `## gradus:<module>` section. Per-module count re-baseline is a separate enforcement-gate unit. Coverage of the names above is the documentation contract.
 
-**Live declaration total** (grep `fn ` across `src/**/*.fab`): `979`. Public coverage is by name, not by the raw declaration count (class methods, `_` helpers, and comment matches are included in the grep total).
+The declaration total is intentionally omitted until the inventory baseline is
+rebaselined against the current nested module tree. Public coverage is by
+name, not by a raw declaration count (class methods, `_` helpers, and comment
+matches are included in the grep total).

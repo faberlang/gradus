@@ -13,9 +13,11 @@ device-neutral contracts. Foundation modules (`gradus:dtype`, `gradus:shape`,
 `gradus:tensor`, `gradus:math`) feed loss, optimizers, and neural-network
 primitives; those compose into attention and transformer blocks;
 model-admission modules bind GGUF and Safetensors artifacts into typed
-capsules without retaining paths or whole-model payloads; decode, cache,
-sampling, and generation sit on the same forward row. Import the leaf that
-owns the type you use (`gradus:loss`, `gradus:nn`,
+capsules without retaining paths or whole-model payloads. Decoded F32 compute
+carriers and opaque encoded storage are separate surfaces: use
+`gradus:tensor` for computation and `gradus:storage` for bytes plus
+representation metadata. Decode, cache, sampling, and generation sit on the
+same forward row. Import the leaf that owns the type you use (`gradus:loss`, `gradus:nn`,
 `gradus:model/gguf_manifest`) — the façade does not re-export genera.
 
 ## Smallest useful program
@@ -54,7 +56,7 @@ main {
     const list<int> shape_2x2 ← [2, 2]
     const tensor<f32, [2, 2]> prediction ← seed.from_flat([1.0, 2.0, 3.0, 4.0], shape_2x2)
     const tensor<f32, [2, 2]> target ← seed.from_flat([1.0, 2.0, 3.0, 3.0], shape_2x2)
-    const f32 value ← loss.mse_2x2(prediction, target)
+    const f32 value ← loss.mse(prediction, target)
     print value
 }
 ```
@@ -63,7 +65,7 @@ main {
 faber check .
 ```
 
-`loss.mse_2x2` is mean squared error over a 2×2 f32 pair; these inputs yield
+`loss.mse` is mean squared error over the 2×2 f32 fixture; these inputs yield
 `0.25`. `faber check` is the standing proof that the import and call
 type-check. The training-loop package proof runs its library-to-library calls
 on the FMIR stepper (radix `43c0102ba`, regression-locked by `2e8042ae7`).

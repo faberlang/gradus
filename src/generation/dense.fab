@@ -12,7 +12,6 @@ import from "gradus:decode" decode
 import from "gradus:model/dense" dense
 import from "gradus:sampling" sampling
 import from "gradus:tensor" tensor
-import from "gradus:tokenizer/identity" identity
 import from "gradus:train" train
 
 fn dense_one(DenseEngine engine, (string, int) → tensor.NumericBlock ⇥ dense.DenseError source, int token_id, int position, list<kv.KVCache> layers) → dense.DenseStep ⇥ config.GenerationError {
@@ -69,23 +68,23 @@ fn logit_row(tensor.NumericBlock logits, int row, int vocab) → list<f32> ⇥ c
     return out
 }
 
-fn draw_target_ids(tensor.NumericBlock logits, int rows, int vocab, sampling.Config drawn, train.Seed rng, decoder.StopPolicy stop) → list<int> ⇥ config.GenerationError {
+fn draw_target_ids(tensor.NumericBlock logits, int rows, int vocab, sampling.Config drawn, train.Seed rng, config.GenerationConfig g, decoder.StopPolicy stop) → list<int> ⇥ config.GenerationError {
     var list<int> out ← empty
     for range 0‥rows const row {
         const list<f32> values ← logit_row(logits, row, vocab)
-        const sampling.Sampler target ← decoder.sample(decoder.sample_logits(values, stop), drawn, empty, rng)
+        const sampling.Sampler target ← decoder.sample(decoder.sample_logits(values, g, stop), drawn, empty, rng)
         out.append(target.token_id)
     }
     return out
 }
 
-fn accepted_prefix(list<int> ids, int count, decoder.StopPolicy stop) → int {
+fn accepted_prefix(list<int> ids, int count, config.GenerationConfig g, decoder.StopPolicy stop) → int {
     if not decoder.stops_on_eog(stop) {
         return count
     }
     # The count selects a prefix, so the source list cannot be walked to its end.
     for range 0‥count const i {
-        if identity.is_eog(ids.get(i) coalesce (-1)) {
+        if decoder.is_eog(g, ids.get(i) coalesce (-1)) {
             return i + 1
         }
     }
@@ -199,10 +198,9 @@ fn commit_dense_block(list<kv.KVCache> base, dense.DenseStep verified, list<int>
 
 # Public generate: config + prompt ids + the admitted decoder.
 # Prefill produces the last-row logits; each later step is
-# decode_data + sampling.sample. Default stop is Eog: halt after the
-# first EOG token (identity.is_eog — set {0, 2}) or at the cursor
-# ceiling. generate_with_stop / generate_cancelled_with_stop take an
-# explicit decoder.StopPolicy. The KV-wired loop is generate_dense.
+# decode_data + sampling.sample. EOG ids come from GenerationConfig; the
+# StopPolicy selects whether generation stops or suppresses those ids. The
+# KV-wired loop is generate_dense.
 # --- dense generation ----------------------------------------------------
 @ public
 class DenseEngine {
@@ -224,9 +222,7 @@ fn default_dense_engine() → DenseEngine {
 }
 
 # Same loop as generate, over dense.decode_step and a per-layer KV cache.
-# Used by the SmolLM2 oracle example. Default EOG-stop applies: SmolLM2
-# EOS=2 is in the admitted set {0, 2}, so a greedy continuation that
-# would have been G1's unrestrained [30, 2, 198] becomes [30, 2].
+# The model or artifact supplies the EOG ids through GenerationConfig.
 # generate_dense_with_stop(IgnoreEos) suppresses EOG from sampling and
 # runs to max_tokens — the U5 / llama.cpp ignore_eos row.
 @ public
@@ -238,6 +234,7 @@ fn generate_dense(config.GenerationConfig g, list<int> prompt_ids, DenseEngine e
 fn generate_dense_with_stop(config.GenerationConfig g, list<int> prompt_ids, DenseEngine engine, (string, int) → tensor.NumericBlock ⇥ dense.DenseError source, list<kv.KVCache> layers, decode.Cancellation cancel, decoder.StopPolicy stop) → list<int> ⇥ config.GenerationError {
     decoder.observe(cancel)
     require prompt_ids.length() ≥ 1 throw variant config.GenerationError.InvalidConfig {message = "needs at least one prompt token"}
+    require prompt_ids.length() ≤ g.max_prompt throw variant config.GenerationError.InvalidConfig {message = "prompt length exceeds max_prompt"}
     require prompt_ids.length() ≺ g.context throw variant config.GenerationError.InvalidConfig {message = "prompt length does not fit context"}
     const string acceleration_mode ← config.acceleration_mode_name(g.acceleration.mode)
     if acceleration_mode ≡ "context_lookup" {
@@ -258,13 +255,13 @@ fn generate_dense_with_stop(config.GenerationConfig g, list<int> prompt_ids, Den
     while decoder.token_allowed(g, cursor) and not finished {
         decoder.observe(cancel)
         if acceleration_mode ≡ "disabled" {
-            const sampling.Sampler outcome ← decoder.sample(decoder.sample_logits(last, stop), drawn, history, rng)
+            const sampling.Sampler outcome ← decoder.sample(decoder.sample_logits(last, g, stop), drawn, history, rng)
             const int token ← outcome.token_id
             tokens.append(token)
             history.append(token)
             rng ← outcome.seed
             cursor ← decoder.cursor_advance(g, cursor)
-            if identity.is_eog(token) and decoder.stops_on_eog(stop) {
+            if decoder.is_eog(g, token) and decoder.stops_on_eog(stop) {
                 finished ← true
             }
             else {
@@ -282,13 +279,13 @@ fn generate_dense_with_stop(config.GenerationConfig g, list<int> prompt_ids, Den
             const int block_size ← g.acceleration.max_block
             const list<int> candidate_ids ← lookup_candidates(prompt_ids, history, block_size)
             if candidate_ids.length() ≡ 0 {
-                const sampling.Sampler outcome ← decoder.sample(decoder.sample_logits(last, stop), drawn, history, rng)
+                const sampling.Sampler outcome ← decoder.sample(decoder.sample_logits(last, g, stop), drawn, history, rng)
                 const int token ← outcome.token_id
                 tokens.append(token)
                 history.append(token)
                 rng ← outcome.seed
                 cursor ← decoder.cursor_advance(g, cursor)
-                if identity.is_eog(token) and decoder.stops_on_eog(stop) {
+                if decoder.is_eog(g, token) and decoder.stops_on_eog(stop) {
                     finished ← true
                 }
                 else {
@@ -314,20 +311,20 @@ fn generate_dense_with_stop(config.GenerationConfig g, list<int> prompt_ids, Den
                 var list<int> target_ids ← empty
                 if attempt_ok {
                     do {
-                        target_ids ← draw_target_ids(verified.logits, candidate_ids.length(), engine.architecture.vocab, drawn, rng, stop)
+                        target_ids ← draw_target_ids(verified.logits, candidate_ids.length(), engine.architecture.vocab, drawn, rng, g, stop)
                     }
                     catch err {
                         attempt_ok ← false
                     }
                 }
                 if not attempt_ok {
-                    const sampling.Sampler outcome ← decoder.sample(decoder.sample_logits(last, stop), drawn, history, rng)
+                    const sampling.Sampler outcome ← decoder.sample(decoder.sample_logits(last, g, stop), drawn, history, rng)
                     const int token ← outcome.token_id
                     tokens.append(token)
                     history.append(token)
                     rng ← outcome.seed
                     cursor ← decoder.cursor_advance(g, cursor)
-                    if identity.is_eog(token) and decoder.stops_on_eog(stop) {
+                    if decoder.is_eog(g, token) and decoder.stops_on_eog(stop) {
                         finished ← true
                     }
                     else {
@@ -348,7 +345,7 @@ fn generate_dense_with_stop(config.GenerationConfig g, list<int> prompt_ids, Den
                     if accepted_count ≻ remaining {
                         accepted_count ← remaining
                     }
-                    accepted_count ← accepted_prefix(candidate_ids, accepted_count, stop)
+                    accepted_count ← accepted_prefix(candidate_ids, accepted_count, g, stop)
                     var decoder.GenerationCursor staged_cursor ← cursor
                     var bool staging_ok ← true
                     do {
@@ -376,13 +373,13 @@ fn generate_dense_with_stop(config.GenerationConfig g, list<int> prompt_ids, Den
                         }
                     }
                     if not staging_ok {
-                        const sampling.Sampler outcome ← decoder.sample(decoder.sample_logits(last, stop), drawn, history, rng)
+                        const sampling.Sampler outcome ← decoder.sample(decoder.sample_logits(last, g, stop), drawn, history, rng)
                         const int token ← outcome.token_id
                         tokens.append(token)
                         history.append(token)
                         rng ← outcome.seed
                         cursor ← decoder.cursor_advance(g, cursor)
-                        if identity.is_eog(token) and decoder.stops_on_eog(stop) {
+                        if decoder.is_eog(g, token) and decoder.stops_on_eog(stop) {
                             finished ← true
                         }
                         else {
@@ -398,43 +395,13 @@ fn generate_dense_with_stop(config.GenerationConfig g, list<int> prompt_ids, Den
                     }
                     else {
                         if accepted_count ≡ 0 {
-                            const sampling.Sampler outcome ← decoder.sample(decoder.sample_logits(last, stop), drawn, history, rng)
-                        const int token ← outcome.token_id
-                        tokens.append(token)
-                        history.append(token)
-                        rng ← outcome.seed
-                        cursor ← decoder.cursor_advance(g, cursor)
-                        if identity.is_eog(token) and decoder.stops_on_eog(stop) {
-                            finished ← true
-                        }
-                        else {
-                            if decoder.token_allowed(g, cursor) {
-                                const dense.DenseStep step ← dense_one(engine, source, token, cursor.session.position - 1, state)
-                                last ← decoder.last_logits(step.logits, engine.architecture.vocab)
-                                state ← step.layers
-                            }
-                            else {
-                                finished ← true
-                            }
-                        }
-                    }
-                    else {
-                        state ← committed
-                        tokens ← copy_prefix(tokens, candidate_ids, accepted_count)
-                        history ← copy_prefix(history, candidate_ids, accepted_count)
-                        cursor ← staged_cursor
-                        last ← staged_last
-                        if decoder.stops_on_eog(stop) and identity.is_eog(candidate_ids.get(accepted_count - 1) coalesce (-1)) {
-                            finished ← true
-                        }
-                        if raw_accepted ≺ candidate_ids.length() and accepted_count ≡ raw_accepted and decoder.token_allowed(g, cursor) and not finished {
-                            const sampling.Sampler outcome ← decoder.sample(decoder.sample_logits(last, stop), drawn, history, rng)
+                            const sampling.Sampler outcome ← decoder.sample(decoder.sample_logits(last, g, stop), drawn, history, rng)
                             const int token ← outcome.token_id
                             tokens.append(token)
                             history.append(token)
                             rng ← outcome.seed
                             cursor ← decoder.cursor_advance(g, cursor)
-                            if identity.is_eog(token) and decoder.stops_on_eog(stop) {
+                            if decoder.is_eog(g, token) and decoder.stops_on_eog(stop) {
                                 finished ← true
                             }
                             else {
@@ -448,11 +415,41 @@ fn generate_dense_with_stop(config.GenerationConfig g, list<int> prompt_ids, Den
                                 }
                             }
                         }
+                        else {
+                            state ← committed
+                            tokens ← copy_prefix(tokens, candidate_ids, accepted_count)
+                            history ← copy_prefix(history, candidate_ids, accepted_count)
+                            cursor ← staged_cursor
+                            last ← staged_last
+                            if decoder.stops_on_eog(stop) and decoder.is_eog(g, candidate_ids.get(accepted_count - 1) coalesce (-1)) {
+                                finished ← true
+                            }
+                            if raw_accepted ≺ candidate_ids.length() and accepted_count ≡ raw_accepted and decoder.token_allowed(g, cursor) and not finished {
+                                const sampling.Sampler outcome ← decoder.sample(decoder.sample_logits(last, g, stop), drawn, history, rng)
+                                const int token ← outcome.token_id
+                                tokens.append(token)
+                                history.append(token)
+                                rng ← outcome.seed
+                                cursor ← decoder.cursor_advance(g, cursor)
+                                if decoder.is_eog(g, token) and decoder.stops_on_eog(stop) {
+                                    finished ← true
+                                }
+                                else {
+                                    if decoder.token_allowed(g, cursor) {
+                                        const dense.DenseStep step ← dense_one(engine, source, token, cursor.session.position - 1, state)
+                                        last ← decoder.last_logits(step.logits, engine.architecture.vocab)
+                                        state ← step.layers
+                                    }
+                                    else {
+                                        finished ← true
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
-    }
     }
     return tokens
 }

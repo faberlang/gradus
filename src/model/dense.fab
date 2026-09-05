@@ -1,15 +1,15 @@
 +++
 locale = "en"
 +++
-# REF-01-U1.8 — dense model assembly (gradus:model/dense).
+# Dense model assembly (gradus:model/dense).
 #
 # Public import: import from "gradus:model/dense" dense
 # Depends on: gradus:attention (RopeConfig), gradus:tensor (staged
-#   carrier), gradus:transformer (dense_block, REF-01-U1.5), gradus:nn
-#   (rmsnorm / linear rows, REF-01-U1.1 / the PML3 surface).
+#   carrier), gradus:transformer (dense_block), gradus:nn (rmsnorm / linear
+#   rows).
 #
 # The complete ordered dense forward graph:
-#   embedding gather → N ordered U1.5 blocks → final RMSNorm → output
+#   embedding gather → N ordered dense blocks → final RMSNorm → output
 #   projection,
 # assembled from the typed architecture config and materialized tensor
 # views via canonical names. The caller supplies a resolver (`source`) that
@@ -40,8 +40,7 @@ locale = "en"
 # and gap reject before the cached block runs, so those cache variants
 # reach the caller instead of a shape mismatch.
 #
-# The F32 row is the admitted row (the composed rows' contract). The
-# surface is forward-only: no autograd import, no gradient path.
+# The surface is forward-only: no autograd import, no gradient path.
 #
 # --- Speculative rollback boundary (SD1) ---------------------------------
 # When the dense route participates in speculative cache rollback, the
@@ -81,9 +80,12 @@ class DenseConfig {
     bool tied
 }
 
-# DenseLayer / DenseModel — pinned weights. Size parameters are the
-# admitted geometry (D hidden, V vocab, Q = H·d, K = KV·d, F MLP).
-# Optional Q/K/V bias is zeros + present=false when the resolver misses.
+# DenseLayer / DenseModel — materialized F32 compute weights. Encoded model
+# storage and arbitrary representation identity live in gradus:storage and
+# gradus:model/tensor_view; `load` is the explicit decode-to-F32 boundary.
+# Size parameters are the admitted geometry (D hidden, V vocab, Q = H·d,
+# K = KV·d, F MLP). Optional Q/K/V bias is zeros + present=false when the
+# resolver misses.
 
 @ public
 class DenseLayer<size D, size Q, size K, size F> {
@@ -227,9 +229,8 @@ fn _collect(tensor.NumericBlock embed, list<int> tokens) → tensor.NumericBlock
     return nn.gather_carrier(embed, tokens)
 }
 
-# REF-01 runners gather through the in-module carrier + concrete pin
-# (GCB-W2-U9 branch (b): the typed nn.gather pin is a MIR-link red, see the
-# nn.fab header record). _collect stays the bag-surface route.
+# The staged gather stays at the carrier boundary; typed shape pins happen
+# only after the generic model loader has resolved a concrete tensor view.
 
 # Absent bias: rank-0 empty carrier. nn.linear_carrier treats this as
 # y = x·w (no [T, N] zero fill, no full add).
@@ -258,8 +259,8 @@ fn _channel_to_rows(tensor.NumericBlock x, tensor.NumericBlock w, tensor.Numeric
     return b
 }
 
-# Optional Q/K/V bias: a resolver miss (SmolLM2 / U1.8 synthetic rows)
-# stays on the verified absent-bias contract. A hit (Qwen2.5 attn_{q,k,v}.bias)
+# Optional Q/K/V bias: a resolver miss stays on the absent-bias contract. A
+# hit (a model's attn_{q,k,v}.bias)
 # is applied after the linear and before RoPE (q/k) or cache-write (v).
 fn _attn_bias((string, int) → tensor.NumericBlock ⇥ DenseError source, string name, int layer, tensor.NumericBlock x, tensor.NumericBlock w) → tensor.NumericBlock ⇥ DenseError {
     var tensor.NumericBlock b ← tensor.default()
@@ -342,15 +343,6 @@ fn _require_cfg(DenseConfig cfg) → bool ⇥ DenseError {
     return true
 }
 
-fn _require_ref01(DenseConfig cfg) → bool ⇥ DenseError {
-    _require_cfg(cfg)
-    require cfg.hidden_dim ≡ 16 throw variant BadConfig {message = "REF-01 load requires hidden_dim 16"}
-    require cfg.vocab ≡ 8 throw variant BadConfig {message = "REF-01 load requires vocab 8"}
-    require cfg.heads * cfg.head_dim ≡ 16 throw variant BadConfig {message = "REF-01 load requires Q width 16"}
-    require cfg.kv_heads * cfg.head_dim ≡ 8 throw variant BadConfig {message = "REF-01 load requires K width 8"}
-    return true
-}
-
 fn _zeros_rank1(int n) → tensor.NumericBlock ⇥ DenseError {
     var list<f32> out ← empty
     for range 0‥n const i {
@@ -397,7 +389,7 @@ fn _pin_same_rank1<size N>(tensor.NumericBlock t, string name) → tensor<f32, [
     }
 }
 
-fn _probe_bias((string, int) → tensor.NumericBlock ⇥ DenseError source, string name, int layer, int n) → BiasBag ⇥ DenseError {
+fn _optional_bias((string, int) → tensor.NumericBlock ⇥ DenseError source, string name, int layer, int n) → BiasBag ⇥ DenseError {
     var tensor.NumericBlock b ← _zeros_rank1(n)
     var bool hit ← false
     do {
@@ -413,9 +405,9 @@ fn _probe_bias((string, int) → tensor.NumericBlock ⇥ DenseError source, stri
     return BiasBag {value = b, present = hit}
 }
 
-# load — resolver → pinned DenseModel. Bag routes still resolve themselves
-# until the unit-4 rewrite. Layer pins stay in this function so D/Q/K/F
-# unify (size params cannot be forwarded as explicit generic arguments).
+# load — resolver → pinned DenseModel. Layer pins stay in this function so
+# D/Q/K/F unify (size params cannot be forwarded as explicit generic
+# arguments).
 @ public
 fn load<size D, size V, size Q, size K, size F>(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ DenseError source) → DenseModel<D, V, Q, K, F> ⇥ DenseError {
     # --- config (fail closed) ---------------------------------------------
@@ -459,11 +451,11 @@ fn load<size D, size V, size Q, size K, size F>(DenseConfig cfg, (string, int) �
         const tensor<f32, [F, D]> wd_t ← _pin_rank2(wd, prefix + ".mlp.down_proj", [f, cfg.hidden_dim])
 
         # --- optional Q/K/V bias ------------------------------------------
-        const BiasBag bq_bag ← _probe_bias(source, prefix + ".self_attn.q_proj.bias", layer, qwidth)
+        const BiasBag bq_bag ← _optional_bias(source, prefix + ".self_attn.q_proj.bias", layer, qwidth)
         const tensor<f32, [Q]> bq ← _pin_same_rank1(bq_bag.value, prefix + ".self_attn.q_proj.bias")
-        const BiasBag bk_bag ← _probe_bias(source, prefix + ".self_attn.k_proj.bias", layer, kwidth)
+        const BiasBag bk_bag ← _optional_bias(source, prefix + ".self_attn.k_proj.bias", layer, kwidth)
         const tensor<f32, [K]> bk ← _pin_same_rank1(bk_bag.value, prefix + ".self_attn.k_proj.bias")
-        const BiasBag bv_bag ← _probe_bias(source, prefix + ".self_attn.v_proj.bias", layer, kwidth)
+        const BiasBag bv_bag ← _optional_bias(source, prefix + ".self_attn.v_proj.bias", layer, kwidth)
         const tensor<f32, [K]> bv ← _pin_same_rank1(bv_bag.value, prefix + ".self_attn.v_proj.bias")
 
         # --- append layer -------------------------------------------------
@@ -481,166 +473,6 @@ fn load<size D, size V, size Q, size K, size F>(DenseConfig cfg, (string, int) �
 
     # --- construct model --------------------------------------------------
     return DenseModel {cfg = cfg, embed = embed, embed_tokens = embed_tokens, norm = norm, w_head = w_head, layers = layers}
-}
-
-# Same-module field read after generic load. Proba calls this so the
-# monomorphization + field projection happens inside dense.fab, not at
-# the proba call site.
-@ public
-fn probe_load_layer_count(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ DenseError source) → int ⇥ DenseError {
-    const DenseModel<16, 8, 16, 8, 16> model ← load<16, 8, 16, 8, 16>(cfg, source)
-    return model.cfg.layers
-}
-
-# Walk generic DenseLayer fields with a glyph. Proves monomorphized
-# field projection on the layer, not just DenseModel.cfg.
-@ public
-fn probe_layer_rms_len(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ DenseError source, list<int> tokens, f32 epsilon) → int ⇥ DenseError {
-    const DenseModel<16, 8, 16, 8, 16> model ← load<16, 8, 16, 8, 16>(cfg, source)
-    const tensor.NumericBlock embed_bag ← tensor.construct(model.embed_tokens ↦ list<f32>, [8, 16])
-    var tensor<f32, [2, 16]> h ← _pin_same(nn.gather_carrier(embed_bag, tokens), "gather")
-    for from model.layers const layer {
-        h ← h.rms_norm(1, epsilon, layer.ln1)
-    }
-    const list<f32> data ← h ↦ list<f32>
-    return data.length()
-}
-
-# DenseLayer → TypedDenseLayer at REF-01 sizes. Size-generic assign is
-# SEM008 (cannot write `_typed<D, Q, K, F>`). Literal sizes only.
-fn _typed_ref01(DenseLayer<16, 16, 8, 16> layer) → transformer.TypedDenseLayer<16, 16, 8, 16> {
-    return transformer.TypedDenseLayer {
-        ln1 = layer.ln1, wq = layer.wq, bq = layer.bq, has_bq = layer.has_bq,
-        wk = layer.wk, bk = layer.bk, has_bk = layer.has_bk,
-        wv = layer.wv, bv = layer.bv, has_bv = layer.has_bv,
-        wo = layer.wo, ln2 = layer.ln2, wg = layer.wg, wu = layer.wu, wd = layer.wd
-    }
-}
-
-# Typed-assembly unit 5 seam: a monomorphized DenseLayer field must assign
-# to the same-shape TypedDenseLayer field, and one static block must run on
-# a layer taken from the generic load (need c7bd96e0 / radix 1fd242b43).
-@ public
-fn probe_typed_block_static(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ DenseError source, list<int> tokens, f32 epsilon, f32 scale, list<int> positions, int rope_dim, rope.RopeConfig rope_cfg) → int ⇥ DenseError {
-    const DenseModel<16, 8, 16, 8, 16> model ← load<16, 8, 16, 8, 16>(cfg, source)
-    const tensor.NumericBlock embed_bag ← tensor.construct(model.embed_tokens ↦ list<f32>, [8, 16])
-    const tensor<f32, [2, 16]> x ← _pin_same(nn.gather_carrier(embed_bag, tokens), "gather")
-    const transformer.DenseAttentionConfig attention_config ← transformer.DenseAttentionConfig {num_heads = model.cfg.heads, num_kv_heads = model.cfg.kv_heads, scale = scale, rope_dim = rope_dim, rope_config = rope_cfg}
-    var tensor<f32, [2, 16]> h ← x
-    for from model.layers const layer {
-        h ← transformer.dense_block_static<2, 16, 16, 8, 16>(h, positions, _typed_ref01(layer), attention_config, epsilon, 2, 16, 16, 8)
-    }
-    const list<f32> data ← h ↦ list<f32>
-    return data.length()
-}
-
-# Glyph probe — namespace generics link but drop type args at package MIR
-# (nn.rmsnorm axis 1 then fires "out of range"). Typed REF-01 uses glyphs.
-@ public
-fn probe_inferred_leaves() → tensor<f32, [2, 4]> ⇥ DenseError {
-    const tensor.NumericBlock raw_x ← tensor.construct([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], [2, 4])
-    const tensor.NumericBlock raw_γ ← tensor.construct([1.0, 1.0, 1.0, 1.0], [4])
-    do {
-        const tensor<f32, [2, 4]> x ← raw_x.data ↦ tensor<f32, [2, 4]>
-        const tensor<f32, [4]> γ ← raw_γ.data ↦ tensor<f32, [4]>
-        const tensor<f32, [2, 4]> y ← x.rms_norm(1, 0.00001 ∷ f32, γ)
-        return y + y
-    }
-    catch conv {
-        throw variant BadShape {message = "probe pin failed"}
-    }
-}
-
-# REF-01 typed runners — generic load + TypedDenseLayer + static
-# assemblers at literal sizes. Public bag `forward` / decode stay until
-# SEM008 can forward size params into `dense_block_static<T, D, Q, K, F>`.
-
-@ public
-fn forward_ref01(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ DenseError source, list<int> tokens, f32 epsilon, f32 scale, list<int> positions, int rope_dim, rope.RopeConfig rope_cfg) → tensor.NumericBlock ⇥ DenseError {
-    # --- sequence (fail closed) -------------------------------------------
-    require tokens.length() ≡ 2 throw variant BadConfig {message = "REF-01 token sequence must be exactly two rows"}
-    require positions.length() ≡ 2 throw variant BadConfig {message = "positions must match the token count"}
-    _require_ref01(cfg)
-
-    # --- load + embed gather ----------------------------------------------
-    const DenseModel<16, 8, 16, 8, 16> model ← load<16, 8, 16, 8, 16>(cfg, source)
-    const tensor.NumericBlock embed_bag ← tensor.construct(model.embed_tokens ↦ list<f32>, [8, 16])
-    const tensor<f32, [2, 16]> x ← _pin_same(nn.gather_carrier(embed_bag, tokens), "gather")
-    const transformer.DenseAttentionConfig attention_config ← transformer.DenseAttentionConfig {num_heads = model.cfg.heads, num_kv_heads = model.cfg.kv_heads, scale = scale, rope_dim = rope_dim, rope_config = rope_cfg}
-
-    # --- per-layer blocks -------------------------------------------------
-    var tensor<f32, [2, 16]> h ← x
-    for from model.layers const layer {
-        h ← transformer.dense_block_static<2, 16, 16, 8, 16>(h, positions, _typed_ref01(layer), attention_config, epsilon, 2, 16, 16, 8)
-    }
-
-    # --- final RMSNorm + output projection --------------------------------
-    const tensor<f32, [2, 16]> hn ← h.rms_norm(1, epsilon, model.norm)
-    const tensor<f32, [2, 8]> y ← hn · model.w_head
-    return tensor.construct(y ↦ list<f32>, [2, 8])
-}
-
-@ public
-fn decode_step_ref01(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ DenseError source, int token_id, int position, f32 epsilon, f32 scale, int rope_dim, rope.RopeConfig rope_cfg, list<kv.KVCache> layers) → DenseStep ⇥ DenseError {
-    # --- cache + token (fail closed) --------------------------------------
-    require layers.length() ≡ cfg.layers throw variant BadConfig {message = "cache layer count must equal the model layer count"}
-    reject (token_id ≺ 0 or token_id ≥ cfg.vocab) throw variant IndexOutOfBounds {message = "token id out of range for the embedding"}
-    require position ≥ 0 throw variant BadConfig {message = "position must be non-negative"}
-    const int prefix_before ← _shared_prefix(layers)
-    require position ≡ prefix_before throw variant Gap {message = "position must equal the cache length"}
-    _admit_cached(layers, 1)
-    _require_ref01(cfg)
-
-    # --- load + embed gather ----------------------------------------------
-    const DenseModel<16, 8, 16, 8, 16> model ← load<16, 8, 16, 8, 16>(cfg, source)
-    const tensor.NumericBlock embed_bag ← tensor.construct(model.embed_tokens ↦ list<f32>, [8, 16])
-    const tensor<f32, [1, 16]> x ← _pin_same(nn.gather_carrier(embed_bag, [token_id]), "gather")
-    const transformer.DenseAttentionConfig attention_config ← transformer.DenseAttentionConfig {num_heads = model.cfg.heads, num_kv_heads = model.cfg.kv_heads, scale = scale, rope_dim = rope_dim, rope_config = rope_cfg}
-
-    # --- per-layer cached blocks ------------------------------------------
-    var tensor<f32, [1, 16]> h ← x
-    var list<kv.KVCache> next ← empty
-    for from model.layers, layers const layer, cache {
-        const transformer.TypedCachedBlock<1, 16> block ← transformer.dense_block_cached_static<1, 16, 16, 8, 16>(h, [position], cache, [token_id], _typed_ref01(layer), attention_config, epsilon, 1, 16, 16, 8)
-        h ← block.output
-        next.append(block.state)
-    }
-
-    # --- final RMSNorm + output projection --------------------------------
-    const tensor<f32, [1, 16]> hn ← h.rms_norm(1, epsilon, model.norm)
-    const tensor<f32, [1, 8]> y ← hn · model.w_head
-    return DenseStep {logits = tensor.construct(y ↦ list<f32>, [1, 8]), layers = next}
-}
-
-@ public
-fn prefill_ref01(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ DenseError source, list<int> tokens, f32 epsilon, f32 scale, int rope_dim, rope.RopeConfig rope_cfg, list<kv.KVCache> layers) → DenseStep ⇥ DenseError {
-    # --- cache + sequence (fail closed) -----------------------------------
-    require tokens.length() ≡ 2 throw variant BadConfig {message = "REF-01 token sequence must be exactly two rows"}
-    require layers.length() ≡ cfg.layers throw variant BadConfig {message = "cache layer count must equal the model layer count"}
-    const int prefix_before ← _shared_prefix(layers)
-    require prefix_before ≡ 0 throw variant Gap {message = "cache write leaves a gap"}
-    _admit_cached(layers, 2)
-    _require_ref01(cfg)
-
-    # --- load + embed gather ----------------------------------------------
-    const DenseModel<16, 8, 16, 8, 16> model ← load<16, 8, 16, 8, 16>(cfg, source)
-    const tensor.NumericBlock embed_bag ← tensor.construct(model.embed_tokens ↦ list<f32>, [8, 16])
-    const tensor<f32, [2, 16]> x ← _pin_same(nn.gather_carrier(embed_bag, tokens), "gather")
-    const transformer.DenseAttentionConfig attention_config ← transformer.DenseAttentionConfig {num_heads = model.cfg.heads, num_kv_heads = model.cfg.kv_heads, scale = scale, rope_dim = rope_dim, rope_config = rope_cfg}
-
-    # --- per-layer cached blocks ------------------------------------------
-    var tensor<f32, [2, 16]> h ← x
-    var list<kv.KVCache> next ← empty
-    for from model.layers, layers const layer, cache {
-        const transformer.TypedCachedBlock<2, 16> block ← transformer.dense_block_cached_static<2, 16, 16, 8, 16>(h, [0, 1], cache, tokens, _typed_ref01(layer), attention_config, epsilon, 2, 16, 16, 8)
-        h ← block.output
-        next.append(block.state)
-    }
-
-    # --- final RMSNorm + output projection --------------------------------
-    const tensor<f32, [2, 16]> hn ← h.rms_norm(1, epsilon, model.norm)
-    const tensor<f32, [2, 8]> y ← hn · model.w_head
-    return DenseStep {logits = tensor.construct(y ↦ list<f32>, [2, 8]), layers = next}
 }
 
 # -------------------------------------------------------------------------
