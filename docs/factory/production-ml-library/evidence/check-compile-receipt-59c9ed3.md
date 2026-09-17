@@ -16,4 +16,4 @@
 
 ## Known red against radix main (residual, out of scope)
 
-The same command against the current radix main binary (92733a2 + working tree) exits 1 with `SEM008:itera_binder_pattern_unsupported` on `for range … const _` binders (SEM008 surface introduced by radix fe0708c81, 2026-08-22 12:16 — after the gradus tip) and `PKG001` on `gradus:nn`/`gradus:dtype` imports. The frozen-tip code is green under the contemporaneous compiler; the current-main failures are a radix-side regression to route separately.
+The same command against the radix main binary at revision 92733a2 + working tree (2026-08-22) exits 1 with `SEM008:itera_binder_pattern_unsupported` on `for range … const _` binders (SEM008 surface introduced by radix fe0708c81, 2026-08-22 12:16 — after the gradus tip) and `PKG001` on `gradus:nn`/`gradus:dtype` imports. The frozen-tip code is green under the contemporaneous compiler; the current-main failures are a radix-side regression to route separately.
