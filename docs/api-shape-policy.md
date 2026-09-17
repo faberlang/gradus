@@ -58,11 +58,14 @@ hard-coded public-API generics. A new admitted row is a new support row in
 `Limites` / `Quantizatio` / `Architectura` field groups are the current
 shape-carriers (PML2, council R3).
 
-## Cross-module variant constraint
+## Cross-module variant policy
 
-Enum variants cannot be referenced across module boundaries in
-library-context checks (SEM001/SEM041 — a language constraint, recorded
-PML1). Consequences:
+Cross-module variant matching works in the compiler — the PML1-era
+constraint is resolved (radix `union-variant-namespace`, 2026-08-10), and
+`SEM001`/`SEM041` now name unrelated live diagnostics
+(`VariableUndefined` / `UnreachablePattern`). The accessor discipline
+below remains a deliberate gradus API policy, not a language constraint.
+Consequences:
 
 - The `DType` tag lives in ONE module (`gradus:dtype`) and is consumed via
   factory functions (`dtype.f32()`), never cross-module variant matching.
@@ -108,13 +111,13 @@ delivery executes unless the operator flips to B2 before TEU7 is tasked.
 TEU7's `done_when` already carries both branches. This ruling does not
 re-open fork 1 (`@ commune`) or the rejected Zig-style `⇥` widening.
 
-**Execution dependency X1** (blocks TEU7, not this ruling): radix
-`compiler-defect-sprint` units `cds-u1-union-match` (registry row 1,
-SEM001 imported-union match) and `cds-u7-generic-construction` +
-`cds-u8-import-binding-collisions` (registry row 9, qualified variant
-construction). The "Cross-module variant constraint" section above still
-states the stale PML1 framing; TEU8 rewrites that paragraph after X1
-lands. TEU6 (`@ commune` mirrors) is independent of this fork.
+**Execution dependency X1: resolved.** The compiler work landed via the
+radix `union-variant-namespace` goal (2026-08-10): imported-union consumer
+matching and qualified variant construction both check green
+(`radix/crates/radix-semantic/src/passes/typecheck/union_pattern_test.rs`
+/ `union_construction_test.rs`). The "Cross-module variant policy"
+section above states the current framing. TEU6 (`@ commune` mirrors) is
+independent of this fork.
 
 ### The two options
 
