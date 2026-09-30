@@ -22,6 +22,7 @@ import from "gradus:model/gguf_manifest" gguf_manifest
 import from "gradus:model/tensor_payload" tensor_payload
 import from "gradus:model/tensor_view" tensor_view
 import from "gradus:nn" nn
+import from "gradus:storage" storage
 import from "gradus:tensor" tensor
 import from "gradus:tokenizer/bpe" tokenizer
 import from "norma:process" process
@@ -189,7 +190,9 @@ fn materialize_named(
     string gguf_name
 ) → tensor.NumericBlock ⇥ PrefillError {
     const tensor_view.TensorView view ← bind_view(m, gguf_name)
-    const int block ← dequant.block_elements(view.dtype_ggml)
+    # Why: `block_elements` fails closed on an un-admitted representation; `⊥ 0`
+    # maps that to 0 so the `block ≺ 1` check below reports it as before.
+    const int block ← dequant.block_elements(view.representation) ⊥ 0
     if block ≺ 1 {
         throw variant MaterializeError { message = "un-admitted GGML type for §"(gguf_name) }
     }
@@ -315,11 +318,13 @@ fn logit_at(tensor.NumericBlock logits, int row, int col) → f32 {
 fn render_f32(f32 x) → string {
     if x ≠ x then return "nan"
     if x ≥ 0.0 {
-        const int n ← (x * 1000000.0) ↦ int
+        # Why: a failable float → int `↦` needs `⊥` in a helper (D17.8); logits are
+        # finite and small, so the default 0 never applies (NaN returned above).
+        const int n ← (x * 1000000.0) ↦ int ⊥ 0
         return n ↦ string
     }
     const f32 abs ← -x
-    const int n ← (abs * 1000000.0) ↦ int
+    const int n ← (abs * 1000000.0) ↦ int ⊥ 0
     return "-§"(n ↦ string)
 }
 
@@ -485,25 +490,34 @@ fn load_floats(string via, int expected) → list<f32> ⇥ PrefillError {
 fn read_u8(string path, int start, int length) → list<int<u8>> {
     const bytes raw ← fs.read_range(path, start, length)
     const value payload ← raw ↦ value
-    const list<int> xs ← payload ↦ list<int>
+    # Why: D17.8 — a failed payload conversion is fatal for this exemplum (it was
+    # an abort before); `panic` states that in a helper that has no `⇥` channel.
+    var list<int> xs ← empty
+    do {
+        xs ← payload ↦ list<int>
+    }
+    catch err {
+        panic "byte payload is not an integer list"
+    }
     var list<int<u8>> out ← empty
     for range 0‥xs.length() const i {
-        out.append((xs.get(i) coalesce 0) ↦ int<u8>)
+        # Why: every element is a byte (0..255), so `⊥ 0` never applies.
+        out.append((xs.get(i) coalesce 0) ↦ int<u8> ⊥ 0)
     }
     return out
 }
 
-fn dequant_bytes(dequant.GgmlKind kind, string path, int start, int length) → list<f32> ⇥ PrefillError {
+fn dequant_bytes(storage.Representation kind, string path, int start, int length) → list<f32> ⇥ PrefillError {
     const list<int<u8>> bytes ← read_u8(path, start, length)
     do {
-        return dequant.dequantize_order(kind, bytes)
+        return dequant.decode_order_f32(kind, bytes ↦ bytes)
     }
     catch err {
         throw variant MaterializeError { message = err.message }
     }
 }
 
-fn row0_from_blocks(dequant.GgmlKind kind, int k, int block_elems, int block_bytes, string path, int abs0, int n) → list<f32> ⇥ PrefillError {
+fn row0_from_blocks(storage.Representation kind, int k, int block_elems, int block_bytes, string path, int abs0, int n) → list<f32> ⇥ PrefillError {
     var list<f32> out ← empty
     for range 0‥n const j {
         const int idx ← j * k
@@ -660,7 +674,7 @@ fn tensor_from(list<f32> data, list<int> shape) → tensor.NumericBlock ⇥ Pref
     }
 }
 
-fn stored_linear(dequant.GgmlKind kind, int k, int n, int block_elems, int block_bytes, string path, int abs0) → tensor.NumericBlock ⇥ PrefillError {
+fn stored_linear(storage.Representation kind, int k, int n, int block_elems, int block_bytes, string path, int abs0) → tensor.NumericBlock ⇥ PrefillError {
     const int elements ← k * n
     const int nbytes ← (elements / block_elems) * block_bytes
     const list<f32> stored ← dequant_bytes(kind, path, abs0, nbytes)
@@ -673,7 +687,7 @@ fn gather_prompt(string path) → tensor.NumericBlock ⇥ PrefillError {
     for from PINNED_TOKENS const tok {
         # Q8_0 embed row: 28 blocks of 32 elems × 34 bytes per 896-wide row.
         const int abs0 ← ORACLE_DATA + ((tok * 896) / 32) * 34
-        const list<f32> row ← dequant_bytes(dequant.GgmlKind.Q8_0, path, abs0, 952)
+        const list<f32> row ← dequant_bytes(dequant.representation_for(8), path, abs0, 952)
         for range 0‥896 const j {
             out.append(row.get(j) coalesce 0.0)
         }
@@ -785,21 +799,21 @@ main {
         print "bytes=§"(total ↦ string)
         print "sha256=§"(digest)
         do {
-            print band_row("q_dequant_head", dequant_bytes(dequant.GgmlKind.Q5_0, path, 160801088, 22), GOLDEN_Q_HEAD, 32, TRACE_BAND)
-            print band_row("q_linear_row0", row0_from_blocks(dequant.GgmlKind.Q5_0, 896, 32, 22, path, 160801088, 32), GOLDEN_Q_ROW0, 32, TRACE_BAND)
-            print band_row("k_dequant_head", dequant_bytes(dequant.GgmlKind.Q5_0, path, 160166720, 22), GOLDEN_K_HEAD, 32, TRACE_BAND)
-            print band_row("k_linear_row0", row0_from_blocks(dequant.GgmlKind.Q5_0, 896, 32, 22, path, 160166720, 32), GOLDEN_K_ROW0, 32, TRACE_BAND)
-            print band_row("v_dequant_head", dequant_bytes(dequant.GgmlKind.Q8_0, path, 161353536, 34), GOLDEN_V_HEAD, 32, TRACE_BAND)
-            print band_row("v_linear_row0", row0_from_blocks(dequant.GgmlKind.Q8_0, 896, 32, 34, path, 161353536, 32), GOLDEN_V_ROW0, 32, TRACE_BAND)
-            print band_row("o_dequant_head", dequant_bytes(dequant.GgmlKind.Q5_0, path, 160245568, 22), GOLDEN_O_HEAD, 32, TRACE_BAND)
-            print band_row("o_linear_row0", row0_from_blocks(dequant.GgmlKind.Q5_0, 896, 32, 22, path, 160245568, 32), GOLDEN_O_ROW0, 32, TRACE_BAND)
-            print band_row("g_dequant_head", dequant_bytes(dequant.GgmlKind.Q5_0, path, 154170176, 22), GOLDEN_G_HEAD, 32, TRACE_BAND)
-            print band_row("g_linear_row0", row0_from_blocks(dequant.GgmlKind.Q5_0, 896, 32, 22, path, 154170176, 32), GOLDEN_G_ROW0, 32, TRACE_BAND)
-            print band_row("u_dequant_head", dequant_bytes(dequant.GgmlKind.Q5_0, path, 157166400, 22), GOLDEN_U_HEAD, 32, TRACE_BAND)
-            print band_row("u_linear_row0", row0_from_blocks(dequant.GgmlKind.Q5_0, 896, 32, 22, path, 157166400, 32), GOLDEN_U_ROW0, 32, TRACE_BAND)
-            print band_row("d_dequant_head", dequant_bytes(dequant.GgmlKind.Q6_K, path, 150595136, 210), GOLDEN_D_HEAD, 32, TRACE_BAND)
-            print band_row("d_linear_row0", row0_from_blocks(dequant.GgmlKind.Q6_K, 4864, 256, 210, path, 150595136, 32), GOLDEN_D_ROW0, 32, TRACE_BAND)
-            print band_row("embed_dequant_head", dequant_bytes(dequant.GgmlKind.Q8_0, path, 5948480, 34), GOLDEN_E_HEAD, 32, TRACE_BAND)
+            print band_row("q_dequant_head", dequant_bytes(dequant.representation_for(6), path, 160801088, 22), GOLDEN_Q_HEAD, 32, TRACE_BAND)
+            print band_row("q_linear_row0", row0_from_blocks(dequant.representation_for(6), 896, 32, 22, path, 160801088, 32), GOLDEN_Q_ROW0, 32, TRACE_BAND)
+            print band_row("k_dequant_head", dequant_bytes(dequant.representation_for(6), path, 160166720, 22), GOLDEN_K_HEAD, 32, TRACE_BAND)
+            print band_row("k_linear_row0", row0_from_blocks(dequant.representation_for(6), 896, 32, 22, path, 160166720, 32), GOLDEN_K_ROW0, 32, TRACE_BAND)
+            print band_row("v_dequant_head", dequant_bytes(dequant.representation_for(8), path, 161353536, 34), GOLDEN_V_HEAD, 32, TRACE_BAND)
+            print band_row("v_linear_row0", row0_from_blocks(dequant.representation_for(8), 896, 32, 34, path, 161353536, 32), GOLDEN_V_ROW0, 32, TRACE_BAND)
+            print band_row("o_dequant_head", dequant_bytes(dequant.representation_for(6), path, 160245568, 22), GOLDEN_O_HEAD, 32, TRACE_BAND)
+            print band_row("o_linear_row0", row0_from_blocks(dequant.representation_for(6), 896, 32, 22, path, 160245568, 32), GOLDEN_O_ROW0, 32, TRACE_BAND)
+            print band_row("g_dequant_head", dequant_bytes(dequant.representation_for(6), path, 154170176, 22), GOLDEN_G_HEAD, 32, TRACE_BAND)
+            print band_row("g_linear_row0", row0_from_blocks(dequant.representation_for(6), 896, 32, 22, path, 154170176, 32), GOLDEN_G_ROW0, 32, TRACE_BAND)
+            print band_row("u_dequant_head", dequant_bytes(dequant.representation_for(6), path, 157166400, 22), GOLDEN_U_HEAD, 32, TRACE_BAND)
+            print band_row("u_linear_row0", row0_from_blocks(dequant.representation_for(6), 896, 32, 22, path, 157166400, 32), GOLDEN_U_ROW0, 32, TRACE_BAND)
+            print band_row("d_dequant_head", dequant_bytes(dequant.representation_for(14), path, 150595136, 210), GOLDEN_D_HEAD, 32, TRACE_BAND)
+            print band_row("d_linear_row0", row0_from_blocks(dequant.representation_for(14), 4864, 256, 210, path, 150595136, 32), GOLDEN_D_ROW0, 32, TRACE_BAND)
+            print band_row("embed_dequant_head", dequant_bytes(dequant.representation_for(8), path, 5948480, 34), GOLDEN_E_HEAD, 32, TRACE_BAND)
             print "lm_head: tied=true — token-major embed, dense.forward transposes to [D,V]"
         }
         catch err {
@@ -811,14 +825,14 @@ main {
         print "trace: Qwen2 layer-0 pos-0 vs pos-16 (Q/K/V+bias, RoPE, mask, cache, frame)"
         do {
             const tensor.NumericBlock gathered ← gather_prompt(path)
-            const list<f32> ln1_w ← dequant_bytes(dequant.GgmlKind.F32, path, 150591552, 3584)
+            const list<f32> ln1_w ← dequant_bytes(dequant.representation_for(0), path, 150591552, 3584)
             const tensor.NumericBlock ln1_s ← tensor_from(ln1_w, [896])
-            const tensor.NumericBlock wq ← stored_linear(dequant.GgmlKind.Q5_0, 896, 896, 32, 22, path, 160801088)
-            const tensor.NumericBlock wk ← stored_linear(dequant.GgmlKind.Q5_0, 896, 128, 32, 22, path, 160166720)
-            const tensor.NumericBlock wv ← stored_linear(dequant.GgmlKind.Q8_0, 896, 128, 32, 34, path, 161353536)
-            const tensor.NumericBlock bq_ch ← tensor_from(dequant_bytes(dequant.GgmlKind.F32, path, 160797504, 3584), [896])
-            const tensor.NumericBlock bk_ch ← tensor_from(dequant_bytes(dequant.GgmlKind.F32, path, 160166208, 512), [128])
-            const tensor.NumericBlock bv_ch ← tensor_from(dequant_bytes(dequant.GgmlKind.F32, path, 161353024, 512), [128])
+            const tensor.NumericBlock wq ← stored_linear(dequant.representation_for(6), 896, 896, 32, 22, path, 160801088)
+            const tensor.NumericBlock wk ← stored_linear(dequant.representation_for(6), 896, 128, 32, 22, path, 160166720)
+            const tensor.NumericBlock wv ← stored_linear(dequant.representation_for(8), 896, 128, 32, 34, path, 161353536)
+            const tensor.NumericBlock bq_ch ← tensor_from(dequant_bytes(dequant.representation_for(0), path, 160797504, 3584), [896])
+            const tensor.NumericBlock bk_ch ← tensor_from(dequant_bytes(dequant.representation_for(0), path, 160166208, 512), [128])
+            const tensor.NumericBlock bv_ch ← tensor_from(dequant_bytes(dequant.representation_for(0), path, 161353024, 512), [128])
             print "bias_q_shape=§"(ids_text(bq_ch.shape))
             print "bias_k_shape=§"(ids_text(bk_ch.shape))
             print "bias_v_shape=§"(ids_text(bv_ch.shape))
