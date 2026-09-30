@@ -1,6 +1,6 @@
 # GOAL: kernel-region-split — convert mixed Gradus functions into wrapper + device region
 
-**Status**: planned — census landed (`f494db2`) and reissued 2026-08-28 under REVISE `1ddc4077` (one-row ledger, `gradient.fab` admitted, `linear_4x4` reclassified annotation-capable, anchors corrected); conversion units carded, none dispatched
+**Status**: done — superseded by gpu-reset (`radix/docs/factory/gpu-reset/CAMPAIGN.md`, 2026-09-29); archived by gpu-reset S0. Prior state: planned — census landed (`f494db2`) and reissued 2026-08-28 under REVISE `1ddc4077` (one-row ledger, `gradient.fab` admitted, `linear_4x4` reclassified annotation-capable, anchors corrected); conversion units carded, none dispatched
 **Created**: 2026-08-28
 **Campaign:** `kernel-region-split`
 **Source:** operator need `3b9e5796` (kernel-region-split conversions — census then unit cards, operator-settled 2026-08-28); lowering task `c78bb834`

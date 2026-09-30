@@ -19,6 +19,12 @@ fork designs or stomp those seats:
 | Device fragments v2 | Visibility rules landed at radix `dd2b52857`: `@ public` entries vs private `@ kernel` / `@ nucleum` helpers | New algebra leaves are **private `@ kernel`** unless they are the public production twin. Assemblers stay ordinary and unannotated. Do not mark a helper `@ public` just to export a glyph |
 | MODEL-03 | Dense-family overlap on the qwen35moe / hybrid state side lands **before** this goal in any sensible order | Do not rewrite MODEL-03 carriers or steal its dense-family names; this goal owns REF-01 host assembly only |
 
+
+> **gpu-reset note (2026-09-29).** This goal stays active but must conform to
+> `radix/docs/factory/gpu-reset/CAMPAIGN.md` settled rules 9–18 (kernels as pure
+> calls, `filum`/`reducta`, runtime extents, implicit residency, logical devices,
+> portable profile). Pre-2026-09-29 GPU goal docs are not authority. Typed dense layers are rule 11's direction; the blocked unit 5 is relevant to C9.
+
 ---
 
 ## Invariant

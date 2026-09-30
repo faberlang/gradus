@@ -9,6 +9,12 @@
 **Related**: [`production-ml-library`](../production-ml-library/CAMPAIGN.md); [`radix device-executor`](../../../../radix/docs/factory/device-executor/goal.md); [`radix kv-cache-decode`](../../../../radix/docs/archived/kv-cache-decode/CAMPAIGN.md); [`Inferentia`](../../../../inferentia/docs/factory/inferentia/CAMPAIGN.md)
 **Campaign readiness**: SD0/SD1 DONE (archived). Current frontier: SD2 spine (U3 in flight, U4→U5 serial) and SD4 remainder (U3 gated on SD2-U5); SD3 waits on settled SD2 handoff + device-executor M4.
 
+> **gpu-reset note (2026-09-29).** This goal stays active but must conform to
+> `radix/docs/factory/gpu-reset/CAMPAIGN.md` settled rules 9–18 (kernels as pure
+> calls, `filum`/`reducta`, runtime extents, implicit residency, logical devices,
+> portable profile). Pre-2026-09-29 GPU goal docs are not authority. Its "Radix/Hosts own compiled multi-row execution" wording predates rules 9–18: execution is the in-process runtime, and the program is the launch graph.
+
+
 ## Summary
 
 Add one explicit, lossless acceleration policy to the current dense generation

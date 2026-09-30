@@ -1,6 +1,6 @@
 # Campaign: MLX Model Bundle Support
 
-**Status**: planned — high-level routing grounded; MLX0 is the first mandatory stage to lower
+**Status**: deferred — after gpu-reset (rule 7: Metal first; `radix/docs/factory/gpu-reset/CAMPAIGN.md`, 2026-09-29). Prior: planned — high-level routing grounded; MLX0 is the first mandatory stage to lower
 **Created**: 2026-08-21
 **Mode**: routing artifact — draft/maintain; does not implement code directly
 **Source**: operator request to support MLX model artifacts in Gradus alongside GGUF

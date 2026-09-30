@@ -1,6 +1,6 @@
 # Campaign: Kernel-Purity Census (OX-Alpha)
 
-**Status**: active — Wave 0 (carrier/admissions ruling + `NumericBlock` rename + stride-cache rider) delivered 2026-08-26, see [`wave-0-carrier-admissions-ruling.md`](wave-0-carrier-admissions-ruling.md); Wave 1 DONE 2026-08-27 — all 15 units accounted (math twins 13df284, nn twins 47d3d69, prior-landed 8; phase audit clean 1c6f1ad9; consumer proof 1d9127f); Wave 2 gate chain lowered and in flight (KPC-SEM landed 16f69d1d2 radix; PKG-ADM/PKG-REP dispatched a5d8c0f0/11948fae; KPC-WIRE/EMIT queued on shared surfaces); Waves 2–3 per §Waves
+**Status**: done — superseded by gpu-reset (`radix/docs/factory/gpu-reset/CAMPAIGN.md`, 2026-09-29); archived by gpu-reset S0. Prior state: active — Wave 0 (carrier/admissions ruling + `NumericBlock` rename + stride-cache rider) delivered 2026-08-26, see [`wave-0-carrier-admissions-ruling.md`](wave-0-carrier-admissions-ruling.md); Wave 1 DONE 2026-08-27 — all 15 units accounted (math twins 13df284, nn twins 47d3d69, prior-landed 8; phase audit clean 1c6f1ad9; consumer proof 1d9127f); Wave 2 gate chain lowered and in flight (KPC-SEM landed 16f69d1d2 radix; PKG-ADM/PKG-REP dispatched a5d8c0f0/11948fae; KPC-WIRE/EMIT queued on shared surfaces); Waves 2–3 per §Waves
 **Created**: 2026-08-26
 **Mode**: routing + delivery record — this campaign owns the census rulings and wave ledger; code lands as normal direct-mode units
 **Control-plane repo**: `/Users/ianzepp/work/faberlang/gradus`

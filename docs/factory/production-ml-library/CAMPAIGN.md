@@ -14,6 +14,12 @@ the historical autograd and nanoGPT architecture source
 **Lowers to**: `delivery` then `factory`
 **Campaign readiness**: **READY FOR DELIVERY — PML5-GGUF-A1c SELECTED**
 
+> **gpu-reset note (2026-09-29).** This goal stays active but must conform to
+> `radix/docs/factory/gpu-reset/CAMPAIGN.md` settled rules 9–18 (kernels as pure
+> calls, `filum`/`reducta`, runtime extents, implicit residency, logical devices,
+> portable profile). Pre-2026-09-29 GPU goal docs are not authority. Its model and format work is gpu-reset C9 donor material; it moves to typed tensors (rule 11) and block-type quantization (rule 17).
+
+
 ## Summary
 
 Turn Gradus from a narrow static-shape proof library into Faber's
