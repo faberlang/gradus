@@ -219,7 +219,7 @@ kernel identity.
 | --- | --- | --- |
 | `head_rmsnorm<D>` | `rms_norm(input, epsilon, weight)` | `[1,D]`, `[D]` → `[1,D]` |
 | `lm_head_gemv<V,D>` | `input · embeddings.transpose()` | `[1,D]`, `[V,D]` → `[1,V]` |
-| `embedding_gather<V,D>` | gather rows from embeddings | `[V,D]`, ids → `[1,D]` |
+| `embedding_gather<V,D>` | gather rows from embeddings | `[V,D]`, `tensor<u32,[1]>` ids → `[1,D]` |
 
 **Embedding row route (design note).** `embedding_gather` receives the
 embedding table and token ids; the selected row geometry is determined by
