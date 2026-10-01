@@ -757,7 +757,7 @@ GGUF row admission into the typed model capsule.
 ### Public functions
 
 - `fn message(GgufError e) → string`
-- `fn admit(list<int<u8>> bytes, string digest, int expected_kv, int expected_tensors, int expected_elements, int expected_f32, int expected_q4k, int expected_q5, int expected_q6, int expected_q8) → capsule.Capsule ⇥ GgufError`
+- `fn admit(list<u8> bytes, string digest, int expected_kv, int expected_tensors, int expected_elements, int expected_f32, int expected_q4k, int expected_q5, int expected_q6, int expected_q8) → capsule.Capsule ⇥ GgufError`
 
 ## gradus:model/gguf_manifest
 
@@ -950,7 +950,7 @@ Safetensors header parsing and row admission into the typed model capsule.
 ### Public functions
 
 - `fn message(SafetensorError e) → string`
-- `fn admit(list<int<u8>> corpus, string digest, string path) → capsule.Capsule ⇥ SafetensorError`
+- `fn admit(list<u8> corpus, string digest, string path) → capsule.Capsule ⇥ SafetensorError`
 
 ## gradus:model/tensor_payload
 

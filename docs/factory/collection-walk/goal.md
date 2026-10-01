@@ -76,7 +76,7 @@ where `i` is not used except to index that same `xs` (including
 | Zip / write-back | two or more aligned collections, or `legacy-L2` comments | `a.layers()` vs `b.layers()`; candidate keys + payloads |
 | Index is identity | vocab id, return-index, replace-at | `tokenizer.is_eog(i)`; `_best_index`; `_find_name` |
 | String walk | `for from s` not proven on `string` | `_hex_ok`, `_numeric`, `_contains_separator` |
-| Bytes walk | `for from o` does not bind `int<u8>` (`SEM010` on `append`) | `_byte_list`, `_join_bytes` |
+| Bytes walk | `for from o` does not bind `u8` (`SEM010` on `append`) | `_byte_list`, `_join_bytes` |
 
 Do not invent a zip combinator. Do not fold tensor `for from grid at [r,c]`
 into this goal — that sibling is already law in `$faber` and
@@ -137,8 +137,8 @@ whole package is not required for closeout.
    `for from` on `string` binds characters. Revisit; do not convert in
    this goal.
 2. **Bytes `for from o`.** Tried in unit 2: `for from o const octet`
-   then `out.append(octet)` is `SEM010` (`list<int<u8>>.append` rejects
-   the bound type). Keep the indexed form with `get(i) coalesce 0 ∷ int<u8>`
+   then `out.append(octet)` is `SEM010` (`list<u8>.append` rejects
+   the bound type). Keep the indexed form with `get(i) coalesce 0 ∷ u8`
    until a dedicated proof lands. Same default as strings.
 3. **Method-call source.** Default: `for from checkpoint.layers() const layer`
    is the spelling (evaluate the getter as the walk source). If check
