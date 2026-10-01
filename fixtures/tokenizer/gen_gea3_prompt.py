@@ -118,12 +118,12 @@ import from "gradus:tokenizer" tokenizer
 import from "norma:process" process
 import from "norma:fs" fs
 
-static int ORACLE_LENGTH = 1449071552
-static int ORACLE_VERSION = 3
-static int ORACLE_ALIGNMENT = 32
-static int ORACLE_DATA_START = 1787072
-static int ORACLE_METADATA = 37
-static int ORACLE_TENSORS = 290
+const int ORACLE_LENGTH = 1449071552
+const int ORACLE_VERSION = 3
+const int ORACLE_ALIGNMENT = 32
+const int ORACLE_DATA_START = 1787072
+const int ORACLE_METADATA = 37
+const int ORACLE_TENSORS = 290
 
 union RunnerError {
     BadArguments { string message },
