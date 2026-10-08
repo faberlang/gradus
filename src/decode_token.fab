@@ -1,0 +1,161 @@
++++
+locale = "en"
++++
+# Decode-token composition (A1-PORT-2): ONE token of a llama-family decoder as a
+# chain of `decode_step` lane-kernel launches, with no host touch of the hidden
+# state or the K/V caches between launches.
+#
+# Public import: import from "gradus:decode_token" dt
+#
+#   embed_step   token id -> hidden[D]           (1 launch)
+#   layer_step   one transformer layer           (21 launches)
+#   head_step    final norm + tied lm_head       (3 launches)  -> logits[V]
+#   argmax_host  greedy pick of a logits tensor  (the ONE host read of a token)
+#
+# A 32-layer token is 1 + 32 * 21 + 3 = 676 launches. Layer launch order:
+#   rms_stats, rms_apply (attn norm); gemv_lane x3 (q, k, v); rope_half x2;
+#   kv_write x2; attn_scores; softmax_stats; softmax_apply; attn_context;
+#   gemv_lane (o); residual_add; rms_stats, rms_apply (ffn norm);
+#   gemv_lane x2 (gate, up); swiglu; gemv_lane (down); residual_add.
+#
+# The layer loop and the per-layer weight lists live in the CALLER, not here:
+# a `list<tensor<f32, [N, K]>>` whose extents are run-time sizes cannot cross a
+# generic host call today (`invalid MIR: call argument type mismatch`, expected
+# `FunctionParameterAxis` extents against the caller's `ScalarBinding` extents),
+# so a gradus-side `token_step(list, ...)` is not expressible; each layer's
+# tensors pass as plain arguments instead.
+#
+# K/V cache protocol: `kv_write` reads the old cache and writes a NEW one (a
+# read and a `mut` of the same tensor would alias), so each layer owns two
+# cache tensors per stream and the caller swaps their roles every token
+# (ping-pong). The caches are only ever passed to kernels.
+#
+# Weights are laid out [out, in] (a GGUF `[ne1, ne0]` row-major matrix).
+# `pos`, dimensions, GQA group and head_dim are `i32` arguments (no `int ↦ i32`
+# outside main; see decode_step.fab).
+
+import from "gradus:decode_step" ds
+
+# hidden[D] <- embed[ids[0], :]
+@ public
+fn embed_step<size V, size D>(tensor<f32, [V, D]> embed, tensor<i32, [1]> ids, mut tensor<f32, [D]> hidden) → void {
+    var tensor<f32, [D]> dom ← tf32[D] {}
+    ds.gather_row(dom, embed, ids, mut hidden)
+}
+
+# One layer: hout = layer(hin) at position `pos`. `hdom` is a zero [H] tensor (the
+# row domain of the softmax statistics launch; it also carries the head count). `kin`/`vin` are the caches
+# before this token, `kout`/`vout` the caches with row `pos` written.
+@ public
+fn layer_step<size D, size QD, size KVD, size F, size H, size C>(
+    tensor<f32, [H]> hdom,
+    tensor<f32, [D]> hin,
+    mut tensor<f32, [D]> hout,
+    tensor<f32, [D]> anorm,
+    tensor<f32, [QD, D]> wq,
+    tensor<f32, [KVD, D]> wk,
+    tensor<f32, [KVD, D]> wv,
+    tensor<f32, [D, QD]> wo,
+    tensor<f32, [D]> fnorm,
+    tensor<f32, [F, D]> wg,
+    tensor<f32, [F, D]> wu,
+    tensor<f32, [D, F]> wd,
+    tensor<f32, [C, KVD]> kin,
+    mut tensor<f32, [C, KVD]> kout,
+    tensor<f32, [C, KVD]> vin,
+    mut tensor<f32, [C, KVD]> vout,
+    i32 pos,
+    i32 pd,
+    i32 pqd,
+    i32 pf,
+    i32 pc,
+    i32 pdh,
+    i32 pspan,
+    i32 pgroup,
+    f32 peps,
+    f32 plntheta,
+    f32 pscale
+) → void {
+    var tensor<f32, [1]> dom1 ← tf32[1] {}
+    var tensor<f32, [1]> st1 ← tf32[1] {}
+    var tensor<f32, [D]> an ← tf32[D] {}
+    ds.rms_stats(dom1, hin, mut st1, pd, peps)
+    ds.rms_apply(hin, st1, anorm, mut an)
+
+    var tensor<f32, [QD]> qdom ← tf32[QD] {}
+    var tensor<f32, [KVD]> kvdom ← tf32[KVD] {}
+    var tensor<f32, [QD]> q ← tf32[QD] {}
+    var tensor<f32, [KVD]> k ← tf32[KVD] {}
+    var tensor<f32, [KVD]> v ← tf32[KVD] {}
+    ds.gemv_lane(qdom, wq, an, mut q, pd)
+    ds.gemv_lane(kvdom, wk, an, mut k, pd)
+    ds.gemv_lane(kvdom, wv, an, mut v, pd)
+
+    var tensor<f32, [QD]> qr ← tf32[QD] {}
+    var tensor<f32, [KVD]> kr ← tf32[KVD] {}
+    ds.rope_half(q, mut qr, pos, pspan, plntheta)
+    ds.rope_half(k, mut kr, pos, pspan, plntheta)
+    ds.kv_write(kin, kr, mut kout, pos)
+    ds.kv_write(vin, v, mut vout, pos)
+
+    var tensor<f32, [H, C]> hc ← tf32[H, C] {}
+    var tensor<f32, [H, C]> sc ← tf32[H, C] {}
+    var tensor<f32, [H]> mx ← tf32[H] {}
+    var tensor<f32, [H]> sm ← tf32[H] {}
+    var tensor<f32, [H, C]> pr ← tf32[H, C] {}
+    var tensor<f32, [QD]> ctx ← tf32[QD] {}
+    ds.attn_scores(hc, qr, kout, mut sc, pos, pgroup, pdh, pscale)
+    ds.softmax_stats(hdom, sc, mut mx, mut sm, pc)
+    ds.softmax_apply(sc, mx, sm, mut pr)
+    ds.attn_context(qdom, pr, vout, mut ctx, pos, pgroup, pdh)
+
+    var tensor<f32, [D]> ddom ← tf32[D] {}
+    var tensor<f32, [D]> ao ← tf32[D] {}
+    var tensor<f32, [D]> h1 ← tf32[D] {}
+    ds.gemv_lane(ddom, wo, ctx, mut ao, pqd)
+    ds.residual_add(hin, ao, mut h1)
+
+    var tensor<f32, [D]> fnx ← tf32[D] {}
+    ds.rms_stats(dom1, h1, mut st1, pd, peps)
+    ds.rms_apply(h1, st1, fnorm, mut fnx)
+
+    var tensor<f32, [F]> fdom ← tf32[F] {}
+    var tensor<f32, [F]> gate ← tf32[F] {}
+    var tensor<f32, [F]> up ← tf32[F] {}
+    var tensor<f32, [F]> act ← tf32[F] {}
+    var tensor<f32, [D]> down ← tf32[D] {}
+    ds.gemv_lane(fdom, wg, fnx, mut gate, pd)
+    ds.gemv_lane(fdom, wu, fnx, mut up, pd)
+    ds.swiglu(gate, up, mut act)
+    ds.gemv_lane(ddom, wd, act, mut down, pf)
+    ds.residual_add(h1, down, mut hout)
+}
+
+# logits[V] = embed @ rmsnorm(hidden) (tied lm_head: `embed` is the token table).
+@ public
+fn head_step<size V, size D>(tensor<f32, [D]> hidden, tensor<f32, [D]> onorm, tensor<f32, [V, D]> embed, mut tensor<f32, [V]> logits, i32 pd, f32 peps) → void {
+    var tensor<f32, [1]> dom1 ← tf32[1] {}
+    var tensor<f32, [1]> st1 ← tf32[1] {}
+    var tensor<f32, [D]> hn ← tf32[D] {}
+    var tensor<f32, [V]> vdom ← tf32[V] {}
+    ds.rms_stats(dom1, hidden, mut st1, pd, peps)
+    ds.rms_apply(hidden, st1, onorm, mut hn)
+    ds.gemv_lane(vdom, embed, hn, mut logits, pd)
+}
+
+# Greedy pick: the index of the largest logit (first on ties).
+@ public
+fn argmax_host<size V>(tensor<f32, [V]> logits) → int {
+    var int best ← 0
+    var f32 top ← logits[[0]]
+    const int n ← V ↦ int
+    var int i ← 1
+    while i ≺ n {
+        if logits[[i]] ≻ top {
+            top ← logits[[i]]
+            best ← i
+        }
+        i ← i + 1
+    }
+    return best
+}
