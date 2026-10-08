@@ -1,0 +1,234 @@
++++
+locale = "en"
++++
+# Decode-step kernels: ONE token (T = 1) of a llama-family decoder in lane form.
+#
+# Public import: import from "gradus:decode_step" decode_step
+#
+# Every function is an `@ kernel` that runs as device launches (or, with
+# `--device cpu`, as the sequential host oracle). The step is a chain of launches
+# over rank-1 vectors; no host code touches the K/V caches or the hidden state
+# between launches:
+#
+#   gather_row                      hidden[D]   <- embedding row ids[0]
+#   per layer:
+#     rms_stats + rms_apply         normed[D]   <- hidden[D] and the norm weight[D]
+#     gemv_lane  (q, k, v)          q[QD], k[KVD], v[KVD]  (QD = H * dh, KVD = KV * dh)
+#     rope_half  (q, k)             rotated q[QD], k[KVD] at position `pos`
+#     kv_write   (k, v)             K/V cache [C, KVD], row `pos` replaced
+#     attn_scores                   scores[H, C], masked past `pos`
+#     softmax_stats + softmax_apply probabilities[H, C]
+#     attn_context                  context[QD]
+#     gemv_lane  (o)                attention out[D]
+#     residual_add                  hidden[D]
+#     rms_stats + rms_apply, gemv_lane (gate, up), swiglu, gemv_lane (down), residual_add
+#   final rms_stats + rms_apply, gemv_lane (lm_head)   logits[V]
+#
+# Constraints these kernels carry (each was learned the hard way in
+# acceptance/a1-rowops and is why the code looks the way it does):
+#   - A lane kernel's domain is its FIRST read tensor, so each reduction
+#     kernel takes a read-only `...dom` tensor of the lane shape first.
+#   - Every store is at the lane's own coordinate. A reduction over a row is a
+#     serial `while` loop inside one lane; a value a later step needs per row is
+#     its own launch (two-launch form) or an extra `mut` output at the lane's
+#     own coordinate (softmax_stats).
+#   - The `o ⇇ w · x` recipe needs literal dimensions, so a generic GEMV is a
+#     lane per output row with a serial dot (gemv_lane): any `size` extent.
+#   - Scalar parameters are `i32`/`f32`; an `int` scalar is not admitted on the
+#     device. `pos ↦ int` inside the body; no `int ↦ i32` outside main.
+#   - Parameter names are unique per kernel (a shared prefix per kernel).
+#   - A generic kernel instantiated at two different static shapes in one
+#     package duplicates the Metal entry name: one process runs one shape.
+#
+# Numeric contract: f32 throughout. The reductions are serial in lane order, so
+# the sequential `--device cpu` oracle and the device agree to the L7 float
+# tolerance (abs <= 1e-5 + 1e-4 * abs(ref)); neither sees the host `list` types.
+
+# Embedding gather: gout[j] = gtable[ids[0], j]. `gdom` is the lane domain [D].
+@ kernel
+@ public
+fn gather_row<size V, size D>(tensor<f32, [D]> gdom, tensor<f32, [V, D]> gtable, tensor<i32, [1]> gids, mut tensor<f32, [D]> gout) → void {
+    for from gdom at [j] thread lane const e {
+        gout[[j]] ← gtable[[gids[0] ↦ int, j]]
+    }
+}
+
+# RMSNorm launch 1: rsstats[0] = 1 / sqrt(mean(rsx^2) + rseps). `rsdom` is [1].
+@ kernel
+@ public
+fn rms_stats<size D>(tensor<f32, [1]> rsdom, tensor<f32, [D]> rsx, mut tensor<f32, [1]> rsstats, i32 rsd, f32 rseps) → void {
+    for from rsdom at [i] thread lane const e {
+        var f32 acc ← 0.0
+        const int n ← rsd ↦ int
+        var int k ← 0
+        while k ≺ n {
+            acc ← acc + rsx[[k]] * rsx[[k]]
+            k ← k + 1
+        }
+        rsstats[[i]] ← 1.0 / (acc / (rsd ↦ f32) + rseps).sqrt()
+    }
+}
+
+# RMSNorm launch 2: rao[j] = rax[j] * rast[0] * raw[j].
+@ kernel
+@ public
+fn rms_apply<size D>(tensor<f32, [D]> rax, tensor<f32, [1]> rast, tensor<f32, [D]> raw, mut tensor<f32, [D]> rao) → void {
+    for from rax at [j] thread lane const v {
+        rao[[j]] ← v * rast[[0]] * raw[[j]]
+    }
+}
+
+# Generic GEMV, lane per output row with a serial dot over the input:
+# gvo[i] = sum_k gvw[i, k] * gvx[k]. `gvdom` is the lane domain [N]; `gvk` is K.
+@ kernel
+@ public
+fn gemv_lane<size N, size K>(tensor<f32, [N]> gvdom, tensor<f32, [N, K]> gvw, tensor<f32, [K]> gvx, mut tensor<f32, [N]> gvo, i32 gvk) → void {
+    for from gvdom at [i] thread lane const e {
+        const int n ← gvk ↦ int
+        var f32 acc ← 0.0
+        var int k ← 0
+        while k ≺ n {
+            acc ← acc + gvw[[i, k]] * gvx[[k]]
+            k ← k + 1
+        }
+        gvo[[i]] ← acc
+    }
+}
+
+# Rotate-half RoPE over a flat vector of heads [N = heads * 2 * rhspan]: the pair
+# (jj, jj + rhspan) of each head rotates by rhpos * theta^(-p / rhspan), where
+# p = jj mod rhspan. `rhlntheta` is ln(theta) (ln 100000 = 11.512925 for SmolLM2).
+@ kernel
+@ public
+fn rope_half<size N>(tensor<f32, [N]> rhx, mut tensor<f32, [N]> rho, i32 rhpos, i32 rhspan, f32 rhlntheta) → void {
+    for from rhx at [j] thread lane const v {
+        const int hf ← rhspan ↦ int
+        const int jj ← j % (2 * hf)
+        const int base ← j - jj
+        const int p ← jj % hf
+        const f32 freq ← (0.0 - (p ↦ f32) / (hf ↦ f32) * rhlntheta).exp()
+        const f32 ang ← (rhpos ↦ f32) * freq
+        const f32 c ← ang.cos()
+        const f32 s ← ang.sin()
+        if jj ≺ hf {
+            rho[[j]] ← v * c - rhx[[base + jj + hf]] * s
+        }
+        else {
+            rho[[j]] ← rhx[[base + jj - hf]] * s + v * c
+        }
+    }
+}
+
+# KV-row write: lane per cache element; row `kwpos` takes `kwrow`, every other
+# element is rewritten with its old value (the cache is a read and a write).
+@ kernel
+@ public
+fn kv_write<size C, size K>(tensor<f32, [C, K]> kwcache, tensor<f32, [K]> kwrow, mut tensor<f32, [C, K]> kwout, i32 kwpos) → void {
+    for from kwcache at [c, j] thread lane const v {
+        if c ≡ (kwpos ↦ int) {
+            kwout[[c, j]] ← kwrow[[j]]
+        }
+        else {
+            kwout[[c, j]] ← v
+        }
+    }
+}
+
+# GQA decode scores: assc[h, c] = (asq[h * dh + :] . askc[c, (h / group) * dh + :])
+# * asscale, masked to -1e30 for c > aspos. `asdom` is [H, C]; `asq` is the flat
+# query [QD = H * dh]; `askc` is the K cache [C, KVD].
+@ kernel
+@ public
+fn attn_scores<size H, size C, size QD, size KVD>(tensor<f32, [H, C]> asdom, tensor<f32, [QD]> asq, tensor<f32, [C, KVD]> askc, mut tensor<f32, [H, C]> assc, i32 aspos, i32 asgroup, i32 asdh, f32 asscale) → void {
+    for from asdom at [h, c] thread lane const e {
+        const int n ← asdh ↦ int
+        const int base ← (h / (asgroup ↦ int)) * n
+        var f32 acc ← 0.0
+        var int k ← 0
+        while k ≺ n {
+            acc ← acc + asq[[h * n + k]] * askc[[c, base + k]]
+            k ← k + 1
+        }
+        if c ≻ (aspos ↦ int) {
+            assc[[h, c]] ← -1.0e30
+        }
+        else {
+            assc[[h, c]] ← acc * asscale
+        }
+    }
+}
+
+# Row softmax statistics, ONE launch with TWO `mut` outputs: per row the max
+# (serial loop 1) and the sum of exp(x - max) (serial loop 2), each written at
+# the lane's own coordinate. `ssdom` is [R].
+@ kernel
+@ public
+fn softmax_stats<size R, size C>(tensor<f32, [R]> ssdom, tensor<f32, [R, C]> sss, mut tensor<f32, [R]> ssmx, mut tensor<f32, [R]> sssm, i32 ssc) → void {
+    for from ssdom at [i] thread lane const e {
+        const int n ← ssc ↦ int
+        var f32 m ← sss[[i, 0]]
+        var int k ← 1
+        while k ≺ n {
+            if sss[[i, k]] ≻ m {
+                m ← sss[[i, k]]
+            }
+            k ← k + 1
+        }
+        ssmx[[i]] ← m
+        var f32 acc ← 0.0
+        var int q ← 0
+        while q ≺ n {
+            acc ← acc + (sss[[i, q]] - m).exp()
+            q ← q + 1
+        }
+        sssm[[i]] ← acc
+    }
+}
+
+# Row softmax launch 2: sao[i, j] = exp(sas[i, j] - samx[i]) / sasm[i].
+@ kernel
+@ public
+fn softmax_apply<size R, size C>(tensor<f32, [R, C]> sas, tensor<f32, [R]> samx, tensor<f32, [R]> sasm, mut tensor<f32, [R, C]> sao) → void {
+    for from sas at [i, j] thread lane const v {
+        sao[[i, j]] ← (v - samx[[i]]).exp() / sasm[[i]]
+    }
+}
+
+# GQA decode context: acctx[j] = sum_{c <= acpos} acp[h, c] * acvc[c, (h / group)
+# * dh + d] for j = h * dh + d. `acdom` is the flat context [QD].
+@ kernel
+@ public
+fn attn_context<size QD, size H, size C, size KVD>(tensor<f32, [QD]> acdom, tensor<f32, [H, C]> acp, tensor<f32, [C, KVD]> acvc, mut tensor<f32, [QD]> acctx, i32 acpos, i32 acgroup, i32 acdh) → void {
+    for from acdom at [j] thread lane const e {
+        const int dh ← acdh ↦ int
+        const int h ← j / dh
+        const int d ← j % dh
+        const int n ← (acpos ↦ int) + 1
+        const int base ← (h / (acgroup ↦ int)) * dh
+        var f32 acc ← 0.0
+        var int c ← 0
+        while c ≺ n {
+            acc ← acc + acp[[h, c]] * acvc[[c, base + d]]
+            c ← c + 1
+        }
+        acctx[[j]] ← acc
+    }
+}
+
+# Residual add: reo[j] = rea[j] + reb[j]. `rea` is the lane domain.
+@ kernel
+@ public
+fn residual_add<size D>(tensor<f32, [D]> rea, tensor<f32, [D]> reb, mut tensor<f32, [D]> reo) → void {
+    for from rea at [j] thread lane const a {
+        reo[[j]] ← a + reb[[j]]
+    }
+}
+
+# SwiGLU: swo[j] = silu(swg[j]) * swu[j], silu(v) = v / (1 + exp(-v)).
+@ kernel
+@ public
+fn swiglu<size F>(tensor<f32, [F]> swg, tensor<f32, [F]> swu, mut tensor<f32, [F]> swo) → void {
+    for from swg at [j] thread lane const v {
+        swo[[j]] ← (v / (1.0 + (0.0 - v).exp())) * swu[[j]]
+    }
+}
