@@ -77,8 +77,10 @@ import from "gradus:model/gguf" gguf
 import from "gradus:model/gguf_manifest" gguf_manifest
 import from "gradus:model/tensor_payload" tensor_payload
 import from "gradus:model/tensor_view" tensor_view
+import from "gradus:sampling" sampling
 import from "gradus:tensor" tensor
 import from "gradus:tokenizer/bpe" tokenizator
+import from "gradus:train" train
 
 import from "./port_generate" pgen
 import from "./port_weights" port
@@ -1861,33 +1863,25 @@ fn run_generate(GenerateConfig cfg, list<int> ids, ResidentModel model, decoder.
     )
 }
 
-# The metal backend decodes greedily (the decode-token launches pick the
-# largest logit on the host); a sampled request is refused with a request-side
-# cause (400) rather than silently decoded greedily.
-fn port_greedy_refusal(GenerateConfig cfg) → string ∪ none {
-    if cfg.temperatura ≻ 0.0 or cfg.top_k ≻ 0 or cfg.poena_repetitionis ≠ 1.0 {
-        return "unsupported generation: the metal backend decodes greedily (temperature 0, no top-k, repetition penalty 1)"
-    }
-    if cfg.top_p ≺ 1.0 or cfg.min_p ≻ 0.0 {
-        return "unsupported generation: the metal backend decodes greedily (top-p 1, min-p 0)"
-    }
-    return null
-}
-
 # The port path's request validation (the same gradus reject rows and prompt
-# fit causes as generate_dense_with_stop) followed by the greedy decode
-# loop. A fresh pair of K/V caches is allocated per call inside
-# port_generate; the weights are the resident ones.
+# fit causes as generate_dense_with_stop) followed by the decode
+# loop (greedy at temperature 0, seeded sampling otherwise, with the request's
+# sampling Config and Seed). A fresh pair of K/V caches is allocated per call inside
+# port_generate_sampled; the weights are the resident ones.
 fn run_generate_port(GenerateConfig cfg, list<int> ids, ResidentModel model, port.PortWeights weights, decoder.StopPolicy stop, bool trace) → pgen.PortResult ⇥ config.GenerationError {
     const config.GenerationConfig g ← to_generation_config(cfg, model.eog_ids)
-    const string ∪ none refusal ← port_greedy_refusal(cfg)
-    if refusal not is none {
-        throw variant config.GenerationError.InvalidConfig { message = refusal coalesce "" }
-    }
     require ids.length() ≥ 1 throw variant config.GenerationError.InvalidConfig { message = "needs at least one prompt token" }
     require ids.length() ≤ g.max_prompt throw variant config.GenerationError.InvalidConfig { message = "prompt length exceeds max_prompt" }
     require ids.length() ≺ g.context throw variant config.GenerationError.InvalidConfig { message = "prompt length does not fit context" }
-    return pgen.port_generate(weights, ids, cfg.maxima_verborum, model.eog_ids, decoder.stops_on_eog(stop), cfg.contextus, trace)
+    const sampling.Config sconf ← config.config(g)
+    const train.Seed seed ← config.seed(g)
+    do {
+        return pgen.port_generate_sampled(weights, ids, cfg.maxima_verborum, model.eog_ids, decoder.stops_on_eog(stop), cfg.contextus, trace, sconf, seed)
+    }
+    catch err {
+        throw variant config.GenerationError.InvalidConfig { message = err.message }
+    }
+    throw variant config.GenerationError.InvalidConfig { message = "unreachable" }
 }
 
 # One generate dispatch for the request path: the port weights list is empty on
@@ -2716,20 +2710,6 @@ describe "backend selection cli parse" tag "inferentia" {
         assert cfg.backend ≡ "cpu"
         assert cfg.trace
         assert model_backend(cfg.backend) ≡ "cpu"
-    }
-}
-describe "port greedy refusal" tag "inferentia" {
-    test "a greedy request is accepted" {
-        const ServeConfig server ← ServeConfig { model = "/m.gguf", host = "127.0.0.1", port = 8080, max_tokens = 32, max_prompt = 0, context = 0, seed = 1, log_level = "info", prompt = "", expected_digest = "", ignore_eos = false, trace = false, backend = "metal" }
-        const GenerateConfig cfg ← build_generate_config(fresh_generate_request(), server)
-        assert port_greedy_refusal(cfg) is none
-    }
-    test "a sampled request is refused with a request-side cause" {
-        const ServeConfig server ← ServeConfig { model = "/m.gguf", host = "127.0.0.1", port = 8080, max_tokens = 32, max_prompt = 0, context = 0, seed = 1, log_level = "info", prompt = "", expected_digest = "", ignore_eos = false, trace = false, backend = "metal" }
-        const GenerateConfig cfg ← build_generate_config(generate_request_with_temperature(fresh_generate_request(), 0.8), server)
-        const string ∪ none refusal ← port_greedy_refusal(cfg)
-        assert refusal not is none
-        assert classify_generate_error(refusal coalesce "") ≡ 400
     }
 }
 describe "health lifecycle" tag "inferentia" {
