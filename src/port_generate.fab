@@ -27,14 +27,17 @@
 # argmax of the masked logits, and under `trace` the full-vocabulary scan that
 # also yields the top two ids and logits.
 #
-# Greedy only. The finish reasons are `stop` (an EOG id was chosen; the EOG id
-# is part of the returned ids, as in the host path) and `length`.
+# Greedy by default; `port_generate_sampled` adds the seeded sampled choice. The
+# finish reasons are `stop` (an EOG id was chosen; the EOG id is part of the
+# returned ids, as in the host path) and `length`.
 # =============================================================================
 
 import from "norma:console" console
 
 import from "gradus:decode_token" dt
 import from "gradus:decode_step" ds
+import from "gradus:sampling" sampling
+import from "gradus:train" train
 
 import from "./port_weights" port
 
@@ -264,6 +267,63 @@ fn port_exact(f32 kept_min, f32 chunk_floor) → bool {
 }
 
 # ---------------------------------------------------------------------------
+# The branch decision of the sampled path (pure; the device launch is not)
+# ---------------------------------------------------------------------------
+
+# Per-chunk candidates the device returns (topm_chunks M).
+@ public
+fn port_topm() → int {
+    return 16
+}
+
+# The choice of a step: "greedy" (temperature <= 0; every other knob, the
+# repetition penalty included, is ignored, as in `sampling.sample`),
+# "candidates" (sampled from the device per-chunk top-M) or "full" (sampled from
+# the full logits read to the host). The candidate set holds the global top-k
+# only for 1 <= top_k <= M, and a sampled path with top_k == 0 or top_k > M needs
+# the whole distribution (softmax denominators, top-p/min-p over the tail), so
+# those take the full-logits fallback, still on the Metal logits.
+@ public
+fn port_branch(sampling.Config c) → string {
+    if c.temperature ≤ 0.0 {
+        return "greedy"
+    }
+    if c.top_k ≥ 1 and c.top_k ≤ port_topm() {
+        return "candidates"
+    }
+    return "full"
+}
+
+# The `[256, 16]` device output (chunk-major) as the flat `[4096]` tensor that
+# `port_candidates` reads: element p * 16 + m is chunk p, rank m.
+@ public
+fn port_flatten(tensor<f32, [256, 16]> src) → tensor<f32, [4096]> {
+    var tensor<f32, [4096]> flat ← tf32[4096] {}
+    var int p ← 0
+    while p ≺ 256 {
+        var int m ← 0
+        while m ≺ 16 {
+            flat[[p * 16 + m]] ← src[[p, m]]
+            m ← m + 1
+        }
+        p ← p + 1
+    }
+    return flat
+}
+
+# The host logits as a list, for the full-logits fallback of `sampling.sample`.
+@ public
+fn port_logits_list(tensor<f32, [49152]> logits) → list<f32> {
+    var list<f32> out ← empty
+    var int i ← 0
+    while i ≺ 49152 {
+        out.append(logits[[i]])
+        i ← i + 1
+    }
+    return out
+}
+
+# ---------------------------------------------------------------------------
 # Helpers of the decode loop (the loop itself is `port_generate` below)
 # ---------------------------------------------------------------------------
 
@@ -488,6 +548,81 @@ describe "port generate sampling helpers" tag "inferentia" {
     }
 }
 
+describe "port generate sampled branch" tag "inferentia" {
+    test "temperature zero is greedy whatever the other knobs say" {
+        const sampling.Config c ← sampling.Config { temperature = 0.0 ∷ f32, top_k = 8, top_p = 0.9 ∷ f32, min_p = 0.1 ∷ f32, repetition_penalty = 1.3 ∷ f32 }
+        assert port_branch(c) ≡ "greedy"
+    }
+    test "a top_k within the per-chunk M samples from the candidates" {
+        const sampling.Config a ← sampling.Config { temperature = 0.8 ∷ f32, top_k = 1, top_p = 1.0 ∷ f32, min_p = 0.0 ∷ f32, repetition_penalty = 1.0 ∷ f32 }
+        const sampling.Config b ← sampling.Config { temperature = 0.8 ∷ f32, top_k = 16, top_p = 0.95 ∷ f32, min_p = 0.05 ∷ f32, repetition_penalty = 1.1 ∷ f32 }
+        assert port_branch(a) ≡ "candidates"
+        assert port_branch(b) ≡ "candidates"
+    }
+    test "top_k zero or above M takes the full-logits fallback" {
+        const sampling.Config a ← sampling.Config { temperature = 0.8 ∷ f32, top_k = 0, top_p = 1.0 ∷ f32, min_p = 0.0 ∷ f32, repetition_penalty = 1.0 ∷ f32 }
+        const sampling.Config b ← sampling.Config { temperature = 0.8 ∷ f32, top_k = 17, top_p = 1.0 ∷ f32, min_p = 0.0 ∷ f32, repetition_penalty = 1.0 ∷ f32 }
+        const sampling.Config d ← sampling.Config { temperature = 1.0 ∷ f32, top_k = 0, top_p = 0.9 ∷ f32, min_p = 0.0 ∷ f32, repetition_penalty = 1.0 ∷ f32 }
+        assert port_branch(a) ≡ "full"
+        assert port_branch(b) ≡ "full"
+        assert port_branch(d) ≡ "full"
+    }
+    test "flatten lays the chunk-major output out as chunk * 16 + rank" {
+        var tensor<f32, [256, 16]> src ← tf32[256, 16] {}
+        src[[0, 0]] ← 1.0 ∷ f32
+        src[[0, 15]] ← 2.0 ∷ f32
+        src[[1, 0]] ← 3.0 ∷ f32
+        src[[255, 15]] ← 4.0 ∷ f32
+        const tensor<f32, [4096]> flat ← port_flatten(src)
+        assert flat[[0]] ≡ (1.0 ∷ f32)
+        assert flat[[15]] ≡ (2.0 ∷ f32)
+        assert flat[[16]] ≡ (3.0 ∷ f32)
+        assert flat[[4095]] ≡ (4.0 ∷ f32)
+        assert flat[[17]] ≡ (0.0 ∷ f32)
+    }
+    test "the logits list copies the tensor in order" {
+        var tensor<f32, [49152]> t ← tf32[49152] {}
+        t[[0]] ← 1.5 ∷ f32
+        t[[49151]] ← -2.5 ∷ f32
+        const list<f32> l ← port_logits_list(t)
+        assert l.length() ≡ 49152
+        assert l.get(0) coalesce (0.0 ∷ f32) ≡ (1.5 ∷ f32)
+        assert l.get(49151) coalesce (0.0 ∷ f32) ≡ (-2.5 ∷ f32)
+    }
+    test "the candidate path equals the full path for a top_k within M" {
+        # 4 chunk-style pairs in id order; ids 1, 3, 5, 9 hold the logits, all
+        # other vocabulary positions are dropped (exact 0.0 after top_k).
+        const sampling.Config c ← sampling.Config { temperature = 0.7 ∷ f32, top_k = 3, top_p = 1.0 ∷ f32, min_p = 0.0 ∷ f32, repetition_penalty = 1.0 ∷ f32 }
+        const train.Seed s ← train.Seed { status = 7 }
+        var tensor<f32, [4096]> v ← tf32[4096] {}
+        var tensor<f32, [4096]> x ← tf32[4096] {}
+        var int k ← 0
+        while k ≺ 4096 {
+            v[[k]] ← -3.4028235e38 ∷ f32
+            x[[k]] ← -1.0 ∷ f32
+            k ← k + 1
+        }
+        v[[0]] ← 2.0 ∷ f32
+        x[[0]] ← 9.0 ∷ f32
+        v[[1]] ← 4.0 ∷ f32
+        x[[1]] ← 1.0 ∷ f32
+        v[[2]] ← 3.0 ∷ f32
+        x[[2]] ← 5.0 ∷ f32
+        v[[3]] ← 1.0 ∷ f32
+        x[[3]] ← 3.0 ∷ f32
+        const PortCandidates cand ← port_candidates(v, x)
+        var tensor<f32, [49152]> full ← tf32[49152] {}
+        full[[1]] ← 4.0 ∷ f32
+        full[[3]] ← 1.0 ∷ f32
+        full[[5]] ← 3.0 ∷ f32
+        full[[9]] ← 2.0 ∷ f32
+        const sampling.Sampler a ← sampling.sample_candidates(cand.values, cand.ids, c, [], s) ⊥ sampling.Sampler { token_id = -1, seed = s }
+        const sampling.Sampler b ← sampling.sample(port_logits_list(full), c, [], s) ⊥ sampling.Sampler { token_id = -2, seed = s }
+        assert a.token_id ≡ b.token_id
+        assert a.seed.status ≡ b.seed.status
+    }
+}
+
 describe "port generate scan" tag "inferentia" {
     test "the scan picks the top two with the first index winning ties" {
         var tensor<f32, [49152]> t ← tf32[49152] {}
@@ -509,12 +644,26 @@ describe "port generate scan" tag "inferentia" {
     }
 }
 
-# Greedy generation. `prompt` must hold at least one id and fewer than
-# `context`; `max_new` >= 1; the caller validates both (main.fab). `eog_ids` is
-# the admitted tokenizer's EOG set; with `stop_on_eog` false the EOG ids are
-# masked out of the choice (the ignore_eos policy).
+# Greedy generation: `port_generate_sampled` at temperature 0, whose other knobs
+# and seed are then never read. Kept until the caller passes its sampling Config
+# and Seed (change-list item 5 of the sampling design note), which retires it.
 @ public
 fn port_generate(port.PortWeights w, list<int> prompt, int max_new, list<int> eog_ids, bool stop_on_eog, int context, bool trace) → PortResult {
+    const sampling.Config greedy ← sampling.Config { temperature = 0.0 ∷ f32, top_k = 0, top_p = 1.0 ∷ f32, min_p = 0.0 ∷ f32, repetition_penalty = 1.0 ∷ f32 }
+    const train.Seed seed ← train.Seed { status = 1 }
+    return port_generate_sampled(w, prompt, max_new, eog_ids, stop_on_eog, context, trace, greedy, seed) ⊥ PortResult { ids = [], finish = "error" }
+}
+
+# Generation. `prompt` must hold at least one id and fewer than `context`;
+# `max_new` >= 1; the caller validates both (main.fab). `eog_ids` is the admitted
+# tokenizer's EOG set; with `stop_on_eog` false the EOG ids are masked out of the
+# choice (the ignore_eos policy). `sconf` and `seed` select the choice per step
+# (`port_branch`): temperature <= 0 keeps the three greedy branches; otherwise a
+# seeded draw (one `next_f32` per generated token) from the device per-chunk
+# top-M candidates, or from the full logits read to the host when
+# `port_branch` says "full". The repetition history is the generated ids only.
+@ public
+fn port_generate_sampled(port.PortWeights w, list<int> prompt, int max_new, list<int> eog_ids, bool stop_on_eog, int context, bool trace, sampling.Config sconf, train.Seed seed) → PortResult ⇥ sampling.SamplingError {
     const int np ← prompt.length()
     const int c ← port_capacity(context, np, max_new)
     const size C ← c
@@ -559,6 +708,12 @@ fn port_generate(port.PortWeights w, list<int> prompt, int max_new, list<int> eo
     var tensor<f32, [256]> cdom ← tf32[256] {}
     var tensor<f32, [256]> cval ← tf32[256] {}
     var tensor<f32, [256]> cidx ← tf32[256] {}
+    # The device per-chunk top-M (sampled path): launch domain [P, M] = [256, 16].
+    const string branch ← port_branch(sconf)
+    var tensor<f32, [256, 16]> tmdom ← tf32[256, 16] {}
+    var tensor<f32, [256, 16]> tmval ← tf32[256, 16] {}
+    var tensor<f32, [256, 16]> tmidx ← tf32[256, 16] {}
+    var train.Seed rng ← seed
     var list<int> out ← []
     var string finish ← "length"
     var bool done ← false
@@ -602,7 +757,24 @@ fn port_generate(port.PortWeights w, list<int> prompt, int max_new, list<int> eo
             dt.head_step(hcur, onorm, emb, mut logits, pd, eps)
             var int chosen ← 0
             const int step ← out.length()
-            if trace {
+            if branch ≡ "candidates" {
+                # EOG mask first (-1e9), then the penalty on the device logits, so the
+                # ranking narrowed on the device is the penalised one; the history
+                # passed to the sampler is therefore empty (no second penalty).
+                port_mask_ignore(mut logits, skip)
+                port_penalize(mut logits, out, sconf.repetition_penalty)
+                ds.topm_chunks(tmdom, logits, mut tmval, mut tmidx, pchunk)
+                const PortCandidates cand ← port_candidates(port_flatten(tmval), port_flatten(tmidx))
+                const sampling.Sampler pick ← sampling.sample_candidates(cand.values, cand.ids, sconf, [], rng)
+                chosen ← pick.token_id
+                rng ← pick.seed
+            } elif branch ≡ "full" {
+                # Full-logits fallback: `sampling.sample` applies the penalty itself.
+                port_mask_ignore(mut logits, skip)
+                const sampling.Sampler pick ← sampling.sample(port_logits_list(logits), sconf, out, rng)
+                chosen ← pick.token_id
+                rng ← pick.seed
+            } elif trace {
                 const PortTop top ← port_scan(logits, skip)
                 chosen ← top.id1
                 console.warn_line(port_trace_line(step, chosen, top.id1, top.val1, top.id2, top.val2))
