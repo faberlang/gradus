@@ -189,6 +189,47 @@ fn sample(list<f32> logits, Config c, list<int> history, train.Seed seed) → Sa
 }
 
 # -------------------------------------------------------------------------
+# sample_candidates — the sparse STOCHASTIC path: the same Sampler (token id
+# and advanced Seed) that sample returns for a full logits list in which every
+# non-candidate position is dropped (exact 0.0 probability). values holds the
+# candidate logits and ids their vocabulary ids, strictly ascending by id.
+# The pipeline and its float summation order are the full-list pipeline's:
+# dropped positions add exact 0.0, so walking only the candidates in id order
+# adds the same terms in the same order. history holds vocabulary ids; a
+# history id that is not a candidate is dropped from the penalty scatter.
+# Callers that already applied the penalty before narrowing pass an empty
+# history. Exact only when the candidate set contains every position the
+# filters would keep. temperature <= 0 is greedy: the argmax candidate's id,
+# Seed unchanged.
+# -------------------------------------------------------------------------
+
+@ public
+fn sample_candidates(list<f32> values, list<int> ids, Config c, list<int> history, train.Seed seed) → Sampler ⇥ SamplingError {
+    require_logits(values)
+    require_candidate_ids(values, ids)
+    for from history const t {
+        require t ≥ 0 throw variant InvalidHistory { message = "history token out of vocabulary range" }
+    }
+    if c.temperature ≤ 0.0 {
+        return Sampler { token_id = ids.get(values.argmax() coalesce 0) coalesce 0, seed = seed }
+    }
+    var list<int> positions ← empty
+    for from history const t {
+        const int at ← candidate_position(ids, t)
+        if at ≥ 0 {
+            positions.append(at)
+        }
+    }
+    const list<f32> penalized ← repetition_penalty(values, positions, c.repetition_penalty)
+    const list<f32> scaled ← temperature_scale(penalized, c.temperature)
+    const TopKResult k_limited ← top_k(scaled, c.top_k)
+    const list<f32> probs ← softmax(k_limited.values, k_limited.keep)
+    const list<f32> p_limited ← top_p(probs, c.top_p)
+    const Sampler drawn ← draw(min_p(p_limited, c.min_p), seed)
+    return Sampler { token_id = ids.get(drawn.token_id) coalesce 0, seed = drawn.seed }
+}
+
+# -------------------------------------------------------------------------
 # Private helpers (the deterministic pipeline).
 # -------------------------------------------------------------------------
 
@@ -202,6 +243,34 @@ fn require_history(list<f32> logits, list<int> history) → void ⇥ SamplingErr
         require t ≥ 0 throw variant InvalidHistory { message = "history token out of vocabulary range" }
         require t ≺ logits.length() throw variant InvalidHistory { message = "history token out of vocabulary range" }
     }
+}
+
+# One id per value, non-negative and strictly ascending.
+fn require_candidate_ids(list<f32> values, list<int> ids) → void ⇥ SamplingError {
+    require ids.length() ≡ values.length() throw variant InvalidLogits { message = "candidate ids must match candidate values" }
+    var int prev ← 0 - 1
+    for from ids const t {
+        require t ≻ prev throw variant InvalidLogits { message = "candidate ids must be strictly ascending" }
+        prev ← t
+    }
+}
+
+# Position of id t in the ascending ids (binary search), or -1 when absent.
+fn candidate_position(list<int> ids, int t) → int {
+    var int lo ← 0
+    var int hi ← ids.length() - 1
+    while lo ≤ hi {
+        const int mid ← lo + (hi - lo) / 2
+        const int v ← ids.get(mid) coalesce 0
+        if v ≡ t then return mid
+        if v ≺ t {
+            lo ← mid + 1
+        }
+        else {
+            hi ← mid - 1
+        }
+    }
+    return 0 - 1
 }
 
 # Steps 1–6 of the pinned pipeline (caller has already gated logits/history).
