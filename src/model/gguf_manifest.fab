@@ -208,18 +208,9 @@ class GgufManifest {
 # -------------------------------------------------------------------------
 
 fn byte_list(bytes o) → list<u8> {
-    # Use the runtime's bulk byte-vector bridge. Reading `bytes` one element
-    # at a time is semantically equivalent, but it makes an owned interpreter
-    # carrier copy the whole buffer for every indexed access.
-    # The bridge always yields a list of byte values, so the `⊥` defaults below
-    # never apply; they only satisfy D17.8.
-    const value wire ↤ o
-    const list<int> numbers ↤ wire ⊥ empty
-    var list<u8> out ← empty
-    for from numbers const v {
-        out.append(v ↦ u8 ⊥ 0)
-    }
-    return out
+    # One representation change, not a per-byte loop: the interpreter step
+    # count of a whole-header parse depends on this staying O(1) statements.
+    return o ↦ list<u8>
 }
 
 fn byte_from_list(list<u8> b) → bytes {
@@ -236,15 +227,19 @@ fn mul(int a, int b) → int ⇥ GgufManifestError {
     return a * b
 }
 
-fn slice(list<u8> b, int off, int len) → list<u8> ⇥ GgufManifestError {
+# Validate that `len` bytes at `off` lie inside `b`; returns the exclusive end.
+# Copies nothing: callers that only need the bounds check (or read a few
+# bytes) use this instead of `slice`.
+fn check_range(list<u8> b, int off, int len) → int ⇥ GgufManifestError {
     reject off ≺ 0 or len ≺ 0 throw variant BadBounds { message = "negative byte range" }
     const int end ← add(off, len)
     require end ≤ b.length() throw variant Truncated { message = "bounded GGUF corpus ends before the required field" }
-    var list<u8> out ← empty
-    for range 0 ‥ len const i {
-        out.append(b.get(off + i) coalesce 0 ∷ u8)
-    }
-    return out
+    return end
+}
+
+fn slice(list<u8> b, int off, int len) → list<u8> ⇥ GgufManifestError {
+    const int end ← check_range(b, off, len)
+    return b.slice(off, end)
 }
 
 # A source read is deliberately a function value, not a field of any public
@@ -262,32 +257,35 @@ fn read_source((int, int) → bytes ⇥ GgufManifestError source, int total, int
     return chunk
 }
 
+# Fixed-width little-endian reads. Each checks its range, then unpacks one
+# exact byte window with the language's endian conversion.
 fn u32(list<u8> b, int off) → int ⇥ GgufManifestError {
-    const list<u8> x ← slice(b, off, 4)
-    const int r0 ← x.get(0) coalesce 0 ∷ u8 ↦ int
-    const int r1 ← x.get(1) coalesce 0 ∷ u8 ↦ int
-    const int r2 ← x.get(2) coalesce 0 ∷ u8 ↦ int
-    const int r3 ← x.get(3) coalesce 0 ∷ u8 ↦ int
-    return r0 ∨ r1 ⇐ 8 ∨ r2 ⇐ 16 ∨ r3 ⇐ 24
+    const int end ← check_range(b, off, 4)
+    const bytes window ← b.slice(off, end) ↦ bytes
+    return window ↦ u32 via Le ↦ int ⊥ 0
 }
 
 fn u64(list<u8> b, int off) → int ⇥ GgufManifestError {
-    const list<u8> x ← slice(b, off, 8)
-    const int r7 ← x.get(7) coalesce 0 ∷ u8 ↦ int
+    const int end ← check_range(b, off, 8)
+    const int r7 ← b.get(off + 7) coalesce 0 ∷ u8 ↦ int
     require r7 ≺ 128 throw variant BadBounds { message = "GGUF UINT64 value exceeds the numeric carrier" }
-    const int r0 ← x.get(0) coalesce 0 ∷ u8 ↦ int
-    const int r1 ← x.get(1) coalesce 0 ∷ u8 ↦ int
-    const int r2 ← x.get(2) coalesce 0 ∷ u8 ↦ int
-    const int r3 ← x.get(3) coalesce 0 ∷ u8 ↦ int
-    const int r4 ← x.get(4) coalesce 0 ∷ u8 ↦ int
-    const int r5 ← x.get(5) coalesce 0 ∷ u8 ↦ int
-    const int r6 ← x.get(6) coalesce 0 ∷ u8 ↦ int
-    return r0 ∨ r1 ⇐ 8 ∨ r2 ⇐ 16 ∨ r3 ⇐ 24 ∨ r4 ⇐ 32 ∨ r5 ⇐ 40 ∨ r6 ⇐ 48 ∨ r7 ⇐ 56
+    const bytes window ← b.slice(off, end) ↦ bytes
+    return window ↦ u64 via Le ↦ int ⊥ 0
 }
 
-fn text_at(list<u8> b, int off, int len) → string ⇥ GgufManifestError {
-    const list<u8> x ← slice(b, off, len)
-    const bytes o ← x
+# The same reads over an exact-length wire (`bytes` of 4 or 8 octets, as
+# returned by `read_source`); no list is built.
+fn u32_wire(bytes w) → int {
+    return w[0‥4] ↦ u32 via Le ↦ int ⊥ 0
+}
+
+fn u64_wire(bytes w) → int ⇥ GgufManifestError {
+    const int r7 ← w[7] ↦ int
+    require r7 ≺ 128 throw variant BadBounds { message = "GGUF UINT64 value exceeds the numeric carrier" }
+    return w[0‥8] ↦ u64 via Le ↦ int ⊥ 0
+}
+
+fn text_wire(bytes o) → string ⇥ GgufManifestError {
     do {
         return o ↦ string
     }
@@ -297,6 +295,12 @@ fn text_at(list<u8> b, int off, int len) → string ⇥ GgufManifestError {
     throw variant BadWire { message = "unreachable string conversion" }
 }
 
+fn text_at(list<u8> b, int off, int len) → string ⇥ GgufManifestError {
+    const int end ← check_range(b, off, len)
+    const bytes o ← b.slice(off, end) ↦ bytes
+    return text_wire(o)
+}
+
 fn string_at(list<u8> b, int off) → string ⇥ GgufManifestError {
     const int len ← u64(b, off)
     require len ≤ TEXT_LIMIT throw variant BadBounds { message = "GGUF string exceeds the bounded text limit" }
@@ -304,8 +308,8 @@ fn string_at(list<u8> b, int off) → string ⇥ GgufManifestError {
 }
 
 fn u8_value(list<u8> b, int off) → int ⇥ GgufManifestError {
-    const list<u8> x ← slice(b, off, 1)
-    return x.get(0) coalesce 0 ∷ u8 ↦ int
+    check_range(b, off, 1)
+    return b.get(off) coalesce 0 ∷ u8 ↦ int
 }
 
 fn scalar_size(int kind) → int {
@@ -318,16 +322,6 @@ fn scalar_size(int kind) → int {
 
 fn dtype_valid(int kind) → bool {
     return kind ≥ GGUF_UINT8 and kind ≤ GGUF_FLOAT64
-}
-
-# Append one octet buffer to another. The range parser uses this only for one
-# metadata value at a time; it never reconstructs or reparses the whole table.
-fn join_bytes(bytes a, bytes b) → bytes {
-    var bytes out ← a
-    for range 0 ‥ b.length() const i {
-        out.append(b.get(i) coalesce 0 ∷ u8)
-    }
-    return out
 }
 
 # Read one metadata value from its absolute wire offset. The result contains
@@ -347,11 +341,13 @@ fn source_value((int, int) → bytes ⇥ GgufManifestError source, int total, in
     if kind ≡ GGUF_STRING {
         # --- string wire (length header + corpus) -------------------------
         const bytes header ← read_source(source, total, off, 8)
-        const int len ← u64(byte_list(header), 0)
+        const int len ← u64_wire(header)
         require len ≤ TEXT_LIMIT throw variant BadBounds { message = "GGUF string exceeds the bounded text limit" }
-        const bytes corpus ← read_source(source, total, add(off, 8), len)
-        text_at(byte_list(corpus), 0, len)
-        return join_bytes(header, corpus)
+        # The language has no bulk `bytes` concatenation, so the whole value
+        # (length header + body) is one exact read instead of two reads joined.
+        const bytes wire ← read_source(source, total, off, add(8, len))
+        text_wire(wire[8‥add(8, len)])
+        return wire
     }
     if kind ≡ GGUF_ARRAY {
         # --- array wire (element kind + count) ----------------------------
@@ -365,8 +361,7 @@ fn source_value((int, int) → bytes ⇥ GgufManifestError source, int total, in
         if element_scalar ≻ 0 {
             # --- scalar element array (bulk read) -------------------------
             const int length ← mul(n, element_scalar)
-            const bytes corpus ← read_source(source, total, add(off, 12), length)
-            const bytes out ← join_bytes(header, corpus)
+            const bytes out ← read_source(source, total, off, add(12, length))
             size_value(byte_list(out), 0, kind, depth)
             return out
         }
@@ -375,7 +370,7 @@ fn source_value((int, int) → bytes ⇥ GgufManifestError source, int total, in
             var int cursor ← add(off, 12)
             for range 0 ‥ n const i {
                 const bytes item_head ← read_source(source, total, cursor, 8)
-                const int len ← u64(byte_list(item_head), 0)
+                const int len ← u64_wire(item_head)
                 require len ≤ TEXT_LIMIT throw variant BadBounds { message = "GGUF string exceeds the bounded text limit" }
                 cursor ← add(cursor, add(8, len))
             }
@@ -395,7 +390,8 @@ fn source_value((int, int) → bytes ⇥ GgufManifestError source, int total, in
             const bytes item ← source_value(source, total, cursor, element_kind, depth + 1)
             # Append in place. Passing the growing accumulator through the
             # helper would copy it once per element and turn large tokenizer
-            # string arrays quadratic.
+            # string arrays quadratic. Nested arrays are not a real GGUF
+            # shape, and the language has no bulk `bytes` concatenation.
             var int j ← 0
             while j ≺ item.length() {
                 out.append(item.get(j) coalesce 0 ∷ u8)
@@ -406,6 +402,28 @@ fn source_value((int, int) → bytes ⇥ GgufManifestError source, int total, in
         return out
     }
     throw variant BadWire { message = "unknown GGUF metadata value type" }
+}
+
+# Size of a validated string array (length-prefixed UTF-8 elements): the
+# per-element u64 length, text-limit, range and UTF-8 checks of `size_value`
+# for a string, inlined into one loop. Returns the array's total wire size.
+fn string_array_size(list<u8> b, int off, int n) → int ⇥ GgufManifestError {
+    const int blen ← b.length()
+    var int pos ← off + 12
+    for range 0 ‥ n const i {
+        require pos + 8 ≤ blen throw variant Truncated { message = "bounded GGUF corpus ends before the required field" }
+        const int r7 ← b.get(pos + 7) coalesce 0 ∷ u8 ↦ int
+        require r7 ≺ 128 throw variant BadBounds { message = "GGUF UINT64 value exceeds the numeric carrier" }
+        const bytes head ← b.slice(pos, pos + 8) ↦ bytes
+        const int len ← head ↦ u64 via Le ↦ int ⊥ 0
+        require len ≤ TEXT_LIMIT throw variant BadBounds { message = "GGUF string exceeds the bounded text limit" }
+        const int next ← pos + 8 + len
+        require next ≤ blen throw variant Truncated { message = "bounded GGUF corpus ends before the required field" }
+        const bytes body ← b.slice(pos + 8, next) ↦ bytes
+        text_wire(body)
+        pos ← next
+    }
+    return pos - off
 }
 
 # Returns the exact payload size for one typed GGUF value. For an array, the
@@ -421,7 +439,7 @@ fn size_value(list<u8> b, int off, int kind, int depth) → int ⇥ GgufManifest
             const int v ← u8_value(b, off)
             reject v ≠ 0 and v ≠ 1 throw variant BadWire { message = "malformed GGUF bool value" }
         }
-        slice(b, off, scalar)
+        check_range(b, off, scalar)
         return scalar
     }
     if kind ≡ GGUF_STRING {
@@ -429,7 +447,7 @@ fn size_value(list<u8> b, int off, int kind, int depth) → int ⇥ GgufManifest
         const int len ← u64(b, off)
         require len ≤ TEXT_LIMIT throw variant BadBounds { message = "GGUF string exceeds the bounded text limit" }
         const int total ← add(8, len)
-        slice(b, off, total)
+        check_range(b, off, total)
         text_at(b, off + 8, len)
         return total
     }
@@ -442,11 +460,26 @@ fn size_value(list<u8> b, int off, int kind, int depth) → int ⇥ GgufManifest
         const int n ← u64(b, off + 4)
         require n ≤ ARRAY_LIMIT throw variant BadBounds { message = "GGUF array count exceeds the bounded limit" }
         var int total ← 12
+        const int element_scalar ← scalar_size(element_kind)
+        if n ≻ 0 and (element_kind ≡ GGUF_STRING or (element_scalar ≻ 0 and element_kind ≠ GGUF_BOOL)) {
+            # Flat arrays: the same checks as the per-element recursion below,
+            # in the same order, without one call per element. The element
+            # depth check applies only when there is a first element.
+            require depth + 1 ≤ 64 throw variant BadBounds { message = "metadata array nesting exceeds the bounded depth" }
+            if element_kind ≡ GGUF_STRING {
+                return string_array_size(b, off, n)
+            }
+            const int body ← n * element_scalar
+            check_range(b, off + 12, body)
+            total ← add(12, body)
+            check_range(b, off, total)
+            return total
+        }
         for range 0 ‥ n const i {
             const int part ← size_value(b, off + total, element_kind, depth + 1)
             total ← add(total, part)
         }
-        slice(b, off, total)
+        check_range(b, off, total)
         return total
     }
     throw variant BadWire { message = "unknown GGUF metadata value type" }
@@ -477,8 +510,9 @@ fn find_metadata(list<GgufMetadata> xs, string key) → GgufMetadata ∪ none {
 }
 
 fn value_u16(list<u8> b, int off) → int ⇥ GgufManifestError {
-    const list<u8> x ← slice(b, off, 2)
-    return (x.get(0) coalesce 0 ∷ u8 ↦ int) ∨ (x.get(1) coalesce 0 ∷ u8 ↦ int) ⇐ 8
+    const int end ← check_range(b, off, 2)
+    const bytes window ← b.slice(off, end) ↦ bytes
+    return window ↦ u16 via Le ↦ int ⊥ 0
 }
 
 fn value_i32(list<u8> b, int off) → int ⇥ GgufManifestError {
@@ -488,22 +522,9 @@ fn value_i32(list<u8> b, int off) → int ⇥ GgufManifestError {
 }
 
 fn value_i64(list<u8> b, int off) → int ⇥ GgufManifestError {
-    const list<u8> x ← slice(b, off, 8)
-    const int high ← x.get(7) coalesce 0 ∷ u8 ↦ int
-    const int r0 ← x.get(0) coalesce 0 ∷ u8 ↦ int
-    const int r1 ← x.get(1) coalesce 0 ∷ u8 ↦ int
-    const int r2 ← x.get(2) coalesce 0 ∷ u8 ↦ int
-    const int r3 ← x.get(3) coalesce 0 ∷ u8 ↦ int
-    const int r4 ← x.get(4) coalesce 0 ∷ u8 ↦ int
-    const int r5 ← x.get(5) coalesce 0 ∷ u8 ↦ int
-    const int r6 ← x.get(6) coalesce 0 ∷ u8 ↦ int
-    # Why: `high % 128 ⇐ 56` inline types as an unsigned 64-bit value that cannot
-    # mix with the signed `int` operands; binding the 7-bit top part to an `int`
-    # slot first keeps the whole expression signed (the result is < 2^63).
-    const int top ← high % 128
-    const int lower ← r0 ∨ r1 ⇐ 8 ∨ r2 ⇐ 16 ∨ r3 ⇐ 24 ∨ r4 ⇐ 32 ∨ r5 ⇐ 40 ∨ r6 ⇐ 48 ∨ top ⇐ 56
-    if high ≺ 128 then return lower
-    return (0 - MAX_NUMBER) - 1 + lower
+    const int end ← check_range(b, off, 8)
+    const bytes window ← b.slice(off, end) ↦ bytes
+    return window ↦ i64 via Le ↦ int ⊥ 0
 }
 
 fn value_u32(list<u8> b, int off) → int ⇥ GgufManifestError {
@@ -660,11 +681,34 @@ fn texts(GgufManifest m, string key) → list<string> ⇥ GgufManifestError {
     require n ≤ ARRAY_LIMIT throw variant BadBounds { message = "GGUF array count exceeds the bounded limit" }
     var list<string> out ← empty
     var int cursor ← 12
+    const int blen ← b.length()
     for range 0 ‥ n const i {
-        const int len ← u64(b, cursor)
+        require cursor + 8 ≤ blen throw variant Truncated { message = "bounded GGUF corpus ends before the required field" }
+        const int r7 ← b.get(cursor + 7) coalesce 0 ∷ u8 ↦ int
+        require r7 ≺ 128 throw variant BadBounds { message = "GGUF UINT64 value exceeds the numeric carrier" }
+        const bytes head ← b.slice(cursor, cursor + 8) ↦ bytes
+        const int len ← head ↦ u64 via Le ↦ int ⊥ 0
         require len ≤ TEXT_LIMIT throw variant BadBounds { message = "GGUF string exceeds the bounded text limit" }
-        out.append(text_at(b, add(cursor, 8), len))
-        cursor ← add(cursor, add(8, len))
+        const int next ← cursor + 8 + len
+        require next ≤ blen throw variant Truncated { message = "bounded GGUF corpus ends before the required field" }
+        const bytes body ← b.slice(cursor + 8, next) ↦ bytes
+        out.append(text_wire(body))
+        cursor ← next
+    }
+    return out
+}
+
+# Read `n` consecutive little-endian u32 values starting after a 12-byte array
+# header. One range check covers the whole run (the per-element check of the
+# generic path fails with the same Truncated error on the same overrun).
+fn u32_run(list<u8> b, int n) → list<int> ⇥ GgufManifestError {
+    const int end ← check_range(b, 12, n * 4)
+    var list<int> out ← empty
+    var int cursor ← 12
+    while cursor ≺ end {
+        const bytes window ← b.slice(cursor, cursor + 4) ↦ bytes
+        out.append(window ↦ u32 via Le ↦ int ⊥ 0)
+        cursor ← cursor + 4
     }
     return out
 }
@@ -681,6 +725,9 @@ fn numbers(GgufManifest m, string key) → list<int> ⇥ GgufManifestError {
     const int scalar ← scalar_size(element_kind)
     var list<int> out ← empty
     var int cursor ← 12
+    if element_kind ≡ GGUF_UINT32 {
+        return u32_run(b, n)
+    }
     for range 0 ‥ n const i {
         out.append(scalar_count(b, cursor, element_kind))
         cursor ← add(cursor, scalar)
@@ -701,13 +748,7 @@ fn numbers_u32(GgufManifest m, string key) → list<int> ⇥ GgufManifestError {
     require element_kind ≡ GGUF_UINT32 throw variant BadWire { message = "metadata array is not a u32 array" }
     const int n ← u64(b, 4)
     require n ≤ ARRAY_LIMIT throw variant BadBounds { message = "GGUF array count exceeds the bounded limit" }
-    var list<int> out ← empty
-    var int cursor ← 12
-    for range 0 ‥ n const i {
-        out.append(value_u32(b, cursor))
-        cursor ← add(cursor, 4)
-    }
-    return out
+    return u32_run(b, n)
 }
 
 # Typed bool accessor (MODEL-01-M1). The wire kind must be exactly GGUF_BOOL;
@@ -950,18 +991,18 @@ fn inspect((int, int) → bytes ⇥ GgufManifestError source, int artifact_lengt
     for range 0 ‥ kv_num const i {
         # --- key (length + duplicate check) -------------------------------
         const bytes key_head_wire ← read_source(source, artifact_length, cursor, 8)
-        const int key_len ← u64(byte_list(key_head_wire), 0)
+        const int key_len ← u64_wire(key_head_wire)
         require key_len ≤ NAME_LIMIT throw variant BadBounds { message = "metadata key exceeds the bounded length" }
         cursor ← add(cursor, 8)
         const bytes key_body_wire ← read_source(source, artifact_length, cursor, key_len)
-        const string key ← text_at(byte_list(key_body_wire), 0, key_len)
+        const string key ← text_wire(key_body_wire)
         reject key ∈ keys throw variant DuplicateKey { message = "duplicate GGUF metadata key: §"(key) }
         keys.append(key)
         cursor ← add(cursor, key_len)
 
         # --- value kind + wire read ---------------------------------------
         const bytes type_wire ← read_source(source, artifact_length, cursor, 4)
-        const int kind ← u32(byte_list(type_wire), 0)
+        const int kind ← u32_wire(type_wire)
         require dtype_valid(kind) throw variant BadWire { message = "unknown GGUF metadata value type" }
         cursor ← add(cursor, 4)
         const bytes value_wire ← source_value(source, artifact_length, cursor, kind, 0)
@@ -989,11 +1030,11 @@ fn inspect((int, int) → bytes ⇥ GgufManifestError source, int artifact_lengt
     while t ≺ tensor_count {
         # --- name (length + duplicate check) ------------------------------
         const bytes name_head_wire ← read_source(source, artifact_length, cursor, 8)
-        const int name_len ← u64(byte_list(name_head_wire), 0)
+        const int name_len ← u64_wire(name_head_wire)
         require name_len ≤ NAME_LIMIT throw variant BadBounds { message = "tensor name exceeds the bounded length" }
         cursor ← add(cursor, 8)
         const bytes name_body_wire ← read_source(source, artifact_length, cursor, name_len)
-        const string name ← text_at(byte_list(name_body_wire), 0, name_len)
+        const string name ← text_wire(name_body_wire)
         require name.length() ≠ 0 throw variant BadWire { message = "empty tensor name" }
         reject name ∈ names throw variant DuplicateTensor { message = "duplicate GGUF tensor name: §"(name) }
         names.append(name)
@@ -1001,7 +1042,7 @@ fn inspect((int, int) → bytes ⇥ GgufManifestError source, int artifact_lengt
 
         # --- rank + shape dims (bounded) ----------------------------------
         const bytes rank_wire ← read_source(source, artifact_length, cursor, 4)
-        const int rank ← u32(byte_list(rank_wire), 0)
+        const int rank ← u32_wire(rank_wire)
         cursor ← add(cursor, 4)
         require rank ≠ 0 throw variant BadBounds { message = "tensor rank must be at least one" }
         require rank ≤ RANK_LIMIT throw variant BadBounds { message = "tensor rank exceeds the bounded limit" }
@@ -1009,7 +1050,7 @@ fn inspect((int, int) → bytes ⇥ GgufManifestError source, int artifact_lengt
         var int d ← 0
         while d ≺ rank {
             const bytes dim_wire ← read_source(source, artifact_length, cursor, 8)
-            const int dim ← u64(byte_list(dim_wire), 0)
+            const int dim ← u64_wire(dim_wire)
             reject dim ≤ 0 throw variant BadBounds { message = "tensor dimension must be positive" }
             shape.append(dim)
             cursor ← add(cursor, 8)
@@ -1018,10 +1059,10 @@ fn inspect((int, int) → bytes ⇥ GgufManifestError source, int artifact_lengt
 
         # --- dtype + offset + layout --------------------------------------
         const bytes ggml_wire ← read_source(source, artifact_length, cursor, 4)
-        const int ggml_dtype ← u32(byte_list(ggml_wire), 0)
+        const int ggml_dtype ← u32_wire(ggml_wire)
         cursor ← add(cursor, 4)
         const bytes offset_wire ← read_source(source, artifact_length, cursor, 8)
-        const int offset ← u64(byte_list(offset_wire), 0)
+        const int offset ← u64_wire(offset_wire)
         cursor ← add(cursor, 8)
         const int elements ← element_count(shape)
         const GgmlLayout lay ← layout(ggml_dtype, shape)
