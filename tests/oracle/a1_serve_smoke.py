@@ -14,7 +14,14 @@ the mismatch step) is taken from a previous oracle run's results JSON
 plain FAIL.
 
     FABER_LIBRARY_HOME=<container root> a1_serve_smoke.py --faber <release faber> \
-        [--live-results results.json] [--cases eog,continuation] [--ready-timeout 400]
+        [--live-results results.json] [--cases eog,continuation] [--ready-timeout 400] \
+        [--no-sampling] [--log serve.log]
+
+After the greedy cases, the same server session runs the seeded sampling cases
+(metal-sampling-design.md section 6, items 3 and 4) on the continuation prompt with
+max_tokens 32: the same seed twice gives identical ids, a different seed gives
+different ids, a full-logits-fallback setting (top_k 0) twice gives identical ids,
+top_k 1 at temperature 0.8 and temperature 1e-6 both equal the greedy ids.
 """
 import argparse
 import json
@@ -66,6 +73,57 @@ def sse_tokens(raw):
     return toks, done
 
 
+SAMPLING_MAX_TOKENS = 32
+
+
+def sample_request(base, prompt, label, extra, a):
+    """POST one /generate with sampling fields; returns the parsed response."""
+    body = {"prompt": prompt, "max_tokens": SAMPLING_MAX_TOKENS}
+    body.update(extra)
+    t = time.time()
+    code, raw = post(base + "/generate", body, timeout=a.request_timeout)
+    resp = json.loads(raw)
+    print("POST /generate %-22s -> %d  %.1fs  ids=%s" % (label, code, time.time() - t, resp["tokens"]))
+    return resp["tokens"]
+
+
+def sampling_cases(base, a):
+    """Seeded sampling proof (metal-sampling-design.md section 6, items 3 and 4)."""
+    ref = json.load(open(os.path.join(a.refs, oracle.CASES["continuation"])))
+    prompt = ref["prompt"]
+    failures = []
+
+    def verdict(name, ok, detail):
+        print("SAMPLING %-34s %s  %s" % (name, "PASS" if ok else "FAIL", detail))
+        if not ok:
+            failures.append("sampling %s: %s" % (name, detail))
+
+    cand = {"temperature": 0.8, "top_k": 8, "top_p": 0.95}
+    greedy = sample_request(base, prompt, "greedy", {}, a)
+    ref_prefix = ref["generated_token_ids"][:SAMPLING_MAX_TOKENS]
+    verdict("greedy32 == reference prefix", greedy == ref_prefix,
+            "server greedy %d ids vs reference first %d" % (len(greedy), len(ref_prefix)))
+
+    s7a = sample_request(base, prompt, "seed7 candidates #1", dict(cand, seed=7), a)
+    s7b = sample_request(base, prompt, "seed7 candidates #2", dict(cand, seed=7), a)
+    verdict("seed 7 twice identical", s7a == s7b, "equal" if s7a == s7b else "run1=%s run2=%s" % (s7a, s7b))
+    s8 = sample_request(base, prompt, "seed8 candidates", dict(cand, seed=8), a)
+    verdict("seed 8 differs from seed 7", s8 != s7a, "differ" if s8 != s7a else "identical ids %s" % s8)
+
+    fb = {"temperature": 0.8, "top_k": 0, "top_p": 1.0, "seed": 7}
+    fa = sample_request(base, prompt, "seed7 fallback #1", fb, a)
+    fb2 = sample_request(base, prompt, "seed7 fallback #2", fb, a)
+    verdict("fallback seed 7 twice identical", fa == fb2, "equal" if fa == fb2 else "run1=%s run2=%s" % (fa, fb2))
+    # identical-but-degenerate (a lone end-of-text id) is not a repeatability proof
+    verdict("fallback is a real continuation", len(fa) >= 2, "%d ids %s" % (len(fa), fa))
+
+    k1 = sample_request(base, prompt, "top_k 1 temp 0.8", {"temperature": 0.8, "top_k": 1, "seed": 7}, a)
+    verdict("top_k 1 at temp 0.8 == greedy", k1 == greedy, "equal" if k1 == greedy else "sampled=%s greedy=%s" % (k1, greedy))
+    t0 = sample_request(base, prompt, "temp 1e-6", {"temperature": 1e-6, "seed": 7}, a)
+    verdict("temperature 1e-6 == greedy", t0 == greedy, "equal" if t0 == greedy else "sampled=%s greedy=%s" % (t0, greedy))
+    return failures
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--faber", required=True)
@@ -76,6 +134,8 @@ def main():
     ap.add_argument("--live-results", default=None)
     ap.add_argument("--ready-timeout", type=float, default=400.0)
     ap.add_argument("--request-timeout", type=float, default=400.0)
+    ap.add_argument("--no-sampling", action="store_true", help="skip the seeded sampling cases")
+    ap.add_argument("--log", default=None, help="server stdout/stderr log path")
     a = ap.parse_args()
     if "FABER_LIBRARY_HOME" not in os.environ:
         sys.exit("set FABER_LIBRARY_HOME to the container root")
@@ -85,7 +145,8 @@ def main():
     base = "http://127.0.0.1:%d" % port
     cmd = [a.faber, "run", "--device", "metal", a.package, "--", "inferentia", "serve",
            "--backend", "metal", "--model", a.model, "--port", str(port)]
-    log = open(os.path.join(os.path.dirname(a.live_results or "."), "serve.log") if a.live_results else "/dev/null", "w")
+    log_path = a.log or (os.path.join(os.path.dirname(a.live_results), "serve.log") if a.live_results else "/dev/null")
+    log = open(log_path, "w")
     t0 = time.time()
     srv = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
     failures = []
@@ -149,6 +210,9 @@ def main():
                     name, code, time.time() - t2, len(toks), done is not None, ok))
                 if not ok:
                     failures.append("SSE ids differ from JSON ids for %s" % name)
+
+        if state == "ready" and not a.no_sampling:
+            failures.extend(sampling_cases(base, a))
     finally:
         srv.terminate()
         try:
