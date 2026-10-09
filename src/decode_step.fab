@@ -23,6 +23,7 @@ locale = "en"
 #     residual_add                  hidden[D]
 #     rms_stats + rms_apply, gemv_lane (gate, up), swiglu, gemv_lane (down), residual_add
 #   final rms_stats + rms_apply, gemv_lane (lm_head)   logits[V]
+#   argmax_chunks                   per-chunk (max, global index) of logits[V], P chunks
 #
 # Constraints these kernels carry (each was learned the hard way in
 # acceptance/a1-rowops and is why the code looks the way it does):
@@ -255,5 +256,41 @@ fn residual_add<size D>(tensor<f32, [D]> rea, tensor<f32, [D]> reb, mut tensor<f
 fn swiglu<size F>(tensor<f32, [F]> swg, tensor<f32, [F]> swu, mut tensor<f32, [F]> swo) → void {
     for from swg at [j] thread lane const v {
         swo[[j]] ← (v / (1.0 + (0.0 - v).exp())) * swu[[j]]
+    }
+}
+
+# Chunked argmax: ONE lane per chunk scans its contiguous chunk of the logits.
+# V logits are split into P chunks of `macchunk` = V / P elements (the caller
+# passes a P that divides V: for SmolLM2, V = 49152, P = 256, chunk 192). Lane p
+# scans [p * chunk, (p + 1) * chunk) with a strict `>`, so inside a chunk the
+# FIRST index wins ties, and writes the best value and its GLOBAL index to
+# `macval[p]` / `macidx[p]`. The index tensor is f32 (the lane stores are f32
+# tensors, as in every other kernel here); indices below 2^24 are exact, and the
+# vocabulary is far below that. The host then scans the P pairs in ascending
+# chunk order with a strict `>`: chunks are contiguous and ascending, so the
+# global rule "the lowest index wins ties" holds. NaN: no `>` is true against a
+# NaN, so a NaN first element of a chunk stays that chunk's best and later
+# numbers never replace it (the generic runner argmax instead replaces a NaN
+# score by the first number); logits are finite in practice, and the kernel never
+# traps. `macdom` is the lane domain [P].
+@ kernel
+@ public
+fn argmax_chunks<size P, size V>(tensor<f32, [P]> macdom, tensor<f32, [V]> macx, mut tensor<f32, [P]> macval, mut tensor<f32, [P]> macidx, i32 macchunk) → void {
+    for from macdom at [p] thread lane const e {
+        const int n ← macchunk ↦ int
+        const int start ← p * n
+        const int stop ← start + n
+        var f32 best ← macx[[start]]
+        var int bi ← start
+        var int k ← start + 1
+        while k ≺ stop {
+            if macx[[k]] ≻ best {
+                best ← macx[[k]]
+                bi ← k
+            }
+            k ← k + 1
+        }
+        macval[[p]] ← best
+        macidx[[p]] ← bi ↦ f32
     }
 }
