@@ -181,6 +181,88 @@ fn port_chunk_pick(tensor<f32, [256]> vals, tensor<f32, [256]> idxs) → int {
     return best
 }
 
+# Candidate logits and their vocabulary ids for the sampled path.
+@ public
+class PortCandidates {
+    var list<f32> values
+    var list<int> ids
+}
+
+# The repetition penalty on the host logits, before the device narrowing (it
+# changes the ranking). The llama rule of `sampling.repetition_penalty`: a
+# positive logit is divided, a non-positive one multiplied, and an id repeated
+# in `history` is penalised once per occurrence. `history` holds the generated
+# ids only (the prompt is not in it) and every id lies in [0, 49152).
+@ public
+fn port_penalize(mut tensor<f32, [49152]> logits, list<int> history, f32 penalty) → void {
+    var int k ← 0
+    while k ≺ history.length() {
+        const int id ← history.get(k) coalesce 0
+        const f32 w ← logits[[id]]
+        if w ≻ 0.0 {
+            logits[[id]] ← w / penalty
+        } else {
+            logits[[id]] ← w * penalty
+        }
+        k ← k + 1
+    }
+}
+
+# The ignore_eos mask of the sampled path: the ids in `skip` are set to -1e9,
+# not the lowest f32 of `port_mask`, which becomes -inf after the temperature
+# division or the penalty and is rejected by `sampling.require_logits`.
+@ public
+fn port_mask_ignore(mut tensor<f32, [49152]> logits, list<int> skip) → void {
+    const f32 floor ← -1000000000.0 ∷ f32
+    var int k ← 0
+    while k ≺ skip.length() {
+        logits[[skip.get(k) coalesce 0]] ← floor
+        k ← k + 1
+    }
+}
+
+# The per-chunk top-M (value, global index) pairs read back from the device
+# (indices are f32, exact below 2^24), as the candidate list in ascending
+# vocabulary-id order: the order `sampling.sample_candidates` needs so its
+# float sums run in the full-list order. The pairs come chunk by chunk, so the
+# input is nearly sorted by id and the stable insertion sort is cheap. A slot
+# the kernel left unfilled (a chunk with fewer than M elements) carries the
+# value -3.4028235e38 and the index -1.0; the INDEX is the marker, not the
+# value (a real logit can be very negative), so every pair with a negative
+# index is dropped.
+@ public
+fn port_candidates(tensor<f32, [4096]> vals, tensor<f32, [4096]> idxs) → PortCandidates {
+    var list<f32> values ← empty
+    var list<int> ids ← empty
+    var int i ← 0
+    while i ≺ 4096 {
+        const int id ← idxs[[i]] ↦ int ⊥ -1
+        if id ≥ 0 {
+            const int n ← ids.length()
+            values.append(vals[[i]])
+            ids.append(id)
+            var int j ← n
+            while j ≻ 0 and (ids.get(j - 1) coalesce 0) ≻ id {
+                ids[j] ← ids.get(j - 1) coalesce 0
+                values[j] ← values.get(j - 1) coalesce (0.0 ∷ f32)
+                ids[j - 1] ← id
+                values[j - 1] ← vals[[i]]
+                j ← j - 1
+            }
+        }
+        i ← i + 1
+    }
+    return PortCandidates { values = values, ids = ids }
+}
+
+# Whether the kept set of a top-p or min-p filter is provably exact: its lowest
+# kept logit must be strictly greater than `chunk_floor`, the largest per-chunk
+# M-th value, since an element a chunk did not return is at most that floor.
+@ public
+fn port_exact(f32 kept_min, f32 chunk_floor) → bool {
+    return kept_min ≻ chunk_floor
+}
+
 # ---------------------------------------------------------------------------
 # Helpers of the decode loop (the loop itself is `port_generate` below)
 # ---------------------------------------------------------------------------
@@ -292,6 +374,117 @@ describe "port generate chunk pick" tag "inferentia" {
         x[[0]] ← 0.0 ∷ f32
         x[[1]] ← 192.0 ∷ f32
         assert port_chunk_pick(v, x) ≡ 0
+    }
+}
+
+describe "port generate sampling helpers" tag "inferentia" {
+    test "the penalty divides positive logits and multiplies non-positive ones" {
+        var tensor<f32, [49152]> t ← tf32[49152] {}
+        t[[3]] ← 4.0 ∷ f32
+        t[[5]] ← -2.0 ∷ f32
+        t[[8]] ← 6.0 ∷ f32
+        port_penalize(mut t, [3, 5], 2.0 ∷ f32)
+        assert t[[3]] ≡ (2.0 ∷ f32)
+        assert t[[5]] ≡ (-4.0 ∷ f32)
+        assert t[[8]] ≡ (6.0 ∷ f32)
+    }
+    test "a repeated history id is penalised repeatedly" {
+        var tensor<f32, [49152]> t ← tf32[49152] {}
+        t[[3]] ← 8.0 ∷ f32
+        port_penalize(mut t, [3, 3], 2.0 ∷ f32)
+        assert t[[3]] ≡ (2.0 ∷ f32)
+    }
+    test "an empty history leaves the logits unchanged" {
+        var tensor<f32, [49152]> t ← tf32[49152] {}
+        t[[3]] ← 4.0 ∷ f32
+        port_penalize(mut t, [], 2.0 ∷ f32)
+        assert t[[3]] ≡ (4.0 ∷ f32)
+    }
+    test "the ignore mask sets the skipped ids to minus 1e9 and nothing else" {
+        var tensor<f32, [49152]> t ← tf32[49152] {}
+        t[[7]] ← 5.0 ∷ f32
+        t[[9]] ← 3.0 ∷ f32
+        port_mask_ignore(mut t, [7])
+        assert t[[7]] ≡ (-1000000000.0 ∷ f32)
+        assert t[[9]] ≡ (3.0 ∷ f32)
+    }
+    test "candidates keep an already ascending order with their values" {
+        var tensor<f32, [4096]> v ← tf32[4096] {}
+        var tensor<f32, [4096]> x ← tf32[4096] {}
+        var int k ← 0
+        while k ≺ 4096 {
+            v[[k]] ← ((4095 - k) ↦ f32 ⊥ (0.0 ∷ f32))
+            x[[k]] ← (k ↦ f32 ⊥ (0.0 ∷ f32))
+            k ← k + 1
+        }
+        const PortCandidates c ← port_candidates(v, x)
+        assert c.ids.length() ≡ 4096
+        assert c.values.length() ≡ 4096
+        assert c.ids.get(0) coalesce -1 ≡ 0
+        assert c.ids.get(4095) coalesce -1 ≡ 4095
+        assert c.values.get(0) coalesce (-1.0 ∷ f32) ≡ (4095.0 ∷ f32)
+        assert c.values.get(4095) coalesce (-1.0 ∷ f32) ≡ (0.0 ∷ f32)
+        assert c.ids.get(100) coalesce -1 ≡ 100
+        assert c.values.get(100) coalesce (-1.0 ∷ f32) ≡ (3995.0 ∷ f32)
+    }
+    test "chunk-ordered pairs sort within the chunk by id" {
+        var tensor<f32, [4096]> v ← tf32[4096] {}
+        var tensor<f32, [4096]> x ← tf32[4096] {}
+        var int k ← 0
+        while k ≺ 4096 {
+            x[[k]] ← ((k / 16) * 192 + 15 - (k % 16)) ↦ f32 ⊥ (0.0 ∷ f32)
+            v[[k]] ← (k % 16) ↦ f32 ⊥ (0.0 ∷ f32)
+            k ← k + 1
+        }
+        const PortCandidates c ← port_candidates(v, x)
+        assert c.ids.get(0) coalesce -1 ≡ 0
+        assert c.ids.get(15) coalesce -1 ≡ 15
+        assert c.values.get(0) coalesce (-1.0 ∷ f32) ≡ (15.0 ∷ f32)
+        assert c.ids.get(16) coalesce -1 ≡ 192
+        assert c.ids.get(4095) coalesce -1 ≡ 255 * 192 + 15
+    }
+    test "unfilled slots (index -1) are dropped and the real pairs sort by id" {
+        var tensor<f32, [4096]> v ← tf32[4096] {}
+        var tensor<f32, [4096]> x ← tf32[4096] {}
+        var int k ← 0
+        while k ≺ 4096 {
+            v[[k]] ← -3.4028235e38 ∷ f32
+            x[[k]] ← -1.0 ∷ f32
+            k ← k + 1
+        }
+        v[[0]] ← 2.0 ∷ f32
+        x[[0]] ← 300.0 ∷ f32
+        v[[1]] ← -3.4028235e38 ∷ f32
+        x[[1]] ← 5.0 ∷ f32
+        v[[17]] ← 7.0 ∷ f32
+        x[[17]] ← 100.0 ∷ f32
+        const PortCandidates c ← port_candidates(v, x)
+        assert c.ids.length() ≡ 3
+        assert c.values.length() ≡ 3
+        assert c.ids.get(0) coalesce -1 ≡ 5
+        assert c.values.get(0) coalesce (0.0 ∷ f32) ≡ (-3.4028235e38 ∷ f32)
+        assert c.ids.get(1) coalesce -1 ≡ 100
+        assert c.values.get(1) coalesce (0.0 ∷ f32) ≡ (7.0 ∷ f32)
+        assert c.ids.get(2) coalesce -1 ≡ 300
+        assert c.values.get(2) coalesce (0.0 ∷ f32) ≡ (2.0 ∷ f32)
+    }
+    test "only unfilled slots give empty lists" {
+        var tensor<f32, [4096]> v ← tf32[4096] {}
+        var tensor<f32, [4096]> x ← tf32[4096] {}
+        var int k ← 0
+        while k ≺ 4096 {
+            v[[k]] ← -3.4028235e38 ∷ f32
+            x[[k]] ← -1.0 ∷ f32
+            k ← k + 1
+        }
+        const PortCandidates c ← port_candidates(v, x)
+        assert c.ids.length() ≡ 0
+        assert c.values.length() ≡ 0
+    }
+    test "the kept set is exact only when its minimum beats the chunk floor" {
+        assert port_exact(3.0 ∷ f32, 2.0 ∷ f32)
+        assert not port_exact(2.0 ∷ f32, 2.0 ∷ f32)
+        assert not port_exact(1.0 ∷ f32, 2.0 ∷ f32)
     }
 }
 
