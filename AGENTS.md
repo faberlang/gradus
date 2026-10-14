@@ -36,18 +36,25 @@ truth. When they disagree, working code and observed behavior win.
 
 ## Validation
 
-Run the narrowest useful proof first — the package imports `gradus:` and
-`norma:` providers, so compilation needs the container as
-`FABER_LIBRARY_HOME`, the workspace radix binary (the PATH `faber` lags main
-and fails package resolution with `PKG001`), and an absolute input path:
+Run the narrowest useful proof first — the package imports the `gradus:`
+provider (Norma is embedded in the binary), so compilation needs
+`--library-home` naming the directory that holds the gradus checkout, the
+workspace radix binary (the PATH `faber` lags main and fails package
+resolution with `PKG001`), and an absolute input path. No `FABER_*`
+environment variable is read. While the container carries a stale `norma/`
+checkout beside `gradus/`, it shadows the embedded Norma; use a library home
+that holds only a `gradus` link.
 
 ```sh
 CONTAINER="$(cd .. && pwd)"
-FABER_BIN="$CONTAINER/radix/target/debug/faber"
-FABER_LIBRARY_HOME="$CONTAINER" "$FABER_BIN" check "$(pwd)"
-FABER_LIBRARY_HOME="$CONTAINER" "$FABER_BIN" build "$(pwd)"
-FABER_LIBRARY_HOME="$CONTAINER" "$FABER_BIN" test "$(pwd)"
+FABER="$CONTAINER/radix/target/debug/faber"
+"$FABER" check --library-home "$CONTAINER" "$(pwd)"
+"$FABER" build --library-home "$CONTAINER" "$(pwd)"
+"$FABER" test --library-home "$CONTAINER" "$(pwd)"
 ```
+
+Inferentia keeps no CPU backend: CPU inference is the same kernels under
+`faber run --device cpu` or `--device reference`.
 
 Measured package-suite baseline (2026-10-03, isolated `inf1` packet):
 `faber test <absolute-package-path>` took 157.74s with the plain development

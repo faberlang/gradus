@@ -14,49 +14,47 @@
 # first, `admit` runs before any allocation, and `/health` serves
 # `starting` → `ready` (with model identity) or `failed` (with the typed
 # cause). No weight materialization happens on this path: only the
-# admission contract (`solum:digestio` + `solum:hauri` → `gradus:model/gguf`
-# admit) is called; `forward` / `generate` are never invoked here.
+# admission contract (the whole-file digest + the header-prefix read →
+# `gradus:model/gguf` admit) is called; `forward` / `generate` are never invoked here.
 #
 # U4 scope: the `/generate` endpoint — request parse (minimal product JSON
 # per D3), field validation via the gradus reject rows (imperium_admissum,
-# enforced by the pinned engine with typed causes), the generation pipeline
-# (encode → the engine's prefill + greedy decode with the admitted tokenizer
-# EOG stop set and the max_tokens budget), cancellation checkpoints (D6 seam), and
-# the resident-model proof (weights load exactly once; stderr records the
-# single load). The generation loop itself lives behind
-# `gradus:generation.generate_dense_with_stop` (G2; factory spelling
-# existence-checked in gradus docs/api-reference.md). Default stop is
+# enforced with typed causes), the generation pipeline
+# (encode → the port decode loop: prefill + decode with the admitted tokenizer
+# EOG stop set and the max_tokens budget), cancellation checkpoints (D6 seam),
+# and the resident-model proof (weights load exactly once; stderr records the
+# single load). The decode loop lives in port_generate.fab. Default stop is
 # `eog_stop()` (D4). This unit owns the request pipeline around it.
 #
 # I-live: `inferentia live --model <PATH> [--prompt TEXT]` admits the GGUF
 # through `gguf.admit`, loads G3 tokenizer tables via `tokenizator.build`,
-# materializes the SmolLM2 dense weights, and one-shot generates the given
-# prompt (default: the frozen fixture) through `dense_gen.generate_dense_with_stop`,
-# printing `ids=` (space-joined) and the decoded `text=`. Default stop is
-# eog_stop (frozen oracle [30, 2]); --ignore-eos selects ignore_eos and the
-# 16-token U5 golden compare.
+# loads the SmolLM2 port weights, and one-shot generates the given prompt
+# (default: the frozen fixture) through the port decode loop, printing `ids=`
+# (space-joined), the decoded `text=` and `finish=`. Default stop is
+# eog_stop; --ignore-eos selects ignore_eos.
 #
 # HTTP serving goes through `norma:http/server` (bind / accept / reply /
-# open_sse). Request bodies arrive as valor octeti; `value ↦ bytes` then
-# `bytes ↦ string` extracts UTF-8 JSON. `/generate` answers JSON by default.
-# `Accept: text/event-stream` or `?stream=1` emits one SSE event per token
-# (I1 minimal stream). Generation itself is still a batch call.
+# open_sse). Request bodies arrive as a value carrying list<b8>; `value ↦
+# list<b8>` then `list<b8> ↦ string` extracts UTF-8 JSON. `/generate` answers
+# JSON by default. `Accept: text/event-stream` or `?stream=1` emits one SSE
+# event per token (I1 minimal stream). Generation itself is still a batch call.
 #
-# Backends (A1): `--backend cpu` (default) is the host NumericBlock path above.
-# `--backend metal` serves through the gradus decode-token launches (bulk F32
-# weight load, K/V ping-pong caches, greedy host argmax). The kernels only run
-# when the program itself is started on a device: `faber run --device metal
-# <inferentia> -- inferentia live|serve --backend metal ...`. Under
-# `faber run --device cpu` the same launches run in host form (correct, far too
-# slow for the real model); without `--device`, a launch is refused. The
-# `/model` body reports the selected backend (`cpu` or `metal`). `live --trace`
-# prints one `trace step=...` stderr line per generated step (the oracle input).
+# Generation (A1): the gradus decode-token launches (bulk F32 weight load, K/V
+# ping-pong caches). The kernels run on whatever device the program is started
+# on: `faber run --device metal <inferentia> -- live ...` for the GPU,
+# `--device cpu` (several cores) or `--device reference` (one core, the oracle)
+# for the same kernels on the CPU; without `--device`, a launch is refused.
+# Inferentia has no CPU backend of its own. `--backend metal` is the only
+# accepted value and names the kernel route, not the device. The `/model` body
+# reports it. `live --trace` prints one `trace step=...` stderr line per
+# generated step (the oracle input).
 #
 # The generated CLI framework is not used: its help/parse errors exit 0/2 and
 # cannot carry the D5 usage-error exit, so argv is parsed in this unit and
 # every usage error is detected before the listener binds.
 
 import from "norma:console" console
+import from "norma:fault" fault
 import from "norma:fs" fsys
 import from "norma:process" proc
 import from "norma:http/headers" headers
@@ -64,21 +62,12 @@ import from "norma:http/request" httpreq
 import from "norma:http/server" server
 import from "norma:http/sse" sse
 
-import from "gradus:attention/rope" rope
-import from "gradus:cache/kv" kv
-import from "gradus:cache/structure" structure
-import from "gradus:decode" decode
 import from "gradus:generation/config" config
 import from "gradus:generation/decoder" decoder
-import from "gradus:generation/dense" dense_gen
 import from "gradus:model/artifact" artifact
-import from "gradus:model/dense" dense
 import from "gradus:model/gguf" gguf
 import from "gradus:model/gguf_manifest" gguf_manifest
-import from "gradus:model/tensor_payload" tensor_payload
-import from "gradus:model/tensor_view" tensor_view
 import from "gradus:sampling" sampling
-import from "gradus:tensor" tensor
 import from "gradus:tokenizer/bpe" tokenizator
 import from "gradus:train" train
 
@@ -169,7 +158,7 @@ fn model_context_limit() → int {
     return 8192
 }
 
-# The marker `request_body_text` returns when octeti→text decode fails
+# The marker `request_body_text` returns when bytes→text decode fails
 # (invalid UTF-8). It is not valid JSON (non-ASCII delimiters), so it cannot
 # collide with a real request. (Functions, not top-level fixum — generated
 # consts cannot own String in this toolchain.)
@@ -377,7 +366,7 @@ fn json_char(JsonCursor c) → string {
 }
 
 fn json_skip_ws(JsonCursor c) → JsonCursor {
-    var JsonCursor out ← c
+    var JsonCursor out ← copy c
     var bool go ← true
     while go {
         const string ch ← json_char(out)
@@ -454,7 +443,7 @@ fn json_parse_string(JsonCursor c) → JsonScalar {
 fn json_parse_number(JsonCursor c) → JsonScalar {
     const string body_text ← c.text
     const int start ← c.pos
-    var JsonCursor cur ← c
+    var JsonCursor cur ← copy c
     if json_char(cur) ≡ "-" {
         cur ← JsonCursor { text = cur.text, pos = cur.pos + 1 }
     }
@@ -879,9 +868,9 @@ fn json_escape_char(string c) → string {
     if c ≡ "\n" { return "\\n" }
     if c ≡ "\r" { return "\\r" }
     if c ≡ "\t" { return "\\t" }
-    const bytes encoded ← c ↦ bytes
+    const list<b8> encoded ← c ↦ list<b8>
     if encoded.length() ≡ 1 {
-        const int code ← (encoded.get(0) coalesce (0 ∷ u8)) ↦ int
+        const int code ← (encoded.get(0) coalesce (0x00 ∷ b8)) ↦ u8 ↦ int
         if code ≡ 8 { return "\\b" }
         if code ≡ 12 { return "\\f" }
         if code ≺ 32 {
@@ -914,15 +903,15 @@ fn classify_generate_error(string err) → int {
     return 500
 }
 
-# Request-body extraction. The provider delivers valor octeti. `value ↦ bytes`
-# now extracts `Valor::Octeti`; UTF-8 decode is `bytes ↦ string`. A string
-# valor (tests / future text carriers) is taken as-is. The gap marker is only
-# for a failed octeti→text decode (invalid UTF-8).
+# Request-body extraction. The provider delivers the body as text; a value
+# carrying a `list<b8>` is also accepted and decoded with `value ↦ list<b8>`
+# then `list<b8> ↦ string` (UTF-8). A string value is taken as-is. The gap
+# marker is only for a failed byte→text decode (invalid UTF-8).
 fn request_body_text(value body_value) → string {
     if body_value is string {
         return body_value ↦ string ⊥ body_read_gap_marker()
     }
-    const bytes raw ← body_value ↦ bytes ⊥ ||
+    const list<b8> raw ← body_value ↦ list<b8> ⊥ ||
     return raw ↦ string ⊥ body_read_gap_marker()
 }
 
@@ -946,8 +935,15 @@ fn json_headers() → headers.Headers {
     return head
 }
 
+# A reply that cannot be written (the peer went away) drops that one request:
+# it is logged and the serve loop continues.
 fn reply_json(server.Incoming incoming, int status, string body) → void {
-    server.reply(incoming, status, json_headers(), body)
+    do {
+        server.reply(incoming, status, json_headers(), body)
+    }
+    catch err {
+        stderr_write("inferentia: reply dropped: §\n"(err))
+    }
 }
 
 fn wants_sse(server.Incoming incoming) → bool {
@@ -973,27 +969,38 @@ fn wants_sse(server.Incoming incoming) → bool {
 # detokenized `text` arrives pre-decoded — decode fails closed before the
 # stream opens, so no partial body is emitted.
 fn send_generate_stream(server.Incoming incoming, ServerState st, string text, list<int> tokens, list<int> prompt_ids, int max_tokens) → void {
-    const server.Stream stream ← server.open_sse(incoming)
-    var int i ← 0
-    while i ≺ tokens.length() {
-        const int t ← tokens.get(i) coalesce 0
-        const sse.Event ev ← sse.Event { name = "token", data = t ↦ string, id = "", retry = "" }
-        server.send_event(stream, ev)
-        i ← i + 1
+    do {
+        const server.Stream stream ← server.open_sse(incoming)
+        var int i ← 0
+        while i ≺ tokens.length() {
+            const int t ← tokens.get(i) coalesce 0
+            const sse.Event ev ← sse.Event { name = "token", data = t ↦ string, id = "", retry = "" }
+            server.send_event(stream, ev)
+            i ← i + 1
+        }
+        const sse.Event done ← sse.Event { name = "done", data = generate_response_body(st, text, tokens, prompt_ids, max_tokens), id = "", retry = "" }
+        server.send_event(stream, done)
+        server.finish_stream(stream, server.keep_alive(incoming.req.headers))
     }
-    const sse.Event done ← sse.Event { name = "done", data = generate_response_body(st, text, tokens, prompt_ids, max_tokens), id = "", retry = "" }
-    server.send_event(stream, done)
-    server.finish_stream(stream, server.keep_alive(incoming.req.headers))
+    catch err {
+        stderr_write("inferentia: stream dropped: §\n"(err))
+    }
 }
 
-# Write text to stdout without a trailing newline.
+# Write text to stdout without a trailing newline. Console writes report on
+# the error channel (IoFault); a broken stdout is a trap.
 fn stdout_write(string text) → void {
-    return console.write_partial(text)
+    do {
+        console.write_partial(text)
+    }
+    catch err {
+        panic "stdout write failed: §"(err)
+    }
 }
 
 # Write a line to stderr.
 fn stderr_write(string text) → void {
-    return console.warn_line(text)
+    port.port_warn(text)
 }
 
 # D5 exit-code delivery: terminate the process with the given code (0 clean
@@ -1024,19 +1031,25 @@ fn pinned_expect_q8() → int { return 0 }
 fn pinned_expect_file_type() → int { return 0 }
 fn pinned_expect_pad_id() → int { return 0 }
 
-# Host IO payloads are String. A ⇥ string wrapper lets them propagate
-# instead of aborting; admit_model's cape maps them into CapsulaMala.
-fn host_digestio(string path) → string ⇥ string {
+# Host I/O reports on the error channel (IoFault, no message text);
+# admit_model's catch maps it into BadCapsule.
+#
+# BLOCKED on need 4f151ca7: the native streaming whole-file SHA-256 leaf
+# (exposed through Norma) is not in the compiler yet. `solum:digestio` was
+# deleted on 2026-10-12 (cea9072475), so this is the one call that does not
+# check. When the Norma digest lands, this body becomes that call and nothing
+# else here changes.
+fn host_digestio(string path) → string ⇥ fault.IoFault {
     return call 'solum:digestio' (path) ↦ string
 }
 
-fn host_mensura(string path) → int ⇥ string {
+fn host_mensura(string path) → int ⇥ fault.IoFault {
     return fsys.byte_length(path)
 }
 
 # The header prefix [0, length): everything the manifest authority inspects.
-fn host_prefix(string path, int length) → list<u8> ⇥ string {
-    const bytes raw ← fsys.read_range(path, 0, length)
+fn host_prefix(string path, int length) → list<u8> ⇥ fault.IoFault {
+    const list<b8> raw ← fsys.read_range(path, 0, length)
     const list<u8> prefix ← raw ↦ list<u8>
     return prefix
 }
@@ -1086,7 +1099,7 @@ fn admit_model(string path) → AdmittedModel ⇥ gguf.GgufError {
         }
     }
     catch err {
-        throw variant BadCapsule { message = err }
+        throw variant BadCapsule { message = "§"(err) }
     }
     if size_refusal not is none {
         throw variant BadCapsule { message = size_refusal coalesce "" }
@@ -1099,16 +1112,11 @@ fn to_generation_config(GenerateConfig cfg, list<int> eog_ids) → config.Genera
     return config.construct_generation(cfg.contextus, cfg.magna_promptus, cfg.maxima_verborum, cfg.semen, cfg.temperatura ↦ f32, cfg.top_k, cfg.top_p ↦ f32, cfg.min_p ↦ f32, cfg.poena_repetitionis ↦ f32, eog_ids)
 }
 
-# Resident dense weights + the admitted G3 tokenizer for /generate (loaded
-# once after admit). The tokenizer carried here is the one built from the
-# admitted manifest — the same tables the EOG stop set came from.
+# The admitted G3 tokenizer for /generate (built once after admit). The
+# tokenizer carried here is the one built from the admitted manifest — the
+# same tables the EOG stop set came from. The weights are not here: they live
+# in `port.PortWeights`, loaded once and passed beside this record.
 class ResidentModel {
-    var bool ready
-    var dense_gen.DenseEngine engine
-    var tensor.NumericBlock embed
-    var tensor.NumericBlock norm_s
-    var list<list<tensor.NumericBlock>> strata
-    var structure.KVStructure structure
     var gguf_manifest.GgufManifest manifest
     var tokenizator.Tokenizer tokenizer
     var list<int> eog_ids
@@ -1162,35 +1170,22 @@ fn empty_tokenizer() → tokenizator.Tokenizer {
 
 fn empty_resident() → ResidentModel {
     return ResidentModel {
-        ready = false,
-        engine = dense_gen.default_dense_engine(),
-        embed = tensor.default(),
-        norm_s = tensor.default(),
-        strata = [],
-        structure = structure.default_kv_structure(),
         manifest = empty_manifest(),
         tokenizer = empty_tokenizer(),
         eog_ids = []
     }
 }
 
-fn fresh_resident_caches(ResidentModel model) → list<kv.KVCache> {
-    do {
-        return dense.empty_caches(model.structure, "smollm2", "360m", "f32-staged", "smollm")
-    }
-    catch err {
-        panic "empty caches failed: " + err.message
-    }
-}
-
 # ---------------------------------------------------------------------------
-# I-live — one-shot G2 generate_dense_with_stop on an admitted GGUF
+# I-live — one-shot generate on an admitted GGUF
 #
-# Serve loads the same resident dense weights and calls
-# generate_dense_with_stop with an explicit StopPolicy (default eog_stop).
-# live is the composed provider run: admit → inspect → G3 tokenizer
-# tables → dense weights → generate_dense_with_stop (eog_stop by default;
-# --ignore-eos selects ignore_eos; no golden compare is recorded for it).
+# Serve loads the port weights once and decodes every /generate from them
+# with an explicit StopPolicy (default eog_stop). live is the composed
+# provider run: admit → inspect → G3 tokenizer tables → port weights →
+# port decode (eog_stop by default; --ignore-eos selects ignore_eos). There
+# is no host-side CPU path: CPU inference is the same kernels under
+# `faber run --device cpu` (several cores) or `--device reference` (one core,
+# the oracle).
 # ---------------------------------------------------------------------------
 
 fn pinned_digest() → string {
@@ -1201,69 +1196,35 @@ fn pinned_data_offset() → int {
     return 1786560
 }
 
-# Elements read from the file per read window. A window's bytes are a value
-# the source closure copies on every sub-range call, so the window must stay
-# small (1024 F32 elements = 4 KiB); the file is still read once per window,
-# not once per block.
-fn live_read_cap() → int {
-    return 1024
-}
-
 # NOTE: the former 16-token ignore_eos golden was Q4_K_M evidence (U5
-# record.json); it does not describe the F32 row and is retired. No F32
-# ignore_eos golden is recorded yet (A1-ORACLE supplies the F32 references),
-# so `--ignore-eos` runs print the ids without an oracle compare.
+# record.json); it does not describe the F32 row and is retired. The F32
+# references are the A1 oracle's (tests/oracle/a1_oracle.py).
 
-# The frozen fixture's greedy eog_stop continuation (generate-gate header
-# fact: the EOG id terminates the run, so the run is [30, 2]).
-fn frozen_eog_continuation() → list<int> {
-    return [30, 2]
-}
-
-fn live_file_size(string path) → int {
+fn live_file_size(string path) → int ⇥ fault.IoFault {
     return fsys.byte_length(path)
 }
 
-fn live_read_range(string path, int start, int length) → bytes {
+fn live_read_range(string path, int start, int length) → list<b8> ⇥ fault.IoFault {
     return fsys.read_range(path, start, length)
 }
 
-fn live_range(string path, int total, int initium, int longitudo) → bytes ⇥ gguf_manifest.GgufManifestError {
+# The bounds-checked byte source for the manifest reader and the port loader.
+# An I/O fault surfaces as BadSource carrying the fault's rendering.
+fn live_range(string path, int total, int initium, int longitudo) → list<b8> ⇥ gguf_manifest.GgufManifestError {
     if initium ≺ 0 or longitudo ≺ 0 or initium ≻ total - longitudo {
         throw variant BadSource { message = "range request exceeds the artifact" }
     }
-    const bytes raw ← live_read_range(path, initium, longitudo)
+    var list<b8> raw ← []
+    do {
+        raw ← live_read_range(path, initium, longitudo)
+    }
+    catch err {
+        throw variant BadSource { message = "range read failed: §"(err) }
+    }
     if raw.length() ≢ longitudo {
         throw variant BadSource { message = "short range read" }
     }
     return raw
-}
-
-fn live_prefix_range(list<int> prefix, int initium, int longitudo) → bytes ⇥ gguf_manifest.GgufManifestError {
-    if initium ≺ 0 or longitudo ≺ 0 or initium ≻ prefix.length() - longitudo {
-        throw variant BadSource { message = "inspection attempted to read the tensor data region" }
-    }
-    const list<int> segment ← prefix.slice(initium, initium + longitudo)
-    const bytes raw ← segment ↦ bytes
-    return raw
-}
-
-fn live_ends(string s, string tail) → bool {
-    if tail.length() ≻ s.length() { return false }
-    return s.slice(s.length() - tail.length(), s.length()) ≡ tail
-}
-
-fn live_slot(string nomen) → int {
-    if live_ends(nomen, ".input_layernorm") { return 0 }
-    if live_ends(nomen, ".self_attn.q_proj") { return 1 }
-    if live_ends(nomen, ".self_attn.k_proj") { return 2 }
-    if live_ends(nomen, ".self_attn.v_proj") { return 3 }
-    if live_ends(nomen, ".self_attn.o_proj") { return 4 }
-    if live_ends(nomen, ".post_attention_layernorm") { return 5 }
-    if live_ends(nomen, ".mlp.gate_proj") { return 6 }
-    if live_ends(nomen, ".mlp.up_proj") { return 7 }
-    if live_ends(nomen, ".mlp.down_proj") { return 8 }
-    return -1
 }
 
 fn live_ids_text(list<int> ids) → string {
@@ -1289,219 +1250,6 @@ fn live_ids_flat(list<int> ids) → string {
     return out
 }
 
-fn live_block_elements(tensor_view.TensorView v) → int {
-    match v.layout {
-        case gguf_manifest.Known const elementa_per_blockum, octeti_per_blockum, longitudo_octetorum {
-            return elementa_per_blockum
-        }
-        case gguf_manifest.Unknown const typo {
-            return 0
-        }
-    }
-}
-
-fn live_window(int remaining, int block) → int {
-    if remaining ≤ live_read_cap() { return remaining }
-    const int aligned ← (live_read_cap() / block) * block
-    if aligned ≺ block { return block }
-    return aligned
-}
-
-fn live_limits(gguf_manifest.GgufManifest m, string gguf_name) → tuple<int, int> {
-    do {
-        return gguf_manifest.payload_limit(m, gguf_name)
-    }
-    catch err {
-        panic "payload range failed for " + gguf_name + ": " + err.message
-    }
-}
-
-fn live_bind(gguf_manifest.GgufManifest m, tensor_payload.TensorPayload p) → tensor_view.TensorView {
-    do {
-        return tensor_view.links(m, p)
-    }
-    catch err {
-        panic "view bind failed for " + p.name + ": " + err.message
-    }
-}
-
-fn live_slice(tensor_view.TensorView v, int off, int n, (int, int) → bytes ⇥ gguf_manifest.GgufManifestError fons) → list<f32> {
-    do {
-        return tensor_view.materialize_slice(v, off, n, fons)
-    }
-    catch err {
-        panic "window materialize failed for " + v.name + ": " + err.message
-    }
-}
-
-fn live_tensor(list<f32> datos, list<int> forma) → tensor.NumericBlock {
-    do {
-        return tensor.construct(datos, forma)
-    }
-    catch err {
-        panic "tensor construct failed: " + err.message
-    }
-}
-
-fn live_block_bytes(tensor_view.TensorView v) → int {
-    match v.layout {
-        case gguf_manifest.Known const elementa_per_blockum, octeti_per_blockum, longitudo_octetorum {
-            return octeti_per_blockum
-        }
-        case gguf_manifest.Unknown const typo {
-            return 0
-        }
-    }
-}
-
-# Serve one sub-range request from the bytes of an already-read window.
-# `base` is the absolute file offset of window[0]; a request outside the
-# window fails closed as BadSource (the window is exactly the range the
-# slice will ask for, so this only fires on a caller bug).
-fn live_window_range(bytes window, int base, int initium, int longitudo) → bytes ⇥ gguf_manifest.GgufManifestError {
-    const int rel ← initium - base
-    if rel ≺ 0 or longitudo ≺ 0 or rel + longitudo ≻ window.length() {
-        throw variant BadSource { message = "range request exceeds the read window" }
-    }
-    return window[rel‥(rel + longitudo)]
-}
-
-fn live_read_window(string via, int total, int base, int longitudo, string gguf_name) → bytes {
-    do {
-        return live_range(via, total, base, longitudo)
-    }
-    catch err {
-        panic "window read failed for " + gguf_name + ": " + err.message
-    }
-}
-
-fn live_materialize(string via, int total, gguf_manifest.GgufManifest m, string gguf_name) → tensor.NumericBlock {
-    const tuple<int, int> limes ← live_limits(m, gguf_name)
-    const tensor_payload.TensorPayload p ← tensor_payload.TensorPayload {
-        name = gguf_name,
-        absolute_start = limes[0],
-        length = limes[1],
-        bytes = ||
-    }
-    const tensor_view.TensorView v ← live_bind(m, p)
-    const int block ← live_block_elements(v)
-    const int block_bytes ← live_block_bytes(v)
-    if block ≺ 1 or block_bytes ≺ 1 {
-        panic "tensor layout has no block size: " + gguf_name
-    }
-    var list<f32> datos ← []
-    var int off ← 0
-    while off ≺ v.elements {
-        const int n ← live_window(v.elements - off, block)
-        # One file read per window; every per-block read below is served
-        # from these bytes.
-        const int base ← v.absolute_start + (off / block) * block_bytes
-        const bytes window_bytes ← live_read_window(via, total, base, (n / block) * block_bytes, gguf_name)
-        const list<f32> part ← live_slice(
-            v,
-            off,
-            n,
-            (int initium, int longitudo) → bytes ⇥ gguf_manifest.GgufManifestError ∴ live_window_range(window_bytes, base, initium, longitudo)
-        )
-        var int pi ← 0
-        while pi ≺ part.length() {
-            datos.append(part.get(pi) coalesce (0.0 ∷ f32))
-            pi ← pi + 1
-        }
-        off ← off + n
-    }
-    return live_tensor(datos, v.shape)
-}
-
-fn live_gguf_name(string family, int stratum) → string {
-    if family ≡ "model.embed_tokens" { return "token_embd.weight" }
-    if family ≡ "model.norm" { return "output_norm.weight" }
-    if family ≡ "lm_head" { return "token_embd.weight" }
-    if stratum ≺ 0 or stratum ≥ 32 {
-        panic "layer index outside the frozen llama layer range: " + (stratum ↦ string)
-    }
-    if family ≡ "model.layers.input_layernorm" { return ("blk." + (stratum ↦ string)) + ".attn_norm.weight" }
-    if family ≡ "model.layers.self_attn.q_proj" { return ("blk." + (stratum ↦ string)) + ".attn_q.weight" }
-    if family ≡ "model.layers.self_attn.k_proj" { return ("blk." + (stratum ↦ string)) + ".attn_k.weight" }
-    if family ≡ "model.layers.self_attn.v_proj" { return ("blk." + (stratum ↦ string)) + ".attn_v.weight" }
-    if family ≡ "model.layers.self_attn.o_proj" { return ("blk." + (stratum ↦ string)) + ".attn_output.weight" }
-    if family ≡ "model.layers.post_attention_layernorm" { return ("blk." + (stratum ↦ string)) + ".ffn_norm.weight" }
-    if family ≡ "model.layers.mlp.gate_proj" { return ("blk." + (stratum ↦ string)) + ".ffn_gate.weight" }
-    if family ≡ "model.layers.mlp.up_proj" { return ("blk." + (stratum ↦ string)) + ".ffn_up.weight" }
-    if family ≡ "model.layers.mlp.down_proj" { return ("blk." + (stratum ↦ string)) + ".ffn_down.weight" }
-    panic "unknown canonical tensor name: " + family
-}
-
-fn live_kmajor_to_linear(tensor.NumericBlock t) → tensor.NumericBlock {
-    const list<int> f ← t.shape
-    if f.length() ≢ 2 {
-        panic "linear weight must be rank 2"
-    }
-    const int k ← f.get(0) coalesce 1
-    const int n ← f.get(1) coalesce 1
-    var list<f32> out ← []
-    var int i ← 0
-    while i ≺ k {
-        var int j ← 0
-        while j ≺ n {
-            out.append(t.data.get(j * k + i) coalesce (0.0 ∷ f32))
-            j ← j + 1
-        }
-        i ← i + 1
-    }
-    return live_tensor(out, [k, n])
-}
-
-fn live_linear_family(string family) → bool {
-    if family ≡ "lm_head" { return true }
-    if live_ends(family, ".self_attn.q_proj") { return true }
-    if live_ends(family, ".self_attn.k_proj") { return true }
-    if live_ends(family, ".self_attn.v_proj") { return true }
-    if live_ends(family, ".self_attn.o_proj") { return true }
-    if live_ends(family, ".mlp.gate_proj") { return true }
-    if live_ends(family, ".mlp.up_proj") { return true }
-    if live_ends(family, ".mlp.down_proj") { return true }
-    return false
-}
-
-fn live_load_one(string via, int total, gguf_manifest.GgufManifest m, string family, int stratum) → tensor.NumericBlock {
-    const string gguf_name ← live_gguf_name(family, stratum)
-    const tensor.NumericBlock stored ← live_materialize(via, total, m, gguf_name)
-    if live_linear_family(family) {
-        return live_kmajor_to_linear(stored)
-    }
-    return stored
-}
-
-fn live_lookup(string nomen, int stratum, tensor.NumericBlock embed, tensor.NumericBlock norm_s, list<list<tensor.NumericBlock>> strata) → tensor.NumericBlock ⇥ dense.DenseError {
-    if nomen ≡ "model.embed_tokens" { return embed }
-    if nomen ≡ "model.norm" { return norm_s }
-    if stratum ≺ 0 or stratum ≥ strata.length() {
-        throw variant MissingTensor { message = "layer out of range: " + (stratum ↦ string) }
-    }
-    const int slot ← live_slot(nomen)
-    if slot ≺ 0 {
-        throw variant MissingTensor { message = "unknown canonical tensor: " + nomen }
-    }
-    var list<tensor.NumericBlock> missing ← []
-    const list<tensor.NumericBlock> row ← strata.get(stratum) coalesce missing
-    if slot ≥ row.length() {
-        throw variant MissingTensor { message = "layer slot missing: " + nomen }
-    }
-    const tensor.NumericBlock t ← row.get(slot) coalesce embed
-    return t
-}
-
-fn live_indices(int n) → list<int> {
-    var list<int> out ← []
-    var int i ← 0
-    while i ≺ n {
-        out.append(i)
-        i ← i + 1
-    }
-    return out
-}
-
 fn live_first_divergence(list<int> observed, list<int> golden) → string {
     var int i ← 0
     const int n ← observed.length()
@@ -1521,21 +1269,8 @@ fn live_first_divergence(list<int> observed, list<int> golden) → string {
     return "none"
 }
 
-fn live_token_match_count(list<int> observed, list<int> golden) → int {
-    var int matches ← 0
-    var int i ← 0
-    const int lim ← if_int(observed.length() ≺ golden.length(), observed.length(), golden.length())
-    while i ≺ lim {
-        const int a ← observed.get(i) coalesce -1
-        const int b ← golden.get(i) coalesce -2
-        if a ≡ b { matches ← matches + 1 }
-        i ← i + 1
-    }
-    return matches
-}
-
 fn live_requested(list<string> argv) → bool {
-    var int i ← 1
+    var int i ← 0
     while i ≺ argv.length() {
         const string arg ← argv.get(i) coalesce ""
         if arg ≡ "live" { return true }
@@ -1581,130 +1316,6 @@ fn live_stop_policy(bool ignore_eos) → decoder.StopPolicy {
     return decoder.eog_stop()
 }
 
-fn inspect_model(string path, string sha) → gguf_manifest.GgufManifest {
-    const int total ← live_file_size(path)
-    if total ≢ model_file_size_bytes() {
-        panic "model byte length mismatch: observed=" + (total ↦ string) + " expected=" + (model_file_size_bytes() ↦ string)
-    }
-    const int data_offset ← pinned_data_offset()
-    const bytes prefix_bytes ← live_read_range(path, 0, data_offset)
-    if prefix_bytes.length() ≢ data_offset {
-        panic "table-prefix read was short"
-    }
-    const value prefix_valor ← prefix_bytes ↦ value
-    var list<int> prefix ← []
-    do {
-        prefix ← prefix_valor ↦ list<int>
-    }
-    catch err {
-        panic "table-prefix carrier was not a byte list: " + err
-    }
-    const artifact.ContentIdentity identitas ← artifact.ContentIdentity {
-        algorithm = "sha-256",
-        digest = sha,
-        length = total
-    }
-    var gguf_manifest.GgufManifest admitted ← empty_manifest()
-    do {
-        admitted ← gguf_manifest.inspect(
-            (int initium, int longitudo) → bytes ⇥ gguf_manifest.GgufManifestError ∴ live_prefix_range(prefix, initium, longitudo),
-            total,
-            identitas
-        )
-    }
-    catch err {
-        panic "manifest admission failed: " + err.message
-    }
-    return admitted
-}
-
-fn load_resident_weights(string path, gguf_manifest.GgufManifest admitted) → ResidentModel {
-    const int total ← live_file_size(path)
-    const tokenizator.Tokenizer tok ← live_build_tokenizer(admitted)
-    const list<int> eog_ids ← tokenizator.artifact_eog(tok)
-    var tensor.NumericBlock embed ← tensor.default()
-    var tensor.NumericBlock norm_s ← tensor.default()
-    embed ← live_load_one(path, total, admitted, "model.embed_tokens", 0)
-    norm_s ← live_load_one(path, total, admitted, "model.norm", 0)
-
-    const list<string> families ← [
-        "model.layers.input_layernorm",
-        "model.layers.self_attn.q_proj",
-        "model.layers.self_attn.k_proj",
-        "model.layers.self_attn.v_proj",
-        "model.layers.self_attn.o_proj",
-        "model.layers.post_attention_layernorm",
-        "model.layers.mlp.gate_proj",
-        "model.layers.mlp.up_proj",
-        "model.layers.mlp.down_proj"
-    ]
-    var list<list<tensor.NumericBlock>> strata ← []
-    var int stratum ← 0
-    while stratum ≺ 32 {
-        var list<tensor.NumericBlock> row ← []
-        var int f ← 0
-        while f ≺ families.length() {
-            row.append(live_load_one(path, total, admitted, families.get(f) coalesce "", stratum))
-            f ← f + 1
-        }
-        strata.append(row)
-        stderr_write("inferentia: loaded layer " + (stratum ↦ string) + "\n")
-        stratum ← stratum + 1
-    }
-
-    var rope.RopeConfig rope_cfg ← rope.default()
-    do {
-        rope_cfg ← rope.construct_rope_config(100000.0 ∷ f32, 1.0 ∷ f32, rope.consecutive_policy())
-    }
-    catch err {
-        panic "rope config failed: " + err.message
-    }
-
-    const dense.DenseConfig architecture ← dense.DenseConfig {
-        layers = 32,
-        heads = 15,
-        kv_heads = 5,
-        head_dim = 64,
-        hidden_dim = 960,
-        vocab = model_vocab_size(),
-        tied = true
-    }
-
-    var structure.KVStructure kv_structure ← structure.default_kv_structure()
-    do {
-        const structure.LayerSet set ← structure.construct_layer_set(live_indices(32), structure.dense_structure(), 5, 64)
-        var list<structure.LayerSet> sets ← []
-        sets.append(set)
-        kv_structure ← structure.construct_kv_structure(
-            sets,
-            structure.kv_dtype_f32(),
-            structure.kv_dtype_f32(),
-            structure.v_layout_transposed(),
-            structure.sharing_gqa(),
-            structure.attention_classic(),
-            15,
-            8192,
-            8192
-        )
-    }
-    catch err {
-        panic "kv structure failed: " + err.message
-    }
-
-    const dense_gen.DenseEngine engine ← dense_gen.construct_dense_engine(architecture, 0.00001 ∷ f32, 0.125 ∷ f32, 64, rope_cfg)
-    return ResidentModel {
-        ready = true,
-        engine = engine,
-        embed = embed,
-        norm_s = norm_s,
-        strata = strata,
-        structure = kv_structure,
-        manifest = admitted,
-        tokenizer = tok,
-        eog_ids = eog_ids
-    }
-}
-
 # Pinned-row digest gate for serve admission (S-F1): the refusal diagnostic
 # when the admitted digest is not the pinned row's, null when it is. `serve`
 # runs this before the operator pin, so the structural admission contract
@@ -1738,7 +1349,7 @@ fn check_expected_digest(string admitted, string expected) → string ∪ none {
 # after admission, so a swap between admit and load cannot serve swapped
 # weights. The refusal covers the admit → load TOCTOU (materialized ≠
 # admitted) and the --expected-digest pin carried from serve; null lets
-# load_resident_weights read. Pure so the rows feed digests as inputs.
+# the weights are read. Pure so the rows feed digests as inputs.
 fn check_materialized_digest(string admitted, string materialized, string expected) → string ∪ none {
     if materialized ≢ admitted {
         return "model changed between admission and materialization: admitted=" + admitted + " materialized=" + materialized
@@ -1749,36 +1360,20 @@ fn check_materialized_digest(string admitted, string materialized, string expect
     return null
 }
 
-# Admit → load TOCTOU closure (G1-U9): the admitted manifest was inspected
-# from the bytes read at admission time, so before load_resident_weights
-# reads the file again, re-digest it and require equality with the admitted
-# sha (and with --expected-digest when set). A swapped or unreadable file
-# throws BadCapsule, which serve routes into the failed state — the load
-# never proceeds and swapped weights are never served.
-fn load_resident_model(string path, string sha, string expected_digest) → ResidentModel ⇥ gguf.GgufError {
-    const gguf_manifest.GgufManifest admitted ← inspect_model(path, sha)
-    var string materialized ← ""
-    do {
-        materialized ← host_digestio(path)
-    }
-    catch err {
-        throw variant BadCapsule { message = err }
-    }
-    const string ∪ none refusal ← check_materialized_digest(sha, materialized, expected_digest)
-    if refusal not is none {
-        throw variant BadCapsule { message = refusal coalesce "" }
-    }
-    return load_resident_weights(path, admitted)
-}
-
 # A1 port load (U-G): every tensor read once and reinterpreted in bulk as a
 # literal-shape tensor (`raw ↦ tensor<f32, [N, K]> via Le`). `path` and the
 # bounds-checked `live_range` are the byte source; the shapes, names and the
 # BadBounds/UnknownLayout refusals live in port_weights.fab.
 fn load_port_weights(string path, gguf_manifest.GgufManifest admitted) → port.PortWeights ⇥ gguf_manifest.GgufManifestError {
-    const int total ← live_file_size(path)
+    var int total ← 0
+    do {
+        total ← live_file_size(path)
+    }
+    catch err {
+        throw variant BadSource { message = "length read failed: §"(err) }
+    }
     return port.load_weights(
-        (int initium, int longitudo) → bytes ⇥ gguf_manifest.GgufManifestError ∴ live_range(path, total, initium, longitudo),
+        (int initium, int longitudo) → list<b8> ⇥ gguf_manifest.GgufManifestError ∴ live_range(path, total, initium, longitudo),
         admitted
     )
 }
@@ -1800,7 +1395,14 @@ fn check_load_identity(string sha, gguf_manifest.GgufManifest admitted, int obse
 }
 
 fn refuse_load_identity(string sha, gguf_manifest.GgufManifest admitted, string path) → void ⇥ gguf.GgufError {
-    const string ∪ none refusal ← check_load_identity(sha, admitted, live_file_size(path))
+    var int observed ← 0
+    do {
+        observed ← live_file_size(path)
+    }
+    catch err {
+        throw variant BadCapsule { message = "§"(err) }
+    }
+    const string ∪ none refusal ← check_load_identity(sha, admitted, observed)
     if refusal not is none {
         throw variant BadCapsule { message = refusal coalesce "" }
     }
@@ -1816,7 +1418,7 @@ fn verify_load_digest(string path, string sha, string expected_digest) → void 
         materialized ← host_digestio(path)
     }
     catch err {
-        throw variant BadCapsule { message = err }
+        throw variant BadCapsule { message = "§"(err) }
     }
     const string ∪ none refusal ← check_materialized_digest(sha, materialized, expected_digest)
     if refusal not is none {
@@ -1846,23 +1448,6 @@ fn load_port_weights_as_capsula(string path, gguf_manifest.GgufManifest admitted
     }
 }
 
-fn run_generate(GenerateConfig cfg, list<int> ids, ResidentModel model, decoder.StopPolicy stop) → list<int> ⇥ config.GenerationError {
-    const config.GenerationConfig g ← to_generation_config(cfg, model.eog_ids)
-    var list<kv.KVCache> layers ← []
-    if model.ready {
-        layers ← fresh_resident_caches(model)
-    }
-    return dense_gen.generate_dense_with_stop(
-        g,
-        ids,
-        model.engine,
-        (string n, int s) → tensor.NumericBlock ⇥ dense.DenseError ∴ live_lookup(n, s, model.embed, model.norm_s, model.strata),
-        layers,
-        decode.fresh_cancellation(),
-        stop
-    )
-}
-
 # The port path's request validation (the same gradus reject rows and prompt
 # fit causes as generate_dense_with_stop) followed by the decode
 # loop (greedy at temperature 0, seeded sampling otherwise, with the request's
@@ -1884,28 +1469,9 @@ fn run_generate_port(GenerateConfig cfg, list<int> ids, ResidentModel model, por
     throw variant config.GenerationError.InvalidConfig { message = "unreachable" }
 }
 
-# One generate dispatch for the request path: the port weights list is empty on
-# the cpu backend (the host path) and holds the single resident weights on
-# metal.
-fn generate_tokens(GenerateConfig cfg, list<int> ids, ResidentModel model, list<port.PortWeights> ports, decoder.StopPolicy stop) → list<int> ⇥ config.GenerationError {
-    if ports.length() ≡ 0 {
-        return run_generate(cfg, ids, model, stop)
-    }
-    const pgen.PortResult res ← run_generate_port(cfg, ids, model, ports[0], stop, false)
-    return res.ids
-}
-
-# The tokenizer + EOG set the metal backend needs without the NumericBlock
-# weights: an otherwise-empty ResidentModel (ready = false) built from the
-# admitted manifest and the tokenizer built once from it.
+# The admitted manifest, the tokenizer built once from it, and its EOG set.
 fn port_resident(gguf_manifest.GgufManifest admitted, tokenizator.Tokenizer tok) → ResidentModel {
     return ResidentModel {
-        ready = false,
-        engine = dense_gen.default_dense_engine(),
-        embed = tensor.default(),
-        norm_s = tensor.default(),
-        strata = [],
-        structure = structure.default_kv_structure(),
         manifest = admitted,
         tokenizer = tok,
         eog_ids = tokenizator.artifact_eog(tok)
@@ -1918,8 +1484,7 @@ fn print_port_result(tokenizator.Tokenizer tok, pgen.PortResult res) → void {
     stdout_write("finish=" + res.finish + "\n")
 }
 
-# The metal-backend one-shot: digest-bound bulk weight load, then the greedy
-# port decode loop. `--trace` prints one stderr trace line per generated step.
+# The one-shot: digest-bound bulk weight load, then the port decode loop. `--trace` prints one stderr trace line per generated step.
 fn live_run_port(ServeConfig serve_config, string sha, gguf_manifest.GgufManifest admitted, tokenizator.Tokenizer tok, list<int> prompt_ids) → void {
     const ResidentModel model ← port_resident(admitted, tok)
     const GenerateConfig cfg ← GenerateConfig {
@@ -1960,7 +1525,7 @@ fn live_port_generate(GenerateConfig cfg, list<int> ids, ResidentModel model, po
 }
 
 fn live_run(ServeConfig serve_config) → void {
-    stdout_write("inferentia live: admit + G3 tokenizer + generate_dense\n")
+    stdout_write("inferentia live: admit + G3 tokenizer + port decode\n")
     stdout_write("model.path=" + serve_config.model + "\n")
 
     var string sha ← ""
@@ -1978,7 +1543,13 @@ fn live_run(ServeConfig serve_config) → void {
         panic "admit digest mismatch: observed=" + sha + " expected=" + pinned_digest()
     }
 
-    const int total ← live_file_size(serve_config.model)
+    var int total ← 0
+    do {
+        total ← live_file_size(serve_config.model)
+    }
+    catch err {
+        panic "model length read failed: §"(err)
+    }
     stdout_write("model.bytes=" + (total ↦ string) + "\n")
 
     stdout_write("manifest.data_offset=" + (admitted.data_start ↦ string) + "\n")
@@ -1996,74 +1567,8 @@ fn live_run(ServeConfig serve_config) → void {
         }
     }
 
-    if serve_config.backend ≡ "metal" {
-        stdout_write("backend=metal\n")
-        live_run_port(serve_config, sha, admitted, tok, prompt_ids)
-        return
-    }
-
-    const ResidentModel model ← load_resident_weights(serve_config.model, admitted)
-    const list<kv.KVCache> layers ← fresh_resident_caches(model)
-    stdout_write("cache.layers=" + (layers.length() ↦ string) + "\n")
-
-    var config.GenerationConfig gen ← config.default()
-    do {
-        gen ← config.construct_generation(8192, effective_max_prompt(serve_config), serve_config.max_tokens, 1, 0.0 ∷ f32, 0, 1.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32, model.eog_ids)
-    }
-    catch err {
-        panic "generation config failed: " + err.message
-    }
-
-    # Stop policy: default eog_stop; --ignore-eos keeps generating to the
-    # --max-tokens ceiling. Selected outside the cape below (BD-3).
-    const decoder.StopPolicy stop ← live_stop_policy(serve_config.ignore_eos)
-
-    var list<int> generated ← []
-    do {
-        generated ← dense_gen.generate_dense_with_stop(
-            gen,
-            prompt_ids,
-            model.engine,
-            (string n, int s) → tensor.NumericBlock ⇥ dense.DenseError ∴ live_lookup(n, s, model.embed, model.norm_s, model.strata),
-            layers,
-            decode.fresh_cancellation(),
-            stop
-        )
-    }
-    catch err {
-        panic "generate_dense failed: " + err.message
-    }
-
-    # The one-shot result surface: space-joined generated ids and the decoded
-    # text (decode fails closed via live_decode).
-    stdout_write("ids=" + live_ids_flat(generated) + "\n")
-    const string text ← live_decode(tok, generated)
-    stdout_write("text=" + text + "\n")
-
-    # Oracle: only the frozen fixture has a golden. eog_stop compares the
-    # [30, 2] continuation; --ignore-eos has no recorded F32 golden.
-    var list<int> golden ← []
-    var bool oracle ← false
-    if prompt_text ≡ frozen_prompt_text() {
-        if not serve_config.ignore_eos {
-            oracle ← true
-            golden ← frozen_eog_continuation()
-        }
-    }
-    if oracle {
-        const string divergence ← live_first_divergence(generated, golden)
-        const int matches ← live_token_match_count(generated, golden)
-        stdout_write("observed=" + live_ids_text(generated) + "\n")
-        stdout_write("golden=" + live_ids_text(golden) + "\n")
-        stdout_write("observed.n=" + (generated.length() ↦ string) + "\n")
-        stdout_write("token_match_count=" + (matches ↦ string) + "\n")
-        stdout_write("first_divergence=" + divergence + "\n")
-        if divergence ≡ "none" {
-            stdout_write("LIVE: PASS\n")
-        } else {
-            stdout_write("LIVE: FAIL\n")
-        }
-    }
+    stdout_write("backend=" + serve_config.backend + "\n")
+    live_run_port(serve_config, sha, admitted, tok, prompt_ids)
 }
 
 # ---------------------------------------------------------------------------
@@ -2099,10 +1604,10 @@ fn print_help() → void {
     stdout_write("      --prompt <TEXT>       Live one-shot prompt text (default: frozen fixture)\n")
     stdout_write("      --expected-digest <SHA256>  Serve: require the admitted sha256 to match (default: unset)\n")
     stdout_write("      --ignore-eos          Live: generate past EOG until --max-tokens\n")
-    stdout_write("      --backend <cpu|metal> Generation path (default: cpu = host NumericBlock path;\n")
-    stdout_write("                            metal = the gradus decode-token launches, run the program\n")
-    stdout_write("                            with `faber run --device metal`; greedy decoding only)\n")
-    stdout_write("      --trace               Live (metal backend): one stderr trace line per generated step\n")
+    stdout_write("      --backend <metal>     Generation path (default and only value: metal = the gradus\n")
+    stdout_write("                            decode-token launches; the device is chosen by how the program\n")
+    stdout_write("                            is run: `faber run --device metal|cpu|reference`)\n")
+    stdout_write("      --trace               Live: one stderr trace line per generated step\n")
     stdout_write("      --host <HOST>         Bind host (loopback only; default: 127.0.0.1)\n")
     stdout_write("      --port <PORT>         Bind port (default: 8080; 0 = ephemeral)\n")
     stdout_write("      --max-tokens <N>      Default output token ceiling (default: 32)\n")
@@ -2114,12 +1619,12 @@ fn print_help() → void {
     stdout_write("      --version             Print version\n")
 }
 
-# Parse argv (program name included at index 0) into a ServeConfig.
-# Every usage error exits before returning.
+# Parse argv (the program arguments only: the program name is not an
+# argument) into a ServeConfig. Every usage error exits before returning.
 fn parse_cli(list<string> argv) → ServeConfig {
-    var ServeConfig config ← ServeConfig { model = "", host = "127.0.0.1", port = 8080, max_tokens = 32, max_prompt = 0, context = 0, seed = 1, log_level = "info", prompt = "", expected_digest = "", ignore_eos = false, trace = false, backend = "cpu" }
+    var ServeConfig config ← ServeConfig { model = "", host = "127.0.0.1", port = 8080, max_tokens = 32, max_prompt = 0, context = 0, seed = 1, log_level = "info", prompt = "", expected_digest = "", ignore_eos = false, trace = false, backend = "metal" }
     var string subcommand ← ""
-    var int i ← 1
+    var int i ← 0
 
     while i ≺ argv.length() {
         const string arg ← argv.get(i) coalesce ""
@@ -2213,10 +1718,10 @@ fn parse_cli(list<string> argv) → ServeConfig {
             i ← i + 1
             if i ≥ argv.length() then usage_error("missing value for --backend")
             const string raw ← argv.get(i) coalesce ""
-            if (raw ≡ "cpu") or (raw ≡ "metal") {
+            if raw ≡ "metal" {
                 config.backend ← raw
             } else {
-                usage_error("invalid backend '" + raw + "' (expected cpu|metal)")
+                usage_error("invalid backend '" + raw + "' (expected metal; CPU inference is `faber run --device cpu` or `--device reference` on the same kernels)")
             }
         }
         elif arg.starts_with("-") and arg.length() ≻ 1 {
@@ -2296,12 +1801,11 @@ fn model_vocab_size() → int {
     return 49152
 }
 
-# The selected generation backend, as served in the /model body: "metal" for
-# the decode-token launches, "cpu" for the host NumericBlock path (the
-# default). Anything else is served as "cpu".
+# The selected generation backend, as served in the /model body. `--backend`
+# accepts "metal" only (parse_cli), the gradus decode-token launches; the
+# device they run on is chosen by `faber run --device`.
 fn model_backend(string selected) → string {
-    if selected ≡ "metal" { return "metal" }
-    return "cpu"
+    return selected
 }
 
 # The /model response body (D3 exact schema). `sha256` is JSON-escaped for
@@ -2382,11 +1886,11 @@ fn handle_generate(server.Incoming incoming, value raw, ServerState st, ServeCon
         reply_json(incoming, 503, error_body("generation cancelled (shutdown)"))
         return
     }
-    # Body from the raw accept valor (Incoming.req.body drops octeti in
-    # server._body_text). `value ↦ bytes` extracts the provider octeti.
+    # Body from the raw accept value (Incoming.req.body keeps text only in
+    # server.body_text); `request_body_text` also reads a `list<b8>` body.
     const string body ← request_body_from_raw(raw)
     if body ≡ body_read_gap_marker() {
-        reply_json(incoming, 500, error_body("request body unavailable: octeti→text decode failed"))
+        reply_json(incoming, 500, error_body("request body unavailable: bytes→text decode failed"))
         return
     }
     # Minimal product JSON parse (D3).
@@ -2415,7 +1919,8 @@ fn handle_generate(server.Incoming incoming, value raw, ServerState st, ServeCon
     }
     const GenerateConfig cfg ← build_generate_config(parsed, config)
     do {
-        const list<int> tokens ← generate_tokens(cfg, enc.ids, model, ports, decoder.eog_stop())
+        const pgen.PortResult run ← run_generate_port(cfg, enc.ids, model, ports[0], decoder.eog_stop(), false)
+        const list<int> tokens ← run.ids
         # Cancellation checkpoint after decode (D6 seam).
         if st.cancelled {
             reply_json(incoming, 503, error_body("generation cancelled (shutdown)"))
@@ -2457,21 +1962,46 @@ fn handle_request(value request, ServerState st, ServeConfig config, ResidentMod
     }
 }
 
+# Does this accept fault end the loop? A stopped listener is Closed and a
+# cancelled accept is Cancelled; every other fault is request-level.
+fn accept_fault_ends(fault.IoFault f) → bool {
+    match f {
+        case fault.IoFault.Closed const path {
+            return true
+        }
+        case fault.IoFault.Cancelled const path {
+            return true
+        }
+        default {
+            return false
+        }
+    }
+}
+
 # Accept-loop step: keep serving unless the listener was stopped or the
 # accept was cancelled; log other request-level rejects (oversize body,
 # malformed request) and continue. A stopped listener ends the loop (D6).
-fn accept_loop_step(bool serving, string err) → bool {
-    const bool cancelled_hit ← err.contains("E_CANCELLED")
-    const bool stopped_hit ← err.contains("listener is stopped")
-    if cancelled_hit or stopped_hit {
+fn accept_loop_step(bool serving, fault.IoFault err) → bool {
+    if accept_fault_ends(err) {
         return false
     }
-    stderr_write("inferentia: request dropped at accept: " + err + "\n")
+    stderr_write("inferentia: request dropped at accept: §\n"(err))
     return serving
 }
 
+# Bind the listener. A bind fault is a trap, as an unbindable port was before
+# faults had a channel: the process cannot serve.
+fn bind_listener(int port_number) → server.Listener {
+    do {
+        return server.bind(port_number)
+    }
+    catch err {
+        panic "listener bind failed: §"(err)
+    }
+}
+
 # Serve's single resident port load: the weights wrapped in a one-element list
-# (the cpu backend passes an empty list, so no placeholder weights exist).
+# (the unready state passes an empty list, so no placeholder weights exist).
 fn port_serve_load(ServeConfig config, string sha, gguf_manifest.GgufManifest admitted) → list<port.PortWeights> ⇥ gguf.GgufError {
     const port.PortWeights weights ← load_port_model(config.model, sha, config.expected_digest, admitted)
     return [weights]
@@ -2484,7 +2014,7 @@ fn serve(ServeConfig config) → void {
     # to any operator --expected-digest, and load_resident_model re-verifies
     # at materialization (admit → load TOCTOU). Weight materialization is out
     # of this path: never forward/generate.
-    const server.Listener listener ← server.bind(config.port)
+    const server.Listener listener ← bind_listener(config.port)
     stderr_write("inferentia: listening on 127.0.0.1:" + (config.port ↦ string) + "\n")
 
     var ServerState state ← new_state(config.model)
@@ -2510,63 +2040,24 @@ fn serve(ServeConfig config) → void {
         stderr_write("inferentia: admission failed: " + cause + "\n")
     }
 
-    # U4 generation readiness: load the dense weights exactly once and prove
-    # generate_dense_with_stop (eog_stop) can decode before serving. Every
-    # /generate reuses the resident model (fresh KV caches per request). A
-    # failed load or warm-up is an admission/load failure (D5 → exit 2):
-    # load_resident_model re-verifies the digest at materialization, so a
+    # U4 generation readiness: load the port weights exactly once and keep
+    # them resident; every /generate reuses them with a fresh K/V cache pair.
+    # A failed load is an admission/load failure (D5 → exit 2): the load
+    # re-verifies the digest at materialization (admit → load TOCTOU), so a
     # file swapped between admit and load throws into the failed state here.
     var ResidentModel resident ← empty_resident()
     var list<port.PortWeights> ports ← []
-    if state.state ≡ "ready" and config.backend ≡ "metal" {
-        # The metal backend loads the bulk port weights ONCE here (digest-bound,
-        # admit digest, re-digested at load, length guarded) and warms the launches with a one-token
-        # generation; every /generate reuses them with a fresh cache pair.
+    if state.state ≡ "ready" {
+        # The bulk port weights load ONCE here (digest-bound: admit digest,
+        # re-digested at load, length guarded); every /generate reuses them.
         do {
             ports ← port_serve_load(config, state.sha256, served_manifest)
             resident ← port_resident(served_manifest, live_build_tokenizer(served_manifest))
-            stderr_write("inferentia: model loaded once (resident, metal) - generation ready\n")
+            stderr_write("inferentia: model loaded once (resident) - generation ready\n")
         }
         catch err {
             state ← failed(state, "model load failed: " + err.message)
             stderr_write("inferentia: model load failed: " + err.message + "\n")
-        }
-    }
-    if state.state ≡ "ready" and config.backend ≢ "metal" {
-        do {
-            resident ← load_resident_model(state.model_path, state.sha256, config.expected_digest)
-        }
-        catch err {
-            state ← failed(state, err.message)
-            stderr_write("inferentia: model load failed: " + err.message + "\n")
-        }
-    }
-    if state.state ≡ "ready" and config.backend ≢ "metal" {
-        do {
-            const GenerateConfig warmup_cfg ← GenerateConfig {
-                contextus = model_context_limit(),
-                magna_promptus = effective_max_prompt(config),
-                maxima_verborum = 1,
-                semen = config.seed,
-                temperatura = 0.0,
-                top_k = 0,
-                top_p = 1.0,
-                min_p = 0.0,
-                poena_repetitionis = 1.0
-            }
-            const list<int> warmup_tokens ← run_generate(warmup_cfg, frozen_prompt_ids(), resident, decoder.eog_stop())
-            const int n ← warmup_tokens.length()
-            if n ≺ 1 {
-                state ← failed(state, "generation readiness: warm-up produced no tokens")
-                stderr_write("inferentia: generation readiness failed: warm-up produced no tokens\n")
-            } else {
-                stderr_write("inferentia: model loaded once (resident) — generation ready\n")
-            }
-        }
-        catch err {
-            const string cause ← err.message
-            state ← failed(state, "generation readiness failed: " + cause)
-            stderr_write("inferentia: generation readiness failed: " + cause + "\n")
         }
     }
 
@@ -2582,7 +2073,7 @@ fn serve(ServeConfig config) → void {
             # The decision lives in a helper: the MIR stepper (`faber test`)
             # cannot lower a conditional inside a `cape` block that wraps a
             # local call into a host route (recorded toolchain limitation).
-            serving ← accept_loop_step(serving, err ↦ string ⊥ "accept error")
+            serving ← accept_loop_step(serving, err)
         }
     }
 
@@ -2618,21 +2109,9 @@ main args argv {
 # tests/admission-gate/; the provider-touching admission path is executed by
 # the admission-gate harness and proven by the in-tree BD-2 probe)
 # ---------------------------------------------------------------------------
-describe "live read window" tag "inferentia" {
-    test "a window never exceeds the read cap and stays block aligned" {
-        assert live_window(5, 1) ≡ 5
-        assert live_window(live_read_cap() + 7, 1) ≡ live_read_cap()
-        assert live_window(live_read_cap() * 3, 256) ≡ live_read_cap()
-        assert live_window(live_read_cap() * 3, 300) ≡ (live_read_cap() / 300) * 300
-    }
-    test "a block larger than the cap still gets a whole-block window" {
-        assert live_window(live_read_cap() * 4, live_read_cap() * 2) ≡ live_read_cap() * 2
-    }
-}
-
 describe "serve cli parse" tag "inferentia" {
     test "documented constants apply when no server flags are given" {
-        const ServeConfig cfg ← parse_cli(["inferentia", "serve", "--model", "/tmp/model.gguf"])
+        const ServeConfig cfg ← parse_cli(["serve", "--model", "/tmp/model.gguf"])
         assert cfg.host ≡ "127.0.0.1"
         assert cfg.port ≡ 8080
         assert cfg.max_tokens ≡ 32
@@ -2642,7 +2121,7 @@ describe "serve cli parse" tag "inferentia" {
         assert cfg.model ≡ "/tmp/model.gguf"
     }
     test "server flags override documented constants" {
-        const ServeConfig cfg ← parse_cli(["inferentia", "serve", "--model", "/tmp/model.gguf", "--port", "9090", "--max-tokens", "16", "--max-prompt", "2048", "--seed", "7", "--host", "127.0.0.1", "--log-level", "warn"])
+        const ServeConfig cfg ← parse_cli(["serve", "--model", "/tmp/model.gguf", "--port", "9090", "--max-tokens", "16", "--max-prompt", "2048", "--seed", "7", "--host", "127.0.0.1", "--log-level", "warn"])
         assert cfg.port ≡ 9090
         assert cfg.max_tokens ≡ 16
         assert cfg.max_prompt ≡ 2048
@@ -2651,65 +2130,64 @@ describe "serve cli parse" tag "inferentia" {
         assert cfg.log_level ≡ "warn"
     }
     test "port zero is ephemeral" {
-        const ServeConfig cfg ← parse_cli(["inferentia", "serve", "--model", "/tmp/model.gguf", "--port", "0"])
+        const ServeConfig cfg ← parse_cli(["serve", "--model", "/tmp/model.gguf", "--port", "0"])
         assert cfg.port ≡ 0
     }
     test "short model flag binds the same option" {
-        const ServeConfig cfg ← parse_cli(["inferentia", "serve", "-m", "/tmp/model.gguf"])
+        const ServeConfig cfg ← parse_cli(["serve", "-m", "/tmp/model.gguf"])
         assert cfg.model ≡ "/tmp/model.gguf"
     }
     test "live subcommand accepts the model path" {
-        const ServeConfig cfg ← parse_cli(["inferentia", "live", "--model", "/tmp/model.gguf"])
+        const ServeConfig cfg ← parse_cli(["live", "--model", "/tmp/model.gguf"])
         assert cfg.model ≡ "/tmp/model.gguf"
-        assert live_requested(["inferentia", "live", "--model", "/tmp/model.gguf"])
-        assert not live_requested(["inferentia", "serve", "--model", "/tmp/model.gguf"])
+        assert live_requested(["live", "--model", "/tmp/model.gguf"])
+        assert not live_requested(["serve", "--model", "/tmp/model.gguf"])
     }
     test "context is unset until a flag provides it" {
-        const ServeConfig cfg ← parse_cli(["inferentia", "serve", "--model", "/tmp/model.gguf"])
+        const ServeConfig cfg ← parse_cli(["serve", "--model", "/tmp/model.gguf"])
         assert cfg.context ≡ 0
-        const ServeConfig cfg2 ← parse_cli(["inferentia", "serve", "--model", "/tmp/model.gguf", "--context", "4096"])
+        const ServeConfig cfg2 ← parse_cli(["serve", "--model", "/tmp/model.gguf", "--context", "4096"])
         assert cfg2.context ≡ 4096
     }
     test "max prompt is unset until a flag provides it" {
-        const ServeConfig cfg ← parse_cli(["inferentia", "serve", "--model", "/tmp/model.gguf"])
+        const ServeConfig cfg ← parse_cli(["serve", "--model", "/tmp/model.gguf"])
         assert cfg.max_prompt ≡ 0
-        const ServeConfig cfg2 ← parse_cli(["inferentia", "serve", "--model", "/tmp/model.gguf", "--max-prompt", "2048"])
+        const ServeConfig cfg2 ← parse_cli(["serve", "--model", "/tmp/model.gguf", "--max-prompt", "2048"])
         assert cfg2.max_prompt ≡ 2048
     }
     test "live prompt flag binds text; ignore-eos defaults off" {
-        const ServeConfig cfg ← parse_cli(["inferentia", "live", "--model", "/tmp/model.gguf", "--prompt", "hello world"])
+        const ServeConfig cfg ← parse_cli(["live", "--model", "/tmp/model.gguf", "--prompt", "hello world"])
         assert cfg.prompt ≡ "hello world"
         assert not cfg.ignore_eos
         assert effective_prompt(cfg) ≡ "hello world"
     }
     test "live defaults select the frozen fixture prompt" {
-        const ServeConfig cfg ← parse_cli(["inferentia", "live", "--model", "/tmp/model.gguf"])
+        const ServeConfig cfg ← parse_cli(["live", "--model", "/tmp/model.gguf"])
         assert cfg.prompt ≡ ""
         assert not cfg.ignore_eos
         assert effective_prompt(cfg) ≡ frozen_prompt_text()
     }
     test "ignore-eos flag parses on" {
-        const ServeConfig cfg ← parse_cli(["inferentia", "live", "--model", "/tmp/model.gguf", "--ignore-eos"])
+        const ServeConfig cfg ← parse_cli(["live", "--model", "/tmp/model.gguf", "--ignore-eos"])
         assert cfg.ignore_eos
         assert effective_prompt(cfg) ≡ frozen_prompt_text()
     }
 }
 describe "backend selection cli parse" tag "inferentia" {
-    test "the backend defaults to cpu (the host path) and trace is off" {
-        const ServeConfig cfg ← parse_cli(["inferentia", "live", "--model", "/tmp/model.gguf"])
-        assert cfg.backend ≡ "cpu"
+    test "the backend defaults to metal and trace is off" {
+        const ServeConfig cfg ← parse_cli(["live", "--model", "/tmp/model.gguf"])
+        assert cfg.backend ≡ "metal"
         assert not cfg.trace
     }
     test "--backend metal selects the port path" {
-        const ServeConfig cfg ← parse_cli(["inferentia", "serve", "--model", "/tmp/model.gguf", "--backend", "metal"])
+        const ServeConfig cfg ← parse_cli(["serve", "--model", "/tmp/model.gguf", "--backend", "metal"])
         assert cfg.backend ≡ "metal"
         assert model_backend(cfg.backend) ≡ "metal"
     }
-    test "--backend cpu parses and --trace switches the trace on" {
-        const ServeConfig cfg ← parse_cli(["inferentia", "live", "--model", "/tmp/model.gguf", "--backend", "cpu", "--trace"])
-        assert cfg.backend ≡ "cpu"
+    test "--trace switches the trace on" {
+        const ServeConfig cfg ← parse_cli(["live", "--model", "/tmp/model.gguf", "--backend", "metal", "--trace"])
+        assert cfg.backend ≡ "metal"
         assert cfg.trace
-        assert model_backend(cfg.backend) ≡ "cpu"
     }
 }
 describe "health lifecycle" tag "inferentia" {
@@ -2759,10 +2237,10 @@ describe "health lifecycle" tag "inferentia" {
         # S-F5: \b, \f, \v and the rest of U+0000..U+001F were emitted raw, so
         # a one-byte vocab token produced invalid JSON. The fixtures are
         # byte-built: a source `\b` / `\f` is not the C0 character.
-        assert json_escape(([8] ↦ bytes) ↦ string ⊥ "") ≡ "\\b"
-        assert json_escape(([12] ↦ bytes) ↦ string ⊥ "") ≡ "\\f"
-        assert json_escape(([1] ↦ bytes) ↦ string ⊥ "") ≡ "\\u0001"
-        assert json_escape(([31] ↦ bytes) ↦ string ⊥ "") ≡ "\\u001f"
+        assert json_escape(([8] ↦ list<b8>) ↦ string ⊥ "") ≡ "\\b"
+        assert json_escape(([12] ↦ list<b8>) ↦ string ⊥ "") ≡ "\\f"
+        assert json_escape(([1] ↦ list<b8>) ↦ string ⊥ "") ≡ "\\u0001"
+        assert json_escape(([31] ↦ list<b8>) ↦ string ⊥ "") ≡ "\\u001f"
         assert json_escape("λ") ≡ "λ"
     }
     test "health body ready escapes quotes and backslashes in the path" {
@@ -2871,7 +2349,7 @@ describe "generate request JSON parse" tag "inferentia" {
 }
 describe "generate config precedence" tag "inferentia" {
     test "body overrides server flag overrides default" {
-        const ServeConfig server ← ServeConfig { model = "/m.gguf", host = "127.0.0.1", port = 8080, max_tokens = 32, max_prompt = 0, context = 0, seed = 1, log_level = "info", prompt = "", expected_digest = "", ignore_eos = false, trace = false, backend = "cpu" }
+        const ServeConfig server ← ServeConfig { model = "/m.gguf", host = "127.0.0.1", port = 8080, max_tokens = 32, max_prompt = 0, context = 0, seed = 1, log_level = "info", prompt = "", expected_digest = "", ignore_eos = false, trace = false, backend = "metal" }
         const GenerateRequest req ← json_parse_generate_body("{\"prompt\":\"x\",\"max_tokens\":8,\"seed\":3}")
         const GenerateConfig cfg ← build_generate_config(req, server)
         assert cfg.contextus ≡ 8192
@@ -2885,7 +2363,7 @@ describe "generate config precedence" tag "inferentia" {
         assert cfg.poena_repetitionis ≡ 1.0
     }
     test "absent body fields inherit the server flags" {
-        const ServeConfig server ← ServeConfig { model = "/m.gguf", host = "127.0.0.1", port = 8080, max_tokens = 16, max_prompt = 1024, context = 4096, seed = 7, log_level = "info", prompt = "", expected_digest = "", ignore_eos = false, trace = false, backend = "cpu" }
+        const ServeConfig server ← ServeConfig { model = "/m.gguf", host = "127.0.0.1", port = 8080, max_tokens = 16, max_prompt = 1024, context = 4096, seed = 7, log_level = "info", prompt = "", expected_digest = "", ignore_eos = false, trace = false, backend = "metal" }
         const GenerateRequest req ← json_parse_generate_body("{\"prompt\":\"x\"}")
         const GenerateConfig cfg ← build_generate_config(req, server)
         assert cfg.contextus ≡ 4096
@@ -2897,7 +2375,7 @@ describe "generate config precedence" tag "inferentia" {
         assert cfg.poena_repetitionis ≡ 1.0
     }
     test "body max_prompt overrides the server flag" {
-        const ServeConfig server ← ServeConfig { model = "/m.gguf", host = "127.0.0.1", port = 8080, max_tokens = 16, max_prompt = 1024, context = 4096, seed = 7, log_level = "info", prompt = "", expected_digest = "", ignore_eos = false, trace = false, backend = "cpu" }
+        const ServeConfig server ← ServeConfig { model = "/m.gguf", host = "127.0.0.1", port = 8080, max_tokens = 16, max_prompt = 1024, context = 4096, seed = 7, log_level = "info", prompt = "", expected_digest = "", ignore_eos = false, trace = false, backend = "metal" }
         const GenerateRequest req ← json_parse_generate_body("{\"prompt\":\"x\",\"max_prompt\":256}")
         const GenerateConfig cfg ← build_generate_config(req, server)
         assert cfg.magna_promptus ≡ 256
@@ -3010,7 +2488,6 @@ describe "model endpoint" tag "inferentia" {
         assert model_quantization() ≡ "f32"
         assert model_file_size_bytes() ≡ 1449071040
         assert model_vocab_size() ≡ 49152
-        assert model_backend("cpu") ≡ "cpu"
         assert model_backend("metal") ≡ "metal"
         assert model_context_limit() ≡ 8192
     }
@@ -3019,17 +2496,16 @@ describe "model endpoint" tag "inferentia" {
         # committed as tests/model-gate/expected-model-body.json, which the
         # live curl proof diffs against.
         const ServerState st ← admitted(new_state("/Users/ianzepp/ai/models/SmolLM2-360M-Instruct-f32.gguf"), "07735177a3542cbc0b0665051ce1922b55c4c9698de65131e65f2aea87a935e0")
-        assert model_body(st, 32, "cpu") ≡ "{\"name\":\"SmolLM2-360M-Instruct-F32\",\"architecture\":\"llama\",\"quantization\":\"f32\",\"file_size_bytes\":1449071040,\"sha256\":\"07735177a3542cbc0b0665051ce1922b55c4c9698de65131e65f2aea87a935e0\",\"context_length\":8192,\"vocab_size\":49152,\"max_output_tokens\":32,\"backend\":\"cpu\"}"
+        assert model_body(st, 32, "metal") ≡ "{\"name\":\"SmolLM2-360M-Instruct-F32\",\"architecture\":\"llama\",\"quantization\":\"f32\",\"file_size_bytes\":1449071040,\"sha256\":\"07735177a3542cbc0b0665051ce1922b55c4c9698de65131e65f2aea87a935e0\",\"context_length\":8192,\"vocab_size\":49152,\"max_output_tokens\":32,\"backend\":\"metal\"}"
     }
     test "model body reports the selected backend" {
         const ServerState st ← admitted(new_state("/m.gguf"), "2fa3f013")
         assert model_body(st, 32, "metal").contains("\"backend\":\"metal\"")
-        assert model_body(st, 32, "cpu").contains("\"backend\":\"cpu\"")
     }
     test "model body reflects the configured max_output_tokens" {
         const ServerState st ← admitted(new_state("/m.gguf"), "2fa3f013")
-        assert model_body(st, 16, "cpu").contains("\"max_output_tokens\":16")
-        assert model_body(st, 1, "cpu").contains("\"max_output_tokens\":1")
+        assert model_body(st, 16, "metal").contains("\"max_output_tokens\":16")
+        assert model_body(st, 1, "metal").contains("\"max_output_tokens\":1")
     }
     test "model unready body carries the state" {
         assert model_unready_body(new_state("/m.gguf")) ≡ "{\"state\":\"starting\"}"
@@ -3040,7 +2516,7 @@ describe "model endpoint" tag "inferentia" {
         # json_escape is applied to the sha256 (a no-op for hex, but the body
         # stays valid JSON under any future identity source).
         const ServerState st ← admitted(new_state("/m.gguf"), "a\"b")
-        assert model_body(st, 32, "cpu").contains("\"sha256\":\"a\\\"b\"")
+        assert model_body(st, 32, "metal").contains("\"sha256\":\"a\\\"b\"")
     }
 }
 describe "admission size ceiling" tag "inferentia" {
@@ -3089,8 +2565,8 @@ describe "http module" tag "inferentia" {
     test "string valor body extracts as text" {
         assert request_body_text("{\"prompt\":\"hi\"}" ↦ value) ≡ "{\"prompt\":\"hi\"}"
     }
-    test "octeti valor body extracts as UTF-8 text" {
-        const bytes payload ← "{\"prompt\":\"hi\"}" ↦ bytes
+    test "list<b8> value body extracts as UTF-8 text" {
+        const list<b8> payload ← "{\"prompt\":\"hi\"}" ↦ list<b8>
         const value v ← payload ↦ value
         assert request_body_text(v) ≡ "{\"prompt\":\"hi\"}"
     }
@@ -3130,6 +2606,35 @@ describe "http module" tag "inferentia" {
         assert wants_sse(incoming)
     }
 }
+# Scratch-file helpers for the load-digest rows: Norma fs reports on the error
+# channel, and a scratch file that cannot be written is a failed row.
+fn scratch_write(string path, list<b8> data) → void {
+    do {
+        fsys.write_bytes(path, data)
+    }
+    catch err {
+        panic "scratch write failed: §"(err)
+    }
+}
+
+fn scratch_delete(string path) → void {
+    do {
+        scratch_delete(path)
+    }
+    catch err {
+        panic "scratch delete failed: §"(err)
+    }
+}
+
+fn scratch_length(string path) → int {
+    do {
+        return fsys.byte_length(path)
+    }
+    catch err {
+        panic "scratch length failed: §"(err)
+    }
+}
+
 describe "serve admission digest" tag "inferentia" {
     test "the pinned row digest passes the serve admission pin" {
         assert check_pinned_digest(pinned_digest()) is none
@@ -3145,13 +2650,13 @@ describe "serve admission digest" tag "inferentia" {
     test "unset flag adds no operator pin of its own" {
         # Default unset (G1-U9 clause 1): the flag adds no constraint; the
         # pinned-row binding is the separate check_pinned_digest gate above.
-        const ServeConfig cfg ← parse_cli(["inferentia", "serve", "--model", "/tmp/model.gguf"])
+        const ServeConfig cfg ← parse_cli(["serve", "--model", "/tmp/model.gguf"])
         assert cfg.expected_digest ≡ ""
         assert check_expected_digest("2fa3f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2", cfg.expected_digest) is none
         assert check_expected_digest("0000f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2", cfg.expected_digest) is none
     }
     test "set flag binds from the cli" {
-        const ServeConfig cfg ← parse_cli(["inferentia", "serve", "--model", "/tmp/model.gguf", "--expected-digest", "2fa3f013"])
+        const ServeConfig cfg ← parse_cli(["serve", "--model", "/tmp/model.gguf", "--expected-digest", "2fa3f013"])
         assert cfg.expected_digest ≡ "2fa3f013"
     }
     test "matching digest passes the admission gate" {
@@ -3205,13 +2710,13 @@ describe "serve admission digest" tag "inferentia" {
     test "load digest: a same-length content swap is refused at load" {
         # The length guard alone cannot see this; only the load-time digest does.
         const string path ← "/tmp/inferentia-load-digest-swap.bin"
-        fsys.write_bytes(path, [1, 2, 3, 4] ↦ bytes)
+        scratch_write(path, [1, 2, 3, 4] ↦ list<b8>)
         var string admitted_sha ← ""
         do {
             admitted_sha ← host_digestio(path)
         }
         catch err {
-            panic "digest failed: " + err
+            panic "digest failed: §"(err)
         }
         var bool same_ok ← false
         do {
@@ -3222,8 +2727,8 @@ describe "serve admission digest" tag "inferentia" {
             same_ok ← false
         }
         assert same_ok
-        fsys.write_bytes(path, [1, 2, 3, 5] ↦ bytes)
-        assert fsys.byte_length(path) ≡ 4
+        scratch_write(path, [1, 2, 3, 5] ↦ list<b8>)
+        assert scratch_length(path) ≡ 4
         var string cause ← ""
         do {
             verify_load_digest(path, admitted_sha, "")
@@ -3231,18 +2736,18 @@ describe "serve admission digest" tag "inferentia" {
         catch err {
             cause ← err.message
         }
-        fsys.delete(path)
+        scratch_delete(path)
         assert cause.contains("model changed between admission and materialization")
     }
     test "load digest: the operator pin binds the load-time digest" {
         const string path ← "/tmp/inferentia-load-digest-pin.bin"
-        fsys.write_bytes(path, [9, 9, 9, 9] ↦ bytes)
+        scratch_write(path, [9, 9, 9, 9] ↦ list<b8>)
         var string sha ← ""
         do {
             sha ← host_digestio(path)
         }
         catch err {
-            panic "digest failed: " + err
+            panic "digest failed: §"(err)
         }
         var string cause ← ""
         do {
@@ -3251,7 +2756,7 @@ describe "serve admission digest" tag "inferentia" {
         catch err {
             cause ← err.message
         }
-        fsys.delete(path)
+        scratch_delete(path)
         assert cause.contains("flag-sha")
     }
 }

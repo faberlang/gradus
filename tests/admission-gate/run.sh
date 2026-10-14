@@ -43,15 +43,17 @@ MODEL="${1:-/Users/ianzepp/ai/models/SmolLM2-360M-Instruct-f32.gguf}"
 PORT="${PORT:-18107}"
 
 # Compiler contract (see README "Current commands"): the package imports
-# `gradus:`/`norma:` providers, so the build needs the container as
-# FABER_LIBRARY_HOME and the workspace radix binary — the PATH `faber` lags
-# main and fails package resolution (PKG001).
+# `gradus:`/`norma:` providers, so the build passes `--library-home` (the
+# directory holding the gradus checkout; Norma is embedded) and uses the
+# workspace radix binary — the PATH `faber` lags main and fails package
+# resolution (PKG001). While the container still carries a stale `norma/`
+# checkout beside `gradus/`, set LIBRARY_HOME to a directory holding only a
+# gradus link.
 CONTAINER="$(cd "$ROOT/.." && pwd)"
-FABER_LIBRARY_HOME="${FABER_LIBRARY_HOME:-$CONTAINER}"
-export FABER_LIBRARY_HOME
-FABER_BIN="${FABER_BIN:-$CONTAINER/radix/target/debug/faber}"
-if [ ! -x "$FABER_BIN" ]; then
-    note "BLOCKED: workspace faber binary not found: $FABER_BIN (set FABER_BIN)"
+LIBRARY_HOME="${LIBRARY_HOME:-$CONTAINER}"
+FABER="${FABER:-$CONTAINER/radix/target/debug/faber}"
+if [ ! -x "$FABER" ]; then
+    printf '%s\n' "BLOCKED: workspace faber binary not found: $FABER (set FABER)"
     exit 1
 fi
 
@@ -64,8 +66,8 @@ bad()  { printf 'FAIL %s\n' "$*"; FAIL=$((FAIL + 1)); }
 
 # --- Harness binary ---------------------------------------------------------
 if [ ! -x "$BIN" ]; then
-    note "== building admission-gate harness (workspace faber + FABER_LIBRARY_HOME) =="
-    (cd "$GATE" && "$FABER_BIN" build "$GATE") >/dev/null || {
+    note "== building admission-gate harness (workspace faber + --library-home) =="
+    (cd "$GATE" && "$FABER" build --library-home "$LIBRARY_HOME" "$GATE") >/dev/null || {
         note "BLOCKED: admission-gate harness build failed (workspace faber build $GATE; see README \"Current commands\")"
         exit 1
     }

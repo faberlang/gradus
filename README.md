@@ -27,21 +27,36 @@ production dependency of Inferentia. Deployment is a separate work stream.
 
 ## Current commands
 
-From this repository — the package imports `gradus:` and `norma:` providers,
-so compilation needs the faberlang container as `FABER_LIBRARY_HOME`, the
-workspace radix binary (the PATH `faber` lags main and fails package
-resolution with `PKG001`), and an absolute input path:
+From this repository — the package imports the `gradus:` provider (Norma is
+embedded in the `faber` binary), so compilation needs `--library-home` naming
+the directory that holds the gradus checkout (`<home>/gradus/src`), a
+current workspace `faber` binary (the PATH `faber` lags main and fails package
+resolution with `PKG001`), and an absolute input path. `[paths] library_home`
+in `faber.toml` is the manifest form of the same setting. No `FABER_*`
+environment variable is read.
 
 ```sh
 CONTAINER="$(cd .. && pwd)"
-FABER_BIN="$CONTAINER/radix/target/debug/faber"
-FABER_LIBRARY_HOME="$CONTAINER" "$FABER_BIN" check "$(pwd)"
-FABER_LIBRARY_HOME="$CONTAINER" "$FABER_BIN" build "$(pwd)"
+FABER="$CONTAINER/radix/target/debug/faber"
+"$FABER" check --library-home "$CONTAINER" "$(pwd)"
+"$FABER" build --library-home "$CONTAINER" "$(pwd)"
 ```
 
+While the container still carries a stale `norma/` checkout beside `gradus/`,
+that checkout shadows the embedded Norma and package resolution fails
+(`PKG001` naming `norma/src/http/...`); use a library home that holds only a
+`gradus` link.
+
 In a `worktrees/<lane>/` packet the same form holds with the lane root as the
-container; if the lane's `radix/target/debug/faber` is not built, override
-`FABER_BIN` to a built workspace binary.
+container; if the lane's `radix/target/debug/faber` is not built, point
+`FABER` at a built workspace binary.
+
+Program arguments after `--` start at the first operand (the program name is
+not an argument): `faber run --device metal --library-home "$CONTAINER"
+inferentia -- live --backend metal --model <GGUF>`. Inferentia has no CPU
+backend of its own; the same kernels run on the CPU under
+`faber run --device cpu` (several cores) or `--device reference` (one core,
+the oracle).
 
 The CLI has no serving command yet. See the
 [Inferentia master campaign](docs/factory/inferentia/CAMPAIGN.md) for the staged

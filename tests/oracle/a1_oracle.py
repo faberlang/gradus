@@ -4,7 +4,7 @@
 For each case (eog, continuation) of radix/docs/factory/gpu-reset/references/a1/
 the script runs
 
-    faber run --device metal <inferentia> -- inferentia live --backend metal
+    faber run --device metal --library-home <home> <inferentia> -- live --backend metal
         --model <F32 gguf> --prompt <text> --max-tokens <n> --trace
 
 with a RELEASE faber, parses the output and compares
@@ -21,7 +21,7 @@ if g <= 1e-5 + 1e-4 * M the comparison ENDS SUCCESSFULLY at k ("near-tie at
 step k"), otherwise it FAILS with the full context. Exit status is non-zero on
 any FAIL.
 
-    FABER_LIBRARY_HOME=<container root> a1_oracle.py --faber <release faber> \
+    a1_oracle.py --faber <release faber> [--library-home <dir holding gradus/src>] \
         [--package <inferentia dir>] [--model <F32 gguf>] [--cases eog,continuation] \
         [--timeout 400] [--out results.json] [--refs <references/a1 dir>]
 """
@@ -37,6 +37,11 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 PACKAGE = os.path.abspath(os.path.join(HERE, "..", ".."))
 DEFAULT_MODEL = "/Users/ianzepp/ai/models/SmolLM2-360M-Instruct-f32.gguf"
+# The directory that holds the gradus checkout (`<home>/gradus/src`); Norma is
+# embedded in the faber binary. While the container still carries a stale
+# `norma/` checkout beside `gradus/`, that checkout shadows the embedded Norma
+# and breaks package resolution: pass a home that holds only gradus.
+DEFAULT_LIBRARY_HOME = os.path.abspath(os.path.join(PACKAGE, ".."))
 DEFAULT_REFS = "/Users/ianzepp/work/faberlang/radix/docs/factory/gpu-reset/references/a1"
 CASES = {"eog": "eog-reference.json", "continuation": "continuation-reference.json"}
 
@@ -109,9 +114,10 @@ def parse_output(out_lines, err_lines):
 # The run
 # ---------------------------------------------------------------------------
 
-def run_live(faber, package, model, prompt, max_tokens, timeout):
-    cmd = ["/usr/bin/time", "-l", faber, "run", "--device", "metal", package, "--",
-           "inferentia", "live", "--backend", "metal", "--model", model,
+def run_live(faber, library_home, package, model, prompt, max_tokens, timeout):
+    cmd = ["/usr/bin/time", "-l", faber, "run", "--device", "metal",
+           "--library-home", library_home, package, "--",
+           "live", "--backend", "metal", "--model", model,
            "--prompt", prompt, "--max-tokens", str(max_tokens), "--trace"]
     t0 = time.time()
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
@@ -189,21 +195,21 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--faber", required=True, help="RELEASE faber binary")
     ap.add_argument("--package", default=PACKAGE)
+    ap.add_argument("--library-home", default=DEFAULT_LIBRARY_HOME,
+                    help="directory holding the gradus checkout (<home>/gradus/src)")
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--refs", default=DEFAULT_REFS)
     ap.add_argument("--cases", default="eog,continuation")
     ap.add_argument("--timeout", type=float, default=400.0)
     ap.add_argument("--out", default=None, help="write results JSON here")
     a = ap.parse_args()
-    if "FABER_LIBRARY_HOME" not in os.environ:
-        sys.exit("set FABER_LIBRARY_HOME to the container root")
 
     rows, results = [], {}
     for name in a.cases.split(","):
         ref = json.load(open(os.path.join(a.refs, CASES[name])))
         max_tokens = len(ref["generated_token_ids"]) if ref["finish_reason"] == "length" else 32
         rc, timed_out, wall, out, err = run_live(
-            a.faber, a.package, a.model, ref["prompt"], max_tokens, a.timeout)
+            a.faber, a.library_home, a.package, a.model, ref["prompt"], max_tokens, a.timeout)
         out_lines = [ln for _, ln in out]
         err_lines = [ln for _, ln in err]
         prompt_ids, ids, finish, traces = parse_output(out_lines, err_lines)
