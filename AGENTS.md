@@ -56,6 +56,15 @@ FABER="$CONTAINER/radix/target/debug/faber"
 Inferentia keeps no CPU backend: CPU inference is the same kernels under
 `faber run --device cpu` or `--device reference`.
 
+Streaming proof (need 86f2d64a): `/generate` with `Accept: text/event-stream` writes
+each token to the open response as it is chosen. `python3 tests/oracle/a1_stream_test.py
+--faber <faber> --device <reference|cpu|metal> --library-home <home>` timestamps every
+SSE event and fails if the tokens arrive in one burst or the first token is not ahead of
+the `done` event; `--selftest` runs its parser and verdict on synthetic streams without a
+model. A step costs about 3.5 minutes on `--device reference` with a release `faber`
+(measured 2026-10-14; a debug `faber` did not finish one step in 13 minutes), so the
+3-token reference run takes about 10 minutes.
+
 Measured package-suite baseline (2026-10-03, isolated `inf1` packet):
 `faber test <absolute-package-path>` took 157.74s with the plain development
 CLI and 82.08s with a CLI built using `CARGO_PROFILE_DEV_OPT_LEVEL=1`.

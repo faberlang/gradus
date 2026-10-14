@@ -37,7 +37,7 @@
 # open_sse). Request bodies arrive as a value carrying list<b8>; `value ↦
 # list<b8>` then `list<b8> ↦ string` extracts UTF-8 JSON. `/generate` answers
 # JSON by default. `Accept: text/event-stream` or `?stream=1` emits one SSE
-# event per token (I1 minimal stream). Generation itself is still a batch call.
+# event per token, written to the open response as each token is generated.
 #
 # Generation (A1): the gradus decode-token launches (bulk F32 weight load, K/V
 # ping-pong caches). The kernels run on whatever device the program is started
@@ -964,27 +964,69 @@ fn wants_sse(server.Incoming incoming) → bool {
     return false
 }
 
-# One SSE `token` event per generated id, then a `done` event with the JSON
-# body. Generation is still a batch call; this is the I1 wire stream. The
-# detokenized `text` arrives pre-decoded — decode fails closed before the
-# stream opens, so no partial body is emitted.
-fn send_generate_stream(server.Incoming incoming, ServerState st, string text, list<int> tokens, list<int> prompt_ids, int max_tokens) → void {
+# One SSE event written and flushed to the open response. false when the peer
+# went away (the write failed): the decode loop then ends the generation.
+fn send_sse_event(server.Stream stream, string name, string data) → bool {
+    do {
+        const sse.Event ev ← sse.Event { name = name, data = data, id = "", retry = "" }
+        server.send_event(stream, ev)
+        return true
+    }
+    catch err {
+        stderr_write("inferentia: stream dropped: §\n"(err))
+        return false
+    }
+}
+
+# The `token` event of one chosen id: the decode-loop sink of a streamed run.
+fn send_token_event(server.Stream stream, int id) → bool {
+    return send_sse_event(stream, "token", id ↦ string)
+}
+
+# Stream one /generate over SSE. Request validation runs before the stream
+# opens, so a rejected request is still a JSON 4xx. Then the response opens, the
+# decode loop writes one `token` event per chosen id between decode steps (each
+# flushed to the client as it is written), and the stream ends with a `done`
+# event carrying the JSON body, or an `error` event if generation or detokenize
+# fails after the stream is open (the status line has already gone out).
+fn stream_generate(server.Incoming incoming, ServerState st, GenerateConfig cfg, list<int> prompt_ids, ResidentModel model, port.PortWeights weights) → void {
+    do {
+        check_generate_port(cfg, prompt_ids, model)
+    }
+    catch err {
+        reply_json(incoming, classify_generate_error(err.message), error_body(err.message))
+        return
+    }
     do {
         const server.Stream stream ← server.open_sse(incoming)
-        var int i ← 0
-        while i ≺ tokens.length() {
-            const int t ← tokens.get(i) coalesce 0
-            const sse.Event ev ← sse.Event { name = "token", data = t ↦ string, id = "", retry = "" }
-            server.send_event(stream, ev)
-            i ← i + 1
+        if stream_run(stream, st, cfg, prompt_ids, model, weights) {
+            server.finish_stream(stream, server.keep_alive(incoming.req.headers))
         }
-        const sse.Event done ← sse.Event { name = "done", data = generate_response_body(st, text, tokens, prompt_ids, max_tokens), id = "", retry = "" }
-        server.send_event(stream, done)
-        server.finish_stream(stream, server.keep_alive(incoming.req.headers))
     }
     catch err {
         stderr_write("inferentia: stream dropped: §\n"(err))
     }
+}
+
+# The decode loop of one open stream. true when the stream is still writable,
+# so the caller may finish it; false once a write failed.
+fn stream_run(server.Stream stream, ServerState st, GenerateConfig cfg, list<int> prompt_ids, ResidentModel model, port.PortWeights weights) → bool {
+    const (int) → bool sink ← int t ∴ send_token_event(stream, t)
+    do {
+        const pgen.PortResult run ← run_generate_port(cfg, prompt_ids, model, weights, decoder.eog_stop(), false, sink)
+        if st.cancelled {
+            return send_sse_event(stream, "error", error_body("generation cancelled (shutdown)"))
+        }
+        const DecodeResult dec ← tokens_text(model.tokenizer, run.ids)
+        if dec.ok {
+            return send_sse_event(stream, "done", generate_response_body(st, dec.text, run.ids, prompt_ids, cfg.maxima_verborum))
+        }
+        return send_sse_event(stream, "error", error_body(dec.error))
+    }
+    catch err {
+        return send_sse_event(stream, "error", error_body(err.message))
+    }
+    return false
 }
 
 # Write text to stdout without a trailing newline. Console writes report on
@@ -1453,15 +1495,26 @@ fn load_port_weights_as_capsula(string path, gguf_manifest.GgufManifest admitted
 # loop (greedy at temperature 0, seeded sampling otherwise, with the request's
 # sampling Config and Seed). A fresh pair of K/V caches is allocated per call inside
 # port_generate_sampled; the weights are the resident ones.
-fn run_generate_port(GenerateConfig cfg, list<int> ids, ResidentModel model, port.PortWeights weights, decoder.StopPolicy stop, bool trace) → pgen.PortResult ⇥ config.GenerationError {
+fn check_generate_port(GenerateConfig cfg, list<int> ids, ResidentModel model) → void ⇥ config.GenerationError {
     const config.GenerationConfig g ← to_generation_config(cfg, model.eog_ids)
     require ids.length() ≥ 1 throw variant config.GenerationError.InvalidConfig { message = "needs at least one prompt token" }
     require ids.length() ≤ g.max_prompt throw variant config.GenerationError.InvalidConfig { message = "prompt length exceeds max_prompt" }
     require ids.length() ≺ g.context throw variant config.GenerationError.InvalidConfig { message = "prompt length does not fit context" }
+}
+
+# The sink of a run that streams nothing: every id is wanted.
+fn discard_token(int id) → bool {
+    return true
+}
+
+# `on_token` receives each chosen id between decode steps (see port_generate_sampled).
+fn run_generate_port(GenerateConfig cfg, list<int> ids, ResidentModel model, port.PortWeights weights, decoder.StopPolicy stop, bool trace, (int) → bool on_token) → pgen.PortResult ⇥ config.GenerationError {
+    check_generate_port(cfg, ids, model)
+    const config.GenerationConfig g ← to_generation_config(cfg, model.eog_ids)
     const sampling.Config sconf ← config.config(g)
     const train.Seed seed ← config.seed(g)
     do {
-        return pgen.port_generate_sampled(weights, ids, cfg.maxima_verborum, model.eog_ids, decoder.stops_on_eog(stop), cfg.contextus, trace, sconf, seed)
+        return pgen.port_generate_sampled(weights, ids, cfg.maxima_verborum, model.eog_ids, decoder.stops_on_eog(stop), cfg.contextus, trace, sconf, seed, on_token)
     }
     catch err {
         throw variant config.GenerationError.InvalidConfig { message = err.message }
@@ -1517,7 +1570,7 @@ fn live_load_port(ServeConfig serve_config, string sha, gguf_manifest.GgufManife
 
 fn live_port_generate(GenerateConfig cfg, list<int> ids, ResidentModel model, port.PortWeights weights, decoder.StopPolicy stop, bool trace) → pgen.PortResult {
     do {
-        return run_generate_port(cfg, ids, model, weights, stop, trace)
+        return run_generate_port(cfg, ids, model, weights, stop, trace, discard_token)
     }
     catch err {
         panic "port generate failed: " + err.message
@@ -1918,20 +1971,22 @@ fn handle_generate(server.Incoming incoming, value raw, ServerState st, ServeCon
         return
     }
     const GenerateConfig cfg ← build_generate_config(parsed, config)
+    if wants_sse(incoming) {
+        stream_generate(incoming, st, cfg, enc.ids, model, ports[0])
+        return
+    }
     do {
-        const pgen.PortResult run ← run_generate_port(cfg, enc.ids, model, ports[0], decoder.eog_stop(), false)
+        const pgen.PortResult run ← run_generate_port(cfg, enc.ids, model, ports[0], decoder.eog_stop(), false, discard_token)
         const list<int> tokens ← run.ids
         # Cancellation checkpoint after decode (D6 seam).
         if st.cancelled {
             reply_json(incoming, 503, error_body("generation cancelled (shutdown)"))
         } else {
-            # Detokenize before any body assembly or stream open: a typed
-            # decode failure fails closed instead of emitting a partial body.
+            # Detokenize before any body assembly: a typed decode failure fails
+            # closed instead of emitting a partial body.
             const DecodeResult dec ← tokens_text(model.tokenizer, tokens)
             if not dec.ok {
                 reply_json(incoming, classify_generate_error(dec.error), error_body(dec.error))
-            } elif wants_sse(incoming) {
-                send_generate_stream(incoming, st, dec.text, tokens, enc.ids, cfg.maxima_verborum)
             } else {
                 reply_json(incoming, 200, generate_response_body(st, dec.text, tokens, enc.ids, cfg.maxima_verborum))
             }
