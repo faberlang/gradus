@@ -8,7 +8,8 @@ asked. Container law: [`../AGENTS.md`](../AGENTS.md).
 Gradus is the public Faber source library for `gradus:*` imports — automatic,
 differentiation, loss functions, optimizers, neural-network primitives, and
 training-loop mechanics. This repo owns `.fab` source under `src/`; Radix and
-`faber` consume it through `FABER_LIBRARY_HOME`, usually the parent
+`faber` consume it through `--library-home` (or `[paths] library_home` in
+`faber.toml`; no `FABER_*` environment variable is read), usually the parent
 `faberlang/` directory in local development.
 
 Gradus is fully self-contained. It does not import from Norma or any other

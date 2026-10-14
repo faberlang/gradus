@@ -34,14 +34,18 @@ row that type-checks with `faber check`.
 
 ## Install
 
-Local `faber` resolves `gradus:*` from the shared library home:
+Local `faber` resolves `gradus:*` from the library home (`--library-home <DIR>`
+or `[paths] library_home` in `faber.toml`):
 
 ```text
-$FABER_LIBRARY_HOME/gradus/src/**/*.fab
+<library home>/gradus/src/**/*.fab
 ```
 
-In local Faber development, `FABER_LIBRARY_HOME` is usually the parent
-`faberlang/` directory that contains sibling checkouts:
+Norma is embedded in the `faber` binary and needs no home. In local Faber
+development the library home is usually the parent `faberlang/` directory that
+contains sibling checkouts (while a stale `norma/` checkout sits beside
+`gradus/`, it shadows the embedded Norma; use a directory holding only a
+`gradus` link):
 
 ```text
 faberlang/
@@ -52,7 +56,7 @@ faberlang/
 ```
 
 ```bash
-export FABER_LIBRARY_HOME=/path/to/faberlang
+faber check --library-home /path/to/faberlang /path/to/your-package
 ```
 
 Install into the shared package store (from sibling `cista`):
@@ -66,12 +70,12 @@ cargo run -p cista -- install \
 
 That snapshots product `*.fab` under `src/` to
 `$CISTAE_HOME/gradus/<version>/interfaces/` (interfaces-only; `*.proba`
-test sources are excluded). `faber` still uses `FABER_LIBRARY_HOME` until
+test sources are excluded). `faber` still uses the library home until
 tooling consumes packaged paths.
 
 ## Example
 
-From an empty directory, with `FABER_LIBRARY_HOME` set as above and a
+From an empty directory, with the library home passed as above and a
 current `faber` binary on `PATH`:
 
 `faber.toml`:
@@ -276,7 +280,7 @@ import from "gradus:loss" loss
 ```
 
 Same form as every live exemplum `src/main.fab`. Provider resolution is
-the `FABER_LIBRARY_HOME` path in [Install](#install).
+the library home in [Install](#install).
 
 ## Layout
 

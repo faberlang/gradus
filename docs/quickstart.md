@@ -23,7 +23,7 @@ same forward row. Import the leaf that owns the type you use (`gradus:loss`, `gr
 ## Smallest useful program
 
 The smallest useful Gradus program builds two 2×2 tensors and evaluates mean
-squared error. Put this in an empty directory with `FABER_LIBRARY_HOME` set
+squared error. Put this in an empty directory with the library home passed (`--library-home`)
 as in the README, and a current `faber` binary on `PATH`.
 
 `faber.toml`:
