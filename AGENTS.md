@@ -96,7 +96,7 @@ mir-swarm rungs, not grow workarounds.
 ## Benchmarks
 
 Same law as unit tests: time the **current tree**. `./scripta/bench run`
-uses the live sibling checkouts (HEAD of radix, hosts, gradus). A leftover
+uses the live sibling checkouts (HEAD of radix, gradus). A leftover
 isolated snapshot is never auto-selected. Artifacts record the HEADs that
 ran; they do not become the next run's input. If you want last week's
 number, check out last week's repos. Operative method:

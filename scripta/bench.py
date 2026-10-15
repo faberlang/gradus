@@ -23,7 +23,7 @@ clean        worktree remove --force + prune in each source repo, then
 
 Laws (gradus/docs/factory/bench-harness/delivery.md GB-U1):
 
-* scratch root defaults to <workspace>/.bench/gradus/<r7>-<h7>-<g7>/
+* scratch root defaults to <workspace>/.bench/gradus/<r7>-<g7>/
   where <workspace> is the parent of this gradus checkout; it is never
   allowed inside one of the three source repos;
 * pinning is fail-closed: a hash that does not resolve is a typed
@@ -41,7 +41,7 @@ Laws (gradus/docs/factory/bench-harness/delivery.md GB-U1):
 
 Run laws:
 
-* default `run` times the live workspace (current radix/hosts/gradus HEAD),
+* default `run` times the live workspace (current radix/gradus HEAD),
   same as `faber check` / `cargo test`. A leftover `.bench/gradus/` snapshot
   is never auto-selected;
 * `--scratch` is an explicit isolated tree, not the default;
@@ -105,7 +105,8 @@ import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
 
-REPOS = ("radix", "hosts", "gradus")
+# `hosts` was deleted by ruling; the live triple is radix + gradus.
+REPOS = ("radix", "gradus")
 TRIPLE_SCHEMA = 1
 TRIPLE_FILE = "triple.json"
 DEFAULT_MIN_FREE_GB = 10.0
@@ -610,9 +611,14 @@ def case_command(faber: Path, scratch: Path, case: dict) -> list[str]:
     `faber check` on the library in the tree being timed."""
     if case["route"] == "check":
         target = (scratch / "gradus" / case["target"]).resolve()
-        return [str(faber), "check", str(target)]
+        return [str(faber), "check", "--library-home", str(scratch), str(target)]
     package = scratch / "gradus" / "bench"
-    return [str(faber), "run", str(package), "--", case["label"], str(case["iterations"])]
+    # The retired FABER_LIBRARY_HOME env branch is not read; the sibling
+    # providers (gradus:*) resolve only through --library-home.
+    return [
+        str(faber), "run", str(package), "--library-home", str(scratch),
+        "--", case["label"], str(case["iterations"]),
+    ]
 
 
 def timed_sample(command: list[str], cap_s: float, env: dict, cwd: Path) -> dict:
@@ -933,7 +939,6 @@ def collect_metadata(
         "pmset_raw": pmset_raw,
         "triple": {
             "radix_sha": triple["radix"],
-            "hosts_sha": triple["hosts"],
             "gradus_sha": triple["gradus"],
         },
         "faber_binary": {
@@ -1002,7 +1007,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         f"bench: run {mode} stage {stage} ({spec['number']}) — {len(selected)} label(s) "
         f"[{label_mode} selection], {warmups} warmup + {samples} sample(s) per "
         f"label, K per manifest; radix {triple['radix'][:7]} "
-        f"hosts {triple['hosts'][:7]} gradus {triple['gradus'][:7]}",
+        f"gradus {triple['gradus'][:7]}",
         file=sys.stderr,
     )
     rows = [
@@ -1343,12 +1348,12 @@ def cmd_capture(args: argparse.Namespace) -> int:
         )
 
     print(
-        f"bench: capture triple radix {triple['radix']} hosts "
-        f"{triple['hosts']} gradus {triple['gradus']}",
+        f"bench: capture triple radix {triple['radix']} "
+        f"gradus {triple['gradus']}",
         file=sys.stderr,
     )
     cmd_materialize(
-        argparse.Namespace(radix=None, hosts=None, gradus=None, scratch=str(scratch))
+        argparse.Namespace(radix=None, gradus=None, scratch=str(scratch))
     )
     cmd_build(
         argparse.Namespace(
@@ -1423,7 +1428,7 @@ def cmd_capture(args: argparse.Namespace) -> int:
 
     stem = (
         f"baseline-{captured.strftime('%Y%m%d')}"
-        f"-r{triple['radix'][:7]}-h{triple['hosts'][:7]}-g{triple['gradus'][:7]}"
+        f"-r{triple['radix'][:7]}-g{triple['gradus'][:7]}"
     )
     BASELINE_DIR.mkdir(parents=True, exist_ok=True)
     baseline_path = BASELINE_DIR / f"{stem}.json"
@@ -1679,7 +1684,7 @@ def build_parser() -> argparse.ArgumentParser:
     materialize.add_argument(
         "--scratch",
         metavar="DIR",
-        help=f"scratch root (default: {BENCH_ROOT}/<r7>-<h7>-<g7>)",
+        help=f"scratch root (default: {BENCH_ROOT}/<r7>-<g7>)",
     )
     materialize.set_defaults(fn=cmd_materialize)
 
