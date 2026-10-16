@@ -10,6 +10,9 @@ PyTorch-shaped: models are pure functions with explicit parameters, gradients
 are compiler-generated companion functions, and the backward pass is
 generated code — not a runtime tape replay.
 
+> **Experimental.** Like Faber itself, this library is experimental until
+> Faber 2; APIs change without notice.
+
 ## Start here
 
 Gradus is a JAX-shaped autograd and ML library: models are pure functions
@@ -34,49 +37,40 @@ row that type-checks with `faber check`.
 
 ## Install
 
-Local `faber` resolves `gradus:*` from the library home (`--library-home <DIR>`
-or `[paths] library_home` in `faber.toml`):
+> **Experimental.** Like Faber itself, this library is experimental until
+> Faber 2; APIs change without notice.
+
+Package installation is not yet available in the public toolchain: `faber`
+never installs packages, and the separate package-store tool is not released.
+Instead, clone this repository and tell `faber` where to find it.
+
+Install the `faber` binary from the
+[release page](https://github.com/faberlang/releases/releases/latest) (docs at
+[faberlang.dev](https://faberlang.dev)). `faber` resolves `gradus:*` from a
+library home: a directory that holds this repo as `gradus/`
+(`--library-home <DIR>`, or `[paths] library_home` in your `faber.toml`).
 
 ```text
 <library home>/gradus/src/**/*.fab
 ```
 
-Norma is embedded in the `faber` binary and needs no home. In local Faber
-development the library home is usually the parent `faberlang/` directory that
-contains sibling checkouts (while a stale `norma/` checkout sits beside
-`gradus/`, it shadows the embedded Norma; use a directory holding only a
-`gradus` link):
-
-```text
-faberlang/
-  radix/
-  norma/
-  triga/
-  gradus/      # this repo
-```
+Norma is embedded in the `faber` binary and needs no home. Put only the
+libraries you use in the library home; a stale `norma/` checkout beside
+`gradus/` would shadow the embedded Norma.
 
 ```bash
-faber check --library-home /path/to/faberlang /path/to/your-package
+mkdir libs && git clone https://github.com/faberlang/gradus libs/gradus
+faber doctor --library-home libs            # library.gradus.availability should be faber-package
+faber check --library-home libs /path/to/your-package
 ```
 
-Install into the shared package store (from sibling `cista`):
-
-```bash
-cargo run -p cista -- install \
-  --path ../gradus \
-  --target-language rust \
-  --store "${CISTAE_HOME:-$HOME/.faber/cistae}"
-```
-
-That snapshots product `*.fab` under `src/` to
-`$CISTAE_HOME/gradus/<version>/interfaces/` (interfaces-only; `*.proba`
-test sources are excluded). `faber` still uses the library home until
-tooling consumes packaged paths.
+Use an absolute path for the library home; a relative one can fail to resolve
+from inside a package.
 
 ## Example
 
 From an empty directory, with the library home passed as above and a
-current `faber` binary on `PATH`:
+current `faber` binary on `PATH` (checked with `faber` 1.14):
 
 `faber.toml`:
 
@@ -98,39 +92,38 @@ kind = "bin"
 locale = "en"
 ```
 
-`src/main.fab` (same `import from` / `main` / `from_flat` shape as
+`src/main.fab` (same `import from` / `main` shape as
 `exempla/gradient-seam/src/main.fab` and `exempla/*/src/main.fab`):
 
 ```fab
 import from "gradus:loss" loss
 
 main {
-    let tensor<f32, []> seed ← empty
-    let list<int> shape_2x2 ← [2, 2]
-    let tensor<f32, [2, 2]> prediction ← seed.from_flat([1.0, 2.0, 3.0, 4.0], shape_2x2)
-    let tensor<f32, [2, 2]> target ← seed.from_flat([1.0, 2.0, 3.0, 3.0], shape_2x2)
+    let tensor<f32, [2, 2]> prediction ← [[1.0, 2.0], [3.0, 4.0]]
+    let tensor<f32, [2, 2]> target ← [[1.0, 2.0], [3.0, 3.0]]
     let f32 value ← loss.mse(prediction, target)
     print value
 }
 ```
 
 ```bash
-faber check .
+faber check --library-home /absolute/path/to/libs .
 ```
 
-`loss.mse` is mean squared error over the 2×2 f32 fixture; the snippet's
-inputs yield `0.25`. `faber check` is the standing proof that the import
-and call type-check. The training-loop exemplum is an executed package proof:
-`faber run` executes its library-to-library calls on the FMIR stepper (radix
-`43c0102ba`, regression-locked by `2e8042ae7`). Other package runs, GPU
+`loss.mse` is mean squared error over the 2×2 f32 fixture; the inputs differ
+in one element by 1, so the mean is `0.25`. `faber check` is the standing
+proof that the import and call type-check. The training-loop exemplum is an
+executed package proof: `faber run` executes its library-to-library calls on
+the FMIR stepper. Other package runs, GPU
 training, and executed model performance are not claimed here. Worked demos
 live under `exempla/`;
 the first-open-per-capability tour is [`docs/quickstart.md`](docs/quickstart.md).
 
 ## Status
 
-Gradus is pre-1.0 with a clean-break posture; APIs may change. See
-[`docs/compatibility-policy.md`](docs/compatibility-policy.md).
+**Experimental.** Like Faber itself, Gradus is experimental until Faber 2;
+APIs change without notice, with a clean-break posture (no compatibility
+shims). See [`docs/compatibility-policy.md`](docs/compatibility-policy.md).
 
 What ships today is the **structural** surface: compile-validated,
 proba-pinned source contracts, plus an executed 100-step MLP training
@@ -141,8 +134,8 @@ identity, GPU training, and executed performance are not claimed here.
 Gradus's executed tier of record is the CPU/reference tier — decoded F32
 host-list compute carriers (`src/tensor.fab` `class NumericBlock`), reference
 kernels, and FMIR stepper receipts. Encoded model bytes belong to the open
-`gradus:storage` representation; device residency and emission are Radix and
-hosts scope.
+`gradus:storage` representation; device residency and emission belong to the compiler
+and host runtimes, not to this library.
 
 | Layer | State |
 | --- | --- |
@@ -186,8 +179,8 @@ range proofs live in `exempla/gguf-manifest/` and `exempla/gguf-inspect/`.
   A Gradus user imports only from `gradus:*`. Duplication with Norma is
   intentional isolation, not a bug.
 - **Device-neutral.** Gradus public types are pure mathematical contracts.
-  GPU execution, kernel fusion, and memory management are Radix and host
-  concerns. Gradus describes *what* to compute; Radix decides *how*.
+  GPU execution, kernel fusion, and memory management are compiler and host
+  concerns. Gradus describes *what* to compute; the compiler decides *how*.
 - **Forcing function: nanoGPT on Shakespeare.** The primary demo trains a
   minimal GPT on the complete works of Shakespeare. It is planned (not
   in-tree yet). It should run on CPU (slowly) for correctness and force
@@ -209,20 +202,20 @@ range proofs live in `exempla/gguf-manifest/` and `exempla/gguf-inspect/`.
 
 ## Who this is NOT yet for
 
-- **Production deployment.** Gradus is pre-1.0 with a clean-break posture;
-  APIs may change. The support matrix and compatibility policy define
+- **Production deployment.** Gradus is experimental until Faber 2, with a
+  clean-break posture; APIs change without notice. The support matrix and compatibility policy define
   exactly what is admitted and what migrates.
 - **GPU-scale training or broad executed performance evidence.** Outside the
   bounded training-loop proof, executed runs are not claimed; speed figures,
   when they exist, are CPU-reference-level at most and never precede the
   correctness gates. Comparator benches to date pin llama.cpp Metal and CPU
-  rows on burgus; no CUDA comparator row exists yet (reserved).
+  rows on one Apple Silicon Mac; no CUDA comparator row exists yet (reserved).
 - **PyTorch users.** Gradus is JAX-shaped (pure functions, explicit params), not
   PyTorch-shaped (nn.Module class hierarchy). No object-oriented model
   registration.
 - **Device/backend residency.** Gradus owns mathematical contracts and
   logical state; device handles, scheduling, and physical storage belong to
-  the hosts surface, not to a `gradus:*` import.
+  the host runtimes, not to a `gradus:*` import.
 
 ## What ships now vs what is planned
 
@@ -244,7 +237,7 @@ below.
 | nanoGPT on Shakespeare (CPU) | Planned (not in-tree) | Gradus |
 | Executed training loop + train/optimize proba | Shipped — 100-step MLP; 90/90 cases | Gradus |
 | Other executed proba / e2e runs | Not claimed | — |
-| GPU training / executed performance | Planned — depends on Radix/hosts | Radix + hosts |
+| GPU training / executed performance | Planned — depends on compiler and host work | Compiler + host runtimes |
 
 ## Static-shape surface
 
@@ -265,8 +258,7 @@ separate library entry points.
 The seam proof for this surface is `exempla/gradient-seam/`. The
 `@ radix backward` annotation lives in `gradus:gradient`; that exemplum
 calls the generated companion through the import. Library-to-library calls
-execute on the FMIR stepper (radix `43c0102ba`, regression-locked by
-`2e8042ae7`). The BERT tuple call cases remain omitted from execution because
+execute on the FMIR stepper. The BERT tuple call cases remain omitted from execution because
 of the named package-MIR call-argument-mismatch residual (E8/E10).
 
 ## Import
@@ -286,12 +278,12 @@ the library home in [Install](#install).
 
 ```text
 faber.toml     library provider metadata for faber package resolution
-cista.toml     package identity + version (cista install)
+cista.toml     package identity + version (for the separate package-store tool)
 src/           public `gradus:*` Faber modules (`name.fab` + co-located `name.proba`)
 exempla/       instructional demos for gradus types
 scripta/       source-library checks (internal)
 fixtures/      test corpus (internal)
-docs/          quickstart, policy, module map, API reference, factory history
+docs/          quickstart, policy, module map, API reference, planning history
 ```
 
 Internal vs product paths: [`docs/internal-surfaces.md`](docs/internal-surfaces.md).
