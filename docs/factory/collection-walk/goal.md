@@ -26,15 +26,15 @@ range is derived from a collection the body immediately re-indexes.
 The offensive form is the layer walk:
 
 ```fab
-for range 0‥d.data.layers().length() const i {
-    const Layer layer ← d.data.layers().get(i) coalesce …
+for range 0‥d.data.layers().length() let i {
+    let Layer layer ← d.data.layers().get(i) coalesce …
 }
 ```
 
 instead of:
 
 ```fab
-for from d.data.layers() const layer {
+for from d.data.layers() let layer {
 }
 ```
 
@@ -64,7 +64,7 @@ for range 0‥xs.length() const i { … xs.get(i) … }
 
 where `i` is not used except to index that same `xs` (including
 `xs()`-shaped getters such as `checkpoint.layers()`). Rewrite to
-`for from xs const x` (or `for from xs() const x`). Drop the
+`for from xs let x` (or `for from xs() let x`). Drop the
 `coalesce` that existed only to paper over `get`.
 
 ### Keep `for range`
@@ -136,11 +136,11 @@ whole package is not required for closeout.
    `s.get(i)` / `s.slice(i, i + 1)` until a dedicated proof shows
    `for from` on `string` binds characters. Revisit; do not convert in
    this goal.
-2. **Bytes `for from o`.** Tried in unit 2: `for from o const octet`
+2. **Bytes `for from o`.** Tried in unit 2: `for from o let octet`
    then `out.append(octet)` is `SEM010` (`list<u8>.append` rejects
    the bound type). Keep the indexed form with `get(i) coalesce 0 ∷ u8`
    until a dedicated proof lands. Same default as strings.
-3. **Method-call source.** Default: `for from checkpoint.layers() const layer`
+3. **Method-call source.** Default: `for from checkpoint.layers() let layer`
    is the spelling (evaluate the getter as the walk source). If check
    rejects a call in that position, bind once (`const layers ← checkpoint.layers()`)
    then `for from layers`.

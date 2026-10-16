@@ -30,7 +30,7 @@ raw `tensor<f32, [N,M]>`.
 loss_backward(x, w, nil(), upstream: f32) → iuncta(grad_x, grad_w)
 ```
 
-Consumer destructured: `fixum [_, gw] ← loss_backward(x, w, nil(), 1.0)`.
+Consumer destructured: `sit [_, gw] ← loss_backward(x, w, nil(), 1.0)`.
 
 **Execution path**: The U1 execution proof is self-contained. `faber run -t
 fmir` does not support library imports — the consumer cannot build against

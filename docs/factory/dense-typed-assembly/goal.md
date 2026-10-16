@@ -84,7 +84,7 @@ graph in place.
 `DenseConfig` and converts:
 
 ```fab
-const tensor<f32, [D, V]> embed ← block.data ↦ tensor<f32, [D, V]>
+let tensor<f32, [D, V]> embed ← block.data ↦ tensor<f32, [D, V]>
 ```
 
 `MissingTensor` / `BadShape` / `BadConfig` fire here, once. After `load`

@@ -135,11 +135,11 @@ union RunnerError {
 
 fn message(RunnerError e) → string {
     match e {
-        case BadArguments const message { return message }
-        case BadDigest const message { return message }
-        case ShortPrefix const message { return message }
-        case BadManifest const message { return message }
-        case AdmissionRejected const message { return message }
+        case BadArguments let message { return message }
+        case BadDigest let message { return message }
+        case ShortPrefix let message { return message }
+        case BadManifest let message { return message }
+        case AdmissionRejected let message { return message }
     }
 }
 
@@ -147,8 +147,8 @@ fn _range(list<int> prefix, int start, int length) → bytes ⇥ gguf_manifest.G
     if start < 0 or length < 0 or start > prefix.length() - length {
         throw variant BadSource {message = "read request exceeds the bounded table prefix"}
     }
-    const list<int> segment ← prefix.slice(start, start + length)
-    const bytes bytes ← segment ↦ bytes
+    let list<int> segment ← prefix.slice(start, start + length)
+    let bytes bytes ← segment ↦ bytes
     return bytes
 }
 
@@ -175,8 +175,8 @@ fn _admission(
 }
 
 fn _repr_ids(list<int> ids) → string {
-    var string out ← ""
-    var int i ← 0
+    mut string out ← ""
+    mut int i ← 0
     while i < ids.length() {
         if i > 0 { out ← out + "," }
         out ← out + (ids.get(i) coalesce 0 ↦ string)
@@ -187,16 +187,16 @@ fn _repr_ids(list<int> ids) → string {
 
 main {
     do {
-        const list<string> args ← process.argv() ↦ list<string>
+        let list<string> args ← process.argv() ↦ list<string>
         if args.length() < 5 {
             throw variant BadArguments { message = "usage: runner <model> --sha256 <digest> --prompt <text>" }
         }
-        const string via ← args.get(0) coalesce ""
-        var string digest ← ""
-        var string prompt ← ""
-        var int i ← 1
+        let string via ← args.get(0) coalesce ""
+        mut string digest ← ""
+        mut string prompt ← ""
+        mut int i ← 1
         while i < args.length() {
-            const string arg ← args.get(i) coalesce ""
+            let string arg ← args.get(i) coalesce ""
             if arg ≡ "--sha256" {
                 digest ← args.get(i + 1) coalesce ""
                 i ← i + 2
@@ -210,24 +210,24 @@ main {
         if digest ≡ "" or prompt ≡ "" {
             throw variant BadArguments { message = "--sha256 and --prompt are required" }
         }
-        const int total ← fs.byte_length(via)
+        let int total ← fs.byte_length(via)
         if total ≠ ORACLE_LENGTH {
             throw variant AdmissionRejected { message = "byte length mismatch" }
         }
-        const artifact.ContentIdentity identity ← _identity(digest, total)
-        const bytes prefix_bytes ← fs.read_range(via, 0, ORACLE_DATA_START)
+        let artifact.ContentIdentity identity ← _identity(digest, total)
+        let bytes prefix_bytes ← fs.read_range(via, 0, ORACLE_DATA_START)
         if prefix_bytes.length() ≠ ORACLE_DATA_START {
             throw variant ShortPrefix { message = "short table-prefix read" }
         }
-        const value prefix_payload ← prefix_bytes ↦ value
-        var list<int> prefix ← empty
+        let value prefix_payload ← prefix_bytes ↦ value
+        mut list<int> prefix ← empty
         do {
             prefix ← prefix_payload ↦ list<int>
         }
         catch err {
             throw variant BadManifest { message = "carrier conversion failed: " + err }
         }
-        const gguf_manifest.GgufManifest m ← _admission(
+        let gguf_manifest.GgufManifest m ← _admission(
             (int start, int length) → bytes ⇥ gguf_manifest.GgufManifestError ∴ _range(prefix, start, length),
             total,
             identity
@@ -238,14 +238,14 @@ main {
         if m.metadata.length() ≠ ORACLE_METADATA or m.tensors.length() ≠ ORACLE_TENSORS {
             throw variant AdmissionRejected { message = "census mismatch" }
         }
-        var tokenizer.Tokenizer t ← tokenizer.Tokenizer {words = empty, vocab = empty, concursus = empty, special_texts = empty, specialia_ids = empty, eog = empty, add_bos = false, chat_template = "", multitudo = 0}
+        mut tokenizer.Tokenizer t ← tokenizer.Tokenizer {words = empty, vocab = empty, concursus = empty, special_texts = empty, specialia_ids = empty, eog = empty, add_bos = false, chat_template = "", multitudo = 0}
         do {
             t ← tokenizer.build(m)
         }
         catch err {
             throw variant BadManifest { message = "tokenizer build failed" }
         }
-        var list<int> ids ← empty
+        mut list<int> ids ← empty
         do {
             ids ← tokenizer.tokenize(t, prompt)
         }
@@ -253,7 +253,7 @@ main {
             throw variant BadManifest { message = "tokenize failed" }
         }
         print "IDS " + _repr_ids(ids)
-        var list<int> literal ← empty
+        mut list<int> literal ← empty
         do {
             literal ← tokenizer.tokenize_literal(t, prompt)
         }

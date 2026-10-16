@@ -21,7 +21,7 @@ Every fixed-shape bridge wraps its production call in nested do/catch and swallo
 ```fab
 fn gelu_4x4(tensor<f32, [4, 4]> x) → tensor<f32, [4, 4]> {
     do {
-        const tensor.Tensor y ← gelu(_staged(x ↦ list<f32>, [4, 4]))
+        let tensor.Tensor y ← gelu(_staged(x ↦ list<f32>, [4, 4]))
         do { return y.data ↦ tensor<f32, [4, 4]> }
         catch conv { return x }
     }
@@ -40,10 +40,10 @@ Same swallow-and-echo-input shape at `gelu_2x8` (:189-195), `linear_2x8` (:149-1
 The module stores the u64 length field as *prefix + JSON* and slices JSON at `[8, header)`:
 
 ```fab
-const int header ← buf[0‥8] ↦ int<u64, Le> ↦ int
+let int header ← buf[0‥8] ↦ int<u64, Le> ↦ int
 require header ≥ 8 throw variant BadFormat {…}
 …
-for range 8‥header const i { … }
+for range 8‥header let i { … }
 ```
 
 The Safetensors reference format defines N as the JSON-header size **excluding** the 8-byte prefix (JSON occupies `[8, 8+N)`, data begins at `8+N`). Consequence: real HF-tooling-produced `.safetensors` files parse a header truncated by 8 bytes → walk fails → `BadFormat`. Direction is fail-closed and the stack is internally self-consistent (generator, oracle hash, probas share the local convention — which is why ~35 green reject rows never caught it), but interop with actual artifacts is broken and the charter comment asserts a false fact about the "reference format".
@@ -55,8 +55,8 @@ The Safetensors reference format defines N as the JSON-header size **excluding**
 `src/cache.fab:445-448` (`extend`), `:410-411` (`append`)
 
 ```fab
-var list<int> new_history ← c.history()
-for from tokens const token_id {
+mut list<int> new_history ← c.history()
+for from tokens let token_id {
     require token_id ≥ 0 throw variant IdOutOfRange {message = "token id must be non-negative"}
     new_history.append(token_id)
 }
@@ -82,7 +82,7 @@ Note: the proba rows currently pin the zeroed arithmetic as the f64 oracle — t
 
 ```fab
 fn _has_no_separator(string s) → bool {
-    for range 0‥s.length() const i {
+    for range 0‥s.length() let i {
         if s.get(i) ≡ "/" then return true
     }
     return false
@@ -137,7 +137,7 @@ Missing `@ public { }` on de-facto cross-module surface (default visibility doin
 - **Additive negation `(0 - x)` over unary minus** — attention.fab:363/:376/:392/:997, cache.fab:1197/:1209/:1511, speculative.fab:137/:155/:163, receipt.fab:21/:245/:283/:330, generation.fab:717, sampling.fab:281, gguf_manifest.fab:580. Same files already write `-1` directly (tokenizer.fab:379/:925/:1092), so it is residue, not constraint.
 - **If-equality ladders over closed unions instead of switch/case** — tokenizer.fab:468-482, cache.fab:738-742/:800-803/:930-933/:964-967/:998-1001, dense.fab:311-315, generation.fab:240-242, gguf.fab:329-366 (37 arms), gguf_manifest.fab:634-661, dequant.fab:578-601.
 - **`+` concat where `"§"(…)` interpolation slots exist** (WARN018 class) — cache.fab:556-562/:1546-1564/:1725-1748 (eleven repeated appends), dense.fab:140-148, tokenizer.fab:1319-1324, generation.fab:494, receipt.fab:266.
-- **Open `while` counters where `for range 0‥n const i` applies** — loss.fab:287-313, nn.fab:536-567/:596-616, metrics.fab:138-158, math.fab:477-487/:512-523/:548-560, shape.fab:262-273/:295-299, attention.fab:409-414, dense.fab:186-192 + layer loops :399/:519/:611.
+- **Open `while` counters where `for range 0‥n let i` applies** — loss.fab:287-313, nn.fab:536-567/:596-616, metrics.fab:138-158, math.fab:477-487/:512-523/:548-560, shape.fab:262-273/:295-299, attention.fab:409-414, dense.fab:186-192 + layer loops :399/:519/:611.
 - **Positional scalar fan-out (>5 params)** — decode.fab:299 `construct_weights` (18 tensors), train.fab:97 `train_step_bert_linear` (25), transformer.fab:364 `transformer_block` (23), transformer.fab:65 `bert_tiny_block_2x8` (20), receipt.fab:274/:293/:301 (same 12 scalars ×3), calibration.fab:372 `bake` (8, five provenance strings belong in the record built at :377 anyway), gguf.fab:379 `admit` (10).
 - **Type restated both sides of a binding** — `const f32 E ← 2.718… ∷ f32` pattern (loss.fab:187, train.fab:300/:537, nn.fab:278-283); tuple return types restated at construction (train.fab:70/:84/:100/:115); proba pins train.proba:841-842.
 - **Field-by-field rebuilds instead of typed re-bind/copy-with-update** — parameter.fab:389 (`Identity` ×5 fields), optimize.fab:512 (`SgdState`).
