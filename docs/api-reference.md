@@ -555,8 +555,9 @@ Classification accuracy and validated loss/accuracy metric records.
 
 ## gradus:mlp
 
-Two-layer MLP: decoded-carrier `forward_mlp_carrier` over the nn carrier and the
-annotated training-path companion `forward_mlp_loss`.
+Two-layer MLP: typed shared `forward_mlp` plus the runtime-shape decoded-carrier
+inference residual `forward_mlp_carrier` over the nn carrier, and the annotated
+training-path companion `forward_mlp_loss`.
 
 **Source**: `src/mlp.fab`
 
@@ -568,6 +569,11 @@ annotated training-path companion `forward_mlp_loss`.
 
 - `fn message(GradusError e) → string`
 - `fn forward_mlp_carrier(tensor.NumericBlock x, tensor.NumericBlock w1, tensor.NumericBlock b1, tensor.NumericBlock w2, tensor.NumericBlock b2) → tensor.NumericBlock ⇥ GradusError`
+- `fn layer_linear<size M, size K, size N>(tensor<f32, [M, K]> x, tensor<f32, [K, N]> w, tensor<f32, [M, N]> b) → tensor<f32, [M, N]>`
+- `fn layer_linear_channel<size M, size K, size N>(tensor<f32, [M, K]> x, tensor<f32, [K, N]> w, tensor<f32, [N]> b) → tensor<f32, [M, N]>`
+- `fn layer_gelu<size M, size N>(tensor<f32, [M, N]> x) → tensor<f32, [M, N]>`
+- `fn forward_mlp<size M, size K, size H, size N>(tensor<f32, [M, K]> input, tensor<f32, [K, H]> weight1, tensor<f32, [M, H]> bias1, tensor<f32, [H, N]> weight2, tensor<f32, [M, N]> bias2) → tensor<f32, [M, N]>` — same-shape biases
+- `fn forward_linear<size M, size K, size N>(tensor<f32, [M, K]> x, tensor<f32, [K, N]> w, tensor<f32, [N]> b) → tensor<f32, [M, N]>` — per-channel bias
 - `fn nil() → void`
 - `fn forward_mlp_loss(tensor<f32, [4, 4]> input, tensor<f32, [4, 4]> weight1, tensor<f32, [4, 4]> bias1, tensor<f32, [4, 4]> weight2, tensor<f32, [4, 4]> bias2, tensor<f32, [4, 4]> target) → f32`
 
