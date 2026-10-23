@@ -29,6 +29,12 @@ locale = "en"
 import from "gradus:data" data
 import from "norma:fs" fs
 
+import from "gradus:loss" loss
+
+import from "gradus:tensor" tensor
+
+import from "gradus:dtype" dtype
+
 import from "gradus:train" train
 
 # ---- helpers (the metrics.proba pattern)
@@ -257,6 +263,37 @@ fn lm_window_mask_sum(list<int> mask) → int {
     return total
 }
 
+# Adapt a data-window's integer labels or mask to the i32 carrier expected by
+# Gradus' authoritative masked cross-entropy consumer.
+fn lm_loss_block(list<int> values, list<int> shape, bool integer_tag) → tensor.NumericBlock {
+    mut list<f32> payload ← empty
+    for from values let value {
+        payload.append(value ↦ f32)
+    }
+    let tensor.NumericBlock block ← tensor.construct(payload, shape) ⊥ tensor.default()
+    if integer_tag {
+        return tensor.NumericBlock { dtype = dtype.i32(), shape = block.shape, data = block.data, numel = block.numel, strides = block.strides }
+    }
+    return block
+}
+
+fn lm_zero_mask_reports_element_mismatch(tensor.NumericBlock logits, tensor.NumericBlock targets, tensor.NumericBlock mask) → bool {
+    do {
+        loss.cross_entropy_masked(logits, targets, mask)
+        return false
+    }
+    catch err {
+        match err {
+            case loss.LossError.ElementMismatch let message {
+                return true
+            }
+            case _ {
+                return false
+            }
+        }
+    }
+}
+
 test "lm windows shift each target one position past its input" {
     let _ trap_result ← trap {
         let list<data.LmWindow> windows ← data.lm_windows([10, 11, 12, 13, 14, 15, 16], 3, 42)
@@ -288,17 +325,38 @@ test "lm windows right-pad a short final window and zero its mask" {
     assert trap_result is void
 }
 
-test "lm window mask counts equal the number of real adjacent pairs" {
+test "lm window mask counts equal adjacent pairs and masked CE ignores right padding" {
     let _ trap_result ← trap {
-        let list<int> tokens ← [10, 11, 12, 13, 14, 15, 16]
+        let list<int> tokens ← [0, 1, 2, 0, 1]
         let list<data.LmWindow> windows ← data.lm_windows(tokens, 3, 42)
         let data.LmWindow first ← windows.get(0) coalesce data.LmWindow { document = 0, start = 0, inputs = empty, targets = empty, loss_mask = empty }
-        let data.LmWindow second ← windows.get(1) coalesce data.LmWindow { document = 0, start = 0, inputs = empty, targets = empty, loss_mask = empty }
-        let data.LmWindow third ← windows.get(2) coalesce data.LmWindow { document = 0, start = 0, inputs = empty, targets = empty, loss_mask = empty }
-        assert lm_window_mask_sum(first.loss_mask) ≡ 3
-        assert lm_window_mask_sum(second.loss_mask) ≡ 3
-        assert lm_window_mask_sum(third.loss_mask) ≡ 0
-        assert lm_window_mask_sum(first.loss_mask) + lm_window_mask_sum(second.loss_mask) + lm_window_mask_sum(third.loss_mask) ≡ tokens.length() - 1
+        let data.LmWindow padded ← windows.get(1) coalesce data.LmWindow { document = 0, start = 0, inputs = empty, targets = empty, loss_mask = empty }
+        assert padded.targets ≡ ([1, 256, 256] ↦ list<int>)
+        assert padded.loss_mask ≡ ([1, 0, 0] ↦ list<int>)
+        assert lm_window_mask_sum(first.loss_mask) + lm_window_mask_sum(padded.loss_mask) ≡ tokens.length() - 1
+
+        let tensor.NumericBlock padded_logits ← lm_loss_block([0, 1, 2, 1, 2, 3, 2, 1, 0], [3, 3], false)
+        let tensor.NumericBlock padded_targets ← lm_loss_block(padded.targets, [3], true)
+        let tensor.NumericBlock padded_mask ← lm_loss_block(padded.loss_mask, [3], true)
+        let f32 masked_loss ← loss.cross_entropy_masked(padded_logits, padded_targets, padded_mask)
+
+        let tensor.NumericBlock active_logits ← lm_loss_block([0, 1, 2], [1, 3], false)
+        let tensor.NumericBlock active_target ← lm_loss_block([1], [1], true)
+        let f32 active_only_loss ← loss.cross_entropy(active_logits, active_target)
+        assert masked_loss ≡ active_only_loss
+    }
+    assert trap_result is void
+}
+
+test "lm masked cross entropy rejects an all-padding zero-valid-target window" {
+    let _ trap_result ← trap {
+        let list<data.LmWindow> windows ← data.lm_windows([0, 1, 2, 0, 1, 2, 0], 3, 42)
+        let data.LmWindow all_padding ← windows.get(2) coalesce data.LmWindow { document = 0, start = 0, inputs = empty, targets = empty, loss_mask = empty }
+        assert all_padding.loss_mask ≡ ([0, 0, 0] ↦ list<int>)
+        let tensor.NumericBlock logits ← lm_loss_block([0, 0, 0, 0, 0, 0, 0, 0, 0], [3, 3], false)
+        let tensor.NumericBlock targets ← lm_loss_block(all_padding.targets, [3], true)
+        let tensor.NumericBlock mask ← lm_loss_block(all_padding.loss_mask, [3], true)
+        assert lm_zero_mask_reports_element_mismatch(logits, targets, mask)
     }
     assert trap_result is void
 }
