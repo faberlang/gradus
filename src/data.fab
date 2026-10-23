@@ -249,3 +249,148 @@ fn lm_split_documents(list<list<int>> documents, int validation_modulus) → LmS
     }
     return LmSplit { training = training, validation = validation }
 }
+
+# -------------------------------------------------------------------------
+# Restartable LM cursor. The cursor's document is an original-corpus index;
+# its window is the next fixed-width window within that document.
+# -------------------------------------------------------------------------
+
+@ public
+class LmCursor {
+    let string corpus
+    let string split
+    let int document
+    let int window
+}
+
+@ public
+fn lm_cursor_start(string corpus, string split) → LmCursor {
+    return LmCursor { corpus = corpus, split = split, document = -1, window = 0 }
+}
+
+@ public
+fn lm_cursor_wire(LmCursor cursor) → string {
+    return "lm-cursor-v1#§#§#§#§"(cursor.corpus, cursor.split, cursor.document ↦ string, cursor.window ↦ string)
+}
+
+fn lm_cursor_parse_integer(string text) → int ∪ none {
+    if text.length() ≡ 0 then return null
+    mut int start ← 0
+    if text.slice(0, 1) ≡ "-" {
+        start ← 1
+        if start ≡ text.length() then return null
+    }
+    for range start ‥ text.length() let i {
+        let string c ← text.slice(i, i + 1)
+        if c ≢ "0" and c ≢ "1" and c ≢ "2" and c ≢ "3" and c ≢ "4" and c ≢ "5" and c ≢ "6" and c ≢ "7" and c ≢ "8" and c ≢ "9" {
+            return null
+        }
+    }
+    mut int value ← 0
+    do {
+        value ↤ text
+    }
+    catch err {
+        return null
+    }
+    return value
+}
+
+@ public
+fn lm_cursor_parse(string wire) → LmCursor ∪ none {
+    let list<string> parts ← wire.split("#")
+    if parts.length() ≢ 5 then return null
+    if parts.get(0) coalesce "" ≢ "lm-cursor-v1" then return null
+    let string corpus ← parts.get(1) coalesce ""
+    let string split ← parts.get(2) coalesce ""
+    let string document_text ← parts.get(3) coalesce ""
+    let string window_text ← parts.get(4) coalesce ""
+    let _ parsed_document ← lm_cursor_parse_integer(document_text)
+    let _ parsed_window ← lm_cursor_parse_integer(window_text)
+    if parsed_document is none or parsed_window is none then return null
+    let int document ← parsed_document coalesce 0
+    let int window ← parsed_window coalesce 0
+    return LmCursor { corpus = corpus, split = split, document = document, window = window }
+}
+
+fn lm_cursor_contains(list<list<int>> documents, list<int> document) → bool {
+    for range 0 ‥ documents.length() let i {
+        if (documents.get(i) coalesce ([] ∷ list<int>)) ≡ document {
+            return true
+        }
+    }
+    return false
+}
+
+# Resolve a possibly initial or stale cursor to the next selected window's
+# canonical original-document index and within-document window index.
+fn lm_cursor_locate(list<list<int>> documents, LmSplit split, LmCursor cursor, int length) → LmCursor ∪ none {
+    if length ≤ 0 or cursor.document ≺ -1 or cursor.window ≺ 0 then return null
+    mut list<list<int>> selected ← empty
+    if cursor.split ≡ "training" {
+        selected ← split.training
+    }
+    elif cursor.split ≡ "validation" {
+        selected ← split.validation
+    }
+    else {
+        return null
+    }
+    for range 0 ‥ documents.length() let i {
+        if i ≥ cursor.document {
+            let list<int> document ← documents.get(i) coalesce ([] ∷ list<int>)
+            if lm_cursor_contains(selected, document) and document.length() ≻ 0 {
+                mut int window ← 0
+                if i ≡ cursor.document {
+                    window ← cursor.window
+                }
+                let int window_count ← ((document.length() - 1) / length) + 1
+                if window ≺ window_count {
+                    return LmCursor { corpus = cursor.corpus, split = cursor.split, document = i, window = window }
+                }
+            }
+        }
+    }
+    return null
+}
+
+fn lm_cursor_window_at(list<int> tokens, int length, int document, int window) → LmWindow {
+    let int start ← window * length
+    mut list<int> inputs ← empty
+    mut list<int> targets ← empty
+    mut list<int> loss_mask ← empty
+    for range 0 ‥ length let k {
+        let int input_index ← start + k
+        if input_index ≺ tokens.length() {
+            inputs.append(tokens.get(input_index) coalesce LM_PAD_ID)
+        } else {
+            inputs.append(LM_PAD_ID)
+        }
+        let int target_index ← input_index + 1
+        if target_index ≺ tokens.length() {
+            targets.append(tokens.get(target_index) coalesce LM_PAD_ID)
+            loss_mask.append(1)
+        } else {
+            targets.append(LM_PAD_ID)
+            loss_mask.append(0)
+        }
+    }
+    return LmWindow { document = document, start = start, inputs = inputs, targets = targets, loss_mask = loss_mask }
+}
+
+@ public
+fn lm_cursor_next(list<list<int>> documents, LmSplit split, LmCursor cursor, int length) → LmWindow ∪ none {
+    let _ location_value ← lm_cursor_locate(documents, split, cursor, length)
+    if location_value is none then return null
+    let LmCursor location ← location_value coalesce LmCursor { corpus = "", split = "", document = -1, window = 0 }
+    let list<int> document ← documents.get(location.document) coalesce ([] ∷ list<int>)
+    return lm_cursor_window_at(document, length, location.document, location.window)
+}
+
+@ public
+fn lm_cursor_advance(list<list<int>> documents, LmSplit split, LmCursor cursor, int length) → LmCursor ∪ none {
+    let _ location_value ← lm_cursor_locate(documents, split, cursor, length)
+    if location_value is none then return null
+    let LmCursor location ← location_value coalesce LmCursor { corpus = "", split = "", document = -1, window = 0 }
+    return lm_cursor_locate(documents, split, LmCursor { corpus = location.corpus, split = location.split, document = location.document, window = location.window + 1 }, length)
+}
