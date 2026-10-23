@@ -144,16 +144,16 @@ plan facts. RMSNorm receives its epsilon from the caller.
 
 | Entry | Idiom | Declared input shape(s) → output shape |
 | --- | --- | --- |
-| `rmsnorm<T,D>` | `rms_norm(input, epsilon, weight)` | `[T,D]`, `[D]` → `[T,D]` |
+| `rmsnorm<T,D>` | `input.norm_rms(axis 1, epsilon, weight)` | `[T,D]`, `[D]` → `[T,D]` |
 | `gemm_qo<T,D>` | `input · weights` | `[T,D]`, `[D,D]` → `[T,D]` |
 | `gemm_kv<T,D,K>` | `input · weights` | `[T,D]`, `[D,K]` → `[T,K]` |
 | `gemm_gate_up<T,D,F>` | `input · weights` | `[T,D]`, `[D,F]` → `[T,F]` |
 | `gemm_down<T,F,D>` | `input · weights` | `[T,F]`, `[F,D]` → `[T,D]` |
-| `rope_q` | `rope_norm<d>(0, rope_table)` | generic `[T,D]`, table `[T,P,3]` → `[T,D]` |
-| `rope_k` | `rope_norm<d>(0, rope_table)` | generic `[T,K]`, table `[T,P,3]` → `[T,K]` |
+| `rope_q` | `input.norm_rope<d>(0, rope_table)` | generic `[T,D]`, table `[T,P,3]` → `[T,D]` |
+| `rope_k` | `input.norm_rope<d>(0, rope_table)` | generic `[T,K]`, table `[T,P,3]` → `[T,K]` |
 | `transpose<T,d>` | `input.transpose()` | `[T,d]` → `[d,T]` |
 | `score_gemm<T,d>` | `(query · key_transposed) ⊙ attention_scale` | `[T,d]`, `[d,T]`, scale `[T,T]` → `[T,T]` |
-| `causal_softmax<T>` | causal masking then `scores.softmax()` | `[T,T]` → `[T,T]` |
+| `causal_softmax<T>` | causal row softmax, `scores.softmax_causal()` | `[T,T]` → `[T,T]` |
 | `context_gemm<T,d>` | `probabilities · values` | `[T,T]`, `[T,d]` → `[T,d]` |
 | `swiglu<T,F>` | `gate.silu() ⊙ up` | `[T,F]`, `[T,F]` → `[T,F]` |
 | `residual_add<T,D>` | `left + right` | `[T,D]`, `[T,D]` → `[T,D]` |
@@ -170,12 +170,12 @@ length is part of a kernel identity.
 
 | Entry | Idiom | Declared input shape(s) → output shape |
 | --- | --- | --- |
-| `decode_rmsnorm<D>` | `rms_norm(input, epsilon, weight)` | `[1,D]`, `[D]` → `[1,D]` |
+| `decode_rmsnorm<D>` | `input.norm_rms(axis 1, epsilon, weight)` | `[1,D]`, `[D]` → `[1,D]` |
 | `decode_gemv_qo<D>` | `input · weights` | `[1,D]`, `[D,D]` → `[1,D]` |
 | `decode_gemv_kv<D,K>` | `input · weights` | `[1,D]`, `[D,K]` → `[1,K]` |
 | `decode_mlp<D,F>` | inline gate/up projections, SiLU gate, and down projection | `[1,D]`, `[D,F]`, `[D,F]`, `[F,D]` → `[1,D]` |
-| `decode_rope_q` | `rope_norm<d>(0, rope_table)` | generic `[1,D]`, table `[1,P,3]` → `[1,D]` |
-| `decode_rope_k` | `rope_norm<d>(0, rope_table)` | generic `[1,K]`, table `[1,P,3]` → `[1,K]` |
+| `decode_rope_q` | `input.norm_rope<d>(0, rope_table)` | generic `[1,D]`, table `[1,P,3]` → `[1,D]` |
+| `decode_rope_k` | `input.norm_rope<d>(0, rope_table)` | generic `[1,K]`, table `[1,P,3]` → `[1,K]` |
 | `kv_append_k<K>` | `history + row` | `[K]`, `[K]` → `[K]` |
 | `kv_append_v<K>` | `history + row` | `[K]`, `[K]` → `[K]` |
 | `decode_key_transpose<H,C,d>` | `input.transpose()` | `[H,C,d]` → `[H,d,C]` |
@@ -195,12 +195,12 @@ than frozen entry identities.
 
 | Entry | Idiom | Declared input shape(s) → output shape |
 | --- | --- | --- |
-| `prefill_rmsnorm<T,D>` | `rms_norm(input, epsilon, weight)` | `[T,D]`, `[D]` → `[T,D]` |
+| `prefill_rmsnorm<T,D>` | `input.norm_rms(axis 1, epsilon, weight)` | `[T,D]`, `[D]` → `[T,D]` |
 | `prefill_gemm_qo<T,D>` | `input · weights` | `[T,D]`, `[D,D]` → `[T,D]` |
 | `prefill_gemm_kv<T,D,K>` | `input · weights` | `[T,D]`, `[D,K]` → `[T,K]` |
 | `prefill_mlp<T,D,F>` | inline gate/up projections, SiLU gate, and down projection | `[T,D]`, `[D,F]`, `[D,F]`, `[F,D]` → `[T,D]` |
-| `prefill_rope_q` | `rope_norm<d>(0, rope_table)` | generic `[T,D]`, table `[T,P,3]` → `[T,D]` |
-| `prefill_rope_k` | `rope_norm<d>(0, rope_table)` | generic `[T,K]`, table `[T,P,3]` → `[T,K]` |
+| `prefill_rope_q` | `input.norm_rope<d>(0, rope_table)` | generic `[T,D]`, table `[T,P,3]` → `[T,D]` |
+| `prefill_rope_k` | `input.norm_rope<d>(0, rope_table)` | generic `[T,K]`, table `[T,P,3]` → `[T,K]` |
 | `prefill_key_transpose<T,d>` | `input.transpose()` | `[T,d]` → `[d,T]` |
 | `prefill_score_gemm<T,d>` | `(query · key_transposed) ⊙ attention_scale` | `[T,d]`, `[d,T]`, scale `[T,T]` → `[T,T]` |
 | `prefill_causal_softmax<T>` | `scores + causal_mask`, then softmax | `[T,T]`, mask `[T,T]` → `[T,T]` |
@@ -217,7 +217,7 @@ kernel identity.
 
 | Entry | Idiom | Declared input shape(s) → output shape |
 | --- | --- | --- |
-| `head_rmsnorm<D>` | `rms_norm(input, epsilon, weight)` | `[1,D]`, `[D]` → `[1,D]` |
+| `head_rmsnorm<D>` | `input.norm_rms(axis 1, epsilon, weight)` | `[1,D]`, `[D]` → `[1,D]` |
 | `lm_head_gemv<V,D>` | `input · embeddings.transpose()` | `[1,D]`, `[V,D]` → `[1,V]` |
 | `embedding_gather<V,D>` | gather rows from embeddings | `[V,D]`, `tensor<u32,[1]>` ids → `[1,D]` |
 
