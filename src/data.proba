@@ -27,6 +27,13 @@ locale = "en"
 # compile-level proof; no runtime value identity is claimed here.
 
 import from "gradus:data" data
+import from "norma:fs" fs
+
+import from "gradus:loss" loss
+
+import from "gradus:tensor" tensor
+
+import from "gradus:dtype" dtype
 
 import from "gradus:train" train
 
@@ -180,4 +187,412 @@ test "batch rejects a negative batch size" {
 
 test "batch rejects a batch size above the corpus length" {
     assert batch_detail(corpus(), 9) ≡ "batch size exceeds corpus length"
+}
+
+# ---- LM byte vocabulary and corpus identity
+
+fn lm_byte_id_rejected(int id) → bool {
+    let _ id_outcome ← trap {
+        data.lm_vocabulary_id(id)
+    }
+    if id_outcome is int {
+        return false
+    }
+    let _ byte_outcome ← trap {
+        data.lm_vocabulary_byte(id)
+    }
+    if byte_outcome is int {
+        return false
+    }
+    return true
+}
+
+test "lm byte ids round-trip through the byte vocabulary" {
+    let _ trap_result ← trap {
+        assert data.lm_vocabulary_id(0) ≡ 0
+        assert data.lm_vocabulary_id(65) ≡ 65
+        assert data.lm_vocabulary_id(255) ≡ 255
+        assert data.lm_vocabulary_byte(0) ≡ 0
+        assert data.lm_vocabulary_byte(65) ≡ 65
+        assert data.lm_vocabulary_byte(255) ≡ 255
+        assert lm_byte_id_rejected(256)
+        assert lm_byte_id_rejected(257)
+    }
+    assert trap_result is void
+}
+
+test "lm vocabulary reserves the pad id outside the byte range" {
+    assert data.LM_PAD_ID ≡ 256
+    assert data.LM_VOCAB_SIZE ≡ 257
+    assert data.lm_is_vocabulary_id(256)
+    assert not data.lm_is_vocabulary_id(257)
+    assert lm_byte_id_rejected(256)
+}
+
+test "lm corpus identity is stable and separates document boundaries" {
+    let list<list<int>> documents ← [[1, 2], [3]]
+    let string identity ← data.lm_corpus_identity(documents)
+    assert identity ≡ "d2:1,2;d1:3;"
+
+    mut list<int> first ← empty
+    first.append(1)
+    first.append(2)
+    mut list<int> second ← empty
+    second.append(3)
+    mut list<list<int>> rebuilt ← empty
+    rebuilt.append(first)
+    rebuilt.append(second)
+    assert data.lm_corpus_identity(rebuilt) ≡ identity
+    assert data.lm_corpus_identity([[1], [2, 3]]) ≢ identity
+}
+
+test "lm document score follows its formula" {
+    assert data.lm_document_score([1, 2]) ≡ 5
+    assert data.lm_document_score([1, 2, 0]) ≡ 6
+}
+
+# -------------------------------------------------------------------------
+# LM fixed-width next-token windows
+# -------------------------------------------------------------------------
+
+fn lm_window_mask_sum(list<int> mask) → int {
+    mut int total ← 0
+    for range 0 ‥ mask.length() let i {
+        total ← total + (mask.get(i) coalesce 0)
+    }
+    return total
+}
+
+# Adapt a data-window's integer labels or mask to the i32 carrier expected by
+# Gradus' authoritative masked cross-entropy consumer.
+fn lm_loss_block(list<int> values, list<int> shape, bool integer_tag) → tensor.NumericBlock {
+    mut list<f32> payload ← empty
+    for from values let value {
+        payload.append(value ↦ f32)
+    }
+    let tensor.NumericBlock block ← tensor.construct(payload, shape) ⊥ tensor.default()
+    if integer_tag {
+        return tensor.NumericBlock { dtype = dtype.i32(), shape = block.shape, data = block.data, numel = block.numel, strides = block.strides }
+    }
+    return block
+}
+
+fn lm_zero_mask_reports_element_mismatch(tensor.NumericBlock logits, tensor.NumericBlock targets, tensor.NumericBlock mask) → bool {
+    do {
+        loss.cross_entropy_masked(logits, targets, mask)
+        return false
+    }
+    catch err {
+        match err {
+            case loss.LossError.ElementMismatch let message {
+                return true
+            }
+            case _ {
+                return false
+            }
+        }
+    }
+}
+
+test "lm windows shift each target one position past its input" {
+    let _ trap_result ← trap {
+        let list<data.LmWindow> windows ← data.lm_windows([10, 11, 12, 13, 14, 15, 16], 3, 42)
+        assert windows.length() ≡ 3
+        let data.LmWindow first ← windows.get(0) coalesce data.LmWindow { document = 0, start = 0, inputs = empty, targets = empty, loss_mask = empty }
+        let data.LmWindow second ← windows.get(1) coalesce data.LmWindow { document = 0, start = 0, inputs = empty, targets = empty, loss_mask = empty }
+        let data.LmWindow third ← windows.get(2) coalesce data.LmWindow { document = 0, start = 0, inputs = empty, targets = empty, loss_mask = empty }
+        assert first.inputs ≡ ([10, 11, 12] ↦ list<int>)
+        assert first.targets ≡ ([11, 12, 13] ↦ list<int>)
+        assert second.inputs ≡ ([13, 14, 15] ↦ list<int>)
+        assert second.targets ≡ ([14, 15, 16] ↦ list<int>)
+        assert third.inputs ≡ ([16, 256, 256] ↦ list<int>)
+        assert third.targets ≡ ([256, 256, 256] ↦ list<int>)
+        assert first.document ≡ 42
+        assert first.start ≡ 0
+        assert second.start ≡ 3
+        assert third.start ≡ 6
+    }
+    assert trap_result is void
+}
+
+test "lm windows right-pad a short final window and zero its mask" {
+    let _ trap_result ← trap {
+        let list<data.LmWindow> windows ← data.lm_windows([10, 11, 12, 13, 14, 15, 16], 3, 42)
+        let data.LmWindow third ← windows.get(2) coalesce data.LmWindow { document = 0, start = 0, inputs = empty, targets = empty, loss_mask = empty }
+        assert third.inputs ≡ ([16, 256, 256] ↦ list<int>)
+        assert third.loss_mask ≡ ([0, 0, 0] ↦ list<int>)
+    }
+    assert trap_result is void
+}
+
+test "lm window mask counts equal adjacent pairs and masked CE ignores right padding" {
+    let _ trap_result ← trap {
+        let list<int> tokens ← [0, 1, 2, 0, 1]
+        let list<data.LmWindow> windows ← data.lm_windows(tokens, 3, 42)
+        let data.LmWindow first ← windows.get(0) coalesce data.LmWindow { document = 0, start = 0, inputs = empty, targets = empty, loss_mask = empty }
+        let data.LmWindow padded ← windows.get(1) coalesce data.LmWindow { document = 0, start = 0, inputs = empty, targets = empty, loss_mask = empty }
+        assert padded.targets ≡ ([1, 256, 256] ↦ list<int>)
+        assert padded.loss_mask ≡ ([1, 0, 0] ↦ list<int>)
+        assert lm_window_mask_sum(first.loss_mask) + lm_window_mask_sum(padded.loss_mask) ≡ tokens.length() - 1
+
+        let tensor.NumericBlock padded_logits ← lm_loss_block([0, 1, 2, 1, 2, 3, 2, 1, 0], [3, 3], false)
+        let tensor.NumericBlock padded_targets ← lm_loss_block(padded.targets, [3], true)
+        let tensor.NumericBlock padded_mask ← lm_loss_block(padded.loss_mask, [3], true)
+        let f32 masked_loss ← loss.cross_entropy_masked(padded_logits, padded_targets, padded_mask)
+
+        let tensor.NumericBlock active_logits ← lm_loss_block([0, 1, 2], [1, 3], false)
+        let tensor.NumericBlock active_target ← lm_loss_block([1], [1], true)
+        let f32 active_only_loss ← loss.cross_entropy(active_logits, active_target)
+        assert masked_loss ≡ active_only_loss
+    }
+    assert trap_result is void
+}
+
+test "lm masked cross entropy rejects an all-padding zero-valid-target window" {
+    let _ trap_result ← trap {
+        let list<data.LmWindow> windows ← data.lm_windows([0, 1, 2, 0, 1, 2, 0], 3, 42)
+        let data.LmWindow all_padding ← windows.get(2) coalesce data.LmWindow { document = 0, start = 0, inputs = empty, targets = empty, loss_mask = empty }
+        assert all_padding.loss_mask ≡ ([0, 0, 0] ↦ list<int>)
+        let tensor.NumericBlock logits ← lm_loss_block([0, 0, 0, 0, 0, 0, 0, 0, 0], [3, 3], false)
+        let tensor.NumericBlock targets ← lm_loss_block(all_padding.targets, [3], true)
+        let tensor.NumericBlock mask ← lm_loss_block(all_padding.loss_mask, [3], true)
+        assert lm_zero_mask_reports_element_mismatch(logits, targets, mask)
+    }
+    assert trap_result is void
+}
+
+
+# ---- LM document-level training/validation split
+
+fn lm_split_is_partition(list<list<int>> documents, data.LmSplit split) → bool {
+    if split.training.length() + split.validation.length() ≢ documents.length() {
+        return false
+    }
+    for range 0 ‥ documents.length() let i {
+        let list<int> document ← documents.get(i) coalesce ([] ∷ list<int>)
+        mut int occurrences ← 0
+        for range 0 ‥ split.training.length() let j {
+            if (split.training.get(j) coalesce ([] ∷ list<int>)) ≡ document {
+                occurrences ← occurrences + 1
+            }
+        }
+        for range 0 ‥ split.validation.length() let j {
+            if (split.validation.get(j) coalesce ([] ∷ list<int>)) ≡ document {
+                occurrences ← occurrences + 1
+            }
+        }
+        if occurrences ≢ 1 {
+            return false
+        }
+    }
+    return true
+}
+
+fn lm_id_belongs_to_range(int id, int base) → bool {
+    return id ≡ data.LM_PAD_ID or (id ≥ base and id ≺ base + 100)
+}
+
+fn lm_split_windows_stay_local(list<list<int>> documents) → bool ⇥ data.DataError {
+    for range 0 ‥ documents.length() let i {
+        let list<int> document ← documents.get(i) coalesce ([] ∷ list<int>)
+        let int first ← document.get(0) coalesce 0
+        let int base ← (first / 100) * 100
+        let list<data.LmWindow> windows ← data.lm_windows(document, 3, i)
+        for range 0 ‥ windows.length() let j {
+            let data.LmWindow window ← windows.get(j) coalesce data.LmWindow { document = 0, start = 0, inputs = empty, targets = empty, loss_mask = empty }
+            for range 0 ‥ window.inputs.length() let k {
+                let int input_id ← window.inputs.get(k) coalesce data.LM_PAD_ID
+                let int target_id ← window.targets.get(k) coalesce data.LM_PAD_ID
+                if not lm_id_belongs_to_range(input_id, base) {
+                    return false
+                }
+                if not lm_id_belongs_to_range(target_id, base) {
+                    return false
+                }
+            }
+        }
+    }
+    return true
+}
+
+test "lm split assigns whole documents and never shares one" {
+    let _ trap_result ← trap {
+        let list<list<int>> documents ← [[1, 2], [3, 4], [5, 6]]
+        let data.LmSplit split ← data.lm_split_documents(documents, 3)
+        assert split.validation ≡ ([[3, 4]] ↦ list<list<int>>)
+        assert split.training ≡ ([[1, 2], [5, 6]] ↦ list<list<int>>)
+        assert lm_split_is_partition(documents, split)
+    }
+    assert trap_result is void
+}
+
+test "lm split is independent of document order" {
+    let _ trap_result ← trap {
+        let list<list<int>> reversed ← [[5, 6], [3, 4], [1, 2]]
+        let data.LmSplit split ← data.lm_split_documents(reversed, 3)
+        assert split.validation ≡ ([[3, 4]] ↦ list<list<int>>)
+        assert split.training ≡ ([[5, 6], [1, 2]] ↦ list<list<int>>)
+        assert lm_split_is_partition(reversed, split)
+    }
+    assert trap_result is void
+}
+
+test "lm split keeps every window inside one document" {
+    let _ trap_result ← trap {
+        # Each document occupies its own 100-id range. The score modulus puts
+        # the first document in validation and the other two in training.
+        let list<list<int>> documents ← [[1, 2], [103, 104], [205, 206]]
+        let data.LmSplit split ← data.lm_split_documents(documents, 5)
+        assert lm_split_windows_stay_local(split.training)
+        assert lm_split_windows_stay_local(split.validation)
+    }
+    assert trap_result is void
+}
+
+# ---- restartable LM cursor wire and window iteration
+
+test "lm cursor wire round-trips all fields" {
+    let data.LmCursor cursor ← data.LmCursor { corpus = "12,34:56;", split = "validation", document = 17, window = 23 }
+    let string wire ← data.lm_cursor_wire(cursor)
+    assert wire ≡ "lm-cursor-v1#12,34:56;#validation#17#23"
+    let _ parsed_value ← data.lm_cursor_parse(wire)
+    assert parsed_value not is none
+    let data.LmCursor parsed ← parsed_value coalesce data.LmCursor { corpus = "", split = "", document = -1, window = 0 }
+    assert parsed.corpus ≡ cursor.corpus
+    assert parsed.split ≡ cursor.split
+    assert parsed.document ≡ cursor.document
+    assert parsed.window ≡ cursor.window
+}
+
+test "a cursor restored from its wire yields the same next window" {
+    let list<list<int>> documents ← [[10, 11, 12, 13, 14], [20, 21], [30, 31, 32, 33]]
+    let string identity ← data.lm_corpus_identity(documents)
+    let data.LmSplit split ← data.LmSplit { training = [[10, 11, 12, 13, 14], [30, 31, 32, 33]], validation = [[20, 21]] }
+    let data.LmCursor cursor ← data.LmCursor { corpus = identity, split = "training", document = 0, window = 1 }
+    let _ live_value ← data.lm_cursor_next(documents, split, cursor, 2)
+    assert live_value not is none
+    let data.LmWindow live ← live_value coalesce data.LmWindow { document = -1, start = -1, inputs = empty, targets = empty, loss_mask = empty }
+    let _ parsed_value ← data.lm_cursor_parse(data.lm_cursor_wire(cursor))
+    assert parsed_value not is none
+    let data.LmCursor restored ← parsed_value coalesce data.LmCursor { corpus = "", split = "", document = -1, window = 0 }
+    let _ resumed_value ← data.lm_cursor_next(documents, split, restored, 2)
+    assert resumed_value not is none
+    let data.LmWindow resumed ← resumed_value coalesce data.LmWindow { document = -1, start = -1, inputs = empty, targets = empty, loss_mask = empty }
+    assert live.document ≡ resumed.document
+    assert live.start ≡ resumed.start
+    assert live.inputs ≡ resumed.inputs
+    assert live.targets ≡ resumed.targets
+    assert live.loss_mask ≡ resumed.loss_mask
+}
+
+test "lm cursor rejects changed or reordered corpora before returning a window" {
+    let list<list<int>> documents ← [[10, 11, 12], [20, 21], [30, 31]]
+    let string identity ← data.lm_corpus_identity(documents)
+    let data.LmCursor cursor ← data.LmCursor { corpus = identity, split = "training", document = 1, window = 0 }
+
+    let list<list<int>> changed ← [[10, 11, 12], [90, 91], [30, 31]]
+    let data.LmSplit changed_split ← data.LmSplit { training = changed, validation = empty }
+    assert data.lm_cursor_next(changed, changed_split, cursor, 2) is none
+
+    let list<list<int>> reordered ← [[30, 31], [20, 21], [10, 11, 12]]
+    let data.LmSplit reordered_split ← data.LmSplit { training = reordered, validation = empty }
+    assert data.lm_cursor_next(reordered, reordered_split, cursor, 2) is none
+}
+
+test "advancing a cursor lands on the window that next returns" {
+    let list<list<int>> documents ← [[10, 11, 12, 13, 14], [20, 21], [], [30, 31, 32, 33]]
+    let string identity ← data.lm_corpus_identity(documents)
+    let data.LmSplit split ← data.LmSplit { training = [[10, 11, 12, 13, 14], [], [30, 31, 32, 33]], validation = [[20, 21]] }
+    let data.LmCursor start ← data.lm_cursor_start(identity, "training")
+    assert start.document ≡ -1
+    assert start.window ≡ 0
+    let _ advanced_value ← data.lm_cursor_advance(documents, split, start, 2)
+    assert advanced_value not is none
+    let data.LmCursor advanced ← advanced_value coalesce data.LmCursor { corpus = "", split = "", document = -1, window = 0 }
+    let data.LmWindow following ← data.lm_cursor_next(documents, split, advanced, 2) coalesce data.LmWindow { document = -1, start = -1, inputs = empty, targets = empty, loss_mask = empty }
+    assert following.document ≡ advanced.document
+    assert following.start ≡ advanced.window * 2
+    assert following.document ≡ 0
+    assert following.start ≡ 2
+    let _ to_last_value ← data.lm_cursor_advance(documents, split, advanced, 2)
+    assert to_last_value not is none
+    let data.LmCursor to_last ← to_last_value coalesce data.LmCursor { corpus = "", split = "", document = -1, window = 0 }
+    assert to_last.document ≡ 0
+    assert to_last.window ≡ 2
+    let _ crossed_value ← data.lm_cursor_advance(documents, split, to_last, 2)
+    assert crossed_value not is none
+    let data.LmCursor crossed ← crossed_value coalesce data.LmCursor { corpus = "", split = "", document = -1, window = 0 }
+    let _ crossed_window_value ← data.lm_cursor_next(documents, split, crossed, 2)
+    assert crossed_window_value not is none
+    let data.LmWindow crossed_window ← crossed_window_value coalesce data.LmWindow { document = -1, start = -1, inputs = empty, targets = empty, loss_mask = empty }
+    assert crossed_window.document ≡ crossed.document
+    assert crossed_window.start ≡ crossed.window * 2
+    assert crossed.document ≡ 3
+    assert crossed.window ≡ 0
+}
+
+test "lm cursor reports exhaustion at the end of its split" {
+    let list<list<int>> documents ← [[1, 2], [3, 4], []]
+    let string identity ← data.lm_corpus_identity(documents)
+    let data.LmSplit split ← data.LmSplit { training = [[1, 2]], validation = [[3, 4], []] }
+    let data.LmCursor validation_start ← data.lm_cursor_start(identity, "validation")
+    let data.LmWindow validation_window ← data.lm_cursor_next(documents, split, validation_start, 2) coalesce data.LmWindow { document = -1, start = -1, inputs = empty, targets = empty, loss_mask = empty }
+    assert validation_window.document ≡ 1
+    let data.LmCursor last ← data.LmCursor { corpus = identity, split = "training", document = 0, window = 0 }
+    let data.LmWindow window ← data.lm_cursor_next(documents, split, last, 2) coalesce data.LmWindow { document = -1, start = -1, inputs = empty, targets = empty, loss_mask = empty }
+    assert window.document ≡ 0
+    let _ after_last ← data.lm_cursor_advance(documents, split, last, 2)
+    assert after_last is none
+    let _ exhausted ← data.lm_cursor_next(documents, split, data.LmCursor { corpus = identity, split = "training", document = 0, window = 1 }, 2)
+    assert exhausted is none
+}
+
+test "lm cursor parse rejects a malformed wire with none" {
+    assert data.lm_cursor_parse("lm-cursor-v2#12;#training#0#0") is none
+    assert data.lm_cursor_parse("lm-cursor-v1#12;#training#0") is none
+    assert data.lm_cursor_parse("lm-cursor-v1#12;#training#x#0") is none
+    assert data.lm_cursor_parse("lm-cursor-v1#12;#training#0#2x") is none
+}
+
+# ---- cursor persistence: the file on disk is the only state a fresh process
+# needs. The save writes exactly the cursor wire, the load parses it back, and
+# a missing file loads as none rather than a guessed cursor.
+
+# Remove a scratch cursor file; an absent file is already the wanted state.
+fn lm_cursor_discard(string path) → none {
+    do {
+        fs.delete(path)
+    }
+    catch err {
+    }
+}
+
+test "a cursor saved to disk resumes at the same next window" {
+    let string path ← fs.join([fs.temp_dir(), "lm_cursor_resume.tmp"])
+    # Original-corpus documents: index 0 and 1 are training, index 2 is
+    # validation. The cursor sits at a non-zero document and a non-zero window.
+    let list<list<int>> documents ← [[10, 11, 12, 13, 14], [30, 31, 32, 33, 34, 35], [20, 21]]
+    let string identity ← data.lm_corpus_identity(documents)
+    let data.LmSplit split ← data.LmSplit { training = [[10, 11, 12, 13, 14], [30, 31, 32, 33, 34, 35]], validation = [[20, 21]] }
+    let data.LmCursor cursor ← data.LmCursor { corpus = identity, split = "training", document = 1, window = 1 }
+    data.lm_cursor_save(path, cursor)
+    let _ loaded_value ← data.lm_cursor_load(path)
+    assert loaded_value not is none
+    let data.LmCursor loaded ← loaded_value coalesce data.LmCursor { corpus = "", split = "", document = -1, window = 0 }
+    assert loaded.document ≢ -1
+    assert loaded.window ≢ 0
+    let data.LmWindow original ← data.lm_cursor_next(documents, split, cursor, 2) coalesce data.LmWindow { document = -1, start = -1, inputs = empty, targets = empty, loss_mask = empty }
+    let data.LmWindow resumed ← data.lm_cursor_next(documents, split, loaded, 2) coalesce data.LmWindow { document = -1, start = -1, inputs = empty, targets = empty, loss_mask = empty }
+    assert resumed.document ≡ original.document
+    assert resumed.start ≡ original.start
+    assert resumed.inputs ≡ original.inputs
+    assert resumed.targets ≡ original.targets
+    assert resumed.loss_mask ≡ original.loss_mask
+    lm_cursor_discard(path)
+}
+
+test "lm cursor load returns none for a missing file" {
+    let string path ← fs.join([fs.temp_dir(), "lm_cursor_absent.tmp"])
+    lm_cursor_discard(path)
+    assert data.lm_cursor_load(path) is none
 }

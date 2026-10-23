@@ -25,6 +25,8 @@ locale = "en"
 # the same batch interface.
 
 import from "gradus:train" train
+import from "norma:fs" fs
+import from "norma:fault" fault
 
 # -------------------------------------------------------------------------
 # DataError — typed error vocabulary of the data surface. Every variant
@@ -38,7 +40,10 @@ union DataError {
     string message
 
     EmptyCorpus,
-    InvalidBatchSize
+    InvalidBatchSize,
+    InvalidVocabularyId,
+    InvalidWindowLength,
+    InvalidValidationModulus
 }
 
 # Shared corpus gate: non-empty. Message identity is the proba pin surface.
@@ -118,4 +123,341 @@ fn batch(list<int> ids, int batch_size) → list<list<int>> ⇥ DataError {
         start ← stop
     }
     return out
+}
+
+# -------------------------------------------------------------------------
+# Language-model byte vocabulary and stable corpus identity.
+# -------------------------------------------------------------------------
+
+@ public
+const int LM_PAD_ID = 256
+@ public
+const int LM_VOCAB_SIZE = 257
+
+@ public
+fn lm_is_vocabulary_id(int id) → bool {
+    return id ≥ 0 and id ≺ LM_VOCAB_SIZE
+}
+
+@ public
+fn lm_vocabulary_id(int byte) → int ⇥ DataError {
+    require byte ≥ 0 and byte ≤ 255 throw variant InvalidVocabularyId { message = "byte is outside the byte vocabulary" }
+    return byte
+}
+
+@ public
+fn lm_vocabulary_byte(int id) → int ⇥ DataError {
+    require id ≥ 0 and id ≤ 255 throw variant InvalidVocabularyId { message = "id is outside the byte vocabulary" }
+    return id
+}
+
+@ public
+fn lm_document_score(list<int> document) → int {
+    mut int score ← document.length()
+    for range 0 ‥ document.length() let i {
+        score ← score + (document.get(i) coalesce 0)
+    }
+    return score
+}
+
+@ public
+fn lm_corpus_identity(list<list<int>> documents) → string {
+    mut string identity ← ""
+    for range 0 ‥ documents.length() let i {
+        let list<int> document ← documents.get(i) coalesce ([] ∷ list<int>)
+        identity ← identity + "d§:"(document.length() ↦ string)
+        for range 0 ‥ document.length() let j {
+            if j ≢ 0 {
+                identity ← identity + ","
+            }
+            identity ← identity + (document.get(j) coalesce 0 ↦ string)
+        }
+        identity ← identity + ";"
+    }
+    return identity
+}
+
+# -------------------------------------------------------------------------
+# LM windows — fixed-width, non-overlapping next-token examples. Each
+# document is divided into windows with stride equal to length; values beyond
+# the document are right-padded and contribute no loss. A non-positive window
+# length is a typed DataError rejection.
+# -------------------------------------------------------------------------
+
+@ public
+class LmWindow {
+    let int document
+    let int start
+    let list<int> inputs
+    let list<int> targets
+    let list<int> loss_mask
+}
+
+@ public
+fn lm_windows(list<int> tokens, int length, int document) → list<LmWindow> ⇥ DataError {
+    require length ≻ 0 throw variant InvalidWindowLength { message = "window length must be positive" }
+    let int n ← tokens.length()
+    mut list<LmWindow> windows ← empty
+    mut int start ← 0
+    while start ≺ n {
+        mut list<int> inputs ← empty
+        mut list<int> targets ← empty
+        mut list<int> loss_mask ← empty
+        for range 0 ‥ length let k {
+            let int input_index ← start + k
+            if input_index ≺ n {
+                inputs.append(tokens.get(input_index) coalesce LM_PAD_ID)
+            } else {
+                inputs.append(LM_PAD_ID)
+            }
+            let int target_index ← input_index + 1
+            if target_index ≺ n {
+                targets.append(tokens.get(target_index) coalesce LM_PAD_ID)
+                loss_mask.append(1)
+            } else {
+                targets.append(LM_PAD_ID)
+                loss_mask.append(0)
+            }
+        }
+        windows.append(LmWindow { document = document, start = start, inputs = inputs, targets = targets, loss_mask = loss_mask })
+        start ← start + length
+    }
+    return windows
+}
+
+# -------------------------------------------------------------------------
+# Document-level deterministic training/validation split. Documents remain
+# intact, and each output preserves the input order within its split.
+# -------------------------------------------------------------------------
+
+@ public
+class LmSplit {
+    let list<list<int>> training
+    let list<list<int>> validation
+}
+
+@ public
+fn lm_split_documents(list<list<int>> documents, int validation_modulus) → LmSplit ⇥ DataError {
+    require validation_modulus ≥ 2 throw variant InvalidValidationModulus { message = "validation modulus must be at least 2" }
+    mut list<list<int>> training ← empty
+    mut list<list<int>> validation ← empty
+    for range 0 ‥ documents.length() let i {
+        let list<int> document ← documents.get(i) coalesce ([] ∷ list<int>)
+        if lm_document_score(document) % validation_modulus ≡ 0 {
+            validation.append(document)
+        } else {
+            training.append(document)
+        }
+    }
+    return LmSplit { training = training, validation = validation }
+}
+
+# -------------------------------------------------------------------------
+# Restartable LM cursor. The cursor's document is an original-corpus index;
+# its window is the next fixed-width window within that document. The corpus
+# field is the exact lm_corpus_identity of the ordered documents used to
+# create the cursor; next/advance reject a cursor if it differs from the
+# supplied documents (including content or order changes). A consumed
+# traversal ends at the exhausted position, which resumes nowhere.
+# -------------------------------------------------------------------------
+
+@ public
+class LmCursor {
+    let string corpus
+    let string split
+    let int document
+    let int window
+}
+
+@ public
+fn lm_cursor_start(string corpus, string split) → LmCursor {
+    return LmCursor { corpus = corpus, split = split, document = -1, window = 0 }
+}
+
+@ public
+fn lm_cursor_wire(LmCursor cursor) → string {
+    return "lm-cursor-v1#§#§#§#§"(cursor.corpus, cursor.split, cursor.document ↦ string, cursor.window ↦ string)
+}
+
+fn lm_cursor_parse_integer(string text) → int ∪ none {
+    if text.length() ≡ 0 then return null
+    mut int start ← 0
+    if text.slice(0, 1) ≡ "-" {
+        start ← 1
+        if start ≡ text.length() then return null
+    }
+    for range start ‥ text.length() let i {
+        let string c ← text.slice(i, i + 1)
+        if c ≢ "0" and c ≢ "1" and c ≢ "2" and c ≢ "3" and c ≢ "4" and c ≢ "5" and c ≢ "6" and c ≢ "7" and c ≢ "8" and c ≢ "9" {
+            return null
+        }
+    }
+    mut int value ← 0
+    do {
+        value ↤ text
+    }
+    catch err {
+        return null
+    }
+    return value
+}
+
+@ public
+fn lm_cursor_parse(string wire) → LmCursor ∪ none {
+    let list<string> parts ← wire.split("#")
+    if parts.length() ≢ 5 then return null
+    if parts.get(0) coalesce "" ≢ "lm-cursor-v1" then return null
+    let string corpus ← parts.get(1) coalesce ""
+    let string split ← parts.get(2) coalesce ""
+    let string document_text ← parts.get(3) coalesce ""
+    let string window_text ← parts.get(4) coalesce ""
+    let _ parsed_document ← lm_cursor_parse_integer(document_text)
+    let _ parsed_window ← lm_cursor_parse_integer(window_text)
+    if parsed_document is none or parsed_window is none then return null
+    let int document ← parsed_document coalesce 0
+    let int window ← parsed_window coalesce 0
+    return LmCursor { corpus = corpus, split = split, document = document, window = window }
+}
+
+fn lm_cursor_contains(list<list<int>> documents, list<int> document) → bool {
+    for range 0 ‥ documents.length() let i {
+        if (documents.get(i) coalesce ([] ∷ list<int>)) ≡ document {
+            return true
+        }
+    }
+    return false
+}
+
+# Resolve a possibly initial or stale cursor to the next selected window's
+# canonical original-document index and within-document window index. An
+# exhausted cursor (a document below the initial -1) resolves to none, which
+# is how a traversal reports the end of its split.
+fn lm_cursor_locate(list<list<int>> documents, LmSplit split, LmCursor cursor, int length) → LmCursor ∪ none {
+    if cursor.corpus ≢ lm_corpus_identity(documents) then return null
+    if length ≤ 0 or cursor.document ≺ -1 or cursor.window ≺ 0 then return null
+    mut list<list<int>> selected ← empty
+    if cursor.split ≡ "training" {
+        selected ← split.training
+    }
+    elif cursor.split ≡ "validation" {
+        selected ← split.validation
+    }
+    else {
+        return null
+    }
+    for range 0 ‥ documents.length() let i {
+        if i ≥ cursor.document {
+            let list<int> document ← documents.get(i) coalesce ([] ∷ list<int>)
+            if lm_cursor_contains(selected, document) and document.length() ≻ 0 {
+                mut int window ← 0
+                if i ≡ cursor.document {
+                    window ← cursor.window
+                }
+                let int window_count ← ((document.length() - 1) / length) + 1
+                if window ≺ window_count {
+                    return LmCursor { corpus = cursor.corpus, split = cursor.split, document = i, window = window }
+                }
+            }
+        }
+    }
+    return null
+}
+
+fn lm_cursor_window_at(list<int> tokens, int length, int document, int window) → LmWindow {
+    let int start ← window * length
+    mut list<int> inputs ← empty
+    mut list<int> targets ← empty
+    mut list<int> loss_mask ← empty
+    for range 0 ‥ length let k {
+        let int input_index ← start + k
+        if input_index ≺ tokens.length() {
+            inputs.append(tokens.get(input_index) coalesce LM_PAD_ID)
+        } else {
+            inputs.append(LM_PAD_ID)
+        }
+        let int target_index ← input_index + 1
+        if target_index ≺ tokens.length() {
+            targets.append(tokens.get(target_index) coalesce LM_PAD_ID)
+            loss_mask.append(1)
+        } else {
+            targets.append(LM_PAD_ID)
+            loss_mask.append(0)
+        }
+    }
+    return LmWindow { document = document, start = start, inputs = inputs, targets = targets, loss_mask = loss_mask }
+}
+
+@ public
+fn lm_cursor_next(list<list<int>> documents, LmSplit split, LmCursor cursor, int length) → LmWindow ∪ none {
+    let _ location_value ← lm_cursor_locate(documents, split, cursor, length)
+    if location_value is none then return null
+    let LmCursor location ← location_value coalesce LmCursor { corpus = "", split = "", document = -1, window = 0 }
+    let list<int> document ← documents.get(location.document) coalesce ([] ∷ list<int>)
+    return lm_cursor_window_at(document, length, location.document, location.window)
+}
+
+@ public
+fn lm_cursor_advance(list<list<int>> documents, LmSplit split, LmCursor cursor, int length) → LmCursor ∪ none {
+    let _ location_value ← lm_cursor_locate(documents, split, cursor, length)
+    if location_value is none then return null
+    let LmCursor location ← location_value coalesce LmCursor { corpus = "", split = "", document = -1, window = 0 }
+    return lm_cursor_locate(documents, split, LmCursor { corpus = location.corpus, split = location.split, document = location.document, window = location.window + 1 }, length)
+}
+
+# The wire's exhausted position: a document index below the initial -1, so a
+# finished cursor is never mistaken for a start cursor and never resumes a
+# document.
+@ public
+const int LM_CURSOR_EXHAUSTED = -2
+
+# The terminal cursor for a traversal: keep the corpus and the split, and mark
+# the position exhausted. A run that consumes a split's final window persists
+# this cursor, so a fresh process loads it, finds no next window, and reports
+# exhaustion instead of replaying the window it already consumed.
+@ public
+fn lm_cursor_finish(LmCursor cursor) → LmCursor {
+    return LmCursor { corpus = cursor.corpus, split = cursor.split, document = LM_CURSOR_EXHAUSTED, window = 0 }
+}
+
+# -------------------------------------------------------------------------
+# Cursor persistence. A fresh process resumes from the file alone: the bytes
+# on disk are exactly the cursor wire, and the loaded cursor is the parse of
+# those bytes. A missing or unreadable file loads as none — never a guessed
+# cursor. A save reports whether the wire reached the disk: it is true only
+# when the write completed, and false when the write failed, in which case
+# the previous file (or no file) is left in place. A false save is NOT a
+# checkpoint — the persisted state is stale or absent, so a caller that keeps
+# training past it would replay windows after a restart. Check the result at
+# the acceptance boundary; a retry is the caller's decision.
+# -------------------------------------------------------------------------
+
+fn lm_cursor_read_text(string path) → string ⇥ fault.IoFault {
+    return fs.read_file<string>(path)
+}
+
+fn lm_cursor_write_text(string path, string wire) → none ⇥ fault.IoFault {
+    fs.write_file(path, wire)
+}
+
+@ public
+fn lm_cursor_save(string path, LmCursor cursor) → bool {
+    do {
+        lm_cursor_write_text(path, lm_cursor_wire(cursor))
+    }
+    catch err {
+        return false
+    }
+    return true
+}
+
+@ public
+fn lm_cursor_load(string path) → LmCursor ∪ none {
+    mut string wire ← ""
+    do {
+        wire ← lm_cursor_read_text(path)
+    }
+    catch err {
+        return null
+    }
+    return lm_cursor_parse(wire)
 }

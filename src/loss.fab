@@ -237,8 +237,12 @@ fn mse_carrier(tensor.NumericBlock prediction, tensor.NumericBlock target) → f
 # Deterministic: fixed row-major iteration, no RNG.
 # -------------------------------------------------------------------------
 
-@ public
-fn cross_entropy(tensor.NumericBlock logits, tensor.NumericBlock target) → f32 ⇥ LossError {
+# Shared classification / next-token loss implementation. A supplied i32
+# mask is row-aligned with targets: 1 includes a target and 0 excludes it.
+# The mean denominator is the count of included targets, not the padded row
+# count. An all-zero mask fails closed rather than producing NaN or a bogus
+# zero loss.
+fn _cross_entropy_impl(tensor.NumericBlock logits, tensor.NumericBlock target, tensor.NumericBlock mask, bool use_mask) → f32 ⇥ LossError {
     let list<int> fl ← logits.shape
     require fl.length() ≡ 2 throw variant GradusMismatch { message = "cross_entropy requires rank-2 logits" }
     dtype_f32(logits)
@@ -250,33 +254,68 @@ fn cross_entropy(tensor.NumericBlock logits, tensor.NumericBlock target) → f32
     let list<int> ft ← target.shape
     require ft.length() ≡ 1 throw variant GradusMismatch { message = "cross_entropy target must be rank-1" }
     require ft.get(0) coalesce 1 ≡ n throw variant ShapeMismatch { message = "target length does not match logits rows" }
+    if use_mask {
+        require dtype.name(mask.dtype) ≡ "i32" throw variant DtypeMismatch { message = "cross_entropy mask must be i32" }
+        require mask.shape.length() ≡ 1 throw variant GradusMismatch { message = "cross_entropy mask must be rank-1" }
+        require mask.shape.get(0) coalesce 1 ≡ n throw variant ShapeMismatch { message = "mask length does not match logits rows" }
+        require mask.data.length() ≡ n throw variant ShapeMismatch { message = "mask storage does not match logits rows" }
+    }
     let int total ← numel_valid(fl)
     let int rows ← total / c
     for from logits.data let v {
         require dtype.finite(v) throw variant NonFinite { message = "non-finite logits" }
     }
     mut f32 acc ← 0.0 ∷ f32
+    mut int valid_rows ← 0
     for range 0 ‥ rows let row {
-        let f32 lbl ← target.data.get(row) coalesce 0.0 ∷ f32
-        require dtype.finite(lbl) throw variant NonFinite { message = "non-finite target" }
-        let int k ← lbl.truncate()
-        require (k ↦ f32) ≡ lbl throw variant Incompatible { message = "target must be integer class indices" }
-        reject k ≺ 0 or k ≥ c throw variant Incompatible { message = "target class out of range" }
-        mut f32 max ← logits.data.get(row * c) coalesce 0.0 ∷ f32
-        for range 1 ‥ c let j {
-            let f32 z ← logits.data.get(row * c + j) coalesce 0.0 ∷ f32
-            if z ≻ max {
-                max ← z
+        mut bool include_row ← true
+        if use_mask {
+            let f32 mask_value ← mask.data.get(row) coalesce 0.0 ∷ f32
+            require dtype.finite(mask_value) throw variant NonFinite { message = "non-finite loss mask" }
+            require mask_value ≡ 0.0 ∷ f32 or mask_value ≡ 1.0 ∷ f32 throw variant Incompatible { message = "loss mask values must be zero or one" }
+            if mask_value ≡ 0.0 ∷ f32 {
+                include_row ← false
             }
         }
-        mut f32 s ← 0.0 ∷ f32
-        for range 0 ‥ c let jj {
-            let f32 z ← logits.data.get(row * c + jj) coalesce 0.0 ∷ f32
-            s ← s + exp(z - max)
+        if include_row {
+            let f32 lbl ← target.data.get(row) coalesce 0.0 ∷ f32
+            require dtype.finite(lbl) throw variant NonFinite { message = "non-finite target" }
+            let int k ← lbl.truncate()
+            require (k ↦ f32) ≡ lbl throw variant Incompatible { message = "target must be integer class indices" }
+            reject k ≺ 0 or k ≥ c throw variant Incompatible { message = "target class out of range" }
+            mut f32 max ← logits.data.get(row * c) coalesce 0.0 ∷ f32
+            for range 1 ‥ c let j {
+                let f32 z ← logits.data.get(row * c + j) coalesce 0.0 ∷ f32
+                if z ≻ max {
+                    max ← z
+                }
+            }
+            mut f32 s ← 0.0 ∷ f32
+            for range 0 ‥ c let j {
+                let f32 z ← logits.data.get(row * c + j) coalesce 0.0 ∷ f32
+                s ← s + exp(z - max)
+            }
+            let f32 lse ← max + log(s)
+            let f32 zk ← logits.data.get(row * c + k) coalesce 0.0 ∷ f32
+            acc ← acc + (lse - zk)
+            valid_rows ← valid_rows + 1
         }
-        let f32 lse ← max + log(s)
-        let f32 zk ← logits.data.get(row * c + k) coalesce 0.0 ∷ f32
-        acc ← acc + (lse - zk)
     }
-    return acc / (rows ↦ f32)
+    require valid_rows ≢ 0 throw variant ElementMismatch { message = "no valid targets" }
+    return acc / (valid_rows ↦ f32)
+}
+
+# Unmasked classification / next-token cross entropy: every target row is
+# included in the mean.
+@ public
+fn cross_entropy(tensor.NumericBlock logits, tensor.NumericBlock target) → f32 ⇥ LossError {
+    return _cross_entropy_impl(logits, target, tensor.default(), false)
+}
+
+# Mask-aware next-token cross entropy. `loss_mask` must be an i32 vector
+# containing only 0/1 values; padded targets at masked-out rows are ignored.
+# Fails with LossError.ElementMismatch when no targets are valid.
+@ public
+fn cross_entropy_masked(tensor.NumericBlock logits, tensor.NumericBlock target, tensor.NumericBlock loss_mask) → f32 ⇥ LossError {
+    return _cross_entropy_impl(logits, target, loss_mask, true)
 }

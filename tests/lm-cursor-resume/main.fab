@@ -1,0 +1,148 @@
++++
+locale = "en"
++++
+
+# Fresh-process cursor resume fixture.
+#
+# The fixture owns one fixed three-document byte corpus and one cursor file
+# path. Two modes drive it, each in its own process:
+#
+#   <path> start   write the training split's initial cursor to <path>,
+#                  then print that cursor's wire
+#   <path> step    load the cursor from <path>, print the next window as
+#                  `document|start|inputs|targets|loss_mask` (ids comma
+#                  separated), then write the advanced cursor back; a load
+#                  whose cursor is already terminal prints `exhausted` and
+#                  leaves the file untouched
+#
+# Nothing about the cursor survives inside a process: the file on disk is the
+# whole state, so a second `step` process must continue where the first one
+# stopped, and the process that consumes the final window must leave the
+# terminal cursor on disk so the next one reports exhaustion instead of
+# replaying that window. See run.sh for the multi-process proof. A save that
+# cannot write is a hard failure in both modes: a silently dropped write
+# would leave the next process replaying a window the run already consumed.
+#
+# Public import: import from "gradus:data" data
+
+import from "gradus:data" data
+import from "norma:process" process
+
+# Fixed-width window and the split modulus that keeps all three documents in
+# the training split (document scores are 201, 139 and 290; none divides by 7).
+const int WINDOW_LENGTH = 2
+const int VALIDATION_MODULUS = 7
+
+# The fixture corpus: three documents of raw byte ids.
+fn corpus_documents() → list<list<int>> {
+    return [[65, 66, 67], [68, 69], [70, 71, 72, 73]]
+}
+
+fn empty_split() → data.LmSplit {
+    return data.LmSplit { training = empty, validation = empty }
+}
+
+fn empty_cursor() → data.LmCursor {
+    return data.LmCursor { corpus = "", split = "", document = -1, window = 0 }
+}
+
+fn empty_window() → data.LmWindow {
+    return data.LmWindow { document = -1, start = -1, inputs = empty, targets = empty, loss_mask = empty }
+}
+
+# The fixture's fixed corpus splits once, at the modulus declared above.
+fn corpus_split() → data.LmSplit {
+    mut data.LmSplit split ← empty_split()
+    do {
+        split ← data.lm_split_documents(corpus_documents(), VALIDATION_MODULUS)
+    }
+    catch err {
+        return empty_split()
+    }
+    return split
+}
+
+fn render_ids(list<int> ids) → string {
+    mut string text ← ""
+    for range 0 ‥ ids.length() let i {
+        if i ≻ 0 {
+            text ← text + ","
+        }
+        text ← text + ((ids.get(i) coalesce 0) ↦ string)
+    }
+    return text
+}
+
+fn render_window(data.LmWindow window) → string {
+    return "§|§|§|§|§"(window.document ↦ string,
+                             window.start ↦ string,
+                             render_ids(window.inputs),
+                             render_ids(window.targets),
+                             render_ids(window.loss_mask))
+}
+
+main {
+    let list<string> args ← process.argv() ↦ list<string>
+    if args.length() ≢ 2 {
+        panic "usage: main.fab <cursor-path> <start|step>"
+    }
+    let string path ← args.get(0) coalesce ""
+    let string mode ← args.get(1) coalesce ""
+    let list<list<int>> documents ← corpus_documents()
+    let data.LmSplit split ← corpus_split()
+
+    if mode ≡ "start" {
+        let data.LmCursor cursor ← data.lm_cursor_start(data.lm_corpus_identity(documents), "training")
+        # Negative path: a save whose parent directory does not exist must
+        # report failure and persist nothing, so no caller can mistake a
+        # dropped write for a successful checkpoint. <path> does not exist
+        # yet here, so <path>/absent-... has a missing parent by construction.
+        let string blocked ← path + "/absent-dir/child.wire"
+        if data.lm_cursor_save(blocked, cursor) {
+            panic "a cursor save that cannot write reported success"
+        }
+        let _ blocked_state ← data.lm_cursor_load(blocked)
+        if blocked_state not is none {
+            panic "a failed cursor save left persisted state behind"
+        }
+        if not data.lm_cursor_save(path, cursor) {
+            panic "cursor was not persisted to the given path"
+        }
+        print data.lm_cursor_wire(cursor)
+    }
+    elif mode ≡ "step" {
+        let _ loaded_value ← data.lm_cursor_load(path)
+        if loaded_value is none {
+            panic "cursor file is absent or unreadable"
+        }
+        let data.LmCursor cursor ← loaded_value coalesce empty_cursor()
+        let _ next_value ← data.lm_cursor_next(documents, split, cursor, WINDOW_LENGTH)
+        if next_value is none {
+            # The cursor is terminal: a consumed traversal reports exhaustion
+            # and never replays a window.
+            print "exhausted"
+        }
+        else {
+            let data.LmWindow window ← next_value coalesce empty_window()
+            print render_window(window)
+            let _ advanced_value ← data.lm_cursor_advance(documents, split, cursor, WINDOW_LENGTH)
+            if advanced_value is none {
+                # This was the split's final window: persist the terminal
+                # cursor so a later process reports exhaustion instead of
+                # replaying it.
+                if not data.lm_cursor_save(path, data.lm_cursor_finish(cursor)) {
+                    panic "terminal cursor was not persisted; the next step would replay this window"
+                }
+            }
+            else {
+                let data.LmCursor advanced ← advanced_value coalesce empty_cursor()
+                if not data.lm_cursor_save(path, advanced) {
+                    panic "advanced cursor was not persisted; the next step would replay this window"
+                }
+            }
+        }
+    }
+    else {
+        panic "unknown mode: expected start or step"
+    }
+}
