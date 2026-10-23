@@ -35,8 +35,12 @@ locale = "en"
 #     own coordinate (softmax_stats).
 #   - The `o ⇇ w · x` recipe needs literal dimensions, so a generic GEMV is a
 #     lane per output row with a serial dot (gemv_lane): any `size` extent.
-#   - Scalar parameters are `i32`/`f32`; an `int` scalar is not admitted on the
-#     device. `pos ↦ int` inside the body; no `int ↦ i32` outside main.
+#   - Scalar parameters are `i32`/`f32`; an `int` scalar or local is not admitted
+#     on the device (it is a 64-bit carrier, refused as nucleum_wide_integer).
+#     Every lane local is `i32`, and each lane body is wrapped in scalar guards
+#     that establish the portable integer envelope the `/`, `%` and `2 * hf`
+#     extents need (the a1-rowops idiom); no `↦ int` conversion appears inside a
+#     kernel, and comparisons are made directly against the i32 parameters.
 #   - Parameter names are unique per kernel (a shared prefix per kernel).
 #   - A generic kernel instantiated at two different static shapes in one
 #     package duplicates the Metal entry name: one process runs one shape.
@@ -50,7 +54,7 @@ locale = "en"
 @ public
 fn gather_row<size V, size D>(tensor<f32, [D]> gdom, tensor<f32, [V, D]> gtable, tensor<i32, [1]> gids, mut tensor<f32, [D]> gout) → void {
     for from gdom at [j] thread lane let e {
-        gout[[j]] ← gtable[[gids[0] ↦ int, j]]
+        gout[[j]] ← gtable[[gids[0], j]]
     }
 }
 
@@ -60,8 +64,8 @@ fn gather_row<size V, size D>(tensor<f32, [D]> gdom, tensor<f32, [V, D]> gtable,
 fn rms_stats<size D>(tensor<f32, [1]> rsdom, tensor<f32, [D]> rsx, mut tensor<f32, [1]> rsstats, i32 rsd, f32 rseps) → void {
     for from rsdom at [i] thread lane let e {
         mut f32 acc ← 0.0
-        let int n ← rsd ↦ int
-        mut int k ← 0
+        let i32 n ← rsd
+        mut i32 k ← 0
         while k ≺ n {
             acc ← acc + rsx[[k]] * rsx[[k]]
             k ← k + 1
@@ -85,9 +89,9 @@ fn rms_apply<size D>(tensor<f32, [D]> rax, tensor<f32, [1]> rast, tensor<f32, [D
 @ public
 fn gemv_lane<size N, size K>(tensor<f32, [N]> gvdom, tensor<f32, [N, K]> gvw, tensor<f32, [K]> gvx, mut tensor<f32, [N]> gvo, i32 gvk) → void {
     for from gvdom at [i] thread lane let e {
-        let int n ← gvk ↦ int
+        let i32 n ← gvk
         mut f32 acc ← 0.0
-        mut int k ← 0
+        mut i32 k ← 0
         while k ≺ n {
             acc ← acc + gvw[[i, k]] * gvx[[k]]
             k ← k + 1
@@ -103,19 +107,21 @@ fn gemv_lane<size N, size K>(tensor<f32, [N]> gvdom, tensor<f32, [N, K]> gvw, te
 @ public
 fn rope_half<size N>(tensor<f32, [N]> rhx, mut tensor<f32, [N]> rho, i32 rhpos, i32 rhspan, f32 rhlntheta) → void {
     for from rhx at [j] thread lane let v {
-        let int hf ← rhspan ↦ int
-        let int jj ← j % (2 * hf)
-        let int base ← j - jj
-        let int p ← jj % hf
-        let f32 freq ← (0.0 - (p ↦ f32) / (hf ↦ f32) * rhlntheta).exp()
-        let f32 ang ← (rhpos ↦ f32) * freq
-        let f32 c ← ang.cos()
-        let f32 s ← ang.sin()
-        if jj ≺ hf {
-            rho[[j]] ← v * c - rhx[[base + jj + hf]] * s
-        }
-        else {
-            rho[[j]] ← rhx[[base + jj - hf]] * s + v * c
+        if rhspan ≻ 0 and rhspan ≤ 960 {
+            let i32 hf ← rhspan
+            let i32 jj ← j % (2 * hf)
+            let i32 base ← j - jj
+            let i32 p ← jj % hf
+            let f32 freq ← (0.0 - (p ↦ f32) / (hf ↦ f32) * rhlntheta).exp()
+            let f32 ang ← (rhpos ↦ f32) * freq
+            let f32 c ← ang.cos()
+            let f32 s ← ang.sin()
+            if jj ≺ hf {
+                rho[[j]] ← v * c - rhx[[base + jj + hf]] * s
+            }
+            else {
+                rho[[j]] ← rhx[[base + jj - hf]] * s + v * c
+            }
         }
     }
 }
@@ -129,18 +135,20 @@ fn rope_half<size N>(tensor<f32, [N]> rhx, mut tensor<f32, [N]> rho, i32 rhpos, 
 @ public
 fn rope_pairs<size N>(tensor<f32, [N]> rpx, mut tensor<f32, [N]> rpo, i32 rppos, i32 rpspan, f32 rplntheta) → void {
     for from rpx at [j] thread lane let v {
-        let int hf ← rpspan ↦ int
-        let int jj ← j % (2 * hf)
-        let int p ← jj / 2
-        let f32 freq ← (0.0 - (p ↦ f32) / (hf ↦ f32) * rplntheta).exp()
-        let f32 ang ← (rppos ↦ f32) * freq
-        let f32 c ← ang.cos()
-        let f32 s ← ang.sin()
-        if jj % 2 ≡ 0 {
-            rpo[[j]] ← v * c - rpx[[j + 1]] * s
-        }
-        else {
-            rpo[[j]] ← rpx[[j - 1]] * s + v * c
+        if rpspan ≻ 0 and rpspan ≤ 960 {
+            let i32 hf ← rpspan
+            let i32 jj ← j % (2 * hf)
+            let i32 p ← jj / 2
+            let f32 freq ← (0.0 - (p ↦ f32) / (hf ↦ f32) * rplntheta).exp()
+            let f32 ang ← (rppos ↦ f32) * freq
+            let f32 c ← ang.cos()
+            let f32 s ← ang.sin()
+            if jj % 2 ≡ 0 {
+                rpo[[j]] ← v * c - rpx[[j + 1]] * s
+            }
+            else {
+                rpo[[j]] ← rpx[[j - 1]] * s + v * c
+            }
         }
     }
 }
@@ -151,7 +159,7 @@ fn rope_pairs<size N>(tensor<f32, [N]> rpx, mut tensor<f32, [N]> rpo, i32 rppos,
 @ public
 fn kv_write<size C, size K>(tensor<f32, [C, K]> kwcache, tensor<f32, [K]> kwrow, mut tensor<f32, [C, K]> kwout, i32 kwpos) → void {
     for from kwcache at [c, j] thread lane let v {
-        if c ≡ (kwpos ↦ int) {
+        if c ≡ kwpos {
             kwout[[c, j]] ← kwrow[[j]]
         }
         else {
@@ -167,19 +175,21 @@ fn kv_write<size C, size K>(tensor<f32, [C, K]> kwcache, tensor<f32, [K]> kwrow,
 @ public
 fn attn_scores<size H, size C, size QD, size KVD>(tensor<f32, [H, C]> asdom, tensor<f32, [QD]> asq, tensor<f32, [C, KVD]> askc, mut tensor<f32, [H, C]> assc, i32 aspos, i32 asgroup, i32 asdh, f32 asscale) → void {
     for from asdom at [h, c] thread lane let e {
-        let int n ← asdh ↦ int
-        let int base ← (h / (asgroup ↦ int)) * n
-        mut f32 acc ← 0.0
-        mut int k ← 0
-        while k ≺ n {
-            acc ← acc + asq[[h * n + k]] * askc[[c, base + k]]
-            k ← k + 1
-        }
-        if c ≻ (aspos ↦ int) {
-            assc[[h, c]] ← -1.0e30
-        }
-        else {
-            assc[[h, c]] ← acc * asscale
+        if asgroup ≻ 0 and asdh ≥ 1 and asdh ≤ 960 {
+            let i32 n ← asdh
+            let i32 base ← (h / asgroup) * n
+            mut f32 acc ← 0.0
+            mut i32 k ← 0
+            while k ≺ n {
+                acc ← acc + asq[[h * n + k]] * askc[[c, base + k]]
+                k ← k + 1
+            }
+            if c ≻ aspos {
+                assc[[h, c]] ← -1.0e30
+            }
+            else {
+                assc[[h, c]] ← acc * asscale
+            }
         }
     }
 }
@@ -191,9 +201,9 @@ fn attn_scores<size H, size C, size QD, size KVD>(tensor<f32, [H, C]> asdom, ten
 @ public
 fn softmax_stats<size R, size C>(tensor<f32, [R]> ssdom, tensor<f32, [R, C]> sss, mut tensor<f32, [R]> ssmx, mut tensor<f32, [R]> sssm, i32 ssc) → void {
     for from ssdom at [i] thread lane let e {
-        let int n ← ssc ↦ int
+        let i32 n ← ssc
         mut f32 m ← sss[[i, 0]]
-        mut int k ← 1
+        mut i32 k ← 1
         while k ≺ n {
             if sss[[i, k]] ≻ m {
                 m ← sss[[i, k]]
@@ -202,7 +212,7 @@ fn softmax_stats<size R, size C>(tensor<f32, [R]> ssdom, tensor<f32, [R, C]> sss
         }
         ssmx[[i]] ← m
         mut f32 acc ← 0.0
-        mut int q ← 0
+        mut i32 q ← 0
         while q ≺ n {
             acc ← acc + (sss[[i, q]] - m).exp()
             q ← q + 1
@@ -226,18 +236,20 @@ fn softmax_apply<size R, size C>(tensor<f32, [R, C]> sas, tensor<f32, [R]> samx,
 @ public
 fn attn_context<size QD, size H, size C, size KVD>(tensor<f32, [QD]> acdom, tensor<f32, [H, C]> acp, tensor<f32, [C, KVD]> acvc, mut tensor<f32, [QD]> acctx, i32 acpos, i32 acgroup, i32 acdh) → void {
     for from acdom at [j] thread lane let e {
-        let int dh ← acdh ↦ int
-        let int h ← j / dh
-        let int d ← j % dh
-        let int n ← (acpos ↦ int) + 1
-        let int base ← (h / (acgroup ↦ int)) * dh
-        mut f32 acc ← 0.0
-        mut int c ← 0
-        while c ≺ n {
-            acc ← acc + acp[[h, c]] * acvc[[c, base + d]]
-            c ← c + 1
+        if acgroup ≻ 0 and acdh ≥ 1 and acdh ≤ 960 and acpos ≥ 0 and acpos ≤ 2147483646 {
+            let i32 dh ← acdh
+            let i32 h ← j / dh
+            let i32 d ← j % dh
+            let i32 n ← acpos + 1
+            let i32 base ← (h / acgroup) * dh
+            mut f32 acc ← 0.0
+            mut i32 c ← 0
+            while c ≺ n {
+                acc ← acc + acp[[h, c]] * acvc[[c, base + d]]
+                c ← c + 1
+            }
+            acctx[[j]] ← acc
         }
-        acctx[[j]] ← acc
     }
 }
 
@@ -277,21 +289,23 @@ fn swiglu<size F>(tensor<f32, [F]> swg, tensor<f32, [F]> swu, mut tensor<f32, [F
 @ public
 fn argmax_chunks<size P, size V>(tensor<f32, [P]> macdom, tensor<f32, [V]> macx, mut tensor<f32, [P]> macval, mut tensor<f32, [P]> macidx, i32 macchunk) → void {
     for from macdom at [p] thread lane let e {
-        let int n ← macchunk ↦ int
-        let int start ← p * n
-        let int stop ← start + n
-        mut f32 best ← macx[[start]]
-        mut int bi ← start
-        mut int k ← start + 1
-        while k ≺ stop {
-            if macx[[k]] ≻ best {
-                best ← macx[[k]]
-                bi ← k
+        if macchunk ≥ 1 {
+            let i32 n ← macchunk
+            let i32 start ← p * n
+            let i32 stop ← start + n
+            mut f32 best ← macx[[start]]
+            mut i32 bi ← start
+            mut i32 k ← start + 1
+            while k ≺ stop {
+                if macx[[k]] ≻ best {
+                    best ← macx[[k]]
+                    bi ← k
+                }
+                k ← k + 1
             }
-            k ← k + 1
+            macval[[p]] ← best
+            macidx[[p]] ← bi ↦ f32
         }
-        macval[[p]] ← best
-        macidx[[p]] ← bi ↦ f32
     }
 }
 
@@ -306,7 +320,9 @@ fn argmax_chunks<size P, size V>(tensor<f32, [P]> macdom, tensor<f32, [V]> macx,
 # best element that sorts strictly AFTER the previous pick (smaller value, or an
 # equal value at a larger index) with a strict `>`, so the first index wins ties
 # and equal values are returned once per index. Start state: value 3.4028235e38,
-# index -1 admits every finite element. A chunk with fewer than M elements has
+# index -1.0 admits every finite element, and the previous pick's index is
+# carried as f32 like the outputs (exact below 2^24), so no lane stores a wide
+# integer. A chunk with fewer than M elements has
 # no qualifier for the trailing ranks: those slots hold the sentinel value
 # -3.4028235e38 and index -1.0 (the host drops index < 0). With a chunk of at
 # least M elements every slot is real (equal values fill slots, they are not
@@ -316,44 +332,46 @@ fn argmax_chunks<size P, size V>(tensor<f32, [P]> macdom, tensor<f32, [V]> macx,
 @ public
 fn topm_chunks<size P, size V, size M>(tensor<f32, [P, M]> tmdom, tensor<f32, [V]> tmx, mut tensor<f32, [P, M]> tmval, mut tensor<f32, [P, M]> tmidx, i32 tmchunk) → void {
     for from tmdom at [p, m] thread lane let e {
-        let int n ← tmchunk ↦ int
-        let int start ← p * n
-        let int stop ← start + n
-        mut f32 pv ← 3.4028235e38
-        mut int pi ← -1
-        mut int j ← 0
-        while j ≤ m {
-            mut f32 best ← -3.4028235e38
-            mut int bi ← -1
-            mut int k ← start
-            while k ≺ stop {
-                let f32 v ← tmx[[k]]
-                mut bool ok ← false
-                if v ≺ pv {
-                    ok ← true
-                }
-                if v ≡ pv {
-                    if k ≻ pi {
+        if tmchunk ≥ 1 {
+            let i32 n ← tmchunk
+            let i32 start ← p * n
+            let i32 stop ← start + n
+            mut f32 pv ← 3.4028235e38
+            mut f32 pf ← -1.0
+            mut i32 j ← 0
+            while j ≤ m {
+                mut f32 best ← -3.4028235e38
+                mut i32 bi ← -1
+                mut i32 k ← start
+                while k ≺ stop {
+                    let f32 v ← tmx[[k]]
+                    mut bool ok ← false
+                    if v ≺ pv {
                         ok ← true
                     }
-                }
-                if ok {
-                    if bi ≺ 0 {
-                        best ← v
-                        bi ← k
+                    if v ≡ pv {
+                        if (k ↦ f32) ≻ pf {
+                            ok ← true
+                        }
                     }
-                    if v ≻ best {
-                        best ← v
-                        bi ← k
+                    if ok {
+                        if bi ≺ 0 {
+                            best ← v
+                            bi ← k
+                        }
+                        if v ≻ best {
+                            best ← v
+                            bi ← k
+                        }
                     }
+                    k ← k + 1
                 }
-                k ← k + 1
+                pv ← best
+                pf ← bi ↦ f32
+                j ← j + 1
             }
-            pv ← best
-            pi ← bi
-            j ← j + 1
+            tmval[[p, m]] ← pv
+            tmidx[[p, m]] ← pf
         }
-        tmval[[p, m]] ← pv
-        tmidx[[p, m]] ← pi ↦ f32
     }
 }
