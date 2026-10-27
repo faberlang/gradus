@@ -741,8 +741,8 @@ remains open; this module only decodes representations it understands.
 - `fn representation_for(int raw) → storage.Representation`
 - `fn block_elements(storage.Representation representation) → int ⇥ DequantError`
 - `fn block_bytes(storage.Representation representation) → int ⇥ DequantError`
-- `fn decode_block_f32(storage.Representation representation, bytes block) → list<f32> ⇥ DequantError`
-- `fn decode_order_f32(storage.Representation representation, bytes payload) → list<f32> ⇥ DequantError`
+- `fn decode_block_f32(storage.Representation representation, list<b8> block) → list<f32> ⇥ DequantError`
+- `fn decode_order_f32(storage.Representation representation, list<b8> payload) → list<f32> ⇥ DequantError`
 
 ## gradus:model/gguf
 
@@ -770,9 +770,9 @@ Bounded GGUF v3 parsing, range inspection, typed metadata, and tensor descriptor
 - `union GgufManifestError` — BadFormat, UnknownVersion, Truncated, BadWire, BadBounds, Surplus, DuplicateKey, DuplicateTensor, BadOffset, UnknownLayout, BadIdentity, BadSource, NotFound
 - `union GgmlLayout` — Known, Unknown
 - `class GgufCorpus`
-  - fields: bytes table, int artifact_length, artifact.ContentIdentity identity
+  - fields: list<b8> table, int artifact_length, artifact.ContentIdentity identity
 - `class GgufMetadata`
-  - fields: string key, int dtype, bytes payload_wire
+  - fields: string key, int dtype, list<b8> payload_wire
 - `class GgufTensorDescriptor`
   - fields: string name, list<int> shape, int dtype_ggml, int relative_offset, int elements, GgmlLayout layout, storage.Representation representation, storage.BlockMetadata block
 - `class GgufManifest`
@@ -793,8 +793,8 @@ Bounded GGUF v3 parsing, range inspection, typed metadata, and tensor descriptor
 - `fn find_tensor(GgufManifest m, string name) → GgufTensorDescriptor ⇥ GgufManifestError`
 - `fn payload_limit(GgufManifest m, string name) → tuple<int, int> ⇥ GgufManifestError`
 - `fn parse(GgufCorpus corpus) → GgufManifest ⇥ GgufManifestError`
-- `fn inspect((int, int) → bytes ⇥ GgufManifestError source, int artifact_length, artifact.ContentIdentity identity) → GgufManifest ⇥ GgufManifestError`
-- `fn read_fragment(GgufManifest m, string name, int start, int length, (int, int) → bytes ⇥ GgufManifestError source) → bytes ⇥ GgufManifestError`
+- `fn inspect((int, int) → list<b8> ⇥ GgufManifestError source, int artifact_length, artifact.ContentIdentity identity) → GgufManifest ⇥ GgufManifestError`
+- `fn read_fragment(GgufManifest m, string name, int start, int length, (int, int) → list<b8> ⇥ GgufManifestError source) → list<b8> ⇥ GgufManifestError`
 
 ## gradus:model/qwen35moe
 
@@ -962,7 +962,7 @@ Pathless tensor payload carrier with bounded byte ranges.
 
 - `union PayloadError` — UnknownName, BadRange, BadLength
 - `class TensorPayload`
-  - fields: string name, int absolute_start, int length, bytes bytes
+  - fields: string name, int absolute_start, int length, list<b8> bytes
 
 ### Public functions
 
@@ -986,8 +986,8 @@ decoded F32 values are produced only by materialization.
 
 - `fn message(ViewError e) → string`
 - `fn links(gguf_manifest.GgufManifest m, tensor_payload.TensorPayload p) → TensorView ⇥ ViewError`
-- `fn materialize_slice(TensorView v, int element_start, int element_length, (int, int) → bytes ⇥ gguf_manifest.GgufManifestError source) → list<f32> ⇥ ViewError`
-- `fn materialize_block(TensorView v, int block_index, (int, int) → bytes ⇥ gguf_manifest.GgufManifestError source) → list<f32> ⇥ ViewError`
+- `fn materialize_slice(TensorView v, int element_start, int element_length, (int, int) → list<b8> ⇥ gguf_manifest.GgufManifestError source) → list<f32> ⇥ ViewError`
+- `fn materialize_block(TensorView v, int block_index, (int, int) → list<b8> ⇥ gguf_manifest.GgufManifestError source) → list<f32> ⇥ ViewError`
 
 ## gradus:nn
 
@@ -1185,14 +1185,14 @@ Versioned byte serialization for dtype, shape, tensor, and parameter values.
 ### Public functions
 
 - `fn message(SerializeError e) → string`
-- `fn serialize_dtype(string dtype_name) → bytes ⇥ SerializeError`
-- `fn serialize_shape(list<int> shape) → bytes ⇥ SerializeError`
-- `fn serialize_tensor(list<f32> data, list<int> shape, string dtype_name) → bytes ⇥ SerializeError`
-- `fn serialize_parameter(string name, string owner, string dtype_name, list<int> shape, int version, string status_name, list<f32> data) → bytes ⇥ SerializeError`
-- `fn deserialize_dtype(bytes wire) → string ⇥ SerializeError`
-- `fn deserialize_shape(bytes wire) → list<int> ⇥ SerializeError`
-- `fn deserialize_tensor(bytes wire) → SerializedTensor ⇥ SerializeError`
-- `fn deserialize_parameter(bytes wire) → ParameterWire ⇥ SerializeError`
+- `fn serialize_dtype(string dtype_name) → list<b8> ⇥ SerializeError`
+- `fn serialize_shape(list<int> shape) → list<b8> ⇥ SerializeError`
+- `fn serialize_tensor(list<f32> data, list<int> shape, string dtype_name) → list<b8> ⇥ SerializeError`
+- `fn serialize_parameter(string name, string owner, string dtype_name, list<int> shape, int version, string status_name, list<f32> data) → list<b8> ⇥ SerializeError`
+- `fn deserialize_dtype(list<b8> wire) → string ⇥ SerializeError`
+- `fn deserialize_shape(list<b8> wire) → list<int> ⇥ SerializeError`
+- `fn deserialize_tensor(list<b8> wire) → SerializedTensor ⇥ SerializeError`
+- `fn deserialize_parameter(list<b8> wire) → ParameterWire ⇥ SerializeError`
 
 ## gradus:shape
 
@@ -1231,7 +1231,7 @@ retain formats that the current decoder does not understand.
 - `class BlockMetadata`
   - fields: bool known, int elements_per_block, int bytes_per_block, int block_count, int byte_length
 - `class EncodedStorage`
-  - fields: bytes payload, Representation representation, BlockMetadata block
+  - fields: list<b8> payload, Representation representation, BlockMetadata block
 
 ### Public functions
 
@@ -1240,7 +1240,7 @@ retain formats that the current decoder does not understand.
 - `fn identity(Representation value) → string`
 - `fn known_block(int elements_per_block, int bytes_per_block, int block_count, int byte_length) → BlockMetadata`
 - `fn unknown_block(int byte_length) → BlockMetadata`
-- `fn encoded(bytes payload, Representation representation, BlockMetadata block) → EncodedStorage`
+- `fn encoded(list<b8> payload, Representation representation, BlockMetadata block) → EncodedStorage`
 - `fn complete(EncodedStorage value) → bool`
 - `fn block_valid(BlockMetadata value) → bool`
 
