@@ -2,7 +2,7 @@
 
 Executable red for the faber-authorship-pilot blocked-item inventory
 (delivery row FAP-1): **byte params reject.** A `@ kernel` taking a scalar
-`octeti<8>` param is semantically admitted (`faber check` exits 0) and
+`list<b8, size 8>` param is semantically admitted (`faber check` exits 0) and
 must reject at Metal device admission today.
 
 ## Commands
@@ -42,4 +42,4 @@ admitted the byte *DeviceView* kernel param, not the scalar byte-aggregate
 param, so the row-wording red still holds today.
 
 Turns green when the kernel byte-param shape the pilot's Q8_0 GEMV needs
-(`octeti<N>` scalar-element/window rows, AEU-7 territory) is admitted.
+(`list<b8, size N>` scalar-element/window rows, AEU-7 territory) is admitted.
