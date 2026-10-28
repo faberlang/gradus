@@ -1,0 +1,533 @@
+# dense-prefill-bench-metal — batched dense prefill of the tiny synthetic model,
+# timed on a device, checked against a pinned last-position logit row.
+#
+# Public entry: the `dense-prefill-bench-metal` executable package.
+# Depends on: gradus:model/dense (config, load, host prefill_cached),
+# gradus:transformer (typed cached block), gradus:nn (gather, rmsnorm),
+# gradus:cache/structure and gradus:cache/kv (the per-layer caches).
+#
+#   faber run --device metal --stats-file STATS --library-home <faberlang/> \
+#       exempla/dense-prefill-bench-metal
+#
+# WHAT IT TIMES: the model of `exempla/dense-model` (2 layers, hidden 16, 4 query
+# and 2 key/value heads of width 4, MLP 16, vocab 8, tied head, weights in
+# source) prefilled over a fixed 8-token prompt into fresh per-layer KV caches.
+# One timed region is the whole prefill: embedding gather, both blocks, the final
+# RMSNorm, the output projection, and the read-back of the [8, 8] logits, so
+# every launch has finished when the clock stops. Model loading and cache
+# construction are outside the clock. The region runs REPEATS times; the median
+# prompt tokens per second is the line `prefill_tokens_per_s <number>`.
+#
+# WHICH PART RUNS ON THE DEVICE: `dense.prefill_cached`, the library's prefill
+# entry, runs on staged runtime-shape carriers whose matmul is a host loop, so
+# it never dispatches a kernel. This program instead composes the library's own
+# typed twins: `transformer.dense_block_cached_static` (the QKV projections and
+# the SwiGLU MLP are `@ kernel` regions, `dense_qkv` and `dense_mlp`),
+# `nn.rmsnorm` (a kernel) and `project` below (the output projection). The
+# embedding gather, the per-head RoPE + causal attention and the KV-cache write
+# stay on the host carrier, as they do in the library today.
+#
+# WHAT IT CHECKS (any failure prints FAIL and exits 1):
+#   * every repetition's last-position logits against the f64 oracle pins
+#     (reference.py, an independent numpy evaluation that reproduces the
+#     dense-model `tied_1_*` pins to 5e-11) within PIN_TOLERANCE, absolute;
+#   * every logit of every repetition finite, and the last row's argmax equal
+#     to the pinned top-1 token;
+#   * every layer's cache holds exactly the prompt length after the prefill;
+#   * step 0: the whole [8, 8] device logits against the library's host
+#     `dense.prefill_cached` on the same weights, within PARITY_TOLERANCE.
+#
+# TOLERANCE: the oracle is f64, the device is f32. The synthetic logits sit
+# within 0.03 of each other, so the absolute tolerance is the meaningful
+# number; the measured worst error is printed as `prefill_max_pin_abs_error`.
+
+import from "norma:process" process
+import from "norma:time" time
+import from "gradus:model/dense" dense
+import from "gradus:attention/rope" rope
+import from "gradus:attention/gqa" gqa
+import from "gradus:cache/kv" kv
+import from "gradus:math" math
+import from "gradus:cache/structure" structure
+import from "gradus:nn" nn
+import from "gradus:tensor" tensor
+
+# Build a staged tensor (test data is always valid; the cape fallback is
+# unreachable).
+fn make_block(list<f32> data, list<int> shape) → tensor.NumericBlock {
+    mut tensor.NumericBlock t ← tensor.default()
+    do {
+        t ← tensor.construct(data, shape)
+    }
+    catch err {
+        return t
+    }
+    return t
+}
+
+# Pack a math-order [D, V] row-major table into the GGUF/ggml stored
+# layout the assembly gathers from (descriptor still [D, V], flat buffer
+# token-major: data[token * D + d]).
+fn pack_embedding(tensor.NumericBlock row_major) → tensor.NumericBlock {
+    let _ f ← row_major.shape
+    let int hidden ← f.get(0) coalesce 1
+    let int vocab ← f.get(1) coalesce 1
+    mut list<f32> out ← empty
+    for range 0‥vocab let tok {
+        for range 0‥hidden let j {
+            out.append(row_major.data.get(j * vocab + tok) coalesce 0.0)
+        }
+    }
+    return make_block(out, [hidden, vocab])
+}
+
+# Validated RopeConfig (swallow the never-firing construction errors).
+fn rope_config(f32 base, f32 scale, rope.RopePolicy policy) → rope.RopeConfig {
+    mut rope.RopeConfig c ← rope.default()
+    do {
+        c ← rope.construct_rope_config(base, scale, policy)
+        return c
+    }
+    catch err {
+        return c
+    }
+    return c
+}
+
+
+# The synthetic resolver: canonical name + layer index -> the materialized
+# stored-weight view (the dense-model resolver, without name slicing: the layer
+# names are rebuilt and compared whole).
+fn layer_tensor(string name, int layer, list<tensor.NumericBlock> weights) → tensor.NumericBlock ⇥ dense.DenseError {
+    let string prefix ← "model.layers.§"(layer ↦ string)
+    let list<string> suffixes ← [".input_layernorm", ".self_attn.q_proj", ".self_attn.k_proj", ".self_attn.v_proj", ".self_attn.o_proj", ".post_attention_layernorm", ".mlp.gate_proj", ".mlp.up_proj", ".mlp.down_proj"]
+    for range 0‥suffixes.length() let slot {
+        if name ≡ prefix + suffixes[slot] {
+            return weights[slot]
+        }
+    }
+    throw variant MissingTensor {message = "unknown canonical tensor: §"(name)}
+}
+
+fn resolve_tensor(string name, int layer, tensor.NumericBlock embed, tensor.NumericBlock norm_s, tensor.NumericBlock w_head, list<tensor.NumericBlock> l0, list<tensor.NumericBlock> l1) → tensor.NumericBlock ⇥ dense.DenseError {
+    if name ≡ "model.embed_tokens" then return embed
+    if name ≡ "model.norm" then return norm_s
+    if name ≡ "lm_head" then return w_head
+    if layer ≡ 1 {
+        return layer_tensor(name, layer, l1)
+    }
+    return layer_tensor(name, layer, l0)
+}
+
+const int REPEATS = 7
+const int PROMPT = 8
+const f64 PIN_TOLERANCE = 0.000005
+const f64 PARITY_TOLERANCE = 0.000005
+const f32 EPSILON = 0.00001
+const f32 ATTENTION_SCALE = 0.5
+const int TOP1 = 5
+
+fn fail(string reason) {
+    print "FAIL " + reason
+    process.exit_process(1)
+}
+
+# Last-position logits of the prompt [0, 3, 7, 1, 5, 2, 6, 4]: the f64 numpy
+# evaluation in reference.py (row 7).
+const list<f64> PINS = [0.6717021625576596, 0.7165090681871487, 0.6708788231076666, 0.720754112333208,
+                        0.7668522283516593, 0.798500960290878, 0.10081539427873201, 0.6185569939034246]
+
+# --- the device route ---------------------------------------------------------
+
+# The device regions: every dense projection of the model is a matmul kernel.
+# The tiny model carries no projection bias, so none is added. Each kernel is
+# one launch.
+@ kernel
+@ public
+fn proj_16(tensor<f32, [8, 16]> x, tensor<f32, [16, 16]> w) → tensor<f32, [8, 16]> {
+    return x · w
+}
+
+@ kernel
+@ public
+fn proj_8(tensor<f32, [8, 16]> x, tensor<f32, [16, 8]> w) → tensor<f32, [8, 8]> {
+    return x · w
+}
+
+# The MLP down projection fused with the second residual.
+@ kernel
+@ public
+fn down_residual(tensor<f32, [8, 16]> hidden, tensor<f32, [16, 16]> w, tensor<f32, [8, 16]> residual) → tensor<f32, [8, 16]> {
+    return (hidden · w) + residual
+}
+
+# The tied output projection: logits = hidden · head.
+@ kernel
+@ public
+fn project(tensor<f32, [8, 16]> hidden, tensor<f32, [16, 8]> head) → tensor<f32, [8, 8]> {
+    return hidden · head
+}
+
+# The model on typed tensors (device operands) and staged blocks (host
+# operands). `dense.load` builds the weights from a resolver, but its
+# size-generic instantiation does not link under the current compiler
+# ("runtime generic shape has no stable formal carrier witness"), so the staged
+# weight blocks are pinned here, one concrete shape per helper.
+class Layer {
+    mut tensor.NumericBlock ln1
+    mut tensor<f32, [16, 16]> wq
+    mut tensor<f32, [16, 8]> wk
+    mut tensor<f32, [16, 8]> wv
+    mut tensor.NumericBlock wo
+    mut tensor.NumericBlock ln2
+    mut tensor<f32, [16, 16]> wg
+    mut tensor<f32, [16, 16]> wu
+    mut tensor<f32, [16, 16]> wd
+}
+
+class TinyModel {
+    mut tensor<f32, [8, 16]> embed_tokens
+    mut tensor.NumericBlock norm
+    mut tensor<f32, [16, 8]> head
+    mut list<Layer> layers
+}
+
+fn pin_16_16(tensor.NumericBlock b) → tensor<f32, [16, 16]> {
+    do {
+        return b.data ↦ tensor<f32, [16, 16]>
+    }
+    catch err {
+        fail("weight [16, 16] pin failed")
+    }
+    return tf32[16, 16] {}
+}
+
+fn pin_16_8(tensor.NumericBlock b) → tensor<f32, [16, 8]> {
+    do {
+        return b.data ↦ tensor<f32, [16, 8]>
+    }
+    catch err {
+        fail("weight [16, 8] pin failed")
+    }
+    return tf32[16, 8] {}
+}
+
+fn pin_8_16(list<f32> data) → tensor<f32, [8, 16]> {
+    do {
+        return data ↦ tensor<f32, [8, 16]>
+    }
+    catch err {
+        fail("weight [8, 16] pin failed")
+    }
+    return tf32[8, 16] {}
+}
+
+# The stored embedding is token-major (data[token * 16 + d]); the tied head is
+# its [16, 8] transpose.
+fn head_from_embed(list<f32> token_major) → tensor<f32, [16, 8]> {
+    mut list<f32> out ← empty
+    for range 0‥16 let d {
+        for range 0‥8 let v {
+            out.append(token_major[v * 16 + d])
+        }
+    }
+    return pin_16_8(make_block(out, [16, 8]))
+}
+
+# Slot order: ln1, wq, wk, wv, wo, ln2, wg, wu, wd.
+fn build_layer(list<tensor.NumericBlock> w) → Layer {
+    return Layer {ln1 = w[0], wq = pin_16_16(w[1]), wk = pin_16_8(w[2]), wv = pin_16_8(w[3]), wo = w[4], ln2 = w[5], wg = pin_16_16(w[6]), wu = pin_16_16(w[7]), wd = pin_16_16(w[8])}
+}
+
+fn build_model(tensor.NumericBlock embed, tensor.NumericBlock norm_s, list<tensor.NumericBlock> l0, list<tensor.NumericBlock> l1) → TinyModel {
+    mut list<Layer> layers ← empty
+    layers.append(build_layer(l0))
+    layers.append(build_layer(l1))
+    return TinyModel {embed_tokens = pin_8_16(embed.data), norm = norm_s, head = head_from_embed(embed.data), layers = layers}
+}
+
+# --- the host pieces ----------------------------------------------------------
+#
+# Not device-capable today, so they run on the staged carrier, as the library's
+# own prefill does:
+#   * RMSNorm: `x.norm_rms(...)` has no Metal launch geometry
+#     (E_DEVICE_UNSUPPORTED geometry_plan_not_covered RmsNormalization), and a
+#     composed form needs `.sqrt()` (TensorMath(Sqrt) is not an elementwise op
+#     on Metal);
+#   * SiLU in the SwiGLU gate: not an elementwise Metal op (the Metal set is
+#     add, sub, mul, div, neg, fill, expand, relu, gelu);
+#   * the embedding gather and the per-head RoPE + causal attention + KV-cache
+#     write: host carrier code in the library.
+
+fn rms_host(tensor<f32, [8, 16]> x, tensor.NumericBlock gamma) → tensor<f32, [8, 16]> {
+    do {
+        let tensor.NumericBlock y ← nn.rmsnorm_carrier(tensor.stage_f32([8, 16], x ↦ list<f32>), gamma, EPSILON)
+        return pin_8_16(y.data)
+    }
+    catch err {
+        fail("host rmsnorm raised " + err.message)
+    }
+    return tf32[8, 16] {}
+}
+
+fn silu_host(tensor.NumericBlock x) → tensor.NumericBlock {
+    do {
+        return nn.silu_carrier(x)
+    }
+    catch err {
+        fail("host silu raised " + err.message)
+    }
+    return x
+}
+
+fn gated_host(tensor.NumericBlock gate, tensor.NumericBlock up) → tensor<f32, [8, 16]> {
+    do {
+        let tensor.NumericBlock h ← math.mul_carrier(silu_host(gate), up)
+        return pin_8_16(h.data)
+    }
+    catch err {
+        fail("host gate product raised " + err.message)
+    }
+    return tf32[8, 16] {}
+}
+
+fn gather_rows(tensor<f32, [8, 16]> table, list<int> tokens) → tensor<f32, [8, 16]> {
+    do {
+        return nn.gather<size 8, size 8, size 16>(table, tokens)
+    }
+    catch err {
+        fail("gather raised " + err.message)
+    }
+    return tf32[8, 16] {}
+}
+
+class Prefilled {
+    mut tensor<f32, [8, 8]> logits
+    mut list<kv.KVCache> caches
+}
+
+class Block {
+    mut tensor<f32, [8, 16]> output
+    mut kv.KVCache state
+}
+
+# Cached multi-head attention on the host carrier (per-head RoPE, causal mask,
+# KV write, output projection).
+fn attention(tensor<f32, [8, 16]> q, tensor<f32, [8, 8]> k, tensor<f32, [8, 8]> v, tensor.NumericBlock wo, kv.KVCache cache, list<int> tokens, list<int> positions, rope.RopeConfig rope_cfg) → gqa.CachedAttention {
+    do {
+        return gqa.multi_head_attention_cached(tensor.stage_f32([8, 16], q ↦ list<f32>), tensor.stage_f32([8, 8], k ↦ list<f32>), tensor.stage_f32([8, 8], v ↦ list<f32>), wo, cache, 4, 2, ATTENTION_SCALE, positions, 4, rope_cfg, tokens)
+    }
+    catch err {
+        fail("cached attention raised " + err.message)
+    }
+    return gqa.CachedAttention {context = tensor.default(), state = cache}
+}
+
+# One dense block: host RMSNorm, device Q/K/V projections, host attention,
+# device residual add, host RMSNorm, device gate and up projections, host
+# gated product, device down projection fused with the second residual.
+fn cached_block(tensor<f32, [8, 16]> x, Layer layer, kv.KVCache cache, list<int> tokens, list<int> positions, rope.RopeConfig rope_cfg) → Block {
+    let tensor<f32, [8, 16]> ln1 ← rms_host(x, layer.ln1)
+    let tensor<f32, [8, 16]> q ← proj_16(ln1, layer.wq)
+    let tensor<f32, [8, 8]> k ← proj_8(ln1, layer.wk)
+    let tensor<f32, [8, 8]> v ← proj_8(ln1, layer.wv)
+    let gqa.CachedAttention step ← attention(q, k, v, layer.wo, cache, tokens, positions, rope_cfg)
+    let tensor<f32, [8, 16]> r1 ← math.add(x, pin_8_16(step.context.data))
+    let tensor<f32, [8, 16]> ln2 ← rms_host(r1, layer.ln2)
+    let tensor<f32, [8, 16]> gate ← proj_16(ln2, layer.wg)
+    let tensor<f32, [8, 16]> up ← proj_16(ln2, layer.wu)
+    let tensor<f32, [8, 16]> act ← gated_host(tensor.stage_f32([8, 16], gate ↦ list<f32>), tensor.stage_f32([8, 16], up ↦ list<f32>))
+    return Block {output = down_residual(act, layer.wd, r1), state = step.state}
+}
+
+fn run_layers(TinyModel model, list<int> tokens, list<kv.KVCache> caches, rope.RopeConfig rope_cfg) → Prefilled {
+    mut tensor<f32, [8, 16]> h ← gather_rows(model.embed_tokens, tokens)
+    mut list<int> positions ← empty
+    for range 0‥tokens.length() let i {
+        positions.append(i)
+    }
+    mut list<kv.KVCache> next ← empty
+    for range 0‥2 let layer {
+        let Block b ← cached_block(h, model.layers[layer], caches[layer], tokens, positions, rope_cfg)
+        h ← b.output
+        next.append(b.state)
+    }
+    let tensor<f32, [8, 16]> hn ← rms_host(h, model.norm)
+    return Prefilled {logits = project(hn, model.head), caches = next}
+}
+
+# --- the library host path (step-0 parity) ----------------------------------
+
+fn prefill_library(dense.DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ dense.DenseError source, list<int> tokens, list<kv.KVCache> caches, rope.RopeConfig rope_cfg) → list<f32> {
+    do {
+        let dense.DenseStep step ← dense.prefill_cached(cfg, source, tokens, EPSILON, ATTENTION_SCALE, 4, rope_cfg, caches)
+        return step.logits.data
+    }
+    catch err {
+        fail("library prefill raised " + err.message)
+    }
+    return empty
+}
+
+# --- checks -------------------------------------------------------------------
+
+fn abs_diff(f64 a, f64 b) → f64 {
+    mut f64 d ← a - b
+    if d ≺ 0.0 {
+        d ← -d
+    }
+    return d
+}
+
+fn check_caches(list<kv.KVCache> caches) {
+    if caches.length() ≢ 2 {
+        fail("cache layer count §"(caches.length()))
+    }
+    for from caches let cache {
+        if cache.length() ≢ PROMPT {
+            fail("cache prefix length § expected §"(cache.length(), PROMPT))
+        }
+    }
+}
+
+# The pinned last row, finiteness of every logit, the top-1 token; returns the
+# worst absolute pin error.
+fn check_logits(list<f32> flat) → f64 {
+    if flat.length() ≢ PROMPT * 8 {
+        fail("logit count §"(flat.length()))
+    }
+    for range 0‥flat.length() let i {
+        let f64 v ← flat[i] ↦ f64
+        if not (v ≥ -1000000.0 and v ≤ 1000000.0) {
+            fail("logit § not finite: §"(i, v))
+        }
+    }
+    mut f64 worst ← 0.0
+    mut int best ← 0
+    for range 0‥8 let j {
+        let f64 observed ← flat[(PROMPT - 1) * 8 + j] ↦ f64
+        let f64 error ← abs_diff(observed, PINS[j])
+        if not (error ≤ PIN_TOLERANCE) {
+            fail("last-row logit § observed § pinned §"(j, observed, PINS[j]))
+        }
+        if error ≻ worst {
+            worst ← error
+        }
+        if observed ≻ (flat[(PROMPT - 1) * 8 + best] ↦ f64) {
+            best ← j
+        }
+    }
+    if best ≢ TOP1 {
+        fail("last-row top-1 § expected §"(best, TOP1))
+    }
+    return worst
+}
+
+fn check_parity(list<f32> flat, list<f32> library) {
+    if library.length() ≢ flat.length() {
+        fail("library logit count § device §"(library.length(), flat.length()))
+    }
+    for range 0‥flat.length() let i {
+        if not (abs_diff(flat[i] ↦ f64, library[i] ↦ f64) ≤ PARITY_TOLERANCE) {
+            fail("step-0 logit § device § library §"(i, flat[i], library[i]))
+        }
+    }
+}
+
+fn cache_layout() → structure.KVStructure {
+    do {
+        let structure.LayerSet set ← structure.construct_layer_set([0, 1], structure.dense_structure(), 2, 4)
+        mut list<structure.LayerSet> sets ← empty
+        sets.append(set)
+        return structure.construct_kv_structure(sets, structure.kv_dtype_f32(), structure.kv_dtype_f32(), structure.v_layout_transposed(), structure.sharing_gqa(), structure.attention_classic(), 4, 8, 16)
+    }
+    catch err {
+        fail("cache layout raised " + err.message)
+    }
+    return structure.default_kv_structure()
+}
+
+fn fresh_caches() → list<kv.KVCache> {
+    do {
+        return dense.empty_caches(cache_layout(), "tiny-prefill-bench", "1.0.0", "causal-rope-d4", "synthetic")
+    }
+    catch err {
+        fail("cache construction raised " + err.message)
+    }
+    return empty
+}
+
+fn bench(dense.DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ dense.DenseError source, TinyModel model, rope.RopeConfig rope_cfg) ⇥ dense.DenseError {
+    let list<int> tokens ← [0, 3, 7, 1, 5, 2, 6, 4]
+
+    # --- step 0: device logits vs the library's host path --------------------
+    let Prefilled first ← run_layers(model, tokens, fresh_caches(), rope_cfg)
+    check_parity(first.logits ↦ list<f32>, prefill_library(cfg, source, tokens, fresh_caches(), rope_cfg))
+
+    # --- timed repetitions ---------------------------------------------------
+    mut list<f64> rates ← empty
+    mut list<f64> region_ms ← empty
+    mut f64 worst_error ← 0.0
+    for range 0‥REPEATS let repeat {
+        let list<kv.KVCache> caches ← fresh_caches()
+        let int started ← time.monotonic()
+        let Prefilled done ← run_layers(model, tokens, caches, rope_cfg)
+        let list<f32> read_back ← done.logits ↦ list<f32>
+        let int elapsed ← time.monotonic() - started
+
+        check_caches(done.caches)
+        let f64 error ← check_logits(read_back)
+        if error ≻ worst_error {
+            worst_error ← error
+        }
+        rates.append((PROMPT ↦ f64) ÷ ((elapsed ↦ f64) ÷ 1000000000.0))
+        region_ms.append((elapsed ↦ f64) ÷ 1000000.0)
+    }
+
+    mut list<f64> sorted_rates ← copy rates
+    sorted_rates.sort()
+    mut list<f64> sorted_ms ← copy region_ms
+    sorted_ms.sort()
+    let int middle ← REPEATS / 2
+    print "prefill_tokens_per_s " + (sorted_rates[middle] ↦ string)
+    print "prefill_ms_median " + (sorted_ms[middle] ↦ string)
+    print "prefill_prompt_tokens " + (PROMPT ↦ string)
+    print "prefill_repeats " + (REPEATS ↦ string)
+    print "prefill_max_pin_abs_error " + (worst_error ↦ string)
+    print "prefill_top1 " + (TOP1 ↦ string)
+    print "prefill_ok true"
+}
+
+main {
+    let _ L0_LN1 ← make_block([0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0, 2.1, 2.2, 2.3, 2.4], [16])
+    let _ L0_LN2 ← make_block([1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5, 0.45, 0.4, 0.35, 0.3, 0.25], [16])
+    let _ L0_WQ ← make_block([0.03333333333, 0.04166666667, 0.05, 0.05833333333, 0.06666666667, 0.075, 0.08333333333, 0.09166666667, 0.1, 0.1083333333, 0.008333333333, 0.01666666667, 0.025, 0.03333333333, 0.04166666667, 0.05, 0.05833333333, 0.075, 0.09166666667, 0.1083333333, 0.01666666667, 0.03333333333, 0.05, 0.06666666667, 0.08333333333, 0.1, 0.008333333333, 0.025, 0.04166666667, 0.05833333333, 0.075, 0.09166666667, 0.08333333333, 0.1083333333, 0.025, 0.05, 0.075, 0.1, 0.01666666667, 0.04166666667, 0.06666666667, 0.09166666667, 0.008333333333, 0.03333333333, 0.05833333333, 0.08333333333, 0.1083333333, 0.025, 0.1083333333, 0.03333333333, 0.06666666667, 0.1, 0.025, 0.05833333333, 0.09166666667, 0.01666666667, 0.05, 0.08333333333, 0.008333333333, 0.04166666667, 0.075, 0.1083333333, 0.03333333333, 0.06666666667, 0.025, 0.06666666667, 0.1083333333, 0.04166666667, 0.08333333333, 0.01666666667, 0.05833333333, 0.1, 0.03333333333, 0.075, 0.008333333333, 0.05, 0.09166666667, 0.025, 0.06666666667, 0.1083333333, 0.05, 0.1, 0.04166666667, 0.09166666667, 0.03333333333, 0.08333333333, 0.025, 0.075, 0.01666666667, 0.06666666667, 0.008333333333, 0.05833333333, 0.1083333333, 0.05, 0.1, 0.04166666667, 0.075, 0.025, 0.08333333333, 0.03333333333, 0.09166666667, 0.04166666667, 0.1, 0.05, 0.1083333333, 0.05833333333, 0.008333333333, 0.06666666667, 0.01666666667, 0.075, 0.025, 0.08333333333, 0.1, 0.05833333333, 0.01666666667, 0.08333333333, 0.04166666667, 0.1083333333, 0.06666666667, 0.025, 0.09166666667, 0.05, 0.008333333333, 0.075, 0.03333333333, 0.1, 0.05833333333, 0.01666666667, 0.01666666667, 0.09166666667, 0.05833333333, 0.025, 0.1, 0.06666666667, 0.03333333333, 0.1083333333, 0.075, 0.04166666667, 0.008333333333, 0.08333333333, 0.05, 0.01666666667, 0.09166666667, 0.05833333333, 0.04166666667, 0.01666666667, 0.1, 0.075, 0.05, 0.025, 0.1083333333, 0.08333333333, 0.05833333333, 0.03333333333, 0.008333333333, 0.09166666667, 0.06666666667, 0.04166666667, 0.01666666667, 0.1, 0.06666666667, 0.05, 0.03333333333, 0.01666666667, 0.1083333333, 0.09166666667, 0.075, 0.05833333333, 0.04166666667, 0.025, 0.008333333333, 0.1, 0.08333333333, 0.06666666667, 0.05, 0.03333333333, 0.09166666667, 0.08333333333, 0.075, 0.06666666667, 0.05833333333, 0.05, 0.04166666667, 0.03333333333, 0.025, 0.01666666667, 0.008333333333, 0.1083333333, 0.1, 0.09166666667, 0.08333333333, 0.075, 0.008333333333, 0.008333333333, 0.008333333333, 0.008333333333, 0.008333333333, 0.008333333333, 0.008333333333, 0.008333333333, 0.008333333333, 0.008333333333, 0.008333333333, 0.008333333333, 0.008333333333, 0.008333333333, 0.008333333333, 0.008333333333, 0.03333333333, 0.04166666667, 0.05, 0.05833333333, 0.06666666667, 0.075, 0.08333333333, 0.09166666667, 0.1, 0.1083333333, 0.008333333333, 0.01666666667, 0.025, 0.03333333333, 0.04166666667, 0.05, 0.05833333333, 0.075, 0.09166666667, 0.1083333333, 0.01666666667, 0.03333333333, 0.05, 0.06666666667, 0.08333333333, 0.1, 0.008333333333, 0.025, 0.04166666667, 0.05833333333, 0.075, 0.09166666667, 0.08333333333, 0.1083333333, 0.025, 0.05, 0.075, 0.1, 0.01666666667, 0.04166666667, 0.06666666667, 0.09166666667, 0.008333333333, 0.03333333333, 0.05833333333, 0.08333333333, 0.1083333333, 0.025], [16, 16])
+    let _ L0_WK ← make_block([0.05, 0.05833333333, 0.06666666667, 0.075, 0.08333333333, 0.09166666667, 0.1, 0.1083333333, 0.075, 0.09166666667, 0.1083333333, 0.125, 0.03333333333, 0.05, 0.06666666667, 0.08333333333, 0.1, 0.125, 0.04166666667, 0.06666666667, 0.09166666667, 0.1166666667, 0.03333333333, 0.05833333333, 0.125, 0.05, 0.08333333333, 0.1166666667, 0.04166666667, 0.075, 0.1083333333, 0.03333333333, 0.04166666667, 0.08333333333, 0.125, 0.05833333333, 0.1, 0.03333333333, 0.075, 0.1166666667, 0.06666666667, 0.1166666667, 0.05833333333, 0.1083333333, 0.05, 0.1, 0.04166666667, 0.09166666667, 0.09166666667, 0.04166666667, 0.1, 0.05, 0.1083333333, 0.05833333333, 0.1166666667, 0.06666666667, 0.1166666667, 0.075, 0.03333333333, 0.1, 0.05833333333, 0.125, 0.08333333333, 0.04166666667, 0.03333333333, 0.1083333333, 0.075, 0.04166666667, 0.1166666667, 0.08333333333, 0.05, 0.125, 0.05833333333, 0.03333333333, 0.1166666667, 0.09166666667, 0.06666666667, 0.04166666667, 0.125, 0.1, 0.08333333333, 0.06666666667, 0.05, 0.03333333333, 0.125, 0.1083333333, 0.09166666667, 0.075, 0.1083333333, 0.1, 0.09166666667, 0.08333333333, 0.075, 0.06666666667, 0.05833333333, 0.05, 0.025, 0.025, 0.025, 0.025, 0.025, 0.025, 0.025, 0.025, 0.05, 0.05833333333, 0.06666666667, 0.075, 0.08333333333, 0.09166666667, 0.1, 0.1083333333, 0.075, 0.09166666667, 0.1083333333, 0.125, 0.03333333333, 0.05, 0.06666666667, 0.08333333333, 0.1, 0.125, 0.04166666667, 0.06666666667, 0.09166666667, 0.1166666667, 0.03333333333, 0.05833333333], [16, 8])
+    let _ L0_WV ← make_block([0.06666666667, 0.075, 0.08333333333, 0.09166666667, 0.1, 0.1083333333, 0.1166666667, 0.125, 0.09166666667, 0.1083333333, 0.125, 0.1416666667, 0.05, 0.06666666667, 0.08333333333, 0.1, 0.1166666667, 0.1416666667, 0.05833333333, 0.08333333333, 0.1083333333, 0.1333333333, 0.05, 0.075, 0.1416666667, 0.06666666667, 0.1, 0.1333333333, 0.05833333333, 0.09166666667, 0.125, 0.05, 0.05833333333, 0.1, 0.1416666667, 0.075, 0.1166666667, 0.05, 0.09166666667, 0.1333333333, 0.08333333333, 0.1333333333, 0.075, 0.125, 0.06666666667, 0.1166666667, 0.05833333333, 0.1083333333, 0.1083333333, 0.05833333333, 0.1166666667, 0.06666666667, 0.125, 0.075, 0.1333333333, 0.08333333333, 0.1333333333, 0.09166666667, 0.05, 0.1166666667, 0.075, 0.1416666667, 0.1, 0.05833333333, 0.05, 0.125, 0.09166666667, 0.05833333333, 0.1333333333, 0.1, 0.06666666667, 0.1416666667, 0.075, 0.05, 0.1333333333, 0.1083333333, 0.08333333333, 0.05833333333, 0.1416666667, 0.1166666667, 0.1, 0.08333333333, 0.06666666667, 0.05, 0.1416666667, 0.125, 0.1083333333, 0.09166666667, 0.125, 0.1166666667, 0.1083333333, 0.1, 0.09166666667, 0.08333333333, 0.075, 0.06666666667, 0.04166666667, 0.04166666667, 0.04166666667, 0.04166666667, 0.04166666667, 0.04166666667, 0.04166666667, 0.04166666667, 0.06666666667, 0.075, 0.08333333333, 0.09166666667, 0.1, 0.1083333333, 0.1166666667, 0.125, 0.09166666667, 0.1083333333, 0.125, 0.1416666667, 0.05, 0.06666666667, 0.08333333333, 0.1, 0.1166666667, 0.1416666667, 0.05833333333, 0.08333333333, 0.1083333333, 0.1333333333, 0.05, 0.075], [16, 8])
+    let _ L0_WO ← make_block([0.07142857143, 0.07857142857, 0.08571428571, 0.09285714286, 0.1, 0.1071428571, 0.1142857143, 0.1214285714, 0.1285714286, 0.1357142857, 0.05, 0.05714285714, 0.06428571429, 0.07142857143, 0.07857142857, 0.08571428571, 0.09285714286, 0.1071428571, 0.1214285714, 0.1357142857, 0.05714285714, 0.07142857143, 0.08571428571, 0.1, 0.1142857143, 0.1285714286, 0.05, 0.06428571429, 0.07857142857, 0.09285714286, 0.1071428571, 0.1214285714, 0.1142857143, 0.1357142857, 0.06428571429, 0.08571428571, 0.1071428571, 0.1285714286, 0.05714285714, 0.07857142857, 0.1, 0.1214285714, 0.05, 0.07142857143, 0.09285714286, 0.1142857143, 0.1357142857, 0.06428571429, 0.1357142857, 0.07142857143, 0.1, 0.1285714286, 0.06428571429, 0.09285714286, 0.1214285714, 0.05714285714, 0.08571428571, 0.1142857143, 0.05, 0.07857142857, 0.1071428571, 0.1357142857, 0.07142857143, 0.1, 0.06428571429, 0.1, 0.1357142857, 0.07857142857, 0.1142857143, 0.05714285714, 0.09285714286, 0.1285714286, 0.07142857143, 0.1071428571, 0.05, 0.08571428571, 0.1214285714, 0.06428571429, 0.1, 0.1357142857, 0.08571428571, 0.1285714286, 0.07857142857, 0.1214285714, 0.07142857143, 0.1142857143, 0.06428571429, 0.1071428571, 0.05714285714, 0.1, 0.05, 0.09285714286, 0.1357142857, 0.08571428571, 0.1285714286, 0.07857142857, 0.1071428571, 0.06428571429, 0.1142857143, 0.07142857143, 0.1214285714, 0.07857142857, 0.1285714286, 0.08571428571, 0.1357142857, 0.09285714286, 0.05, 0.1, 0.05714285714, 0.1071428571, 0.06428571429, 0.1142857143, 0.1285714286, 0.09285714286, 0.05714285714, 0.1142857143, 0.07857142857, 0.1357142857, 0.1, 0.06428571429, 0.1214285714, 0.08571428571, 0.05, 0.1071428571, 0.07142857143, 0.1285714286, 0.09285714286, 0.05714285714, 0.05714285714, 0.1214285714, 0.09285714286, 0.06428571429, 0.1285714286, 0.1, 0.07142857143, 0.1357142857, 0.1071428571, 0.07857142857, 0.05, 0.1142857143, 0.08571428571, 0.05714285714, 0.1214285714, 0.09285714286, 0.07857142857, 0.05714285714, 0.1285714286, 0.1071428571, 0.08571428571, 0.06428571429, 0.1357142857, 0.1142857143, 0.09285714286, 0.07142857143, 0.05, 0.1214285714, 0.1, 0.07857142857, 0.05714285714, 0.1285714286, 0.1, 0.08571428571, 0.07142857143, 0.05714285714, 0.1357142857, 0.1214285714, 0.1071428571, 0.09285714286, 0.07857142857, 0.06428571429, 0.05, 0.1285714286, 0.1142857143, 0.1, 0.08571428571, 0.07142857143, 0.1214285714, 0.1142857143, 0.1071428571, 0.1, 0.09285714286, 0.08571428571, 0.07857142857, 0.07142857143, 0.06428571429, 0.05714285714, 0.05, 0.1357142857, 0.1285714286, 0.1214285714, 0.1142857143, 0.1071428571, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.07142857143, 0.07857142857, 0.08571428571, 0.09285714286, 0.1, 0.1071428571, 0.1142857143, 0.1214285714, 0.1285714286, 0.1357142857, 0.05, 0.05714285714, 0.06428571429, 0.07142857143, 0.07857142857, 0.08571428571, 0.09285714286, 0.1071428571, 0.1214285714, 0.1357142857, 0.05714285714, 0.07142857143, 0.08571428571, 0.1, 0.1142857143, 0.1285714286, 0.05, 0.06428571429, 0.07857142857, 0.09285714286, 0.1071428571, 0.1214285714, 0.1142857143, 0.1357142857, 0.06428571429, 0.08571428571, 0.1071428571, 0.1285714286, 0.05714285714, 0.07857142857, 0.1, 0.1214285714, 0.05, 0.07142857143, 0.09285714286, 0.1142857143, 0.1357142857, 0.06428571429], [16, 16])
+    let _ L0_WG ← make_block([0.04166666667, 0.05, 0.05833333333, 0.06666666667, 0.075, 0.08333333333, 0.09166666667, 0.1, 0.1083333333, 0.1166666667, 0.01666666667, 0.025, 0.03333333333, 0.04166666667, 0.05, 0.05833333333, 0.06666666667, 0.08333333333, 0.1, 0.1166666667, 0.025, 0.04166666667, 0.05833333333, 0.075, 0.09166666667, 0.1083333333, 0.01666666667, 0.03333333333, 0.05, 0.06666666667, 0.08333333333, 0.1, 0.09166666667, 0.1166666667, 0.03333333333, 0.05833333333, 0.08333333333, 0.1083333333, 0.025, 0.05, 0.075, 0.1, 0.01666666667, 0.04166666667, 0.06666666667, 0.09166666667, 0.1166666667, 0.03333333333, 0.1166666667, 0.04166666667, 0.075, 0.1083333333, 0.03333333333, 0.06666666667, 0.1, 0.025, 0.05833333333, 0.09166666667, 0.01666666667, 0.05, 0.08333333333, 0.1166666667, 0.04166666667, 0.075, 0.03333333333, 0.075, 0.1166666667, 0.05, 0.09166666667, 0.025, 0.06666666667, 0.1083333333, 0.04166666667, 0.08333333333, 0.01666666667, 0.05833333333, 0.1, 0.03333333333, 0.075, 0.1166666667, 0.05833333333, 0.1083333333, 0.05, 0.1, 0.04166666667, 0.09166666667, 0.03333333333, 0.08333333333, 0.025, 0.075, 0.01666666667, 0.06666666667, 0.1166666667, 0.05833333333, 0.1083333333, 0.05, 0.08333333333, 0.03333333333, 0.09166666667, 0.04166666667, 0.1, 0.05, 0.1083333333, 0.05833333333, 0.1166666667, 0.06666666667, 0.01666666667, 0.075, 0.025, 0.08333333333, 0.03333333333, 0.09166666667, 0.1083333333, 0.06666666667, 0.025, 0.09166666667, 0.05, 0.1166666667, 0.075, 0.03333333333, 0.1, 0.05833333333, 0.01666666667, 0.08333333333, 0.04166666667, 0.1083333333, 0.06666666667, 0.025, 0.025, 0.1, 0.06666666667, 0.03333333333, 0.1083333333, 0.075, 0.04166666667, 0.1166666667, 0.08333333333, 0.05, 0.01666666667, 0.09166666667, 0.05833333333, 0.025, 0.1, 0.06666666667, 0.05, 0.025, 0.1083333333, 0.08333333333, 0.05833333333, 0.03333333333, 0.1166666667, 0.09166666667, 0.06666666667, 0.04166666667, 0.01666666667, 0.1, 0.075, 0.05, 0.025, 0.1083333333, 0.075, 0.05833333333, 0.04166666667, 0.025, 0.1166666667, 0.1, 0.08333333333, 0.06666666667, 0.05, 0.03333333333, 0.01666666667, 0.1083333333, 0.09166666667, 0.075, 0.05833333333, 0.04166666667, 0.1, 0.09166666667, 0.08333333333, 0.075, 0.06666666667, 0.05833333333, 0.05, 0.04166666667, 0.03333333333, 0.025, 0.01666666667, 0.1166666667, 0.1083333333, 0.1, 0.09166666667, 0.08333333333, 0.01666666667, 0.01666666667, 0.01666666667, 0.01666666667, 0.01666666667, 0.01666666667, 0.01666666667, 0.01666666667, 0.01666666667, 0.01666666667, 0.01666666667, 0.01666666667, 0.01666666667, 0.01666666667, 0.01666666667, 0.01666666667, 0.04166666667, 0.05, 0.05833333333, 0.06666666667, 0.075, 0.08333333333, 0.09166666667, 0.1, 0.1083333333, 0.1166666667, 0.01666666667, 0.025, 0.03333333333, 0.04166666667, 0.05, 0.05833333333, 0.06666666667, 0.08333333333, 0.1, 0.1166666667, 0.025, 0.04166666667, 0.05833333333, 0.075, 0.09166666667, 0.1083333333, 0.01666666667, 0.03333333333, 0.05, 0.06666666667, 0.08333333333, 0.1, 0.09166666667, 0.1166666667, 0.03333333333, 0.05833333333, 0.08333333333, 0.1083333333, 0.025, 0.05, 0.075, 0.1, 0.01666666667, 0.04166666667, 0.06666666667, 0.09166666667, 0.1166666667, 0.03333333333], [16, 16])
+    let _ L0_WU ← make_block([0.05833333333, 0.06666666667, 0.075, 0.08333333333, 0.09166666667, 0.1, 0.1083333333, 0.1166666667, 0.125, 0.1333333333, 0.03333333333, 0.04166666667, 0.05, 0.05833333333, 0.06666666667, 0.075, 0.08333333333, 0.1, 0.1166666667, 0.1333333333, 0.04166666667, 0.05833333333, 0.075, 0.09166666667, 0.1083333333, 0.125, 0.03333333333, 0.05, 0.06666666667, 0.08333333333, 0.1, 0.1166666667, 0.1083333333, 0.1333333333, 0.05, 0.075, 0.1, 0.125, 0.04166666667, 0.06666666667, 0.09166666667, 0.1166666667, 0.03333333333, 0.05833333333, 0.08333333333, 0.1083333333, 0.1333333333, 0.05, 0.1333333333, 0.05833333333, 0.09166666667, 0.125, 0.05, 0.08333333333, 0.1166666667, 0.04166666667, 0.075, 0.1083333333, 0.03333333333, 0.06666666667, 0.1, 0.1333333333, 0.05833333333, 0.09166666667, 0.05, 0.09166666667, 0.1333333333, 0.06666666667, 0.1083333333, 0.04166666667, 0.08333333333, 0.125, 0.05833333333, 0.1, 0.03333333333, 0.075, 0.1166666667, 0.05, 0.09166666667, 0.1333333333, 0.075, 0.125, 0.06666666667, 0.1166666667, 0.05833333333, 0.1083333333, 0.05, 0.1, 0.04166666667, 0.09166666667, 0.03333333333, 0.08333333333, 0.1333333333, 0.075, 0.125, 0.06666666667, 0.1, 0.05, 0.1083333333, 0.05833333333, 0.1166666667, 0.06666666667, 0.125, 0.075, 0.1333333333, 0.08333333333, 0.03333333333, 0.09166666667, 0.04166666667, 0.1, 0.05, 0.1083333333, 0.125, 0.08333333333, 0.04166666667, 0.1083333333, 0.06666666667, 0.1333333333, 0.09166666667, 0.05, 0.1166666667, 0.075, 0.03333333333, 0.1, 0.05833333333, 0.125, 0.08333333333, 0.04166666667, 0.04166666667, 0.1166666667, 0.08333333333, 0.05, 0.125, 0.09166666667, 0.05833333333, 0.1333333333, 0.1, 0.06666666667, 0.03333333333, 0.1083333333, 0.075, 0.04166666667, 0.1166666667, 0.08333333333, 0.06666666667, 0.04166666667, 0.125, 0.1, 0.075, 0.05, 0.1333333333, 0.1083333333, 0.08333333333, 0.05833333333, 0.03333333333, 0.1166666667, 0.09166666667, 0.06666666667, 0.04166666667, 0.125, 0.09166666667, 0.075, 0.05833333333, 0.04166666667, 0.1333333333, 0.1166666667, 0.1, 0.08333333333, 0.06666666667, 0.05, 0.03333333333, 0.125, 0.1083333333, 0.09166666667, 0.075, 0.05833333333, 0.1166666667, 0.1083333333, 0.1, 0.09166666667, 0.08333333333, 0.075, 0.06666666667, 0.05833333333, 0.05, 0.04166666667, 0.03333333333, 0.1333333333, 0.125, 0.1166666667, 0.1083333333, 0.1, 0.03333333333, 0.03333333333, 0.03333333333, 0.03333333333, 0.03333333333, 0.03333333333, 0.03333333333, 0.03333333333, 0.03333333333, 0.03333333333, 0.03333333333, 0.03333333333, 0.03333333333, 0.03333333333, 0.03333333333, 0.03333333333, 0.05833333333, 0.06666666667, 0.075, 0.08333333333, 0.09166666667, 0.1, 0.1083333333, 0.1166666667, 0.125, 0.1333333333, 0.03333333333, 0.04166666667, 0.05, 0.05833333333, 0.06666666667, 0.075, 0.08333333333, 0.1, 0.1166666667, 0.1333333333, 0.04166666667, 0.05833333333, 0.075, 0.09166666667, 0.1083333333, 0.125, 0.03333333333, 0.05, 0.06666666667, 0.08333333333, 0.1, 0.1166666667, 0.1083333333, 0.1333333333, 0.05, 0.075, 0.1, 0.125, 0.04166666667, 0.06666666667, 0.09166666667, 0.1166666667, 0.03333333333, 0.05833333333, 0.08333333333, 0.1083333333, 0.1333333333, 0.05], [16, 16])
+    let _ L0_WD ← make_block([0.075, 0.08333333333, 0.09166666667, 0.1, 0.1083333333, 0.1166666667, 0.125, 0.1333333333, 0.1416666667, 0.15, 0.05, 0.05833333333, 0.06666666667, 0.075, 0.08333333333, 0.09166666667, 0.1, 0.1166666667, 0.1333333333, 0.15, 0.05833333333, 0.075, 0.09166666667, 0.1083333333, 0.125, 0.1416666667, 0.05, 0.06666666667, 0.08333333333, 0.1, 0.1166666667, 0.1333333333, 0.125, 0.15, 0.06666666667, 0.09166666667, 0.1166666667, 0.1416666667, 0.05833333333, 0.08333333333, 0.1083333333, 0.1333333333, 0.05, 0.075, 0.1, 0.125, 0.15, 0.06666666667, 0.15, 0.075, 0.1083333333, 0.1416666667, 0.06666666667, 0.1, 0.1333333333, 0.05833333333, 0.09166666667, 0.125, 0.05, 0.08333333333, 0.1166666667, 0.15, 0.075, 0.1083333333, 0.06666666667, 0.1083333333, 0.15, 0.08333333333, 0.125, 0.05833333333, 0.1, 0.1416666667, 0.075, 0.1166666667, 0.05, 0.09166666667, 0.1333333333, 0.06666666667, 0.1083333333, 0.15, 0.09166666667, 0.1416666667, 0.08333333333, 0.1333333333, 0.075, 0.125, 0.06666666667, 0.1166666667, 0.05833333333, 0.1083333333, 0.05, 0.1, 0.15, 0.09166666667, 0.1416666667, 0.08333333333, 0.1166666667, 0.06666666667, 0.125, 0.075, 0.1333333333, 0.08333333333, 0.1416666667, 0.09166666667, 0.15, 0.1, 0.05, 0.1083333333, 0.05833333333, 0.1166666667, 0.06666666667, 0.125, 0.1416666667, 0.1, 0.05833333333, 0.125, 0.08333333333, 0.15, 0.1083333333, 0.06666666667, 0.1333333333, 0.09166666667, 0.05, 0.1166666667, 0.075, 0.1416666667, 0.1, 0.05833333333, 0.05833333333, 0.1333333333, 0.1, 0.06666666667, 0.1416666667, 0.1083333333, 0.075, 0.15, 0.1166666667, 0.08333333333, 0.05, 0.125, 0.09166666667, 0.05833333333, 0.1333333333, 0.1, 0.08333333333, 0.05833333333, 0.1416666667, 0.1166666667, 0.09166666667, 0.06666666667, 0.15, 0.125, 0.1, 0.075, 0.05, 0.1333333333, 0.1083333333, 0.08333333333, 0.05833333333, 0.1416666667, 0.1083333333, 0.09166666667, 0.075, 0.05833333333, 0.15, 0.1333333333, 0.1166666667, 0.1, 0.08333333333, 0.06666666667, 0.05, 0.1416666667, 0.125, 0.1083333333, 0.09166666667, 0.075, 0.1333333333, 0.125, 0.1166666667, 0.1083333333, 0.1, 0.09166666667, 0.08333333333, 0.075, 0.06666666667, 0.05833333333, 0.05, 0.15, 0.1416666667, 0.1333333333, 0.125, 0.1166666667, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.075, 0.08333333333, 0.09166666667, 0.1, 0.1083333333, 0.1166666667, 0.125, 0.1333333333, 0.1416666667, 0.15, 0.05, 0.05833333333, 0.06666666667, 0.075, 0.08333333333, 0.09166666667, 0.1, 0.1166666667, 0.1333333333, 0.15, 0.05833333333, 0.075, 0.09166666667, 0.1083333333, 0.125, 0.1416666667, 0.05, 0.06666666667, 0.08333333333, 0.1, 0.1166666667, 0.1333333333, 0.125, 0.15, 0.06666666667, 0.09166666667, 0.1166666667, 0.1416666667, 0.05833333333, 0.08333333333, 0.1083333333, 0.1333333333, 0.05, 0.075, 0.1, 0.125, 0.15, 0.06666666667], [16, 16])
+    let _ L1_LN1 ← make_block([1.53, 1.7, 1.87, 2.04, 2.21, 2.38, 2.55, 2.72, 2.89, 3.06, 3.23, 3.4, 3.57, 3.74, 3.91, 4.08], [16])
+    let _ L1_LN2 ← make_block([1.7, 1.615, 1.53, 1.445, 1.36, 1.275, 1.19, 1.105, 1.02, 0.935, 0.85, 0.765, 0.68, 0.595, 0.51, 0.425], [16])
+    let _ L1_WQ ← make_block([0.0566666667, 0.0708333333, 0.085, 0.0991666667, 0.1133333333, 0.1275, 0.1416666667, 0.1558333333, 0.17, 0.1841666666, 0.0141666667, 0.0283333333, 0.0425, 0.0566666667, 0.0708333333, 0.085, 0.0991666667, 0.1275, 0.1558333333, 0.1841666666, 0.0283333333, 0.0566666667, 0.085, 0.1133333333, 0.1416666667, 0.17, 0.0141666667, 0.0425, 0.0708333333, 0.0991666667, 0.1275, 0.1558333333, 0.1416666667, 0.1841666666, 0.0425, 0.085, 0.1275, 0.17, 0.0283333333, 0.0708333333, 0.1133333333, 0.1558333333, 0.0141666667, 0.0566666667, 0.0991666667, 0.1416666667, 0.1841666666, 0.0425, 0.1841666666, 0.0566666667, 0.1133333333, 0.17, 0.0425, 0.0991666667, 0.1558333333, 0.0283333333, 0.085, 0.1416666667, 0.0141666667, 0.0708333333, 0.1275, 0.1841666666, 0.0566666667, 0.1133333333, 0.0425, 0.1133333333, 0.1841666666, 0.0708333333, 0.1416666667, 0.0283333333, 0.0991666667, 0.17, 0.0566666667, 0.1275, 0.0141666667, 0.085, 0.1558333333, 0.0425, 0.1133333333, 0.1841666666, 0.085, 0.17, 0.0708333333, 0.1558333333, 0.0566666667, 0.1416666667, 0.0425, 0.1275, 0.0283333333, 0.1133333333, 0.0141666667, 0.0991666667, 0.1841666666, 0.085, 0.17, 0.0708333333, 0.1275, 0.0425, 0.1416666667, 0.0566666667, 0.1558333333, 0.0708333333, 0.17, 0.085, 0.1841666666, 0.0991666667, 0.0141666667, 0.1133333333, 0.0283333333, 0.1275, 0.0425, 0.1416666667, 0.17, 0.0991666667, 0.0283333333, 0.1416666667, 0.0708333333, 0.1841666666, 0.1133333333, 0.0425, 0.1558333333, 0.085, 0.0141666667, 0.1275, 0.0566666667, 0.17, 0.0991666667, 0.0283333333, 0.0283333333, 0.1558333333, 0.0991666667, 0.0425, 0.17, 0.1133333333, 0.0566666667, 0.1841666666, 0.1275, 0.0708333333, 0.0141666667, 0.1416666667, 0.085, 0.0283333333, 0.1558333333, 0.0991666667, 0.0708333333, 0.0283333333, 0.17, 0.1275, 0.085, 0.0425, 0.1841666666, 0.1416666667, 0.0991666667, 0.0566666667, 0.0141666667, 0.1558333333, 0.1133333333, 0.0708333333, 0.0283333333, 0.17, 0.1133333333, 0.085, 0.0566666667, 0.0283333333, 0.1841666666, 0.1558333333, 0.1275, 0.0991666667, 0.0708333333, 0.0425, 0.0141666667, 0.17, 0.1416666667, 0.1133333333, 0.085, 0.0566666667, 0.1558333333, 0.1416666667, 0.1275, 0.1133333333, 0.0991666667, 0.085, 0.0708333333, 0.0566666667, 0.0425, 0.0283333333, 0.0141666667, 0.1841666666, 0.17, 0.1558333333, 0.1416666667, 0.1275, 0.0141666667, 0.0141666667, 0.0141666667, 0.0141666667, 0.0141666667, 0.0141666667, 0.0141666667, 0.0141666667, 0.0141666667, 0.0141666667, 0.0141666667, 0.0141666667, 0.0141666667, 0.0141666667, 0.0141666667, 0.0141666667, 0.0566666667, 0.0708333333, 0.085, 0.0991666667, 0.1133333333, 0.1275, 0.1416666667, 0.1558333333, 0.17, 0.1841666666, 0.0141666667, 0.0283333333, 0.0425, 0.0566666667, 0.0708333333, 0.085, 0.0991666667, 0.1275, 0.1558333333, 0.1841666666, 0.0283333333, 0.0566666667, 0.085, 0.1133333333, 0.1416666667, 0.17, 0.0141666667, 0.0425, 0.0708333333, 0.0991666667, 0.1275, 0.1558333333, 0.1416666667, 0.1841666666, 0.0425, 0.085, 0.1275, 0.17, 0.0283333333, 0.0708333333, 0.1133333333, 0.1558333333, 0.0141666667, 0.0566666667, 0.0991666667, 0.1416666667, 0.1841666666, 0.0425], [16, 16])
+    let _ L1_WK ← make_block([0.085, 0.0991666667, 0.1133333333, 0.1275, 0.1416666667, 0.1558333333, 0.17, 0.1841666666, 0.1275, 0.1558333333, 0.1841666666, 0.2125, 0.0566666667, 0.085, 0.1133333333, 0.1416666667, 0.17, 0.2125, 0.0708333333, 0.1133333333, 0.1558333333, 0.1983333334, 0.0566666667, 0.0991666667, 0.2125, 0.085, 0.1416666667, 0.1983333334, 0.0708333333, 0.1275, 0.1841666666, 0.0566666667, 0.0708333333, 0.1416666667, 0.2125, 0.0991666667, 0.17, 0.0566666667, 0.1275, 0.1983333334, 0.1133333333, 0.1983333334, 0.0991666667, 0.1841666666, 0.085, 0.17, 0.0708333333, 0.1558333333, 0.1558333333, 0.0708333333, 0.17, 0.085, 0.1841666666, 0.0991666667, 0.1983333334, 0.1133333333, 0.1983333334, 0.1275, 0.0566666667, 0.17, 0.0991666667, 0.2125, 0.1416666667, 0.0708333333, 0.0566666667, 0.1841666666, 0.1275, 0.0708333333, 0.1983333334, 0.1416666667, 0.085, 0.2125, 0.0991666667, 0.0566666667, 0.1983333334, 0.1558333333, 0.1133333333, 0.0708333333, 0.2125, 0.17, 0.1416666667, 0.1133333333, 0.085, 0.0566666667, 0.2125, 0.1841666666, 0.1558333333, 0.1275, 0.1841666666, 0.17, 0.1558333333, 0.1416666667, 0.1275, 0.1133333333, 0.0991666667, 0.085, 0.0425, 0.0425, 0.0425, 0.0425, 0.0425, 0.0425, 0.0425, 0.0425, 0.085, 0.0991666667, 0.1133333333, 0.1275, 0.1416666667, 0.1558333333, 0.17, 0.1841666666, 0.1275, 0.1558333333, 0.1841666666, 0.2125, 0.0566666667, 0.085, 0.1133333333, 0.1416666667, 0.17, 0.2125, 0.0708333333, 0.1133333333, 0.1558333333, 0.1983333334, 0.0566666667, 0.0991666667], [16, 8])
+    let _ L1_WV ← make_block([0.1133333333, 0.1275, 0.1416666667, 0.1558333333, 0.17, 0.1841666666, 0.1983333334, 0.2125, 0.1558333333, 0.1841666666, 0.2125, 0.2408333334, 0.085, 0.1133333333, 0.1416666667, 0.17, 0.1983333334, 0.2408333334, 0.0991666667, 0.1416666667, 0.1841666666, 0.2266666666, 0.085, 0.1275, 0.2408333334, 0.1133333333, 0.17, 0.2266666666, 0.0991666667, 0.1558333333, 0.2125, 0.085, 0.0991666667, 0.17, 0.2408333334, 0.1275, 0.1983333334, 0.085, 0.1558333333, 0.2266666666, 0.1416666667, 0.2266666666, 0.1275, 0.2125, 0.1133333333, 0.1983333334, 0.0991666667, 0.1841666666, 0.1841666666, 0.0991666667, 0.1983333334, 0.1133333333, 0.2125, 0.1275, 0.2266666666, 0.1416666667, 0.2266666666, 0.1558333333, 0.085, 0.1983333334, 0.1275, 0.2408333334, 0.17, 0.0991666667, 0.085, 0.2125, 0.1558333333, 0.0991666667, 0.2266666666, 0.17, 0.1133333333, 0.2408333334, 0.1275, 0.085, 0.2266666666, 0.1841666666, 0.1416666667, 0.0991666667, 0.2408333334, 0.1983333334, 0.17, 0.1416666667, 0.1133333333, 0.085, 0.2408333334, 0.2125, 0.1841666666, 0.1558333333, 0.2125, 0.1983333334, 0.1841666666, 0.17, 0.1558333333, 0.1416666667, 0.1275, 0.1133333333, 0.0708333333, 0.0708333333, 0.0708333333, 0.0708333333, 0.0708333333, 0.0708333333, 0.0708333333, 0.0708333333, 0.1133333333, 0.1275, 0.1416666667, 0.1558333333, 0.17, 0.1841666666, 0.1983333334, 0.2125, 0.1558333333, 0.1841666666, 0.2125, 0.2408333334, 0.085, 0.1133333333, 0.1416666667, 0.17, 0.1983333334, 0.2408333334, 0.0991666667, 0.1416666667, 0.1841666666, 0.2266666666, 0.085, 0.1275], [16, 8])
+    let _ L1_WO ← make_block([0.1214285714, 0.1335714286, 0.1457142857, 0.1578571429, 0.17, 0.1821428571, 0.1942857143, 0.2064285714, 0.2185714286, 0.2307142857, 0.085, 0.0971428571, 0.1092857143, 0.1214285714, 0.1335714286, 0.1457142857, 0.1578571429, 0.1821428571, 0.2064285714, 0.2307142857, 0.0971428571, 0.1214285714, 0.1457142857, 0.17, 0.1942857143, 0.2185714286, 0.085, 0.1092857143, 0.1335714286, 0.1578571429, 0.1821428571, 0.2064285714, 0.1942857143, 0.2307142857, 0.1092857143, 0.1457142857, 0.1821428571, 0.2185714286, 0.0971428571, 0.1335714286, 0.17, 0.2064285714, 0.085, 0.1214285714, 0.1578571429, 0.1942857143, 0.2307142857, 0.1092857143, 0.2307142857, 0.1214285714, 0.17, 0.2185714286, 0.1092857143, 0.1578571429, 0.2064285714, 0.0971428571, 0.1457142857, 0.1942857143, 0.085, 0.1335714286, 0.1821428571, 0.2307142857, 0.1214285714, 0.17, 0.1092857143, 0.17, 0.2307142857, 0.1335714286, 0.1942857143, 0.0971428571, 0.1578571429, 0.2185714286, 0.1214285714, 0.1821428571, 0.085, 0.1457142857, 0.2064285714, 0.1092857143, 0.17, 0.2307142857, 0.1457142857, 0.2185714286, 0.1335714286, 0.2064285714, 0.1214285714, 0.1942857143, 0.1092857143, 0.1821428571, 0.0971428571, 0.17, 0.085, 0.1578571429, 0.2307142857, 0.1457142857, 0.2185714286, 0.1335714286, 0.1821428571, 0.1092857143, 0.1942857143, 0.1214285714, 0.2064285714, 0.1335714286, 0.2185714286, 0.1457142857, 0.2307142857, 0.1578571429, 0.085, 0.17, 0.0971428571, 0.1821428571, 0.1092857143, 0.1942857143, 0.2185714286, 0.1578571429, 0.0971428571, 0.1942857143, 0.1335714286, 0.2307142857, 0.17, 0.1092857143, 0.2064285714, 0.1457142857, 0.085, 0.1821428571, 0.1214285714, 0.2185714286, 0.1578571429, 0.0971428571, 0.0971428571, 0.2064285714, 0.1578571429, 0.1092857143, 0.2185714286, 0.17, 0.1214285714, 0.2307142857, 0.1821428571, 0.1335714286, 0.085, 0.1942857143, 0.1457142857, 0.0971428571, 0.2064285714, 0.1578571429, 0.1335714286, 0.0971428571, 0.2185714286, 0.1821428571, 0.1457142857, 0.1092857143, 0.2307142857, 0.1942857143, 0.1578571429, 0.1214285714, 0.085, 0.2064285714, 0.17, 0.1335714286, 0.0971428571, 0.2185714286, 0.17, 0.1457142857, 0.1214285714, 0.0971428571, 0.2307142857, 0.2064285714, 0.1821428571, 0.1578571429, 0.1335714286, 0.1092857143, 0.085, 0.2185714286, 0.1942857143, 0.17, 0.1457142857, 0.1214285714, 0.2064285714, 0.1942857143, 0.1821428571, 0.17, 0.1578571429, 0.1457142857, 0.1335714286, 0.1214285714, 0.1092857143, 0.0971428571, 0.085, 0.2307142857, 0.2185714286, 0.2064285714, 0.1942857143, 0.1821428571, 0.085, 0.085, 0.085, 0.085, 0.085, 0.085, 0.085, 0.085, 0.085, 0.085, 0.085, 0.085, 0.085, 0.085, 0.085, 0.085, 0.1214285714, 0.1335714286, 0.1457142857, 0.1578571429, 0.17, 0.1821428571, 0.1942857143, 0.2064285714, 0.2185714286, 0.2307142857, 0.085, 0.0971428571, 0.1092857143, 0.1214285714, 0.1335714286, 0.1457142857, 0.1578571429, 0.1821428571, 0.2064285714, 0.2307142857, 0.0971428571, 0.1214285714, 0.1457142857, 0.17, 0.1942857143, 0.2185714286, 0.085, 0.1092857143, 0.1335714286, 0.1578571429, 0.1821428571, 0.2064285714, 0.1942857143, 0.2307142857, 0.1092857143, 0.1457142857, 0.1821428571, 0.2185714286, 0.0971428571, 0.1335714286, 0.17, 0.2064285714, 0.085, 0.1214285714, 0.1578571429, 0.1942857143, 0.2307142857, 0.1092857143], [16, 16])
+    let _ L1_WG ← make_block([0.0708333333, 0.085, 0.0991666667, 0.1133333333, 0.1275, 0.1416666667, 0.1558333333, 0.17, 0.1841666666, 0.1983333334, 0.0283333333, 0.0425, 0.0566666667, 0.0708333333, 0.085, 0.0991666667, 0.1133333333, 0.1416666667, 0.17, 0.1983333334, 0.0425, 0.0708333333, 0.0991666667, 0.1275, 0.1558333333, 0.1841666666, 0.0283333333, 0.0566666667, 0.085, 0.1133333333, 0.1416666667, 0.17, 0.1558333333, 0.1983333334, 0.0566666667, 0.0991666667, 0.1416666667, 0.1841666666, 0.0425, 0.085, 0.1275, 0.17, 0.0283333333, 0.0708333333, 0.1133333333, 0.1558333333, 0.1983333334, 0.0566666667, 0.1983333334, 0.0708333333, 0.1275, 0.1841666666, 0.0566666667, 0.1133333333, 0.17, 0.0425, 0.0991666667, 0.1558333333, 0.0283333333, 0.085, 0.1416666667, 0.1983333334, 0.0708333333, 0.1275, 0.0566666667, 0.1275, 0.1983333334, 0.085, 0.1558333333, 0.0425, 0.1133333333, 0.1841666666, 0.0708333333, 0.1416666667, 0.0283333333, 0.0991666667, 0.17, 0.0566666667, 0.1275, 0.1983333334, 0.0991666667, 0.1841666666, 0.085, 0.17, 0.0708333333, 0.1558333333, 0.0566666667, 0.1416666667, 0.0425, 0.1275, 0.0283333333, 0.1133333333, 0.1983333334, 0.0991666667, 0.1841666666, 0.085, 0.1416666667, 0.0566666667, 0.1558333333, 0.0708333333, 0.17, 0.085, 0.1841666666, 0.0991666667, 0.1983333334, 0.1133333333, 0.0283333333, 0.1275, 0.0425, 0.1416666667, 0.0566666667, 0.1558333333, 0.1841666666, 0.1133333333, 0.0425, 0.1558333333, 0.085, 0.1983333334, 0.1275, 0.0566666667, 0.17, 0.0991666667, 0.0283333333, 0.1416666667, 0.0708333333, 0.1841666666, 0.1133333333, 0.0425, 0.0425, 0.17, 0.1133333333, 0.0566666667, 0.1841666666, 0.1275, 0.0708333333, 0.1983333334, 0.1416666667, 0.085, 0.0283333333, 0.1558333333, 0.0991666667, 0.0425, 0.17, 0.1133333333, 0.085, 0.0425, 0.1841666666, 0.1416666667, 0.0991666667, 0.0566666667, 0.1983333334, 0.1558333333, 0.1133333333, 0.0708333333, 0.0283333333, 0.17, 0.1275, 0.085, 0.0425, 0.1841666666, 0.1275, 0.0991666667, 0.0708333333, 0.0425, 0.1983333334, 0.17, 0.1416666667, 0.1133333333, 0.085, 0.0566666667, 0.0283333333, 0.1841666666, 0.1558333333, 0.1275, 0.0991666667, 0.0708333333, 0.17, 0.1558333333, 0.1416666667, 0.1275, 0.1133333333, 0.0991666667, 0.085, 0.0708333333, 0.0566666667, 0.0425, 0.0283333333, 0.1983333334, 0.1841666666, 0.17, 0.1558333333, 0.1416666667, 0.0283333333, 0.0283333333, 0.0283333333, 0.0283333333, 0.0283333333, 0.0283333333, 0.0283333333, 0.0283333333, 0.0283333333, 0.0283333333, 0.0283333333, 0.0283333333, 0.0283333333, 0.0283333333, 0.0283333333, 0.0283333333, 0.0708333333, 0.085, 0.0991666667, 0.1133333333, 0.1275, 0.1416666667, 0.1558333333, 0.17, 0.1841666666, 0.1983333334, 0.0283333333, 0.0425, 0.0566666667, 0.0708333333, 0.085, 0.0991666667, 0.1133333333, 0.1416666667, 0.17, 0.1983333334, 0.0425, 0.0708333333, 0.0991666667, 0.1275, 0.1558333333, 0.1841666666, 0.0283333333, 0.0566666667, 0.085, 0.1133333333, 0.1416666667, 0.17, 0.1558333333, 0.1983333334, 0.0566666667, 0.0991666667, 0.1416666667, 0.1841666666, 0.0425, 0.085, 0.1275, 0.17, 0.0283333333, 0.0708333333, 0.1133333333, 0.1558333333, 0.1983333334, 0.0566666667], [16, 16])
+    let _ L1_WU ← make_block([0.0991666667, 0.1133333333, 0.1275, 0.1416666667, 0.1558333333, 0.17, 0.1841666666, 0.1983333334, 0.2125, 0.2266666666, 0.0566666667, 0.0708333333, 0.085, 0.0991666667, 0.1133333333, 0.1275, 0.1416666667, 0.17, 0.1983333334, 0.2266666666, 0.0708333333, 0.0991666667, 0.1275, 0.1558333333, 0.1841666666, 0.2125, 0.0566666667, 0.085, 0.1133333333, 0.1416666667, 0.17, 0.1983333334, 0.1841666666, 0.2266666666, 0.085, 0.1275, 0.17, 0.2125, 0.0708333333, 0.1133333333, 0.1558333333, 0.1983333334, 0.0566666667, 0.0991666667, 0.1416666667, 0.1841666666, 0.2266666666, 0.085, 0.2266666666, 0.0991666667, 0.1558333333, 0.2125, 0.085, 0.1416666667, 0.1983333334, 0.0708333333, 0.1275, 0.1841666666, 0.0566666667, 0.1133333333, 0.17, 0.2266666666, 0.0991666667, 0.1558333333, 0.085, 0.1558333333, 0.2266666666, 0.1133333333, 0.1841666666, 0.0708333333, 0.1416666667, 0.2125, 0.0991666667, 0.17, 0.0566666667, 0.1275, 0.1983333334, 0.085, 0.1558333333, 0.2266666666, 0.1275, 0.2125, 0.1133333333, 0.1983333334, 0.0991666667, 0.1841666666, 0.085, 0.17, 0.0708333333, 0.1558333333, 0.0566666667, 0.1416666667, 0.2266666666, 0.1275, 0.2125, 0.1133333333, 0.17, 0.085, 0.1841666666, 0.0991666667, 0.1983333334, 0.1133333333, 0.2125, 0.1275, 0.2266666666, 0.1416666667, 0.0566666667, 0.1558333333, 0.0708333333, 0.17, 0.085, 0.1841666666, 0.2125, 0.1416666667, 0.0708333333, 0.1841666666, 0.1133333333, 0.2266666666, 0.1558333333, 0.085, 0.1983333334, 0.1275, 0.0566666667, 0.17, 0.0991666667, 0.2125, 0.1416666667, 0.0708333333, 0.0708333333, 0.1983333334, 0.1416666667, 0.085, 0.2125, 0.1558333333, 0.0991666667, 0.2266666666, 0.17, 0.1133333333, 0.0566666667, 0.1841666666, 0.1275, 0.0708333333, 0.1983333334, 0.1416666667, 0.1133333333, 0.0708333333, 0.2125, 0.17, 0.1275, 0.085, 0.2266666666, 0.1841666666, 0.1416666667, 0.0991666667, 0.0566666667, 0.1983333334, 0.1558333333, 0.1133333333, 0.0708333333, 0.2125, 0.1558333333, 0.1275, 0.0991666667, 0.0708333333, 0.2266666666, 0.1983333334, 0.17, 0.1416666667, 0.1133333333, 0.085, 0.0566666667, 0.2125, 0.1841666666, 0.1558333333, 0.1275, 0.0991666667, 0.1983333334, 0.1841666666, 0.17, 0.1558333333, 0.1416666667, 0.1275, 0.1133333333, 0.0991666667, 0.085, 0.0708333333, 0.0566666667, 0.2266666666, 0.2125, 0.1983333334, 0.1841666666, 0.17, 0.0566666667, 0.0566666667, 0.0566666667, 0.0566666667, 0.0566666667, 0.0566666667, 0.0566666667, 0.0566666667, 0.0566666667, 0.0566666667, 0.0566666667, 0.0566666667, 0.0566666667, 0.0566666667, 0.0566666667, 0.0566666667, 0.0991666667, 0.1133333333, 0.1275, 0.1416666667, 0.1558333333, 0.17, 0.1841666666, 0.1983333334, 0.2125, 0.2266666666, 0.0566666667, 0.0708333333, 0.085, 0.0991666667, 0.1133333333, 0.1275, 0.1416666667, 0.17, 0.1983333334, 0.2266666666, 0.0708333333, 0.0991666667, 0.1275, 0.1558333333, 0.1841666666, 0.2125, 0.0566666667, 0.085, 0.1133333333, 0.1416666667, 0.17, 0.1983333334, 0.1841666666, 0.2266666666, 0.085, 0.1275, 0.17, 0.2125, 0.0708333333, 0.1133333333, 0.1558333333, 0.1983333334, 0.0566666667, 0.0991666667, 0.1416666667, 0.1841666666, 0.2266666666, 0.085], [16, 16])
+    let _ L1_WD ← make_block([0.1275, 0.1416666667, 0.1558333333, 0.17, 0.1841666666, 0.1983333334, 0.2125, 0.2266666666, 0.2408333334, 0.255, 0.085, 0.0991666667, 0.1133333333, 0.1275, 0.1416666667, 0.1558333333, 0.17, 0.1983333334, 0.2266666666, 0.255, 0.0991666667, 0.1275, 0.1558333333, 0.1841666666, 0.2125, 0.2408333334, 0.085, 0.1133333333, 0.1416666667, 0.17, 0.1983333334, 0.2266666666, 0.2125, 0.255, 0.1133333333, 0.1558333333, 0.1983333334, 0.2408333334, 0.0991666667, 0.1416666667, 0.1841666666, 0.2266666666, 0.085, 0.1275, 0.17, 0.2125, 0.255, 0.1133333333, 0.255, 0.1275, 0.1841666666, 0.2408333334, 0.1133333333, 0.17, 0.2266666666, 0.0991666667, 0.1558333333, 0.2125, 0.085, 0.1416666667, 0.1983333334, 0.255, 0.1275, 0.1841666666, 0.1133333333, 0.1841666666, 0.255, 0.1416666667, 0.2125, 0.0991666667, 0.17, 0.2408333334, 0.1275, 0.1983333334, 0.085, 0.1558333333, 0.2266666666, 0.1133333333, 0.1841666666, 0.255, 0.1558333333, 0.2408333334, 0.1416666667, 0.2266666666, 0.1275, 0.2125, 0.1133333333, 0.1983333334, 0.0991666667, 0.1841666666, 0.085, 0.17, 0.255, 0.1558333333, 0.2408333334, 0.1416666667, 0.1983333334, 0.1133333333, 0.2125, 0.1275, 0.2266666666, 0.1416666667, 0.2408333334, 0.1558333333, 0.255, 0.17, 0.085, 0.1841666666, 0.0991666667, 0.1983333334, 0.1133333333, 0.2125, 0.2408333334, 0.17, 0.0991666667, 0.2125, 0.1416666667, 0.255, 0.1841666666, 0.1133333333, 0.2266666666, 0.1558333333, 0.085, 0.1983333334, 0.1275, 0.2408333334, 0.17, 0.0991666667, 0.0991666667, 0.2266666666, 0.17, 0.1133333333, 0.2408333334, 0.1841666666, 0.1275, 0.255, 0.1983333334, 0.1416666667, 0.085, 0.2125, 0.1558333333, 0.0991666667, 0.2266666666, 0.17, 0.1416666667, 0.0991666667, 0.2408333334, 0.1983333334, 0.1558333333, 0.1133333333, 0.255, 0.2125, 0.17, 0.1275, 0.085, 0.2266666666, 0.1841666666, 0.1416666667, 0.0991666667, 0.2408333334, 0.1841666666, 0.1558333333, 0.1275, 0.0991666667, 0.255, 0.2266666666, 0.1983333334, 0.17, 0.1416666667, 0.1133333333, 0.085, 0.2408333334, 0.2125, 0.1841666666, 0.1558333333, 0.1275, 0.2266666666, 0.2125, 0.1983333334, 0.1841666666, 0.17, 0.1558333333, 0.1416666667, 0.1275, 0.1133333333, 0.0991666667, 0.085, 0.255, 0.2408333334, 0.2266666666, 0.2125, 0.1983333334, 0.085, 0.085, 0.085, 0.085, 0.085, 0.085, 0.085, 0.085, 0.085, 0.085, 0.085, 0.085, 0.085, 0.085, 0.085, 0.085, 0.1275, 0.1416666667, 0.1558333333, 0.17, 0.1841666666, 0.1983333334, 0.2125, 0.2266666666, 0.2408333334, 0.255, 0.085, 0.0991666667, 0.1133333333, 0.1275, 0.1416666667, 0.1558333333, 0.17, 0.1983333334, 0.2266666666, 0.255, 0.0991666667, 0.1275, 0.1558333333, 0.1841666666, 0.2125, 0.2408333334, 0.085, 0.1133333333, 0.1416666667, 0.17, 0.1983333334, 0.2266666666, 0.2125, 0.255, 0.1133333333, 0.1558333333, 0.1983333334, 0.2408333334, 0.0991666667, 0.1416666667, 0.1841666666, 0.2266666666, 0.085, 0.1275, 0.17, 0.2125, 0.255, 0.1133333333], [16, 16])
+    let _ EMBED ← pack_embedding(make_block([0.04, 0.045, 0.05, 0.055, 0.06, 0.065, 0.005, 0.01, 0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.005, 0.015, 0.045, 0.06, 0.01, 0.025, 0.04, 0.055, 0.005, 0.02, 0.015, 0.035, 0.055, 0.01, 0.03, 0.05, 0.005, 0.025, 0.05, 0.01, 0.035, 0.06, 0.02, 0.045, 0.005, 0.03, 0.02, 0.05, 0.015, 0.045, 0.01, 0.04, 0.005, 0.035, 0.055, 0.025, 0.06, 0.03, 0.065, 0.035, 0.005, 0.04, 0.025, 0.065, 0.04, 0.015, 0.055, 0.03, 0.005, 0.045, 0.06, 0.04, 0.02, 0.065, 0.045, 0.025, 0.005, 0.05, 0.03, 0.015, 0.065, 0.05, 0.035, 0.02, 0.005, 0.055, 0.065, 0.055, 0.045, 0.035, 0.025, 0.015, 0.005, 0.06, 0.035, 0.03, 0.025, 0.02, 0.015, 0.01, 0.005, 0.065, 0.005, 0.005, 0.005, 0.005, 0.005, 0.005, 0.005, 0.005, 0.04, 0.045, 0.05, 0.055, 0.06, 0.065, 0.005, 0.01, 0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.005, 0.015, 0.045, 0.06, 0.01, 0.025, 0.04, 0.055, 0.005, 0.02], [16, 8]))
+    let _ NORM_S ← make_block([0.9, 0.95, 1.0, 1.05, 1.1, 1.15, 1.2, 1.25, 1.3, 1.35, 1.4, 1.45, 1.5, 1.55, 1.6, 1.65], [16])
+    let _ W_HEAD ← make_block([0.0166666667, 0.0208333333, 0.025, 0.0291666667, 0.0333333333, 0.0375, 0.0416666667, 0.0458333333, 0.0291666667, 0.0375, 0.0458333333, 0.0541666667, 0.0083333333, 0.0166666667, 0.025, 0.0333333333, 0.0416666667, 0.0541666667, 0.0125, 0.025, 0.0375, 0.05, 0.0083333333, 0.0208333333, 0.0541666667, 0.0166666667, 0.0333333333, 0.05, 0.0125, 0.0291666667, 0.0458333333, 0.0083333333, 0.0125, 0.0333333333, 0.0541666667, 0.0208333333, 0.0416666667, 0.0083333333, 0.0291666667, 0.05, 0.025, 0.05, 0.0208333333, 0.0458333333, 0.0166666667, 0.0416666667, 0.0125, 0.0375, 0.0375, 0.0125, 0.0416666667, 0.0166666667, 0.0458333333, 0.0208333333, 0.05, 0.025, 0.05, 0.0291666667, 0.0083333333, 0.0416666667, 0.0208333333, 0.0541666667, 0.0333333333, 0.0125, 0.0083333333, 0.0458333333, 0.0291666667, 0.0125, 0.05, 0.0333333333, 0.0166666667, 0.0541666667, 0.0208333333, 0.0083333333, 0.05, 0.0375, 0.025, 0.0125, 0.0541666667, 0.0416666667, 0.0333333333, 0.025, 0.0166666667, 0.0083333333, 0.0541666667, 0.0458333333, 0.0375, 0.0291666667, 0.0458333333, 0.0416666667, 0.0375, 0.0333333333, 0.0291666667, 0.025, 0.0208333333, 0.0166666667, 0.0041666667, 0.0041666667, 0.0041666667, 0.0041666667, 0.0041666667, 0.0041666667, 0.0041666667, 0.0041666667, 0.0166666667, 0.0208333333, 0.025, 0.0291666667, 0.0333333333, 0.0375, 0.0416666667, 0.0458333333, 0.0291666667, 0.0375, 0.0458333333, 0.0541666667, 0.0083333333, 0.0166666667, 0.025, 0.0333333333, 0.0416666667, 0.0541666667, 0.0125, 0.025, 0.0375, 0.05, 0.0083333333, 0.0208333333], [16, 8])
+    let _ rope_cfg ← rope_config(100000.0, 1.0, rope.consecutive_policy())
+    let list<tensor.NumericBlock> l0 ← [L0_LN1, L0_WQ, L0_WK, L0_WV, L0_WO, L0_LN2, L0_WG, L0_WU, L0_WD]
+    let list<tensor.NumericBlock> l1 ← [L1_LN1, L1_WQ, L1_WK, L1_WV, L1_WO, L1_LN2, L1_WG, L1_WU, L1_WD]
+    let dense.DenseConfig cfg ← dense.DenseConfig {layers = 2, heads = 4, kv_heads = 2, head_dim = 4, hidden_dim = 16, vocab = 8, tied = true}
+    do {
+        bench(cfg, (string n, int s) → tensor.NumericBlock ⇥ dense.DenseError ∴ resolve_tensor(n, s, EMBED, NORM_S, W_HEAD, l0, l1), build_model(EMBED, NORM_S, l0, l1), rope_cfg)
+    }
+    catch err {
+        fail("bench raised " + err.message)
+    }
+}
