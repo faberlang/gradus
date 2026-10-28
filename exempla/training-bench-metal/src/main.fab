@@ -1,0 +1,597 @@
+# training-bench-metal — the 4×4 MLP training loop, timed on a device.
+#
+# Public entry: the `training-bench-metal` executable package.
+# Depends on: gradus:math (device kernels sub/mul), gradus:mlp (parity
+# reference), gradus:optimize, gradus:train, gradus:parameter, gradus:gradient,
+# gradus:tensor.
+#
+#   faber run --device metal --stats-file STATS --library-home <faberlang/> \
+#       exempla/training-bench-metal
+#   faber run --device metal --library-home <faberlang/> \
+#       exempla/training-bench-metal -- large
+#
+# WHAT IT TIMES: the same workload as `exempla/training-loop-mlp` (a 4×4
+# two-layer MLP, linear → GELU → linear → MSE; 100 steps; lr 0.1) with every
+# step's forward, backward and SGD update dispatched as device kernels. One
+# timed loop is the 100 steps plus the read-back of the four trained weights,
+# so every launch has finished when the clock stops. Weights are re-uploaded
+# before each repetition, outside the clock. The program repeats the loop
+# (REPEATS times) and reports the MEDIAN steps per second on the line
+# `train_steps_per_s <number>`. The loss is read back every step, as the
+# FMIR exemplum records it every step.
+#
+# WHAT IT CHECKS (any failure prints FAIL and exits 1):
+#   * every repetition's 100-step loss trace against the f64 oracle pins
+#     (steps 0/10/25/50/75/99; README of training-loop-mlp and
+#     src/train.proba) within PIN_TOLERANCE relative;
+#   * the device loss and gradients at step 0 against the library's own
+#     `mlp.forward_mlp_loss` / `forward_mlp_loss_backward` run on the host;
+#   * the checkpoint round-trip (serialize → deserialize → equal) built from
+#     the trained weights through gradus:optimize and gradus:train.
+#
+# TOLERANCE: the pins are f64 evaluations; the device computes in f32 (Metal
+# has no f64). One f32 ulp is 6e-8 relative; 100 steps of SGD through GELU
+# accumulate a few ulps. Measured worst pin error: 4.9e-8 on the MIR runner
+# (`--device reference`), 3.7e-7 on Metal. PIN_TOLERANCE = 1e-5 is about 25×
+# the Metal figure, and still far below any real defect: a wrong gradient or
+# a wrong update moves a pinned loss by 1e-3 or more.
+#
+# WHY THE LOSS FUNCTION IS CARRIED HERE: `mlp.forward_mlp_loss` is generic
+# over [M, K, H, N]. A generic `@ kernel` that also carries `@ radix backward`
+# fails when its companion is called ("generic AIR definition has no analyzed
+# template"), and a kernel cannot call a non-kernel function, so the library
+# function cannot be the device entry. `mlp_loss` below is the same seven-line
+# composition at the concrete 4×4 shape; the step-0 parity checks pin it to
+# the library. The SGD update uses the library's own `math.mul` / `math.sub`
+# kernels (a tensor-by-scalar lift does not lower to Metal, so the learning
+# rate rides as a tensor).
+#
+# THE LARGE MODE (`-- large`, off by default): the same composition at
+# 512×512 for a loop whose time is compute, not launch overhead. It has no
+# pinned oracle, so its gate is the step-0 device loss against the library
+# forward on the host, then finite / falling / reproducible losses. It
+# currently FAILS that gate on Metal: the fused AIR forward returns a wrong
+# loss for matrix extents of 32 and above (see README.md for the reproducer).
+# Do not quote its steps per second until it passes.
+
+import from "norma:process" process
+import from "norma:time" time
+import from "gradus:math" math
+import from "gradus:mlp" mlp
+import from "gradus:gradient" gradient
+import from "gradus:optimize" optimize
+import from "gradus:train" train
+import from "gradus:parameter" parameter
+import from "gradus:tensor" tensor
+
+const int STEPS = 100
+const int REPEATS = 7
+const int LARGE_STEPS = 100
+const int LARGE_REPEATS = 5
+const int LARGE_SIZE = 512
+const f32 LARGE_RATE = 0.05
+const f64 PIN_TOLERANCE = 0.00001
+const f64 GRADIENT_TOLERANCE = 0.00001
+const f64 GRADIENT_FLOOR = 0.001
+
+# --- device entry: the differentiable loss and its companion ---------------
+
+@ kernel
+@ radix { lane = "air" }
+@ radix backward "mlp_loss_backward"
+@ public
+fn mlp_loss(tensor<f32, [4, 4]> input, tensor<f32, [4, 4]> weight1, tensor<f32, [4, 4]> bias1, tensor<f32, [4, 4]> weight2, tensor<f32, [4, 4]> bias2, tensor<f32, [4, 4]> target) → f32 {
+    let _ h1 ← input · weight1
+    let _ h1b ← h1 + bias1
+    let _ a1 ← h1b.gelu()
+    let _ h2 ← a1 · weight2
+    let _ h2b ← h2 + bias2
+    let _ resd ← h2b - target
+    let _ sqrd ← resd ⊙ resd
+    return sqrd.mean()
+}
+
+# The large configuration: the same composition at 512×512, for a loop whose
+# time is compute rather than launch overhead.
+@ kernel
+@ radix { lane = "air" }
+@ radix backward "mlp_loss_large_backward"
+@ public
+fn mlp_loss_large(tensor<f32, [512, 512]> input, tensor<f32, [512, 512]> weight1, tensor<f32, [512, 512]> bias1, tensor<f32, [512, 512]> weight2, tensor<f32, [512, 512]> bias2, tensor<f32, [512, 512]> target) → f32 {
+    let _ h1 ← input · weight1
+    let _ h1b ← h1 + bias1
+    let _ a1 ← h1b.gelu()
+    let _ h2 ← a1 · weight2
+    let _ h2b ← h2 + bias2
+    let _ resd ← h2b - target
+    let _ sqrd ← resd ⊙ resd
+    return sqrd.mean()
+}
+
+fn nil() → void {
+    pass
+}
+
+# --- builder adapters (the exemplum's non-failable boundary) ----------------
+
+fn stage_tensor(list<f32> data, list<int> shape) → tensor.NumericBlock {
+    mut tensor.NumericBlock t ← tensor.default()
+    do {
+        t ← tensor.construct(data, shape)
+    }
+    catch err {
+        return t
+    }
+    return t
+}
+
+fn build_parameter(string name, list<f32> data) → parameter.Parameter {
+    mut parameter.Parameter p ← parameter.default()
+    do {
+        p ← parameter.construct(name, "model.mlp", "f32", [4, 4], data)
+    }
+    catch err {
+        return p
+    }
+    return p
+}
+
+fn build_state(string name, int version, f32 rate) → optimize.SgdState {
+    mut optimize.SgdState s ← optimize.default()
+    do {
+        s ← optimize.construct(name, "model.mlp", version, rate)
+    }
+    catch err {
+        return s
+    }
+    return s
+}
+
+fn build_gradient(string name, int version, tensor.NumericBlock value) → gradient.Gradient {
+    mut gradient.Gradient g ← gradient.default()
+    do {
+        g ← gradient.construct(name, "model.mlp", version, value)
+    }
+    catch err {
+        return g
+    }
+    return g
+}
+
+fn optimizer_step(optimize.SgdState s, parameter.Parameter p, gradient.Gradient g) → optimize.StepResult {
+    mut optimize.StepResult r ← optimize.default_step()
+    do {
+        r ← optimize.step(s, p, g)
+    }
+    catch err {
+        return r
+    }
+    return r
+}
+
+fn build_seed(int seed) → train.Seed {
+    mut train.Seed s ← train.default()
+    do {
+        s ← train.construct_seed(seed)
+    }
+    catch err {
+        return s
+    }
+    return s
+}
+
+fn build_sgd(optimize.SgdState a, optimize.SgdState b, optimize.SgdState c, optimize.SgdState d) → optimize.Sgd {
+    mut optimize.Sgd o ← optimize.default_sgd()
+    do {
+        let _ o1 ← optimize.add(optimize.empty_sgd(), a)
+        let _ o2 ← optimize.add(o1, b)
+        let _ o3 ← optimize.add(o2, c)
+        o ← optimize.add(o3, d)
+    }
+    catch err {
+        return o
+    }
+    return o
+}
+
+fn build_checkpoint(int age, int step, train.Seed rng, string state_wire) → train.Checkpoint {
+    mut train.Checkpoint t ← train.default_checkpoint()
+    do {
+        t ← train.construct_checkpoint(age, step, rng, state_wire)
+    }
+    catch err {
+        return t
+    }
+    return t
+}
+
+fn restore_checkpoint(string wire) → train.Checkpoint {
+    mut train.Checkpoint t ← train.default_checkpoint()
+    do {
+        t ← train.deserialize_checkpoint(wire)
+    }
+    catch err {
+        return t
+    }
+    return t
+}
+
+# --- checks ------------------------------------------------------------------
+
+fn fail(string reason) {
+    print "FAIL " + reason
+    process.exit_process(1)
+}
+
+# |observed - expected| / |expected|; the pinned values are never zero.
+fn relative_error(f64 observed, f64 expected) → f64 {
+    mut f64 difference ← observed - expected
+    if difference ≺ 0.0 {
+        difference ← -difference
+    }
+    mut f64 scale ← expected
+    if scale ≺ 0.0 {
+        scale ← -scale
+    }
+    return difference ÷ scale
+}
+
+# Gradient entries can be exactly zero, so their scale has a floor: below
+# GRADIENT_FLOOR the error is absolute.
+fn scaled_error(f64 observed, f64 expected) → f64 {
+    mut f64 difference ← observed - expected
+    if difference ≺ 0.0 {
+        difference ← -difference
+    }
+    mut f64 scale ← expected
+    if scale ≺ 0.0 {
+        scale ← -scale
+    }
+    if scale ≺ GRADIENT_FLOOR {
+        scale ← GRADIENT_FLOOR
+    }
+    return difference ÷ scale
+}
+
+# One pin: the f32 trace entry against its f64 oracle. Returns the relative
+# error; a miss past PIN_TOLERANCE fails the run (a NaN fails too, because
+# `≤` is false for it).
+fn check_pin(list<f32> trace, int step, f64 expected) → f64 {
+    let f64 observed ← trace[step] ↦ f64
+    let f64 error ← relative_error(observed, expected)
+    if not (error ≤ PIN_TOLERANCE) {
+        fail("loss pin step § observed § expected §"(step, observed, expected))
+    }
+    return error
+}
+
+fn check_trace(list<f32> trace) → f64 {
+    if trace.length() ≢ STEPS {
+        fail("loss trace length §"(trace.length()))
+    }
+    mut f64 worst ← 0.0
+    let list<int> at ← [0, 10, 25, 50, 75, 99]
+    let list<f64> pins ← [1.576448169383708, 0.7815377070077427, 0.4303461875641296,
+                           0.13848813116166797, 0.04746405569680761, 0.017928625511508454]
+    for range 0‥at.length() let i {
+        let f64 error ← check_pin(trace, at[i], pins[i])
+        if error ≻ worst {
+            worst ← error
+        }
+    }
+    return worst
+}
+
+# Device gradient against the library companion run on the host.
+fn check_gradient(string name, tensor<f32, [4, 4]> device, tensor<f32, [4, 4]> library) {
+    let list<f32> d ← device ↦ list<f32>
+    let list<f32> l ← library ↦ list<f32>
+    for range 0‥16 let i {
+        let f64 error ← scaled_error(d[i] ↦ f64, l[i] ↦ f64)
+        if not (error ≤ GRADIENT_TOLERANCE) {
+            fail("gradient §[§] device § library §"(name, i, d[i], l[i]))
+        }
+    }
+}
+
+# --- the large configuration ---------------------------------------------------
+
+# Deterministic fill: entry (i, j) of an n × n matrix is
+# ((i·a + j·b + c) mod m − m/2) · scale + offset.
+fn pattern(int n, int a, int b, int c, int m, f32 scale, f32 offset) → list<f32> {
+    mut list<f32> out ← empty
+    for range 0‥n let i {
+        for range 0‥n let j {
+            let int v ← (i * a + j * b + c) % m - m / 2
+            out.append((v ↦ f32) * scale + offset)
+        }
+    }
+    return out
+}
+
+fn constant(int count, f32 value) → list<f32> {
+    mut list<f32> out ← empty
+    for range 0‥count let i {
+        out.append(value)
+    }
+    return out
+}
+
+# The large shapes are all [512, 512] (LARGE_SIZE; a tensor type needs the
+# literal, so the two must agree). The conversion is failable (the length is a
+# run-time fact), so it sits behind a handler.
+fn square_tensor(list<f32> data) → tensor<f32, [512, 512]> {
+    mut tensor<f32, [512, 512]> t ← tf32[512, 512] {}
+    do {
+        t ← data ↦ tensor<f32, [512, 512]>
+    }
+    catch err {
+        fail("large [512, 512] tensor conversion failed")
+    }
+    return t
+}
+
+# No pinned oracle exists at this size, so the checks are self-consistency:
+# every loss finite, the loss falls over the loop, and every repetition
+# reproduces the first repetition's trace within PIN_TOLERANCE.
+fn check_large_trace(list<f32> trace, list<f32> reference) {
+    if trace.length() ≢ LARGE_STEPS {
+        fail("large loss trace length §"(trace.length()))
+    }
+    for range 0‥LARGE_STEPS let i {
+        let f64 loss ← trace[i] ↦ f64
+        if not (loss ≥ 0.0 and loss ≺ 1000000.0) {
+            fail("large loss step § not finite: §"(i, loss))
+        }
+        if not (relative_error(loss, reference[i] ↦ f64) ≤ PIN_TOLERANCE) {
+            fail("large loss step § differs from repetition 0: § vs §"(i, loss, reference[i]))
+        }
+    }
+    if not (trace[LARGE_STEPS - 1] ≺ trace[0] * 0.9) {
+        fail("large loss did not fall: § to §"(trace[0], trace[LARGE_STEPS - 1]))
+    }
+}
+
+fn check_finite(string name, list<f32> values) {
+    for from values let v {
+        if not (v ≥ -1000000.0 and v ≤ 1000000.0) {
+            fail("large trained weight § is not finite: §"(name, v))
+        }
+    }
+}
+
+fn large_workload() {
+    let int n ← LARGE_SIZE
+    let tensor<f32, [512, 512]> input ← square_tensor(pattern(n, 7, 3, 0, 11, 0.1, 0.0))
+    let tensor<f32, [512, 512]> target ← square_tensor(pattern(n, 3, 5, 2, 7, 0.1, 0.5))
+    let tensor<f32, [512, 512]> rate_large ← square_tensor(constant(n * n, LARGE_RATE))
+    let list<f32> data_w1 ← pattern(n, 5, 2, 1, 13, 0.1, 0.0)
+    let list<f32> data_b1 ← pattern(n, 1, 3, 4, 9, 0.01, 0.0)
+    let list<f32> data_w2 ← pattern(n, 2, 7, 3, 17, 0.03, 0.0)
+    let list<f32> data_b2 ← pattern(n, 3, 1, 5, 5, 0.01, 0.0)
+
+    # Step-0 parity: the device loss against the library's own forward run on
+    # the host. This is the gate for the large loop's numbers: the device
+    # forward must agree with the host before a throughput is worth quoting.
+    let tensor<f32, [512, 512]> p_w1 ← square_tensor(data_w1)
+    let tensor<f32, [512, 512]> p_b1 ← square_tensor(data_b1)
+    let tensor<f32, [512, 512]> p_w2 ← square_tensor(data_w2)
+    let tensor<f32, [512, 512]> p_b2 ← square_tensor(data_b2)
+    let f32 library_loss ← mlp.forward_mlp_loss(input, p_w1, p_b1, p_w2, p_b2, target)
+    let f32 device_loss ← mlp_loss_large(input, p_w1, p_b1, p_w2, p_b2, target)
+    if not (relative_error(device_loss ↦ f64, library_loss ↦ f64) ≤ PIN_TOLERANCE) {
+        fail("large step-0 loss device § library §"(device_loss, library_loss))
+    }
+
+    mut list<f64> rates ← empty
+    mut list<f64> loop_ms ← empty
+    mut list<f32> reference ← empty
+    mut list<f32> last_trace ← empty
+
+    for range 0‥LARGE_REPEATS let repeat {
+        mut tensor<f32, [512, 512]> w1 ← square_tensor(data_w1)
+        mut tensor<f32, [512, 512]> b1 ← square_tensor(data_b1)
+        mut tensor<f32, [512, 512]> w2 ← square_tensor(data_w2)
+        mut tensor<f32, [512, 512]> b2 ← square_tensor(data_b2)
+        mut list<f32> trace ← empty
+
+        let int started ← time.monotonic()
+        for range 0‥LARGE_STEPS let step {
+            let f32 loss ← mlp_loss_large(input, w1, b1, w2, b2, target)
+            trace.append(loss)
+            let _ grads ← mlp_loss_large_backward(input, w1, b1, w2, b2, target, nil(), 1.0)
+            let [_, gw1, gb1, gw2, gb2, _] ← grads
+            w1 ← math.sub(w1, math.mul(gw1, rate_large))
+            b1 ← math.sub(b1, math.mul(gb1, rate_large))
+            w2 ← math.sub(w2, math.mul(gw2, rate_large))
+            b2 ← math.sub(b2, math.mul(gb2, rate_large))
+        }
+        let list<f32> read_w1 ← w1 ↦ list<f32>
+        let list<f32> read_b1 ← b1 ↦ list<f32>
+        let list<f32> read_w2 ← w2 ↦ list<f32>
+        let list<f32> read_b2 ← b2 ↦ list<f32>
+        let int elapsed ← time.monotonic() - started
+        check_finite("w1", read_w1)
+        check_finite("b1", read_b1)
+        check_finite("w2", read_w2)
+        check_finite("b2", read_b2)
+
+        if repeat ≡ 0 {
+            reference ← trace
+        }
+        check_large_trace(trace, reference)
+        rates.append((LARGE_STEPS ↦ f64) ÷ ((elapsed ↦ f64) ÷ 1000000000.0))
+        loop_ms.append((elapsed ↦ f64) ÷ 1000000.0)
+        last_trace ← trace
+    }
+
+    mut list<f64> sorted_rates ← copy rates
+    sorted_rates.sort()
+    mut list<f64> sorted_ms ← copy loop_ms
+    sorted_ms.sort()
+    let int middle ← LARGE_REPEATS / 2
+    print "train_large_steps_per_s " + (sorted_rates[middle] ↦ string)
+    print "train_large_loop_ms_median " + (sorted_ms[middle] ↦ string)
+    print "train_large_loss_first " + (last_trace[0] ↦ string)
+    print "train_large_loss_last " + (last_trace[LARGE_STEPS - 1] ↦ string)
+}
+
+# --- pinned workload ---------------------------------------------------------
+
+main {
+    let list<f32> data_input ← [0.5, -0.3, 1.2, -0.7,
+                                   -0.4, 0.8, -1.0, 0.3,
+                                   0.7, -0.2, -0.6, 1.0,
+                                   -0.9, 1.3, 0.1, -0.5]
+    let list<f32> data_weight1 ← [0.2, -0.4, 0.7, -0.2,
+                                     -0.6, 0.3, -0.8, 0.5,
+                                     -0.3, 0.9, -0.1, -0.5,
+                                     0.4, -0.7, 0.6, -0.9]
+    let list<f32> data_bias1 ← [0.1, -0.1, 0.0, 0.1,
+                                   0.2, -0.2, 0.1, -0.1,
+                                   0.0, 0.1, -0.1, 0.2,
+                                   -0.2, 0.0, 0.1, -0.1]
+    let list<f32> data_weight2 ← [-0.5, 0.4, -0.3, 0.8,
+                                     -0.1, -0.7, 0.6, -0.4,
+                                     0.3, -0.8, -0.2, 0.5,
+                                     -0.6, 0.2, -0.9, 0.1]
+    let list<f32> data_bias2 ← [0.1, -0.2, 0.1, 0.0,
+                                   0.0, 0.1, -0.1, 0.2,
+                                   -0.1, 0.0, 0.2, -0.1,
+                                   0.1, -0.1, 0.0, 0.1]
+    let list<f32> data_target ← [1.0, 1.0, 1.0, 1.0,
+                                    1.0, 1.0, 1.0, 1.0,
+                                    1.0, 1.0, 1.0, 1.0,
+                                    1.0, 1.0, 1.0, 1.0]
+    # The learning rate as a tensor: the library kernels are tensor-by-tensor.
+    let list<f32> data_rate ← [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1,
+                                  0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+
+    let tensor<f32, [4, 4]> input ← data_input ↦ tensor<f32, [4, 4]>
+    let tensor<f32, [4, 4]> target ← data_target ↦ tensor<f32, [4, 4]>
+    let tensor<f32, [4, 4]> rate ← data_rate ↦ tensor<f32, [4, 4]>
+
+    # --- step-0 parity: device loss and gradients vs the library on the host
+
+    let tensor<f32, [4, 4]> p_w1 ← data_weight1 ↦ tensor<f32, [4, 4]>
+    let tensor<f32, [4, 4]> p_b1 ← data_bias1 ↦ tensor<f32, [4, 4]>
+    let tensor<f32, [4, 4]> p_w2 ← data_weight2 ↦ tensor<f32, [4, 4]>
+    let tensor<f32, [4, 4]> p_b2 ← data_bias2 ↦ tensor<f32, [4, 4]>
+    let f32 library_loss ← mlp.forward_mlp_loss(input, p_w1, p_b1, p_w2, p_b2, target)
+    let f32 device_loss ← mlp_loss(input, p_w1, p_b1, p_w2, p_b2, target)
+    if not (relative_error(device_loss ↦ f64, library_loss ↦ f64) ≤ PIN_TOLERANCE) {
+        fail("step-0 loss device § library §"(device_loss, library_loss))
+    }
+    let _ library_grads ← mlp.forward_mlp_loss_backward(input, p_w1, p_b1, p_w2, p_b2,
+                                                          target, mlp.nil(), 1.0)
+    let [_, lgw1, lgb1, lgw2, lgb2, _] ← library_grads
+    let _ device_grads ← mlp_loss_backward(input, p_w1, p_b1, p_w2, p_b2,
+                                              target, nil(), 1.0)
+    let [_, dgw1, dgb1, dgw2, dgb2, _] ← device_grads
+    check_gradient("w1", dgw1, lgw1)
+    check_gradient("b1", dgb1, lgb1)
+    check_gradient("w2", dgw2, lgw2)
+    check_gradient("b2", dgb2, lgb2)
+
+    # --- timed repetitions ---------------------------------------------------
+
+    mut list<f64> rates ← empty
+    mut list<f64> loop_ms ← empty
+    mut f64 worst_error ← 0.0
+    mut list<f32> final_w1 ← empty
+    mut list<f32> final_b1 ← empty
+    mut list<f32> final_w2 ← empty
+    mut list<f32> final_b2 ← empty
+    mut list<f32> final_trace ← empty
+
+    for range 0‥REPEATS let repeat {
+        mut tensor<f32, [4, 4]> w1 ← data_weight1 ↦ tensor<f32, [4, 4]>
+        mut tensor<f32, [4, 4]> b1 ← data_bias1 ↦ tensor<f32, [4, 4]>
+        mut tensor<f32, [4, 4]> w2 ← data_weight2 ↦ tensor<f32, [4, 4]>
+        mut tensor<f32, [4, 4]> b2 ← data_bias2 ↦ tensor<f32, [4, 4]>
+        mut list<f32> trace ← empty
+
+        let int started ← time.monotonic()
+        for range 0‥STEPS let step {
+            let f32 loss ← mlp_loss(input, w1, b1, w2, b2, target)
+            trace.append(loss)
+            let _ grads ← mlp_loss_backward(input, w1, b1, w2, b2, target, nil(), 1.0)
+            let [_, gw1, gb1, gw2, gb2, _] ← grads
+            w1 ← math.sub(w1, math.mul(gw1, rate))
+            b1 ← math.sub(b1, math.mul(gb1, rate))
+            w2 ← math.sub(w2, math.mul(gw2, rate))
+            b2 ← math.sub(b2, math.mul(gb2, rate))
+        }
+        let list<f32> read_w1 ← w1 ↦ list<f32>
+        let list<f32> read_b1 ← b1 ↦ list<f32>
+        let list<f32> read_w2 ← w2 ↦ list<f32>
+        let list<f32> read_b2 ← b2 ↦ list<f32>
+        let int elapsed ← time.monotonic() - started
+
+        let f64 error ← check_trace(trace)
+        if error ≻ worst_error {
+            worst_error ← error
+        }
+        let f64 seconds ← (elapsed ↦ f64) ÷ 1000000000.0
+        rates.append((STEPS ↦ f64) ÷ seconds)
+        loop_ms.append((elapsed ↦ f64) ÷ 1000000.0)
+        final_w1 ← read_w1
+        final_b1 ← read_b1
+        final_w2 ← read_w2
+        final_b2 ← read_b2
+        final_trace ← trace
+    }
+
+    # --- checkpoint round-trip from the trained weights ----------------------
+
+    let tensor<f32, [4, 4]> t_w1 ← final_w1 ↦ tensor<f32, [4, 4]>
+    let tensor<f32, [4, 4]> t_b1 ← final_b1 ↦ tensor<f32, [4, 4]>
+    let tensor<f32, [4, 4]> t_w2 ← final_w2 ↦ tensor<f32, [4, 4]>
+    let tensor<f32, [4, 4]> t_b2 ← final_b2 ↦ tensor<f32, [4, 4]>
+    let _ last_grads ← mlp_loss_backward(input, t_w1, t_b1, t_w2, t_b2, target, nil(), 1.0)
+    let [_, lg1, lgb_1, lg2, lgb_2, _] ← last_grads
+    let parameter.Parameter q_w1 ← build_parameter("w1", final_w1)
+    let parameter.Parameter q_b1 ← build_parameter("b1", final_b1)
+    let parameter.Parameter q_w2 ← build_parameter("w2", final_w2)
+    let parameter.Parameter q_b2 ← build_parameter("b2", final_b2)
+    let optimize.StepResult r_w1 ← optimizer_step(build_state("w1", q_w1.version(), 0.1),
+        q_w1, build_gradient("w1", q_w1.version(), stage_tensor(lg1 ↦ list<f32>, [4, 4])))
+    let optimize.StepResult r_b1 ← optimizer_step(build_state("b1", q_b1.version(), 0.1),
+        q_b1, build_gradient("b1", q_b1.version(), stage_tensor(lgb_1 ↦ list<f32>, [4, 4])))
+    let optimize.StepResult r_w2 ← optimizer_step(build_state("w2", q_w2.version(), 0.1),
+        q_w2, build_gradient("w2", q_w2.version(), stage_tensor(lg2 ↦ list<f32>, [4, 4])))
+    let optimize.StepResult r_b2 ← optimizer_step(build_state("b2", q_b2.version(), 0.1),
+        q_b2, build_gradient("b2", q_b2.version(), stage_tensor(lgb_2 ↦ list<f32>, [4, 4])))
+    let optimize.Sgd sgd ← build_sgd(r_w1.state, r_b1.state, r_w2.state, r_b2.state)
+    let train.Seed seed ← build_seed(1)
+    let train.Checkpoint checkpoint ← build_checkpoint(0, STEPS, seed, optimize.serialize(sgd))
+    let string wire ← train.serialize_checkpoint(checkpoint)
+    let train.Checkpoint restored ← restore_checkpoint(wire)
+    let bool round_trip ← train.checkpoint_equal(checkpoint, restored)
+    if not round_trip {
+        fail("checkpoint round-trip: restored checkpoint differs")
+    }
+    if train.serialize_checkpoint(restored) ≢ wire {
+        fail("checkpoint round-trip: re-serialized wire differs")
+    }
+
+    # --- report --------------------------------------------------------------
+
+    mut list<f64> sorted_rates ← copy rates
+    sorted_rates.sort()
+    mut list<f64> sorted_ms ← copy loop_ms
+    sorted_ms.sort()
+    let int middle ← REPEATS / 2
+    print "train_steps_per_s " + (sorted_rates[middle] ↦ string)
+    print "train_loop_ms_median " + (sorted_ms[middle] ↦ string)
+    print "train_repeats " + (REPEATS ↦ string)
+    print "train_final_loss_pin99 " + (final_trace[99] ↦ string)
+    print "train_max_pin_rel_error " + (worst_error ↦ string)
+    print "train_checkpoint_round_trip " + (round_trip ↦ string)
+    print "train_ok true"
+
+    let list<string> args ← process.argv()
+    if args.get(0) coalesce "" ≡ "large" {
+        large_workload()
+    }
+}
