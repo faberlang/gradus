@@ -1,0 +1,130 @@
++++
+locale = "en"
++++
+# GGML Q8_0 as a named block genus and one decode function (gradus need
+# 579e8f2e, byte half; plan U1).
+#
+# Public import: import from "gradus:quant/q8_0" q8_0
+#
+# --- Contract ------------------------------------------------------------
+#
+# A Q8_0 block quantizes 32 weights to signed 8-bit integers with one half
+# scale. On disk a block is 34 bytes, little-endian, with no padding:
+#
+#     block_q8_0 { ggml_half d; int8_t qs[32]; }     (ggml-common.h)
+#
+# and the dequantized weight is `y[j] = qs[j] * f32(d)`, one f32 multiply
+# (`dequantize_row_q8_0`, ggml-quants.c @ a957b7747). The genus mirrors that
+# layout: `d` is an `f16` and `qs` a `list<i8, size 32>`. Both fields are
+# NUMBERS, not bit patterns: a Q8_0 quant is a signed integer and the scale
+# is a half, so nothing in this format is raw bits. The record layout the
+# compiler gives that genus (f16 at byte 0, i8[32] at byte 2, size 34,
+# align 2, no padding) is pinned by radix `struct_layout_test.rs`; this
+# module asserts the same 34 bytes at its own boundary (`Q8_0_BYTES` and the
+# truncated-block refusal below).
+#
+# Rule 17 (gpu-reset CAMPAIGN): the format lives in Gradus, never in the
+# compiler. Decoding is a function and only a function; it reads the fields
+# in place and copies no block.
+#
+# --- Public names (settled by plan section 6.L3, GGML spellings verbatim) --
+#
+#   * `Q8_0`                  the block genus (same spelling in every locale;
+#                             an industry identity like `matmul`)
+#   * `decode(b, k)`          the one decode function: weight `k` of block `b`
+#   * `from_bytes(raw)`       host loader: 34 raw bytes -> `Q8_0`
+#   * `Q8_0_BYTES`, `Q8_0_ELEMENTS`   the layout constants
+#   * `Q8_0Error`             typed fail-closed errors of `from_bytes`
+#
+# --- Host oracle ---------------------------------------------------------
+#
+# `decode` is proven bit-for-bit against the independent oracle (the numpy
+# mirror of ggml-quants.c in `fixtures/gguf/gguf-dequant-goldens.json`) and
+# against the host decoder `gradus:model/dequant` in `q8_0.proba`. The host
+# decoder stays the exact reference and is not rewritten.
+#
+# --- Loader seam ---------------------------------------------------------
+#
+# `from_bytes` builds one genus value from bytes on the host. The zero-copy
+# device load (`octeti ↦ tensor<Q8_0, [N]> via Le`, radix need 78796af9)
+# replaces it for tensors; the genus and `decode` do not change.
+
+# Elements per block.
+@ public
+const int Q8_0_ELEMENTS = 32
+
+# Bytes per block: 2 (half scale) + 32 (int8 quants), no padding.
+@ public
+const int Q8_0_BYTES = 34
+
+# The block genus. Field order is the on-disk order.
+#
+# INTERIM VISIBILITY (radix gap, see "Public names" above): the genus, `decode`
+# and `from_bytes` are module-private for now. A public export whose type
+# carries a `list<T, size N>` is refused at the file-interface seam
+# (`InferenceTypeUnsupported`, radix-semantic `file_interface.rs`:
+# `Type::BoundedArray` is in the unrepresentable set), so `@ public class Q8_0`
+# cannot be imported by a kernel module or by the proba. Everything else is the
+# final shape; when the seam can snapshot a sized list, mark `Q8_0`, `decode`
+# and `from_bytes` `@ public` and delete `decode_block` and this note.
+class Q8_0 {
+    let f16 d
+    let list<i8, size 32> qs
+}
+
+# Typed fail-closed diagnostics of the loader.
+#   BadBlock — byte length is not Q8_0_BYTES (truncated or padded block).
+#   BadScale — the half scale is NaN: malformed data, never smuggled in.
+@ public
+union Q8_0Error {
+    @ shared
+    string message
+
+    BadBlock,
+    BadScale
+}
+
+# Weight `k` (0 ≤ k < 32) of block `b` as f32: `qs[k] * d`. Both widenings
+# are exact, so the product has the single rounding of the C kernel. An
+# out-of-range `k` ends the run (the `qs[k]` read).
+fn decode(Q8_0 b, i32 k) → f32 {
+    return (b.qs[k] ↦ f32) * (b.d ↦ f32)
+}
+
+# One block from its 34 on-disk bytes (scale half first, little-endian, then
+# the 32 signed quants).
+fn from_bytes(list<u8> raw) → Q8_0 ⇥ Q8_0Error {
+    if raw.length() ≢ Q8_0_BYTES {
+        throw variant BadBlock {message = "Q8_0 block byte length mismatch"}
+    }
+    let list<b8> buf ↤ raw
+    let int bits ← buf[0‥2] ↦ u16 via Le ↦ int
+    if (bits ⇒ 10) % 32 ≡ 31 {
+        if bits % 1024 ≢ 0 {
+            throw variant BadScale {message = "NaN half scale in Q8_0 block"}
+        }
+    }
+    let f16 d ← buf[0‥2] ↦ u16 via Le ↦ b16 ↦ f16
+    let list<i8> quants ← buf[2‥34] ↦ list<i8>
+    # The length gate above makes this conversion total; the handler keeps
+    # the failure on the loader's own channel instead of a bare trap.
+    do {
+        return Q8_0 {d = d, qs = quants ↦ list<i8, size 32>}
+    }
+    catch err {
+        throw variant BadBlock {message = "Q8_0 block byte length mismatch"}
+    }
+}
+
+# The 32 weights of one block from its 34 bytes: the genus path end to end
+# (`from_bytes`, then `decode` for every `k`). Public so the proba can reach
+# the genus while the genus itself cannot cross the module boundary yet.
+@ public
+fn decode_block(list<u8> raw) → list<f32> ⇥ Q8_0Error {
+    let Q8_0 b ← from_bytes(raw)
+    mut list<f32> y ← empty
+    for range 0‥Q8_0_ELEMENTS let k {
+        y.append(decode(b, k ↦ i32 ⊥ 0))
+    }
+    return y
+}
