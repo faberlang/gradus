@@ -22,6 +22,8 @@ the historical autograd and nanoGPT architecture source
 
 ## Summary
 
+Current carrier census and removal order: [NumericBlock retirement inventory](numericblock-retirement-inventory.md).
+
 Turn Gradus from a narrow static-shape proof library into Faber's
 production-quality machine-learning computation library. Gradus owns the
 device-neutral model semantics shared by training and inference, plus clearly
