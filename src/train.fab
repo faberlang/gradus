@@ -1,21 +1,14 @@
 +++
 locale = "en"
 +++
-# Training facade — warmup+cosine schedule, train/eval mode, RNG, dropout,
-# and checkpoint envelope (PML4).
+# Training controls — train/eval mode, RNG, dropout, and checkpoint envelope.
 #
 # Public import: import from "gradus:train" train
 # Depends on: gradus:dtype (finite), gradus:tensor (value carrier).
 #
-# This module does not own an epoch loop or metrics. Metrics live in
-# gradus:metrics. The admitted parameter update is SGD
-# (param' = param − lr·grad); optimizer state lives in gradus:optimize.
-# Learning-rate schedules live here.
-#
-# The generic SGD update (param' = param − lr·grad) lives in
-# gradus:optimize as `sgd_step`. This module owns schedules, train/eval mode,
-# RNG, dropout, and checkpoint envelopes; it does not specialize updates for
-# a model or fixture.
+# Learning-rate schedules live in gradus:schedule. This module does not own
+# an epoch loop or metrics (gradus:metrics), and it does not specialize
+# optimizer updates for a model or fixture (gradus:optimize).
 #
 # Architectural rule: the training step is reusable across models. It must not
 # import from a specific model definition. A model definition does not own its
@@ -26,52 +19,12 @@ import from "gradus:dtype" dtype
 import from "gradus:tensor" tensor
 
 # =========================================================================
-# PML4-U4 — Schedules + train/eval mode (explicit public controls)
+# Train/eval mode and dropout policy
 # =========================================================================
-#
-# --- Contract (pml4-delivery.md PML4-U4) ---------------------------------
-# Two explicit public controls for a training run:
-#
-#   1. Schedule — the learning-rate schedule (warmup + cosine decay, the
-#      accepted training-proof default). A pure config + one pure
-#      evaluation, deterministic (no RNG, no hidden state):
-#
-#        lr(step) = vertex · step/warmup                      step < warmup
-#        lr(step) = end + (vertex − end)·(1+cos(π·t))/2   step ≥ warmup
-#      with t = (step − warmup)/(total − warmup) ∈ [0, 1], clamped to the
-#      horizon (post-horizon lr = end). A degenerate horizon
-#      (total == warmup) is constant at the vertex. The schedule's lr at
-#      step k is the lr the loop binds into the parameter's SgdState
-#      (U3, rate) before step — the loop composition is U6's.
-#
-#   2. Mode — train/eval mode (the dropout/RNG policy gate). Explicit
-#      mode argument only: forward evaluation consults the mode it is
-#      CALLED with — no hidden global state (the shared-layer rule,
-#      council "forward-functions-first"). In eval mode dropout is
-#      identity (effective rate 0); in train mode the effective rate is
-#      the configured rate. The stochastic dropout mask is generated from
-#      an explicit RNG state — the U5 seed/RNG seam; the MODE CONTROL and
-#      its deterministic rate policy are this unit's.
-#
-# --- Shared with the GPU-training lane's accepted facts -----------------
-#   * warmup + cosine is the schedule default per the pml4 delivery open
-#     questions ("default: warmup + cosine per accepted training proof").
-#   * lr = 0.01 is the accepted MLP training proof's constant; the
-#     schedule's peak (vertex) is the same lr the optimizer state (U3)
-#     carries per parameter.
-#   * dropout rate domain [0, 1] (fraction of units omitted); eval = no
-#     dropout (the standard evaluation-policy identity).
-#
-# --- Evidence honesty (CTO Q2, hard) ------------------------------------
-# This surface is the STRUCTURAL proof: the controls are pure functions
-# (explicit arguments, deterministic, no hidden state) and are
-# compile-validated + proven by the co-located proba. Executed VALUE
-# identity (a schedule's numeric lr, the f32 cosine self-hosting vs the
-# f64 oracle) remains deferred. Library-to-library calls execute on the
-# FMIR stepper (radix 43c0102ba; regression-locked by 2e8042ae7).
-# PML4-U4 is PARTIAL: schedule and policy numeric identity is deferred
-# to a runtime-evidence gate
-# (auditor-owned faber test path; oracle pins recorded in train.proba).
+# Mode is explicit: forward evaluation consults the mode it is called with,
+# never hidden global state. Eval mode has effective dropout rate 0; train
+# mode uses the configured rate. The stochastic mask uses the explicit Seed
+# state defined below.
 
 # -------------------------------------------------------------------------
 # TrainError — typed error vocabulary of the training-loop controls.
@@ -84,10 +37,8 @@ union TrainError {
     @ shared
     string message
 
-    InvalidSchedule,
     UnknownMode,
     InvalidDropout,
-    NegativeStep,
     InvalidSeed,
     BadPayload,
     InvalidPosition,
@@ -105,95 +56,6 @@ fn from_tensor_error(tensor.TensorError err) → TrainError {
 }
 
 
-
-# -------------------------------------------------------------------------
-# Schedule — the learning-rate schedule config (warmup + cosine decay).
-#   rate_vertex — peak lr at the end of warmup (the lr the U3 state
-#                   slot carries at the peak);
-#   warmup     — warmup steps (linear ramp 0 → vertex);
-#   total_steps  — total scheduled steps (the decay horizon);
-#   rate_end  — final lr after the cosine decay (≤ vertex).
-# Construction fail-closed: finite non-negative rates, end ≤ vertex,
-# non-negative warmup, horizon ≥ 1 and ≥ warmup.
-# -------------------------------------------------------------------------
-
-
-@ public
-class Schedule {
-    mut f32 rate_vertex
-    mut int warmup
-    mut int total_steps
-    mut f32 rate_end
-}
-
-@ public
-fn construct_schedule(f32 rate_vertex, int warmup, int total_steps, f32 rate_end) → Schedule ⇥ TrainError {
-    require dtype.finite(rate_vertex) throw variant InvalidSchedule { message = "invalid peak learning rate" }
-    require rate_vertex ≥ 0.0 throw variant InvalidSchedule { message = "invalid peak learning rate" }
-    require dtype.finite(rate_end) throw variant InvalidSchedule { message = "invalid final learning rate" }
-    require rate_end ≥ 0.0 throw variant InvalidSchedule { message = "invalid final learning rate" }
-    require rate_end ≤ rate_vertex throw variant InvalidSchedule { message = "final learning rate above peak" }
-    require warmup ≥ 0 throw variant InvalidSchedule { message = "negative warmup steps" }
-    require total_steps ≥ 1 throw variant InvalidSchedule { message = "schedule horizon must be at least one step" }
-    require total_steps ≥ warmup throw variant InvalidSchedule { message = "warmup exceeds the schedule horizon" }
-    return Schedule { rate_vertex = rate_vertex, warmup = warmup, total_steps = total_steps, rate_end = rate_end }
-}
-
-# Placeholder Default for `var Schedule` bindings (varia on structs).
-# Zero rates/horizon (not a valid schedule). Only a placeholder the
-# caller overwrites, or returns from an unreachable cape arm.
-@ public
-fn default_schedule() → Schedule {
-    return Schedule { rate_vertex = 0.0, warmup = 0, total_steps = 0, rate_end = 0.0 }
-}
-
-# π — the cosine-decay phase constant.
-const f32 PI = 3.141592653589793 ∷ f32
-
-# cos via Taylor series. The schedule's phase is always in [0, π] (t ∈
-# [0, 1]), so no range reduction is needed; 12 terms leave the remainder
-# below f32 precision over that range (the attention.fab cos
-# precedent). At the horizon the series may undershoot by < 1e-4; the
-# evaluation clamps the result to the true [end, vertex] range.
-fn cos(f32 x) → f32 {
-    mut f32 term ← 1.0
-    mut f32 sum ← 1.0
-    let f32 x2 ← x * x
-    for range 1‥12 let n {
-        term ← (term * (0.0 - x2)) / (((2 * n - 1) ↦ f32) * (2 * n ↦ f32))
-        sum ← sum + term
-    }
-    return sum
-}
-
-# -------------------------------------------------------------------------
-# scheduled_rate — the schedule evaluation: the deterministic learning
-# rate at a step (warmup + cosine decay, see the contract above). Pure:
-# explicit Schedule + step in, lr out; no RNG, no hidden state.
-# -------------------------------------------------------------------------
-
-@ public
-fn scheduled_rate(Schedule s, int step) → f32 ⇥ TrainError {
-    require step ≥ 0 throw variant NegativeStep { message = "schedule step must be non-negative" }
-    if step ≺ s.warmup then return s.rate_vertex * ((step ↦ f32) / (s.warmup ↦ f32))
-    mut int step_eff ← step
-    if step_eff ≻ s.total_steps {
-        step_eff ← s.total_steps
-    }
-    if s.total_steps ≻ s.warmup {
-        let f32 t ← ((step_eff - s.warmup) ↦ f32) / ((s.total_steps - s.warmup) ↦ f32)
-        let f32 phase ← PI * t
-        mut f32 lr ← s.rate_end + ((s.rate_vertex - s.rate_end) * (1.0 + cos(phase))) / 2.0
-        if lr ≺ s.rate_end {
-            lr ← s.rate_end
-        }
-        if lr ≻ s.rate_vertex {
-            lr ← s.rate_vertex
-        }
-        return lr
-    }
-    return s.rate_vertex
-}
 
 # -------------------------------------------------------------------------
 # Mode — train/eval mode. An EXPLICIT argument to any mode-dependent
