@@ -334,7 +334,7 @@ One-token decode, prefill, explicit sessions, cancellation, replica-loop mechani
 - `fn fresh_cancellation() → Cancellation`
 - `fn cancellation_cancelled() → Cancellation`
 - `fn observe_cancellation(Cancellation c) → Cancellation ⇥ DecodeError`
-- `fn replay(list<list<f32>> logit_rows, sampling.Config c, list<int> history, train.Seed seed, Cancellation cancellation) → list<int> ⇥ DecodeError`
+- `fn replay(list<list<f32>> logit_rows, sampling.Config c, list<int> history, random.Seed seed, Cancellation cancellation) → list<int> ⇥ DecodeError`
 
 ## gradus:dtype
 
@@ -416,7 +416,7 @@ Generation configuration, sampling projection, serialized config, cursor limits,
 - `fn support_flags() → list<string>`
 - `fn admitted_features(string name) → bool`
 - `fn config(GenerationConfig g) → sampling.Config ⇥ GenerationError`
-- `fn seed(GenerationConfig g) → train.Seed ⇥ GenerationError`
+- `fn seed(GenerationConfig g) → random.Seed ⇥ GenerationError`
 - `fn serialize_generation(GenerationConfig g) → string`
 - `fn deserialize_generation(string wire) → GenerationConfig ⇥ GenerationError`
 - `fn fresh_cursor(GenerationConfig g) → GenerationCursor ⇥ GenerationError`
@@ -1141,10 +1141,10 @@ Deterministic greedy/filtering/sampling pipeline and sampler configuration.
     - `fn min_p() → f32`
     - `fn repetition_penalty() → f32`
 - `class Sampler`
-  - fields: int token_id, train.Seed seed
+  - fields: int token_id, random.Seed seed
   - methods:
     - `fn token_id() → int`
-    - `fn seed() → train.Seed`
+    - `fn seed() → random.Seed`
 
 ### Public functions
 
@@ -1154,7 +1154,7 @@ Deterministic greedy/filtering/sampling pipeline and sampler configuration.
 - `fn default() → Sampler`
 - `fn max(list<f32> logits) → int ⇥ SamplingError`
 - `fn distribution(list<f32> logits, Config c, list<int> history) → list<f32> ⇥ SamplingError`
-- `fn sample(list<f32> logits, Config c, list<int> history, train.Seed seed) → Sampler ⇥ SamplingError`
+- `fn sample(list<f32> logits, Config c, list<int> history, random.Seed seed) → Sampler ⇥ SamplingError`
 
 ## gradus:serialize
 
@@ -1359,18 +1359,15 @@ Warmup and cosine learning-rate schedules.
 - `fn default_schedule() → Schedule`
 - `fn scheduled_rate(Schedule s, int step) → f32 ⇥ ScheduleError`
 
-## gradus:train
+## gradus:random
 
-Learning-rate schedules live in `gradus:schedule`; this module provides
-train/eval mode, RNG, dropout, and checkpoints. Parameter updates are
-composed from explicit gradients and optimizer state.
+Deterministic xorshift64 seed state, draws, and the versioned RNG wire.
 
-**Source**: `src/train.fab`
+**Source**: `src/random.fab`
 
 ### Public types
 
-- `union TrainError` — UnknownMode, InvalidDropout, InvalidSeed, BadPayload, InvalidPosition, EmptyState, UnknownVersion, BadWire
-- `union Mode` — Discipline, Estimate
+- `union RandomError` — InvalidSeed, BadWire, UnknownVersion
 - `class Seed`
   - fields: int status
   - methods:
@@ -1385,17 +1382,40 @@ composed from explicit gradients and optimizer state.
   - methods:
     - `fn payload() → f32`
     - `fn seed() → Seed`
+
+### Public functions
+
+- `fn construct_seed(int seed) → Seed ⇥ RandomError`
+- `fn default() → Seed`
+- `fn next(Seed s) → Draw`
+- `fn next_f32(Seed s) → DrawF32`
+- `fn serialize_seed(Seed s) → string`
+- `fn deserialize_seed(string wire) → Seed ⇥ RandomError`
+
+## gradus:train
+
+Learning-rate schedules live in `gradus:schedule`; this module provides
+train/eval mode, dropout, and checkpoints. Parameter updates are composed
+from explicit gradients and optimizer state. RNG state and draws live in
+`gradus:random`.
+
+**Source**: `src/train.fab`
+
+### Public types
+
+- `union TrainError` — UnknownMode, InvalidDropout, InvalidSeed, BadPayload, InvalidPosition, EmptyState, UnknownVersion, BadWire
+- `union Mode` — Discipline, Estimate
 - `class Dropout`
-  - fields: tensor.NumericBlock payload, Seed seed
+  - fields: tensor.NumericBlock payload, random.Seed seed
   - methods:
     - `fn payload() → tensor.NumericBlock`
-    - `fn seed() → Seed`
+    - `fn seed() → random.Seed`
 - `class Checkpoint`
-  - fields: int age, int step, Seed rng, string state_wire
+  - fields: int age, int step, random.Seed rng, string state_wire
   - methods:
     - `fn age() → int`
     - `fn step() → int`
-    - `fn rng() → Seed`
+    - `fn rng() → random.Seed`
     - `fn state_wire() → string`
 
 ### Public functions
@@ -1406,14 +1426,8 @@ composed from explicit gradients and optimizer state.
 - `fn is_estimate(Mode m) → bool`
 - `fn mode(string name) → Mode ⇥ TrainError`
 - `fn dropout_probability(Mode m, f32 rate) → f32 ⇥ TrainError`
-- `fn construct_seed(int seed) → Seed ⇥ TrainError`
-- `fn default() → Seed`
-- `fn next(Seed s) → Draw`
-- `fn next_f32(Seed s) → DrawF32`
-- `fn dropout(tensor.NumericBlock x, Seed s, Mode m, f32 rate) → Dropout ⇥ TrainError`
-- `fn serialize_seed(Seed s) → string`
-- `fn deserialize_seed(string wire) → Seed ⇥ TrainError`
-- `fn construct_checkpoint(int age, int step, Seed rng, string state_wire) → Checkpoint ⇥ TrainError`
+- `fn dropout(tensor.NumericBlock x, random.Seed s, Mode m, f32 rate) → Dropout ⇥ TrainError`
+- `fn construct_checkpoint(int age, int step, random.Seed rng, string state_wire) → Checkpoint ⇥ TrainError`
 - `fn default_checkpoint() → Checkpoint`
 - `fn checkpoint_equal(Checkpoint a, Checkpoint b) → bool`
 - `fn serialize_checkpoint(Checkpoint c) → string`

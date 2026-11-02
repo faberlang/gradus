@@ -41,7 +41,7 @@ for each live import that has a demo:
 | `gradus:gradient` | [`exempla/gradient-seam/`](../exempla/gradient-seam/) |
 | `gradus:mlp` | [`exempla/training-loop-mlp/`](../exempla/training-loop-mlp/) |
 | `gradus:loss` | [`docs/quickstart.md`](quickstart.md) snippet; then [`exempla/training-loop-mlp/`](../exempla/training-loop-mlp/) |
-| `gradus:optimize`, `gradus:train`, `gradus:metrics` | [`exempla/training-loop-mlp/`](../exempla/training-loop-mlp/) |
+| `gradus:random`, `gradus:optimize`, `gradus:train`, `gradus:metrics` | [`exempla/training-loop-mlp/`](../exempla/training-loop-mlp/) |
 | `gradus:model/gguf_manifest` | [`exempla/gguf-manifest/`](../exempla/gguf-manifest/) |
 | `gradus:model/tensor_payload`, `gradus:model/tensor_view` | [`exempla/gguf-materialize/`](../exempla/gguf-materialize/) |
 | `gradus:model/dense_llama` | [`exempla/dense-llama-adapter/`](../exempla/dense-llama-adapter/) |
@@ -96,10 +96,11 @@ evidence and boundaries are recorded in
 | `gradus:attention/gqa` | `src/attention/gqa.fab` | SDPA, causal, rotary, multi-head, cached attention (REF-01-U1.4) |
 | `gradus:transformer` | `src/transformer.fab` | Generic runtime-carrier and typed dense transformer blocks — input RMSNorm → GQA attention (causal + RoPE) → residual → post-attn RMSNorm → SwiGLU MLP → residual, composing the U1.1/U1.2/U1.4 rows (REF-01-U1.5) |
 | `gradus:mlp` | `src/mlp.fab` | Two-layer MLP: decoded-carrier `forward_mlp` + annotated `forward_mlp_loss` companion (PML3-U4) |
-| `gradus:train` | `src/train.fab` | Schedules, modes, RNG, dropout, and checkpoint `Checkpoint` (PML4) |
+| `gradus:random` | `src/random.fab` | Deterministic seed state, xorshift64 draws, and RNG wire format |
+| `gradus:train` | `src/train.fab` | Train/eval mode, dropout, and checkpoint `Checkpoint` (PML4) |
 | `gradus:metrics` | `src/metrics.fab` | Defined metrics: `accuracy`, `Metric` (PML4) |
 | `gradus:test_util` | `src/test_util.fab` | Shared proba-support helpers: `or_default` (U4a proba do/catch deblock) |
-| `gradus:data` | `src/data.fab` | Batch leaf: deterministic shuffle over `gradus:train` Seed/Draw + order-preserving batch slicing of rank-1 i32 token-id tensors (short last batch; fail-closed empty/size bounds); tokenization still future |
+| `gradus:data` | `src/data.fab` | Batch leaf: deterministic shuffle over `gradus:random` Seed/Draw + order-preserving batch slicing of rank-1 i32 token-id tensors (short last batch; fail-closed empty/size bounds); tokenization still future |
 | `gradus:model/artifact` | `src/model/artifact.fab` | Pathless content identity for bounded model artifacts (GGUF-A1a) |
 | `gradus:model/capsule` | `src/model/capsule.fab` | Admitted-model capsule — the typed identity handoff (`capsule-schema-2.0.0`, PML2, C8; A1C-M1 clean break — schema 1 retired) |
 | `gradus:model/dense_llama` | `src/model/dense_llama.fab` | Typed `llama` (SmolLM2) architecture adapter — canonical tensor-name → manifest-descriptor mapping over the GGUF-A1b surface, frozen SmolLM2-360M config, fail-closed typed diagnostics (REF-01-U1.6) |
@@ -235,7 +236,7 @@ L3  Loss                gradus:loss
 L4  Optimization        gradus:optimize
 L5  NN primitives       gradus:nn
 L6  Architecture blocks gradus:attention, gradus:mlp, gradus:transformer
-L7  Training            gradus:train, gradus:metrics, gradus:data
+L7  Training            gradus:random, gradus:train, gradus:metrics, gradus:data
 GEA1 Kernel            gradus:kernel — paired BF16/F32 GEMV source bodies
 PML2 Model admission    gradus:model/artifact, gradus:model/capsule,
                         gradus:model/gguf_manifest, gradus:model/gguf,
