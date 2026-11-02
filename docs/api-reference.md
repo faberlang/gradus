@@ -1022,7 +1022,7 @@ Differentiable tensor primitives: linear, GELU, LayerNorm, RMSNorm, SiLU, and Sw
 
 ## gradus:optimize
 
-SGD state, optimizer slots, updates, schedules, and optimizer serialization.
+SGD state, optimizer slots, updates, and optimizer serialization.
 
 **Source**: `src/optimize.fab`
 
@@ -1336,17 +1336,15 @@ Tokenizer identity, pinned probes, artifact-backed encoding/decoding, Unicode ca
 - `fn chat_template(Tokenizer t) → string`
 - `fn render_user_turn(Tokenizer t, string content) → string ⇥ TokenizerError`
 
-## gradus:train
+## gradus:schedule
 
-Learning-rate schedules, modes, RNG, dropout, and checkpoints. Parameter
-updates are composed from explicit gradients and optimizer state.
+Warmup and cosine learning-rate schedules.
 
-**Source**: `src/train.fab`
+**Source**: `src/schedule.fab`
 
 ### Public types
 
-- `union TrainError` — InvalidSchedule, UnknownMode, InvalidDropout, NegativeStep, InvalidSeed, BadPayload, InvalidPosition, EmptyState, UnknownVersion, BadWire
-- `union Mode` — Discipline, Estimate
+- `union ScheduleError` — InvalidSchedule, NegativeStep
 - `class Schedule`
   - fields: f32 rate_vertex, int warmup, int total_steps, f32 rate_end
   - methods:
@@ -1354,6 +1352,25 @@ updates are composed from explicit gradients and optimizer state.
     - `fn warmup() → int`
     - `fn total_steps() → int`
     - `fn rate_end() → f32`
+
+### Public functions
+
+- `fn construct_schedule(f32 rate_vertex, int warmup, int total_steps, f32 rate_end) → Schedule ⇥ ScheduleError`
+- `fn default_schedule() → Schedule`
+- `fn scheduled_rate(Schedule s, int step) → f32 ⇥ ScheduleError`
+
+## gradus:train
+
+Learning-rate schedules live in `gradus:schedule`; this module provides
+train/eval mode, RNG, dropout, and checkpoints. Parameter updates are
+composed from explicit gradients and optimizer state.
+
+**Source**: `src/train.fab`
+
+### Public types
+
+- `union TrainError` — UnknownMode, InvalidDropout, InvalidSeed, BadPayload, InvalidPosition, EmptyState, UnknownVersion, BadWire
+- `union Mode` — Discipline, Estimate
 - `class Seed`
   - fields: int status
   - methods:
@@ -1384,9 +1401,6 @@ updates are composed from explicit gradients and optimizer state.
 ### Public functions
 
 - `fn message(TrainError e) → string`
-- `fn construct_schedule(f32 rate_vertex, int warmup, int total_steps, f32 rate_end) → Schedule ⇥ TrainError`
-- `fn default_schedule() → Schedule`
-- `fn scheduled_rate(Schedule s, int step) → f32 ⇥ TrainError`
 - `fn mode_name(Mode m) → string`
 - `fn is_discipline(Mode m) → bool`
 - `fn is_estimate(Mode m) → bool`

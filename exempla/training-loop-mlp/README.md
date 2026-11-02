@@ -15,7 +15,7 @@ step (`optimize.sgd_step`) over the 4×4 fixture; printed losses match the pins
 
 | Step | Surface |
 | --- | --- |
-| Schedule → optimizer-state binding | `train.scheduled_rate` (U4) feeds `optimize.construct`'s `rate` (U3) each step — the accepted constant lr 0.1 is the schedule `Schedule(0.1, 0, 1, 0.1)` (vertex == end) |
+| Schedule → optimizer-state binding | `schedule.scheduled_rate` feeds `optimize.construct`'s `rate` each step — the accepted constant lr 0.1 is the schedule `Schedule(0.1, 0, 1, 0.1)` (vertex == end) |
 | Shared-layer training path | `mlp.forward_mlp_loss` (loss) + the compiler-generated companion `forward_mlp_loss_backward` (gradients) |
 | Per-parameter gradients | `gradient.construct` records (U2): identity + generation = the parameter version at the backward |
 | Optimizer steps | Tensor SGD: `optimize.sgd_step` generic list form over the 4×4 fixture. Parameter/checkpoint: `optimize.step` (U3) fresh-gradient rules, fail-closed; `parameter.mutate` bumps version |
