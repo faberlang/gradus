@@ -246,12 +246,12 @@ explicit parameters, explicit gradients, scalar learning rates, and
 explicit update tuples — no universal parameter registry, model class, or
 device/backend handle:
 
-- `gradus:nn` — `linear<M,K,N>`, `gelu<M,N>` (shape-generic leaves)
+- `gradus:nn` — `linear<M,K,N>`, `gelu<M,N>`, train/eval mode, and dropout
 - `gradus:loss` — `mse<M,N>` plus decoded-carrier `mse_carrier`
-- `gradus:optimize` — optimizers; `gradus:schedule` — warmup and cosine
-  learning-rate schedules
-- `gradus:random` — deterministic seeds, xorshift draws, and the versioned RNG wire.
-- `gradus:train` — train/eval mode, dropout, and checkpoints; training updates
+- `gradus:optimize` — optimizers
+- `gradus:schedule` — warmup and cosine learning-rate schedules
+- `gradus:random` — deterministic seeds, xorshift draws, and the versioned RNG wire
+- `gradus:checkpoint` — versioned checkpoint save/load envelope; training updates
   use explicit parameters, gradients, and optimizer state
 
 The `gradus:optimize` surface carries explicit `SgdState` slots, steps, and

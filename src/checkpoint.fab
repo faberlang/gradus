@@ -1,0 +1,161 @@
++++
+locale = "en"
++++
+# Checkpoint envelope: epoch, step, RNG state, and optimizer-state wire.
+#
+# Public import: import from "gradus:checkpoint" checkpoint
+# The optimizer-state wire is carried verbatim and validated by its owner
+# when resumed. Checkpoint state has its own schema and typed error type.
+#
+import from "gradus:random" random
+
+@ public
+union CheckpointError {
+    @ shared
+    string message
+
+    InvalidSeed,
+    InvalidPosition,
+    EmptyState,
+    UnknownVersion,
+    BadWire
+}
+
+@ conversion
+fn from_random_error(random.RandomError err) → CheckpointError {
+    match err {
+        case random.RandomError.InvalidSeed let message {
+            return variant InvalidSeed { message = message }
+        }
+        case random.RandomError.BadWire let message {
+            return variant BadWire { message = message }
+        }
+        case random.RandomError.UnknownVersion let message {
+            return variant UnknownVersion { message = message }
+        }
+    }
+}
+
+const string schema_version = "1.0.0"
+
+
+
+# -------------------------------------------------------------------------
+# Checkpoint — the checkpoint: epoch + step + RNG state + the optimizer-state
+# wire (U3, carried verbatim). The envelope is autograd-free; the state
+# wire validates against ITS OWN schema at resume (optimize.deserialize).
+# -------------------------------------------------------------------------
+
+
+@ public
+class Checkpoint {
+    # Epoch.
+    mut int age
+    # Step within the epoch.
+    mut int step
+    mut random.Seed rng
+    # Embedded optimizer-state wire, carried verbatim.
+    mut string state_wire
+}
+
+# Build a checkpoint. Epoch/step are non-negative; the state wire is
+# non-empty (fail closed). The RNG is already a validated Seed.
+@ public
+fn construct_checkpoint(int age, int step, random.Seed rng, string state_wire) → Checkpoint ⇥ CheckpointError {
+    require age ≥ 0 throw variant InvalidPosition { message = "epoch must be non-negative" }
+    require step ≥ 0 throw variant InvalidPosition { message = "step must be non-negative" }
+    require state_wire.length() ≢ 0 throw variant EmptyState { message = "checkpoint state wire is empty" }
+    return Checkpoint { age = age, step = step, rng = rng, state_wire = state_wire }
+}
+
+# Placeholder Default for `var Checkpoint` bindings (varia on structs).
+# Empty wire and an empty seed (not a valid checkpoint). Only a
+# placeholder the caller overwrites, or returns from an unreachable cape arm.
+@ public
+fn default_checkpoint() → Checkpoint {
+    return Checkpoint { age = 0, step = 0, rng = random.default(), state_wire = "" }
+}
+
+# Field-wise checkpoint equality — the round-trip predicate.
+@ public
+fn checkpoint_equal(Checkpoint a, Checkpoint b) → bool {
+    if a.age ≢ b.age then return false
+    if a.step ≢ b.step then return false
+    if a.rng.status ≢ b.rng.status then return false
+    if a.state_wire ≢ b.state_wire then return false
+    return true
+}
+
+# -------------------------------------------------------------------------
+# Checkpoint wire — versioned, exact round-trip. The fixed prefix carries
+# marker/schema/epoch/step/rng-state; the embedded optimizer-state wire is
+# the '/' tail (joined verbatim from the trailing segments).
+# -------------------------------------------------------------------------
+
+@ public
+fn serialize_checkpoint(Checkpoint c) → string {
+    return "train/checkpoint/§/§/§/§/§"(schema_version, c.age ↦ string, c.step ↦ string, c.rng.status ↦ string, c.state_wire)
+}
+
+# All-digits predicate for wire integer fields (epoch, step).
+fn digit(string c) → bool {
+    let string text ↤ c
+    return "0123456789".contains(text)
+}
+
+fn numeric(string s) → bool {
+    if s.length() ≡ 0 then return false
+    if s.length() ≻ 18 then return false
+    for from s let c {
+        if not digit(c ↦ string) then return false
+    }
+    return true
+}
+
+@ public
+fn deserialize_checkpoint(string wire) → Checkpoint ⇥ CheckpointError {
+    let list<string> parts ← wire.split("/")
+    require parts.length() ≥ 7 throw variant BadWire { message = "malformed checkpoint wire" }
+    require parts.get(0) coalesce "" ≡ "train" throw variant BadWire { message = "unknown checkpoint marker" }
+    require parts.get(1) coalesce "" ≡ "checkpoint" throw variant BadWire { message = "unknown checkpoint marker" }
+    require parts.get(2) coalesce "" ≡ schema_version throw variant UnknownVersion { message = "unknown checkpoint schema version" }
+    let string age_text ← parts.get(3) coalesce ""
+    let string step_text ← parts.get(4) coalesce ""
+    require numeric(age_text) throw variant BadWire { message = "malformed epoch in checkpoint wire" }
+    require numeric(step_text) throw variant BadWire { message = "malformed step in checkpoint wire" }
+    mut int age ← 0
+    mut int step ← 0
+    do {
+        age ↤ age_text
+    }
+    catch err {
+        throw variant BadWire { message = "malformed epoch in checkpoint wire" }
+    }
+    do {
+        step ↤ step_text
+    }
+    catch err {
+        throw variant BadWire { message = "malformed step in checkpoint wire" }
+    }
+    let string status_text ← parts.get(5) coalesce ""
+    require status_text.length() ≢ 0 throw variant BadWire { message = "malformed rng state in checkpoint wire" }
+    mut int status ← 0
+    do {
+        status ↤ status_text
+    }
+    catch err {
+        throw variant BadWire { message = "malformed rng state in checkpoint wire" }
+    }
+    let random.Seed rng ← random.construct_seed(status)
+    # The embedded optimizer-state wire is the '/' tail, joined verbatim.
+    mut string state_wire ← ""
+    # legacy-L2: flat list carrier — tail assembly needs source indices; retain bounded range walk.
+    for range 6 ‥ parts.length() let i {
+        if i ≻ 6 {
+            state_wire ← state_wire + "/"
+        }
+        state_wire ← state_wire + parts.get(i) coalesce ""
+    }
+    require state_wire.length() ≢ 0 throw variant EmptyState { message = "checkpoint state wire is empty" }
+    return Checkpoint { age = age, step = step, rng = rng, state_wire = state_wire }
+}

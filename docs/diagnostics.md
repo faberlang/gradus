@@ -64,7 +64,8 @@ pinned row is space-prefix-free (add_space_prefix = false)
 | `gradus:model/dense` | `DenseError` | 4 | `src/model/dense.fab` |
 | `gradus:model/moe` | `MoeError` | 4 | `src/model/moe.fab` |
 | `gradus:model/qwen35moe_state` | `Qwen35moeStateError` | 6 | `src/model/qwen35moe_state.fab` |
-| `gradus:nn` | `NnError` | 9 | `src/nn.fab` |
+| `gradus:checkpoint` | `CheckpointError` | 5 | `src/checkpoint.fab` |
+| `gradus:nn` | `NnError` | 13 | `src/nn.fab` |
 | `gradus:optimize` | `OptimizeError` | 14 | `src/optimize.fab` |
 | `gradus:parameter` | `ParametrumError` | 10 | `src/parameter.fab` |
 | `gradus:sampling` | `SamplingError` | 3 | `src/sampling.fab` |
@@ -72,10 +73,10 @@ pinned row is space-prefix-free (add_space_prefix = false)
 | `gradus:shape` | `FormaError` | 6 | `src/shape.fab` |
 | `gradus:tensor` | `TensorError` | 3 | `src/tensor.fab` |
 | `gradus:tokenizer` | `TokenizerError` | 14 | `src/tokenizer.fab` |
-| `gradus:train` | `TrainError` | 10 | `src/train.fab` |
+| `gradus:train` | `TrainError` | 9 | `src/train.fab` |
 | `gradus:transformer` | `TransformerError` | 12 | `src/transformer.fab` |
 
-**Total**: 232 public error codes across 31 error types.
+**Total**: 240 public error codes across 32 error types.
 
 ## `gradus:model/artifact` — `ArtifactError`
 
@@ -481,6 +482,24 @@ Source: `src/nn.fab`. Render with module `message(e)`.
 | `NnError.DtypeMismatch` | Dtype mismatch or unsupported dtype for this surface. | `dtype mismatch`<br>`unsupported dtype for nn primitive` | Fix caller shapes, ranks, dtypes, and element counts so they satisfy the operation contract. |
 | `NnError.ElementMismatch` | Element-count / emptiness failure. | `empty normalization axis` | Fix caller shapes, ranks, dtypes, and element counts so they satisfy the operation contract. |
 | `NnError.EpsilonInvalida` | Invalid (negative) epsilon. | `negative epsilon` | Correct the field to the documented admitted range and re-construct. |
+| `NnError.IndexOutOfBounds` | Embedding token id is outside the table. | `token id out of range for the embedding` | Supply ids in the admitted table range. |
+| `NnError.UnknownMode` | Unknown train/eval mode name. | `unknown mode name` | Use the canonical `train` or `eval` mode name. |
+| `NnError.InvalidDropout` | Dropout rate is outside the finite `[0, 1]` domain. | `dropout rate must be in [0, 1]` | Supply a finite rate from zero through one. |
+| `NnError.TensorFailure` | Tensor construction failed while applying dropout. | _(the underlying tensor error message)_ | Supply a valid tensor payload and shape. |
+
+## `gradus:checkpoint` — `CheckpointError`
+
+Source: `src/checkpoint.fab`. The checkpoint envelope reports only its own
+construction and wire errors; the embedded optimizer wire is validated by
+`gradus:optimize` when resumed.
+
+| Code | Class / when | Live messages (representative) | Resolution |
+| --- | --- | --- | --- |
+| `CheckpointError.InvalidSeed` | Checkpoint wire contains the invalid zero RNG state. | `seed must be non-zero` | Supply a non-zero seed state. |
+| `CheckpointError.InvalidPosition` | Epoch or step is negative. | `epoch must be non-negative`<br>`step must be non-negative` | Use non-negative epoch and step values. |
+| `CheckpointError.EmptyState` | Embedded optimizer-state wire is empty. | `checkpoint state wire is empty` | Store a non-empty optimizer-state wire. |
+| `CheckpointError.UnknownVersion` | Checkpoint schema version is unsupported. | `unknown checkpoint schema version` | Re-emit with the supported checkpoint schema. |
+| `CheckpointError.BadWire` | Checkpoint marker or envelope is malformed. | `malformed checkpoint wire`<br>`malformed epoch in checkpoint wire`<br>`malformed step in checkpoint wire`<br>`malformed rng state in checkpoint wire`<br>`unknown checkpoint marker` | Re-emit a well-formed checkpoint with the current schema. |
 
 ## `gradus:optimize` — `OptimizeError`
 
@@ -603,20 +622,10 @@ divergent id/character.
 
 ## `gradus:train` — `TrainError`
 
-Source: `src/train.fab`. Render with module `message(e)`.
-
-| Code | Class / when | Live messages (representative) | Resolution |
-| --- | --- | --- | --- |
-| `TrainError.InvalidSchedule` | Learning-rate schedule construction failed. | `final learning rate above peak`<br>`invalid final learning rate`<br>`invalid peak learning rate`<br>`negative warmup steps`<br>`schedule horizon must be at least one step`<br>`warmup exceeds the schedule horizon` | Correct the field to the documented admitted range and re-construct. |
-| `TrainError.UnknownMode` | Unknown train/eval mode name. | `unknown mode name` | Correct the field to the documented admitted range and re-construct. |
-| `TrainError.ExcutioInvalida` | Invalid execution policy field (e.g. dropout rate). | `dropout rate must be in [0, 1]` | Correct the field to the documented admitted range and re-construct. |
-| `TrainError.NegativeStep` | Negative schedule step. | `schedule step must be non-negative` | Correct the field to the documented admitted range and re-construct. |
-| `TrainError.InvalidSeed` | Invalid RNG seed. | `seed must be non-zero` | Use a seed that meets the contract (non-zero / ≥ 1 as required). |
-| `TrainError.BadPayload` | Malformed numeric value at a boundary. | _(reserved / mapped — no direct literal `iace` site; code is live on the `discretio`)_ | Reject NaN/malformed values at the boundary; re-export clean weights. |
-| `TrainError.InvalidPosition` | Invalid position / epoch / step (negative or out of range). | `epoch must be non-negative`<br>`step must be non-negative` | Correct the field to the documented admitted range and re-construct. |
-| `TrainError.EmptyState` | Empty checkpoint / state wire. | `checkpoint state wire is empty` | Provide a non-empty checkpoint wire produced by the current serialize path. |
-| `TrainError.UnknownVersion` | Unknown or unsupported schema / file / marker version. | `unknown checkpoint schema version`<br>`unknown rng schema version` | Re-emit with the current schema stamp; never guess an unknown version. |
-| `TrainError.BadWire` | Malformed wire / bytes / marker / field encoding. | `malformed checkpoint wire`<br>`malformed epoch in checkpoint wire`<br>`malformed rng state`<br>`malformed rng state in checkpoint wire`<br>`malformed rng wire`<br>`malformed step in checkpoint wire`<br>`unknown checkpoint marker`<br>`unknown rng marker` | Re-emit with the current schema stamp; never guess an unknown version. |
+Source: `src/train.fab`. This public error union remains for compatibility;
+new mode/dropout operations return `nn.NnError`, and checkpoint operations
+return `checkpoint.CheckpointError`. No current training operation produces
+`TrainError`.
 
 ## `gradus:transformer` — `TransformerError`
 

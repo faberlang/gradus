@@ -21,7 +21,7 @@ step (`optimize.sgd_step`) over the 4×4 fixture; printed losses match the pins
 | Per-parameter gradients | `gradient.construct` records (U2): identity + generation = the parameter version at the backward |
 | Optimizer steps | Tensor SGD: `optimize.sgd_step` generic list form over the 4×4 fixture. Parameter/checkpoint: `optimize.step` (U3) fresh-gradient rules, fail-closed; `parameter.mutate` bumps version |
 | Per-step metric log | `metrics.metric` (U5): `loss` = the loss (the accepted trajectory); `accuracy` = the documented regression-match rate (`|pred − target| ≤ 0.1` over the 16 output elements), read from the typed shared forward `mlp.forward_mlp` over the current tensor values — the same definition `forward_mlp_loss` composes |
-| Checkpoint in/out | `train.construct_checkpoint` (U5): whole-optimizer state wire (U3 `serialize`) + RNG state + epoch/step; `serialize_checkpoint` → `deserialize_checkpoint` is the resume round-trip (`checkpoint_equal`) |
+| Checkpoint in/out | `checkpoint.construct_checkpoint` (U5): whole-optimizer state wire (U3 `serialize`) + RNG state + epoch/step; `serialize_checkpoint` → `deserialize_checkpoint` is the resume round-trip (`checkpoint_equal`) |
 
 ## Convergence target (accepted oracle, f64 evaluations)
 

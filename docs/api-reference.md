@@ -998,17 +998,29 @@ decoded F32 values are produced only by materialization.
 
 ## gradus:nn
 
-Differentiable tensor primitives: linear, GELU, LayerNorm, RMSNorm, SiLU, and SwiGLU.
+Differentiable tensor primitives plus explicit train/eval mode and dropout: linear, GELU, LayerNorm, RMSNorm, SiLU, and SwiGLU.
 
 **Source**: `src/nn.fab`
 
 ### Public types
 
-- `union NnError` — NegativeDimension, DimensionAboveLimit, ProductAboveLimit, GradusMismatch, ShapeMismatch, Incompatible, DtypeMismatch, ElementMismatch, InvalidEpsilon
+- `union NnError` — NegativeDimension, DimensionAboveLimit, ProductAboveLimit, GradusMismatch, ShapeMismatch, Incompatible, DtypeMismatch, ElementMismatch, InvalidEpsilon, IndexOutOfBounds, UnknownMode, InvalidDropout, TensorFailure
+- `union Mode` — Discipline, Estimate
+- `class Dropout`
+  - fields: tensor.NumericBlock payload, random.Seed seed
+  - methods:
+    - `fn payload() → tensor.NumericBlock`
+    - `fn seed() → random.Seed`
 
 ### Public functions
 
 - `fn message(NnError e) → string`
+- `fn mode_name(Mode m) → string`
+- `fn is_discipline(Mode m) → bool`
+- `fn is_estimate(Mode m) → bool`
+- `fn mode(string name) → Mode ⇥ NnError`
+- `fn dropout_probability(Mode m, f32 rate) → f32 ⇥ NnError`
+- `fn dropout(tensor.NumericBlock x, random.Seed s, Mode m, f32 rate) → Dropout ⇥ NnError`
 - `fn linear<size M, size K, size N>(tensor<f32, [M, K]> x, tensor<f32, [K, N]> w, tensor<f32, [M, N]> b) → tensor<f32, [M, N]>`
 - `fn linear_channel<size M, size K, size N>(tensor<f32, [M, K]> x, tensor<f32, [K, N]> w, tensor<f32, [N]> b) → tensor<f32, [M, N]>`
 - `fn gelu<size M, size N>(tensor<f32, [M, N]> x) → tensor<f32, [M, N]>`
@@ -1399,24 +1411,16 @@ Deterministic xorshift64 seed state, draws, and the versioned RNG wire.
 - `fn serialize_seed(Seed s) → string`
 - `fn deserialize_seed(string wire) → Seed ⇥ RandomError`
 
-## gradus:train
+## gradus:checkpoint
 
-Learning-rate schedules live in `gradus:schedule`; this module provides
-train/eval mode, dropout, and checkpoints. Parameter updates are composed
-from explicit gradients and optimizer state. RNG state and draws live in
-`gradus:random`.
+Versioned checkpoint envelope with epoch, step, RNG state, and an embedded
+optimizer-state wire carried verbatim.
 
-**Source**: `src/train.fab`
+**Source**: `src/checkpoint.fab`
 
 ### Public types
 
-- `union TrainError` — UnknownMode, InvalidDropout, InvalidSeed, BadPayload, InvalidPosition, EmptyState, UnknownVersion, BadWire
-- `union Mode` — Discipline, Estimate
-- `class Dropout`
-  - fields: tensor.NumericBlock payload, random.Seed seed
-  - methods:
-    - `fn payload() → tensor.NumericBlock`
-    - `fn seed() → random.Seed`
+- `union CheckpointError` — InvalidSeed, InvalidPosition, EmptyState, UnknownVersion, BadWire
 - `class Checkpoint`
   - fields: int age, int step, random.Seed rng, string state_wire
   - methods:
@@ -1427,18 +1431,23 @@ from explicit gradients and optimizer state. RNG state and draws live in
 
 ### Public functions
 
-- `fn message(TrainError e) → string`
-- `fn mode_name(Mode m) → string`
-- `fn is_discipline(Mode m) → bool`
-- `fn is_estimate(Mode m) → bool`
-- `fn mode(string name) → Mode ⇥ TrainError`
-- `fn dropout_probability(Mode m, f32 rate) → f32 ⇥ TrainError`
-- `fn dropout(tensor.NumericBlock x, random.Seed s, Mode m, f32 rate) → Dropout ⇥ TrainError`
-- `fn construct_checkpoint(int age, int step, random.Seed rng, string state_wire) → Checkpoint ⇥ TrainError`
+- `fn construct_checkpoint(int age, int step, random.Seed rng, string state_wire) → Checkpoint ⇥ CheckpointError`
 - `fn default_checkpoint() → Checkpoint`
 - `fn checkpoint_equal(Checkpoint a, Checkpoint b) → bool`
 - `fn serialize_checkpoint(Checkpoint c) → string`
-- `fn deserialize_checkpoint(string wire) → Checkpoint ⇥ TrainError`
+- `fn deserialize_checkpoint(string wire) → Checkpoint ⇥ CheckpointError`
+
+## gradus:train
+
+Retains the training error vocabulary for compatibility. Train/eval mode and
+dropout live in `gradus:nn`; checkpointing lives in `gradus:checkpoint`.
+
+**Source**: `src/train.fab`
+
+### Public types
+
+- `union TrainError` — UnknownMode, InvalidDropout, InvalidSeed, BadPayload, InvalidPosition, EmptyState, UnknownVersion, BadWire, TensorFailure
+
 
 ## gradus:transformer
 
