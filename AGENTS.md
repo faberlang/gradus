@@ -52,7 +52,8 @@ One `.fab` file → one import path. Nested dirs for packages.
 | `gradus:generation/dense` | DenseEngine and dense generate |
 | `gradus:mlp` | Two-layer MLP forward + training-path companion |
 | `gradus:transformer` | Transformer block, positional encoding, output head |
-| `gradus:train` | Train/eval mode, RNG, dropout, and checkpointing |
+| `gradus:random` | Deterministic seed state, RNG draws, and serialization |
+| `gradus:train` | Train/eval mode, dropout, and checkpointing |
 | `gradus:data` | Batching, shuffling, tokenization |
 | `gradus:gradus` | Facade map only (no genera) |
 

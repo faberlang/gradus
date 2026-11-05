@@ -1,10 +1,11 @@
 +++
 locale = "en"
 +++
-# Training controls — train/eval mode, RNG, dropout, and checkpoint envelope.
+# Training controls — train/eval mode, dropout, and checkpoint envelope.
 #
 # Public import: import from "gradus:train" train
-# Depends on: gradus:dtype (finite), gradus:tensor (value carrier).
+# Depends on: gradus:dtype (finite), gradus:tensor (value carrier),
+# gradus:random (the shared explicit seed state).
 #
 # Learning-rate schedules live in gradus:schedule. This module does not own
 # an epoch loop or metrics (gradus:metrics), and it does not specialize
@@ -18,13 +19,15 @@ import from "gradus:dtype" dtype
 
 import from "gradus:tensor" tensor
 
+import from "gradus:random" random
+
 # =========================================================================
 # Train/eval mode and dropout policy
 # =========================================================================
 # Mode is explicit: forward evaluation consults the mode it is called with,
 # never hidden global state. Eval mode has effective dropout rate 0; train
 # mode uses the configured rate. The stochastic mask uses the explicit Seed
-# state defined below.
+# state owned by gradus:random.
 
 # -------------------------------------------------------------------------
 # TrainError — typed error vocabulary of the training-loop controls.
@@ -53,6 +56,21 @@ union TrainError {
 @ conversion
 fn from_tensor_error(tensor.TensorError err) → TrainError {
     return variant TensorFailure { message = err.message, inner = err }
+}
+
+@ conversion
+fn from_random_error(random.RandomError err) → TrainError {
+    match err {
+        case random.RandomError.InvalidSeed let message {
+            return variant InvalidSeed { message = message }
+        }
+        case random.RandomError.BadWire let message {
+            return variant BadWire { message = message }
+        }
+        case random.RandomError.UnknownVersion let message {
+            return variant UnknownVersion { message = message }
+        }
+    }
 }
 
 
@@ -129,131 +147,6 @@ fn dropout_probability(Mode m, f32 rate) → f32 ⇥ TrainError {
     return rate
 }
 
-# =========================================================================
-# PML4-U5 — Seeds (RNG) and checkpoint resume (pml4-delivery.md U5)
-# =========================================================================
-#
-# --- Contract ------------------------------------------------------------
-# Two pieces close this module's reproducibility contract (metrics live
-# in gradus:metrics, not here):
-#
-#   1. Seed — the seed/RNG state (this unit owns the machinery U4's
-#      dropout gate composes with). A xorshift64 generator (shifts + XOR
-#      only, no multiply — no overflow concerns) over a nonzero i64
-#      state; deterministic: the same seed produces the same sequence.
-#      next() draws the next 64-bit value and advances the state;
-#      next_f32() maps a draw to [0, 1) (sign-masked, top 52 bits,
-#      uniform over the masked space — the f32 [0,1) contract). dropout()
-#      is the dropout-mask composition: it takes the effective rate from
-#      dropout_probability (U4) — eval mode is identity and the RNG is left
-#      untouched — and in train mode applies a per-element Bernoulli mask
-#      scaled by 1/(1−rate) (inverted dropout, so the eval identity
-#      composes exactly). Deterministic given (tensor, seed, mode, rate).
-#
-#   2. Checkpoint — the checkpoint: epoch + step + RNG state + the U3
-#      optimizer-state wire (carried VERBATIM — the envelope stays
-#      autograd-free; the state wire is validated by its own schema,
-#      optimize.deserialize, at resume). Versioned wire round-trip
-#      ("train/checkpoint/1.0.0/<epoch>/<step>/<rng_state>/<state_wire>");
-#      interrupted-resume failure is EXPLICIT: a truncated/malformed
-#      checkpoint wire, an unknown schema, an invalid epoch/step, a zero
-#      RNG state, or a missing state wire all fail closed at
-#      deserialization; a corrupt embedded state wire fails closed at
-#      optimize.deserialize (resume).
-#
-# --- Shared with the GPU-training lane's accepted facts -----------------
-#   * checkpoint resume (state + RNG + epoch/step) versioned per the U3
-#     wire precedent (slot wire, lossless float form, '/' and ';'
-#     reserved); same fail-closed posture (capsule rule).
-#   * dropout mask semantics: per-element Bernoulli(1−rate), scaled by
-#     1/(1−rate) in train (inverted dropout) — the standard training
-#     policy the U4 dropout_probability gate controls.
-#
-# --- Evidence honesty (CTO Q2, hard) ------------------------------------
-# This surface is the STRUCTURAL proof: the generator recurrence, the
-# mask policy, and the checkpoint round-trip are compile-validated and
-# proven by the co-located proba (f64 oracle pins for the xorshift
-# recurrence, the [0,1) draws, and a concrete dropout-mask output).
-# Executed VALUE identity for this section remains deferred.
-# Library-to-library calls execute on the FMIR stepper (radix 43c0102ba;
-# regression-locked by 2e8042ae7). PML4-U5 is PARTIAL: numeric identity
-# is deferred to a runtime-evidence gate (auditor-owned faber
-# test path; oracle pins recorded in train.proba).
-
-# Schema version of this module's wire forms (rng, checkpoint).
-const string schema_version = "1.0.0"
-
-# -------------------------------------------------------------------------
-# Seed — the deterministic RNG state. A xorshift64 state (nonzero i64);
-# the same seed reproduces the same sequence (reproducibility).
-# -------------------------------------------------------------------------
-
-
-@ public
-class Seed {
-    mut int status
-}
-
-# Seed the generator. Zero is rejected fail-closed (xorshift64 maps 0 → 0).
-@ public
-fn construct_seed(int seed) → Seed ⇥ TrainError {
-    require seed ≢ 0 throw variant InvalidSeed { message = "seed must be non-zero" }
-    return Seed { status = seed }
-}
-
-# Placeholder Default for `var Seed` bindings (varia on structs).
-# Status 0 (not a valid seed — xorshift64 degenerates at 0). Only a
-# placeholder the caller overwrites, or returns from an unreachable cape arm.
-@ public
-fn default() → Seed {
-    return Seed { status = 0 }
-}
-
-# One RNG draw: the next 64-bit value + the advanced state.
-
-@ public
-class Draw {
-    mut int payload
-    mut Seed seed
-}
-
-# xorshift64 step: x ^= x<<13; x ^= x>>7; x ^= x<<17. Shifts + XOR only —
-# no multiply. The step runs in the `wrapping<i64>` ring: a left shift is
-# exact (`x·2ⁿ`), so each store wraps it back into the 64-bit state; `⇒`
-# reduces its operand first (arithmetic shift of the signed state).
-@ public
-fn next(Seed s) → Draw {
-    mut wrapping<i64> x ← s.status ↦ wrapping<i64>
-    x ← x ⊻ x ⇐ 13
-    x ← x ⊻ x ⇒ 7
-    x ← x ⊻ x ⇐ 17
-    let int state ← x ↦ int
-    return Draw { payload = state, seed = Seed { status = state } }
-}
-
-# Sign-bit mask: the [0,1) draw uses only the low 63 bits (sign-agnostic).
-const int MASK_63 = 9223372036854775807
-
-# 2^52 as f32 (exact power of two) — the draw denominator.
-const f32 POW2_52 = 4503599627370496.0 ∷ f32
-
-# One f32 draw in [0, 1): the top 52 bits of the sign-masked state over
-# 2^52. Uniform over the masked space; deterministic (same seed → same
-# draws). f32 rounding is ~1e-7 — the proba pins compare within 1e-6.
-
-@ public
-class DrawF32 {
-    mut f32 payload
-    mut Seed seed
-}
-
-@ public
-fn next_f32(Seed s) → DrawF32 {
-    let Draw f ← next(s)
-    let f32 v ← (((f.payload ∧ MASK_63) ⇒ 11) ↦ f32) / POW2_52
-    return DrawF32 { payload = v, seed = f.seed }
-}
-
 # -------------------------------------------------------------------------
 # dropout — the dropout-mask composition (the U5 machinery the U4
 # dropout_probability gate controls). Eval mode (or rate 0) is identity and the
@@ -268,19 +161,19 @@ fn next_f32(Seed s) → DrawF32 {
 @ public
 class Dropout {
     mut tensor.NumericBlock payload
-    mut Seed seed
+    mut random.Seed seed
 }
 
 @ public
-fn dropout(tensor.NumericBlock x, Seed s, Mode m, f32 rate) → Dropout ⇥ TrainError {
+fn dropout(tensor.NumericBlock x, random.Seed s, Mode m, f32 rate) → Dropout ⇥ TrainError {
     let f32 par ← dropout_probability(m, rate)
     if par ≡ 0.0 ∷ f32 then return Dropout { payload = x, seed = s }
     let f32 scale ← 1.0 / (1.0 - par)
     let list<f32> data ← x.data
     mut list<f32> out ← empty
-    mut Seed s2 ← copy s
+    mut random.Seed s2 ← copy s
     for from data let v {
-        let DrawF32 f ← next_f32(s2)
+        let random.DrawF32 f ← random.next_f32(s2)
         s2 ← f.seed
         if f.payload ≥ par {
             out.append(v * scale)
@@ -294,33 +187,7 @@ fn dropout(tensor.NumericBlock x, Seed s, Mode m, f32 rate) → Dropout ⇥ Trai
     return Dropout { payload = updated, seed = s2 }
 }
 
-# -------------------------------------------------------------------------
-# RNG wire — versioned, exact round-trip.
-# -------------------------------------------------------------------------
-
-@ public
-fn serialize_seed(Seed s) → string {
-    return "train/rng/§/§"(schema_version, s.status ↦ string)
-}
-
-@ public
-fn deserialize_seed(string wire) → Seed ⇥ TrainError {
-    let list<string> parts ← wire.split("/")
-    require parts.length() ≡ 4 throw variant BadWire { message = "malformed rng wire" }
-    require parts.get(0) coalesce "" ≡ "train" throw variant BadWire { message = "unknown rng marker" }
-    require parts.get(1) coalesce "" ≡ "rng" throw variant BadWire { message = "unknown rng marker" }
-    require parts.get(2) coalesce "" ≡ schema_version throw variant UnknownVersion { message = "unknown rng schema version" }
-    let string status_text ← parts.get(3) coalesce ""
-    require status_text.length() ≢ 0 throw variant BadWire { message = "malformed rng state" }
-    mut int status ← 0
-    do {
-        status ↤ status_text
-    }
-    catch err {
-        throw variant BadWire { message = "malformed rng state" }
-    }
-    return construct_seed(status)
-}
+const string schema_version = "1.0.0"
 
 # -------------------------------------------------------------------------
 # Checkpoint — the checkpoint: epoch + step + RNG state + the optimizer-state
@@ -335,7 +202,7 @@ class Checkpoint {
     mut int age
     # Step within the epoch.
     mut int step
-    mut Seed rng
+    mut random.Seed rng
     # Embedded optimizer-state wire, carried verbatim.
     mut string state_wire
 }
@@ -343,7 +210,7 @@ class Checkpoint {
 # Build a checkpoint. Epoch/step are non-negative; the state wire is
 # non-empty (fail closed). The RNG is already a validated Seed.
 @ public
-fn construct_checkpoint(int age, int step, Seed rng, string state_wire) → Checkpoint ⇥ TrainError {
+fn construct_checkpoint(int age, int step, random.Seed rng, string state_wire) → Checkpoint ⇥ TrainError {
     require age ≥ 0 throw variant InvalidPosition { message = "epoch must be non-negative" }
     require step ≥ 0 throw variant InvalidPosition { message = "step must be non-negative" }
     require state_wire.length() ≢ 0 throw variant EmptyState { message = "checkpoint state wire is empty" }
@@ -355,7 +222,7 @@ fn construct_checkpoint(int age, int step, Seed rng, string state_wire) → Chec
 # placeholder the caller overwrites, or returns from an unreachable cape arm.
 @ public
 fn default_checkpoint() → Checkpoint {
-    return Checkpoint { age = 0, step = 0, rng = default(), state_wire = "" }
+    return Checkpoint { age = 0, step = 0, rng = random.default(), state_wire = "" }
 }
 
 # Field-wise checkpoint equality — the round-trip predicate.
@@ -428,7 +295,7 @@ fn deserialize_checkpoint(string wire) → Checkpoint ⇥ TrainError {
     catch err {
         throw variant BadWire { message = "malformed rng state in checkpoint wire" }
     }
-    let Seed rng ← construct_seed(status)
+    let random.Seed rng ← random.construct_seed(status)
     # The embedded optimizer-state wire is the '/' tail, joined verbatim.
     mut string state_wire ← ""
     # legacy-L2: flat list carrier — tail assembly needs source indices; retain bounded range walk.
