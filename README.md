@@ -248,8 +248,10 @@ device/backend handle:
 
 - `gradus:nn` — `linear<M,K,N>`, `gelu<M,N>` (shape-generic leaves)
 - `gradus:loss` — `mse<M,N>` plus decoded-carrier `mse_carrier`
-- `gradus:train` — schedules, modes, RNG, dropout, and checkpoints; training
-  updates use explicit parameters, gradients, and optimizer state
+- `gradus:optimize` — optimizers; `gradus:schedule` — warmup and cosine
+  learning-rate schedules
+- `gradus:train` — modes, RNG, dropout, and checkpoints; training updates
+  use explicit parameters, gradients, and optimizer state
 
 The `gradus:optimize` surface carries explicit `SgdState` slots, steps, and
 wires. Dimensions such as 2×2 remain fixture choices in examples rather than
