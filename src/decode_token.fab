@@ -8,11 +8,18 @@ locale = "en"
 # Public import: import from "gradus:decode_token" dt
 #
 #   embed_step   token id -> hidden[D]           (1 launch)
-#   layer_step   one transformer layer           (21 launches)
+#   layer_step   one transformer layer           (22 launches)
 #   head_step    final norm + tied lm_head       (3 launches)  -> logits[V]
-#   argmax_host  greedy pick of a logits tensor  (the ONE host read of a token)
+#   argmax_host  greedy pick of a logits tensor  (host scan)
 #
-# A 32-layer token is 1 + 32 * 21 + 3 = 676 launches. Layer launch order:
+# These allocate scratch inside the generic function, which `--strict-engine` refuses
+# and which makes every kernel-written scratch tensor an observation point (a
+# download and a blocking wait per launch). The wide path further down is the
+# strict-engine route: `embed_wide`, `layer_wide`, `head_step_wide`, with the token
+# picked on the device by `decode_step.argmax_token`.
+#
+# A 32-layer token on the serial path is 1 + 32 * 22 + 3 + 1 = 709 launches. Layer
+# launch order (22 launches):
 #   rms_stats, rms_apply (attn norm); gemv_lane x3 (q, k, v); rope_half or rope_pairs x2;
 #   kv_write x2; attn_scores; softmax_stats; softmax_apply; attn_context;
 #   gemv_lane (o); residual_add; rms_stats, rms_apply (ffn norm);
@@ -148,19 +155,137 @@ fn head_step<size V, size D>(tensor<f32, [D]> hidden, tensor<f32, [D]> onorm, te
     ds.gemv_lane(vdom, embed, hn, mut logits, pd)
 }
 
-# Greedy pick: the index of the largest logit (first on ties).
+# ---------------------------------------------------------------------------
+# Wide path (strict-engine safe): 14 launches per layer instead of 22, none of them a
+# serial 960-term dot in one lane, and no allocation inside the generic functions
+# (a generic host function that allocates `tf32[D] {}` is refused by `--strict-engine`).
+# The CALLER owns every scratch tensor, allocates it once, and primes it with
+# `prime_layer_wide` / `decode_step.prime1` / `prime2` before the first token; an
+# unprimed kernel-written tensor makes every later launch download it and block. The
+# caches `kin` / `vin` are primed with `decode_step.prime2`.
+#
+# Scratch shapes (D hidden, QD query width, KVD key/value width, F ffn width, H query
+# heads, C cache rows; R = QD + 2 * KVD; P lanes per GEMV row, a power of two, 64 is
+# the measured sweet spot; Q partial sums for RMSNorm, 32):
+#   rp [Q]   qkvp [R, P]   qkv [R]   kvdom [KVD] (zeros)   sc [H, C]   mx [H]   sm [H]
+#   ctx [QD]   op [D, P]   h1 [D]   gp [F, P]   up [F, P]   act [F]   dp [D, P]
+# `pqd` / `pkvd` are QD / KVD, `pdh` the head width, `pgroup` = QD / KVD, `prope` the
+# RoPE pair convention (as in `layer_step`), `pos` the token position.
+# ---------------------------------------------------------------------------
+
+# Prime every scratch tensor of `layer_wide` (one launch and one wait each, at setup).
+@ public
+fn prime_layer_wide<size D, size QD, size F, size H, size C, size P, size Q, size R>(
+    mut tensor<f32, [Q]> rp,
+    mut tensor<f32, [R, P]> qkvp,
+    mut tensor<f32, [R]> qkv,
+    mut tensor<f32, [H, C]> sc,
+    mut tensor<f32, [H]> mx,
+    mut tensor<f32, [H]> sm,
+    mut tensor<f32, [QD]> ctx,
+    mut tensor<f32, [D, P]> op,
+    mut tensor<f32, [D]> h1,
+    mut tensor<f32, [F, P]> gp,
+    mut tensor<f32, [F, P]> up,
+    mut tensor<f32, [F]> act,
+    mut tensor<f32, [D, P]> dp,
+    mut tensor<f32, [1]> sink
+) → void {
+    ds.prime1(rp, mut sink)
+    ds.prime2(qkvp, mut sink)
+    ds.prime1(qkv, mut sink)
+    ds.prime2(sc, mut sink)
+    ds.prime1(mx, mut sink)
+    ds.prime1(sm, mut sink)
+    ds.prime1(ctx, mut sink)
+    ds.prime2(op, mut sink)
+    ds.prime1(h1, mut sink)
+    ds.prime2(gp, mut sink)
+    ds.prime2(up, mut sink)
+    ds.prime1(act, mut sink)
+    ds.prime2(dp, mut sink)
+}
+
+# One layer: hout = layer(hin) at position `pos`, in 14 launches.
+@ public
+fn layer_wide<size D, size QD, size KVD, size F, size H, size C, size P, size Q, size R>(
+    tensor<f32, [D]> hin,
+    mut tensor<f32, [D]> hout,
+    tensor<f32, [D]> anorm,
+    tensor<f32, [QD, D]> wq,
+    tensor<f32, [KVD, D]> wk,
+    tensor<f32, [KVD, D]> wv,
+    tensor<f32, [D, QD]> wo,
+    tensor<f32, [D]> fnorm,
+    tensor<f32, [F, D]> wg,
+    tensor<f32, [F, D]> wu,
+    tensor<f32, [D, F]> wd,
+    mut tensor<f32, [C, KVD]> kin,
+    mut tensor<f32, [C, KVD]> vin,
+    mut tensor<f32, [Q]> rp,
+    mut tensor<f32, [R, P]> qkvp,
+    mut tensor<f32, [R]> qkv,
+    tensor<f32, [KVD]> kvdom,
+    mut tensor<f32, [H, C]> sc,
+    mut tensor<f32, [H]> mx,
+    mut tensor<f32, [H]> sm,
+    mut tensor<f32, [QD]> ctx,
+    mut tensor<f32, [D, P]> op,
+    mut tensor<f32, [D]> h1,
+    mut tensor<f32, [F, P]> gp,
+    mut tensor<f32, [F, P]> up,
+    mut tensor<f32, [F]> act,
+    mut tensor<f32, [D, P]> dp,
+    i32 pos,
+    i32 pqd,
+    i32 pkvd,
+    i32 pdh,
+    i32 pgroup,
+    i32 prope,
+    f32 peps,
+    f32 plntheta,
+    f32 pscale
+) → void {
+    ds.rms_part(hin, mut rp)
+    ds.qkv_part(hin, rp, anorm, wq, wk, wv, mut qkvp, peps)
+    ds.qkv_fin(qkvp, mut qkv, pos, pqd, pkvd, pdh, plntheta, prope)
+    ds.kv_write_wide(kvdom, qkv, mut kin, mut vin, pos, pqd)
+    ds.scores_wide(qkv, kin, mut sc, pos, pdh, pgroup, pscale)
+    ds.softmax_wide(sc, mut mx, mut sm, pos)
+    ds.attn_wide(sc, mx, sm, vin, mut ctx, pos, pdh, pgroup)
+    ds.gemv_part(ctx, wo, mut op)
+    ds.gemv_fin_residual(op, hin, mut h1)
+    ds.rms_part(h1, mut rp)
+    ds.gateup_part(h1, rp, fnorm, wg, wu, mut gp, mut up, peps)
+    ds.swiglu_fin(gp, up, mut act)
+    ds.gemv_part(act, wd, mut dp)
+    ds.gemv_fin_residual(dp, h1, mut hout)
+}
+
+# hidden[D] <- embed[ids[0], :] (the id is read on the device).
+@ public
+fn embed_wide<size V, size D>(tensor<f32, [V, D]> embed, tensor<i32, [1]> ids, mut tensor<f32, [D]> hidden) → void {
+    ds.gather_wide(embed, ids, mut hidden)
+}
+
+# logits[V] = embed @ rmsnorm(hidden), the final norm folded into the lm_head GEMV.
+@ public
+fn head_step_wide<size V, size D, size Q>(tensor<f32, [D]> hidden, tensor<f32, [D]> onorm, tensor<f32, [V, D]> embed, mut tensor<f32, [Q]> rp, mut tensor<f32, [V]> logits, f32 peps) → void {
+    ds.rms_part(hidden, mut rp)
+    ds.head_wide(hidden, rp, onorm, embed, mut logits, peps)
+}
+
+# Greedy pick on the host: the index of the largest logit (first on ties). The wide
+# path uses `decode_step.argmax_token` instead, which leaves the id on the device.
 @ public
 fn argmax_host<size V>(tensor<f32, [V]> logits) → int {
     mut int best ← 0
     mut f32 top ← logits[[0]]
-    let int n ← V ↦ int
-    mut int i ← 1
-    while i ≺ n {
+    for range 1 ‥ V let i {
         if logits[[i]] ≻ top {
             top ← logits[[i]]
             best ← i
         }
-        i ← i + 1
     }
     return best
 }
