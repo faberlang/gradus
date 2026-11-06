@@ -7,30 +7,36 @@ locale = "en"
 #
 # Every compute function is an `@ kernel` that runs as a device launch (or,
 # with `--device cpu`, on the CPU device interpreter). The step is a chain of
-# launches over rank-1 vectors; host code reads only the K/V cache shape to
-# guard the in-place row write, never cache or hidden-state data between launches:
+# launches over rank-1 vectors; host code never reads cache or hidden-state data
+# between launches. Two launch sets live here:
 #
-#   gather_row                      hidden[D]   <- embedding row ids[0]
-#   per layer:
-#     rms_stats + rms_apply         normed[D]   <- hidden[D] and the norm weight[D]
-#     gemv_lane  (q, k, v)          q[QD], k[KVD], v[KVD]  (QD = H * dh, KVD = KV * dh)
-#     rope_half | rope_pairs (q, k) rotated q[QD], k[KVD] at position `pos`
-#     kv_write   (k, v)             K/V cache [C, KVD], row `pos` replaced
-#     attn_scores                   scores[H, C], masked past `pos`
-#     softmax_stats + softmax_apply probabilities[H, C]
-#     attn_context                  context[QD]
-#     gemv_lane  (o)                attention out[D]
-#     residual_add                  hidden[D]
-#     rms_stats + rms_apply, gemv_lane (gate, up), swiglu, gemv_lane (down), residual_add
-#   final rms_stats + rms_apply, gemv_lane (lm_head)   logits[V]
-#   argmax_chunks                   per-chunk (max, global index) of logits[V], P chunks
+#   Serial set (one lane per output element; the 22-launch layer of `layer_step`):
+#     gather_row                      hidden[D]   <- embedding row ids[0]
+#     per layer:
+#       rms_stats + rms_apply         normed[D]   <- hidden[D] and the norm weight[D]
+#       gemv_lane  (q, k, v)          q[QD], k[KVD], v[KVD]  (QD = H * dh, KVD = KV * dh)
+#       rope_half | rope_pairs (q, k) rotated q[QD], k[KVD] at position `pos`
+#       kv_write   (k, v)             K/V cache [C, KVD], row `pos` replaced
+#       attn_scores                   scores[H, C], masked past `pos`
+#       softmax_stats + softmax_apply probabilities[H, C]
+#       attn_context                  context[QD]
+#       gemv_lane  (o)                attention out[D]
+#       residual_add                  hidden[D]
+#       rms_stats + rms_apply, gemv_lane (gate, up), swiglu, gemv_lane (down), residual_add
+#     final rms_stats + rms_apply, gemv_lane (lm_head)   logits[V]
+#
+#   Wide set (`layer_wide`, 14 launches per layer; see "Wide launch set" below):
+#     gather_wide, rms_part, qkv_part, qkv_fin, kv_write_wide, scores_wide,
+#     softmax_wide, attn_wide, gemv_part + gemv_fin_residual (o and down), gateup_part,
+#     swiglu_fin, head_wide; then `argmax_token` leaves the token id on the device.
 #
 # Constraints these kernels carry (each was learned the hard way in
 # acceptance/a1-rowops and is why the code looks the way it does):
-#   - A lane kernel's domain is its FIRST read tensor, so each reduction
-#     kernel takes a read-only `...dom` tensor of the lane shape first.
+#   - A lane kernel's domain is its FIRST read tensor, so each serial reduction
+#     kernel takes a read-only `...dom` tensor of the lane shape first. (The wide set
+#     uses the output as the domain instead.)
 #   - Every store is at the lane's own coordinate. A reduction over a row is a
-#     serial `while` loop inside one lane; a value a later step needs per row is
+#     sequential loop inside one lane; a value a later step needs per row is
 #     its own launch (two-launch form) or an extra `mut` output at the lane's
 #     own coordinate (softmax_stats).
 #   - The `o ⇇ w · x` recipe needs literal dimensions, so a generic GEMV is a
@@ -39,15 +45,41 @@ locale = "en"
 #     on the device (it is a 64-bit carrier, refused as nucleum_wide_integer).
 #     Every lane local is `i32`, and each lane body is wrapped in scalar guards
 #     that establish the portable integer envelope the `/`, `%` and `2 * hf`
-#     extents need (the a1-rowops idiom); no `↦ int` conversion appears inside a
-#     kernel, and comparisons are made directly against the i32 parameters.
+#     extents need (the a1-rowops idiom). A `size` generic read as a value is NOT
+#     range-known: `k + P` and `QD % H` over generics are refused (SEM008
+#     nucleum_extent_unproven) unless the loop form proves them.
 #   - Parameter names are unique per kernel (a shared prefix per kernel).
 #   - A generic kernel instantiated at two different static shapes in one
 #     package duplicates the Metal entry name: one process runs one shape.
 #
-# Numeric contract: f32 throughout. The reductions are serial in lane order, so
+# Numeric contract: f32 throughout. The serial reductions are serial in lane order, so
 # the sequential `--device cpu` oracle and the device agree to the L7 float
 # tolerance (abs <= 1e-5 + 1e-4 * abs(ref)); neither sees the host `list` types.
+
+# Residency priming. A device buffer takes its lifetime class from the FIRST kernel
+# that binds it. A buffer first bound as a `mut` output is an observation point: the
+# host reads it back and waits after EVERY later launch that writes it (measured:
+# ~100-150 us per launch, one blocking wait each). A buffer first bound as a
+# read-only input stays device-resident, and later `mut` writes to it are queued with
+# no read-back and no wait. Scratch, ping-pong and cache tensors are written by
+# kernels, so the owner calls `prime1` / `prime2` ONCE after allocating each of them,
+# before any kernel writes it. Each call costs one launch and one wait, at setup.
+# `psink` is any [1] tensor.
+@ kernel
+@ public
+fn prime1<size N>(tensor<f32, [N]> ptarget, mut tensor<f32, [1]> psink) → void {
+    psink[0] ← reduce via sum from ptarget at [i] thread lane let v {
+        return v
+    }
+}
+
+@ kernel
+@ public
+fn prime2<size R, size C>(tensor<f32, [R, C]> ptarget, mut tensor<f32, [1]> psink) → void {
+    for from psink at [i] thread lane let e {
+        psink[[i]] ← ptarget[[0, 0]]
+    }
+}
 
 # Embedding gather: gout[j] = gtable[ids[0], j]. `gdom` is the lane domain [D].
 @ kernel
@@ -65,10 +97,8 @@ fn rms_stats<size D>(tensor<f32, [1]> rsdom, tensor<f32, [D]> rsx, mut tensor<f3
     for from rsdom at [i] thread lane let e {
         mut f32 acc ← 0.0
         let i32 n ← rsd
-        mut i32 k ← 0
-        while k ≺ n {
+        for range 0 ‥ n let k {
             acc ← acc + rsx[[k]] * rsx[[k]]
-            k ← k + 1
         }
         rsstats[[i]] ← 1.0 / (acc / (rsd ↦ f32) + rseps).sqrt()
     }
@@ -91,10 +121,8 @@ fn gemv_lane<size N, size K>(tensor<f32, [N]> gvdom, tensor<f32, [N, K]> gvw, te
     for from gvdom at [i] thread lane let e {
         let i32 n ← gvk
         mut f32 acc ← 0.0
-        mut i32 k ← 0
-        while k ≺ n {
+        for range 0 ‥ n let k {
             acc ← acc + gvw[[i, k]] * gvx[[k]]
-            k ← k + 1
         }
         gvo[[i]] ← acc
     }
@@ -112,7 +140,7 @@ fn rope_half<size N>(tensor<f32, [N]> rhx, mut tensor<f32, [N]> rho, i32 rhpos, 
             let i32 jj ← j % (2 * hf)
             let i32 base ← j - jj
             let i32 p ← jj % hf
-            let f32 freq ← (0.0 - (p ↦ f32) / (hf ↦ f32) * rhlntheta).exp()
+            let f32 freq ← (-(p ↦ f32) / (hf ↦ f32) * rhlntheta).exp()
             let f32 ang ← (rhpos ↦ f32) * freq
             let f32 c ← ang.cos()
             let f32 s ← ang.sin()
@@ -139,7 +167,7 @@ fn rope_pairs<size N>(tensor<f32, [N]> rpx, mut tensor<f32, [N]> rpo, i32 rppos,
             let i32 hf ← rpspan
             let i32 jj ← j % (2 * hf)
             let i32 p ← jj / 2
-            let f32 freq ← (0.0 - (p ↦ f32) / (hf ↦ f32) * rplntheta).exp()
+            let f32 freq ← (-(p ↦ f32) / (hf ↦ f32) * rplntheta).exp()
             let f32 ang ← (rppos ↦ f32) * freq
             let f32 c ← ang.cos()
             let f32 s ← ang.sin()
@@ -153,24 +181,24 @@ fn rope_pairs<size N>(tensor<f32, [N]> rpx, mut tensor<f32, [N]> rpo, i32 rppos,
     }
 }
 
-# KV-row write: update row `kwpos` in the existing cache. The host wrapper
-# keeps the public no-op behavior for a negative or out-of-capacity position;
-# only an in-range position reaches the indexed kernel store.
-# This launchable kernel entry requires an in-range position; callers use
-# `kv_write` below to retain the no-op behavior.
+# KV-row write: update row `kwpos` in the existing cache. A negative or
+# out-of-capacity position leaves the cache unchanged: the guard is in the lane
+# body, so the host never reads the cache shape (a host-side `.shape()` read is
+# refused by `--strict-engine`, and a size generic read as a value on the host is
+# refused too).
 @ kernel
 @ public
 fn kv_write_row<size C, size K>(tensor<f32, [K]> kwrow, mut tensor<f32, [C, K]> kwcache, i32 kwpos) → void {
     for from kwrow at [j] thread lane let v {
-        kwcache[[kwpos, j]] ← v
+        if kwpos ≥ 0 and kwpos ≺ C {
+            kwcache[[kwpos, j]] ← v
+        }
     }
 }
 
 @ public
 fn kv_write<size C, size K>(mut tensor<f32, [C, K]> kwcache, tensor<f32, [K]> kwrow, i32 kwpos) → void {
-    if kwpos ≥ 0 and kwpos ≺ kwcache.shape()[0] {
-        kv_write_row(kwrow, mut kwcache, kwpos)
-    }
+    kv_write_row(kwrow, mut kwcache, kwpos)
 }
 
 # GQA decode scores: assc[h, c] = (asq[h * dh + :] . askc[c, (h / group) * dh + :])
@@ -184,10 +212,8 @@ fn attn_scores<size H, size C, size QD, size KVD>(tensor<f32, [H, C]> asdom, ten
             let i32 n ← asdh
             let i32 base ← (h / asgroup) * n
             mut f32 acc ← 0.0
-            mut i32 k ← 0
-            while k ≺ n {
+            for range 0 ‥ n let k {
                 acc ← acc + asq[[h * n + k]] * askc[[c, base + k]]
-                k ← k + 1
             }
             if c ≻ aspos {
                 assc[[h, c]] ← -1.0e30
@@ -208,19 +234,15 @@ fn softmax_stats<size R, size C>(tensor<f32, [R]> ssdom, tensor<f32, [R, C]> sss
     for from ssdom at [i] thread lane let e {
         let i32 n ← ssc
         mut f32 m ← sss[[i, 0]]
-        mut i32 k ← 1
-        while k ≺ n {
+        for range 1 ‥ n let k {
             if sss[[i, k]] ≻ m {
                 m ← sss[[i, k]]
             }
-            k ← k + 1
         }
         ssmx[[i]] ← m
         mut f32 acc ← 0.0
-        mut i32 q ← 0
-        while q ≺ n {
+        for range 0 ‥ n let q {
             acc ← acc + (sss[[i, q]] - m).exp()
-            q ← q + 1
         }
         sssm[[i]] ← acc
     }
@@ -248,10 +270,8 @@ fn attn_context<size QD, size H, size C, size KVD>(tensor<f32, [QD]> acdom, tens
             let i32 n ← acpos + 1
             let i32 base ← (h / acgroup) * dh
             mut f32 acc ← 0.0
-            mut i32 c ← 0
-            while c ≺ n {
+            for range 0 ‥ n let c {
                 acc ← acc + acp[[h, c]] * acvc[[c, base + d]]
-                c ← c + 1
             }
             acctx[[j]] ← acc
         }
@@ -272,62 +292,365 @@ fn residual_add<size D>(tensor<f32, [D]> rea, tensor<f32, [D]> reb, mut tensor<f
 @ public
 fn swiglu<size F>(tensor<f32, [F]> swg, tensor<f32, [F]> swu, mut tensor<f32, [F]> swo) → void {
     for from swg at [j] thread lane let v {
-        swo[[j]] ← (v / (1.0 + (0.0 - v).exp())) * swu[[j]]
+        swo[[j]] ← (v / (1.0 + (-v).exp())) * swu[[j]]
     }
 }
 
-# Chunked argmax: ONE lane per chunk scans its contiguous chunk of the logits.
-# V logits are split into P chunks of `macchunk` = V / P elements (the caller
-# passes a P that divides V: for SmolLM2, V = 49152, P = 256, chunk 192). Lane p
-# scans [p * chunk, (p + 1) * chunk) with a strict `>`, so inside a chunk the
-# FIRST index wins ties, and writes the best value and its GLOBAL index to
-# `macval[p]` / `macidx[p]`. The index tensor is f32 (the lane stores are f32
-# tensors, as in every other kernel here); indices below 2^24 are exact, and the
-# vocabulary is far below that. The host then scans the P pairs in ascending
-# chunk order with a strict `>`: chunks are contiguous and ascending, so the
-# global rule "the lowest index wins ties" holds. NaN: no `>` is true against a
-# NaN, so a NaN first element of a chunk stays that chunk's best and later
-# numbers never replace it (the generic runner argmax instead replaces a NaN
-# score by the first number); logits are finite in practice, and the kernel never
-# traps. `macdom` is the lane domain [P].
+# ---------------------------------------------------------------------------
+# Wide launch set (decode_token.layer_wide / head_step_wide / embed_wide)
+#
+# The kernels above give each output element ONE lane that runs the whole dot
+# product serially, so a 960-row GEMV is 960 busy lanes reading uncoalesced rows
+# (measured 16 to 130 GB/s on an M5 Max, against ~450 GB/s for a 49152-row one). The
+# kernels below split each long reduction over `P` lanes (a [rows, P] lane grid:
+# lane (i, p) sums every P-th product, so the lanes of a SIMD group read contiguous
+# weights) and finish it in a small second launch that also carries the epilogue
+# (residual add, SwiGLU, RoPE). RMSNorm is folded into the GEMV that consumes it:
+# one `rms_part` launch computes Q partial sums of squares and every consumer lane
+# folds them, so no normalized vector is ever written.
+#
+# Conventions of this set:
+#   - The output (or the [rows, P] partial tensor) is its own lane domain, so there
+#     is no `...dom` argument.
+#   - Dimensions come from the size generics (`D`, `K`, `P`, ...), which a kernel may
+#     read as a value and use as a `for range` bound; scalars are the per-token
+#     position, the model's epsilon / scale / RoPE base, the head geometry and the
+#     RoPE convention flag.
+#   - Every tensor a launch writes must be primed (`prime1` / `prime2`) before its
+#     first launch, or each later launch downloads it and waits (see `prime1`).
+#   - A strided loop (`k ← k + P`, lane p taking every P-th element) stays a `while`:
+#     `for range p ‥ K step P` with a generic stride is refused by the kernel
+#     requirements pass (SEM008 nucleum_extent_unproven).
+#
+# Numeric contract: f32. Splitting a sum changes only the association of the
+# additions (deterministic: each partial is a serial strided sum, the combine is a
+# serial sum in lane order); every product and every epilogue is computed as in the
+# serial kernels, so with P = 1 the results are bit-identical to them.
+# ---------------------------------------------------------------------------
+
+# Embedding gather: gwo[j] = gwtable[ids[0], j]; the output is the lane domain.
 @ kernel
 @ public
-fn argmax_chunks<size P, size V>(tensor<f32, [P]> macdom, tensor<f32, [V]> macx, mut tensor<f32, [P]> macval, mut tensor<f32, [P]> macidx, i32 macchunk) → void {
-    for from macdom at [p] thread lane let e {
-        if macchunk ≥ 1 {
-            let i32 n ← macchunk
-            let i32 start ← p * n
-            let i32 stop ← start + n
-            mut f32 best ← macx[[start]]
-            mut i32 bi ← start
-            mut i32 k ← start + 1
-            while k ≺ stop {
-                if macx[[k]] ≻ best {
-                    best ← macx[[k]]
-                    bi ← k
-                }
-                k ← k + 1
+fn gather_wide<size V, size D>(tensor<f32, [V, D]> gwtable, tensor<i32, [1]> gwids, mut tensor<f32, [D]> gwo) → void {
+    for from gwo at [j] thread lane let e {
+        gwo[[j]] ← gwtable[[gwids[0], j]]
+    }
+}
+
+# RMSNorm statistic, partial sums: rpo[p] = sum over k = p, p + Q, ... of rpx[k]^2.
+@ kernel
+@ public
+fn rms_part<size Q, size D>(tensor<f32, [D]> rpx, mut tensor<f32, [Q]> rpo) → void {
+    for from rpo at [p] thread lane let e {
+        mut f32 acc ← 0.0
+        mut i32 k ← p
+        while k ≺ D {
+            acc ← acc + rpx[[k]] * rpx[[k]]
+            k ← k + Q
+        }
+        rpo[[p]] ← acc
+    }
+}
+
+# Split GEMV, partial sums: gpo[i, p] = sum over k = p, p + P, ... of gpw[i, k] * gpx[k].
+@ kernel
+@ public
+fn gemv_part<size N, size P, size K>(tensor<f32, [K]> gpx, tensor<f32, [N, K]> gpw, mut tensor<f32, [N, P]> gpo) → void {
+    for from gpo at [i, p] thread lane let e {
+        mut f32 acc ← 0.0
+        mut i32 k ← p
+        while k ≺ K {
+            acc ← acc + gpw[[i, k]] * gpx[[k]]
+            k ← k + P
+        }
+        gpo[[i, p]] ← acc
+    }
+}
+
+# Q, K and V projections of the RMSNorm'd input in ONE launch. Rows [0, QD) are the
+# query rows, [QD, QD + KVD) the key rows, the rest the value rows (R = QD + 2 * KVD).
+# The normalized input is never stored: element k is qx[k] * s * qnw[k], with
+# s = 1 / sqrt(sum(qrp) / D + qeps) folded from the `rms_part` partials.
+@ kernel
+@ public
+fn qkv_part<size R, size P, size Q, size D, size QD, size KVD>(tensor<f32, [D]> qx, tensor<f32, [Q]> qrp, tensor<f32, [D]> qnw, tensor<f32, [QD, D]> qwq, tensor<f32, [KVD, D]> qwk, tensor<f32, [KVD, D]> qwv, mut tensor<f32, [R, P]> qpo, f32 qeps) → void {
+    for from qpo at [i, p] thread lane let e {
+        if R ≡ QD + KVD + KVD {
+            mut f32 ss ← 0.0
+            for range 0 ‥ Q let q {
+                ss ← ss + qrp[[q]]
             }
-            macval[[p]] ← best
-            macidx[[p]] ← bi ↦ f32
+            let f32 s ← 1.0 / (ss / (D ↦ f32) + qeps).sqrt()
+            mut f32 acc ← 0.0
+            mut i32 k ← p
+            if i ≺ QD {
+                while k ≺ D {
+                    acc ← acc + qwq[[i, k]] * (qx[[k]] * s * qnw[[k]])
+                    k ← k + P
+                }
+            }
+            elif i ≺ QD + KVD {
+                while k ≺ D {
+                    acc ← acc + qwk[[i - QD, k]] * (qx[[k]] * s * qnw[[k]])
+                    k ← k + P
+                }
+            }
+            else {
+                while k ≺ D {
+                    acc ← acc + qwv[[i - QD - KVD, k]] * (qx[[k]] * s * qnw[[k]])
+                    k ← k + P
+                }
+            }
+            qpo[[i, p]] ← acc
         }
     }
 }
 
+# Combine the QKV partials and apply RoPE at position `qfpos` to the query and key
+# rows. `qfo` is [rotated q | rotated k | v] (`kv_write_wide` stores the last two
+# thirds in the caches: a lane may store only at its own coordinate, so the cache row
+# write cannot live here). Rows [0, qfqd) are query rows, [qfqd, qfqd + qfkv) key
+# rows, the rest value rows. `qfnorm` picks the pair convention: 1 = consecutive
+# pairs (2p, 2p + 1) (llama.cpp NORM), 0 = rotate-half pairs (j, j + span) (NEOX).
+# The head width is `qfdh` (even).
+@ kernel
+@ public
+fn qkv_fin<size R, size P>(tensor<f32, [R, P]> qfp, mut tensor<f32, [R]> qfo, i32 qfpos, i32 qfqd, i32 qfkv, i32 qfdh, f32 qflntheta, i32 qfnorm) → void {
+    for from qfo at [j] thread lane let e {
+        if qfqd ≥ 0 and qfqd ≤ 1000000 and qfkv ≥ 0 and qfkv ≤ 1000000 and qfdh ≥ 2 and qfdh ≤ 1920 {
+            let i32 hf ← qfdh / 2
+            mut f32 own ← 0.0
+            for range 0 ‥ P let q {
+                own ← own + qfp[[j, q]]
+            }
+            if j ≥ qfqd + qfkv {
+                qfo[[j]] ← own
+            }
+            else {
+                let i32 jj ← j % qfdh
+                mut i32 partner ← 0
+                mut i32 pidx ← 0
+                mut bool first ← false
+                if qfnorm ≡ 1 {
+                    pidx ← jj / 2
+                    first ← jj % 2 ≡ 0
+                    if first {
+                        partner ← j + 1
+                    }
+                    else {
+                        partner ← j - 1
+                    }
+                }
+                else {
+                    pidx ← jj % hf
+                    first ← jj ≺ hf
+                    if first {
+                        partner ← j + hf
+                    }
+                    else {
+                        partner ← j - hf
+                    }
+                }
+                mut f32 other ← 0.0
+                for range 0 ‥ P let r {
+                    other ← other + qfp[[partner, r]]
+                }
+                let f32 freq ← (-(pidx ↦ f32) / (hf ↦ f32) * qflntheta).exp()
+                let f32 ang ← (qfpos ↦ f32) * freq
+                let f32 cs ← ang.cos()
+                let f32 sn ← ang.sin()
+                if first {
+                    qfo[[j]] ← own * cs - other * sn
+                }
+                else {
+                    qfo[[j]] ← other * sn + own * cs
+                }
+            }
+        }
+    }
+}
+
+# K/V cache row write from the `qkv_fin` output: row `kwpos` of the key cache is
+# kwqkv[kwqd .. kwqd + K) and of the value cache kwqkv[kwqd + K .. kwqd + 2K). `kwdom`
+# is any [K] tensor (the lane domain). A position outside the cache leaves it unchanged.
+@ kernel
+@ public
+fn kv_write_wide<size C, size K, size R>(tensor<f32, [K]> kwdom, tensor<f32, [R]> kwqkv, mut tensor<f32, [C, K]> kwkc, mut tensor<f32, [C, K]> kwvc, i32 kwpos, i32 kwqd) → void {
+    for from kwdom at [j] thread lane let e {
+        if kwqd ≥ 0 and kwqd ≤ 1000000 and kwpos ≥ 0 and kwpos ≺ C {
+            kwkc[[kwpos, j]] ← kwqkv[[kwqd + j]]
+            kwvc[[kwpos, j]] ← kwqkv[[kwqd + K + j]]
+        }
+    }
+}
+
+# GQA decode scores for positions c <= awpos only (later positions are never read by
+# `softmax_wide` / `attn_wide`, so they are not computed and not written):
+# awsc[h, c] = (awqkv[h * dh + :] . awkc[c, (h / group) * dh + :]) * awscale, with
+# dh = `awdh` (head width) and group = `awgroup` (query heads per KV head). `awqkv` is
+# the `qkv_fin` output (the query is its first QD elements).
+@ kernel
+@ public
+fn scores_wide<size H, size C, size R, size KVD>(tensor<f32, [R]> awqkv, tensor<f32, [C, KVD]> awkc, mut tensor<f32, [H, C]> awsc, i32 awpos, i32 awdh, i32 awgroup, f32 awscale) → void {
+    for from awsc at [h, c] thread lane let e {
+        if c ≤ awpos and awgroup ≻ 0 and awdh ≥ 1 and awdh ≤ 960 {
+            let i32 dh ← awdh
+            let i32 base ← (h / awgroup) * dh
+            mut f32 acc ← 0.0
+            for range 0 ‥ dh let k {
+                acc ← acc + awqkv[[h * dh + k]] * awkc[[c, base + k]]
+            }
+            awsc[[h, c]] ← acc * awscale
+        }
+    }
+}
+
+# Row softmax statistics over positions 0 .. smpos: per head the max (smmx) and the
+# sum of exp(x - max) (smsm). `smmx` is the lane domain [H].
+@ kernel
+@ public
+fn softmax_wide<size H, size C>(tensor<f32, [H, C]> smsc, mut tensor<f32, [H]> smmx, mut tensor<f32, [H]> smsm, i32 smpos) → void {
+    for from smmx at [h] thread lane let e {
+        if smpos ≥ 0 and smpos ≤ 2147483646 and smpos ≺ C {
+            let i32 n ← smpos + 1
+            mut f32 m ← smsc[[h, 0]]
+            for range 1 ‥ n let k {
+                if smsc[[h, k]] ≻ m {
+                    m ← smsc[[h, k]]
+                }
+            }
+            smmx[[h]] ← m
+            mut f32 acc ← 0.0
+            for range 0 ‥ n let q {
+                acc ← acc + (smsc[[h, q]] - m).exp()
+            }
+            smsm[[h]] ← acc
+        }
+    }
+}
+
+# Attention context with the softmax normalization folded in:
+# axctx[j] = sum over c <= axpos of (exp(axsc[h, c] - axmx[h]) / axsm[h]) * axvc[c, base + d],
+# j = h * dh + d, dh = `axdh`, group = `axgroup`. `axctx` is the lane domain [QD].
+@ kernel
+@ public
+fn attn_wide<size QD, size H, size C, size KVD>(tensor<f32, [H, C]> axsc, tensor<f32, [H]> axmx, tensor<f32, [H]> axsm, tensor<f32, [C, KVD]> axvc, mut tensor<f32, [QD]> axctx, i32 axpos, i32 axdh, i32 axgroup) → void {
+    for from axctx at [j] thread lane let e {
+        if axgroup ≻ 0 and axdh ≥ 1 and axdh ≤ 960 and axpos ≥ 0 and axpos ≤ 2147483646 and axpos ≺ C {
+            let i32 dh ← axdh
+            let i32 h ← j / dh
+            let i32 d ← j % dh
+            let i32 base ← (h / axgroup) * dh
+            let i32 n ← axpos + 1
+            mut f32 acc ← 0.0
+            for range 0 ‥ n let c {
+                acc ← acc + ((axsc[[h, c]] - axmx[[h]]).exp() / axsm[[h]]) * axvc[[c, base + d]]
+            }
+            axctx[[j]] ← acc
+        }
+    }
+}
+
+# Combine GEMV partials with a residual: fro[j] = frr[j] + sum over p of frp[j, p].
+@ kernel
+@ public
+fn gemv_fin_residual<size N, size P>(tensor<f32, [N, P]> frp, tensor<f32, [N]> frr, mut tensor<f32, [N]> fro) → void {
+    for from fro at [j] thread lane let e {
+        mut f32 acc ← 0.0
+        for range 0 ‥ P let q {
+            acc ← acc + frp[[j, q]]
+        }
+        fro[[j]] ← frr[[j]] + acc
+    }
+}
+
+# Gate and up projections of the RMSNorm'd input in ONE launch (same fold as
+# `qkv_part`): ghpg[i, p] and ghpu[i, p] are the partial dots of row i of the gate
+# and up weights. `ghpg` is the lane domain.
+@ kernel
+@ public
+fn gateup_part<size F, size P, size Q, size D>(tensor<f32, [D]> ghx, tensor<f32, [Q]> ghrp, tensor<f32, [D]> ghnw, tensor<f32, [F, D]> ghwg, tensor<f32, [F, D]> ghwu, mut tensor<f32, [F, P]> ghpg, mut tensor<f32, [F, P]> ghpu, f32 gheps) → void {
+    for from ghpg at [i, p] thread lane let e {
+        mut f32 ss ← 0.0
+        for range 0 ‥ Q let q {
+            ss ← ss + ghrp[[q]]
+        }
+        let f32 s ← 1.0 / (ss / (D ↦ f32) + gheps).sqrt()
+        mut f32 ag ← 0.0
+        mut f32 au ← 0.0
+        mut i32 k ← p
+        while k ≺ D {
+            let f32 xn ← ghx[[k]] * s * ghnw[[k]]
+            ag ← ag + ghwg[[i, k]] * xn
+            au ← au + ghwu[[i, k]] * xn
+            k ← k + P
+        }
+        ghpg[[i, p]] ← ag
+        ghpu[[i, p]] ← au
+    }
+}
+
+# Combine the gate and up partials and apply SwiGLU: sfo[j] = silu(gate) * up.
+@ kernel
+@ public
+fn swiglu_fin<size F, size P>(tensor<f32, [F, P]> sfg, tensor<f32, [F, P]> sfu, mut tensor<f32, [F]> sfo) → void {
+    for from sfo at [j] thread lane let e {
+        mut f32 g ← 0.0
+        mut f32 u ← 0.0
+        for range 0 ‥ P let q {
+            g ← g + sfg[[j, q]]
+            u ← u + sfu[[j, q]]
+        }
+        sfo[[j]] ← (g / (1.0 + (-g).exp())) * u
+    }
+}
+
+# Final norm folded into the tied lm_head GEMV: hlo[v] = sum over k of
+# hlw[v, k] * (hlx[k] * s * hlnw[k]), s from the `rms_part` partials. One lane per
+# vocabulary row (49152 lanes already stream at memory bandwidth).
+@ kernel
+@ public
+fn head_wide<size V, size Q, size D>(tensor<f32, [D]> hlx, tensor<f32, [Q]> hlrp, tensor<f32, [D]> hlnw, tensor<f32, [V, D]> hlw, mut tensor<f32, [V]> hlo, f32 hleps) → void {
+    for from hlo at [v] thread lane let e {
+        mut f32 ss ← 0.0
+        for range 0 ‥ Q let q {
+            ss ← ss + hlrp[[q]]
+        }
+        let f32 s ← 1.0 / (ss / (D ↦ f32) + hleps).sqrt()
+        mut f32 acc ← 0.0
+        for range 0 ‥ D let k {
+            acc ← acc + hlw[[v, k]] * (hlx[[k]] * s * hlnw[[k]])
+        }
+        hlo[[v]] ← acc
+    }
+}
+
+# Greedy pick on the device: atid[0] = the index of the largest element of atx, the
+# lowest index on ties, a NaN never winning while a number participates (the language's
+# `reduce via argmax`, one launch). The id stays on the device: the next token's
+# embedding gather reads it there, and the host reads this one integer, never the
+# logits and never a per-chunk table. Replaces the `argmax_chunks` + host-scan pair.
+@ kernel
+@ public
+fn argmax_token<size V>(tensor<f32, [V]> atx, mut tensor<i32, [1]> atid) → void {
+    atid[0] ← reduce via argmax from atx at [i] thread lane let v {
+        return v
+    } coalesce 0
+}
+
 # Chunked top-M: lane (p, m) of the [P, M] domain writes the m-th best (value,
 # global index) pair of chunk p, so each chunk yields its M best in descending
-# value, ties to the LOWEST index (the order `argmax_chunks` and the host picks
-# use). The outputs are [P, M] f32 (indices exact below 2^24); a lane writes only
-# its own element [p, m], which is what the lane-independence proof requires (a
-# single lane looping over m to write a whole row is refused with
-# SEM010 filum_independence_unproven). Lane (p, m) runs m + 1 selection passes
-# over its chunk instead of keeping an insertion buffer: pass j scans for the
-# best element that sorts strictly AFTER the previous pick (smaller value, or an
-# equal value at a larger index) with a strict `>`, so the first index wins ties
-# and equal values are returned once per index. Start state: value 3.4028235e38,
-# index -1.0 admits every finite element, and the previous pick's index is
-# carried as f32 like the outputs (exact below 2^24), so no lane stores a wide
-# integer. A chunk with fewer than M elements has
+# value, ties to the LOWEST index (the order the host picks use). The outputs are
+# [P, M] f32 (indices exact below 2^24); a lane writes only its own element [p, m],
+# which is what the lane-independence proof requires (a single lane looping over m to
+# write a whole row is refused with SEM010 filum_independence_unproven). Lane (p, m)
+# runs m + 1 selection passes over its chunk instead of keeping an insertion buffer:
+# pass j scans for the best element that sorts strictly AFTER the previous pick
+# (smaller value, or an equal value at a larger index) with a strict `>`, so the
+# first index wins ties and equal values are returned once per index. Start state:
+# value 3.4028235e38, index -1.0 admits every finite element, and the previous pick's
+# index is carried as f32 like the outputs (an i32 index carried across the passes is
+# refused: SEM008 nucleum_trapping_store). A chunk with fewer than M elements has
 # no qualifier for the trailing ranks: those slots hold the sentinel value
 # -3.4028235e38 and index -1.0 (the host drops index < 0). With a chunk of at
 # least M elements every slot is real (equal values fill slots, they are not
@@ -343,37 +666,20 @@ fn topm_chunks<size P, size V, size M>(tensor<f32, [P, M]> tmdom, tensor<f32, [V
             let i32 stop ← start + n
             mut f32 pv ← 3.4028235e38
             mut f32 pf ← -1.0
-            mut i32 j ← 0
-            while j ≤ m {
+            for range 0 … m let rank {
                 mut f32 best ← -3.4028235e38
                 mut i32 bi ← -1
-                mut i32 k ← start
-                while k ≺ stop {
+                for range start ‥ stop let k {
                     let f32 v ← tmx[[k]]
-                    mut bool ok ← false
-                    if v ≺ pv {
-                        ok ← true
-                    }
-                    if v ≡ pv {
-                        if (k ↦ f32) ≻ pf {
-                            ok ← true
-                        }
-                    }
-                    if ok {
-                        if bi ≺ 0 {
-                            best ← v
-                            bi ← k
-                        }
-                        if v ≻ best {
+                    if v ≺ pv or (v ≡ pv and (k ↦ f32) ≻ pf) {
+                        if bi ≺ 0 or v ≻ best {
                             best ← v
                             bi ← k
                         }
                     }
-                    k ← k + 1
                 }
                 pv ← best
                 pf ← bi ↦ f32
-                j ← j + 1
             }
             tmval[[p, m]] ← pv
             tmidx[[p, m]] ← pf
