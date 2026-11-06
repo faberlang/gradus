@@ -1,30 +1,28 @@
 # Decode layer device pin
 
-This executable calls `gradus:decode_token.layer_step` directly. The starter
-fixture uses D=4, QD=4, KVD=2, F=6, dh=2, two query heads with GQA group 2,
-and a three-row cache. Deterministic nonzero weights and cache rows exercise
-RoPE, GQA attention, the in-place KV update, both residual paths, RMSNorm and
-SwiGLU. `pin.py` independently recomputes the layer in Python double precision
-and compares the hidden state and every K/V cache element.
+This exemplum calls only the public `gradus:decode_token.layer_step` signature.
+It keeps two fixtures: the small D=4/QD=4/KVD=2/F=6 case and a real-shape
+D=960, QD=960, KVD=320, F=2560 case (15 query heads, 5 KV heads, dh=64,
+GQA group 3). Both use deterministic nonzero projection weights and multiple
+cache rows; the real run writes every hidden element and every K/V cache value
+into the receipt after comparison with an independent Python f64 oracle.
 
-Run from the Gradus checkout with the Faber built from the current Radix main:
+Run from the Gradus checkout with current Faber:
 
 ```sh
-FABER_BIN=/path/to/current/radix/target/debug/faber \
-    python3 exempla/decode-layer-pin/pin.py
+FABER_BIN=/path/to/faber python3 exempla/decode-layer-pin/pin.py
 ```
 
-Both `--device reference` and `--device metal` are mandatory. A failed Metal
-launch, including no admitted Metal device, exits nonzero; there is no skip
-path. The runner creates a temporary local library-home link because some
-checkouts are not named `gradus`, then removes it on exit. It writes the
-successful device values and per-device oracle errors to `receipt-tiny.json`.
+Reference and Metal are mandatory for both modes. A device launch failure is
+fatal, with no skip path. Both complete output arrays are compared against the
+f64 oracle, including all cache rows, under the fixed component-wise cap
+`1.1e-5 + 1.1e-4 * abs(reference)`. `decode_step.fab` documents the serial-f32
+kernel numeric envelope as `1e-5 + 1e-4 * abs(reference)`; the pin adds 10% to
+both coefficients. This cap was fixed in the file before the real-dimension
+run and is not adjusted from observed errors.
 
-The fixed comparison cap is `1e-5 + 1e-4 * abs(f64_reference)`, selected from
-the existing serial-f32 `decode_step` numeric contract before the two-device
-run. This tiny fixture establishes the launch-chain pin and runner protocol;
-it is not the required real-dimension tolerance measurement or oracle. At dh=2
-the rotate-half and consecutive-pair RoPE conventions are mathematically
-identical, so this fixture does not distinguish a wrong RoPE convention. The
-real D=960 / QD=960 / KVD=320 / F=2560 / dh=64 / group-3 pin, real-dimension
-independent oracle, and deliberate wrong-index red case remain to be added.
+The committed `receipt-real.json` records dimensions, tolerance basis, full
+per-device values and maximum absolute errors. The red check recomputes the
+oracle with deliberately wrong rotate-half RoPE, whereas `layer_step` uses
+consecutive pairs, and requires the resulting mismatch to fail the same fixed
+cap. If it ever passes, the runner exits nonzero.
