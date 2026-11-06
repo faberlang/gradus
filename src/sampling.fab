@@ -156,7 +156,7 @@ fn default() → Sampler {
 @ public
 fn max(list<f32> logits) → int ⇥ SamplingError {
     require_logits(logits)
-    return logits.argmax() coalesce 0
+    return argmax_index(logits)
 }
 
 # -------------------------------------------------------------------------
@@ -184,7 +184,7 @@ fn distribution(list<f32> logits, Config c, list<int> history) → list<f32> ⇥
 fn sample(list<f32> logits, Config c, list<int> history, train.Seed seed) → Sampler ⇥ SamplingError {
     require_logits(logits)
     require_history(logits, history)
-    if c.temperature ≤ 0.0 then return Sampler { token_id = logits.argmax() coalesce 0, seed = seed }
+    if c.temperature ≤ 0.0 then return Sampler { token_id = argmax_index(logits), seed = seed }
     return draw(filtered(logits, c, history), seed)
 }
 
@@ -211,12 +211,13 @@ fn sample_candidates(list<f32> values, list<int> ids, Config c, list<int> histor
         require t ≥ 0 throw variant InvalidHistory { message = "history token out of vocabulary range" }
     }
     if c.temperature ≤ 0.0 {
-        return Sampler { token_id = ids.get(values.argmax() coalesce 0) coalesce 0, seed = seed }
+        let int greedy ← argmax_index(values)
+        return Sampler { token_id = ids[greedy], seed = seed }
     }
     mut list<int> positions ← empty
     for from history let t {
-        let int at ← candidate_position(ids, t)
-        if at ≥ 0 {
+        let int ∪ none at ← candidate_position(ids, t)
+        if at ≢ null {
             positions.append(at)
         }
     }
@@ -226,7 +227,7 @@ fn sample_candidates(list<f32> values, list<int> ids, Config c, list<int> histor
     let list<f32> probs ← softmax(k_limited.values, k_limited.keep)
     let list<f32> p_limited ← top_p(probs, c.top_p)
     let Sampler drawn ← draw(min_p(p_limited, c.min_p), seed)
-    return Sampler { token_id = ids.get(drawn.token_id) coalesce 0, seed = drawn.seed }
+    return Sampler { token_id = ids[drawn.token_id], seed = drawn.seed }
 }
 
 # -------------------------------------------------------------------------
@@ -248,20 +249,33 @@ fn require_history(list<f32> logits, list<int> history) → void ⇥ SamplingErr
 # One id per value, non-negative and strictly ascending.
 fn require_candidate_ids(list<f32> values, list<int> ids) → void ⇥ SamplingError {
     require ids.length() ≡ values.length() throw variant InvalidLogits { message = "candidate ids must match candidate values" }
-    mut int prev ← 0 - 1
-    for from ids let t {
-        require t ≻ prev throw variant InvalidLogits { message = "candidate ids must be strictly ascending" }
-        prev ← t
+    let int n ← ids.length()
+    if n ≡ 0 then return
+    require ids[0] ≥ 0 throw variant InvalidLogits { message = "candidate ids must be strictly ascending" }
+    if n ≻ 1 {
+        for from ids[0 ‥ n - 1], ids[1 ‥ n] let previous, next {
+            require next ≻ previous throw variant InvalidLogits { message = "candidate ids must be strictly ascending" }
+        }
     }
 }
 
-# Position of id t in the ascending ids (binary search), or -1 when absent.
-fn candidate_position(list<int> ids, int t) → int {
+# The index of the largest value (first-index ties). Callers gate non-empty
+# logits; an empty list is the typed error rather than a default index.
+fn argmax_index(list<f32> xs) → int ⇥ SamplingError {
+    let int ∪ none best ← xs.argmax()
+    if best ≡ null then throw variant InvalidLogits { message = "logits must be non-empty" }
+    return best
+}
+
+# Position of id t in the ascending ids (binary search), or none when absent.
+# The interval halves until the id is found or the interval is empty, so the
+# number of probes depends on the data.
+fn candidate_position(list<int> ids, int t) → int ∪ none {
     mut int lo ← 0
     mut int hi ← ids.length() - 1
     while lo ≤ hi {
         let int mid ← lo + (hi - lo) / 2
-        let int v ← ids.get(mid) coalesce 0
+        let int v ← ids[mid]
         if v ≡ t then return mid
         if v ≺ t {
             lo ← mid + 1
@@ -270,18 +284,14 @@ fn candidate_position(list<int> ids, int t) → int {
             hi ← mid - 1
         }
     }
-    return 0 - 1
+    return null
 }
 
 # Steps 1–6 of the pinned pipeline (caller has already gated logits/history).
-fn filtered(list<f32> logits, Config c, list<int> history) → list<f32> {
+fn filtered(list<f32> logits, Config c, list<int> history) → list<f32> ⇥ SamplingError {
     if c.temperature ≤ 0.0 {
-        # Keep: constant fill of a fresh list; no covering fill construct.
-        mut list<f32> degenerate ← empty
-        for range 0 ‥ logits.length() let i {
-            degenerate.append(0.0)
-        }
-        return replace_at(degenerate, logits.argmax() coalesce 0, 1.0)
+        let list<f32> degenerate ← logits.map(f32 v ∴ 0.0 ∷ f32)
+        return replace_at(degenerate, argmax_index(logits), 1.0)
     }
     let list<f32> penalized ← repetition_penalty(logits, history, c.repetition_penalty)
     let list<f32> scaled ← temperature_scale(penalized, c.temperature)
@@ -306,14 +316,16 @@ fn exp(f32 x) → f32 {
 # Wave-0 delivery §3; this pairwise comparison stays because it compares
 # two heap indices, not a full-collection reduction.
 fn prefers(list<f32> xs, int a, int b) → bool {
-    let f32 va ← xs.get(a) coalesce 0.0 ∷ f32
-    let f32 vb ← xs.get(b) coalesce 0.0 ∷ f32
+    let f32 va ← xs[a]
+    let f32 vb ← xs[b]
     if va ≻ vb then return true
     if vb ≻ va then return false
     return a ≺ b
 }
 
 # Sift heap[i] down inside heap[0, size). The heap stores indices into xs.
+# The element sinks one level per pass and stops where it outranks its
+# children, so the number of passes depends on the data.
 fn sift_down(mut list<int> heap, list<f32> xs, int i, int size) → void {
     mut int cur ← i
     while true {
@@ -324,13 +336,13 @@ fn sift_down(mut list<int> heap, list<f32> xs, int i, int size) → void {
         mut int pick ← child
         let int other ← child + 1
         if other ≺ size {
-            if prefers(xs, heap.get(other) coalesce 0, heap.get(pick) coalesce 0) {
+            if prefers(xs, heap[other], heap[pick]) {
                 pick ← other
             }
         }
-        if prefers(xs, heap.get(pick) coalesce 0, heap.get(cur) coalesce 0) {
-            let int tmp ← heap.get(cur) coalesce 0
-            heap[cur] ← heap.get(pick) coalesce 0
+        if prefers(xs, heap[pick], heap[cur]) {
+            let int tmp ← heap[cur]
+            heap[cur] ← heap[pick]
             heap[pick] ← tmp
             cur ← pick
         }
@@ -343,15 +355,16 @@ fn sift_down(mut list<int> heap, list<f32> xs, int i, int size) → void {
 # Max-heap of 0..n-1 over xs (first-index ties). Heapify is O(n).
 fn index_heap(list<f32> xs) → list<int> {
     let int n ← xs.length()
-    # Keep: index fill (the element IS its position); no covering construct.
+    # Keep: index fill (the element IS its position); no index-carrying map
+    # or range-to-list form exists.
     mut list<int> heap ← empty
     for range 0 ‥ n let j {
         heap.append(j)
     }
-    mut int start ← n / 2
-    while start ≻ 0 {
-        start ← start - 1
-        sift_down(mut heap, xs, start, n)
+    if n ≥ 2 {
+        for range n / 2 - 1 … 0 let start {
+            sift_down(mut heap, xs, start, n)
+        }
     }
     return heap
 }
@@ -359,56 +372,24 @@ fn index_heap(list<f32> xs) → list<int> {
 # Pop the current max index; restore a heap of the remaining size-1.
 # Caller must pass size > 0 and then decrement its own size.
 fn heap_pop(mut list<int> heap, list<f32> xs, int size) → int {
-    let int best ← heap.get(0) coalesce 0
+    let int best ← heap[0]
     let int last ← size - 1
     if last ≻ 0 {
-        heap[0] ← heap.get(last) coalesce 0
+        heap[0] ← heap[last]
         sift_down(mut heap, xs, 0, last)
     }
     return best
 }
 
-# Every element is finite (the GI2 finite gate).
+# Every element is finite (the GI2 finite gate); stops at the first failure.
 fn finite(list<f32> xs) → bool {
-    # Keep: early-exit predicate; a filter twin would scan the whole list.
-    for from xs let v {
-        if not dtype.finite(v) then return false
-    }
-    return true
-}
-
-# A false mask of length n.
-fn mask_false(int n) → list<bool> {
-    # Keep: constant fill; no covering fill construct.
-    mut list<bool> m ← empty
-    for range 0 ‥ n let _ {
-        m.append(false)
-    }
-    return m
-}
-
-# A true mask of length n.
-fn mask_true(int n) → list<bool> {
-    # Keep: constant fill; no covering fill construct.
-    mut list<bool> m ← empty
-    for range 0 ‥ n let _ {
-        m.append(true)
-    }
-    return m
+    return xs.all(f32 v ∴ dtype.finite(v))
 }
 
 # The list with position i replaced by v (pure rebuild).
 fn replace_at(list<f32> xs, int i, f32 v) → list<f32> {
-    # Keep: indexed rebuild; no index-carrying map form exists.
-    mut list<f32> out ← empty
-    for range 0 ‥ xs.length() let j {
-        if j ≡ i {
-            out.append(v)
-        }
-        else {
-            out.append(xs.get(j) coalesce 0.0 ∷ f32)
-        }
-    }
+    mut list<f32> out ← copy xs
+    out[i] ← v
     return out
 }
 
@@ -417,14 +398,9 @@ fn replace_at(list<f32> xs, int i, f32 v) → list<f32> {
 # One vocab copy, then one in-place apply per history token (O(V + history);
 # a token listed twice is penalized twice, matching the nested-scan rule).
 fn repetition_penalty(list<f32> logits, list<int> history, f32 penalty) → list<f32> {
-    # Keep: identity carrier copy (no clone intrinsic) feeding an in-place
-    # scatter over history indices; no covering copy/scatter construct.
-    mut list<f32> out ← empty
-    for from logits let v {
-        out.append(v)
-    }
+    mut list<f32> out ← copy logits
     for from history let t {
-        let f32 w ← out.get(t) coalesce 0.0 ∷ f32
+        let f32 w ← out[t]
         if w ≻ 0.0 {
             out[t] ← w / penalty
         }
@@ -452,28 +428,15 @@ class TopKResult {
 # Partial selection: heapify once, extract k (O(V + k log V)); no full sort.
 fn top_k(list<f32> xs, int k) → TopKResult {
     let int n ← xs.length()
+    let list<f32> values ← copy xs
     if k ≤ 0 or k ≥ n {
-        # Keep: identity carrier copy (no clone intrinsic).
-        mut list<f32> values ← empty
-        for from xs let v {
-            values.append(v)
-        }
-        return TopKResult { values = values, keep = mask_true(n) }
+        return TopKResult { values = values, keep = xs.map(f32 v ∴ true) }
     }
-    mut list<bool> keep ← mask_false(n)
+    mut list<bool> keep ← xs.map(f32 v ∴ false)
     mut list<int> heap ← index_heap(xs)
-    mut int extent ← n
-    mut int count ← 0
-    while count ≺ k and extent ≻ 0 {
-        let int best ← heap_pop(mut heap, xs, extent)
-        extent ← extent - 1
+    for range 0 ‥ k let removed {
+        let int best ← heap_pop(mut heap, xs, n - removed)
         keep[best] ← true
-        count ← count + 1
-    }
-    # Keep: identity carrier copy (no clone intrinsic).
-    mut list<f32> values ← empty
-    for from xs let v {
-        values.append(v)
     }
     return TopKResult { values = values, keep = keep }
 }
@@ -484,34 +447,23 @@ fn top_k(list<f32> xs, int k) → TopKResult {
 # W0 stay: this is a participation-masked max; no masked-argmax twin is
 # admitted, so the found-flag scan remains the W1 seam.
 fn softmax(list<f32> xs, list<bool> keep) → list<f32> {
-    let int n ← xs.length()
     mut int best ← 0
     mut bool found ← false
     mut f32 best_value ← 0.0
-    for range 0 ‥ n let i {
-        if keep.get(i) coalesce false {
-            let f32 v ← xs.get(i) coalesce 0.0 ∷ f32
-            if not found or v ≻ best_value {
-                best ← i
-                best_value ← v
-                found ← true
-            }
+    for from xs, keep at [i] let v, kept {
+        if kept and (not found or v ≻ best_value) {
+            best ← i
+            best_value ← v
+            found ← true
         }
     }
-    let f32 m ← xs.get(best) coalesce 0.0 ∷ f32
-    # Keep: participation-masked exponent build needs the index into keep;
-    # no index-carrying map form exists. Dropped positions carry exact 0.0,
+    let f32 m ← xs[best]
+    # Participation-masked exponent build. Dropped positions carry exact 0.0,
     # so the flat reducer below reproduces the masked sum byte-exactly
     # (adding +0.0 is an exact identity for the non-negative accumulator).
     mut list<f32> es ← empty
-    for range 0 ‥ n let i {
-        if keep.get(i) coalesce false {
-            let f32 e ← exp(xs.get(i) coalesce 0.0 ∷ f32 - m)
-            es.append(e)
-        }
-        else {
-            es.append(0.0)
-        }
+    for from xs, keep let v, kept {
+        es.append(kept ✓ exp(v - m) ✗ 0.0)
     }
     let f32 sum ← es.reduce((f32 acc, f32 e) ∴ acc + e, 0.0)
     return es.map(f32 e ∴ e / sum)
@@ -519,23 +471,16 @@ fn softmax(list<f32> xs, list<bool> keep) → list<f32> {
 
 # Renormalize the kept probabilities (kept positions keep prob/sum, others 0).
 fn renormalize_mask(list<f32> ps, list<bool> keep) → list<f32> {
-    # Keep: both passes are participation-masked by index; no masked-reduce
-    # or index-carrying map form exists.
-    let int n ← ps.length()
+    # Both passes are participation-masked; no masked-reduce form exists.
     mut f32 sum ← 0.0
-    for range 0 ‥ n let i {
-        if keep.get(i) coalesce false {
-            sum ← sum + ps.get(i) coalesce 0.0 ∷ f32
+    for from ps, keep let v, kept {
+        if kept {
+            sum ← sum + v
         }
     }
     mut list<f32> out ← empty
-    for range 0 ‥ n let i {
-        if keep.get(i) coalesce false {
-            out.append(ps.get(i) coalesce 0.0 ∷ f32 / sum)
-        }
-        else {
-            out.append(0.0)
-        }
+    for from ps, keep let v, kept {
+        out.append(kept ✓ v / sum ✗ 0.0)
     }
     return out
 }
@@ -548,36 +493,24 @@ fn renormalize_mask(list<f32> ps, list<bool> keep) → list<f32> {
 fn top_p(list<f32> ps, f32 p) → list<f32> {
     if p ≤ 0.0 or p ≥ 1.0 then return ps
     let int n ← ps.length()
-    mut list<bool> keep ← mask_false(n)
+    mut list<bool> keep ← ps.map(f32 v ∴ false)
     mut list<int> heap ← index_heap(ps)
-    mut int extent ← n
     mut f32 cum ← 0.0
-    mut bool progress ← true
-    while cum ≺ p and progress {
-        if extent ≤ 0 {
-            progress ← false
-        }
-        else {
-            let int best ← heap_pop(mut heap, ps, extent)
-            extent ← extent - 1
-            let f32 v ← ps.get(best) coalesce 0.0 ∷ f32
-            if v ≻ 0.0 {
-                keep[best] ← true
-                cum ← cum + v
-            }
-            else {
-                progress ← false
-            }
-        }
+    for range 0 ‥ n let removed {
+        if not (cum ≺ p) then break
+        let int best ← heap_pop(mut heap, ps, n - removed)
+        let f32 v ← ps[best]
+        if not (v ≻ 0.0) then break
+        keep[best] ← true
+        cum ← cum + v
     }
     return renormalize_mask(ps, keep)
 }
 
 # Step 6 — min-p: keep probs >= min_p * max_prob, renormalized (p <= 0 off).
-fn min_p(list<f32> ps, f32 p) → list<f32> {
+fn min_p(list<f32> ps, f32 p) → list<f32> ⇥ SamplingError {
     if p ≤ 0.0 then return ps
-    let int max_index ← ps.argmax() coalesce 0
-    let f32 mx ← ps.get(max_index) coalesce 0.0 ∷ f32
+    let f32 mx ← ps[argmax_index(ps)]
     let f32 threshold ← mx * p
     let list<bool> keep ← ps.map(f32 v ∴ v ≥ threshold)
     return renormalize_mask(ps, keep)
@@ -589,11 +522,9 @@ fn min_p(list<f32> ps, f32 p) → list<f32> {
 fn draw(list<f32> probs, train.Seed seed) → Sampler {
     let train.DrawF32 u_f ← train.next_f32(seed)
     let f32 u ← u_f.payload
-    # Keep: early-exit cumulative walk (first index with cum >= u); a
-    # reduction twin cannot return mid-scan.
     mut f32 cum ← 0.0
-    for range 0 ‥ probs.length() let i {
-        cum ← cum + probs.get(i) coalesce 0.0 ∷ f32
+    for from probs at [i] let p {
+        cum ← cum + p
         if u ≺ cum then return Sampler { token_id = i, seed = u_f.seed }
     }
     return Sampler { token_id = probs.length() - 1, seed = u_f.seed }

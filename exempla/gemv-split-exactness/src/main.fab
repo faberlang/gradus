@@ -1,0 +1,93 @@
++++
+locale = "en"
++++
+# gemv-split-exactness: the split GEMV of `decode_step` at the real SmolLM2 row lengths.
+#
+# `decode_step.gemv_part` (P = 64 lanes per output row, lane p summing every 64th
+# product) followed by its combine `decode_step.gemv_fin_residual` (a serial sum of
+# the 64 partials, with a zero residual) is run at 960 terms (the hidden size) and
+# 2560 terms (the MLP width) over 384 rows. The weights and the input are exact
+# multiples of 2^-11, the input half positive and half negative, so every product is exactly representable in
+# f32, the exact dot product is an integer count of 2^-22 units, and the f32 result
+# differs from it only by the library's reduction order. `check.py` computes the exact
+# value outside Faber (Python integers) and judges each printed row against it.
+#
+# Model-free: no files, no argv; the inputs are built on the device by `synth_*`. The
+# results are read one row at a time: the strict engine declines both bulk readbacks
+# (`flatten()` and `↦ list<f32>`) on the host half, and 768 reads are cheap here.
+#
+#   python3 check.py --faber <faber> --library-home <gradus parent>
+#
+# runs this program with `--device metal --strict-engine` and `--device cpu
+# --strict-engine`. Output: `case K=<terms>` followed by one `row <i> <value>` line
+# per row (the f32 result in shortest round-trip form).
+
+import from "gradus:decode_step" ds
+
+const int ROWS = 384
+
+# Weight w[i, k] = ((7919 i + 104729 k + seed) mod 4096) / 2048, in [0, 2).
+@ kernel
+@ public
+fn synth_w<size N, size K>(tensor<f32, [N, K]> sdom, mut tensor<f32, [N, K]> sout, i32 sseed) → void {
+    for from sdom at [i, k] thread lane let e {
+        let i32 a ← (i * 7919 + k * 104729 + sseed) % 4096
+        sout[[i, k]] ← (a ↦ f32) * 0.00048828125
+    }
+}
+
+# Input x[k] = +m(k) for k < shalf and -m(k) from there on, m(k) = (((40503 k + seed) mod 2048) + 1) / 2048.
+# With positive weights the first half of each row adds up and the second half
+# cancels it: the partial sums grow far past 2^24 units while the exact row sum
+# stays small next to the sum of the absolute products.
+@ kernel
+@ public
+fn synth_x<size K>(tensor<f32, [K]> sdom, mut tensor<f32, [K]> sout, i32 sseed, i32 shalf) → void {
+    for from sdom at [k] thread lane let e {
+        let i32 a ← (k * 40503 + sseed) % 2048 + 1
+        let f32 m ← (a ↦ f32) * 0.00048828125
+        if k ≥ shalf {
+            sout[[k]] ← -m
+        }
+        else {
+            sout[[k]] ← m
+        }
+    }
+}
+
+const i32 SEED_W = 5 ∷ i32
+const i32 SEED_X = 11 ∷ i32
+
+main {
+    let tensor<f32, [960]> xdom960 ← tf32[960] {}
+    mut tensor<f32, [960]> x960 ← tf32[960] {}
+    synth_x(xdom960, mut x960, SEED_X, 480 ∷ i32)
+    let tensor<f32, [384, 960]> wdom960 ← tf32[384, 960] {}
+    mut tensor<f32, [384, 960]> w960 ← tf32[384, 960] {}
+    synth_w(wdom960, mut w960, SEED_W)
+    mut tensor<f32, [384, 64]> part960 ← tf32[384, 64] {}
+    mut tensor<f32, [384]> out960 ← tf32[384] {}
+    let tensor<f32, [384]> zero960 ← tf32[384] {}
+    ds.gemv_part(x960, w960, mut part960)
+    ds.gemv_fin_residual(part960, zero960, mut out960)
+    print "case K=960"
+    for range 0 ‥ ROWS let i {
+        print "row §0 §1"(i, out960[[i]])
+    }
+
+    let tensor<f32, [2560]> xdom2560 ← tf32[2560] {}
+    mut tensor<f32, [2560]> x2560 ← tf32[2560] {}
+    synth_x(xdom2560, mut x2560, SEED_X, 1280 ∷ i32)
+    let tensor<f32, [384, 2560]> wdom2560 ← tf32[384, 2560] {}
+    mut tensor<f32, [384, 2560]> w2560 ← tf32[384, 2560] {}
+    synth_w(wdom2560, mut w2560, SEED_W)
+    mut tensor<f32, [384, 64]> part2560 ← tf32[384, 64] {}
+    mut tensor<f32, [384]> out2560 ← tf32[384] {}
+    let tensor<f32, [384]> zero2560 ← tf32[384] {}
+    ds.gemv_part(x2560, w2560, mut part2560)
+    ds.gemv_fin_residual(part2560, zero2560, mut out2560)
+    print "case K=2560"
+    for range 0 ‥ ROWS let i {
+        print "row §0 §1"(i, out2560[[i]])
+    }
+}

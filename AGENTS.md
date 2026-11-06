@@ -12,10 +12,15 @@ training-loop mechanics. This repo owns `.fab` source under `src/`; Radix and
 `faber.toml`; no `FABER_*` environment variable is read), usually the parent
 `faberlang/` directory in local development.
 
-Gradus is fully self-contained. It does not import from Norma or any other
-sibling library. A Gradus user never needs to decide between `norma:*` and
-`gradus:*` — if you need autograd or ML, import from Gradus; if you need plain
-math, import from Norma. Duplication between them is intentional isolation.
+Gradus is self-contained for computation. Its math, tensor, autograd and ML
+modules do not import from Norma or any other sibling library. A Gradus user
+never needs to decide between `norma:*` and `gradus:*` — if you need autograd
+or ML, import from Gradus; if you need plain math, import from Norma.
+Duplication between them is intentional isolation. The one place Gradus
+reaches outside itself is file I/O: Gradus has no file system of its own, so
+`src/data.fab` imports `norma:fs` and `norma:fault` to read and write corpus
+and cursor files. Any other import from Norma or a sibling library needs a
+reason recorded here.
 
 GPU architecture follows the canonical public
 [GPU Execution Architecture](https://github.com/faberlang/faber/blob/main/docs/gpu-execution-architecture.md).
@@ -82,7 +87,9 @@ mir-swarm rungs, not grow workarounds.
 - Prefer receiver methods on genera; free functions for constructors / scalars
   / generators only.
 - Nested package directories need at least two leaves (prefer three+).
-- Do not import from Norma or any sibling library. Gradus is self-contained.
+- Do not import Norma or a sibling library for computation (math, tensors, autograd, ML);
+  Gradus is self-contained there. File I/O is the exception: `src/data.fab` imports
+  `norma:fs` and `norma:fault`. Do not add another exception without recording it above.
 - Never `importa` a `.proba` file; shared helpers stay in `.fab` modules.
 - `@ radix backward` annotations live behind the `gradient` module wrapper, not
   leaked into every public function signature.

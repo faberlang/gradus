@@ -213,52 +213,78 @@ class HeaderCursor {
     mut string text
 }
 
-# -------------------------------------------------------------------------
-# Character / value predicates (self-contained copies per leaf-module
-# convention — the capsule's is_hex/hex_ok are module-private).
-# -------------------------------------------------------------------------
-
-fn is_digit(string c) → bool {
-    return "0123456789".contains(c)
+# One lexer step: the tokens it emits (none for whitespace) and the index just
+# past the text it consumed.
+class Step {
+    mut list<Token> tokens
+    mut int end
 }
 
-fn is_hex(string c) → bool {
-    return "0123456789abcdef".contains(c)
+# -------------------------------------------------------------------------
+# Character classes over UTF-32 scalars. The header text is scanned as a list
+# of Unicode scalars (`text ↦ list<b32> ↦ list<u32>`), and every token payload
+# is the bulk conversion of a scalar slice back to a string.
+# -------------------------------------------------------------------------
+
+fn is_digit(u32 c) → bool {
+    return c ≥ 48 and c ≤ 57
 }
 
-fn is_optional(string c) → bool {
-    return c ∈ [" ", "\t", "\n", "\r"]
+# Lowercase hex digit (the digest and \u escape alphabet).
+fn is_hex(u32 c) → bool {
+    return is_digit(c) or (c ≥ 97 and c ≤ 102)
+}
+
+# JSON whitespace between tokens.
+fn is_blank(u32 c) → bool {
+    return c ≡ 32 or c ≡ 9 or c ≡ 10 or c ≡ 13
+}
+
+# A string body scalar that needs no escape: not the quote, not the backslash,
+# and not one of the five control characters the reader rejects.
+fn is_plain(u32 c) → bool {
+    return c ≢ 34 and c ≢ 92 and c ≢ 10 and c ≢ 13 and c ≢ 9 and c ≢ 8 and c ≢ 12
 }
 
 # Whole-digest predicate: exactly 64 lowercase hex characters.
 fn hex_ok(string s) → bool {
-    if s.length() ≢ 64 then return false
-    for from s let c {
-        if not is_hex(c ↦ string) then return false
+    let list<u32> cps ← s ↦ list<b32> ↦ list<u32>
+    return cps.length() ≡ 64 and cps.all((u32 c) → bool ∴ is_hex(c))
+}
+
+# The index where the run of scalars satisfying `keep` that starts at `from`
+# ends, or `to` when the run reaches it. `from` never exceeds `to`.
+fn run_end(list<u32> cps, int from, int to, (u32) → bool keep) → int {
+    for range from ‥ to let i {
+        if not keep(cps[i]) then return i
     }
-    return true
+    return to
+}
+
+# The text of scalars [lo, hi).
+fn piece(list<b32> raw, int lo, int hi) → string ⇥ SafetensorError {
+    do {
+        return raw[lo ‥ hi] ↦ string
+    }
+    catch err {
+        throw variant BadFormat { message = "header span is not valid text" }
+    }
 }
 
 # -------------------------------------------------------------------------
 # Byte-level helpers (Safetensors container).
 # -------------------------------------------------------------------------
 
-# Little-endian u64 from the first 8 bytes of a list. Package MIR rejects the
-# language octet-window form `bytes[lo‥hi] ↦ u64 via Le` (`octet index is
-# not numerus` plus `conversion source type mismatch`); this mirrors
-# gguf_manifest._u64, which already executes on the runner.
+# Little-endian u64 from the first 8 bytes of a list.
 fn u64_le(list<u8> b) → int ⇥ SafetensorError {
     require b.length() ≥ 8 throw variant BadFormat { message = "truncated safetensors header prefix" }
-    let int r7 ← b.get(7) coalesce 0 ∷ u8 ↦ int
-    require r7 ≺ 128 throw variant BadBounds { message = "header size above the numeric carrier" }
-    let int r0 ← b.get(0) coalesce 0 ∷ u8 ↦ int
-    let int r1 ← b.get(1) coalesce 0 ∷ u8 ↦ int
-    let int r2 ← b.get(2) coalesce 0 ∷ u8 ↦ int
-    let int r3 ← b.get(3) coalesce 0 ∷ u8 ↦ int
-    let int r4 ← b.get(4) coalesce 0 ∷ u8 ↦ int
-    let int r5 ← b.get(5) coalesce 0 ∷ u8 ↦ int
-    let int r6 ← b.get(6) coalesce 0 ∷ u8 ↦ int
-    return r0 ∨ r1 ⇐ 8 ∨ r2 ⇐ 16 ∨ r3 ⇐ 24 ∨ r4 ⇐ 32 ∨ r5 ⇐ 40 ∨ r6 ⇐ 48 ∨ r7 ⇐ 56
+    require b[7] ≺ 128 throw variant BadBounds { message = "header size above the numeric carrier" }
+    do {
+        return b[0 ‥ 8] ↦ list<b8> ↦ u64 via Le ↦ int
+    }
+    catch err {
+        throw variant BadFormat { message = "truncated safetensors header prefix" }
+    }
 }
 
 # Container-header validation: the 8-byte LE N is the JSON-only header
@@ -272,13 +298,8 @@ fn header(list<u8> corpus) → HeaderCursor ⇥ SafetensorError {
     require header ≤ HEADER_LIMIT throw variant BadBounds { message = "header size above ceiling" }
     require 8 + header ≤ corpus.length() throw variant BadFormat { message = "truncated header — header size beyond file" }
     # --- header slice + UTF-8 extraction ----------------------------------
-    mut list<u8> sub ← empty
-    for range 8 ‥ 8 + header let i {
-        sub.append(corpus.get(i) coalesce 0 ∷ u8)
-    }
-    let list<b8> o ↤ sub
     do {
-        return HeaderCursor { header = header, text = o ↦ string }
+        return HeaderCursor { header = header, text = corpus[8 ‥ 8 + header] ↦ list<b8> ↦ string }
     }
     catch err {
         throw variant BadFormat { message = "header is not valid UTF-8" }
@@ -289,189 +310,165 @@ fn header(list<u8> corpus) → HeaderCursor ⇥ SafetensorError {
 # JSON tokenizer (strict lexical validation of the header).
 # -------------------------------------------------------------------------
 
-# Parse a JSON string starting at index i (the opening quote). Handles the
-# standard escapes; \uXXXX is form-validated (4 hex digits) and preserved
-# verbatim (no codepoint intrinsic — compiler-boundary note above).
-fn read_string(string h, int i) → StringValue ⇥ SafetensorError {
+# The text a simple escape stands for, or none for an unknown escape letter
+# (\u is handled by the reader: it is form-validated and kept verbatim).
+fn escape_text(u32 e) → string ∪ none {
+    switch e {
+        case 34 {
+            return «"»
+        }
+        case 92 {
+            return "\\"
+        }
+        case 47 {
+            return "/"
+        }
+        case 110 {
+            return "\n"
+        }
+        case 114 {
+            return "\r"
+        }
+        case 116 {
+            return "\t"
+        }
+        case 98 {
+            return "\u{08}"
+        }
+        case 102 {
+            return "\u{0C}"
+        }
+        default {
+            return null
+        }
+    }
+}
+
+# Parse a JSON string starting at scalar index i (the opening quote). Handles
+# the standard escapes; \uXXXX is form-validated (4 hex digits) and preserved
+# verbatim (no codepoint intrinsic — compiler-boundary note above). Each pass
+# takes the unescaped run, then one escape; the escape's width (2 or 6) decides
+# where the next pass starts, so the cursor is a `while`.
+fn read_string(list<b32> raw, list<u32> cps, int i) → StringValue ⇥ SafetensorError {
+    let int n ← cps.length()
     mut string payload ← ""
     mut int pos ← i + 1
-    while pos ≺ h.length() {
-        let string c ← (h.slice(pos, pos + 1) ⊥ "")
-        if c ≡ «"» then return StringValue { pos = pos + 1, payload = payload }
-        if c ≡ "\\" {
-            require pos + 1 ≺ h.length() throw variant BadFormat { message = "unterminated string escape" }
-            let string e ← (h.slice(pos + 1, pos + 2) ⊥ "")
-            if e ≡ «"» {
-                payload ← payload + «"»
-                pos ← pos + 2
+    while pos ≺ n {
+        let int stop ← run_end(cps, pos, n, is_plain)
+        payload ← "§§"(payload, piece(raw, pos, stop))
+        require stop ≺ n throw variant BadFormat { message = "unterminated string" }
+        if cps[stop] ≡ 34 then return StringValue { pos = stop + 1, payload = payload }
+        reject cps[stop] ≢ 92 throw variant BadFormat { message = "unescaped control character in string" }
+        require stop + 1 ≺ n throw variant BadFormat { message = "unterminated string escape" }
+        if cps[stop + 1] ≡ 117 {
+            require stop + 5 ≺ n throw variant BadFormat { message = "truncated \\u escape" }
+            for from cps[stop + 2 ‥ stop + 6] let digit {
+                require is_hex(digit) throw variant BadFormat { message = "malformed \\u escape" }
             }
-            elif e ≡ "\\" {
-                payload ← payload + "\\"
-                pos ← pos + 2
-            }
-            elif e ≡ "/" {
-                payload ← payload + "/"
-                pos ← pos + 2
-            }
-            elif e ≡ "n" {
-                payload ← payload + "\n"
-                pos ← pos + 2
-            }
-            elif e ≡ "r" {
-                payload ← payload + "\r"
-                pos ← pos + 2
-            }
-            elif e ≡ "t" {
-                payload ← payload + "\t"
-                pos ← pos + 2
-            }
-            elif e ≡ "b" {
-                payload ← payload + "\u{08}"
-                pos ← pos + 2
-            }
-            elif e ≡ "f" {
-                payload ← payload + "\u{0C}"
-                pos ← pos + 2
-            }
-            elif e ≡ "u" {
-                require pos + 5 ≺ h.length() throw variant BadFormat { message = "truncated \\u escape" }
-                let string quad ← (h.slice(pos + 2, pos + 6) ⊥ "")
-                for range 0‥4 let j {
-                    require is_hex((quad.slice(j, j + 1) ⊥ "")) throw variant BadFormat { message = "malformed \\u escape" }
-                }
-                payload ← "§\\u§"(payload, quad)
-                pos ← pos + 6
-            }
-            else {
-                throw variant BadFormat { message = "unknown string escape" }
-            }
+            payload ← "§\\u§"(payload, piece(raw, stop + 2, stop + 6))
+            pos ← stop + 6
         }
         else {
-            reject c ≡ "\n" or c ≡ "\r" or c ≡ "\t" or c ≡ "\u{08}" or c ≡ "\u{0C}" throw variant BadFormat { message = "unescaped control character in string" }
-            payload ← payload + c
-            pos ← pos + 1
+            let string ∪ none text ← escape_text(cps[stop + 1])
+            if text ≡ null then throw variant BadFormat { message = "unknown string escape" }
+            payload ← "§§"(payload, text)
+            pos ← stop + 2
         }
     }
     throw variant BadFormat { message = "unterminated string" }
 }
 
+# The end of the digit run that must start at `at` (a digit is required there).
+fn digits_after(list<u32> cps, int at) → int ⇥ SafetensorError {
+    require at ≺ cps.length() throw variant BadFormat { message = "malformed number" }
+    require is_digit(cps[at]) throw variant BadFormat { message = "malformed number" }
+    return run_end(cps, at, cps.length(), is_digit)
+}
+
 # Parse a JSON number starting at index i (digit or minus). Returns the
 # raw number text (JSON grammar: -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?).
-fn read_number(string h, int i) → StringValue ⇥ SafetensorError {
-    mut int pos ← i
-    if (h.slice(pos, pos + 1) ⊥ "") ≡ "-" {
-        pos ← pos + 1
-        require pos ≺ h.length() throw variant BadFormat { message = "malformed number" }
-    }
-    if (h.slice(pos, pos + 1) ⊥ "") ≡ "0" {
-        pos ← pos + 1
-        reject pos ≺ h.length() and is_digit((h.slice(pos, pos + 1) ⊥ "")) throw variant BadFormat { message = "malformed number" }
-    }
-    elif is_digit((h.slice(pos, pos + 1) ⊥ "")) {
-        while pos ≺ h.length() and is_digit((h.slice(pos, pos + 1) ⊥ "")) {
-            pos ← pos + 1
+fn read_number(list<b32> raw, list<u32> cps, int i) → StringValue ⇥ SafetensorError {
+    let int n ← cps.length()
+    let int lead ← cps[i] ≡ 45 ✓ i + 1 ✗ i
+    require lead ≺ n throw variant BadFormat { message = "malformed number" }
+    require is_digit(cps[lead]) throw variant BadFormat { message = "malformed number" }
+    let int int_end ← cps[lead] ≡ 48 ✓ lead + 1 ✗ run_end(cps, lead, n, is_digit)
+    reject cps[lead] ≡ 48 and int_end ≺ n and is_digit(cps[int_end]) throw variant BadFormat { message = "malformed number" }
+    let int frac_end ← int_end ≺ n and cps[int_end] ≡ 46 ✓ digits_after(cps, int_end + 1) ✗ int_end
+    let bool has_exponent ← frac_end ≺ n and (cps[frac_end] ≡ 101 or cps[frac_end] ≡ 69)
+    let bool has_sign ← has_exponent and frac_end + 1 ≺ n and (cps[frac_end + 1] ≡ 43 or cps[frac_end + 1] ≡ 45)
+    let int exponent_at ← has_sign ✓ frac_end + 2 ✗ frac_end + 1
+    let int end ← has_exponent ✓ digits_after(cps, exponent_at) ✗ frac_end
+    return StringValue { pos = end, payload = piece(raw, i, end) }
+}
+
+# The token (if any) and end of the lexeme that starts at scalar index pos.
+fn next_lexeme(list<b32> raw, list<u32> cps, int pos) → Step ⇥ SafetensorError {
+    let int n ← cps.length()
+    let u32 c ← cps[pos]
+    if is_blank(c) then return Step { tokens = empty, end = run_end(cps, pos, n, is_blank) }
+    switch c {
+        case 123 {
+            return Step { tokens = [Token { kind = 0, payload = "{" }], end = pos + 1 }
+        }
+        case 125 {
+            return Step { tokens = [Token { kind = 1, payload = "}" }], end = pos + 1 }
+        }
+        case 91 {
+            return Step { tokens = [Token { kind = 2, payload = "[" }], end = pos + 1 }
+        }
+        case 93 {
+            return Step { tokens = [Token { kind = 3, payload = "]" }], end = pos + 1 }
+        }
+        case 58 {
+            return Step { tokens = [Token { kind = 4, payload = ":" }], end = pos + 1 }
+        }
+        case 44 {
+            return Step { tokens = [Token { kind = 5, payload = "," }], end = pos + 1 }
+        }
+        case 34 {
+            let StringValue s ← read_string(raw, cps, pos)
+            return Step { tokens = [Token { kind = 6, payload = s.payload }], end = s.pos }
+        }
+        case 116 {
+            require word_at(cps, pos, [116, 114, 117, 101]) throw variant BadFormat { message = "malformed literal" }
+            return Step { tokens = [Token { kind = 8, payload = "true" }], end = pos + 4 }
+        }
+        case 102 {
+            require word_at(cps, pos, [102, 97, 108, 115, 101]) throw variant BadFormat { message = "malformed literal" }
+            return Step { tokens = [Token { kind = 9, payload = "false" }], end = pos + 5 }
+        }
+        case 110 {
+            require word_at(cps, pos, [110, 117, 108, 108]) throw variant BadFormat { message = "malformed literal" }
+            return Step { tokens = [Token { kind = 10, payload = "null" }], end = pos + 4 }
+        }
+        default {
+            require is_digit(c) or c ≡ 45 throw variant BadFormat { message = "unexpected character in header" }
+            let StringValue number ← read_number(raw, cps, pos)
+            return Step { tokens = [Token { kind = 7, payload = number.payload }], end = number.pos }
         }
     }
-    else {
-        throw variant BadFormat { message = "malformed number" }
-    }
-    if pos ≺ h.length() and (h.slice(pos, pos + 1) ⊥ "") ≡ "." {
-        pos ← pos + 1
-        require pos ≺ h.length() throw variant BadFormat { message = "malformed number" }
-        require is_digit((h.slice(pos, pos + 1) ⊥ "")) throw variant BadFormat { message = "malformed number" }
-        while pos ≺ h.length() and is_digit((h.slice(pos, pos + 1) ⊥ "")) {
-            pos ← pos + 1
-        }
-    }
-    if pos ≺ h.length() and ((h.slice(pos, pos + 1) ⊥ "") ≡ "e" or (h.slice(pos, pos + 1) ⊥ "") ≡ "E") {
-        pos ← pos + 1
-        if pos ≺ h.length() and ((h.slice(pos, pos + 1) ⊥ "") ≡ "+" or (h.slice(pos, pos + 1) ⊥ "") ≡ "-") {
-            pos ← pos + 1
-        }
-        require pos ≺ h.length() throw variant BadFormat { message = "malformed number" }
-        require is_digit((h.slice(pos, pos + 1) ⊥ "")) throw variant BadFormat { message = "malformed number" }
-        while pos ≺ h.length() and is_digit((h.slice(pos, pos + 1) ⊥ "")) {
-            pos ← pos + 1
-        }
-    }
-    return StringValue { pos = pos, payload = (h.slice(i, pos) ⊥ "") }
+}
+
+# Whether the scalars at `pos` spell `word` (a JSON literal).
+fn word_at(list<u32> cps, int pos, list<u32> word) → bool {
+    return pos + word.length() ≤ cps.length() and cps[pos ‥ pos + word.length()] ≡ word
 }
 
 # Tokenize the whole header (strict lexical validation, bounded token
-# count — checked before more tokens are appended).
+# count — checked before more tokens are appended). Lexemes have different
+# widths, so the cursor jumps to each lexeme's end.
 fn scan(string h) → list<Token> ⇥ SafetensorError {
+    let list<b32> raw ← h ↦ list<b32>
+    let list<u32> cps ← raw ↦ list<u32>
+    let int n ← cps.length()
     mut list<Token> tks ← empty
     mut int pos ← 0
-    while pos ≺ h.length() {
-        let string c ← (h.slice(pos, pos + 1) ⊥ "")
-        if is_optional(c) {
-            pos ← pos + 1
-        }
-        elif c ≡ "{" {
-            tks.append(Token { kind = 0, payload = "{" })
-            pos ← pos + 1
-        }
-        elif c ≡ "}" {
-            tks.append(Token { kind = 1, payload = "}" })
-            pos ← pos + 1
-        }
-        elif c ≡ "[" {
-            tks.append(Token { kind = 2, payload = "[" })
-            pos ← pos + 1
-        }
-        elif c ≡ "]" {
-            tks.append(Token { kind = 3, payload = "]" })
-            pos ← pos + 1
-        }
-        elif c ≡ ":" {
-            tks.append(Token { kind = 4, payload = ":" })
-            pos ← pos + 1
-        }
-        elif c ≡ "," {
-            tks.append(Token { kind = 5, payload = "," })
-            pos ← pos + 1
-        }
-        elif c ≡ «"» {
-            let StringValue s ← read_string(h, pos)
-            tks.append(Token { kind = 6, payload = s.payload })
-            pos ← s.pos
-        }
-        elif is_digit(c) or c ≡ "-" {
-            let StringValue n ← read_number(h, pos)
-            tks.append(Token { kind = 7, payload = n.payload })
-            pos ← n.pos
-        }
-        elif c ≡ "t" {
-            if (h.slice(pos, pos + 4) ⊥ "") ≡ "true" {
-                tks.append(Token { kind = 8, payload = "true" })
-                pos ← pos + 4
-            }
-            else {
-                throw variant BadFormat { message = "malformed literal" }
-            }
-        }
-        elif c ≡ "f" {
-            if (h.slice(pos, pos + 5) ⊥ "") ≡ "false" {
-                tks.append(Token { kind = 9, payload = "false" })
-                pos ← pos + 5
-            }
-            else {
-                throw variant BadFormat { message = "malformed literal" }
-            }
-        }
-        elif c ≡ "n" {
-            if (h.slice(pos, pos + 4) ⊥ "") ≡ "null" {
-                tks.append(Token { kind = 10, payload = "null" })
-                pos ← pos + 4
-            }
-            else {
-                throw variant BadFormat { message = "malformed literal" }
-            }
-        }
-        else {
-            throw variant BadFormat { message = "unexpected character in header" }
-        }
+    while pos ≺ n {
+        let Step step ← next_lexeme(raw, cps, pos)
+        tks.extend(step.tokens)
         require tks.length() ≤ TOKEN_LIMIT throw variant BadBounds { message = "header token count above ceiling" }
+        pos ← step.end
     }
     return tks
 }
@@ -480,17 +477,18 @@ fn scan(string h) → list<Token> ⇥ SafetensorError {
 # JSON structural walk (strict grammar validation + generic extraction).
 # -------------------------------------------------------------------------
 
-# Token lookup still paper-overs a missing index as kind=-1. Making these
-# failable ripples through the whole header walker; conversion is outside
-# this unit.
-fn dtype_kind(list<Token> tks, int i) → int {
-    let Token t ← tks.get(i) coalesce Token { kind = -1, payload = "" }
-    return t.kind
+# Whether token i exists and has the given kind (0..10 as in `Token`).
+fn is_kind(list<Token> tks, int i, int kind) → bool {
+    return i ≺ tks.length() and tks[i].kind ≡ kind
 }
 
-fn value_at(list<Token> tks, int i) → string {
-    let Token t ← tks.get(i) coalesce Token { kind = -1, payload = "" }
-    return t.payload
+# The index of the first token of `kind` at or after `from`, or the token count
+# when there is none.
+fn kind_end(list<Token> tks, int from, int kind) → int {
+    for range from ‥ tks.length() let i {
+        if tks[i].kind ≡ kind then return i
+    }
+    return tks.length()
 }
 
 # Integer-valued JSON number -> number (digits only, length-capped). A
@@ -498,12 +496,10 @@ fn value_at(list<Token> tks, int i) → string {
 fn parse_integer(string raw) → int ⇥ SafetensorError {
     require raw.length() ≢ 0 throw variant BadFormat { message = "malformed integer" }
     require raw.length() ≤ 18 throw variant BadFormat { message = "integer above the numeric carrier" }
-    for from raw let c {
-        require is_digit(c ↦ string) throw variant BadFormat { message = "non-integer value" }
-    }
+    let list<u32> cps ← raw ↦ list<b32> ↦ list<u32>
+    require cps.all((u32 c) → bool ∴ is_digit(c)) throw variant BadFormat { message = "non-integer value" }
     do {
-        let int v ↤ raw
-        return v
+        return raw ↦ int
     }
     catch err {
         throw variant BadFormat { message = "malformed integer" }
@@ -511,74 +507,72 @@ fn parse_integer(string raw) → int ⇥ SafetensorError {
 }
 
 # Parse a JSON array of integers starting at pos (token kind 2). Bounded
-# array length (shape rank / offsets / any numeric array).
+# array length (shape rank / offsets / any numeric array). The array holds no
+# nesting, so its body is the tokens up to the first `]`: integers at the even
+# slots, commas at the odd ones.
 fn parse_numbers(list<Token> tks, int pos) → NumberCursor ⇥ SafetensorError {
-    require dtype_kind(tks, pos) ≡ 2 throw variant BadFormat { message = "expected an integer array" }
-    mut int p ← pos + 1
+    require is_kind(tks, pos, 2) throw variant BadFormat { message = "expected an integer array" }
+    let int close ← kind_end(tks, pos + 1, 3)
+    let list<Token> body ← tks[pos + 1 ‥ close]
     mut list<int> values ← empty
-    while p ≺ tks.length() {
-        if dtype_kind(tks, p) ≡ 3 {
-            p ← p + 1
-            return NumberCursor { pos = p, values = values }
+    for from body at [slot] let t {
+        if slot % 2 ≡ 0 {
+            require t.kind ≡ 7 throw variant BadFormat { message = "array must contain only integers" }
+            values.append(parse_integer(t.payload))
+            require values.length() ≤ ARRAY_LIMIT throw variant BadBounds { message = "array above length ceiling" }
         }
-        require dtype_kind(tks, p) ≡ 7 throw variant BadFormat { message = "array must contain only integers" }
-        values.append(parse_integer(value_at(tks, p)))
-        p ← p + 1
-        require values.length() ≤ ARRAY_LIMIT throw variant BadBounds { message = "array above length ceiling" }
-        require p ≺ tks.length() throw variant BadFormat { message = "unterminated array" }
-        if dtype_kind(tks, p) ≡ 5 {
-            p ← p + 1
-            require p ≺ tks.length() throw variant BadFormat { message = "trailing comma in array" }
-            require dtype_kind(tks, p) ≢ 3 throw variant BadFormat { message = "trailing comma in array" }
-        }
-        elif dtype_kind(tks, p) ≢ 3 {
-            throw variant BadFormat { message = "malformed array separator" }
+        else {
+            require t.kind ≡ 5 throw variant BadFormat { message = "malformed array separator" }
         }
     }
-    throw variant BadFormat { message = "unterminated array" }
+    reject body.length() ≻ 0 and body.length() % 2 ≡ 0 throw variant BadFormat { message = "trailing comma in array" }
+    require close ≺ tks.length() throw variant BadFormat { message = "unterminated array" }
+    return NumberCursor { pos = close + 1, values = values }
 }
 
 # Parse the __metadata__ object: a flat string->string table. KV count is
-# bounded while collecting (ceiling before the walk grows further).
+# bounded while collecting (ceiling before the walk grows further). The object
+# holds only strings, so its body is the tokens up to the first `}`: members of
+# four slots, key : value ,.
 fn parse_metadata(list<Token> tks, int pos) → MetadataCursor ⇥ SafetensorError {
-    require dtype_kind(tks, pos) ≡ 0 throw variant BadMetadata { message = "metadata must be a JSON object" }
-    mut int p ← pos + 1
+    require is_kind(tks, pos, 0) throw variant BadMetadata { message = "metadata must be a JSON object" }
+    let int close ← kind_end(tks, pos + 1, 1)
+    let list<Token> body ← tks[pos + 1 ‥ close]
     mut list<string> keys ← empty
     mut list<string> values ← empty
-    while p ≺ tks.length() {
-        if dtype_kind(tks, p) ≡ 1 {
-            p ← p + 1
-            return MetadataCursor { pos = p, keys = keys, values = values }
-        }
-        require dtype_kind(tks, p) ≡ 6 throw variant BadMetadata { message = "malformed metadata member" }
-        let string key ← value_at(tks, p)
-        p ← p + 1
-        require dtype_kind(tks, p) ≡ 4 throw variant BadMetadata { message = "missing colon in metadata" }
-        p ← p + 1
-        require dtype_kind(tks, p) ≡ 6 throw variant BadMetadata { message = "metadata value must be a string" }
-        let string payload ← value_at(tks, p)
-        p ← p + 1
-        keys.append(key)
-        values.append(payload)
-        require keys.length() ≤ KV_LIMIT throw variant BadBounds { message = "metadata KV count above ceiling" }
-        require p ≺ tks.length() throw variant BadMetadata { message = "unterminated metadata object" }
-        if dtype_kind(tks, p) ≡ 5 {
-            p ← p + 1
-            require p ≺ tks.length() throw variant BadMetadata { message = "trailing comma in metadata" }
-            require dtype_kind(tks, p) ≢ 1 throw variant BadMetadata { message = "trailing comma in metadata" }
-        }
-        elif dtype_kind(tks, p) ≢ 1 {
-            throw variant BadMetadata { message = "malformed metadata separator" }
+    for from body at [slot] let t {
+        switch slot % 4 {
+            case 0 {
+                require t.kind ≡ 6 throw variant BadMetadata { message = "malformed metadata member" }
+                keys.append(t.payload)
+            }
+            case 1 {
+                require t.kind ≡ 4 throw variant BadMetadata { message = "missing colon in metadata" }
+            }
+            case 2 {
+                require t.kind ≡ 6 throw variant BadMetadata { message = "metadata value must be a string" }
+                values.append(t.payload)
+                require keys.length() ≤ KV_LIMIT throw variant BadBounds { message = "metadata KV count above ceiling" }
+            }
+            default {
+                require t.kind ≡ 5 throw variant BadMetadata { message = "malformed metadata separator" }
+            }
         }
     }
-    throw variant BadMetadata { message = "unterminated metadata object" }
+    let int tail ← body.length() % 4
+    reject tail ≡ 0 and body.length() ≻ 0 throw variant BadMetadata { message = "trailing comma in metadata" }
+    require tail ≢ 1 throw variant BadMetadata { message = "missing colon in metadata" }
+    require tail ≢ 2 throw variant BadMetadata { message = "metadata value must be a string" }
+    require close ≺ tks.length() throw variant BadMetadata { message = "unterminated metadata object" }
+    return MetadataCursor { pos = close + 1, keys = keys, values = values }
 }
 
 # Parse one tensor descriptor: {"dtype": "...", "shape": [...],
 # "data_offsets": [begin, end]}. Unknown members, duplicates, and missing
-# members fail closed.
+# members fail closed. Members have different widths (a string, an array), so
+# the cursor moves to each member's end.
 fn parse_tensor(list<Token> tks, int pos, string name) → TensorCursor ⇥ SafetensorError {
-    require dtype_kind(tks, pos) ≡ 0 throw variant BadFormat { message = "tensor descriptor must be an object: §"(name) }
+    require is_kind(tks, pos, 0) throw variant BadFormat { message = "tensor descriptor must be an object: §"(name) }
     mut int p ← pos + 1
     mut bool seen_dtype ← false
     mut bool seen_shape ← false
@@ -587,56 +581,62 @@ fn parse_tensor(list<Token> tks, int pos, string name) → TensorCursor ⇥ Safe
     mut list<int> shape ← empty
     mut int start ← 0
     mut int end ← 0
-    while p ≺ tks.length() {
-        if dtype_kind(tks, p) ≡ 1 {
-            p ← p + 1
+    let int count ← tks.length()
+    while p ≺ count {
+        if is_kind(tks, p, 1) {
             require seen_dtype throw variant BadFormat { message = "missing dtype in tensor descriptor: §"(name) }
             require seen_shape throw variant BadFormat { message = "missing shape in tensor descriptor: §"(name) }
             require seen_offset throw variant BadFormat { message = "missing data_offsets in tensor descriptor: §"(name) }
-            return TensorCursor { pos = p, dtype = kind, shape = shape, start = start, end = end }
+            return TensorCursor { pos = p + 1, dtype = kind, shape = shape, start = start, end = end }
         }
-        require dtype_kind(tks, p) ≡ 6 throw variant BadFormat { message = "malformed tensor descriptor member" }
-        let string key ← value_at(tks, p)
-        p ← p + 1
-        require dtype_kind(tks, p) ≡ 4 throw variant BadFormat { message = "missing colon in tensor descriptor" }
-        p ← p + 1
+        require is_kind(tks, p, 6) throw variant BadFormat { message = "malformed tensor descriptor member" }
+        let string key ← tks[p].payload
+        require is_kind(tks, p + 1, 4) throw variant BadFormat { message = "missing colon in tensor descriptor" }
+        let int value ← p + 2
         if key ≡ "dtype" {
             reject seen_dtype throw variant BadFormat { message = "duplicate dtype in tensor descriptor" }
-            require dtype_kind(tks, p) ≡ 6 throw variant BadFormat { message = "dtype must be a string" }
-            kind ← value_at(tks, p)
-            p ← p + 1
+            require is_kind(tks, value, 6) throw variant BadFormat { message = "dtype must be a string" }
+            kind ← tks[value].payload
+            p ← value + 1
             seen_dtype ← true
         }
         elif key ≡ "shape" {
             reject seen_shape throw variant BadFormat { message = "duplicate shape in tensor descriptor" }
-            let NumberCursor nc ← parse_numbers(tks, p)
+            let NumberCursor nc ← parse_numbers(tks, value)
             p ← nc.pos
             shape ← nc.values
             seen_shape ← true
         }
         elif key ≡ "data_offsets" {
             reject seen_offset throw variant BadFormat { message = "duplicate data_offsets in tensor descriptor" }
-            let NumberCursor oc ← parse_numbers(tks, p)
+            let NumberCursor oc ← parse_numbers(tks, value)
             p ← oc.pos
             require oc.values.length() ≡ 2 throw variant BadOffset { message = "data_offsets must have exactly 2 values: §"(name) }
-            start ← int_at(oc.values, 0)
-            end ← int_at(oc.values, 1)
+            start ← oc.values[0]
+            end ← oc.values[1]
             seen_offset ← true
         }
         else {
             throw variant BadFormat { message = "unknown member in tensor descriptor: §"(key) }
         }
-        require p ≺ tks.length() throw variant BadFormat { message = "unterminated tensor descriptor" }
-        if dtype_kind(tks, p) ≡ 5 {
-            p ← p + 1
-            require p ≺ tks.length() throw variant BadFormat { message = "trailing comma in tensor descriptor" }
-            require dtype_kind(tks, p) ≢ 1 throw variant BadFormat { message = "trailing comma in tensor descriptor" }
-        }
-        elif dtype_kind(tks, p) ≢ 1 {
-            throw variant BadFormat { message = "malformed tensor descriptor separator" }
-        }
+        p ← member_end(tks, p, "tensor descriptor")
     }
     throw variant BadFormat { message = "unterminated tensor descriptor" }
+}
+
+# After a member ending at p: the index where the next member starts, or the
+# index of the closing `}` itself, or the token count when the stream ended
+# (the caller's loop then reports the unterminated object). A comma must be
+# followed by a member (not the close), and anything else must be the close.
+fn member_end(list<Token> tks, int p, string what) → int ⇥ SafetensorError {
+    if p ≥ tks.length() then return p
+    if is_kind(tks, p, 5) {
+        require p + 1 ≺ tks.length() throw variant BadFormat { message = "trailing comma in §"(what) }
+        require not is_kind(tks, p + 1, 1) throw variant BadFormat { message = "trailing comma in §"(what) }
+        return p + 1
+    }
+    require is_kind(tks, p, 1) throw variant BadFormat { message = "malformed § separator"(what) }
+    return p
 }
 
 # Walk the token stream: top-level must be a single JSON object whose
@@ -648,7 +648,7 @@ fn parse_tensor(list<Token> tks, int pos, string name) → TensorCursor ⇥ Safe
 # count-driven work downstream).
 fn walk(list<Token> tks) → Structure ⇥ SafetensorError {
     require tks.length() ≢ 0 throw variant BadFormat { message = "empty header" }
-    require dtype_kind(tks, 0) ≡ 0 throw variant BadFormat { message = "header is not a JSON object" }
+    require is_kind(tks, 0, 0) throw variant BadFormat { message = "header is not a JSON object" }
     mut int pos ← 1
     mut bool seen_meta ← false
     mut list<string> meta_keys ← empty
@@ -658,23 +658,22 @@ fn walk(list<Token> tks) → Structure ⇥ SafetensorError {
     mut list<list<int>> shapes ← empty
     mut list<int> starts ← empty
     mut list<int> end ← empty
-    while pos ≺ tks.length() {
-        if dtype_kind(tks, pos) ≡ 1 {
-            pos ← pos + 1
+    let int count ← tks.length()
+    while pos ≺ count {
+        if is_kind(tks, pos, 1) {
             # Fail closed on trailing content: the top-level object must
             # close exactly at the end of the token stream.
-            require pos ≡ tks.length() throw variant BadFormat { message = "trailing tokens after the header object" }
+            require pos + 1 ≡ count throw variant BadFormat { message = "trailing tokens after the header object" }
             return Structure { meta_keys = meta_keys, meta_values = meta_values, names = names, dtypes = dtypes, shapes = shapes, starts = starts, end = end }
         }
-        require dtype_kind(tks, pos) ≡ 6 throw variant BadFormat { message = "malformed header member" }
-        let string key ← value_at(tks, pos)
-        pos ← pos + 1
-        require dtype_kind(tks, pos) ≡ 4 throw variant BadFormat { message = "missing colon in header" }
-        pos ← pos + 1
+        require is_kind(tks, pos, 6) throw variant BadFormat { message = "malformed header member" }
+        let string key ← tks[pos].payload
+        require is_kind(tks, pos + 1, 4) throw variant BadFormat { message = "missing colon in header" }
+        let int value ← pos + 2
         if key ≡ "__metadata__" {
             reject seen_meta throw variant BadMetadata { message = "duplicate __metadata__" }
             seen_meta ← true
-            let MetadataCursor m ← parse_metadata(tks, pos)
+            let MetadataCursor m ← parse_metadata(tks, value)
             pos ← m.pos
             meta_keys ← m.keys
             meta_values ← m.values
@@ -682,7 +681,7 @@ fn walk(list<Token> tks) → Structure ⇥ SafetensorError {
         else {
             require names.length() ≺ TENSOR_LIMIT throw variant BadBounds { message = "tensor count above ceiling" }
             require key.length() ≤ NAME_LIMIT throw variant BadBounds { message = "tensor name above length ceiling" }
-            let TensorCursor t ← parse_tensor(tks, pos, key)
+            let TensorCursor t ← parse_tensor(tks, value, key)
             pos ← t.pos
             names.append(key)
             dtypes.append(t.dtype)
@@ -690,15 +689,7 @@ fn walk(list<Token> tks) → Structure ⇥ SafetensorError {
             starts.append(t.start)
             end.append(t.end)
         }
-        require pos ≺ tks.length() throw variant BadFormat { message = "unterminated header object" }
-        if dtype_kind(tks, pos) ≡ 5 {
-            pos ← pos + 1
-            require pos ≺ tks.length() throw variant BadFormat { message = "trailing comma in header" }
-            require dtype_kind(tks, pos) ≢ 1 throw variant BadFormat { message = "trailing comma in header" }
-        }
-        elif dtype_kind(tks, pos) ≢ 1 {
-            throw variant BadFormat { message = "malformed header separator" }
-        }
+        pos ← member_end(tks, pos, "header")
     }
     throw variant BadFormat { message = "unterminated header object" }
 }
@@ -711,8 +702,8 @@ fn walk(list<Token> tks) → Structure ⇥ SafetensorError {
 # (parallel key/value lists, header order preserved).
 fn metadata(list<string> keys, list<string> values) → list<capsule.SafetensorsMetadata> {
     mut list<capsule.SafetensorsMetadata> out ← empty
-    for range 0 ‥ keys.length() let i {
-        out.append(capsule.SafetensorsMetadata { key = keys.get(i) coalesce "", payload = values.get(i) coalesce "" })
+    for from keys, values let key, payload {
+        out.append(capsule.SafetensorsMetadata { key = key, payload = payload })
     }
     return out
 }
@@ -738,94 +729,17 @@ fn mul(int a, int b) → int ⇥ SafetensorError {
     return a * b
 }
 
-# Known Safetensors storage widths. A zero result means the wire dtype is
-# retained opaquely; the generic parser must not reject a future dtype merely
-# because Gradus cannot materialize it yet.
-fn dtype_bytes(string kind) → int {
-    switch kind {
-        case "BOOL" {
-            return 1
-        }
-        case "U8" {
-            return 1
-        }
-        case "I8" {
-            return 1
-        }
-        case "F8_E4M3" {
-            return 1
-        }
-        case "F8_E5M2" {
-            return 1
-        }
-        case "F16" {
-            return 2
-        }
-        case "BF16" {
-            return 2
-        }
-        case "I16" {
-            return 2
-        }
-        case "U16" {
-            return 2
-        }
-        case "F32" {
-            return 4
-        }
-        case "I32" {
-            return 4
-        }
-        case "U32" {
-            return 4
-        }
-        case "F64" {
-            return 8
-        }
-        case "I64" {
-            return 8
-        }
-        case "U64" {
-            return 8
-        }
-        case "C64" {
-            return 8
-        }
-        case "I128" {
-            return 16
-        }
-        case "U128" {
-            return 16
-        }
-        case "F128" {
-            return 16
-        }
-        case "I256" {
-            return 32
-        }
-        case "U256" {
-            return 32
-        }
-        case "F256" {
-            return 32
-        }
-        default {
-            return 0
-        }
-    }
-}
-
-# In-bounds integer read. A miss fails closed instead of coalescing to -1.
-fn int_at(list<int> xs, int i) → int ⇥ SafetensorError {
-    require i ≥ 0 throw variant BadBounds { message = "integer index out of range" }
-    require i ≺ xs.length() throw variant BadBounds { message = "integer index out of range" }
-    do {
-        return xs[i]
-    }
-    catch err {
-        throw variant BadBounds { message = "integer index out of range" }
-    }
-    throw variant BadBounds { message = "integer index out of range" }
+# Known Safetensors storage widths. A dtype with no entry here is retained
+# opaquely; the generic parser must not reject a future dtype merely because
+# Gradus cannot materialize it yet.
+fn dtype_bytes(string kind) → int ∪ none {
+    if kind ∈ ["BOOL", "U8", "I8", "F8_E4M3", "F8_E5M2"] then return 1
+    if kind ∈ ["F16", "BF16", "I16", "U16"] then return 2
+    if kind ∈ ["F32", "I32", "U32"] then return 4
+    if kind ∈ ["F64", "I64", "U64", "C64"] then return 8
+    if kind ∈ ["I128", "U128", "F128"] then return 16
+    if kind ∈ ["I256", "U256", "F256"] then return 32
+    return null
 }
 
 # The public Gradus DType union covers the currently materializable floating
@@ -888,25 +802,22 @@ fn admit(list<u8> corpus, string digest) → capsule.Capsule ⇥ SafetensorError
     let list<Token> tks ← scan(header_text)
     let Structure st ← walk(tks)
     let int n ← st.names.length()
-    let list<string> sorted_names ← st.names.sorted()
-    for range 1 ‥ n let i {
-        let string previous ← sorted_names.get(i - 1) coalesce ""
-        let string current ← sorted_names.get(i) coalesce ""
-        reject previous ≡ current throw variant BadOffset { message = "duplicate tensor name: §"(current) }
+    # A header with no tensors has no data to admit.
+    require n ≻ 0 throw variant BadFormat { message = "header declares no tensors" }
+    let list<string> sorted_names ← sort via asc from st.names
+    if n ≻ 1 {
+        for from sorted_names[0 ‥ n - 1], sorted_names[1 ‥ n] let previous, current {
+            reject previous ≡ current throw variant BadOffset { message = "duplicate tensor name: §"(current) }
+        }
     }
     mut int total_elements ← 0
     mut list<capsule.SafetensorsTensorDescriptor> descriptors ← empty
     mut list<TensorRange> ranges ← empty
-    for range 0 ‥ n let i {
-        let string name ← st.names.get(i) coalesce ""
-        let string kind ← st.dtypes.get(i) coalesce ""
-        let list<int> dimensions ← st.shapes.get(i) coalesce [] ∷ list<int>
-        let int start ← int_at(st.starts, i)
-        let int end ← int_at(st.end, i)
-        let int bytes_per_element ← dtype_bytes(kind)
+    for from st.names, st.dtypes, st.shapes, st.starts, st.end let name, kind, dimensions, start, end {
         let int elements ← numel(dimensions)
         require start ≥ 0 and end ≻ start and end ≤ data_length throw variant BadOffset { message = "tensor data range is invalid: §"(name) }
-        if bytes_per_element ≻ 0 {
+        let int ∪ none bytes_per_element ← dtype_bytes(kind)
+        if bytes_per_element ≢ null {
             require end - start ≡ mul(elements, bytes_per_element) throw variant BadShape { message = "shape/offset inconsistency for §"(name) }
         }
         total_elements ← add(total_elements, elements)
@@ -914,10 +825,10 @@ fn admit(list<u8> corpus, string digest) → capsule.Capsule ⇥ SafetensorError
         ranges.append(TensorRange { start = start, end = end })
     }
     let list<TensorRange> sorted_ranges ← sort via asc from ranges let tensor_range { return tensor_range.start }
-    for range 1 ‥ n let i {
-        let TensorRange previous ← sorted_ranges.get(i - 1) coalesce TensorRange { start = 0, end = 0 }
-        let TensorRange current ← sorted_ranges.get(i) coalesce TensorRange { start = 0, end = 0 }
-        reject previous.end ≻ current.start throw variant BadOffset { message = "overlapping tensor data regions" }
+    if n ≻ 1 {
+        for from sorted_ranges[0 ‥ n - 1], sorted_ranges[1 ‥ n] let previous, current {
+            reject previous.end ≻ current.start throw variant BadOffset { message = "overlapping tensor data regions" }
+        }
     }
     do {
         let artifact.ContentIdentity identity ← artifact.ContentIdentity { algorithm = DIGEST_SHA256, digest = digest, length = corpus.length() }
