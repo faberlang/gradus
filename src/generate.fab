@@ -1,0 +1,205 @@
+# =============================================================================
+# Generate — the resident model and the encode → decode pipeline around the port
+# =============================================================================
+#
+# The admitted tokenizer, the EOG set and the weights, and the generation entry
+# points that serve and live share. The decode loop itself is port_generate.fab.
+
+import from "gradus:generation/config" config
+import from "gradus:generation/decoder" decoder
+import from "gradus:model/gguf_manifest" gguf_manifest
+import from "gradus:sampling" sampling
+import from "gradus:tokenizer/bpe" tokenizator
+
+import from "./request" const GenerateConfig
+import from "./port_generate" pgen
+import from "./port_weights" port
+
+# The admitted G3 tokenizer, its EOG set and the port weights, built once after
+# admission. The tokenizer is the one built from the admitted manifest, the same
+# tables the EOG stop set came from. Weights load once and stay resident; every
+# request decodes from them with a fresh K/V cache pair.
+@ public
+class ResidentModel {
+    mut gguf_manifest.GgufManifest manifest
+    mut tokenizator.Tokenizer tokenizer
+    mut list<int> eog_ids
+    mut port.PortWeights weights
+}
+
+# The admitted manifest, the tokenizer built once from it, its EOG set, and the
+# loaded weights.
+@ public
+fn port_resident(gguf_manifest.GgufManifest admitted, tokenizator.Tokenizer tok, port.PortWeights weights) → ResidentModel {
+    return ResidentModel {
+        manifest = admitted,
+        tokenizer = tok,
+        eog_ids = tokenizator.artifact_eog(tok),
+        weights = weights
+    }
+}
+
+@ public
+fn build_tokenizer(gguf_manifest.GgufManifest manifest) → tokenizator.Tokenizer {
+    do {
+        return tokenizator.build(manifest)
+    }
+    catch err {
+        panic "G3 tokenizer tables failed: §"(err.message)
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Encode and decode
+# ---------------------------------------------------------------------------
+
+# Text → token ids through the admitted model's real G3 tokenizer
+# (`tokenizator.tokenize`: SMOLLM scanner, parse-special on). A typed
+# TokenizerError fails closed with its message; the request path maps that to 400.
+@ public
+fn encode_prompt(tokenizator.Tokenizer tok, string prompt) → list<int> ⇥ string {
+    do {
+        return tokenizator.tokenize(tok, prompt)
+    }
+    catch err {
+        throw "prompt encode failed: §"(err.message)
+    }
+}
+
+# Ids → detokenized text (G3 `tokenizator.decode` over the admitted tokenizer).
+# Decode happens before any response body is assembled or any stream is opened:
+# a typed TokenizerError fails closed with its message instead of emitting a
+# partial body. The id list stays the machine surface.
+@ public
+fn tokens_text(tokenizator.Tokenizer tok, list<int> tokens) → string ⇥ string {
+    do {
+        return tokenizator.decode(tok, tokens)
+    }
+    catch err {
+        throw "token decode failed: §"(err.message)
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Validation and the decode run
+# ---------------------------------------------------------------------------
+
+@ public
+fn to_generation_config(GenerateConfig cfg, list<int> eog_ids) → config.GenerationConfig ⇥ config.GenerationError {
+    return config.construct_generation(cfg.context, cfg.max_prompt, cfg.max_tokens, cfg.seed, cfg.temperature, cfg.top_k, cfg.top_p, cfg.min_p, cfg.repeat_penalty, eog_ids)
+}
+
+# The port path's request validation (the same gradus reject rows and prompt
+# fit causes as generate_dense_with_stop), run before the decode loop (greedy at
+# temperature 0, seeded sampling otherwise, with the request's sampling config
+# and seed).
+@ public
+fn check_generate_port(GenerateConfig cfg, list<int> ids, ResidentModel model) → void ⇥ config.GenerationError {
+    let config.GenerationConfig g ← to_generation_config(cfg, model.eog_ids)
+    require ids.length() ≥ 1 throw variant config.GenerationError.InvalidConfig { message = "needs at least one prompt token" }
+    require ids.length() ≤ g.max_prompt throw variant config.GenerationError.InvalidConfig { message = "prompt length exceeds max_prompt" }
+    require ids.length() ≺ g.context throw variant config.GenerationError.InvalidConfig { message = "prompt length does not fit context" }
+}
+
+# Generate from the resident model. `on_token` receives each chosen id between
+# decode steps (see port_generate_sampled) and returns false to end the run.
+@ public
+fn run_generate_port(GenerateConfig cfg, list<int> ids, ResidentModel model, decoder.StopPolicy stop, bool trace, (int) → bool on_token) → pgen.PortResult ⇥ config.GenerationError {
+    check_generate_port(cfg, ids, model)
+    let config.GenerationConfig g ← to_generation_config(cfg, model.eog_ids)
+    let sampling.Config sconf ← config.config(g)
+    let _ seed ← config.seed(g)
+    do {
+        return pgen.port_generate_sampled(model.weights, ids, cfg.max_tokens, model.eog_ids, decoder.stops_on_eog(stop), cfg.context, trace, sconf, seed, on_token)
+    }
+    catch err {
+        throw variant config.GenerationError.InvalidConfig { message = err.message }
+    }
+}
+
+# A run that streams nothing: the sink wants every id (ids are never negative).
+@ public
+fn run_generate_port_unstreamed(GenerateConfig cfg, list<int> ids, ResidentModel model, decoder.StopPolicy stop, bool trace) → pgen.PortResult ⇥ config.GenerationError {
+    return run_generate_port(cfg, ids, model, stop, trace, (int id) → bool ∴ id ≥ 0)
+}
+
+# Test fixture tokenizer: a minimal byte-level BPE table (ids 0..2, one
+# merge "a b" → "ab") built through the same public table constructor the
+# artifact path uses.
+fn table_tokenizer() → tokenizator.Tokenizer {
+    do {
+        return tokenizator.build_tables([0, 1, 2], ["a", "b", "ab"], ["a b"], [])
+    }
+    catch err {
+        panic "test tokenizer tables failed: " + err.message
+    }
+}
+
+# The empty-table tokenizer: `build_tables` rejects an empty vocabulary, so it
+# is the class literal. Any encode against it fails closed with a typed cause.
+fn empty_tokenizer() → tokenizator.Tokenizer {
+    let map<string, int> no_vocab ← empty
+    let map<string, int> no_merges ← empty
+    return tokenizator.Tokenizer {
+        words = [],
+        vocab = no_vocab,
+        concursus = no_merges,
+        special_texts = [],
+        specialia_ids = [],
+        eog = [],
+        add_bos = false,
+        chat_template = "",
+        multitudo = 0
+    }
+}
+
+fn encode_cause(tokenizator.Tokenizer tok, string prompt) → string {
+    do {
+        encode_prompt(tok, prompt)
+        return ""
+    }
+    catch err {
+        return "§"(err)
+    }
+}
+
+fn decode_cause(tokenizator.Tokenizer tok, list<int> ids) → string {
+    do {
+        tokens_text(tok, ids)
+        return ""
+    }
+    catch err {
+        return "§"(err)
+    }
+}
+
+describe "prompt encode" tag "inferentia" {
+    test "table-built tokenizer encodes through G3 tokenize" {
+        do {
+            let list<int> ids ← encode_prompt(table_tokenizer(), "ab")
+            assert ids.length() ≡ 1
+            assert ids.get(0) coalesce 0 ≡ 2
+        }
+        catch err {
+            assert false
+        }
+    }
+    test "empty-table tokenizer fails closed with the typed cause" {
+        assert encode_cause(empty_tokenizer(), "some other text").contains("prompt encode failed")
+    }
+}
+
+describe "generate decode" tag "inferentia" {
+    test "tokens text decodes through the tokenizer" {
+        do {
+            assert tokens_text(table_tokenizer(), [0, 1]) ≡ "ab"
+            assert tokens_text(table_tokenizer(), []) ≡ ""
+        }
+        catch err {
+            assert false
+        }
+    }
+    test "out-of-range token id fails closed with the typed cause" {
+        assert decode_cause(table_tokenizer(), [7]).contains("token id outside the vocabulary range")
+    }
+}
