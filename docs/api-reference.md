@@ -1443,18 +1443,6 @@ optimizer-state wire carried verbatim.
 - `fn serialize_checkpoint(Checkpoint c) → string`
 - `fn deserialize_checkpoint(string wire) → Checkpoint ⇥ CheckpointError`
 
-## gradus:train
-
-Retains the training error vocabulary for compatibility. Train/eval mode and
-dropout live in `gradus:nn`; checkpointing lives in `gradus:checkpoint`.
-
-**Source**: `src/train.fab`
-
-### Public types
-
-- `union TrainError` — UnknownMode, InvalidDropout, InvalidSeed, BadPayload, InvalidPosition, EmptyState, UnknownVersion, BadWire, TensorFailure
-
-
 ## gradus:transformer
 
 Generic runtime-carrier and typed transformer blocks, including block

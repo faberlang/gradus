@@ -73,10 +73,9 @@ pinned row is space-prefix-free (add_space_prefix = false)
 | `gradus:shape` | `FormaError` | 6 | `src/shape.fab` |
 | `gradus:tensor` | `TensorError` | 3 | `src/tensor.fab` |
 | `gradus:tokenizer` | `TokenizerError` | 14 | `src/tokenizer.fab` |
-| `gradus:train` | `TrainError` | 9 | `src/train.fab` |
 | `gradus:transformer` | `TransformerError` | 12 | `src/transformer.fab` |
 
-**Total**: 240 public error codes across 32 error types.
+**Total**: 231 public error codes across 31 error types.
 
 ## `gradus:model/artifact` — `ArtifactError`
 
@@ -619,13 +618,6 @@ runs the composed runtime through the public surface on the target
 artifact and surfaces the same `TokenizerError` rows fail-closed; a probe
 or decode divergence exits nonzero with the typed cause naming the first
 divergent id/character.
-
-## `gradus:train` — `TrainError`
-
-Source: `src/train.fab`. This public error union remains for compatibility;
-new mode/dropout operations return `nn.NnError`, and checkpoint operations
-return `checkpoint.CheckpointError`. No current training operation produces
-`TrainError`.
 
 ## `gradus:transformer` — `TransformerError`
 

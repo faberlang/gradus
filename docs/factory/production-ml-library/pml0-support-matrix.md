@@ -200,15 +200,15 @@ claim runtime identity of the generated backward companion.
 | `shape` | enumerated fixed shapes: the MLP 4×4 training workload + the shared primitive rows 2x2 / 4x4 / 2x8 (loss 2×2/4×4/2×8 MSE + logsumexp CE; SGD state on the 2×2/4×4 steps); every shape fixture/oracle-backed |
 | `tokenizer identity` | not part of this row — the training layer is tokenizer-free by contract; tokenizer identity is a model-file admission dimension (PML2-U4 row facts / `fixtures/tokenizer/tokenizer-identity-oracle.md`) |
 | `legal fixture ref` | no model-file fixture — the row is qualified over synthetic fragment data + the accepted training proof's workload (no acquisition or redistribution claim) |
-| `oracle ref` | the accepted training proof's trajectory, pinned (f64) at steps 0/10/25/50/75/99 → 1.576448169383708 / 0.7815377070077427 / 0.4303461875641296 / 0.13848813116166797 / 0.04746405569680761 / 0.017928625511508454; convergence gate `final/initial = 0.01137 < 0.1`; resume + seeded determinism pins in `src/train.proba` (PML4-U6). Executed through the delegating stepper (`train.train_step_4x4` → `optimize.sgd_step_4x4`) by `exempla/training-loop-mlp` — printed losses match the pins (final 0.017928625511508454); values did not move vs the pre-delegation oracle |
-| `evidence links` | `src/loss.fab`, `src/gradient.fab`, `src/optimize.fab`, `src/train.fab`, `src/metrics.fab` + co-located probas (`loss.proba`, `gradient.proba`, `optimize.proba`, `train.proba`, `metrics.proba`); `exempla/training-loop-mlp`; committed units 5f98e8b (U1), e09c79c (U2), 9bebda9 (U3), 4b24c81 (U4), 94d8a94 (U5), fc85de7 (U6) |
+| `oracle ref` | the accepted training proof's trajectory, pinned (f64) at steps 0/10/25/50/75/99 → 1.576448169383708 / 0.7815377070077427 / 0.4303461875641296 / 0.13848813116166797 / 0.04746405569680761 / 0.017928625511508454; convergence gate `final/initial = 0.01137 < 0.1`; resume + seeded determinism pins in `src/mlp.proba` (PML4-U6). Executed through the delegating stepper (`train.train_step_4x4` → `optimize.sgd_step_4x4`) by `exempla/training-loop-mlp` — printed losses match the pins (final 0.017928625511508454); values did not move vs the pre-delegation oracle |
+| `evidence links` | `src/loss.fab`, `src/gradient.fab`, `src/optimize.fab`, `src/train.fab`, `src/metrics.fab` + co-located probas (`loss.proba`, `gradient.proba`, `optimize.proba`, `mlp.proba`, `metrics.proba`); `exempla/training-loop-mlp`; committed units 5f98e8b (U1), e09c79c (U2), 9bebda9 (U3), 4b24c81 (U4), 94d8a94 (U5), fc85de7 (U6) |
 | `compatibility policy` | exact admitted combination: the PML4 training layer (losses + gradient-call contract + SGD optimizer state + schedules + train/eval mode + checkpoint resume + metrics + deterministic seeds) over the PML3 training forward row. The MLP 4×4 trajectory is executed through the delegating stepper (`train.train_step_4x4` → `optimize.sgd_step_4x4`) and matches the oracle pins. Non-goals: no optimizers/schedules beyond the admitted SGD + warmup/cosine; no quantized training |
 | `schema version` | `gradus-support-matrix-schema v0.1.0` |
 ```
 
 **Executed through delegation (train-step-optimizer-call unit 4).** The
 accepted-trajectory pins + ratio gate, resume round-trip, and seeded draws
-are in `src/train.proba` (PML4-U6). The 100-step loop
+are in `src/mlp.proba` (PML4-U6). The 100-step loop
 (`exempla/training-loop-mlp`) executes on the FMIR stepper through
 `train.train_step_4x4` → `optimize.sgd_step_4x4`; printed losses match the
 pins (final 0.017928625511508454). Values did not move vs the

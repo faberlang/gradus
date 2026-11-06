@@ -195,7 +195,7 @@ Foundation that is not a shape-family copy: `DTypeError`, `TensorError`
 (`IndexOutOfBounds` is tensor-local).
 
 Training / values: `ParameterError`, `SerializeError`, `GradientError`,
-`OptimizeError`, `TrainError`.
+`OptimizeError`.
 
 Inference domain: `CacheError`, `DecodeError`, `SamplingError`,
 `GenerationError`.

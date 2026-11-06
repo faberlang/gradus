@@ -76,7 +76,7 @@ the verification command, and the correction disposition.
   is shipped — gradus:attention.scaled_dot_product_2x8, gradus:transformer
   bert_tiny_block_2x8 / attention_block_2x8 / ffn_block_2x8, gradus:nn
   linear_2x8 / layernorm_2x8 / gelu_2x8, gradus:loss.mse_2x8, and
-  gradus:train.train_step_bert (18-trainable BERT-tiny set)". The declarations
+  training module.train_step_bert (18-trainable BERT-tiny set)". The declarations
   exist in the tree: `src/attention.fab:38` (`scaled_dot_product_2x8`),
   `src/transformer.fab:38/74/100` (`attention_block_2x8`, `ffn_block_2x8`,
   `bert_tiny_block_2x8`), `src/nn.fab` (`linear_2x8`, `layernorm_2x8`,

@@ -180,19 +180,19 @@ these annotations.)
 
 | Line | Declaration |
 | --- | --- |
-| 293 | `functio message(TrainError e) → textus {` |
+| 293 | `functio message(former shared train error union e) → textus {` |
 | 319 | `genus Schedule {` |
-| 346 | `functio construct_schedule(f32 rate_vertex, numerus warmup, numerus total_steps, f32 rate_end) → Schedule ⇥ TrainError {` |
-| 386 | `functio scheduled_rate(Schedule s, numerus passus) → f32 ⇥ TrainError {` |
+| 346 | `functio construct_schedule(f32 rate_vertex, numerus warmup, numerus total_steps, f32 rate_end) → Schedule ⇥ former shared train error union {` |
+| 386 | `functio scheduled_rate(Schedule s, numerus passus) → f32 ⇥ former shared train error union {` |
 | 539 | `genus Seed {` |
-| 549 | `functio construct_seed(numerus seed) → Seed ⇥ TrainError {` |
+| 549 | `functio construct_seed(numerus seed) → Seed ⇥ former shared train error union {` |
 | 591 | `genus DrawF32 {` |
 | 606 | `functio next_f32(Seed s) → DrawF32 {` |
 | 708 | `genus Checkpoint {` |
-| 737 | `functio construct_checkpoint(numerus age, numerus passus, Seed rng, textus state_wire) → Checkpoint ⇥ TrainError {` |
+| 737 | `functio construct_checkpoint(numerus age, numerus passus, Seed rng, textus state_wire) → Checkpoint ⇥ former shared train error union {` |
 | 751 | `functio checkpoint_equal(Checkpoint a, Checkpoint b) → bivalens {` |
 | 765 | `functio serialize_checkpoint(Checkpoint c) → textus {` |
-| 788 | `functio deserialize_checkpoint(textus wire) → Checkpoint ⇥ TrainError {` |
+| 788 | `functio deserialize_checkpoint(textus wire) → Checkpoint ⇥ former shared train error union {` |
 
 Consumers: sampling.fab, decode.fab, generation.fab, exempla/training-loop-mlp,
 exempla/token-generation.

@@ -6,7 +6,7 @@ a 4×4 two-layer MLP (linear → GELU → linear → MSE), 100 steps, lr 0.1 —
 the accepted MLP training-proof shape (`examples/training/mlp`, the pinned
 CPU/FMIR oracle).
 
-**Tier**: executed (FMIR stepper). Oracle pins below match `src/train.proba`
+**Tier**: executed (FMIR stepper). Oracle pins below match `src/mlp.proba`
 (PML4-U6). The 100-step loop runs through the generic list-driven optimizer
 step (`optimize.sgd_step`) over the 4×4 fixture; printed losses match the pins
 (final `0.017928625511508454`).
@@ -25,7 +25,7 @@ step (`optimize.sgd_step`) over the 4×4 fixture; printed losses match the pins
 
 ## Convergence target (accepted oracle, f64 evaluations)
 
-Pinned in `src/train.proba` (PML4-U6). The proba asserts the gate
+Pinned in `src/mlp.proba` (PML4-U6). The proba asserts the gate
 `final/initial < 0.1` and the trajectory points below (step 25 is part of
 the documented target series; the proba binds l0/l10/l50/l75/l99 for the
 ratio checks):
