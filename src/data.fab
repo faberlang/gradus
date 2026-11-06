@@ -43,7 +43,17 @@ union DataError {
     InvalidBatchSize,
     InvalidVocabularyId,
     InvalidWindowLength,
-    InvalidValidationModulus
+    InvalidValidationModulus,
+    InvalidPairLengths,
+    InvalidSamplerState,
+    RandomFailure {
+        random.RandomError inner
+    }
+}
+
+@ conversion
+fn from_random_error(random.RandomError err) → DataError {
+    return variant RandomFailure { message = err.message, inner = err }
 }
 
 # Shared corpus gate: non-empty. Message identity is the proba pin surface.
@@ -126,8 +136,191 @@ fn batch(list<int> ids, int batch_size) → list<list<int>> ⇥ DataError {
 }
 
 # -------------------------------------------------------------------------
+# Local supervised examples. The documented in-memory format is two equally
+# sized columns of rank-one integer tensors: inputs[i] and targets[i] are one
+# aligned sample. Batch preserves that pairing; its x/y fields are lists of
+# sample tensors (each sample is a list<int>). The final batch is retained
+# short, never dropped or padded.
+# -------------------------------------------------------------------------
+
+@ public
+class Batch {
+    let list<list<int>> x
+    let list<list<int>> y
+}
+
+@ public
+class SupervisedSet {
+    let list<list<int>> inputs
+    let list<list<int>> targets
+}
+
+@ public
+class SupervisedSplit {
+    let list<int> training
+    let list<int> held_out
+}
+
+@ public
+class SupervisedSampler {
+    let string corpus
+    let int seed
+    let int epoch
+    let int position
+}
+
+@ public
+fn supervised_set(list<list<int>> inputs, list<list<int>> targets) → SupervisedSet ⇥ DataError {
+    require inputs.length() ≡ targets.length() throw variant InvalidPairLengths { message = "input and target sample counts differ" }
+    return SupervisedSet { inputs = inputs, targets = targets }
+}
+
+@ public
+fn supervised_split(int count, int held_out_modulus) → SupervisedSplit ⇥ DataError {
+    require held_out_modulus ≥ 2 throw variant InvalidValidationModulus { message = "held-out modulus must be at least 2" }
+    mut list<int> training ← empty
+    mut list<int> held_out ← empty
+    for range 0 ‥ count let i {
+        if i % held_out_modulus ≡ 0 { held_out.append(i) } else { training.append(i) }
+    }
+    return SupervisedSplit { training = training, held_out = held_out }
+}
+
+@ public
+fn epoch_order(list<int> train_set, random.Seed seed) → Shuffled ⇥ DataError {
+    return shuffle(train_set, seed)
+}
+
+# Batch indices are positions in the shuffled epoch order; paired input and
+# target samples are gathered with the same index before a batch is emitted.
+@ public
+fn supervised_batches(SupervisedSet set, list<int> order, int batch_size) → list<Batch> ⇥ DataError {
+    require_ids(order)
+    require batch_size ≥ 1 throw variant InvalidBatchSize { message = "batch size must be at least 1" }
+    mut list<Batch> out ← empty
+    mut int start ← 0
+    while start ≺ order.length() {
+        mut int stop ← start + batch_size
+        if stop ≻ order.length() { stop ← order.length() }
+        mut list<list<int>> xs ← empty
+        mut list<list<int>> ys ← empty
+        for range start ‥ stop let p {
+            let int index ← order.get(p) coalesce -1
+            require index ≥ 0 and index ≺ set.inputs.length() and index ≺ set.targets.length() throw variant InvalidSamplerState { message = "sample index is outside the supervised set" }
+            xs.append(set.inputs.get(index) coalesce ([] ∷ list<int>))
+            ys.append(set.targets.get(index) coalesce ([] ∷ list<int>))
+        }
+        out.append(Batch { x = xs, y = ys })
+        start ← stop
+    }
+    return out
+}
+
+@ public
+fn supervised_indices_identity(list<int> indices) → string {
+    mut string identity ← "n§:"(indices.length() ↦ string)
+    for range 0 ‥ indices.length() let i {
+        if i ≢ 0 { identity ← identity + "," }
+        identity ← identity + (indices.get(i) coalesce 0 ↦ string)
+    }
+    return identity
+}
+
+@ public
+fn supervised_sampler_start(list<int> train_set, random.Seed seed) → SupervisedSampler {
+    return SupervisedSampler { corpus = supervised_indices_identity(train_set), seed = seed.status, epoch = 0, position = 0 }
+}
+
+@ public
+fn supervised_sampler_wire(SupervisedSampler state) → string {
+    return "supervised-sampler-v1#§#§#§#§"(state.corpus, state.seed ↦ string, state.epoch ↦ string, state.position ↦ string)
+}
+
+@ public
+fn supervised_sampler_parse(string wire) → SupervisedSampler ∪ none {
+    let list<string> parts ← wire.split("#")
+    if parts.length() ≢ 5 or (parts.get(0) coalesce "") ≢ "supervised-sampler-v1" then return null
+    let _ seed_value ← lm_cursor_parse_integer(parts.get(2) coalesce "")
+    let _ epoch_value ← lm_cursor_parse_integer(parts.get(3) coalesce "")
+    let _ position_value ← lm_cursor_parse_integer(parts.get(4) coalesce "")
+    if seed_value is none or epoch_value is none or position_value is none then return null
+    let int seed ← seed_value coalesce 0
+    let int epoch ← epoch_value coalesce 0
+    let int position ← position_value coalesce 0
+    if epoch ≺ 0 or position ≺ 0 then return null
+    return SupervisedSampler { corpus = parts.get(1) coalesce "", seed = seed, epoch = epoch, position = position }
+}
+
+@ public
+fn supervised_sampler_order(list<int> train_set, SupervisedSampler state) → Shuffled ∪ none {
+    if state.corpus ≢ supervised_indices_identity(train_set) then return null
+    mut random.Seed seed ← random.default()
+    do {
+        seed ← random.construct_seed(state.seed)
+    }
+    catch err {
+        return null
+    }
+    do {
+        return shuffle(train_set, seed)
+    }
+    catch err {
+        return null
+    }
+}
+
+@ public
+class SupervisedStep {
+    let Batch batch
+    let SupervisedSampler state
+}
+
+@ public
+fn supervised_sampler_step(SupervisedSet set, list<int> train_set, int batch_size, SupervisedSampler state) → SupervisedStep ∪ none ⇥ DataError {
+    if state.corpus ≢ supervised_indices_identity(train_set) or batch_size ≤ 0 or train_set.length() ≡ 0 then return null
+    mut int epoch ← state.epoch
+    mut int position ← state.position
+    if position ≥ train_set.length() {
+        epoch ← epoch + 1
+        position ← 0
+    }
+    mut random.Seed seed ← random.default()
+    do {
+        seed ← random.construct_seed(state.seed + epoch)
+    }
+    catch err {
+        return null
+    }
+    let Shuffled shuffled ← epoch_order(train_set, seed)
+    mut int stop ← position + batch_size
+    if stop ≻ train_set.length() { stop ← train_set.length() }
+    mut list<int> selected ← empty
+    for range position ‥ stop let i { selected.append(shuffled.payload.get(i) coalesce -1) }
+    let list<Batch> batches ← supervised_batches(set, selected, batch_size)
+    let Batch next_batch ← batches.get(0) coalesce Batch { x = empty, y = empty }
+    let SupervisedSampler next_state ← SupervisedSampler { corpus = state.corpus, seed = state.seed, epoch = epoch, position = stop }
+    return SupervisedStep { batch = next_batch, state = next_state }
+}
+
+@ public
+fn supervised_sampler_save(string path, SupervisedSampler state) → bool {
+    do { lm_cursor_write_text(path, supervised_sampler_wire(state)) }
+    catch err { return false }
+    return true
+}
+
+@ public
+fn supervised_sampler_load(string path) → SupervisedSampler ∪ none {
+    mut string wire ← ""
+    do { wire ← lm_cursor_read_text(path) }
+    catch err { return null }
+    return supervised_sampler_parse(wire)
+}
+
+# -------------------------------------------------------------------------
 # Language-model byte vocabulary and stable corpus identity.
 # -------------------------------------------------------------------------
+
 
 @ public
 const int LM_PAD_ID = 256
