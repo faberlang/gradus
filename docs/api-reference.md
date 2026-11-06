@@ -578,6 +578,12 @@ annotated training-path loss companions composed from the same layer rows.
 - `fn forward_mlp_loss<size M, size K, size H, size N>(tensor<f32, [M, K]> input, tensor<f32, [K, H]> weight1, tensor<f32, [M, H]> bias1, tensor<f32, [H, N]> weight2, tensor<f32, [M, N]> bias2, tensor<f32, [M, N]> target) → f32` — companion ABI: `forward_mlp_loss_backward(input, weight1, bias1, weight2, bias2, target, nil(), upstream) → iuncta(grad_input, grad_w1, grad_b1, grad_w2, grad_b2, grad_target)`
 - `fn forward_linear_loss<size M, size K, size N>(tensor<f32, [M, K]> input, tensor<f32, [K, N]> weight, tensor<f32, [N]> bias, tensor<f32, [M, N]> target) → f32` — companion ABI: `forward_linear_loss_backward(input, weight, bias, target, nil(), upstream) → iuncta(grad_input, grad_weight, grad_bias, grad_target)`
 
+### Typed backward contract and evidence status
+
+Differentiation is supported for `@ radix backward` on a same-package typed loss. The loss body may compose the typed layer rows in this module, and the compiler generates its companion. Cross-package use of an annotated layer in that reverse-mode call graph is refused with SEM004 (`namespace_missing_export`); diagnostics for other unsupported differentiable constructs are reported by reverse-mode validation. The generated companion's positional `iuncta` tuple ABI is interim until record-shaped backward lands.
+
+Current `src/mlp.proba` coverage is for `forward_mlp_carrier` only; it does not establish typed inference/loss agreement or companion gradients. The existing `training-loop-mlp` demonstrates a 4×4 MLP training run, but does not yet establish the distinct linear and rectangular-model cases or finite-difference companion checks. These remain unproven, as do arbitrary-shape/backend identity and general numerical bounds.
+
 ## gradus:model/artifact
 
 Pathless content identity for bounded model artifacts.
