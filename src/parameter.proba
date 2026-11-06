@@ -23,6 +23,18 @@ import from "gradus:parameter" parameter
 
 import from "gradus:tensor" tensor
 
+# Typed model records used by the registry-over-record proof. Their differently
+# shaped fields are model-side views; registry payloads remain authoritative.
+class LinearModel {
+    let list<f32> weight
+    let list<f32> bias
+}
+
+class TwoLayerModel {
+    let LinearModel layer0
+    let LinearModel layer1
+}
+
 # -- helpers ---------------------------------------------------------------
 
 # Renders a construction outcome as text: "ok" on success, the typed
@@ -37,9 +49,9 @@ fn construct_result(string name, string owner, string dtype_name, list<int> shap
     }
 }
 
-fn mutate_result(parameter.Parameter p, list<f32> data) → string {
+fn mutate_result(parameter.Parameter p, list<f32> data, int expected_version) → string {
     do {
-        let _ updated ← parameter.mutate(p, data)
+        let _ updated ← parameter.mutate(p, data, expected_version)
         return "ok"
     }
     catch err {
@@ -215,7 +227,7 @@ test "mutate replaces values, preserves identity, and bumps version" {
     let _ trap_result_4 ← trap {
 
         let parameter.Parameter p ← parameter.construct("weight", "model", "f32", [2], [1.0, 2.0])
-        let parameter.Parameter q ← parameter.mutate(p, [5.0, 6.0])
+        let parameter.Parameter q ← parameter.mutate(p, [5.0, 6.0], p.version())
         assert p.version() ≡ 1
         assert q.version() ≡ 2
         assert q.name() ≡ "weight"
@@ -233,17 +245,26 @@ test "mutate cannot change the pinned shape or dtype" {
     let _ trap_result_5 ← trap {
 
         let parameter.Parameter p ← parameter.construct("weight", "model", "f32", [2], [1.0, 2.0])
-        let parameter.Parameter q ← parameter.mutate(p, [7.0, 8.0])
+        let parameter.Parameter q ← parameter.mutate(p, [7.0, 8.0], p.version())
         assert q.shape() ≡ ([2] ↦ list<int>)
         assert q.dtype_name() ≡ "f32"
     }
     assert trap_result_5 is void
 }
 
+test "mutate rejects a stale caller version" {
+    let _ trap_result_mutate_stale ← trap {
+        let parameter.Parameter p ← parameter.construct("weight", "model", "f32", [1], [1.0])
+        let parameter.Parameter updated ← parameter.mutate(p, [2.0], p.version())
+        assert mutate_result(updated, [3.0], p.version()) ≡ "stale parameter version"
+    }
+    assert trap_result_mutate_stale is void
+}
+
 test "mutate rejects a wrong element count" {
     let _ trap_result_mutate_count ← trap {
         let parameter.Parameter p ← parameter.construct("weight", "model", "f32", [2], [1.0, 2.0])
-        assert mutate_result(p, [9.0]) ≡ "element count mismatch"
+        assert mutate_result(p, [9.0], p.version()) ≡ "element count mismatch"
     }
     assert trap_result_mutate_count is void
 }
@@ -251,12 +272,57 @@ test "mutate rejects a wrong element count" {
 test "mutate rejects a frozen parameter" {
     let _ trap_result_mutate_frozen ← trap {
         let parameter.Parameter p ← parameter.construct_frozen("weight", "model", "f32", [1], [1.0])
-        assert mutate_result(p, [2.0]) ≡ "frozen parameter cannot be mutated"
+        assert mutate_result(p, [2.0], p.version()) ≡ "frozen parameter cannot be mutated"
     }
     assert trap_result_mutate_frozen is void
 }
 
-# -- registry and traversal ------------------------------------------------
+test "record-typed models register and retrieve every field deterministically" {
+    let _ trap_record_registry ← trap {
+        let LinearModel linear ← LinearModel { weight = [1.0, 2.0, 3.0, 4.0], bias = [0.1, 0.2] }
+        let LinearModel first ← LinearModel { weight = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0], bias = [0.1, 0.2, 0.3] }
+        let LinearModel second ← LinearModel { weight = [7.0, 8.0, 9.0, 10.0], bias = [0.4, 0.5] }
+        let TwoLayerModel nested ← TwoLayerModel { layer0 = first, layer1 = second }
+        let parameter.Parameter lw ← parameter.construct("weight", "linear", "f32", [2, 2], linear.weight)
+        let parameter.Parameter lb ← parameter.construct("bias", "linear", "f32", [2], linear.bias)
+        let parameter.Parameter w0 ← parameter.construct("weight", "nested.layer0", "f32", [2, 3], nested.layer0.weight)
+        let parameter.Parameter b0 ← parameter.construct("bias", "nested.layer0", "f32", [3], nested.layer0.bias)
+        let parameter.Parameter w1 ← parameter.construct("weight", "nested.layer1", "f32", [2, 2], nested.layer1.weight)
+        let parameter.Parameter b1 ← parameter.construct("bias", "nested.layer1", "f32", [2], nested.layer1.bias)
+        let parameter.Registry r0 ← parameter.empty_registry()
+        let parameter.Registry r1 ← parameter.add(r0, lw)
+        let parameter.Registry r2 ← parameter.add(r1, lb)
+        let parameter.Registry r3 ← parameter.add(r2, w0)
+        let parameter.Registry r4 ← parameter.add(r3, b0)
+        let parameter.Registry r5 ← parameter.add(r4, w1)
+        let parameter.Registry r6 ← parameter.add(r5, b1)
+        let parameter.Registry again ← parameter.empty_registry()
+        let parameter.Registry a1 ← parameter.add(again, lw)
+        let parameter.Registry a2 ← parameter.add(a1, lb)
+        let parameter.Registry a3 ← parameter.add(a2, w0)
+        let parameter.Registry a4 ← parameter.add(a3, b0)
+        let parameter.Registry a5 ← parameter.add(a4, w1)
+        let parameter.Registry a6 ← parameter.add(a5, b1)
+        let list<parameter.Parameter> order ← r6.order()
+        let list<parameter.Parameter> repeat ← a6.order()
+        assert order.length() ≡ 6
+        assert repeat.length() ≡ order.length()
+        for range 0 ‥ order.length() let i {
+            let parameter.Parameter p ← order.get(i) coalesce parameter.default()
+            let parameter.Parameter q ← repeat.get(i) coalesce parameter.default()
+            assert p.owner() ≡ q.owner()
+            assert p.name() ≡ q.name()
+            assert p.shape() ≡ q.shape()
+        }
+        assert (order.get(0) coalesce parameter.default()).owner() ≡ "linear"
+        assert (order.get(1) coalesce parameter.default()).name() ≡ "bias"
+        assert (order.get(2) coalesce parameter.default()).owner() ≡ "nested.layer0"
+        assert (order.get(4) coalesce parameter.default()).owner() ≡ "nested.layer1"
+        assert r6.find("nested.layer1", "bias").shape() ≡ ([2] ↦ list<int>)
+    }
+    assert trap_record_registry is void
+}
+
 
 test "add registers parameters and reports the count" {
     let _ trap_result_6 ← trap {
@@ -469,7 +535,7 @@ test "serialization round-trips the mutated version" {
     let _ trap_result_12 ← trap {
 
         let parameter.Parameter p ← parameter.construct("weight", "model", "f32", [2], [1.0, 2.0])
-        let parameter.Parameter q ← parameter.mutate(p, [3.0, 4.0])
+        let parameter.Parameter q ← parameter.mutate(p, [3.0, 4.0], p.version())
         assert q.version() ≡ 2
         assert roundtrip(q.identity)
         assert parameter.serialize(q.identity) ≡ "parameter/identity/1.0.0/model/weight/f32/2/2"
