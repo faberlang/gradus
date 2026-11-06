@@ -36,25 +36,55 @@ truth. When they disagree, working code and observed behavior win.
 
 ## Validation
 
-Run the narrowest useful proof first — the package imports the `gradus:`
-provider (Norma is embedded in the binary), so compilation needs
-`--library-home` naming the directory that holds the gradus checkout, the
-workspace radix binary (the PATH `faber` lags main and fails package
-resolution with `PKG001`), and an absolute input path. No `FABER_*`
-environment variable is read. While the container carries a stale `norma/`
-checkout beside `gradus/`, it shadows the embedded Norma; use a library home
-that holds only a `gradus` link.
+Run the narrowest useful proof first. The commands below were checked on
+2026-11-05 (radix `3e8dc5a9e6`, Gradus `79036e3`). The package imports the
+`gradus:` provider (Norma is embedded in the binary), so every command needs
+`--library-home` naming a directory that holds a `gradus` link, a radix-built
+`faber` (the PATH `faber` lags main), and an absolute input path. No `FABER_*`
+environment variable is read. The package carries no `faber.lock`, so it works
+from any checkout or worktree. A `norma/` checkout beside `gradus/` shadows the
+embedded Norma; use a library home that holds only `gradus`.
 
 ```sh
-CONTAINER="$(cd .. && pwd)"
-FABER="$CONTAINER/radix/target/debug/faber"
-"$FABER" check --library-home "$CONTAINER" "$(pwd)"
-"$FABER" build --library-home "$CONTAINER" "$(pwd)"
-"$FABER" test --library-home "$CONTAINER" "$(pwd)"
+FABER=<radix>/target/release/faber       # cargo build --release -p faber, in radix
+LIBRARY_HOME=<dir with a gradus link>
+INF="$(pwd)"
+"$FABER" check --library-home "$LIBRARY_HOME" "$INF"                    # about 2 s
+"$FABER" build --library-home "$LIBRARY_HOME" "$INF"                    # image: target/faber-mir/image.fmir
+"$FABER" test  --device reference --library-home "$LIBRARY_HOME" "$INF" # 132 package tests, about 4 s
 ```
+
+The manifest target is `fmir`: the Rust target refuses the decode launches'
+run-time tensor shapes. `faber run` ignores the build target.
 
 Inferentia keeps no CPU backend: CPU inference is the same kernels under
 `faber run --device cpu` or `--device reference`.
+
+Engine rule (operator, 2026-11-05): inference never runs on the MIR
+interpreter, and a timed run uses `--strict-engine`. Today `live` and `serve`
+still run their host half on the interpreter (one `ENGINE001` line), so
+`--strict-engine` refuses them with exit 69 until the radix JIT closes its
+host-half gaps. An unflagged run is allowed only to check token correctness
+and is labelled as such in any receipt.
+
+Token-correctness run (unflagged, correctness only; about 2 minutes):
+
+```sh
+"$FABER" run --device metal --library-home "$LIBRARY_HOME" "$INF" -- \
+    live --model <dir>/SmolLM2-360M-Instruct-f32.gguf --max-tokens 40 --ignore-eos --trace
+```
+
+It must print `ids=30 198 198 788 451 6330 28 260 33197 476 269 18 4271 288 260
+11531 476 29343 1270 378 33197 476 269 18 314 253 1502 282 2700 791 33197 28
+527 314 804 288 3386 288 253 1678`, the llama.cpp greedy continuation of the
+frozen prompt.
+
+The gate packages under `tests/` (`admission-gate`, `model-gate`,
+`generate-gate`) run as `"$FABER" run --device reference --library-home
+"$LIBRARY_HOME" "$INF/tests/<gate>" -- <model>`. `tests/admission-gate/run.sh`
+and `tests/process-exit/run.sh` still expect a native `target/debug/inferentia`
+binary from the retired Rust build and do not run. `tests/port-load/run.sh` and
+`tests/oracle/*.py` take the `faber` and library home as arguments.
 
 Streaming proof (need 86f2d64a): `/generate` with `Accept: text/event-stream` writes
 each token to the open response as it is chosen. `python3 tests/oracle/a1_stream_test.py
@@ -65,11 +95,10 @@ model. A step costs about 3.5 minutes on `--device reference` with a release `fa
 (measured 2026-10-14; a debug `faber` did not finish one step in 13 minutes), so the
 3-token reference run takes about 10 minutes.
 
-Measured package-suite baseline (2026-10-03, isolated `inf1` packet):
-`faber test <absolute-package-path>` took 157.74s with the plain development
-CLI and 82.08s with a CLI built using `CARGO_PROFILE_DEV_OPT_LEVEL=1`.
-These measure the MIR package suite, not model serving or GPU throughput.
-In a packet, set `CONTAINER` to the packet root so its sibling libraries are used.
+Measured package-suite baseline (2026-11-05, release `faber` from radix `3e8dc5a9e6`):
+`faber test --device reference <absolute-package-path>` ran 132 tests in 4.2 s wall
+(an earlier suite took 157.74 s on 2026-10-03). This measures the MIR package suite,
+not model serving or GPU throughput.
 
 Model-serving stages must record the exact model path, size, hash, GGUF
 metadata, command, request fixture, observed output, and comparison oracle.
