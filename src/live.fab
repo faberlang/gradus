@@ -1,0 +1,192 @@
+# =============================================================================
+# Live — one-shot prompt in, decoded ids and text out
+# =============================================================================
+#
+# `inferentia live --model <PATH> [--prompt TEXT]` admits the GGUF, builds the
+# G3 tokenizer, loads the port weights and generates once, printing `ids=`
+# (space-joined), `text=` and `finish=`. The default stop is eog_stop;
+# --ignore-eos selects ignore_eos. Serve loads the weights once and decodes
+# every /generate from them; live is the composed provider run:
+# admit → inspect → G3 tokenizer tables → port weights → port decode. There is
+# no host-side CPU path: CPU inference is the same kernels under
+# `faber run --device cpu` (several cores) or `--device reference` (one core,
+# the oracle).
+
+import from "norma:fs" fsys
+import from "norma:text" text
+
+import from "gradus:generation/decoder" decoder
+import from "gradus:tokenizer/bpe" tokenizator
+
+import from "./port_generate" pgen
+import from "./port_weights" port
+import from "./cli" const ServeConfig, effective_max_prompt, effective_prompt
+import from "./request" const GenerateConfig
+import from "./generate" const ResidentModel, build_tokenizer, port_resident, run_generate_port_unstreamed
+import from "./admission" const AdmittedModel, admit_model, load_port_model
+import from "./pinned" const FROZEN_PROMPT, FROZEN_PROMPT_IDS, PINNED_CONTEXT_LENGTH, PINNED_DIGEST
+import from "./io" const stderr_write, stdout_write
+
+# The ids joined by a separator.
+fn joined_ids(list<int> ids, string separator) → string {
+    return text.join(ids.map((int id) → string ∴ "§"(id)), separator)
+}
+
+# Where two id lists first differ; returns when they are the same list.
+fn check_same_ids(list<int> observed, list<int> golden) → void ⇥ string {
+    let int shared ← observed.length() ≺ golden.length() ✓ observed.length() ✗ golden.length()
+    for range 0 ‥ shared let i {
+        reject observed[i] ≢ golden[i] throw "index §: observed § vs golden §"(i, observed[i], golden[i])
+    }
+    reject observed.length() ≢ golden.length() throw "length § vs golden §"(observed.length(), golden.length())
+}
+
+fn tokenize(tokenizator.Tokenizer tok, string prompt) → list<int> {
+    do {
+        return tokenizator.tokenize(tok, prompt)
+    }
+    catch err {
+        panic "G3 tokenize failed: §"(err.message)
+    }
+}
+
+# Generated ids → decoded text through the admitted tokenizer. A typed
+# TokenizerError fails closed: no placeholder or partial text.
+fn decode(tokenizator.Tokenizer tok, list<int> tokens) → string {
+    do {
+        return tokenizator.decode(tok, tokens)
+    }
+    catch err {
+        panic "G3 decode failed: §"(err.message)
+    }
+}
+
+# The live stop policy: default eog_stop; --ignore-eos runs to the
+# --max-tokens ceiling.
+fn stop_policy(bool ignore_eos) → decoder.StopPolicy {
+    return ignore_eos ✓ decoder.ignore_eos() ✗ decoder.eog_stop()
+}
+
+fn print_result(tokenizator.Tokenizer tok, pgen.PortResult res) → void {
+    stdout_write("ids=§\n"(joined_ids(res.ids, " ")))
+    stdout_write("text=§\n"(decode(tok, res.ids)))
+    stdout_write("finish=§\n"(res.finish))
+}
+
+fn load_weights(ServeConfig serving, AdmittedModel admitted) → port.PortWeights {
+    do {
+        return load_port_model(serving.model, admitted.sha, serving.expected_digest, admitted.manifest)
+    }
+    catch err {
+        panic "port load failed: §"(err.message)
+    }
+}
+
+# The one-shot: digest-bound bulk weight load, then the port decode loop.
+# `--trace` prints one stderr trace line per generated step.
+fn generate_once(ServeConfig serving, AdmittedModel admitted, tokenizator.Tokenizer tok, list<int> prompt_ids) → void {
+    let GenerateConfig cfg ← GenerateConfig {
+        context = PINNED_CONTEXT_LENGTH,
+        max_prompt = effective_max_prompt(serving),
+        max_tokens = serving.max_tokens,
+        seed = serving.seed
+    }
+    stderr_write("port: load-start\n")
+    let port.PortWeights weights ← load_weights(serving, admitted)
+    stderr_write("port: load-done\n")
+    let ResidentModel model ← port_resident(admitted.manifest, tok, weights)
+    do {
+        print_result(tok, run_generate_port_unstreamed(cfg, prompt_ids, model, stop_policy(serving.ignore_eos), serving.trace))
+    }
+    catch err {
+        panic "port generate failed: §"(err.message)
+    }
+}
+
+# Admission with the digest bound to the pinned row.
+fn admit_pinned(ServeConfig serving) → AdmittedModel {
+    do {
+        let AdmittedModel admitted ← admit_model(serving.model)
+        stdout_write("admit.sha256=§\n"(admitted.sha))
+        if admitted.sha ≢ PINNED_DIGEST {
+            panic "admit digest mismatch: observed=§ expected=§"(admitted.sha, PINNED_DIGEST)
+        }
+        return admitted
+    }
+    catch err {
+        panic "admit failed: §"(err.message)
+    }
+}
+
+fn model_bytes(string path) → int {
+    do {
+        return fsys.byte_length(path)
+    }
+    catch err {
+        panic "model length read failed: §"(err)
+    }
+}
+
+# The prompt's ids; the frozen fixture prompt is checked against its pinned ids.
+fn live_prompt_ids(ServeConfig serving, tokenizator.Tokenizer tok) → list<int> {
+    let string prompt ← effective_prompt(serving)
+    let list<int> ids ← tokenize(tok, prompt)
+    stdout_write("prompt.ids=[§]\n"(joined_ids(ids, ", ")))
+    if prompt ≡ FROZEN_PROMPT {
+        stdout_write("prompt.golden=[§]\n"(joined_ids(FROZEN_PROMPT_IDS, ", ")))
+        do {
+            check_same_ids(ids, FROZEN_PROMPT_IDS)
+        }
+        catch cause {
+            panic "G3 tokenize diverged from pinned P10: §"(cause)
+        }
+    }
+    return ids
+}
+
+@ public
+fn live_run(ServeConfig serving) → void {
+    stdout_write("inferentia live: admit + G3 tokenizer + port decode\n")
+    stdout_write("model.path=§\n"(serving.model))
+    let AdmittedModel admitted ← admit_pinned(serving)
+    stdout_write("model.bytes=§\n"(model_bytes(serving.model)))
+    stdout_write("manifest.data_offset=§\n"(admitted.manifest.data_start))
+    let tokenizator.Tokenizer tok ← build_tokenizer(admitted.manifest)
+    stdout_write("tokenizer.vocab=§\n"(tok.multitudo))
+    let list<int> prompt_ids ← live_prompt_ids(serving, tok)
+    stdout_write("backend=§\n"(serving.backend))
+    generate_once(serving, admitted, tok, prompt_ids)
+}
+
+# The divergence between two id lists, "" when they are the same list.
+fn divergence(list<int> observed, list<int> golden) → string {
+    do {
+        check_same_ids(observed, golden)
+        return ""
+    }
+    catch cause {
+        return cause
+    }
+}
+
+describe "live helpers" tag "inferentia" {
+    test "ids join with the separator" {
+        assert joined_ids([30, 198, 7], " ") ≡ "30 198 7"
+        assert joined_ids([30, 198, 7], ", ") ≡ "30, 198, 7"
+        assert joined_ids([], " ") ≡ ""
+    }
+    test "equal id lists do not diverge" {
+        assert divergence([1, 2, 3], [1, 2, 3]) ≡ ""
+    }
+    test "the first differing index is reported" {
+        assert divergence([1, 9, 3], [1, 2, 3]) ≡ "index 1: observed 9 vs golden 2"
+    }
+    test "a shorter or longer list diverges by length" {
+        assert divergence([1, 2], [1, 2, 3]) ≡ "length 2 vs golden 3"
+        assert divergence([1, 2, 3, 4], [1, 2, 3]) ≡ "length 4 vs golden 3"
+    }
+    test "the default stop is eog_stop and --ignore-eos selects ignore_eos" {
+        assert stop_policy(false) ≅ decoder.eog_stop()
+        assert stop_policy(true) ≅ decoder.ignore_eos()
+    }
+}

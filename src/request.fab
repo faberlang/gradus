@@ -1,0 +1,388 @@
+# =============================================================================
+# Request — the /generate request and the generation config it resolves to
+# =============================================================================
+#
+# The body is parsed with `norma:json` into a GenerateRequest (D3 fixed schema):
+# one flat object whose values are strings or numbers. Unknown fields, repeated
+# fields, wrong types and malformed JSON reject with typed causes, never
+# silently ignored. A field the body did not carry stays `none`, which is how
+# D2 precedence resolves: a body field overrides the server flag, which
+# overrides the documented default.
+#
+# The gradus GenerationConfig contract (gradus generation/config) owns the
+# domain checks (field ranges, prompt fit, the context cursor); this module
+# never re-implements them.
+
+import from "norma:json" codec
+import from "norma:text" text
+
+import from "./cli" const ServeConfig, effective_context, effective_max_prompt
+
+# The /generate fields, in the order the body is checked.
+const list<string> REQUEST_FIELDS = ["prompt", "max_tokens", "max_prompt", "temperature", "top_k", "top_p", "min_p", "repeat_penalty", "seed"]
+
+# Integers are accepted up to an 18-character token: 999999999999999999 and
+# -99999999999999999. Anything wider is refused as out of range.
+const int MAX_INTEGER = 999999999999999999
+const int MIN_INTEGER = -99999999999999999
+
+# The parsed /generate request (D3). Sampling floats are narrowed to f32 here,
+# once, where the wire number enters.
+@ public
+class GenerateRequest {
+    mut string prompt
+    mut int ∪ none max_tokens = null
+    mut int ∪ none max_prompt = null
+    mut f32 ∪ none temperature = null
+    mut int ∪ none top_k = null
+    mut f32 ∪ none top_p = null
+    mut f32 ∪ none min_p = null
+    mut f32 ∪ none repeat_penalty = null
+    mut int ∪ none seed = null
+}
+
+# ---------------------------------------------------------------------------
+# Parsing
+# ---------------------------------------------------------------------------
+
+# The refusal text of a body Norma could not parse. A repeated key is the
+# wire contract's `duplicate field` for the fields it knows.
+fn malformed(string cause) → string {
+    let string repeated ← "duplicate JSON object key: "
+    if cause.starts_with(repeated) {
+        let string key ← text.suffix(cause, repeated.length())
+        return key ∈ REQUEST_FIELDS ✓ "duplicate field '§'"(key) ✗ unknown_field(key)
+    }
+    return "malformed JSON: §"(cause)
+}
+
+fn unknown_field(string name) → string {
+    return "unknown field '§' (imperium_admissum reject — never silently ignored)"(name)
+}
+
+# The top-level object of a body, as a map of its fields.
+fn body_fields(string body) → map<string, value> ⇥ string {
+    reject not body.trim().starts_with("{") throw "malformed JSON: expected an object"
+    do {
+        let json document ← codec.parse(body)
+        let value tree ← document ↦ value
+        let map<string, value> fields ↤ tree
+        return fields
+    }
+    catch err {
+        throw malformed("§"(err))
+    }
+}
+
+# An integer beyond `int` is neither `int`, `float` nor `string`; Norma keeps it
+# as `inf`.
+fn is_wide_integer(value node) → bool {
+    do {
+        let inf wide ↤ node
+        return true
+    }
+    catch err {
+        return false
+    }
+}
+
+# Every field value is a string or a number, and a number is in range.
+fn check_scalar(string name, value node) → void ⇥ string {
+    if node is string or node is float then return
+    if node is int {
+        let int whole ← node ↦ int
+        reject whole ≻ MAX_INTEGER or whole ≺ MIN_INTEGER throw "malformed JSON: integer out of range"
+        return
+    }
+    reject is_wide_integer(node) throw "malformed JSON: integer out of range"
+    throw "field '§': value must be a JSON string or number (minimal I1 parser)"(name)
+}
+
+fn prompt_of(value node) → string ⇥ string {
+    reject node not is string throw "field 'prompt' must be a JSON string"
+    let string prompt ← node ↦ string
+    reject prompt ≡ "" throw "field 'prompt' must not be empty"
+    return prompt
+}
+
+fn integer_of(string name, value node) → int ⇥ string {
+    reject node not is int throw "field '§' must be an integer"(name)
+    return node ↦ int
+}
+
+# A number as f32: an integer widens through float first, as the wire number is
+# a float everywhere else.
+fn number_of(string name, value node) → f32 ⇥ string {
+    if node is float {
+        let float real ← node ↦ float
+        return real ↦ f32
+    }
+    reject node not is int throw "field '§' must be a JSON number"(name)
+    let int whole ← node ↦ int
+    return whole ↦ float ↦ f32
+}
+
+# Store one body field in the request.
+fn apply_field(mut GenerateRequest out, string name, value node) → void ⇥ string {
+    check_scalar(name, node)
+    switch name {
+        case "prompt" {
+            out.prompt ← prompt_of(node)
+        }
+        case "max_tokens" {
+            out.max_tokens ← integer_of(name, node)
+        }
+        case "max_prompt" {
+            out.max_prompt ← integer_of(name, node)
+        }
+        case "temperature" {
+            out.temperature ← number_of(name, node)
+        }
+        case "top_k" {
+            out.top_k ← integer_of(name, node)
+        }
+        case "top_p" {
+            out.top_p ← number_of(name, node)
+        }
+        case "min_p" {
+            out.min_p ← number_of(name, node)
+        }
+        case "repeat_penalty" {
+            out.repeat_penalty ← number_of(name, node)
+        }
+        case "seed" {
+            out.seed ← integer_of(name, node)
+        }
+        default {
+            throw unknown_field(name)
+        }
+    }
+}
+
+# Parse a /generate request body (D3) into the fixed schema. The refusal text
+# is the 400 body's `error`.
+@ public
+fn parse_generate_body(string body) → GenerateRequest ⇥ string {
+    let map<string, value> fields ← body_fields(body)
+    mut list<string> names ← fields.keys()
+    names.sort()
+    mut GenerateRequest out ← GenerateRequest { prompt = "" }
+    for from names let name {
+        apply_field(mut out, name, fields[name])
+    }
+    require fields.has("prompt") throw "missing required field 'prompt'"
+    return out
+}
+
+# ---------------------------------------------------------------------------
+# Generation config (the nine gradus GenerationConfig fields, D2/D4)
+# ---------------------------------------------------------------------------
+
+@ public
+class GenerateConfig {
+    mut int context
+    mut int max_prompt
+    mut int max_tokens
+    mut int seed
+    mut f32 temperature = 0.0
+    mut int top_k = 0
+    mut f32 top_p = 1.0
+    mut f32 min_p = 0.0
+    mut f32 repeat_penalty = 1.0
+}
+
+# D2 precedence: body fields override server flags, flags override defaults.
+# `max_prompt` is the prompt-token admission bound, not a request batch: the
+# engine rejects any prompt longer than it with "prompt length exceeds
+# max_prompt".
+@ public
+fn build_generate_config(GenerateRequest req, ServeConfig server) → GenerateConfig {
+    return GenerateConfig {
+        context = effective_context(server),
+        max_prompt = req.max_prompt coalesce effective_max_prompt(server),
+        max_tokens = req.max_tokens coalesce server.max_tokens,
+        seed = req.seed coalesce server.seed,
+        temperature = req.temperature coalesce 0.0,
+        top_k = req.top_k coalesce 0,
+        top_p = req.top_p coalesce 1.0,
+        min_p = req.min_p coalesce 0.0,
+        repeat_penalty = req.repeat_penalty coalesce 1.0
+    }
+}
+
+# A refusal text, or "" when the body parses.
+fn refusal_of(string body) → string {
+    do {
+        parse_generate_body(body)
+        return ""
+    }
+    catch err {
+        return "§"(err)
+    }
+}
+
+describe "generate request JSON parse" tag "inferentia" {
+    test "frozen fixture request parses to the pinned fields" {
+        do {
+            let GenerateRequest req ← parse_generate_body(«{"prompt":"The quick brown fox jumps over the lazy dog","max_tokens":16,"temperature":0.0,"top_k":0,"top_p":1.0,"min_p":0.0,"repeat_penalty":1.0,"seed":1}»)
+            assert req.prompt ≡ "The quick brown fox jumps over the lazy dog"
+            assert (req.max_tokens coalesce -1) ≡ 16
+            assert (req.temperature coalesce -1.0) ≅ 0.0
+            assert (req.top_k coalesce -1) ≡ 0
+            assert (req.top_p coalesce -1.0) ≅ 1.0
+            assert (req.min_p coalesce -1.0) ≅ 0.0
+            assert (req.repeat_penalty coalesce -1.0) ≅ 1.0
+            assert (req.seed coalesce -1) ≡ 1
+            assert req.max_prompt is none
+        }
+        catch err {
+            assert false
+        }
+    }
+    test "minimal request parses with optional fields absent" {
+        do {
+            let GenerateRequest req ← parse_generate_body(«{"prompt":"The quick brown fox jumps over the lazy dog"}»)
+            assert req.prompt ≡ "The quick brown fox jumps over the lazy dog"
+            assert req.max_tokens is none
+            assert req.max_prompt is none
+            assert req.temperature is none
+            assert req.seed is none
+        }
+        catch err {
+            assert false
+        }
+    }
+    test "unknown field is an imperium_admissum reject row" {
+        let string cause ← refusal_of(«{"prompt":"hi","bogus":1}»)
+        assert cause.contains("unknown field 'bogus'")
+        assert cause.contains("imperium_admissum")
+    }
+    test "empty prompt is rejected" {
+        assert refusal_of(«{"prompt":""}»).contains("must not be empty")
+    }
+    test "missing prompt is rejected" {
+        assert refusal_of(«{"max_tokens":4}»).contains("missing required field 'prompt'")
+    }
+    test "malformed JSON is rejected with a typed cause" {
+        assert refusal_of("").starts_with("malformed JSON")
+        assert refusal_of("not json").starts_with("malformed JSON")
+        assert refusal_of(«{"prompt":») ≢ ""
+        assert refusal_of(«{"prompt":"hi"} trailing») ≢ ""
+        assert refusal_of(«{"prompt" "hi"}») ≢ ""
+        assert refusal_of(«{"prompt":"hi",}») ≢ ""
+    }
+    test "wrong field types are rejected" {
+        assert refusal_of(«{"prompt":42}») ≡ "field 'prompt' must be a JSON string"
+        assert refusal_of(«{"prompt":"hi","max_tokens":16.5}») ≡ "field 'max_tokens' must be an integer"
+        assert refusal_of(«{"prompt":"hi","max_tokens":"x"}») ≡ "field 'max_tokens' must be an integer"
+        assert refusal_of(«{"prompt":"hi","max_prompt":"x"}») ≡ "field 'max_prompt' must be an integer"
+        assert refusal_of(«{"prompt":"hi","temperature":"x"}») ≡ "field 'temperature' must be a JSON number"
+        assert refusal_of(«{"prompt":"hi","seed":true}») ≡ "field 'seed': value must be a JSON string or number (minimal I1 parser)"
+    }
+    test "duplicate fields are rejected" {
+        assert refusal_of(«{"prompt":"a","prompt":"b"}») ≡ "duplicate field 'prompt'"
+        assert refusal_of(«{"prompt":"a","seed":1,"seed":2}») ≡ "duplicate field 'seed'"
+    }
+    test "max_prompt body field parses and rejects bad shapes" {
+        do {
+            let GenerateRequest req ← parse_generate_body(«{"prompt":"hi","max_prompt":128}»)
+            assert (req.max_prompt coalesce -1) ≡ 128
+        }
+        catch err {
+            assert false
+        }
+        assert refusal_of(«{"prompt":"hi","max_prompt":1.5}») ≢ ""
+        assert refusal_of(«{"prompt":"hi","max_prompt":4,"max_prompt":8}») ≢ ""
+    }
+    test "whitespace and integer-form floats are tolerated" {
+        do {
+            let GenerateRequest req ← parse_generate_body(«  { "prompt" : "hi" , "max_tokens" : 4 , "temperature" : 1 }  »)
+            assert req.prompt ≡ "hi"
+            assert (req.max_tokens coalesce -1) ≡ 4
+            assert (req.temperature coalesce -1.0) ≅ 1.0
+        }
+        catch err {
+            assert false
+        }
+    }
+    test "escapes decode in string values" {
+        do {
+            let GenerateRequest req ← parse_generate_body(«{"prompt":"a\\nb\\tc\\"d"}»)
+            assert req.prompt ≡ «a\nb\tc"d»
+        }
+        catch err {
+            assert false
+        }
+    }
+    test "integers keep an 18-character token bound" {
+        assert refusal_of(«{"prompt":"hi","seed":999999999999999999}») ≡ ""
+        assert refusal_of(«{"prompt":"hi","seed":1000000000000000000}») ≡ "malformed JSON: integer out of range"
+        assert refusal_of(«{"prompt":"hi","seed":-99999999999999999}») ≡ ""
+        assert refusal_of(«{"prompt":"hi","seed":-100000000000000000}») ≡ "malformed JSON: integer out of range"
+        assert refusal_of(«{"prompt":"hi","seed":12345678901234567890}») ≡ "malformed JSON: integer out of range"
+    }
+}
+
+describe "generate config precedence" tag "inferentia" {
+    test "body overrides server flag overrides default" {
+        let ServeConfig server ← ServeConfig { model = "/m.gguf" }
+        do {
+            let GenerateRequest req ← parse_generate_body(«{"prompt":"x","max_tokens":8,"seed":3}»)
+            let GenerateConfig cfg ← build_generate_config(req, server)
+            assert cfg.context ≡ 8192
+            assert cfg.max_tokens ≡ 8
+            assert cfg.seed ≡ 3
+            assert cfg.max_prompt ≡ 8192
+            assert cfg.temperature ≅ 0.0
+            assert cfg.top_k ≡ 0
+            assert cfg.top_p ≅ 1.0
+            assert cfg.min_p ≅ 0.0
+            assert cfg.repeat_penalty ≅ 1.0
+        }
+        catch err {
+            assert false
+        }
+    }
+    test "absent body fields inherit the server flags" {
+        let ServeConfig server ← ServeConfig { model = "/m.gguf", max_tokens = 16, max_prompt = 1024, context = 4096, seed = 7 }
+        do {
+            let GenerateRequest req ← parse_generate_body(«{"prompt":"x"}»)
+            let GenerateConfig cfg ← build_generate_config(req, server)
+            assert cfg.context ≡ 4096
+            assert cfg.max_tokens ≡ 16
+            assert cfg.max_prompt ≡ 1024
+            assert cfg.seed ≡ 7
+            assert cfg.temperature ≅ 0.0
+            assert cfg.top_p ≅ 1.0
+            assert cfg.repeat_penalty ≅ 1.0
+        }
+        catch err {
+            assert false
+        }
+    }
+    test "body max_prompt overrides the server flag" {
+        let ServeConfig server ← ServeConfig { model = "/m.gguf", max_tokens = 16, max_prompt = 1024, context = 4096, seed = 7 }
+        do {
+            let GenerateRequest req ← parse_generate_body(«{"prompt":"x","max_prompt":256}»)
+            assert build_generate_config(req, server).max_prompt ≡ 256
+        }
+        catch err {
+            assert false
+        }
+    }
+    test "sampling fields from the body reach the config" {
+        let ServeConfig server ← ServeConfig { model = "/m.gguf" }
+        do {
+            let GenerateRequest req ← parse_generate_body(«{"prompt":"x","temperature":0.5,"top_k":4,"top_p":0.5,"min_p":0.25,"repeat_penalty":2}»)
+            let GenerateConfig cfg ← build_generate_config(req, server)
+            assert cfg.temperature ≅ 0.5
+            assert cfg.top_k ≡ 4
+            assert cfg.top_p ≅ 0.5
+            assert cfg.min_p ≅ 0.25
+            assert cfg.repeat_penalty ≅ 2.0
+        }
+        catch err {
+            assert false
+        }
+    }
+}

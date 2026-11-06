@@ -1,0 +1,404 @@
+# =============================================================================
+# Admission — path → digest + header prefix → gguf.admit, and the digest-bound
+# weight load
+# =============================================================================
+#
+# Admission runs before any allocation. The load re-verifies the digest and
+# the byte length (admit → load TOCTOU) before and after the weights are read.
+# Host I/O reports on the error channel (IoFault, no message text); the
+# conversion below maps it into BadCapsule wherever a function propagates it.
+
+import from "norma:crypto" crypto
+import from "norma:fault" fault
+import from "norma:fs" fsys
+
+import from "gradus:model/artifact" artifact
+import from "gradus:model/gguf" gguf
+import from "gradus:model/gguf_manifest" gguf_manifest
+
+import from "./port_weights" port
+import from "./cli" const ServeConfig, parse_cli
+import from "./pinned" const PINNED_DATA_OFFSET, PINNED_DIGEST, PINNED_ELEMENT_COUNT, PINNED_F32_TENSORS, PINNED_FILE_SIZE, PINNED_FILE_TYPE, PINNED_KV_COUNT, PINNED_PAD_ID, PINNED_Q4K_TENSORS, PINNED_Q5_TENSORS, PINNED_Q6_TENSORS, PINNED_Q8_TENSORS, PINNED_TENSOR_COUNT
+
+# An admission or load refusal: the cause text /health reports as the failed
+# state. The conversions below carry each foreign error into it wherever a
+# function propagates one.
+@ public
+class AdmissionError {
+    let string message
+}
+
+@ public
+@ conversion
+fn refusal_of_fault(fault.IoFault err) → AdmissionError {
+    return AdmissionError { message = "§"(err) }
+}
+
+@ public
+@ conversion
+fn refusal_of_gguf(gguf.GgufError err) → AdmissionError {
+    return AdmissionError { message = err.message }
+}
+
+@ public
+@ conversion
+fn refusal_of_manifest(gguf_manifest.GgufManifestError err) → AdmissionError {
+    return AdmissionError { message = err.message }
+}
+
+# ---------------------------------------------------------------------------
+# Pure gates: each throws the refusal diagnostic, or returns when the path
+# proceeds, so the rows can feed sizes and digests as inputs.
+# ---------------------------------------------------------------------------
+
+# Size gate for admit_model (S-F3 / G1-U8): the artifact may not exceed the
+# pinned row's exact byte length.
+@ public
+fn check_admission_size(int observed) → void ⇥ AdmissionError {
+    reject observed ≻ PINNED_FILE_SIZE throw AdmissionError { message = "model byte length § exceeds the admission ceiling §"(observed, PINNED_FILE_SIZE) }
+}
+
+# Pinned-row digest gate for serve admission (S-F1): the structural admission
+# contract (`gguf.admit` is pinned to the SmolLM2 row) is always bound to one
+# verified file identity, the binding `live_run` has always applied.
+@ public
+fn check_pinned_digest(string admitted) → void ⇥ AdmissionError {
+    reject admitted ≢ PINNED_DIGEST throw AdmissionError { message = "model digest § is not the pinned row digest §"(admitted, PINNED_DIGEST) }
+}
+
+# Operator digest gate for serve admission (G1-U9): the admitted digest must
+# match the operator-supplied --expected-digest. An empty expected means unset;
+# the flag then adds no constraint of its own.
+@ public
+fn check_expected_digest(string admitted, string expected) → void ⇥ AdmissionError {
+    reject expected ≢ "" and admitted ≢ expected throw AdmissionError { message = "model digest § does not match --expected-digest §"(admitted, expected) }
+}
+
+# Materialization re-verify (G1-U9): the file is re-digested at load time, after
+# admission, so a swap between admit and load cannot serve swapped weights. The
+# refusal covers the admit → load TOCTOU (materialized ≠ admitted) and the
+# --expected-digest pin carried from serve.
+@ public
+fn check_materialized_digest(string admitted, string materialized, string expected) → void ⇥ AdmissionError {
+    reject materialized ≢ admitted throw AdmissionError { message = "model changed between admission and materialization: admitted=§ materialized=§"(admitted, materialized) }
+    reject expected ≢ "" and materialized ≢ expected throw AdmissionError { message = "materialized digest § does not match --expected-digest §"(materialized, expected) }
+}
+
+# Load-time length guard for the port path (A1 one-manifest): an ADDITIONAL
+# cheap check on top of the load-time digest, never a replacement for it. The
+# manifest was inspected for the admitted digest, and the file's current byte
+# length equals the admitted length. A same-size content swap is the digest's
+# job.
+@ public
+fn check_load_identity(string sha, gguf_manifest.GgufManifest admitted, int observed) → void ⇥ AdmissionError {
+    reject admitted.identity.digest ≢ sha throw AdmissionError { message = "model changed between admission and materialization: admitted=§ manifest=§"(sha, admitted.identity.digest) }
+    reject observed ≢ admitted.artifact_length throw AdmissionError { message = "model changed between admission and materialization: admitted length=§ observed length=§"(admitted.artifact_length, observed) }
+}
+
+# ---------------------------------------------------------------------------
+# Admission
+# ---------------------------------------------------------------------------
+
+# The admitted digest plus the manifest gradus inspected while admitting it:
+# the header is parsed once, here, and the manifest is passed on.
+@ public
+class AdmittedModel {
+    mut string sha
+    mut gguf_manifest.GgufManifest manifest
+}
+
+# Path → host stat + digest + header prefix → gradus admit, with the admitted
+# identity {sha-256, digest, artifact length}. The stat runs first and the
+# ceiling gate refuses an over-ceiling path before anything is read (G1-U8);
+# only the header prefix [0, data offset) is read, never the tensor data, and
+# the stat length is the artifact length the digest covers.
+@ public
+fn admit_model(string path) → AdmittedModel ⇥ AdmissionError {
+    let int observed ← fsys.byte_length(path)
+    check_admission_size(observed)
+    reject observed ≺ PINNED_DATA_OFFSET throw AdmissionError { message = "model byte length § is shorter than the pinned header prefix §"(observed, PINNED_DATA_OFFSET) }
+    let string digest ← crypto.digest_file(path)
+    let list<b8> raw ← fsys.read_range(path, 0, PINNED_DATA_OFFSET)
+    let list<u8> prefix ← raw ↦ list<u8>
+    let gguf.Admission admission ← gguf.admit_with_manifest(prefix, digest, observed, PINNED_FILE_TYPE, PINNED_PAD_ID, PINNED_KV_COUNT, PINNED_TENSOR_COUNT, PINNED_ELEMENT_COUNT, PINNED_F32_TENSORS, PINNED_Q4K_TENSORS, PINNED_Q5_TENSORS, PINNED_Q6_TENSORS, PINNED_Q8_TENSORS)
+    return AdmittedModel { sha = admission.cap.digest(), manifest = admission.manifest }
+}
+
+# Admission for serve: the admitted digest is bound to the pinned row (S-F1),
+# then to any operator --expected-digest (G1-U9). The structural admission
+# contract (`gguf.admit` is pinned to the SmolLM2 row) is thereby tied to one
+# verified file identity, the binding `live_run` has always applied.
+@ public
+fn admit_serving(string path, string expected_digest) → AdmittedModel ⇥ AdmissionError {
+    let AdmittedModel admitted ← admit_model(path)
+    check_pinned_digest(admitted.sha)
+    check_expected_digest(admitted.sha, expected_digest)
+    return admitted
+}
+
+# ---------------------------------------------------------------------------
+# Digest-bound load
+# ---------------------------------------------------------------------------
+
+# The bounds-checked byte source for the manifest reader and the port loader.
+fn bounded_range(string path, int total, int initium, int longitudo) → list<b8> ⇥ gguf_manifest.GgufManifestError {
+    reject initium ≺ 0 or longitudo ≺ 0 or initium ≻ total - longitudo throw variant BadSource { message = "range request exceeds the artifact" }
+    let list<b8> raw ← read_bytes(path, initium, longitudo)
+    reject raw.length() ≢ longitudo throw variant BadSource { message = "short range read" }
+    return raw
+}
+
+# An I/O fault surfaces as BadSource carrying the fault's rendering.
+fn read_bytes(string path, int initium, int longitudo) → list<b8> ⇥ gguf_manifest.GgufManifestError {
+    do {
+        return fsys.read_range(path, initium, longitudo)
+    }
+    catch err {
+        throw variant BadSource { message = "range read failed: §"(err) }
+    }
+}
+
+fn artifact_length(string path) → int ⇥ gguf_manifest.GgufManifestError {
+    do {
+        return fsys.byte_length(path)
+    }
+    catch err {
+        throw variant BadSource { message = "length read failed: §"(err) }
+    }
+}
+
+# A1 port load (U-G): every tensor read once and reinterpreted in bulk as a
+# literal-shape tensor (`raw ↦ tensor<f32, [N, K]> via Le`). `path` and the
+# bounds-checked `bounded_range` are the byte source; the shapes, names and the
+# BadBounds/UnknownLayout refusals live in port_weights.fab.
+fn load_port_weights(string path, gguf_manifest.GgufManifest admitted) → port.PortWeights ⇥ gguf_manifest.GgufManifestError {
+    let int total ← artifact_length(path)
+    return port.load_weights(
+        (int initium, int longitudo) → list<b8> ⇥ gguf_manifest.GgufManifestError ∴ bounded_range(path, total, initium, longitudo),
+        admitted
+    )
+}
+
+fn refuse_load_identity(string sha, gguf_manifest.GgufManifest admitted, string path) → void ⇥ AdmissionError {
+    check_load_identity(sha, admitted, fsys.byte_length(path))
+}
+
+# Materialization re-verify (G1-U9): the file is re-digested at load time,
+# after admission and before any weight is read, and must equal the admitted
+# sha (and --expected-digest when set), so a swap between admit and load, a
+# same-size content swap included, cannot serve swapped weights.
+@ public
+fn verify_load_digest(string path, string sha, string expected_digest) → void ⇥ AdmissionError {
+    check_materialized_digest(sha, crypto.digest_file(path), expected_digest)
+}
+
+# The port path's digest-bound entry: the manifest is the one inspected from
+# the admitted header prefix (passed in, never re-parsed). Length guard, then
+# the load-time digest re-verify, then the weights, then the length guard again.
+# The loader's manifest-side refusals are mapped into BadCapsule.
+@ public
+fn load_port_model(string path, string sha, string expected_digest, gguf_manifest.GgufManifest admitted) → port.PortWeights ⇥ AdmissionError {
+    refuse_load_identity(sha, admitted, path)
+    verify_load_digest(path, sha, expected_digest)
+    let port.PortWeights loaded ← load_port_weights(path, admitted)
+    refuse_load_identity(sha, admitted, path)
+    return loaded
+}
+
+# A manifest that carries only the admitted identity (digest + artifact length):
+# what the load-time identity re-check reads.
+fn identity_manifest(string sha, int length) → gguf_manifest.GgufManifest {
+    return gguf_manifest.GgufManifest {
+        identity = artifact.ContentIdentity { algorithm = "sha-256", digest = sha, length = length },
+        version = 0,
+        alignment = 0,
+        data_start = 0,
+        artifact_length = length,
+        metadata = [],
+        tensors = []
+    }
+}
+
+# Scratch-file helpers for the load-digest rows: a scratch file that cannot be
+# written is a failed row.
+fn scratch_write(string path, list<b8> data) → void {
+    do {
+        fsys.write_bytes(path, data)
+    }
+    catch err {
+        panic "scratch write failed: §"(err)
+    }
+}
+
+fn scratch_digest(string path) → string {
+    do {
+        return crypto.digest_file(path)
+    }
+    catch err {
+        panic "scratch digest failed: §"(err)
+    }
+}
+
+# The refusal text of a load-time digest check on a scratch file, "" when it holds.
+fn load_digest_cause(string path, string sha, string expected) → string {
+    do {
+        verify_load_digest(path, sha, expected)
+        return ""
+    }
+    catch err {
+        return err.message
+    }
+}
+
+fn scratch_delete(string path) → void {
+    do {
+        fsys.delete(path)
+    }
+    catch err {
+        panic "scratch delete failed: §"(err)
+    }
+}
+
+# The refusal text of each pure gate, "" when the gate lets the path proceed.
+fn size_refusal(int observed) → string {
+    do {
+        check_admission_size(observed)
+        return ""
+    }
+    catch err {
+        return err.message
+    }
+}
+
+fn pinned_refusal(string admitted) → string {
+    do {
+        check_pinned_digest(admitted)
+        return ""
+    }
+    catch err {
+        return err.message
+    }
+}
+
+fn expected_refusal(string admitted, string expected) → string {
+    do {
+        check_expected_digest(admitted, expected)
+        return ""
+    }
+    catch err {
+        return err.message
+    }
+}
+
+fn materialized_refusal(string admitted, string materialized, string expected) → string {
+    do {
+        check_materialized_digest(admitted, materialized, expected)
+        return ""
+    }
+    catch err {
+        return err.message
+    }
+}
+
+fn identity_refusal(string sha, string manifest_sha, int observed) → string {
+    do {
+        check_load_identity(sha, identity_manifest(manifest_sha, PINNED_FILE_SIZE), observed)
+        return ""
+    }
+    catch err {
+        return err.message
+    }
+}
+
+describe "admission size ceiling" tag "inferentia" {
+    test "pinned row size passes the ceiling gate" {
+        # The gate is pure so the rows feed sizes as inputs: admission refuses
+        # an over-ceiling path before any byte is read, and the pinned size passes.
+        assert size_refusal(PINNED_FILE_SIZE) ≡ ""
+    }
+    test "one byte over the pinned size is refused with the size diagnostic" {
+        let string refusal ← size_refusal(PINNED_FILE_SIZE + 1)
+        assert refusal.contains("§"(PINNED_FILE_SIZE + 1))
+        assert refusal.contains("§"(PINNED_FILE_SIZE))
+    }
+}
+
+describe "serve admission digest" tag "inferentia" {
+    test "the pinned row digest passes the serve admission pin" {
+        assert pinned_refusal(PINNED_DIGEST) ≡ ""
+    }
+    test "a digest that is not the pinned row is refused on serve" {
+        # S-F1: serve binds admission to the pinned row like live_run, so a
+        # structure-valid file with other weights never reaches `ready`.
+        let string refusal ← pinned_refusal("0000f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2")
+        assert refusal.contains("0000f013")
+        assert refusal.contains(PINNED_DIGEST)
+    }
+    test "unset flag adds no operator pin of its own" {
+        # Default unset (G1-U9 clause 1): the flag adds no constraint; the
+        # pinned-row binding is the separate check_pinned_digest gate above.
+        let ServeConfig cfg ← parse_cli(["serve", "--model", "/tmp/model.gguf"])
+        assert cfg.expected_digest ≡ ""
+        assert expected_refusal("2fa3f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2", cfg.expected_digest) ≡ ""
+        assert expected_refusal("0000f013dcdd7b99f9b237717fa0b12d75bbb89984cc1274be1471a465bac9c2", cfg.expected_digest) ≡ ""
+    }
+    test "set flag binds from the cli" {
+        let ServeConfig cfg ← parse_cli(["serve", "--model", "/tmp/model.gguf", "--expected-digest", "2fa3f013"])
+        assert cfg.expected_digest ≡ "2fa3f013"
+    }
+    test "matching digest passes the admission gate" {
+        assert expected_refusal("2fa3f013", "2fa3f013") ≡ ""
+    }
+    test "mismatching digest is refused with the pin diagnostic" {
+        # Clause 2: the refusal is the thrown cause, which serve's catch maps
+        # into the failed state: admission never reaches `ready`, so the
+        # model is never served and there is no panic path.
+        let string refusal ← expected_refusal("aaaa", "bbbb")
+        assert refusal.contains("aaaa")
+        assert refusal.contains("bbbb")
+    }
+    test "file swapped between admit and materialization is caught" {
+        # Clause 3: the re-verify at load time compares against the admitted
+        # sha, so swapped bytes throw before the weights are read.
+        let string refusal ← materialized_refusal("admitted-sha", "swapped-sha", "")
+        assert refusal.contains("admitted-sha")
+        assert refusal.contains("swapped-sha")
+    }
+    test "materialized digest equal to admitted passes, with or without the flag" {
+        assert materialized_refusal("same-sha", "same-sha", "") ≡ ""
+        assert materialized_refusal("same-sha", "same-sha", "same-sha") ≡ ""
+    }
+    test "materialized digest mismatching the flag is caught" {
+        assert materialized_refusal("same-sha", "same-sha", "flag-sha").contains("flag-sha")
+    }
+    test "load length guard: matching digest and length pass" {
+        assert identity_refusal("admitted-sha", "admitted-sha", PINNED_FILE_SIZE) ≡ ""
+    }
+    test "load length guard: a manifest inspected for another digest is refused" {
+        let string refusal ← identity_refusal("admitted-sha", "other-sha", PINNED_FILE_SIZE)
+        assert refusal.contains("admitted-sha")
+        assert refusal.contains("other-sha")
+    }
+    test "load length guard: a file whose length changed since admission is refused" {
+        assert identity_refusal("admitted-sha", "admitted-sha", PINNED_FILE_SIZE - 1).contains("1449071039")
+        assert identity_refusal("admitted-sha", "admitted-sha", PINNED_FILE_SIZE + 1).contains("1449071041")
+    }
+    test "load digest: a same-length content swap is refused at load" {
+        # The length guard alone cannot see this; only the load-time digest does.
+        let string path ← "/tmp/inferentia-load-digest-swap.bin"
+        scratch_write(path, [1, 2, 3, 4] ↦ list<b8>)
+        let string admitted_sha ← scratch_digest(path)
+        assert load_digest_cause(path, admitted_sha, "") ≡ ""
+        scratch_write(path, [1, 2, 3, 5] ↦ list<b8>)
+        let string cause ← load_digest_cause(path, admitted_sha, "")
+        scratch_delete(path)
+        assert cause.contains("model changed between admission and materialization")
+    }
+    test "load digest: the operator pin binds the load-time digest" {
+        let string path ← "/tmp/inferentia-load-digest-pin.bin"
+        scratch_write(path, [9, 9, 9, 9] ↦ list<b8>)
+        let string cause ← load_digest_cause(path, scratch_digest(path), "flag-sha")
+        scratch_delete(path)
+        assert cause.contains("flag-sha")
+    }
+}

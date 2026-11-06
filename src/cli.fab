@@ -1,0 +1,361 @@
+# =============================================================================
+# CLI — argv parsing and the serve/live configuration (D1 syntax + D2 precedence)
+# =============================================================================
+#
+# The generated CLI framework is not used: its help/parse errors exit 0/2 and
+# cannot carry the D5 usage-error exit, so argv is parsed here and every usage
+# error is detected before the listener binds.
+
+import from "norma:text" text
+
+import from "./pinned" const FROZEN_PROMPT, PINNED_CONTEXT_LENGTH
+import from "./io" const stderr_write, stdout_write
+
+# Documented constants are the defaults; server flags override them. `context`
+# uses 0 as the "derive from the model's context_length" sentinel (the model is
+# admitted at startup); an explicit `--context 0` is rejected as a config error.
+# `max_prompt` uses the same 0 sentinel (default: the model context limit).
+@ public
+class ServeConfig {
+    mut string model = ""
+    mut string host = "127.0.0.1"
+    mut int port = 8080
+    mut int max_tokens = 32
+    mut int max_prompt = 0
+    mut int context = 0
+    mut int seed = 1
+    mut string log_level = "info"
+    mut string prompt = ""
+    mut string expected_digest = ""
+    mut bool ignore_eos = false
+    mut bool trace = false
+    mut string backend = "metal"
+}
+
+# The effective prompt-token admission bound: the configured --max-prompt, or
+# the model context limit when unset (0 sentinel, same convention as context).
+@ public
+fn effective_max_prompt(ServeConfig config) → int {
+    return config.max_prompt ≡ 0 ✓ PINNED_CONTEXT_LENGTH ✗ config.max_prompt
+}
+
+# The effective session context: the configured --context, or the model limit.
+@ public
+fn effective_context(ServeConfig config) → int {
+    return config.context ≡ 0 ✓ PINNED_CONTEXT_LENGTH ✗ config.context
+}
+
+# The effective live prompt: the --prompt text, or the frozen fixture when
+# unset (the parser rejects an empty --prompt, so "" is a safe sentinel).
+@ public
+fn effective_prompt(ServeConfig config) → string {
+    return config.prompt ≢ "" ✓ config.prompt ✗ FROZEN_PROMPT
+}
+
+# The D1 `serve` syntax, printed on `--help`.
+const string HELP_TEXT = «Usage: inferentia <serve|live> [OPTIONS]
+
+Local-first GGUF inference server written in Faber
+
+Commands:
+  serve                     Bind the HTTP server (U1–U4)
+  live                      One-shot prompt in, decoded ids + text out
+
+Options:
+  -m, --model <PATH>        Path to the GGUF model file (required)
+      --prompt <TEXT>       Live one-shot prompt text (default: frozen fixture)
+      --expected-digest <SHA256>  Serve: require the admitted sha256 to match (default: unset)
+      --ignore-eos          Live: generate past EOG until --max-tokens
+      --backend <metal>     Generation path (default and only value: metal = the gradus
+                            decode-token launches; the device is chosen by how the program
+                            is run: `faber run --device metal|cpu|reference`)
+      --trace               Live: one stderr trace line per generated step
+      --host <HOST>         Bind host (loopback only; default: 127.0.0.1)
+      --port <PORT>         Bind port (default: 8080; 0 = ephemeral)
+      --max-tokens <N>      Default output token ceiling (default: 32)
+      --max-prompt <N>      Prompt-token admission bound (default: model limit)
+      --context <N>         Session context ceiling (default: model limit)
+      --seed <N>            Deterministic seed (default: 1)
+      --log-level <LEVEL>   stderr verbosity: info|warn|error (default: info)
+  -h, --help                Print help
+      --version             Print version
+»
+
+# ---------------------------------------------------------------------------
+# Usage errors (D5): detected before any listen, non-zero exit.
+# ---------------------------------------------------------------------------
+
+@ public
+fn usage_error(string message) → never {
+    stderr_write("error: " + message)
+    panic "usage error"
+}
+
+# The subcommand `live` is requested when it appears anywhere in argv.
+@ public
+fn live_requested(list<string> argv) → bool {
+    return argv.contains("live")
+}
+
+# ---------------------------------------------------------------------------
+# Option values
+# ---------------------------------------------------------------------------
+
+# The flags that take a value (the next argument).
+const list<string> VALUE_FLAGS = ["--model", "--host", "--port", "--max-tokens", "--max-prompt", "--context", "--seed", "--log-level", "--expected-digest", "--prompt", "--backend"]
+
+# A base-10 integer, or none when the text is not one.
+fn parse_int(string raw) → int ∪ none {
+    do {
+        return raw ↦ int
+    }
+    catch err {
+        return null
+    }
+}
+
+# A count flag whose value must be at least one. The error names the flag
+# without its dashes: `--max-tokens` reports `invalid max-tokens '0' ...`.
+fn flag_count(string flag, string raw) → int {
+    let int value ← parse_int(raw) coalesce 0
+    if value ≺ 1 {
+        usage_error("invalid §0 '§1' (expected >= 1)"(text.suffix(flag, 2), raw))
+    }
+    return value
+}
+
+fn flag_port(string raw) → int {
+    let int ∪ none value ← parse_int(raw)
+    let int port ← value coalesce -1
+    if port ≺ 0 or port ≻ 65535 {
+        usage_error("invalid port '§' (expected 0..=65535)"(raw))
+    }
+    return port
+}
+
+fn flag_log_level(string raw) → string {
+    if raw ∉ ["info", "warn", "error"] {
+        usage_error("invalid log-level '§' (expected info|warn|error)"(raw))
+    }
+    return raw
+}
+
+fn flag_prompt(string raw) → string {
+    if raw ≡ "" then usage_error("invalid prompt '' (expected non-empty text)")
+    return raw
+}
+
+fn flag_backend(string raw) → string {
+    if raw ≢ "metal" {
+        usage_error("invalid backend '§' (expected metal; CPU inference is `faber run --device cpu` or `--device reference` on the same kernels)"(raw))
+    }
+    return raw
+}
+
+# The long spelling of a flag: the two short flags map to theirs.
+fn long_flag(string arg) → string {
+    switch arg {
+        case "-h" {
+            return "--help"
+        }
+        case "-m" {
+            return "--model"
+        }
+        default {
+            return arg
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# CLI parsing (D1)
+# ---------------------------------------------------------------------------
+
+# Store the value of a value-taking flag.
+fn apply_value(mut ServeConfig config, string flag, string raw) → void {
+    switch flag {
+        case "--model" {
+            config.model ← raw
+        }
+        case "--host" {
+            config.host ← raw
+        }
+        case "--port" {
+            config.port ← flag_port(raw)
+        }
+        case "--max-tokens" {
+            config.max_tokens ← flag_count(flag, raw)
+        }
+        case "--max-prompt" {
+            config.max_prompt ← flag_count(flag, raw)
+        }
+        case "--context" {
+            config.context ← flag_count(flag, raw)
+        }
+        case "--seed" {
+            config.seed ← flag_count(flag, raw)
+        }
+        case "--log-level" {
+            config.log_level ← flag_log_level(raw)
+        }
+        case "--expected-digest" {
+            config.expected_digest ← raw
+        }
+        case "--prompt" {
+            config.prompt ← flag_prompt(raw)
+        }
+        case "--backend" {
+            config.backend ← flag_backend(raw)
+        }
+        default {
+            usage_error("unknown option '§'"(flag))
+        }
+    }
+}
+
+# Apply a flag that takes no value; `arg` is the spelling the user typed.
+fn apply_switch(mut ServeConfig config, string flag, string arg) → void {
+    switch flag {
+        case "--help" {
+            stdout_write(HELP_TEXT)
+            panic "help requested"
+        }
+        case "--version" {
+            stdout_write("inferentia 0.1.0\n")
+            panic "version requested"
+        }
+        case "--ignore-eos" {
+            config.ignore_eos ← true
+        }
+        case "--trace" {
+            config.trace ← true
+        }
+        default {
+            usage_error("unknown option '§'"(arg))
+        }
+    }
+}
+
+# Parse argv (the program arguments only: the program name is not an
+# argument) into a ServeConfig. Every usage error exits before returning. A flag
+# that takes a value waits in `pending` for the next argument, whatever it is.
+@ public
+fn parse_cli(list<string> argv) → ServeConfig {
+    mut ServeConfig config ← ServeConfig {}
+    mut string subcommand ← ""
+    mut string pending ← ""
+    for from argv let arg {
+        if pending ≢ "" {
+            apply_value(mut config, pending, arg)
+            pending ← ""
+        } elif arg.starts_with("-") and arg.length() ≻ 1 {
+            let string flag ← long_flag(arg)
+            if flag ∈ VALUE_FLAGS {
+                pending ← flag
+            } else {
+                apply_switch(mut config, flag, arg)
+            }
+        } elif subcommand ≡ "" {
+            subcommand ← arg
+        } else {
+            usage_error("unexpected operand '§'"(arg))
+        }
+    }
+    if pending ≢ "" then usage_error("missing value for §"(pending))
+    if subcommand ≡ "" then usage_error("missing subcommand 'serve' or 'live'")
+    if subcommand ∉ ["serve", "live"] {
+        usage_error("unknown subcommand '§'"(subcommand))
+    }
+    if config.model ≡ "" then usage_error("missing required option --model")
+    return config
+}
+
+describe "serve cli parse" tag "inferentia" {
+    test "documented constants apply when no server flags are given" {
+        let ServeConfig cfg ← parse_cli(["serve", "--model", "/tmp/model.gguf"])
+        assert cfg.host ≡ "127.0.0.1"
+        assert cfg.port ≡ 8080
+        assert cfg.max_tokens ≡ 32
+        assert cfg.max_prompt ≡ 0
+        assert cfg.seed ≡ 1
+        assert cfg.log_level ≡ "info"
+        assert cfg.model ≡ "/tmp/model.gguf"
+    }
+    test "server flags override documented constants" {
+        let ServeConfig cfg ← parse_cli(["serve", "--model", "/tmp/model.gguf", "--port", "9090", "--max-tokens", "16", "--max-prompt", "2048", "--seed", "7", "--host", "127.0.0.1", "--log-level", "warn"])
+        assert cfg.port ≡ 9090
+        assert cfg.max_tokens ≡ 16
+        assert cfg.max_prompt ≡ 2048
+        assert cfg.seed ≡ 7
+        assert cfg.host ≡ "127.0.0.1"
+        assert cfg.log_level ≡ "warn"
+    }
+    test "port zero is ephemeral" {
+        let ServeConfig cfg ← parse_cli(["serve", "--model", "/tmp/model.gguf", "--port", "0"])
+        assert cfg.port ≡ 0
+    }
+    test "short model flag binds the same option" {
+        let ServeConfig cfg ← parse_cli(["serve", "-m", "/tmp/model.gguf"])
+        assert cfg.model ≡ "/tmp/model.gguf"
+    }
+    test "live subcommand accepts the model path" {
+        let ServeConfig cfg ← parse_cli(["live", "--model", "/tmp/model.gguf"])
+        assert cfg.model ≡ "/tmp/model.gguf"
+        assert live_requested(["live", "--model", "/tmp/model.gguf"])
+        assert not live_requested(["serve", "--model", "/tmp/model.gguf"])
+    }
+    test "context is unset until a flag provides it" {
+        let ServeConfig cfg ← parse_cli(["serve", "--model", "/tmp/model.gguf"])
+        assert cfg.context ≡ 0
+        assert effective_context(cfg) ≡ PINNED_CONTEXT_LENGTH
+        let ServeConfig cfg2 ← parse_cli(["serve", "--model", "/tmp/model.gguf", "--context", "4096"])
+        assert cfg2.context ≡ 4096
+        assert effective_context(cfg2) ≡ 4096
+    }
+    test "max prompt is unset until a flag provides it" {
+        let ServeConfig cfg ← parse_cli(["serve", "--model", "/tmp/model.gguf"])
+        assert cfg.max_prompt ≡ 0
+        assert effective_max_prompt(cfg) ≡ PINNED_CONTEXT_LENGTH
+        let ServeConfig cfg2 ← parse_cli(["serve", "--model", "/tmp/model.gguf", "--max-prompt", "2048"])
+        assert cfg2.max_prompt ≡ 2048
+        assert effective_max_prompt(cfg2) ≡ 2048
+    }
+    test "live prompt flag binds text; ignore-eos defaults off" {
+        let ServeConfig cfg ← parse_cli(["live", "--model", "/tmp/model.gguf", "--prompt", "hello world"])
+        assert cfg.prompt ≡ "hello world"
+        assert not cfg.ignore_eos
+        assert effective_prompt(cfg) ≡ "hello world"
+    }
+    test "live defaults select the frozen fixture prompt" {
+        let ServeConfig cfg ← parse_cli(["live", "--model", "/tmp/model.gguf"])
+        assert cfg.prompt ≡ ""
+        assert not cfg.ignore_eos
+        assert effective_prompt(cfg) ≡ FROZEN_PROMPT
+    }
+    test "ignore-eos flag parses on" {
+        let ServeConfig cfg ← parse_cli(["live", "--model", "/tmp/model.gguf", "--ignore-eos"])
+        assert cfg.ignore_eos
+        assert effective_prompt(cfg) ≡ FROZEN_PROMPT
+    }
+    test "the expected digest flag binds the pin" {
+        let ServeConfig cfg ← parse_cli(["serve", "--model", "/tmp/model.gguf", "--expected-digest", "2fa3f013"])
+        assert cfg.expected_digest ≡ "2fa3f013"
+    }
+}
+
+describe "backend selection cli parse" tag "inferentia" {
+    test "the backend defaults to metal and trace is off" {
+        let ServeConfig cfg ← parse_cli(["live", "--model", "/tmp/model.gguf"])
+        assert cfg.backend ≡ "metal"
+        assert not cfg.trace
+    }
+    test "--backend metal selects the port path" {
+        let ServeConfig cfg ← parse_cli(["serve", "--model", "/tmp/model.gguf", "--backend", "metal"])
+        assert cfg.backend ≡ "metal"
+    }
+    test "--trace switches the trace on" {
+        let ServeConfig cfg ← parse_cli(["live", "--model", "/tmp/model.gguf", "--backend", "metal", "--trace"])
+        assert cfg.backend ≡ "metal"
+        assert cfg.trace
+    }
+}
