@@ -60,13 +60,14 @@ MODEL=<dir>/SmolLM2-360M-Instruct-f32.gguf
   `--max-tokens`, `--max-prompt`, `--context`, `--seed`, `--log-level`,
   `--expected-digest`). `--backend metal` is the only accepted value and names
   the kernel route; the device is the `faber run --device` choice. Inferentia
-  has no CPU backend of its own: `--device cpu` (several cores) or
-  `--device reference` (one core) run the same kernels.
-- Engine: `live` and `serve` currently run their host half on the MIR
-  interpreter (the run prints one `ENGINE001` line), because the Cranelift JIT
-  declines it. `--strict-engine` therefore refuses the run (exit 69) until
-  those JIT gaps close. A run on the interpreter is a correctness run, never a
-  timed one. Timed runs use `--strict-engine`.
+  has no CPU backend of its own: `--device cpu` runs the same kernels on
+  several cores; `--device reference` is a correctness oracle only.
+- Engine: inference never runs on the MIR interpreter. The manifest sets
+  `[run] strict-engine = true`, so `live` and `serve` run their host half on
+  the Cranelift JIT and their kernels on the device, and any fallback to the
+  interpreter refuses the run (exit 69, `ENGINE001`/`ENGINE002`) instead of
+  running slowly. Needs radix peer/main abbc34c3f3 or later and Gradus
+  peer/main 57ac132 or later.
 
 Token correctness: the `live` command above must print the same 40 ids as
 llama.cpp (greedy): `30 198 198 788 451 6330 28 260 33197 476 269 18 4271 288

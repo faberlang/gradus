@@ -63,13 +63,12 @@ Inferentia keeps no CPU backend: CPU inference is the same kernels under
 run passes `--strict-engine`.
 
 Engine rule (operator, 2026-11-05): inference never runs on the MIR
-interpreter, and a timed run uses `--strict-engine`. Today `live` and `serve`
-still run their host half on the interpreter (one `ENGINE001` line), so
-`--strict-engine` refuses them with exit 69 until the radix JIT closes its
-host-half gaps. An unflagged run is allowed only to check token correctness
-and is labelled as such in any receipt.
+interpreter. The manifest sets `[run] strict-engine = true`: `live` and `serve`
+run their host half on the Cranelift JIT (radix peer/main abbc34c3f3 or later,
+Gradus peer/main 57ac132 or later), and any interpreter fallback refuses with
+exit 69. Never remove the key to get a run; a refusal names the gap to close.
 
-Token-correctness run (unflagged, correctness only; about 2 minutes):
+Token-correctness run (strict through the manifest; about 16 s on an M5 Max, most of it model load):
 
 ```sh
 "$FABER" run --device metal --library-home "$LIBRARY_HOME" "$INF" -- \
