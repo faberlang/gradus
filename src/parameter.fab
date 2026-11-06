@@ -30,17 +30,22 @@ locale = "en"
 #                parameters never mutate, so their version never bumps.
 #   owner  — owner path (e.g. "model.block0.linear.weight").
 #
-# Mutation rules:
-#   * mutation replaces VALUES only — the identity's shape and dtype are
-#     pinned by construction; mutate takes the flat value list (the tensor's
-#     movable form) and rebuilds the value against the pinned identity;
-#   * a successful mutation bumps version by 1;
-#   * frozen parameters never mutate.
-#   * Registry.tie(canonical, alias) keeps the canonical identity and payload,
-#     removes the alias's independent slot, and makes alias lookup resolve to
-#     that same identity. Replacing through either path updates the one slot.
-#     Tied slots must agree in dtype, shape, and trainability. Independent
-#     registrations remain independent even when their values are equal.
+# Mutation rules / public payload-path audit:
+#   * mutate(p, data, expected_version) changes values only; it rejects stale
+#     versions (StaleVersion) and frozen parameters (FrozenMutation).
+#   * Registry.replace(owner, name, payload, expected_version) resolves the
+#     registered slot (including aliases), rejects stale versions, then calls
+#     guarded mutate; frozen parameters are rejected by mutate.
+#   * add registers an existing payload, rejecting duplicate (owner,name); it
+#     does not change payload bytes.
+#   * tie removes an independent slot and redirects its path; it checks distinct
+#     registered identities and matching dtype, shape, and trainability, but
+#     does not change payload bytes. These are all public payload-related paths.
+#   Every successful mutation bumps version; frozen parameters never mutate.
+#   Registry-over-record evidence in parameter.proba establishes ownership:
+#   registry slots own authoritative Parameter/payload values keyed by record
+#   field paths; typed model records are construction/read views. Linear and
+#   nested two-layer models retrieve fields in repeatable registry order.
 #
 # Traversal:
 #   * status: Trainable (trainable) | Frozen (frozen);
@@ -307,15 +312,29 @@ fn construct_frozen(string name, string owner, string dtype_name, list<int> shap
     return assemble(name, owner, dtype_name, shape, data, variant Frozen)
 }
 
-# -------------------------------------------------------------------------
-# Mutation rules.
+# Mutation rules:
 #   * values only — shape and dtype are pinned by identity;
 #   * frozen parameters reject mutation (FrozenMutation);
+#   * every payload-changing API is audited here: mutate(p, data,
+#     expected_version) rejects frozen parameters and stale versions;
+#     Registry.replace(owner, name, payload, expected_version) resolves ties,
+#     checks the current version, then delegates to mutate;
+#     add only registers an existing payload and does not change it;
+#     tie removes an independent slot and redirects lookup, without changing
+#     either payload. No other public API changes payload bytes.
 #   * a successful mutation bumps version by 1.
+#
+# Registry over records: parameter.proba registers linear and nested two-layer
+# record fields under their full field-path owners, then retrieves all fields
+# in deterministic registry order on repeated runs. Evidence from that example
+# establishes ownership: the registry owns immutable Parameter/payload values
+# and record-typed models are typed views/inputs; registry slots keyed by field
+# paths are the authoritative update identities (records are not mutated).
 # -------------------------------------------------------------------------
 
 @ public
-fn mutate(Parameter p, list<f32> data) → Parameter ⇥ ParameterError {
+fn mutate(Parameter p, list<f32> data, int expected_version) → Parameter ⇥ ParameterError {
+    reject p.version() ≢ expected_version throw variant StaleVersion { message = "stale parameter version" }
     reject status_is_frozen(p.status) throw variant FrozenMutation { message = "frozen parameter cannot be mutated" }
     let tensor.NumericBlock out ← tensor.construct_f32(data, p.shape())
     return Parameter { identity = Identity { name = p.name(), dtype = p.identity.dtype, shape = p.shape(), version = p.version() + 1, owner = p.owner() }, status = p.status, payload = out }
@@ -462,7 +481,7 @@ class Registry {
     fn replace(string owner, string name, list<f32> payload, int expected_version) → Registry ⇥ ParameterError {
         let Parameter current ← self.find(owner, name)
         reject current.version() ≢ expected_version throw variant StaleVersion { message = "stale parameter version" }
-        let Parameter updated ← mutate(current, payload)
+        let Parameter updated ← mutate(current, payload, current.version())
         let list<list<string>> next_ties ← copy self.ties
         mut list<Parameter> next ← copy self.parameters
         for range 0 ‥ next.length() let i {
