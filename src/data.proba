@@ -207,20 +207,92 @@ test "batch rejects a batch size above the corpus length" {
     assert batch_detail(corpus(), 9) ≡ "batch size exceeds corpus length"
 }
 
-test "supervised batches preserve aligned input and target rows and retain tail" {
+fn supervised_input_width_error() → string {
+    let _ outcome ← trap { data.supervised_set([[1], [2, 3]], [[11], [12]]) }
+    match outcome {
+        case returned let _ { return "accepted" }
+        case thrown let err {
+            match err {
+                case data.DataError.InputWidthMismatch let message, expected_width, actual_width { return message }
+                case _ { return "wrong error" }
+            }
+        }
+    }
+}
+
+fn supervised_target_width_error() → string {
+    let _ outcome ← trap { data.supervised_set([[1], [2]], [[11], [12, 13]]) }
+    match outcome {
+        case returned let _ { return "accepted" }
+        case thrown let err {
+            match err {
+                case data.DataError.TargetWidthMismatch let message, expected_width, actual_width { return message }
+                case _ { return "wrong error" }
+            }
+        }
+    }
+}
+
+test "supervised tensor batches keep shuffled pairs aligned, use independent widths, and retain tail" {
     let _ outcome ← trap {
-        let data.SupervisedSet set ← data.supervised_set([[10], [20], [30]], [[110], [120], [130]])
+        let data.SupervisedSet set ← data.supervised_set([[10, 20], [11, 21], [12, 22]], [[110, 210, 310], [111, 211, 311], [112, 212, 312]])
         let list<data.Batch> batches ← data.supervised_batches(set, [2, 0, 1], 2)
         assert batches.length() ≡ 2
-        let data.Batch first ← batches.get(0) coalesce data.Batch { x = empty, y = empty }
-        let data.Batch tail ← batches.get(1) coalesce data.Batch { x = empty, y = empty }
-        assert first.x ≡ ([[30], [10]] ↦ list<list<int>>)
-        assert first.y ≡ ([[130], [110]] ↦ list<list<int>>)
-        assert tail.x ≡ ([[20]] ↦ list<list<int>>)
-        assert tail.y ≡ ([[120]] ↦ list<list<int>>)
+        let data.Batch first ← batches.get(0) coalesce data.Batch { x = tensor.default(), y = tensor.default() }
+        let data.Batch tail ← batches.get(1) coalesce data.Batch { x = tensor.default(), y = tensor.default() }
+        assert first.x.shape ≡ ([2, 2] ↦ list<int>)
+        assert first.y.shape ≡ ([2, 3] ↦ list<int>)
+        assert first.x.data ≡ ([12.0, 22.0, 10.0, 20.0] ↦ list<f32>)
+        assert first.y.data ≡ ([112.0, 212.0, 312.0, 110.0, 210.0, 310.0] ↦ list<f32>)
+        assert tail.x.shape ≡ ([1, 2] ↦ list<int>)
+        assert tail.y.shape ≡ ([1, 3] ↦ list<int>)
+        assert tail.x.data ≡ ([11.0, 21.0] ↦ list<f32>)
+        assert tail.y.data ≡ ([111.0, 211.0, 311.0] ↦ list<f32>)
     }
     match outcome {
-        case returned let _ {}
+        case returned let _ { }
+        case thrown let _ { assert false }
+    }
+}
+
+test "supervised set refuses inconsistent input and target widths with named-width errors" {
+    assert supervised_input_width_error() ≡ "input sample widths differ: expected 1, got 2"
+    assert supervised_target_width_error() ≡ "target sample widths differ: expected 1, got 2"
+}
+
+test "fixed-seed supervised epoch covers each training row once, excludes held-out rows, and preserves pairing" {
+    let _ outcome ← trap {
+        let data.SupervisedSplit split ← data.supervised_split(8, 3)
+        let data.SupervisedSet set ← data.supervised_set([[0, 10], [1, 11], [2, 12], [3, 13], [4, 14], [5, 15], [6, 16], [7, 17]], [[100, 200, 300], [101, 201, 301], [102, 202, 302], [103, 203, 303], [104, 204, 304], [105, 205, 305], [106, 206, 306], [107, 207, 307]])
+        let data.Shuffled order ← data.epoch_order(split.training, seed_p(SEED_A))
+        assert order.payload ≡ ([4, 5, 7, 2, 1] ↦ list<int>)
+        let list<data.Batch> batches ← data.supervised_batches(set, order.payload, 2)
+        assert batches.length() ≡ 3
+        let data.Batch tail ← batches.get(2) coalesce data.Batch { x = tensor.default(), y = tensor.default() }
+        assert tail.x.shape ≡ ([1, 2] ↦ list<int>)
+        assert tail.y.shape ≡ ([1, 3] ↦ list<int>)
+        mut list<f32> seen ← empty
+        for from batches let batch {
+            for range 0 ‥ (batch.x.shape.get(0) coalesce 0) let row {
+                let f32 sample ← batch.x.data.get(row * 2) coalesce 0.0
+                let f32 target ← batch.y.data.get(row * 3) coalesce 0.0
+                assert target ≡ sample + 100.0
+                assert (batch.x.data.get(row * 2 + 1) coalesce 0.0) ≡ sample + 10.0
+                seen.append(sample)
+            }
+        }
+        assert seen ≡ ([4.0, 5.0, 7.0, 2.0, 1.0] ↦ list<f32>)
+        for from split.training let sample {
+            mut int occurrences ← 0
+            for from seen let observed { if observed ≡ (sample ↦ f32) { occurrences ← occurrences + 1 } }
+            assert occurrences ≡ 1
+        }
+        for from split.held_out let sample {
+            for from seen let observed { assert observed ≢ (sample ↦ f32) }
+        }
+    }
+    match outcome {
+        case returned let _ { }
         case thrown let _ { assert false }
     }
 }
@@ -237,14 +309,18 @@ test "supervised held-out split indices are disjoint and exhaustive" {
     }
 }
 
-test "sampler wire round-trips seed epoch and tail position" {
-    let data.SupervisedSampler state ← data.SupervisedSampler { corpus = "3", seed = 123, epoch = 2, position = 2 }
-    let _ decoded ← data.supervised_sampler_parse(data.supervised_sampler_wire(state))
+test "sampler wire round-trips seed epoch and tail position through the shared versioned format" {
+    let data.SupervisedSampler state ← data.SupervisedSampler { corpus = data.supervised_indices_identity([1, 2, 4, 5, 7]), seed = 123, epoch = 2, position = 4 }
+    let string wire ← data.supervised_sampler_wire(state)
+    assert wire ≡ "supervised-sampler-v1#d5:1,2,4,5,7;#123#2#4"
+    let _ decoded ← data.supervised_sampler_parse(wire)
     assert decoded not is none
     let data.SupervisedSampler restored ← decoded coalesce state
+    assert restored.corpus ≡ state.corpus
     assert restored.seed ≡ 123
     assert restored.epoch ≡ 2
-    assert restored.position ≡ 2
+    assert restored.position ≡ 4
+    assert data.supervised_sampler_parse("supervised-sampler-v2#d5:1,2,4,5,7;#123#2#4") is none
 }
 
 # ---- LM byte vocabulary and corpus identity
