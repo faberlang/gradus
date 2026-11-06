@@ -154,7 +154,7 @@ has no `@ publica`).
 | `src/nn.fab` | NnError@162 |
 | `src/attention.fab` | AttentionError@140, rotary_position_embedding@508 |
 | `src/transformer.fab` | TransformerError@164 |
-| `src/train.fab` | TrainError@280, Mode@423, mode_name@429, is_discipline@445, is_estimate@450, mode@457, dropout_probability@472, Draw@563, next@580, Dropout@630, dropout@645, serialize_seed@678, deserialize_seed@682 |
+| `src/train.fab` | former shared train error union@280, Mode@423, mode_name@429, is_discipline@445, is_estimate@450, mode@457, dropout_probability@472, Draw@563, next@580, Dropout@630, dropout@645, serialize_seed@678, deserialize_seed@682 |
 | `src/parameter.fab` | status_name@88, ParameterError@100, Identity@134, identity_equal@170, is_trainable@253, construct_frozen@313, Registry@355, empty_registry@413, add@419, serialize@465, deserialize@473 |
 | `src/optimize.fab` | OptimizeError@115, message@132, state_equal@231, sgd_equal@297, serialize_state@405, deserialize_state@410 |
 | `src/serialize.fab` | SerializeError@117, message@126, SerializedTensor@144, ParameterWire@166, serialize_dtype@460, serialize_shape@472, serialize_tensor@506, serialize_parameter@543, deserialize_dtype@634, deserialize_shape@647, deserialize_tensor@677, deserialize_parameter@719 |
@@ -416,8 +416,8 @@ oracle).
 
 | Field | Value |
 | --- | --- |
-| outcome | train family public-import surface complete: TrainError, Mode, Draw, Dropout + mode_name/is_discipline/is_estimate/mode/dropout_probability/next/dropout/serialize_seed/deserialize_seed `@ publica`; all SEM006 referencing `train.` cleared (30 visible + masked sites) |
-| exact write scope | `src/train.fab` — `@ publica` above the 13 §4 anchors (TrainError@280 … deserialize_seed@682) |
+| outcome | train family public-import surface complete: former shared train error union, Mode, Draw, Dropout + mode_name/is_discipline/is_estimate/mode/dropout_probability/next/dropout/serialize_seed/deserialize_seed `@ publica`; all SEM006 referencing `train.` cleared (30 visible + masked sites) |
+| exact write scope | `src/train.fab` — `@ publica` above the 13 §4 anchors (former shared train error union@280 … deserialize_seed@682) |
 | first failing oracle | `src/train.proba:80:21` SEM006 (`train.Mode`) |
 | closeout command | common closeout with `<X>` = train |
 | expected observed result | zero SEM006 referencing `train.` in the sweep; `faber test .` SEM006 drops by ≥30 (masked train.proba + optimize-targeted sites surface here or under SEM-OPTIMIZE; record non-train ones) |

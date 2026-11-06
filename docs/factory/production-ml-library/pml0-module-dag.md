@@ -137,7 +137,7 @@ L3  Loss                gradus:loss
 L4  Optimization        gradus:optimize
 L5  NN primitives       gradus:nn
 L6  Architecture blocks gradus:attention, gradus:transformer
-L7  Training and data   gradus:train, gradus:data
+L7  Training and data   training module, gradus:data
 SC  Shared value contracts (PML1)   gradus:parameter, gradus:serialize
 ```
 
@@ -167,7 +167,7 @@ L5  gradus:nn          (declared standalone)
 L6  gradus:attention ──▶ gradus:tensor, gradient, nn   (declared)
     gradus:transformer ──▶ gradus:tensor, gradient, nn, attention  (declared)
       │
-L7  gradus:train       (declared standalone; inline update math)
+L7  training module       (declared standalone; inline update math)
     gradus:data ──▶ gradus:tensor          (declared)
       │
 SC  gradus:serialize   (leaf — no imports; mirrors shape ceilings and dtype
@@ -188,7 +188,7 @@ PML2  gradus:model/capsule (leaf root — no imports)
 | loss | gradus:optimize, gradus:nn | a loss is a differentiable function, not an optimization concern |
 | nn | gradus:attention, gradus:transformer | primitives do not know the architectures built from them |
 | optimize | gradus:nn, gradus:attention, gradus:transformer | optimizers consume raw tensors, not layer abstractions |
-| transformer | gradus:train | a transformer does not own its training loop |
+| transformer | training module | a transformer does not own its training loop |
 | gradient | loss, optimize, nn, attention, transformer | pure calculus — does not know what it differentiates |
 | train | any specific model definition | the training loop is reusable across models |
 

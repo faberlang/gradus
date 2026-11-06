@@ -12,10 +12,11 @@ locale = "en"
 # backend or device handle.
 #
 # Two tiers. The typed surface is shape-generic over compile-time f32
-# shapes: mse<M,N>. The staged surface rides the gradus:tensor NumericBlock
-# carrier (runtime shapes — R3: no one-row/one-shape narrowing in the
-# public API): mse_carrier and cross_entropy. Staged failures are typed
-# LossError values with a text message.
+# shapes: mse<M,N> and cross_entropy<N,C>. The staged surface rides the
+# gradus:tensor NumericBlock carrier (runtime shapes): mse_carrier,
+# cross_entropy_carrier, and cross_entropy_masked_carrier. Typed CE currently
+# takes dense one-hot f32 targets because CruxEntropia has that contract;
+# indexed-i32 typed targets and a masked typed VJP require compiler support.
 #
 # The typed and staged MSE rows expose the same element arithmetic
 # (mean((p − t)²)) through compile-time and runtime shape contracts. New
@@ -26,21 +27,18 @@ locale = "en"
 #                      training proofs. Typed mse<M,N> and staged mse_carrier
 #                      share this one formula.
 #   cross_entropy    = mean over rows of (logsumexp(logits_row) −
-#                      logits_row[target]) — the classification / next-token
-#                      path. logsumexp uses the numerically stabilized form
-#                      max + ln(Σ_c exp(z_c − max)); exp via the base-e
-#                      exponentiation with a sign split so power is only
-#                      ever called with a non-negative exponent (the accepted
-#                      GELU tanh precedent), ln self-hosted by range
-#                      reduction + the atanh series (no scalar log builtin
-#                      exists in the compiler surface).
+#                      logits_row[target]); typed tensors currently use
+#                      dense one-hot f32 targets through CruxEntropia.
+#                      The carrier API accepts i32 class indices and has a
+#                      masked form. logsumexp uses the numerically
+#                      stabilized max + ln(Σ_c exp(z_c − max)) form.
 #
 # --- Determinism contract -----------------------------------------------
 # Both losses are pure, deterministic functions: no RNG, no global state, no
 # hidden reduction order. Iteration is fixed row-major over the flat storage,
 # so equal inputs produce bit-identical outputs. A training run seeded with
-# the same data therefore reproduces identical losses; seed and checkpoint
-# machinery belongs to gradus:train.
+# the same data therefore reproduces identical losses; seed state belongs to
+# gradus:random and checkpoint envelopes to gradus:checkpoint.
 #
 # --- Non-finite handling (capsule rule — fail closed, no silent tolerance) -
 # Any non-finite (NaN/±Inf) value in an input fails closed with
@@ -61,8 +59,9 @@ locale = "en"
 #
 # --- Seams ----------------------------------------------------------------
 #   * optimizer state, schedules, train/eval mode, metrics, and seeds (RNG)
-#     belong to gradus:optimize / gradus:train. This module must not import
-#     from either package.
+#     belong to gradus:optimize / gradus:schedule / gradus:nn /
+#     gradus:random / gradus:checkpoint. This module must not import from
+#     those packages.
 
 import from "gradus:dtype" dtype
 
@@ -184,6 +183,28 @@ fn log(f32 x) → f32 {
 }
 
 # -------------------------------------------------------------------------
+# Cross-entropy aggregation for token-weighted microbatches. A batch exports
+# its unnormalized loss sum and valid-token count; combining these records
+# computes a global token mean rather than a mean of batch means.
+# -------------------------------------------------------------------------
+
+@ public
+class CrossEntropyStats {
+    mut f32 sum
+    mut int valid_count
+
+    fn mean() → f32 ⇥ LossError {
+        require self.valid_count ≢ 0 throw variant ElementMismatch { message = "no valid targets" }
+        return self.sum / (self.valid_count ↦ f32)
+    }
+}
+
+@ public
+fn combine_cross_entropy_stats(CrossEntropyStats left, CrossEntropyStats right) → CrossEntropyStats {
+    return CrossEntropyStats { sum = left.sum + right.sum, valid_count = left.valid_count + right.valid_count }
+}
+
+# -------------------------------------------------------------------------
 # Family: mse — mean((prediction − target)²), one formula, two tiers.
 # Typed mse<M,N> is the public surface: compile-time [M, N] f32 shapes,
 # infallible, kernel-eligible. mse_carrier is the staged load-edge
@@ -227,6 +248,16 @@ fn mse_carrier(tensor.NumericBlock prediction, tensor.NumericBlock target) → f
     return acc / (total ↦ f32)
 }
 
+# Typed unmasked cross entropy. CruxEntropia differentiates logits and
+# accepts dense f32 one-hot/soft targets with the same [N,C] shape. This is
+# the compiler's existing typed primitive; class-index i32 targets are
+# accepted by the carrier API below, but cannot yet be lowered to this op.
+@ radix { lane = "air" }
+@ public
+fn cross_entropy<size N, size C>(tensor<f32, [N, C]> logits, tensor<f32, [N, C]> one_hot_targets) → f32 {
+    return logits.cross_entropy(one_hot_targets)
+}
+
 # -------------------------------------------------------------------------
 # Family: cross_entropy — mean over rows of (logsumexp(logits_row) −
 # logits_row[target]) over the staged carrier. The classification /
@@ -242,7 +273,7 @@ fn mse_carrier(tensor.NumericBlock prediction, tensor.NumericBlock target) → f
 # The mean denominator is the count of included targets, not the padded row
 # count. An all-zero mask fails closed rather than producing NaN or a bogus
 # zero loss.
-fn _cross_entropy_impl(tensor.NumericBlock logits, tensor.NumericBlock target, tensor.NumericBlock mask, bool use_mask) → f32 ⇥ LossError {
+fn cross_entropy_stats_impl(tensor.NumericBlock logits, tensor.NumericBlock target, tensor.NumericBlock mask, bool use_mask) → CrossEntropyStats ⇥ LossError {
     let list<int> fl ← logits.shape
     require fl.length() ≡ 2 throw variant GradusMismatch { message = "cross_entropy requires rank-2 logits" }
     dtype_f32(logits)
@@ -302,20 +333,30 @@ fn _cross_entropy_impl(tensor.NumericBlock logits, tensor.NumericBlock target, t
         }
     }
     require valid_rows ≢ 0 throw variant ElementMismatch { message = "no valid targets" }
-    return acc / (valid_rows ↦ f32)
+    return CrossEntropyStats { sum = acc, valid_count = valid_rows }
 }
 
-# Unmasked classification / next-token cross entropy: every target row is
-# included in the mean.
+# Unmasked staged carrier API: integer class-index targets, every row used.
 @ public
-fn cross_entropy(tensor.NumericBlock logits, tensor.NumericBlock target) → f32 ⇥ LossError {
-    return _cross_entropy_impl(logits, target, tensor.default(), false)
+fn cross_entropy_stats_carrier(tensor.NumericBlock logits, tensor.NumericBlock target) → CrossEntropyStats ⇥ LossError {
+    return cross_entropy_stats_impl(logits, target, tensor.default(), false)
 }
 
-# Mask-aware next-token cross entropy. `loss_mask` must be an i32 vector
-# containing only 0/1 values; padded targets at masked-out rows are ignored.
-# Fails with LossError.ElementMismatch when no targets are valid.
 @ public
-fn cross_entropy_masked(tensor.NumericBlock logits, tensor.NumericBlock target, tensor.NumericBlock loss_mask) → f32 ⇥ LossError {
-    return _cross_entropy_impl(logits, target, loss_mask, true)
+fn cross_entropy_carrier(tensor.NumericBlock logits, tensor.NumericBlock target) → f32 ⇥ LossError {
+    let CrossEntropyStats stats ← cross_entropy_stats_carrier(logits, target)
+    return stats.mean()
+}
+
+# Masked staged carrier API. The sum/count record is the microbatch interface;
+# padded rows are excluded from both fields.
+@ public
+fn cross_entropy_masked_stats_carrier(tensor.NumericBlock logits, tensor.NumericBlock target, tensor.NumericBlock loss_mask) → CrossEntropyStats ⇥ LossError {
+    return cross_entropy_stats_impl(logits, target, loss_mask, true)
+}
+
+@ public
+fn cross_entropy_masked_carrier(tensor.NumericBlock logits, tensor.NumericBlock target, tensor.NumericBlock loss_mask) → f32 ⇥ LossError {
+    let CrossEntropyStats stats ← cross_entropy_masked_stats_carrier(logits, target, loss_mask)
+    return stats.mean()
 }

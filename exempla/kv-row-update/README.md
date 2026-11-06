@@ -1,39 +1,53 @@
-# In-place KV row updates
+# In-place KV block writes
 
-This package updates two rows of one resident cache, then attempts a negative
-and an out-of-capacity position. Those two calls are no-ops. The output is the
-unchanged first row `[0, 1, 2, 3, 4]`, followed by rows `[100, ..., 104]` and
-`[200, ..., 204]`.
+`kv_write_block(cache, block, start)` writes the block's in-capacity rows in one
+kernel launch. The example primes the cache as a read-only resident input before
+writing it, and exercises block sizes 1, 7 and the full 9-row capacity. Output is
+the final full-cache block; no per-write cache-sized output buffer is introduced.
 
-Build the sibling Radix product and pass the absolute parent directory as
-`--library-home`. From this repository, for example:
+Run with a library home that contains the repository as `gradus`:
 
 ```sh
-../radix/target/debug/faber run exempla/kv-row-update --library-home /path/to/parent --device reference
-../radix/target/debug/faber run exempla/kv-row-update --library-home /path/to/parent --device metal --stats
-../radix/target/debug/faber run exempla/kv-row-update --library-home /path/to/parent --device metal --partitions 3 --stats
+faber run exempla/kv-row-update --library-home "$LIBHOME" --device reference
+faber run exempla/kv-row-update --library-home "$LIBHOME" --device metal --stats
 ```
 
-`kv_write` reads the cache shape on the host before invoking `kv_write_row`.
-The raw kernel is public so the device image can launch it; a direct call to
-that kernel has the ordinary checked-index contract. Use `kv_write` for the
-library's invalid-position no-op behavior. The caller supplies a separate row
-tensor; writable aliases of the cache are not admitted as another argument.
+## Metal receipt
 
-## Verification, 2026-10-23
+Measured with `faber 1.18.1` on Apple M1 (`--device metal --stats`). The device
+stats counters read were `runtime.launch_count`, `uploaded_bytes`,
+`downloaded_bytes`, and `peak_allocated_bytes`:
 
-Tested the source in this change with the sibling Radix `7cb9627668` debug
-product on the laptop (Apple M5 Max, macOS 26.5.2, Rust 1.99.1):
+- 1-row write: 1 launch; 20 logical f32 bytes written (1 × 5 × 4).
+- 7-row write: 1 launch; 140 logical f32 bytes written (7 × 5 × 4).
+- 9-row/full-capacity write: 1 launch; 180 logical f32 bytes written (9 × 5 × 4).
+- For the complete exemplar (including one cache-prime launch): 4 launches,
+  524 uploaded bytes, 184 downloaded bytes, 1,049,100 peak allocated bytes.
 
-- `decode_step` and `decode_token` package tests: 20 passed on reference and
-  20 passed on the CPU device with four workers. Cache assertions are exact
-  f32 equality; the other numerical tests retain their existing comparisons.
-- This example: exact expected output on reference, CPU, Metal, and Metal
-  with three virtual partitions.
-- Both Metal runs recorded exactly two kernel launches, proving that the
-  invalid positions did not launch and the valid calls used the device.
-- The three-partition run recorded two first-partition launches, with
-  `writes-not-lane-local`: in-place mutation is implemented independently of
-  the later partial-write split/transfer optimization.
+The individual block sizes are separate kernel entries, each called once; launch
+count is independent of rows within a block. The written element count scales as
+rows × K. The 184 downloaded bytes are the one final 180-byte cache observation
+and the 4-byte prime sink; the three writes do not allocate or download a
+full-capacity output per call. Peak allocated bytes include Metal's runtime pool
+and are not a cache-output allocation measurement.
 
-This is a correctness and dispatch receipt, not a performance benchmark.
+The single-row `kv_write` remains available and retains its existing invalid
+position no-op behavior. For block writes, out-of-range rows are skipped
+individually: negative starts write nothing; a block running past capacity writes
+only the in-range prefix.
+
+The block kernel stores directly into the cache, has no writable row view or
+cache alias argument, and keeps all bounds guards in the kernel rather than
+reading the cache shape on the host.
+
+The package-level source test currently cannot complete: besides warnings, the
+existing test file's `argmax_chunks` references resolve to an absent public
+member in `decode_step.fab`. The block-write assertions are included in that
+file, but the required whole-file test command exits during package analysis.
+
+`./scripta/check-source` and `LIBRARY_HOME="$LIBHOME" FABER_BIN="$FABER"
+./scripta/check-compile` pass.
+
+Expected final output is nine rows beginning `[300, 301, 302, 303, 304]` and
+ending `[380, 381, 382, 383, 384]`.
+'});

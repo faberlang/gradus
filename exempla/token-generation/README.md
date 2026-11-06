@@ -49,7 +49,7 @@ before every step (honored: a cancelled flag stops the run).
 | --- | --- |
 | Token decode | `decode.decode_data(prev, position, m)` — one-token decode over the shared forward row (embedding gather → transformer block → output projection) |
 | Greedy selection | `sampling.max` — the exact argmax path (temperature 0) |
-| Seeded draw | `sampling.sample` — the deterministic pipeline (rep-penalty → temperature → top-k → softmax → top-p → min-p) + one `train.next_f32` draw per step, walking the cumulative distribution (first-index rule) |
+| Seeded draw | `sampling.sample` — the deterministic pipeline (rep-penalty → temperature → top-k → softmax → top-p → min-p) + one `random.next_f32` draw per step, walking the cumulative distribution (first-index rule) |
 | Bounded loop | `generation.fresh_cursor` / `token_allowed` / `cursor_advance` — the cursor limits (reject, never truncate) + the configured EOG-stop policy (`decoder.is_eog` — terminate at the first EOG token `0`/`2`) drive the loop |
 | Cancellation | `decode.observe_cancellation` per step — the cooperative checkpoint (fail closed) |
 | Determinism | pure composition: same model + config + seed → same tokens; the advanced `Seed` is carried explicitly |
@@ -58,7 +58,7 @@ before every step (honored: a cancelled flag stops the run).
 
 The expected token sequences are f64 evaluations of the documented
 decode + sampling arithmetic (the same pins the U1/U3 probas carry;
-re-verified model-independent against the train.proba recurrence pins).
+re-verified model-independent against the random.proba recurrence pins).
 Pins are recorded in `src/decode.proba` (PML5-U6 section). Tolerance:
 the decode logits compare within the documented 5e-4; the token
 sequences are exact (the token choice is robust — see the boundaries).

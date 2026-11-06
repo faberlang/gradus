@@ -6,7 +6,7 @@ a 4×4 two-layer MLP (linear → GELU → linear → MSE), 100 steps, lr 0.1 —
 the accepted MLP training-proof shape (`examples/training/mlp`, the pinned
 CPU/FMIR oracle).
 
-**Tier**: executed (FMIR stepper). Oracle pins below match `src/train.proba`
+**Tier**: executed (FMIR stepper). Oracle pins below match `src/mlp.proba`
 (PML4-U6). The 100-step loop runs through the generic list-driven optimizer
 step (`optimize.sgd_step`) over the 4×4 fixture; printed losses match the pins
 (final `0.017928625511508454`).
@@ -17,14 +17,15 @@ step (`optimize.sgd_step`) over the 4×4 fixture; printed losses match the pins
 | --- | --- |
 | Schedule → optimizer-state binding | `schedule.scheduled_rate` feeds `optimize.construct`'s `rate` each step — the accepted constant lr 0.1 is the schedule `Schedule(0.1, 0, 1, 0.1)` (vertex == end) |
 | Shared-layer training path | `mlp.forward_mlp_loss` (loss) + the compiler-generated companion `forward_mlp_loss_backward` (gradients) |
+| One forward for both paths | the typed shared `mlp.forward_mlp` IS the forward: `forward_mlp_loss` composes it for training, and every per-step agreement check recomputes the loss from that same typed forward over the same inputs — one definition, and it prints `agree` = true after the loop |
 | Per-parameter gradients | `gradient.construct` records (U2): identity + generation = the parameter version at the backward |
 | Optimizer steps | Tensor SGD: `optimize.sgd_step` generic list form over the 4×4 fixture. Parameter/checkpoint: `optimize.step` (U3) fresh-gradient rules, fail-closed; `parameter.mutate` bumps version |
-| Per-step metric log | `metrics.metric` (U5): `loss` = the loss (the accepted trajectory); `accuracy` = the documented regression-match rate (`|pred − target| ≤ 0.1` over the 16 output elements, read from the bare shared forward `mlp.forward_mlp`) |
-| Checkpoint in/out | `train.construct_checkpoint` (U5): whole-optimizer state wire (U3 `serialize`) + RNG state + epoch/step; `serialize_checkpoint` → `deserialize_checkpoint` is the resume round-trip (`checkpoint_equal`) |
+| Per-step metric log | `metrics.metric` (U5): `loss` = the loss (the accepted trajectory); `accuracy` = the documented regression-match rate (`|pred − target| ≤ 0.1` over the 16 output elements), read from the typed shared forward `mlp.forward_mlp` over the current tensor values — the same definition `forward_mlp_loss` composes |
+| Checkpoint in/out | `checkpoint.construct_checkpoint` (U5): whole-optimizer state wire (U3 `serialize`) + RNG state + epoch/step; `serialize_checkpoint` → `deserialize_checkpoint` is the resume round-trip (`checkpoint_equal`) |
 
 ## Convergence target (accepted oracle, f64 evaluations)
 
-Pinned in `src/train.proba` (PML4-U6). The proba asserts the gate
+Pinned in `src/mlp.proba` (PML4-U6). The proba asserts the gate
 `final/initial < 0.1` and the trajectory points below (step 25 is part of
 the documented target series; the proba binds l0/l10/l50/l75/l99 for the
 ratio checks):
