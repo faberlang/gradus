@@ -25,11 +25,13 @@ MODEL="${3:-/Users/ianzepp/ai/models/SmolLM2-360M-Instruct-f32.gguf}"
 SCRATCH="${4:-/tmp/port-load-driver}"
 export PATH="/opt/homebrew/bin:$PATH"
 
-rm -rf "$SCRATCH/pkg"
+if [ -e "$SCRATCH/pkg" ]; then
+  echo "scratch package exists: $SCRATCH/pkg (remove it or pass another scratch-dir)" >&2
+  exit 1
+fi
 mkdir -p "$SCRATCH/pkg/src"
-cp "$PKG/faber.toml" "$PKG/faber.lock" "$SCRATCH/pkg/"
-# faber.lock names the library by a path relative to the package root
-ln -sfn "$LIBRARY_HOME/gradus" "$SCRATCH/gradus"
+# gradus resolves from <library home>/gradus/src; the package carries no lock.
+cp "$PKG/faber.toml" "$SCRATCH/pkg/"
 cp "$PKG/src/port_weights.fab" "$PKG/src/port_generate.fab" "$SCRATCH/pkg/src/"
 python3.13 - "$PKG/src/main.fab" "$HERE/driver.fab.part" "$SCRATCH/pkg/src/main.fab" <<'PY'
 import re, sys
