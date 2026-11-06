@@ -40,7 +40,6 @@ INF="$(pwd)"                              # absolute package path (this reposito
 MODEL=<dir>/SmolLM2-360M-Instruct-f32.gguf
 
 "$FABER" check --library-home "$LIBRARY_HOME" "$INF"
-"$FABER" build --library-home "$LIBRARY_HOME" "$INF"                    # target/faber-mir/image.fmir
 "$FABER" test  --device reference --library-home "$LIBRARY_HOME" "$INF" # 132 package tests, about 4 s
 "$FABER" run --device metal --library-home "$LIBRARY_HOME" "$INF" -- \
     live --model "$MODEL" --max-tokens 40 --ignore-eos --trace
@@ -51,10 +50,10 @@ MODEL=<dir>/SmolLM2-360M-Instruct-f32.gguf
   `faber.lock` and no `[dependencies]` table, so it builds from any checkout or
   worktree. While a stale `norma/` checkout sits beside `gradus/` it shadows
   the embedded Norma, so use a home that holds only a `gradus` link.
-- The manifest target is `fmir`. The Rust target refuses the decode launches'
-  run-time tensor shapes (`CODEGEN001`), so `target = "rust"` no longer checks.
-  `faber run` ignores the build target and runs the source on the device named
-  by `--device`.
+- The manifest names no build target, like the corpus simulations: `faber run`
+  runs the source on the device named by `--device`. (`target = "rust"` no
+  longer checks: the Rust target refuses the decode launches' run-time tensor
+  shapes, `CODEGEN001`.)
 - Program arguments follow `--` and start at the first operand. Subcommands:
   `live` (one-shot generation: `--model`, `--prompt`, `--max-tokens`,
   `--ignore-eos`, `--trace`) and `serve` (HTTP: `--model`, `--host`, `--port`,

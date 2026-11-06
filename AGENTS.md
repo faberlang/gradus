@@ -50,15 +50,17 @@ FABER=<radix>/target/release/faber       # cargo build --release -p faber, in ra
 LIBRARY_HOME=<dir with a gradus link>
 INF="$(pwd)"
 "$FABER" check --library-home "$LIBRARY_HOME" "$INF"                    # about 2 s
-"$FABER" build --library-home "$LIBRARY_HOME" "$INF"                    # image: target/faber-mir/image.fmir
 "$FABER" test  --device reference --library-home "$LIBRARY_HOME" "$INF" # 132 package tests, about 4 s
 ```
 
-The manifest target is `fmir`: the Rust target refuses the decode launches'
-run-time tensor shapes. `faber run` ignores the build target.
+The manifest names no build target, like the corpus simulations; `faber run`
+runs the source on the device named by `--device`. The Rust target refuses the
+decode launches' run-time tensor shapes.
 
 Inferentia keeps no CPU backend: CPU inference is the same kernels under
-`faber run --device cpu` or `--device reference`.
+`faber run --device cpu`. Inference never runs on the MIR interpreter:
+`--device reference` is a correctness oracle only, and every timed or served
+run passes `--strict-engine`.
 
 Engine rule (operator, 2026-11-05): inference never runs on the MIR
 interpreter, and a timed run uses `--strict-engine`. Today `live` and `serve`
