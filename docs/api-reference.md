@@ -1387,6 +1387,14 @@ Warmup and cosine learning-rate schedules.
 ## gradus:random
 
 Deterministic xorshift64 seed state, draws, and the versioned RNG wire.
+`initialize_fan_uniform` initializes rank-2 weights in record-label order.
+For entry index i (zero-based), it copies the input Seed, XORs its state with
+i+1 (substituting 1 if zero), applies three xorshift64 steps, then draws that
+entry's elements in tensor order from its private substream. Thus changing an
+entry's shape cannot shift another entry's values. The returned Seed is the
+input Seed advanced once for each entry, independent of all shapes and bias
+flags. Weights are uniform within ±sqrt(6/(fan_in+fan_out)); bias entries
+(rank one or two) are zero-filled and consume no substream draws.
 
 **Source**: `src/random.fab`
 
@@ -1414,6 +1422,8 @@ Deterministic xorshift64 seed state, draws, and the versioned RNG wire.
 - `fn default() → Seed`
 - `fn next(Seed s) → Draw`
 - `fn next_f32(Seed s) → DrawF32`
+- `fn initialize_fan_uniform(list<list<int>> shapes, list<bool> biases, Seed seed) → Initialized ⇥ RandomError` — shape/bias lists follow deterministic record-label order; each weight has a private substream derived from the input state and its one-based entry index by XOR and three xorshift steps. Weight elements draw in tensor order, within ±sqrt(6/(fan_in+fan_out)). Bias entries are zero-filled and consume no draws. The returned Seed advances once per entry, irrespective of shape or bias.
+- `class Initialized` — tensors in input order and final Seed
 - `fn serialize_seed(Seed s) → string`
 - `fn deserialize_seed(string wire) → Seed ⇥ RandomError`
 
