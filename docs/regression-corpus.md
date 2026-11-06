@@ -54,7 +54,7 @@ Live co-located suites (45 files):
 | `src/gradient.proba` | `gradus:gradient` | Companion-call contract; oracle pins for runtime gate |
 | `src/optimize.proba` | `gradus:optimize` | SGD step pins @ **1e-4** absolute |
 | `src/checkpoint.proba` | `gradus:checkpoint` | Epoch/step validation, versioned envelope round-trip, signed RNG state, malformed-wire rejection, verbatim optimizer-state carry |
-| `src/train.proba` | training composition | U6 convergence / resume trajectory and generic optimizer updates |
+| `src/mlp.proba` | training composition | U6 convergence / resume trajectory and generic optimizer updates |
 | `src/metrics.proba` | `gradus:metrics` | Accuracy / metric record |
 | `src/tokenizer.proba` | `gradus:tokenizer` | Identity + **`is_eog` {0,2}** + EOG admission rejects + **LIB-02-U2 byte-level BPE word oracle** (`transformers` → `[4549, 382]`, `สวัสดี` → `[34469, 168607]`, `人工智能` → `[109015]`, decode round-trips, typed error rows) + **LIB-02-U3 composed full-prompt oracle** (scanner + special/EOG/BOS/chat policy rows, Probe A/B exact id lists §4.8) |
 | `src/decode.proba` | `gradus:decode` | Logits @ **5e-4**; **tokens `[0]` / `[1,1]`**; reset/replay; first-token-divergence |
@@ -164,7 +164,7 @@ PML6-U4 / the correctness wave. Loss of any pin is a corpus defect.
 | --- | --- | --- |
 | Forward / logits / sampling | nn / attention / transformer / decode / sampling / loss / gradus | **5e-4** absolute |
 | SGD step | `src/optimize.proba` | **1e-4** absolute |
-| Train trajectory / schedules | `src/train.proba` (PML4-U6) | **5e-4** + exact resume/seed contracts |
+| Train trajectory / schedules | `src/mlp.proba` (PML4-U6) | **5e-4** + exact resume/seed contracts |
 | Gradient companion contract | `src/gradient.proba` + `src/gradient.fab` comments | runtime gate uses policy **1e-4 / 1e-4** |
 | Wire / identity / integer | serialize / parameter / dtype / tokenizer lists | exact |
 
@@ -381,7 +381,7 @@ Until then, §5.1–§5.2 are the only green criteria for this document.
 | 2 GGUF | `fixtures/gguf/*`, `src/model/gguf.proba`, `src/model/capsule.proba`, `src/model/dequant.proba`, `src/model/tensor_payload.proba`, `src/model/tensor_view.proba` |
 | 3 BERT-tiny training arch | `src/nn.proba`, `src/attention.proba`, `src/transformer.proba`, `src/gradus.proba` |
 | 4 SmolLM2-360M scaled inference arch | `src/attention.proba`, `src/transformer.proba`, `src/model/dense_llama.proba` + GGUF fixture facts + `exempla/dense-rope` (REF-01-U1.3 executed proof) + `exempla/dense-llama-adapter` (REF-01-U1.6) |
-| 5 PML4 training layer | `src/loss.proba`, `src/gradient.proba`, `src/optimize.proba`, `src/train.proba`, `src/metrics.proba`, `exempla/training-loop-mlp` |
+| 5 PML4 training layer | `src/loss.proba`, `src/gradient.proba`, `src/optimize.proba`, `src/mlp.proba`, `src/metrics.proba`, `exempla/training-loop-mlp` |
 | 6 PML5 inference layer | `src/decode.proba`, `src/cache.proba`, `src/sampling.proba`, `src/generation.proba`, `src/tokenizer.proba`, `exempla/token-generation` |
 | 7 REF-01 dense reference — RMSNorm | `src/nn.proba` (rmsnorm rows), `exempla/dense-rmsnorm` (32 PASS / 0 FAIL) |
 
