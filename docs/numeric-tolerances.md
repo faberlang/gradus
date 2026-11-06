@@ -44,7 +44,7 @@ Representative constants (live tree):
 | `src/gradus.proba` | `TOLERATIO` | `0.0005` |
 | `src/decode.proba` | `DECODE_TOLERATIO` | `0.0005` |
 | `src/sampling.proba` | `SAMPLING_TOLERATIO` | `0.0005` |
-| `src/train.proba` | `LENTUS_TOLERATIO` | `0.0005` |
+| `src/mlp.proba` | `LENTUS_TOLERATIO` | `0.0005` |
 
 Rationale recorded in those files: the production surface is **f32
 self-hosted** (self-hosted exp/tanh/ln/sin/cos/sqrt via documented
@@ -125,7 +125,7 @@ The optimize suite comments explicitly bind this band to
 
 | Location | Band | Role |
 | --- | ---: | --- |
-| `src/train.proba` RNG draws | `1e-6` absolute on documented `[0,1)` draws | xorshift64 / f64 recurrence pins — not a forward-math band |
+| `src/mlp.proba` RNG draws | `1e-6` absolute on documented `[0,1)` draws | xorshift64 / f64 recurrence pins — not a forward-math band |
 | Exact equality (`≡`) | 0 | Integer tokens, identities, wire round-trips, error `message` strings, EOG membership |
 
 A specialized tighter band never authorizes relaxing a looser family row
@@ -234,7 +234,7 @@ cd /path/to/faberlang/gradus
 
 # Forward 5e-4 absolute band still present on the primary surfaces
 rg -n '0\.0005|5e-4' src/nn.proba src/loss.proba src/attention.proba \
-  src/transformer.proba src/decode.proba src/sampling.proba src/train.proba
+  src/transformer.proba src/decode.proba src/sampling.proba src/mlp.proba
 
 # 1e-4 absolute self-host / gradient-aligned band on optimize
 rg -n '0\.0001|1e-4' src/optimize.proba src/gradient.fab

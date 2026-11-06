@@ -98,7 +98,6 @@ evidence and boundaries are recorded in
 | `gradus:mlp` | `src/mlp.fab` | Two-layer MLP: decoded-carrier `forward_mlp` + annotated `forward_mlp_loss` companion (PML3-U4) |
 | `gradus:random` | `src/random.fab` | Deterministic seed state, xorshift64 draws, and RNG wire format |
 | `gradus:checkpoint` | `src/checkpoint.fab` | Checkpoint envelope and versioned save/load wire (PML4) |
-| `gradus:train` | `src/train.fab` | Training error vocabulary retained for compatibility |
 | `gradus:metrics` | `src/metrics.fab` | Defined metrics: `accuracy`, `Metric` (PML4) |
 | `gradus:test_util` | `src/test_util.fab` | Shared proba-support helpers: `or_default` (U4a proba do/catch deblock) |
 | `gradus:data` | `src/data.fab` | Batch leaf: deterministic shuffle over `gradus:random` Seed/Draw + order-preserving batch slicing of rank-1 i32 token-id tensors (short last batch; fail-closed empty/size bounds); tokenization still future |
@@ -237,7 +236,7 @@ L3  Loss                gradus:loss
 L4  Optimization        gradus:optimize
 L5  NN primitives       gradus:nn
 L6  Architecture blocks gradus:attention, gradus:mlp, gradus:transformer
-L7  Training            gradus:random, gradus:checkpoint, gradus:train, gradus:metrics, gradus:data
+L7  Training            gradus:random, gradus:checkpoint, gradus:metrics, gradus:data
 GEA1 Kernel            gradus:kernel — paired BF16/F32 GEMV source bodies
 PML2 Model admission    gradus:model/artifact, gradus:model/capsule,
                         gradus:model/gguf_manifest, gradus:model/gguf,

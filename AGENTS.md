@@ -54,7 +54,6 @@ One `.fab` file → one import path. Nested dirs for packages.
 | `gradus:transformer` | Transformer block, positional encoding, output head |
 | `gradus:random` | Deterministic seed state, RNG draws, and serialization |
 | `gradus:checkpoint` | Checkpoint envelope and versioned save/load wire |
-| `gradus:train` | Training error vocabulary |
 | `gradus:data` | Batching, shuffling, tokenization |
 | `gradus:gradus` | Facade map only (no genera) |
 

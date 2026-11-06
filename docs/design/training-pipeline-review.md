@@ -27,7 +27,7 @@ Verified 2026-08-18, in the order the task names.
 
 1. **Gradus training tier is real but small.** 33 modules with a layered
    autograd spine: `gradus:gradient` (the ONE companion-call entry),
-   `gradus:loss`, `gradus:optimize` (SGD only), `gradus:train` (steps,
+   `gradus:loss`, `gradus:optimize` (SGD only), `gradus:mlp` (steps,
    schedules, RNG, dropout, checkpoint), `gradus:metrics`, and `gradus:data`
    (**stub** — `docs/module-map.md:41` says so honestly; `src/data.fab` has
    no functions, only the facade header declaring future `data/batch` and
@@ -75,7 +75,7 @@ Verified 2026-08-18, in the order the task names.
    lane (in-memory interpreted package MIR): 100 steps, 4×4 two-layer MLP,
    lr 0.1, asserting the trajectory against six f64 oracle pins
    (`PML4_PINS`, `lane_test.rs:516-523`, same pins as
-   `gradus/src/train.proba` PML4-U6) within 5e-4 and convergence ratio
+   `gradus/src/mlp.proba` PML4-U6) within 5e-4 and convergence ratio
    < 0.1. Stage 4b (`cargo test --workspace`, `radix/scripta/test:167`)
    executes this — it is real running training-loop code, CPU-interpreted.
    The exemplum itself (`gradus/exempla/training-loop-mlp/src/main.fab`,
@@ -312,7 +312,7 @@ bands). Value-per-cost ranking at the end.
   admission (`radix-air/src/gradient_check_admission.rs`, chain at
   `driver/mod.rs:2202-2216`) — and the ecosystem around it has the FD
   central-difference oracle (`exempla/gradient-seam`, eps 1e-5) plus f64
-  trajectory pins (`train.proba`, `lane_test.rs:516-523`) as the golden
+  trajectory pins (`mlp.proba`, `lane_test.rs:516-523`) as the golden
   methodology.
 - **What it buys**: a new differentiable op cannot silently produce wrong
   gradients; per-model golden rows extend to per-model gradient oracles
