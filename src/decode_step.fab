@@ -27,8 +27,9 @@ locale = "en"
 #
 #   Wide set (`layer_wide`, 14 launches per layer; see "Wide launch set" below):
 #     gather_wide, rms_part, qkv_part, qkv_fin, kv_write_wide, scores_wide,
-#     softmax_wide, attn_wide, gemv_part + gemv_fin_residual (o and down), gateup_part,
-#     swiglu_fin, head_wide; then `argmax_token` leaves the token id on the device.
+#     softmax_wide, attn_wide, gemv + residual_add (o and down), gateup_part,
+#     swiglu_fin; the head is rms_part + rms_apply_part + gemv (lm_head); then
+#     `argmax_token` leaves the token id on the device.
 #
 # Constraints these kernels carry (each was learned the hard way in
 # acceptance/a1-rowops and is why the code looks the way it does):
@@ -39,8 +40,9 @@ locale = "en"
 #     sequential loop inside one lane; a value a later step needs per row is
 #     its own launch (two-launch form) or an extra `mut` output at the lane's
 #     own coordinate (softmax_stats).
-#   - The `o ⇇ w · x` recipe needs literal dimensions, so a generic GEMV is a
-#     lane per output row with a serial dot (gemv_lane): any `size` extent.
+#   - `gemv_lane` (a lane per output row with a serial dot) serves the serial set
+#     only. A plain GEMV over `size` generics is the `o ⇇ w · x` glyph (`gemv`),
+#     which the compiler parallelizes.
 #   - Scalar parameters are `i32`/`f32`; an `int` scalar or local is not admitted
 #     on the device (it is a 64-bit carrier, refused as nucleum_wide_integer).
 #     Every lane local is `i32`, and each lane body is wrapped in scalar guards
@@ -49,8 +51,6 @@ locale = "en"
 #     range-known: `k + P` and `QD % H` over generics are refused (SEM008
 #     nucleum_extent_unproven) unless the loop form proves them.
 #   - Parameter names are unique per kernel (a shared prefix per kernel).
-#   - A generic kernel instantiated at two different static shapes in one
-#     package duplicates the Metal entry name: one process runs one shape.
 #
 # Numeric contract: f32 throughout. The serial reductions are serial in lane order, so
 # the sequential `--device cpu` oracle and the device agree to the L7 float
@@ -295,18 +295,26 @@ fn swiglu<size F>(tensor<f32, [F]> swg, tensor<f32, [F]> swu, mut tensor<f32, [F
 # Wide launch set (decode_token.layer_wide / head_step_wide / embed_wide)
 #
 # The kernels above give each output element ONE lane that runs the whole dot
-# product serially, so a 960-row GEMV is 960 busy lanes reading uncoalesced rows
-# (measured 16 to 130 GB/s on an M5 Max, against ~450 GB/s for a 49152-row one). The
-# kernels below split each long reduction over `P` lanes (a [rows, P] lane grid:
-# lane (i, p) sums every P-th product, so the lanes of a SIMD group read contiguous
-# weights) and finish it in a small second launch that also carries the epilogue
-# (residual add, SwiGLU, RoPE). RMSNorm is folded into the GEMV that consumes it:
-# one `rms_part` launch computes Q partial sums of squares and every consumer lane
-# folds them, so no normalized vector is ever written.
+# product serially, so a 960-row GEMV is 960 busy lanes reading uncoalesced rows. In
+# the set below, a plain GEMV is the `⇇ ·` glyph (`gemv`) and the compiler owns its
+# parallel form: the o and down projections and the lm_head. On an M5 Max the glyph
+# runs a layer's projections at about 490 GB/s and the 49152-row head at about
+# 570 GB/s, against about 370 and 470 GB/s for a hand-split partial-sum GEMV (radix
+# corpus/inference rungs gemv-layer, gemv-layer-split, gemv-output-head).
+#
+# The q/k/v and gate/up projections stay hand-split kernels because they fold work
+# the glyph cannot: each reads two or three weight matrices and the RMSNorm in ONE
+# launch. Splitting them into norm + glyph GEMVs + epilogue adds five launches per
+# layer, and in a decode chain a small launch costs several microseconds: that
+# version measured no faster end to end. Those kernels split each long reduction
+# over `P` lanes (a [rows, P] lane grid: lane (i, p) sums every P-th product, so the
+# lanes of a SIMD group read contiguous weights) and finish it in a small second
+# launch that carries the epilogue (RoPE, SwiGLU). One `rms_part` launch computes Q
+# partial sums of squares and every consumer lane folds them.
 #
 # Conventions of this set:
-#   - The output (or the [rows, P] partial tensor) is its own lane domain, so there
-#     is no `...dom` argument.
+#   - The output (or the [rows, P] partial tensor), or for a map over an input that
+#     input, is the lane domain, so there is no `...dom` argument.
 #   - Dimensions come from the size generics (`D`, `K`, `P`, ...), which a kernel may
 #     read as a value and use as a `for range` bound; scalars are the per-token
 #     position, the model's epsilon / scale / RoPE base, the head geometry and the
@@ -315,10 +323,10 @@ fn swiglu<size F>(tensor<f32, [F]> swg, tensor<f32, [F]> swu, mut tensor<f32, [F
 #     `for range p ‥ K step P` with a generic stride is refused by the kernel
 #     requirements pass (SEM008 nucleum_extent_unproven).
 #
-# Numeric contract: f32. Splitting a sum changes only the association of the
-# additions (deterministic: each partial is a serial strided sum, the combine is a
-# serial sum in lane order); every product and every epilogue is computed as in the
-# serial kernels, so with P = 1 the results are bit-identical to them.
+# Numeric contract: f32. Splitting a sum, by hand or in the glyph's parallel form,
+# changes only the association of the additions, so a result differs from the
+# serial set's ascending sum by rounding, within the kernel float tolerance; every
+# product and every epilogue is computed as in the serial kernels.
 # ---------------------------------------------------------------------------
 
 # Embedding gather: gwo[j] = gwtable[ids[0], j]; the output is the lane domain.
@@ -345,18 +353,27 @@ fn rms_part<size Q, size D>(tensor<f32, [D]> rpx, mut tensor<f32, [Q]> rpo) → 
     }
 }
 
-# Split GEMV, partial sums: gpo[i, p] = sum over k = p, p + P, ... of gpw[i, k] * gpx[k].
+# GEMV: gmy = gmw · gmx, the language's matrix × vector product. The compiler owns
+# the parallel form (on Metal every invocation of a workgroup shares its tile's rows,
+# with a tree reduction), so no lane layout or partial-sum tensor appears here.
 @ kernel
 @ public
-fn gemv_part<size N, size P, size K>(tensor<f32, [K]> gpx, tensor<f32, [N, K]> gpw, mut tensor<f32, [N, P]> gpo) → void {
-    for from gpo at [i, p] thread lane let e {
-        mut f32 acc ← 0.0
-        mut i32 k ← p
-        while k ≺ K {
-            acc ← acc + gpw[[i, k]] * gpx[[k]]
-            k ← k + P
+fn gemv<size N, size K>(tensor<f32, [N, K]> gmw, tensor<f32, [K]> gmx, mut tensor<f32, [N]> gmy) → void {
+    gmy ⇇ gmw · gmx
+}
+
+# RMSNorm apply from the `rms_part` partials: rno[j] = rnx[j] * s * rnw[j], with
+# s = 1 / sqrt(sum(rnrp) / D + rneps). `rnx` is the lane domain.
+@ kernel
+@ public
+fn rms_apply_part<size Q, size D>(tensor<f32, [D]> rnx, tensor<f32, [Q]> rnrp, tensor<f32, [D]> rnw, mut tensor<f32, [D]> rno, f32 rneps) → void {
+    for from rnx at [j] thread lane let v {
+        mut f32 ss ← 0.0
+        for range 0 ‥ Q let q {
+            ss ← ss + rnrp[[q]]
         }
-        gpo[[i, p]] ← acc
+        let f32 s ← 1.0 / (ss / (D ↦ f32) + rneps).sqrt()
+        rno[[j]] ← v * s * rnw[[j]]
     }
 }
 
@@ -544,19 +561,6 @@ fn attn_wide<size QD, size H, size C, size KVD>(tensor<f32, [H, C]> axsc, tensor
     }
 }
 
-# Combine GEMV partials with a residual: fro[j] = frr[j] + sum over p of frp[j, p].
-@ kernel
-@ public
-fn gemv_fin_residual<size N, size P>(tensor<f32, [N, P]> frp, tensor<f32, [N]> frr, mut tensor<f32, [N]> fro) → void {
-    for from fro at [j] thread lane let e {
-        mut f32 acc ← 0.0
-        for range 0 ‥ P let q {
-            acc ← acc + frp[[j, q]]
-        }
-        fro[[j]] ← frr[[j]] + acc
-    }
-}
-
 # Gate and up projections of the RMSNorm'd input in ONE launch (same fold as
 # `qkv_part`): ghpg[i, p] and ghpu[i, p] are the partial dots of row i of the gate
 # and up weights. `ghpg` is the lane domain.
@@ -595,26 +599,6 @@ fn swiglu_fin<size F, size P>(tensor<f32, [F, P]> sfg, tensor<f32, [F, P]> sfu, 
             u ← u + sfu[[j, q]]
         }
         sfo[[j]] ← (g / (1.0 + (-g).exp())) * u
-    }
-}
-
-# Final norm folded into the tied lm_head GEMV: hlo[v] = sum over k of
-# hlw[v, k] * (hlx[k] * s * hlnw[k]), s from the `rms_part` partials. One lane per
-# vocabulary row (49152 lanes already stream at memory bandwidth).
-@ kernel
-@ public
-fn head_wide<size V, size Q, size D>(tensor<f32, [D]> hlx, tensor<f32, [Q]> hlrp, tensor<f32, [D]> hlnw, tensor<f32, [V, D]> hlw, mut tensor<f32, [V]> hlo, f32 hleps) → void {
-    for from hlo at [v] thread lane let e {
-        mut f32 ss ← 0.0
-        for range 0 ‥ Q let q {
-            ss ← ss + hlrp[[q]]
-        }
-        let f32 s ← 1.0 / (ss / (D ↦ f32) + hleps).sqrt()
-        mut f32 acc ← 0.0
-        for range 0 ‥ D let k {
-            acc ← acc + hlw[[v, k]] * (hlx[[k]] * s * hlnw[[k]])
-        }
-        hlo[[v]] ← acc
     }
 }
 

@@ -157,7 +157,8 @@ fn head_step<size V, size D>(tensor<f32, [D]> hidden, tensor<f32, [D]> onorm, te
 
 # ---------------------------------------------------------------------------
 # Wide path (strict-engine safe): 14 launches per layer instead of 22, none of them a
-# serial 960-term dot in one lane, and no allocation inside the generic functions
+# serial 960-term dot in one lane (the o and down projections and the lm_head are the
+# `⇇ ·` glyph, `decode_step.gemv`), and no allocation inside the generic functions
 # (a generic host function that allocates `tf32[D] {}` is refused by `--strict-engine`).
 # The CALLER owns every scratch tensor and the caches `kin` / `vin` and allocates each
 # once; kernel outputs stay device-resident until the host reads them.
@@ -166,7 +167,8 @@ fn head_step<size V, size D>(tensor<f32, [D]> hidden, tensor<f32, [D]> onorm, te
 # heads, C cache rows; R = QD + 2 * KVD; P lanes per GEMV row, a power of two, 64 is
 # the measured sweet spot; Q partial sums for RMSNorm, 32):
 #   rp [Q]   qkvp [R, P]   qkv [R]   kvdom [KVD] (zeros)   sc [H, C]   mx [H]   sm [H]
-#   ctx [QD]   op [D, P]   h1 [D]   gp [F, P]   up [F, P]   act [F]   dp [D, P]
+#   ctx [QD]   ao [D]   h1 [D]   gp [F, P]   up [F, P]   act [F]   dn [D]
+# `head_step_wide` also takes xn [D], the normalized hidden state.
 # `pqd` / `pkvd` are QD / KVD, `pdh` the head width, `pgroup` = QD / KVD, `prope` the
 # RoPE pair convention (as in `layer_step`), `pos` the token position.
 # ---------------------------------------------------------------------------
@@ -195,12 +197,12 @@ fn layer_wide<size D, size QD, size KVD, size F, size H, size C, size P, size Q,
     mut tensor<f32, [H]> mx,
     mut tensor<f32, [H]> sm,
     mut tensor<f32, [QD]> ctx,
-    mut tensor<f32, [D, P]> op,
+    mut tensor<f32, [D]> ao,
     mut tensor<f32, [D]> h1,
     mut tensor<f32, [F, P]> gp,
     mut tensor<f32, [F, P]> up,
     mut tensor<f32, [F]> act,
-    mut tensor<f32, [D, P]> dp,
+    mut tensor<f32, [D]> dn,
     i32 pos,
     i32 pqd,
     i32 pkvd,
@@ -218,13 +220,13 @@ fn layer_wide<size D, size QD, size KVD, size F, size H, size C, size P, size Q,
     ds.scores_wide(qkv, kin, mut sc, pos, pdh, pgroup, pscale)
     ds.softmax_wide(sc, mut mx, mut sm, pos)
     ds.attn_wide(sc, mx, sm, vin, mut ctx, pos, pdh, pgroup)
-    ds.gemv_part(ctx, wo, mut op)
-    ds.gemv_fin_residual(op, hin, mut h1)
+    ds.gemv(wo, ctx, mut ao)
+    ds.residual_add(hin, ao, mut h1)
     ds.rms_part(h1, mut rp)
     ds.gateup_part(h1, rp, fnorm, wg, wu, mut gp, mut up, peps)
     ds.swiglu_fin(gp, up, mut act)
-    ds.gemv_part(act, wd, mut dp)
-    ds.gemv_fin_residual(dp, h1, mut hout)
+    ds.gemv(wd, act, mut dn)
+    ds.residual_add(h1, dn, mut hout)
 }
 
 # hidden[D] <- embed[ids[0], :] (the id is read on the device).
@@ -233,11 +235,12 @@ fn embed_wide<size V, size D>(tensor<f32, [V, D]> embed, tensor<i32, [1]> ids, m
     ds.gather_wide(embed, ids, mut hidden)
 }
 
-# logits[V] = embed @ rmsnorm(hidden), the final norm folded into the lm_head GEMV.
+# logits[V] = embed @ rmsnorm(hidden): the final norm, then the tied lm_head GEMV.
 @ public
-fn head_step_wide<size V, size D, size Q>(tensor<f32, [D]> hidden, tensor<f32, [D]> onorm, tensor<f32, [V, D]> embed, mut tensor<f32, [Q]> rp, mut tensor<f32, [V]> logits, f32 peps) → void {
+fn head_step_wide<size V, size D, size Q>(tensor<f32, [D]> hidden, tensor<f32, [D]> onorm, tensor<f32, [V, D]> embed, mut tensor<f32, [Q]> rp, mut tensor<f32, [D]> xn, mut tensor<f32, [V]> logits, f32 peps) → void {
     ds.rms_part(hidden, mut rp)
-    ds.head_wide(hidden, rp, onorm, embed, mut logits, peps)
+    ds.rms_apply_part(hidden, rp, onorm, mut xn, peps)
+    ds.gemv(embed, xn, mut logits)
 }
 
 # Greedy pick on the host: the index of the largest logit (first on ties). The wide
