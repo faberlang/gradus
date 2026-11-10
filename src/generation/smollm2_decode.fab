@@ -37,6 +37,7 @@
 
 import from "gradus:decode_token" dt
 import from "gradus:decode_step" ds
+import from "gradus:prefill" pf
 import from "gradus:sampling" sampling
 import from "gradus:random" random
 
@@ -330,26 +331,64 @@ fn port_generate_sampled(port.PortWeights w, list<int> prompt, int max_new, list
     mut random.Seed rng ← copy seed
     mut list<int> out ← []
     mut string finish ← "length"
-    ids[[0]] ← token_i32(prompt[0])
+    if np ≡ 0 then panic "port_generate_sampled: empty prompt"
     report("port: prefill-start prompt=§ capacity=§"(np, c))
-    # One forward pass per prompt token, then one per generated token: at most
-    # np + max_new passes, and the run leaves the loop on its finish reason.
-    for range 0 ‥ np + max_new let t {
-        let i32 pos ← token_i32(t)
-        dt.embed_wide(w.embed, ids, mut ha)
-        # The hidden state ping-pongs between ha and hb; an even layer count ends in ha.
-        for range 0 ‥ port.PORT_LAYERS let ll {
-            mut tensor<f32, [C, 320]> kin ← ka[ll]
-            mut tensor<f32, [C, 320]> vin ← va[ll]
-            if ll % 2 ≡ 0 {
-                layer_pass(mut s, w.layers[ll], ha, mut hb, mut kin, mut vin, mut sc, mut pr, pos)
-            } else {
-                layer_pass(mut s, w.layers[ll], hb, mut ha, mut kin, mut vin, mut sc, mut pr, pos)
+    # Batched prefill (gradus:prefill): the embedding rows, 32 prefill_layer passes
+    # over all np rows at positions 0 .. np - 1 (writing those cache rows), and the
+    # last row into `ha`. The [T, ...] scratch is allocated once per request.
+    let size T ← np
+    let int ht ← 15 * np
+    let size HT ← ht
+    mut tensor<i32, [T]> pids ← ti32[T] {}
+    for from prompt at [i] let id {
+        pids[[i]] ← token_i32(id)
+    }
+    mut tensor<f32, [T, 960]> pa ← tf32[T, 960] {}
+    mut tensor<f32, [T, 960]> pb ← tf32[T, 960] {}
+    mut tensor<f32, [T, 960]> pxn ← tf32[T, 960] {}
+    mut tensor<f32, [T, 1600]> qkvr ← tf32[T, 1600] {}
+    mut tensor<f32, [T, 1600]> qkv ← tf32[T, 1600] {}
+    mut tensor<f32, [HT, C]> psc ← tf32[HT, C] {}
+    mut tensor<f32, [HT, C]> ppr ← tf32[HT, C] {}
+    mut tensor<f32, [T, 960]> ctx ← tf32[T, 960] {}
+    mut tensor<f32, [T, 960]> ao ← tf32[T, 960] {}
+    mut tensor<f32, [T, 960]> h1 ← tf32[T, 960] {}
+    mut tensor<f32, [T, 5120]> gu ← tf32[T, 5120] {}
+    mut tensor<f32, [T, 2560]> act ← tf32[T, 2560] {}
+    mut tensor<f32, [T, 960]> dn ← tf32[T, 960] {}
+    let i32 rows ← token_i32(np)
+    pf.gather_rows(w.embed, pids, mut pa)
+    for range 0 ‥ port.PORT_LAYERS let ll {
+        let port.PortLayer ly ← w.layers[ll]
+        mut tensor<f32, [C, 320]> kin ← ka[ll]
+        mut tensor<f32, [C, 320]> vin ← va[ll]
+        if ll % 2 ≡ 0 {
+            pf.prefill_layer(pa, mut pb, ly.attn_norm, ly.wqkv, ly.wo, ly.ffn_norm, ly.wgu, ly.wd, mut kin, mut vin, mut pxn, mut qkvr, mut qkv, mut psc, mut ppr, mut ctx, mut ao, mut h1, mut gu, mut act, mut dn, rows, 0 ∷ i32, port.PORT_QD, port.PORT_KVD, port.PORT_HEAD_WIDTH, port.PORT_GROUP, port.PORT_ROPE_PAIRS, port.PORT_EPS, port.PORT_LN_THETA, port.PORT_ATTN_SCALE)
+        } else {
+            pf.prefill_layer(pb, mut pa, ly.attn_norm, ly.wqkv, ly.wo, ly.ffn_norm, ly.wgu, ly.wd, mut kin, mut vin, mut pxn, mut qkvr, mut qkv, mut psc, mut ppr, mut ctx, mut ao, mut h1, mut gu, mut act, mut dn, rows, 0 ∷ i32, port.PORT_QD, port.PORT_KVD, port.PORT_HEAD_WIDTH, port.PORT_GROUP, port.PORT_ROPE_PAIRS, port.PORT_EPS, port.PORT_LN_THETA, port.PORT_ATTN_SCALE)
+        }
+    }
+    # An even layer count ends in pa.
+    pf.take_row(pa, mut ha, rows - 1)
+    # Then one forward pass per generated token. The first iteration (t = np - 1)
+    # only reads the head of the prefilled last row; every later one decodes the
+    # token chosen before it at position t.
+    for range np - 1 ‥ np + max_new let t {
+        if t ≥ np {
+            let i32 pos ← token_i32(t)
+            dt.embed_wide(w.embed, ids, mut ha)
+            # The hidden state ping-pongs between ha and hb; an even layer count ends in ha.
+            for range 0 ‥ port.PORT_LAYERS let ll {
+                mut tensor<f32, [C, 320]> kin ← ka[ll]
+                mut tensor<f32, [C, 320]> vin ← va[ll]
+                if ll % 2 ≡ 0 {
+                    layer_pass(mut s, w.layers[ll], ha, mut hb, mut kin, mut vin, mut sc, mut pr, pos)
+                } else {
+                    layer_pass(mut s, w.layers[ll], hb, mut ha, mut kin, mut vin, mut sc, mut pr, pos)
+                }
             }
         }
-        if t ≺ np - 1 {
-            ids[[0]] ← token_i32(prompt[t + 1])
-        } else {
+        {
             mut tensor<f32, [960]> xn ← s.xn
             dt.head_step_wide(ha, w.out_norm, w.embed, mut xn, mut logits, port.PORT_EPS)
             let int step ← out.length()

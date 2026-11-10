@@ -1,0 +1,161 @@
++++
+locale = "en"
++++
+# prefill-parity-metal: gradus:prefill's batched layer against the decode layer.
+#
+#   faber run exempla/prefill-parity-metal --library-home <gradus parent> \
+#       --device metal --strict-engine
+#
+# One synthetic SmolLM2-360M-shaped layer (the weights of decode-token-bench-metal)
+# and T = 6 synthetic hidden rows. The reference feeds the rows one at a time
+# through `decode_token.layer_wide` at positions 0 .. 5; the batched path runs all
+# six through `prefill.prefill_layer` at once. Both write their own K/V caches.
+# The program prints the worst absolute difference of the key cache rows, the
+# value cache rows and the output rows, and `parity ok` when all three are within
+# 1e-4 (f32, different summation orders), `parity FAIL` otherwise.
+
+import from "gradus:decode_step" ds
+import from "gradus:decode_token" dt
+import from "gradus:prefill" pf
+
+const int ROWS = 6
+
+# Deterministic pseudo-random matrix: values in (-amp, amp) from a sine hash.
+@ kernel
+@ public
+fn synth_mat<size N, size K>(tensor<f32, [N, K]> sdom, mut tensor<f32, [N, K]> sout, i32 sseed, f32 samp) → void {
+    for from sdom at [i, k] thread lane let e {
+        let i32 a ← (i * 31 + k * 17 + sseed) % 65521
+        let f32 h ← ((a ↦ f32) + 0.5) * 0.7123
+        sout[[i, k]] ← h.sin() * samp
+    }
+}
+
+# Deterministic norm weights near 1.
+@ kernel
+@ public
+fn synth_vec<size N>(tensor<f32, [N]> sdom, mut tensor<f32, [N]> sout, i32 sseed) → void {
+    for from sdom at [i] thread lane let e {
+        let i32 a ← ((i % 251) * 31 + sseed) % 17
+        sout[[i]] ← 1.0 + ((a ↦ f32) - 8.0) * 0.01
+    }
+}
+
+# dst[row, :] = src.
+@ kernel
+@ public
+fn put_row<size T, size D>(tensor<f32, [D]> prsrc, mut tensor<f32, [T, D]> prdst, i32 prrow) → void {
+    for from prdst at [t, j] thread lane let e {
+        if t ≡ prrow {
+            prdst[[t, j]] ← prsrc[[j]]
+        }
+    }
+}
+
+fn max_diff<size N, size K>(tensor<f32, [N, K]> a, tensor<f32, [N, K]> b, int rows) → f32 {
+    mut f32 worst ← 0.0
+    for range 0 ‥ rows let i {
+        for range 0 ‥ K let k {
+            let f32 d ← (a[[i, k]] - b[[i, k]]).abs()
+            if d ≻ worst {
+                worst ← d
+            }
+        }
+    }
+    return worst
+}
+
+main {
+    # The layer.
+    let tensor<f32, [960]> d960 ← tf32[960] {}
+    mut tensor<f32, [960]> anorm ← tf32[960] {}
+    mut tensor<f32, [960]> fnorm ← tf32[960] {}
+    synth_vec(d960, mut anorm, 8 ∷ i32)
+    synth_vec(d960, mut fnorm, 9 ∷ i32)
+    let tensor<f32, [960, 960]> d960x960 ← tf32[960, 960] {}
+    mut tensor<f32, [960, 960]> wq ← tf32[960, 960] {}
+    mut tensor<f32, [960, 960]> wo ← tf32[960, 960] {}
+    synth_mat(d960x960, mut wq, 10 ∷ i32, 0.03 ∷ f32)
+    synth_mat(d960x960, mut wo, 11 ∷ i32, 0.03 ∷ f32)
+    let tensor<f32, [320, 960]> d320x960 ← tf32[320, 960] {}
+    mut tensor<f32, [320, 960]> wk ← tf32[320, 960] {}
+    mut tensor<f32, [320, 960]> wv ← tf32[320, 960] {}
+    synth_mat(d320x960, mut wk, 12 ∷ i32, 0.03 ∷ f32)
+    synth_mat(d320x960, mut wv, 13 ∷ i32, 0.03 ∷ f32)
+    let tensor<f32, [2560, 960]> d2560x960 ← tf32[2560, 960] {}
+    mut tensor<f32, [2560, 960]> wg ← tf32[2560, 960] {}
+    mut tensor<f32, [2560, 960]> wu ← tf32[2560, 960] {}
+    synth_mat(d2560x960, mut wg, 15 ∷ i32, 0.03 ∷ f32)
+    synth_mat(d2560x960, mut wu, 16 ∷ i32, 0.03 ∷ f32)
+    let tensor<f32, [960, 2560]> d960x2560 ← tf32[960, 2560] {}
+    mut tensor<f32, [960, 2560]> wd ← tf32[960, 2560] {}
+    synth_mat(d960x2560, mut wd, 17 ∷ i32, 0.02 ∷ f32)
+    mut tensor<f32, [1600, 960]> wqkv ← tf32[1600, 960] {}
+    ds.stack_rows3(wq, wk, wv, mut wqkv)
+    mut tensor<f32, [5120, 960]> wgu ← tf32[5120, 960] {}
+    ds.stack_rows2(wg, wu, mut wgu)
+
+    # The prompt rows. T and HT are run-time sizes, as a prompt's are (a literal
+    # [6, 960] row norm is miscomputed on Metal today, a compiler defect).
+    let int rows ← ROWS
+    let size T ← rows
+    let int heads_rows ← 15 * rows
+    let size HT ← heads_rows
+    let tensor<f32, [T, 960]> dtx ← tf32[T, 960] {}
+    mut tensor<f32, [T, 960]> xin ← tf32[T, 960] {}
+    synth_mat(dtx, mut xin, 21 ∷ i32, 1.0 ∷ f32)
+
+    # Reference: one row at a time through the decode layer.
+    mut tensor<f32, [64, 320]> ka ← tf32[64, 320] {}
+    mut tensor<f32, [64, 320]> va ← tf32[64, 320] {}
+    mut tensor<f32, [960]> hin ← tf32[960] {}
+    mut tensor<f32, [960]> hout ← tf32[960] {}
+    mut tensor<f32, [960]> xn ← tf32[960] {}
+    mut tensor<f32, [1600]> qkvr ← tf32[1600] {}
+    mut tensor<f32, [1600]> qkv ← tf32[1600] {}
+    let tensor<f32, [320]> kvdom ← tf32[320] {}
+    mut tensor<f32, [15, 64]> sc ← tf32[15, 64] {}
+    mut tensor<f32, [15, 64]> pr ← tf32[15, 64] {}
+    mut tensor<f32, [16, 960]> cpart ← tf32[16, 960] {}
+    mut tensor<f32, [960]> ctx ← tf32[960] {}
+    mut tensor<f32, [960]> ao ← tf32[960] {}
+    mut tensor<f32, [960]> h1 ← tf32[960] {}
+    mut tensor<f32, [5120]> gu ← tf32[5120] {}
+    mut tensor<f32, [2560]> act ← tf32[2560] {}
+    mut tensor<f32, [960]> dn ← tf32[960] {}
+    mut tensor<f32, [T, 960]> want ← tf32[T, 960] {}
+    for range 0 ‥ ROWS let t {
+        let i32 pos ← t ↦ i32
+        pf.take_row(xin, mut hin, pos)
+        dt.layer_wide(hin, mut hout, anorm, wqkv, wo, fnorm, wgu, wd, mut ka, mut va, mut xn, mut qkvr, mut qkv, kvdom, mut sc, mut pr, mut cpart, mut ctx, mut ao, mut h1, mut gu, mut act, mut dn, pos, 960, 320, 64, 3, 1, 0.00001, 11.512925, 0.125)
+        put_row(hout, mut want, pos)
+    }
+
+    # Batched: all rows at once through the prefill layer.
+    mut tensor<f32, [64, 320]> kb ← tf32[64, 320] {}
+    mut tensor<f32, [64, 320]> vb ← tf32[64, 320] {}
+    mut tensor<f32, [T, 960]> got ← tf32[T, 960] {}
+    mut tensor<f32, [T, 960]> pxn ← tf32[T, 960] {}
+    mut tensor<f32, [T, 1600]> pqkvr ← tf32[T, 1600] {}
+    mut tensor<f32, [T, 1600]> pqkv ← tf32[T, 1600] {}
+    mut tensor<f32, [HT, 64]> psc ← tf32[HT, 64] {}
+    mut tensor<f32, [HT, 64]> ppr ← tf32[HT, 64] {}
+    mut tensor<f32, [T, 960]> pctx ← tf32[T, 960] {}
+    mut tensor<f32, [T, 960]> pao ← tf32[T, 960] {}
+    mut tensor<f32, [T, 960]> ph1 ← tf32[T, 960] {}
+    mut tensor<f32, [T, 5120]> pgu ← tf32[T, 5120] {}
+    mut tensor<f32, [T, 2560]> pact ← tf32[T, 2560] {}
+    mut tensor<f32, [T, 960]> pdn ← tf32[T, 960] {}
+    pf.prefill_layer(xin, mut got, anorm, wqkv, wo, fnorm, wgu, wd, mut kb, mut vb, mut pxn, mut pqkvr, mut pqkv, mut psc, mut ppr, mut pctx, mut pao, mut ph1, mut pgu, mut pact, mut pdn, rows ↦ i32, 0, 960, 320, 64, 3, 1, 0.00001, 11.512925, 0.125)
+
+    let f32 dk ← max_diff(ka, kb, ROWS)
+    let f32 dv ← max_diff(va, vb, ROWS)
+    let f32 dout ← max_diff(want, got, ROWS)
+    print "max_abs_diff key_cache=§0 value_cache=§1 output=§2"(dk, dv, dout)
+    if dk ≤ 0.0001 and dv ≤ 0.0001 and dout ≤ 0.0001 {
+        print "parity ok"
+    }
+    else {
+        print "parity FAIL"
+    }
+}

@@ -1,0 +1,257 @@
++++
+locale = "en"
++++
+# Batched prefill: T prompt tokens of a llama-family decoder in one pass per layer.
+#
+# Public import: import from "gradus:prefill" prefill
+
+import from "gradus:decode_step" ds
+#
+# The decode path (`gradus:decode_token` / `gradus:decode_step`) runs one token per
+# launch chain, so a prompt of T tokens costs T chains. Here every step of a layer
+# runs over all T rows at once: the projections are `⇇ ·` matrix products over the
+# transposed stacked weights (the radix corpus/training gemm-layer shape), the norms
+# are the language's row operation, and attention takes the decode form widened to
+# T query rows (masked scores, the row softmax, the context sum). The K/V rows of
+# all T positions are written to the caches in one launch, so decoding continues
+# from position `pos0 + T` exactly as if the prompt had been fed token by token.
+#
+# Shapes (D hidden, QD query width, KVD key/value width, F ffn width, H query heads,
+# C cache rows, T prompt rows, HT = H * T, R = QD + 2 * KVD, G = 2 * F). The weights
+# are those of `layer_wide`: wqkv [R, D] (q, k, v stacked row-wise), wo [D, QD],
+# wgu [G, D] (gate and up stacked), wd [D, F], all [out, in].
+# Scratch (the caller allocates each once per prompt):
+#   xn [T, D]   qkvr [T, R]   qkv [T, R]   sc [HT, C]
+#   pr [HT, C]   ctx [T, QD]   ao [T, D]   h1 [T, D]   gu [T, G]   act [T, F]   dn [T, D]
+
+# ---------------------------------------------------------------------------
+# Kernels
+# ---------------------------------------------------------------------------
+
+# Embedding gather of every prompt row: gro[t, j] = grtable[grids[t], j].
+@ kernel
+@ public
+fn gather_rows<size V, size D, size T>(tensor<f32, [V, D]> grtable, tensor<i32, [T]> grids, mut tensor<f32, [T, D]> gro) → void {
+    for from gro at [t, j] thread lane let e {
+        gro[[t, j]] ← grtable[[grids[t], j]]
+    }
+}
+
+# RMSNorm of every row: rro[t, :] = rrx[t, :] * rrw / sqrt(mean(rrx[t, :]^2) + rreps).
+@ kernel relaxed
+@ public
+fn rms_norm_rows<size T, size D>(tensor<f32, [T, D]> rrx, tensor<f32, [D]> rrw, mut tensor<f32, [T, D]> rro, f32 rreps) → void {
+    rro ⇇ rrx.norm_rms(axis 1, rreps, rrw)
+}
+
+# Row-batched projection against a weight stored [out, in]: mty = mtx · mtwᵀ.
+@ kernel
+@ public
+fn matmul_t<size T, size K, size N>(tensor<f32, [T, K]> mtx, tensor<f32, [N, K]> mtw, mut tensor<f32, [T, N]> mty) → void {
+    let _ mtwt ← mtw.transpose()
+    mty ⇇ mtx · mtwt
+}
+
+# RoPE of every row of the stacked q/k/v projection, row t at position rrpos + t:
+# `qkv_rope` (gradus:decode_step) per row. Rows' columns [0, rrqd) are query,
+# [rrqd, rrqd + rrkv) key, the rest value (copied). `rrnorm` 1 = consecutive pairs,
+# 0 = rotate-half pairs.
+@ kernel relaxed
+@ public
+fn rope_rows<size T, size R>(tensor<f32, [T, R]> rrx, mut tensor<f32, [T, R]> rro, i32 rrpos, i32 rrqd, i32 rrkv, i32 rrdh, f32 rrlntheta, i32 rrnorm) → void {
+    for from rrx at [t, j] thread lane let own {
+        if rrqd ≥ 0 and rrqd ≤ 1000000 and rrkv ≥ 0 and rrkv ≤ 1000000 and rrdh ≥ 2 and rrdh ≤ 1920 {
+            let i32 hf ← rrdh / 2
+            if j ≥ rrqd + rrkv {
+                rro[[t, j]] ← own
+            }
+            else {
+                let i32 jj ← j % rrdh
+                mut i32 partner ← 0
+                mut i32 pidx ← 0
+                mut bool first ← false
+                if rrnorm ≡ 1 {
+                    pidx ← jj / 2
+                    first ← jj % 2 ≡ 0
+                    if first {
+                        partner ← j + 1
+                    }
+                    else {
+                        partner ← j - 1
+                    }
+                }
+                else {
+                    pidx ← jj % hf
+                    first ← jj ≺ hf
+                    if first {
+                        partner ← j + hf
+                    }
+                    else {
+                        partner ← j - hf
+                    }
+                }
+                let f32 other ← rrx[[t, partner]]
+                let f32 freq ← (-(pidx ↦ f32) / (hf ↦ f32) * rrlntheta).exp()
+                let f32 ang ← ((rrpos + t) ↦ f32) * freq
+                let f32 cs ← ang.cos()
+                let f32 sn ← ang.sin()
+                if first {
+                    rro[[t, j]] ← own * cs - other * sn
+                }
+                else {
+                    rro[[t, j]] ← other * sn + own * cs
+                }
+            }
+        }
+    }
+}
+
+# K/V cache rows rkpos .. rkpos + T - 1 from the rotated q/k/v rows: key row
+# rkpos + t is rkqkv[t, rkqd .. rkqd + K), value row rkqkv[t, rkqd + K .. rkqd + 2K).
+# The key cache is the lane domain (a lane stores only at its own coordinate); rows
+# outside the prompt's positions are left unchanged.
+@ kernel
+@ public
+fn kv_write_rows<size T, size C, size K, size R>(tensor<f32, [T, R]> rkqkv, mut tensor<f32, [C, K]> rkkc, mut tensor<f32, [C, K]> rkvc, i32 rkpos, i32 rkqd) → void {
+    for from rkkc at [c, j] thread lane let e {
+        let i32 t ← c - rkpos
+        if rkqd ≥ 0 and rkqd ≤ 1000000 and t ≥ 0 and t ≺ T {
+            rkkc[[c, j]] ← rkqkv[[t, rkqd + j]]
+            rkvc[[c, j]] ← rkqkv[[t, rkqd + K + j]]
+        }
+    }
+}
+
+# GQA scores of every (head, prompt row) against the cache, causally masked:
+# rssc[h * T + t, c] = (q[t, h * dh + :] . kc[c, (h / group) * dh + :]) * rsscale for
+# c <= rspos + t, and -3.0e38 past it, so `decode_step.row_softmax` gives those 0.
+@ kernel relaxed
+@ public
+fn scores_rows<size T, size HT, size C, size R, size KVD>(tensor<f32, [T, R]> rsqkv, tensor<f32, [C, KVD]> rskc, mut tensor<f32, [HT, C]> rssc, i32 rsrows, i32 rspos, i32 rsdh, i32 rsgroup, f32 rsscale) → void {
+    for from rssc at [r, c] thread lane let e {
+        mut f32 score ← -3.0e38
+        if rsrows ≥ 1 and rsrows ≤ 1000000 and rsgroup ≻ 0 and rsdh ≥ 1 and rsdh ≤ 960 and rspos ≥ 0 and rspos ≤ 1000000 {
+            let i32 h ← r / rsrows
+            let i32 t ← r % rsrows
+            if c ≤ rspos + t {
+                let i32 base ← (h / rsgroup) * rsdh
+                mut f32 acc ← 0.0
+                for range 0 ‥ rsdh let k {
+                    acc ← acc + rsqkv[[t, h * rsdh + k]] * rskc[[c, base + k]]
+                }
+                score ← acc * rsscale
+            }
+        }
+        rssc[[r, c]] ← score
+    }
+}
+
+# Attention context of every prompt row: rcctx[t, j] = sum over c <= rcpos + t of
+# rcpr[h * T + t, c] * rcvc[c, (h / group) * dh + d], j = h * dh + d.
+@ kernel
+@ public
+fn context_rows<size T, size QD, size HT, size C, size KVD>(tensor<f32, [HT, C]> rcpr, tensor<f32, [C, KVD]> rcvc, mut tensor<f32, [T, QD]> rcctx, i32 rcrows, i32 rcpos, i32 rcdh, i32 rcgroup) → void {
+    for from rcctx at [t, j] thread lane let e {
+        if rcrows ≥ 1 and rcrows ≤ 1000000 and rcgroup ≻ 0 and rcdh ≥ 1 and rcdh ≤ 960 and rcpos ≥ 0 and rcpos ≤ 1000000 and rcpos + t ≺ C {
+            let i32 h ← j / rcdh
+            let i32 d ← j % rcdh
+            let i32 base ← (h / rcgroup) * rcdh
+            let i32 r ← h * rcrows + t
+            mut f32 acc ← 0.0
+            for range 0 ‥ rcpos + t + 1 let c {
+                acc ← acc + rcpr[[r, c]] * rcvc[[c, base + d]]
+            }
+            rcctx[[t, j]] ← acc
+        }
+    }
+}
+
+# Residual add of every row: rao[t, j] = raa[t, j] + rab[t, j].
+@ kernel
+@ public
+fn add_rows<size T, size D>(tensor<f32, [T, D]> raa, tensor<f32, [T, D]> rab, mut tensor<f32, [T, D]> rao) → void {
+    for from raa at [t, j] thread lane let a {
+        rao[[t, j]] ← a + rab[[t, j]]
+    }
+}
+
+# SwiGLU of every row of the stacked gate/up projection: swo[t, j] =
+# silu(swgu[t, j]) * swgu[t, F + j].
+@ kernel relaxed
+@ public
+fn swiglu_rows<size T, size F, size G>(tensor<f32, [T, G]> swgu, mut tensor<f32, [T, F]> swo) → void {
+    for from swo at [t, j] thread lane let e {
+        if G ≡ F + F {
+            let f32 g ← swgu[[t, j]]
+            swo[[t, j]] ← (g / (1.0 + (-g).exp())) * swgu[[t, F + j]]
+        }
+    }
+}
+
+# One row of a [T, D] tensor: tro[j] = trx[trrow, j].
+@ kernel
+@ public
+fn take_row<size T, size D>(tensor<f32, [T, D]> trx, mut tensor<f32, [D]> tro, i32 trrow) → void {
+    for from tro at [j] thread lane let e {
+        if trrow ≥ 0 and trrow ≺ T {
+            tro[[j]] ← trx[[trrow, j]]
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# One layer over T prompt rows
+# ---------------------------------------------------------------------------
+
+# hout = layer(hin) for prompt rows at positions pos0 .. pos0 + T - 1, writing their
+# K/V cache rows. `prows` is T as an i32 (the attention kernels divide by it).
+# 14 launches, whatever T is.
+@ public
+fn prefill_layer<size D, size QD, size KVD, size F, size C, size T, size HT, size R, size G>(
+    tensor<f32, [T, D]> hin,
+    mut tensor<f32, [T, D]> hout,
+    tensor<f32, [D]> anorm,
+    tensor<f32, [R, D]> wqkv,
+    tensor<f32, [D, QD]> wo,
+    tensor<f32, [D]> fnorm,
+    tensor<f32, [G, D]> wgu,
+    tensor<f32, [D, F]> wd,
+    mut tensor<f32, [C, KVD]> kin,
+    mut tensor<f32, [C, KVD]> vin,
+    mut tensor<f32, [T, D]> xn,
+    mut tensor<f32, [T, R]> qkvr,
+    mut tensor<f32, [T, R]> qkv,
+    mut tensor<f32, [HT, C]> sc,
+    mut tensor<f32, [HT, C]> pr,
+    mut tensor<f32, [T, QD]> ctx,
+    mut tensor<f32, [T, D]> ao,
+    mut tensor<f32, [T, D]> h1,
+    mut tensor<f32, [T, G]> gu,
+    mut tensor<f32, [T, F]> act,
+    mut tensor<f32, [T, D]> dn,
+    i32 prows,
+    i32 pos0,
+    i32 pqd,
+    i32 pkvd,
+    i32 pdh,
+    i32 pgroup,
+    i32 prope,
+    f32 peps,
+    f32 plntheta,
+    f32 pscale
+) → void {
+    rms_norm_rows(hin, anorm, mut xn, peps)
+    matmul_t(xn, wqkv, mut qkvr)
+    rope_rows(qkvr, mut qkv, pos0, pqd, pkvd, pdh, plntheta, prope)
+    kv_write_rows(qkv, mut kin, mut vin, pos0, pqd)
+    scores_rows(qkv, kin, mut sc, prows, pos0, pdh, pgroup, pscale)
+    ds.row_softmax(sc, mut pr)
+    context_rows(pr, vin, mut ctx, prows, pos0, pdh, pgroup)
+    matmul_t(ctx, wo, mut ao)
+    add_rows(hin, ao, mut h1)
+    rms_norm_rows(h1, fnorm, mut xn, peps)
+    matmul_t(xn, wgu, mut gu)
+    swiglu_rows(gu, mut act)
+    matmul_t(act, wd, mut dn)
+    add_rows(h1, dn, mut hout)
+}
