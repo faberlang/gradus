@@ -25,11 +25,13 @@ locale = "en"
 #       rms_stats + rms_apply, gemv_lane (gate, up), swiglu, gemv_lane (down), residual_add
 #     final rms_stats + rms_apply, gemv_lane (lm_head)   logits[V]
 #
-#   Wide set (`layer_wide`, 14 launches per layer; see "Wide launch set" below):
-#     gather_wide, rms_part, qkv_part, qkv_fin, kv_write_wide, scores_wide,
-#     softmax_wide, attn_wide, gemv + residual_add (o and down), gateup_part,
-#     swiglu_fin; the head is rms_part + rms_apply_part + gemv (lm_head); then
-#     `argmax_token` leaves the token id on the device.
+#   Wide set (`layer_wide`, 16 launches per layer; see "Wide launch set" below):
+#     gather_wide; rms_part + rms_apply_part, gemv over the stacked q/k/v weights,
+#     qkv_rope, kv_write_wide; scores_wide, softmax_wide, attn_wide; gemv +
+#     residual_add (o); rms_part + rms_apply_part, gemv over the stacked gate/up
+#     weights, swiglu_stacked, gemv + residual_add (down); the head is rms_part +
+#     rms_apply_part + gemv (lm_head); then `argmax_token` leaves the token id on
+#     the device. `stack_rows3` / `stack_rows2` build the stacked weights at load.
 #
 # Constraints these kernels carry (each was learned the hard way in
 # acceptance/a1-rowops and is why the code looks the way it does):
@@ -296,25 +298,19 @@ fn swiglu<size F>(tensor<f32, [F]> swg, tensor<f32, [F]> swu, mut tensor<f32, [F
 #
 # The kernels above give each output element ONE lane that runs the whole dot
 # product serially, so a 960-row GEMV is 960 busy lanes reading uncoalesced rows. In
-# the set below, a plain GEMV is the `⇇ ·` glyph (`gemv`) and the compiler owns its
-# parallel form: the o and down projections and the lm_head. On an M5 Max the glyph
-# runs a layer's projections at about 490 GB/s and the 49152-row head at about
-# 570 GB/s, against about 370 and 470 GB/s for a hand-split partial-sum GEMV (radix
-# corpus/inference rungs gemv-layer, gemv-layer-split, gemv-output-head).
-#
-# The q/k/v and gate/up projections stay hand-split kernels because they fold work
-# the glyph cannot: each reads two or three weight matrices and the RMSNorm in ONE
-# launch. Splitting them into norm + glyph GEMVs + epilogue adds five launches per
-# layer, and in a decode chain a small launch costs several microseconds: that
-# version measured no faster end to end. Those kernels split each long reduction
-# over `P` lanes (a [rows, P] lane grid: lane (i, p) sums every P-th product, so the
-# lanes of a SIMD group read contiguous weights) and finish it in a small second
-# launch that carries the epilogue (RoPE, SwiGLU). One `rms_part` launch computes Q
-# partial sums of squares and every consumer lane folds them.
+# the set below every projection is the `⇇ ·` glyph (`gemv`) and the compiler owns
+# its parallel form. q, k and v are stacked row-wise into one matrix at load, and
+# gate and up into another (`stack_rows3`, `stack_rows2`), so each group is ONE
+# GEMV: at decode shapes a launch, not the bytes, sets a small GEMV's time (radix
+# corpus/inference qkv-stacked: 5.5 us for one stacked q/k/v GEMV against 13.5 us
+# for the hand-split pair and 14.9 us for three glyphs). The RMSNorm is `rms_part`
+# (Q partial sums of squares) and `rms_apply_part`; small epilogue kernels carry
+# RoPE (`qkv_rope`) and SwiGLU (`swiglu_stacked`). On an M5 Max this set took the
+# synthetic SmolLM2-360M token from 4.56 to 4.23 ms (decode-token-bench-metal,
+# pipelined), against 4.05-4.12 ms for the radix decode-token rung.
 #
 # Conventions of this set:
-#   - The output (or the [rows, P] partial tensor), or for a map over an input that
-#     input, is the lane domain, so there is no `...dom` argument.
+#   - The output, or for a map over an input that input, is the lane domain, so there is no `...dom` argument.
 #   - Dimensions come from the size generics (`D`, `K`, `P`, ...), which a kernel may
 #     read as a value and use as a `for range` bound; scalars are the per-token
 #     position, the model's epsilon / scale / RoPE base, the head geometry and the
@@ -377,71 +373,63 @@ fn rms_apply_part<size Q, size D>(tensor<f32, [D]> rnx, tensor<f32, [Q]> rnrp, t
     }
 }
 
-# Q, K and V projections of the RMSNorm'd input in ONE launch. Rows [0, QD) are the
-# query rows, [QD, QD + KVD) the key rows, the rest the value rows (R = QD + 2 * KVD).
-# The normalized input is never stored: element k is qx[k] * s * qnw[k], with
-# s = 1 / sqrt(sum(qrp) / D + qeps) folded from the `rms_part` partials.
+# Stack two or three weight matrices row-wise into one, at load time, so that one
+# `⇇ ·` GEMV reads all of them in one launch (one launch over stacked weights beats
+# several small ones at decode shapes; radix corpus/inference qkv-stacked).
 @ kernel
 @ public
-fn qkv_part<size R, size P, size Q, size D, size QD, size KVD>(tensor<f32, [D]> qx, tensor<f32, [Q]> qrp, tensor<f32, [D]> qnw, tensor<f32, [QD, D]> qwq, tensor<f32, [KVD, D]> qwk, tensor<f32, [KVD, D]> qwv, mut tensor<f32, [R, P]> qpo, f32 qeps) → void {
-    for from qpo at [i, p] thread lane let e {
-        if R ≡ QD + KVD + KVD {
-            mut f32 ss ← 0.0
-            for range 0 ‥ Q let q {
-                ss ← ss + qrp[[q]]
-            }
-            let f32 s ← 1.0 / (ss / (D ↦ f32) + qeps).sqrt()
-            mut f32 acc ← 0.0
-            mut i32 k ← p
-            if i ≺ QD {
-                while k ≺ D {
-                    acc ← acc + qwq[[i, k]] * (qx[[k]] * s * qnw[[k]])
-                    k ← k + P
-                }
-            }
-            elif i ≺ QD + KVD {
-                while k ≺ D {
-                    acc ← acc + qwk[[i - QD, k]] * (qx[[k]] * s * qnw[[k]])
-                    k ← k + P
-                }
+fn stack_rows2<size A, size B, size N, size K>(tensor<f32, [A, K]> s2a, tensor<f32, [B, K]> s2b, mut tensor<f32, [N, K]> s2o) → void {
+    for from s2o at [i, k] thread lane let e {
+        if N ≡ A + B {
+            if i ≺ A {
+                s2o[[i, k]] ← s2a[[i, k]]
             }
             else {
-                while k ≺ D {
-                    acc ← acc + qwv[[i - QD - KVD, k]] * (qx[[k]] * s * qnw[[k]])
-                    k ← k + P
-                }
+                s2o[[i, k]] ← s2b[[i - A, k]]
             }
-            qpo[[i, p]] ← acc
         }
     }
 }
 
-# Combine the QKV partials and apply RoPE at position `qfpos` to the query and key
-# rows. `qfo` is [rotated q | rotated k | v] (`kv_write_wide` stores the last two
-# thirds in the caches: a lane may store only at its own coordinate, so the cache row
-# write cannot live here). Rows [0, qfqd) are query rows, [qfqd, qfqd + qfkv) key
-# rows, the rest value rows. `qfnorm` picks the pair convention: 1 = consecutive
-# pairs (2p, 2p + 1) (llama.cpp NORM), 0 = rotate-half pairs (j, j + span) (NEOX).
-# The head width is `qfdh` (even).
 @ kernel
 @ public
-fn qkv_fin<size R, size P>(tensor<f32, [R, P]> qfp, mut tensor<f32, [R]> qfo, i32 qfpos, i32 qfqd, i32 qfkv, i32 qfdh, f32 qflntheta, i32 qfnorm) → void {
-    for from qfo at [j] thread lane let e {
-        if qfqd ≥ 0 and qfqd ≤ 1000000 and qfkv ≥ 0 and qfkv ≤ 1000000 and qfdh ≥ 2 and qfdh ≤ 1920 {
-            let i32 hf ← qfdh / 2
-            mut f32 own ← 0.0
-            for range 0 ‥ P let q {
-                own ← own + qfp[[j, q]]
+fn stack_rows3<size A, size B, size C, size N, size K>(tensor<f32, [A, K]> s3a, tensor<f32, [B, K]> s3b, tensor<f32, [C, K]> s3c, mut tensor<f32, [N, K]> s3o) → void {
+    for from s3o at [i, k] thread lane let e {
+        if N ≡ A + B + C {
+            if i ≺ A {
+                s3o[[i, k]] ← s3a[[i, k]]
             }
-            if j ≥ qfqd + qfkv {
-                qfo[[j]] ← own
+            elif i ≺ A + B {
+                s3o[[i, k]] ← s3b[[i - A, k]]
             }
             else {
-                let i32 jj ← j % qfdh
+                s3o[[i, k]] ← s3c[[i - A - B, k]]
+            }
+        }
+    }
+}
+
+# RoPE at position `qrpos` over the stacked q/k/v GEMV output `qrx`: `qro` is
+# [rotated q | rotated k | v] (`kv_write_wide` stores the last two thirds in the
+# caches). Rows [0, qrqd) are query rows, [qrqd, qrqd + qrkv) key rows, the rest value
+# rows. `qrnorm` picks the pair convention: 1 = consecutive pairs (2p, 2p + 1)
+# (llama.cpp NORM), 0 = rotate-half pairs (j, j + span) (NEOX). The head width is
+# `qrdh` (even).
+@ kernel
+@ public
+fn qkv_rope<size R>(tensor<f32, [R]> qrx, mut tensor<f32, [R]> qro, i32 qrpos, i32 qrqd, i32 qrkv, i32 qrdh, f32 qrlntheta, i32 qrnorm) → void {
+    for from qrx at [j] thread lane let own {
+        if qrqd ≥ 0 and qrqd ≤ 1000000 and qrkv ≥ 0 and qrkv ≤ 1000000 and qrdh ≥ 2 and qrdh ≤ 1920 {
+            let i32 hf ← qrdh / 2
+            if j ≥ qrqd + qrkv {
+                qro[[j]] ← own
+            }
+            else {
+                let i32 jj ← j % qrdh
                 mut i32 partner ← 0
                 mut i32 pidx ← 0
                 mut bool first ← false
-                if qfnorm ≡ 1 {
+                if qrnorm ≡ 1 {
                     pidx ← jj / 2
                     first ← jj % 2 ≡ 0
                     if first {
@@ -461,26 +449,23 @@ fn qkv_fin<size R, size P>(tensor<f32, [R, P]> qfp, mut tensor<f32, [R]> qfo, i3
                         partner ← j - hf
                     }
                 }
-                mut f32 other ← 0.0
-                for range 0 ‥ P let r {
-                    other ← other + qfp[[partner, r]]
-                }
-                let f32 freq ← (-(pidx ↦ f32) / (hf ↦ f32) * qflntheta).exp()
-                let f32 ang ← (qfpos ↦ f32) * freq
+                let f32 other ← qrx[[partner]]
+                let f32 freq ← (-(pidx ↦ f32) / (hf ↦ f32) * qrlntheta).exp()
+                let f32 ang ← (qrpos ↦ f32) * freq
                 let f32 cs ← ang.cos()
                 let f32 sn ← ang.sin()
                 if first {
-                    qfo[[j]] ← own * cs - other * sn
+                    qro[[j]] ← own * cs - other * sn
                 }
                 else {
-                    qfo[[j]] ← other * sn + own * cs
+                    qro[[j]] ← other * sn + own * cs
                 }
             }
         }
     }
 }
 
-# K/V cache row write from the `qkv_fin` output: row `kwpos` of the key cache is
+# K/V cache row write from the `qkv_rope` output: row `kwpos` of the key cache is
 # kwqkv[kwqd .. kwqd + K) and of the value cache kwqkv[kwqd + K .. kwqd + 2K). `kwdom`
 # is any [K] tensor (the lane domain). A position outside the cache leaves it unchanged.
 @ kernel
@@ -498,7 +483,7 @@ fn kv_write_wide<size C, size K, size R>(tensor<f32, [K]> kwdom, tensor<f32, [R]
 # `softmax_wide` / `attn_wide`, so they are not computed and not written):
 # awsc[h, c] = (awqkv[h * dh + :] . awkc[c, (h / group) * dh + :]) * awscale, with
 # dh = `awdh` (head width) and group = `awgroup` (query heads per KV head). `awqkv` is
-# the `qkv_fin` output (the query is its first QD elements).
+# the `qkv_rope` output (the query is its first QD elements).
 @ kernel
 @ public
 fn scores_wide<size H, size C, size R, size KVD>(tensor<f32, [R]> awqkv, tensor<f32, [C, KVD]> awkc, mut tensor<f32, [H, C]> awsc, i32 awpos, i32 awdh, i32 awgroup, f32 awscale) → void {
@@ -561,44 +546,15 @@ fn attn_wide<size QD, size H, size C, size KVD>(tensor<f32, [H, C]> axsc, tensor
     }
 }
 
-# Gate and up projections of the RMSNorm'd input in ONE launch (same fold as
-# `qkv_part`): ghpg[i, p] and ghpu[i, p] are the partial dots of row i of the gate
-# and up weights. `ghpg` is the lane domain.
+# SwiGLU over the stacked gate/up GEMV output: sgo[j] = silu(sgu[j]) * sgu[F + j].
 @ kernel
 @ public
-fn gateup_part<size F, size P, size Q, size D>(tensor<f32, [D]> ghx, tensor<f32, [Q]> ghrp, tensor<f32, [D]> ghnw, tensor<f32, [F, D]> ghwg, tensor<f32, [F, D]> ghwu, mut tensor<f32, [F, P]> ghpg, mut tensor<f32, [F, P]> ghpu, f32 gheps) → void {
-    for from ghpg at [i, p] thread lane let e {
-        mut f32 ss ← 0.0
-        for range 0 ‥ Q let q {
-            ss ← ss + ghrp[[q]]
+fn swiglu_stacked<size F, size N>(tensor<f32, [N]> sgu, mut tensor<f32, [F]> sgo) → void {
+    for from sgo at [j] thread lane let e {
+        if N ≡ F + F {
+            let f32 g ← sgu[[j]]
+            sgo[[j]] ← (g / (1.0 + (-g).exp())) * sgu[[F + j]]
         }
-        let f32 s ← 1.0 / (ss / (D ↦ f32) + gheps).sqrt()
-        mut f32 ag ← 0.0
-        mut f32 au ← 0.0
-        mut i32 k ← p
-        while k ≺ D {
-            let f32 xn ← ghx[[k]] * s * ghnw[[k]]
-            ag ← ag + ghwg[[i, k]] * xn
-            au ← au + ghwu[[i, k]] * xn
-            k ← k + P
-        }
-        ghpg[[i, p]] ← ag
-        ghpu[[i, p]] ← au
-    }
-}
-
-# Combine the gate and up partials and apply SwiGLU: sfo[j] = silu(gate) * up.
-@ kernel
-@ public
-fn swiglu_fin<size F, size P>(tensor<f32, [F, P]> sfg, tensor<f32, [F, P]> sfu, mut tensor<f32, [F]> sfo) → void {
-    for from sfo at [j] thread lane let e {
-        mut f32 g ← 0.0
-        mut f32 u ← 0.0
-        for range 0 ‥ P let q {
-            g ← g + sfg[[j, q]]
-            u ← u + sfu[[j, q]]
-        }
-        sfo[[j]] ← (g / (1.0 + (-g).exp())) * u
     }
 }
 

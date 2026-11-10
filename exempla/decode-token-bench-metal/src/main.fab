@@ -12,7 +12,7 @@ locale = "en"
 #       --device metal --strict-engine
 #
 # A token is the wide launch set of `gradus:decode_token`: `embed_wide`, 32 x
-# `layer_wide` (14 launches each), `head_step_wide`, then `decode_step.argmax_token`,
+# `layer_wide` (16 launches each), `head_step_wide`, then `decode_step.argmax_token`,
 # which leaves the next token id in a device tensor. The program is one device
 # stream: every scratch and cache tensor stays device-resident, so the only host read
 # of a token is the id itself (one blocking wait).
@@ -35,13 +35,10 @@ const int PASSES = 6
 
 class Layer {
     let tensor<f32, [960]> anorm
-    let tensor<f32, [960, 960]> wq
-    let tensor<f32, [320, 960]> wk
-    let tensor<f32, [320, 960]> wv
+    let tensor<f32, [1600, 960]> wqkv
     let tensor<f32, [960, 960]> wo
     let tensor<f32, [960]> fnorm
-    let tensor<f32, [2560, 960]> wg
-    let tensor<f32, [2560, 960]> wu
+    let tensor<f32, [5120, 960]> wgu
     let tensor<f32, [960, 2560]> wd
 }
 
@@ -90,15 +87,19 @@ fn make_layer(i32 sd) → Layer {
     let tensor<f32, [960, 2560]> d960x2560 ← tf32[960, 2560] {}
     mut tensor<f32, [960, 2560]> wd ← tf32[960, 2560] {}
     synth_mat(d960x2560, mut wd, sd + 10, 0.02 ∷ f32)
-    return Layer { anorm = anorm, wq = wq, wk = wk, wv = wv, wo = wo, fnorm = fnorm, wg = wg, wu = wu, wd = wd }
+    mut tensor<f32, [1600, 960]> wqkv ← tf32[1600, 960] {}
+    ds.stack_rows3(wq, wk, wv, mut wqkv)
+    mut tensor<f32, [5120, 960]> wgu ← tf32[5120, 960] {}
+    ds.stack_rows2(wg, wu, mut wgu)
+    return Layer { anorm = anorm, wqkv = wqkv, wo = wo, fnorm = fnorm, wgu = wgu, wd = wd }
 }
 
 # Persistent scratch of `dt.layer_wide` (shapes documented in decode_token.fab):
-# 15 query heads of width 64, 5 KV heads, group 3, P = 64 lanes per GEMV row, Q = 32
-# RMSNorm partial sums, 64 cache rows.
+# 15 query heads of width 64, 5 KV heads, group 3, Q = 32 RMSNorm partial sums,
+# 64 cache rows.
 class Scratch {
     mut tensor<f32, [32]> rp
-    mut tensor<f32, [1600, 64]> qkvp
+    mut tensor<f32, [1600]> qkvr
     mut tensor<f32, [1600]> qkv
     let tensor<f32, [320]> kvdom
     mut tensor<f32, [15, 64]> sc
@@ -107,8 +108,7 @@ class Scratch {
     mut tensor<f32, [960]> ctx
     mut tensor<f32, [960]> ao
     mut tensor<f32, [960]> h1
-    mut tensor<f32, [2560, 64]> gp
-    mut tensor<f32, [2560, 64]> up
+    mut tensor<f32, [5120]> gu
     mut tensor<f32, [2560]> act
     mut tensor<f32, [960]> dn
     mut tensor<f32, [960]> xn
@@ -116,7 +116,7 @@ class Scratch {
 
 fn make_scratch() → Scratch {
     let tensor<f32, [32]> rp ← tf32[32] {}
-    let tensor<f32, [1600, 64]> qkvp ← tf32[1600, 64] {}
+    let tensor<f32, [1600]> qkvr ← tf32[1600] {}
     let tensor<f32, [1600]> qkv ← tf32[1600] {}
     let tensor<f32, [320]> kvdom ← tf32[320] {}
     let tensor<f32, [15, 64]> sc ← tf32[15, 64] {}
@@ -125,19 +125,19 @@ fn make_scratch() → Scratch {
     let tensor<f32, [960]> ctx ← tf32[960] {}
     let tensor<f32, [960]> ao ← tf32[960] {}
     let tensor<f32, [960]> h1 ← tf32[960] {}
-    let tensor<f32, [2560, 64]> gp ← tf32[2560, 64] {}
-    let tensor<f32, [2560, 64]> up ← tf32[2560, 64] {}
+    let tensor<f32, [5120]> gu ← tf32[5120] {}
     let tensor<f32, [2560]> act ← tf32[2560] {}
     let tensor<f32, [960]> dn ← tf32[960] {}
     let tensor<f32, [960]> xn ← tf32[960] {}
-    return Scratch { rp = rp, qkvp = qkvp, qkv = qkv, kvdom = kvdom, sc = sc, mx = mx, sm = sm, ctx = ctx, ao = ao, h1 = h1, gp = gp, up = up, act = act, dn = dn, xn = xn }
+    return Scratch { rp = rp, qkvr = qkvr, qkv = qkv, kvdom = kvdom, sc = sc, mx = mx, sm = sm, ctx = ctx, ao = ao, h1 = h1, gu = gu, act = act, dn = dn, xn = xn }
 }
 
 # A `mut` class field cannot be a call argument under the strict engine, so each
 # function below binds the fields it passes to locals first.
 fn run_layer(mut Scratch s, tensor<f32, [960]> hin, mut tensor<f32, [960]> hout, Layer ly, mut tensor<f32, [64, 320]> kin, mut tensor<f32, [64, 320]> vin, i32 pos) → void {
     mut tensor<f32, [32]> rp ← s.rp
-    mut tensor<f32, [1600, 64]> qkvp ← s.qkvp
+    mut tensor<f32, [960]> xn ← s.xn
+    mut tensor<f32, [1600]> qkvr ← s.qkvr
     mut tensor<f32, [1600]> qkv ← s.qkv
     let tensor<f32, [320]> kvdom ← s.kvdom
     mut tensor<f32, [15, 64]> sc ← s.sc
@@ -146,13 +146,12 @@ fn run_layer(mut Scratch s, tensor<f32, [960]> hin, mut tensor<f32, [960]> hout,
     mut tensor<f32, [960]> ctx ← s.ctx
     mut tensor<f32, [960]> ao ← s.ao
     mut tensor<f32, [960]> h1 ← s.h1
-    mut tensor<f32, [2560, 64]> gp ← s.gp
-    mut tensor<f32, [2560, 64]> up ← s.up
+    mut tensor<f32, [5120]> gu ← s.gu
     mut tensor<f32, [2560]> act ← s.act
     mut tensor<f32, [960]> dn ← s.dn
     # pqd 960, pkvd 320, head width 64, GQA group 3, consecutive-pair RoPE (1),
     # epsilon 1e-5, ln(theta) = ln(100000), attention scale 1/8.
-    dt.layer_wide(hin, mut hout, ly.anorm, ly.wq, ly.wk, ly.wv, ly.wo, ly.fnorm, ly.wg, ly.wu, ly.wd, mut kin, mut vin, mut rp, mut qkvp, mut qkv, kvdom, mut sc, mut mx, mut sm, mut ctx, mut ao, mut h1, mut gp, mut up, mut act, mut dn, pos, 960, 320, 64, 3, 1, 0.00001, 11.512925, 0.125)
+    dt.layer_wide(hin, mut hout, ly.anorm, ly.wqkv, ly.wo, ly.fnorm, ly.wgu, ly.wd, mut kin, mut vin, mut rp, mut xn, mut qkvr, mut qkv, kvdom, mut sc, mut mx, mut sm, mut ctx, mut ao, mut h1, mut gu, mut act, mut dn, pos, 960, 320, 64, 3, 1, 0.00001, 11.512925, 0.125)
 }
 
 fn run_head(mut Scratch s, tensor<f32, [960]> hidden, tensor<f32, [960]> onorm, tensor<f32, [49152, 960]> embed, mut tensor<f32, [49152]> logits) → void {

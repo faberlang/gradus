@@ -32,6 +32,7 @@
 # The digest-bound entry (`load_port_model`) is in admission.fab.
 # =============================================================================
 
+import from "gradus:decode_step" ds
 import from "gradus:model/gguf_manifest" gguf_manifest
 
 
@@ -103,24 +104,20 @@ const int GGML_TYPE_F32 = 0
 @ public
 class PortLayer {
     let tensor<f32, [960]> attn_norm
-    let tensor<f32, [960, 960]> wq
-    let tensor<f32, [320, 960]> wk
-    let tensor<f32, [320, 960]> wv
+    let tensor<f32, [1600, 960]> wqkv
     let tensor<f32, [960, 960]> wo
     let tensor<f32, [960]> ffn_norm
-    let tensor<f32, [2560, 960]> wg
-    let tensor<f32, [2560, 960]> wu
+    let tensor<f32, [5120, 960]> wgu
     let tensor<f32, [960, 2560]> wd
 }
 
 # The device scratch of the fused layer launches (the caller owns every scratch
-# tensor: Gradus allocates none in the wide path). A request allocates one and primes
-# it before its first launch; the loader reads the extents of its destination shapes
-# from one.
+# tensor: Gradus allocates none in the wide path). A request allocates one once; the
+# loader reads the extents of its destination shapes from one.
 @ public
 class PortScratch {
     mut tensor<f32, [32]> rp
-    mut tensor<f32, [1600, 64]> qkvp
+    mut tensor<f32, [1600]> qkvr
     mut tensor<f32, [1600]> qkv
     let tensor<f32, [320]> kvdom
     mut tensor<f32, [15]> mx
@@ -128,8 +125,7 @@ class PortScratch {
     mut tensor<f32, [960]> ctx
     mut tensor<f32, [960]> ao
     mut tensor<f32, [960]> h1
-    mut tensor<f32, [2560, 64]> gp
-    mut tensor<f32, [2560, 64]> up
+    mut tensor<f32, [5120]> gu
     mut tensor<f32, [2560]> act
     mut tensor<f32, [960]> dn
     mut tensor<f32, [960]> xn
@@ -145,7 +141,7 @@ class PortWeights {
 @ public
 fn new_scratch() → PortScratch {
     let tensor<f32, [32]> rp ← tf32[32] {}
-    let tensor<f32, [1600, 64]> qkvp ← tf32[1600, 64] {}
+    let tensor<f32, [1600]> qkvr ← tf32[1600] {}
     let tensor<f32, [1600]> qkv ← tf32[1600] {}
     let tensor<f32, [320]> kvdom ← tf32[320] {}
     let tensor<f32, [15]> mx ← tf32[15] {}
@@ -153,12 +149,11 @@ fn new_scratch() → PortScratch {
     let tensor<f32, [960]> ctx ← tf32[960] {}
     let tensor<f32, [960]> ao ← tf32[960] {}
     let tensor<f32, [960]> h1 ← tf32[960] {}
-    let tensor<f32, [2560, 64]> gp ← tf32[2560, 64] {}
-    let tensor<f32, [2560, 64]> up ← tf32[2560, 64] {}
+    let tensor<f32, [5120]> gu ← tf32[5120] {}
     let tensor<f32, [2560]> act ← tf32[2560] {}
     let tensor<f32, [960]> dn ← tf32[960] {}
     let tensor<f32, [960]> xn ← tf32[960] {}
-    return PortScratch { rp = rp, qkvp = qkvp, qkv = qkv, kvdom = kvdom, mx = mx, sm = sm, ctx = ctx, ao = ao, h1 = h1, gp = gp, up = up, act = act, dn = dn, xn = xn }
+    return PortScratch { rp = rp, qkvr = qkvr, qkv = qkv, kvdom = kvdom, mx = mx, sm = sm, ctx = ctx, ao = ao, h1 = h1, gu = gu, act = act, dn = dn, xn = xn }
 }
 
 # ---------------------------------------------------------------------------
@@ -237,17 +232,21 @@ fn load_vector<size N>((int, int) → list<b8> ⇥ gguf_manifest.GgufManifestErr
 }
 
 fn load_layer((int, int) → list<b8> ⇥ gguf_manifest.GgufManifestError source, (string) → void report, gguf_manifest.GgufManifest m, int n, PortScratch s) → PortLayer ⇥ gguf_manifest.GgufManifestError {
-    return PortLayer {
-        attn_norm = load_vector(source, report, m, layer_tensor(n, "attn_norm.weight"), s.ctx),
-        wq = load_matrix(source, report, m, layer_tensor(n, "attn_q.weight"), s.ctx, s.ctx),
-        wk = load_matrix(source, report, m, layer_tensor(n, "attn_k.weight"), s.kvdom, s.ctx),
-        wv = load_matrix(source, report, m, layer_tensor(n, "attn_v.weight"), s.kvdom, s.ctx),
-        wo = load_matrix(source, report, m, layer_tensor(n, "attn_output.weight"), s.ctx, s.ctx),
-        ffn_norm = load_vector(source, report, m, layer_tensor(n, "ffn_norm.weight"), s.ctx),
-        wg = load_matrix(source, report, m, layer_tensor(n, "ffn_gate.weight"), s.act, s.ctx),
-        wu = load_matrix(source, report, m, layer_tensor(n, "ffn_up.weight"), s.act, s.ctx),
-        wd = load_matrix(source, report, m, layer_tensor(n, "ffn_down.weight"), s.ctx, s.act)
-    }
+    let tensor<f32, [960]> attn_norm ← load_vector(source, report, m, layer_tensor(n, "attn_norm.weight"), s.ctx)
+    let tensor<f32, [960, 960]> wq ← load_matrix(source, report, m, layer_tensor(n, "attn_q.weight"), s.ctx, s.ctx)
+    let tensor<f32, [320, 960]> wk ← load_matrix(source, report, m, layer_tensor(n, "attn_k.weight"), s.kvdom, s.ctx)
+    let tensor<f32, [320, 960]> wv ← load_matrix(source, report, m, layer_tensor(n, "attn_v.weight"), s.kvdom, s.ctx)
+    let tensor<f32, [960, 960]> wo ← load_matrix(source, report, m, layer_tensor(n, "attn_output.weight"), s.ctx, s.ctx)
+    let tensor<f32, [960]> ffn_norm ← load_vector(source, report, m, layer_tensor(n, "ffn_norm.weight"), s.ctx)
+    let tensor<f32, [2560, 960]> wg ← load_matrix(source, report, m, layer_tensor(n, "ffn_gate.weight"), s.act, s.ctx)
+    let tensor<f32, [2560, 960]> wu ← load_matrix(source, report, m, layer_tensor(n, "ffn_up.weight"), s.act, s.ctx)
+    let tensor<f32, [960, 2560]> wd ← load_matrix(source, report, m, layer_tensor(n, "ffn_down.weight"), s.ctx, s.act)
+    # q, k and v stacked row-wise, and gate and up: one GEMV each per token.
+    mut tensor<f32, [1600, 960]> wqkv ← tf32[1600, 960] {}
+    ds.stack_rows3(wq, wk, wv, mut wqkv)
+    mut tensor<f32, [5120, 960]> wgu ← tf32[5120, 960] {}
+    ds.stack_rows2(wg, wu, mut wgu)
+    return PortLayer { attn_norm = attn_norm, wqkv = wqkv, wo = wo, ffn_norm = ffn_norm, wgu = wgu, wd = wd }
 }
 
 # Every one of the 290 tensors, each read once, after the metadata dims check.

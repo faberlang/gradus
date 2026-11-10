@@ -156,41 +156,41 @@ fn head_step<size V, size D>(tensor<f32, [D]> hidden, tensor<f32, [D]> onorm, te
 }
 
 # ---------------------------------------------------------------------------
-# Wide path (strict-engine safe): 14 launches per layer instead of 22, none of them a
-# serial 960-term dot in one lane (the o and down projections and the lm_head are the
-# `⇇ ·` glyph, `decode_step.gemv`), and no allocation inside the generic functions
-# (a generic host function that allocates `tf32[D] {}` is refused by `--strict-engine`).
-# The CALLER owns every scratch tensor and the caches `kin` / `vin` and allocates each
-# once; kernel outputs stay device-resident until the host reads them.
+# Wide path (strict-engine safe): 16 launches per layer, every projection one `⇇ ·`
+# GEMV (`decode_step.gemv`), and no allocation inside the generic functions (a generic
+# host function that allocates `tf32[D] {}` is refused by `--strict-engine`). The
+# query, key and value weights are stacked row-wise into one [R, D] matrix, and the
+# gate and up weights into one [G, D] (`decode_step.stack_rows3` / `stack_rows2`, at
+# load), so each group is one GEMV over its RMSNorm'd input. The CALLER owns every
+# scratch tensor and the caches `kin` / `vin` and allocates each once; kernel outputs
+# stay device-resident until the host reads them.
 #
-# Scratch shapes (D hidden, QD query width, KVD key/value width, F ffn width, H query
-# heads, C cache rows; R = QD + 2 * KVD; P lanes per GEMV row, a power of two, 64 is
-# the measured sweet spot; Q partial sums for RMSNorm, 32):
-#   rp [Q]   qkvp [R, P]   qkv [R]   kvdom [KVD] (zeros)   sc [H, C]   mx [H]   sm [H]
-#   ctx [QD]   ao [D]   h1 [D]   gp [F, P]   up [F, P]   act [F]   dn [D]
+# Shapes: D hidden, QD query width, KVD key/value width, F ffn width, H query heads,
+# C cache rows, R = QD + 2 * KVD, G = 2 * F, Q partial sums for RMSNorm (32).
+# Scratch:
+#   rp [Q]   xn [D]   qkvr [R]   qkv [R]   kvdom [KVD] (zeros)   sc [H, C]   mx [H]
+#   sm [H]   ctx [QD]   ao [D]   h1 [D]   gu [G]   act [F]   dn [D]
 # `head_step_wide` also takes xn [D], the normalized hidden state.
 # `pqd` / `pkvd` are QD / KVD, `pdh` the head width, `pgroup` = QD / KVD, `prope` the
 # RoPE pair convention (as in `layer_step`), `pos` the token position.
 # ---------------------------------------------------------------------------
 
-# One layer: hout = layer(hin) at position `pos`, in 14 launches.
+# One layer: hout = layer(hin) at position `pos`, in 16 launches.
 @ public
-fn layer_wide<size D, size QD, size KVD, size F, size H, size C, size P, size Q, size R>(
+fn layer_wide<size D, size QD, size KVD, size F, size H, size C, size Q, size R, size G>(
     tensor<f32, [D]> hin,
     mut tensor<f32, [D]> hout,
     tensor<f32, [D]> anorm,
-    tensor<f32, [QD, D]> wq,
-    tensor<f32, [KVD, D]> wk,
-    tensor<f32, [KVD, D]> wv,
+    tensor<f32, [R, D]> wqkv,
     tensor<f32, [D, QD]> wo,
     tensor<f32, [D]> fnorm,
-    tensor<f32, [F, D]> wg,
-    tensor<f32, [F, D]> wu,
+    tensor<f32, [G, D]> wgu,
     tensor<f32, [D, F]> wd,
     mut tensor<f32, [C, KVD]> kin,
     mut tensor<f32, [C, KVD]> vin,
     mut tensor<f32, [Q]> rp,
-    mut tensor<f32, [R, P]> qkvp,
+    mut tensor<f32, [D]> xn,
+    mut tensor<f32, [R]> qkvr,
     mut tensor<f32, [R]> qkv,
     tensor<f32, [KVD]> kvdom,
     mut tensor<f32, [H, C]> sc,
@@ -199,8 +199,7 @@ fn layer_wide<size D, size QD, size KVD, size F, size H, size C, size P, size Q,
     mut tensor<f32, [QD]> ctx,
     mut tensor<f32, [D]> ao,
     mut tensor<f32, [D]> h1,
-    mut tensor<f32, [F, P]> gp,
-    mut tensor<f32, [F, P]> up,
+    mut tensor<f32, [G]> gu,
     mut tensor<f32, [F]> act,
     mut tensor<f32, [D]> dn,
     i32 pos,
@@ -214,8 +213,9 @@ fn layer_wide<size D, size QD, size KVD, size F, size H, size C, size P, size Q,
     f32 pscale
 ) → void {
     ds.rms_part(hin, mut rp)
-    ds.qkv_part(hin, rp, anorm, wq, wk, wv, mut qkvp, peps)
-    ds.qkv_fin(qkvp, mut qkv, pos, pqd, pkvd, pdh, plntheta, prope)
+    ds.rms_apply_part(hin, rp, anorm, mut xn, peps)
+    ds.gemv(wqkv, xn, mut qkvr)
+    ds.qkv_rope(qkvr, mut qkv, pos, pqd, pkvd, pdh, plntheta, prope)
     ds.kv_write_wide(kvdom, qkv, mut kin, mut vin, pos, pqd)
     ds.scores_wide(qkv, kin, mut sc, pos, pdh, pgroup, pscale)
     ds.softmax_wide(sc, mut mx, mut sm, pos)
@@ -223,8 +223,9 @@ fn layer_wide<size D, size QD, size KVD, size F, size H, size C, size P, size Q,
     ds.gemv(wo, ctx, mut ao)
     ds.residual_add(hin, ao, mut h1)
     ds.rms_part(h1, mut rp)
-    ds.gateup_part(h1, rp, fnorm, wg, wu, mut gp, mut up, peps)
-    ds.swiglu_fin(gp, up, mut act)
+    ds.rms_apply_part(h1, rp, fnorm, mut xn, peps)
+    ds.gemv(wgu, xn, mut gu)
+    ds.swiglu_stacked(gu, mut act)
     ds.gemv(wd, act, mut dn)
     ds.residual_add(h1, dn, mut hout)
 }
