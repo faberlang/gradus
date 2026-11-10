@@ -479,14 +479,13 @@ fn kv_write_wide<size C, size K, size R>(tensor<f32, [K]> kwdom, tensor<f32, [R]
     }
 }
 
-# GQA decode scores for positions c <= awpos only (later positions are never read by
-# `softmax_wide` / `attn_wide`, so they are not computed and not written):
-# awsc[h, c] = (awqkv[h * dh + :] . awkc[c, (h / group) * dh + :]) * awscale, with
-# dh = `awdh` (head width) and group = `awgroup` (query heads per KV head). `awqkv` is
-# the `qkv_rope` output (the query is its first QD elements).
+# GQA decode scores, masked: awsc[h, c] = (awqkv[h * dh + :] . awkc[c, (h / group) * dh + :])
+# * awscale for c <= awpos, and -3.0e38 past it, so `row_softmax` gives those positions
+# exactly 0. dh = `awdh` (head width), group = `awgroup` (query heads per KV head).
+# `awqkv` is the `qkv_rope` output (the query is its first QD elements).
 @ kernel
 @ public
-fn scores_wide<size H, size C, size R, size KVD>(tensor<f32, [R]> awqkv, tensor<f32, [C, KVD]> awkc, mut tensor<f32, [H, C]> awsc, i32 awpos, i32 awdh, i32 awgroup, f32 awscale) → void {
+fn scores_masked<size H, size C, size R, size KVD>(tensor<f32, [R]> awqkv, tensor<f32, [C, KVD]> awkc, mut tensor<f32, [H, C]> awsc, i32 awpos, i32 awdh, i32 awgroup, f32 awscale) → void {
     for from awsc at [h, c] thread lane let e {
         if c ≤ awpos and awgroup ≻ 0 and awdh ≥ 1 and awdh ≤ 960 {
             let i32 dh ← awdh
@@ -497,52 +496,50 @@ fn scores_wide<size H, size C, size R, size KVD>(tensor<f32, [R]> awqkv, tensor<
             }
             awsc[[h, c]] ← acc * awscale
         }
-    }
-}
-
-# Row softmax statistics over positions 0 .. smpos: per head the max (smmx) and the
-# sum of exp(x - max) (smsm). `smmx` is the lane domain [H].
-@ kernel
-@ public
-fn softmax_wide<size H, size C>(tensor<f32, [H, C]> smsc, mut tensor<f32, [H]> smmx, mut tensor<f32, [H]> smsm, i32 smpos) → void {
-    for from smmx at [h] thread lane let e {
-        if smpos ≥ 0 and smpos ≤ 2147483646 and smpos ≺ C {
-            let i32 n ← smpos + 1
-            mut f32 m ← smsc[[h, 0]]
-            for range 1 ‥ n let k {
-                if smsc[[h, k]] ≻ m {
-                    m ← smsc[[h, k]]
-                }
-            }
-            smmx[[h]] ← m
-            mut f32 acc ← 0.0
-            for range 0 ‥ n let q {
-                acc ← acc + (smsc[[h, q]] - m).exp()
-            }
-            smsm[[h]] ← acc
+        else {
+            awsc[[h, c]] ← -3.0e38
         }
     }
 }
 
-# Attention context with the softmax normalization folded in:
-# axctx[j] = sum over c <= axpos of (exp(axsc[h, c] - axmx[h]) / axsm[h]) * axvc[c, base + d],
-# j = h * dh + d, dh = `axdh`, group = `axgroup`. `axctx` is the lane domain [QD].
+# Attention probabilities: each head's row of masked scores through the language's
+# row softmax, written into a buffer the caller allocates once.
 @ kernel
 @ public
-fn attn_wide<size QD, size H, size C, size KVD>(tensor<f32, [H, C]> axsc, tensor<f32, [H]> axmx, tensor<f32, [H]> axsm, tensor<f32, [C, KVD]> axvc, mut tensor<f32, [QD]> axctx, i32 axpos, i32 axdh, i32 axgroup) → void {
-    for from axctx at [j] thread lane let e {
-        if axgroup ≻ 0 and axdh ≥ 1 and axdh ≤ 960 and axpos ≥ 0 and axpos ≤ 2147483646 and axpos ≺ C {
-            let i32 dh ← axdh
-            let i32 h ← j / dh
-            let i32 d ← j % dh
-            let i32 base ← (h / axgroup) * dh
-            let i32 n ← axpos + 1
+fn row_softmax<size H, size C>(tensor<f32, [H, C]> rss, mut tensor<f32, [H, C]> rso) → void {
+    rso ⇇ rss.softmax()
+}
+
+# Attention context, split over the context: cpo[p, j] = sum over c = p, p + P, ... <= cppos
+# of cpp[h, c] * cpvc[c, base + d], j = h * dh + d, dh = `cpdh`, group = `cpgroup`.
+# Neighbouring lanes read neighbouring value elements, and no lane walks the whole
+# context (radix corpus/inference attention-decode-split). `context_fin` sums the P parts.
+@ kernel
+@ public
+fn context_part<size P, size QD, size H, size C, size KVD>(tensor<f32, [H, C]> cpp, tensor<f32, [C, KVD]> cpvc, mut tensor<f32, [P, QD]> cpo, i32 cppos, i32 cpdh, i32 cpgroup) → void {
+    for from cpo at [p, j] thread lane let e {
+        if cpgroup ≻ 0 and cpdh ≥ 1 and cpdh ≤ 960 and cppos ≥ 0 and cppos ≺ C {
+            let i32 h ← j / cpdh
+            let i32 d ← j % cpdh
+            let i32 base ← (h / cpgroup) * cpdh
             mut f32 acc ← 0.0
-            for range 0 ‥ n let c {
-                acc ← acc + ((axsc[[h, c]] - axmx[[h]]).exp() / axsm[[h]]) * axvc[[c, base + d]]
+            for range p ‥ cppos + 1 step P let c {
+                acc ← acc + cpp[[h, c]] * cpvc[[c, base + d]]
             }
-            axctx[[j]] ← acc
+            cpo[[p, j]] ← acc
         }
+    }
+}
+
+@ kernel
+@ public
+fn context_fin<size P, size QD>(tensor<f32, [P, QD]> cfpart, mut tensor<f32, [QD]> cfo) → void {
+    for from cfo at [j] thread lane let e {
+        mut f32 acc ← 0.0
+        for range 0 ‥ P let p {
+            acc ← acc + cfpart[[p, j]]
+        }
+        cfo[[j]] ← acc
     }
 }
 

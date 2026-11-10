@@ -156,7 +156,7 @@ fn head_step<size V, size D>(tensor<f32, [D]> hidden, tensor<f32, [D]> onorm, te
 }
 
 # ---------------------------------------------------------------------------
-# Wide path (strict-engine safe): 16 launches per layer, every projection one `⇇ ·`
+# Wide path (strict-engine safe): 17 launches per layer, every projection one `⇇ ·`
 # GEMV (`decode_step.gemv`), and no allocation inside the generic functions (a generic
 # host function that allocates `tf32[D] {}` is refused by `--strict-engine`). The
 # query, key and value weights are stacked row-wise into one [R, D] matrix, and the
@@ -165,19 +165,24 @@ fn head_step<size V, size D>(tensor<f32, [D]> hidden, tensor<f32, [D]> onorm, te
 # scratch tensor and the caches `kin` / `vin` and allocates each once; kernel outputs
 # stay device-resident until the host reads them.
 #
+# Attention is the masked scores, the language's row softmax, and a context sum split
+# over S lanes per output (radix corpus/inference decode-layer): no lane walks the
+# whole context, so a long context costs bandwidth, not one lane's serial loop.
+#
 # Shapes: D hidden, QD query width, KVD key/value width, F ffn width, H query heads,
-# C cache rows, R = QD + 2 * KVD, G = 2 * F, Q partial sums for RMSNorm (32).
+# C cache rows, R = QD + 2 * KVD, G = 2 * F, Q partial sums for RMSNorm (32), S context
+# parts per attention output (16).
 # Scratch:
-#   rp [Q]   xn [D]   qkvr [R]   qkv [R]   kvdom [KVD] (zeros)   sc [H, C]   mx [H]
-#   sm [H]   ctx [QD]   ao [D]   h1 [D]   gu [G]   act [F]   dn [D]
+#   rp [Q]   xn [D]   qkvr [R]   qkv [R]   kvdom [KVD] (zeros)   sc [H, C]   pr [H, C]
+#   cpart [S, QD]   ctx [QD]   ao [D]   h1 [D]   gu [G]   act [F]   dn [D]
 # `head_step_wide` also takes xn [D], the normalized hidden state.
 # `pqd` / `pkvd` are QD / KVD, `pdh` the head width, `pgroup` = QD / KVD, `prope` the
 # RoPE pair convention (as in `layer_step`), `pos` the token position.
 # ---------------------------------------------------------------------------
 
-# One layer: hout = layer(hin) at position `pos`, in 16 launches.
+# One layer: hout = layer(hin) at position `pos`, in 17 launches.
 @ public
-fn layer_wide<size D, size QD, size KVD, size F, size H, size C, size Q, size R, size G>(
+fn layer_wide<size D, size QD, size KVD, size F, size H, size C, size Q, size R, size G, size S>(
     tensor<f32, [D]> hin,
     mut tensor<f32, [D]> hout,
     tensor<f32, [D]> anorm,
@@ -194,8 +199,8 @@ fn layer_wide<size D, size QD, size KVD, size F, size H, size C, size Q, size R,
     mut tensor<f32, [R]> qkv,
     tensor<f32, [KVD]> kvdom,
     mut tensor<f32, [H, C]> sc,
-    mut tensor<f32, [H]> mx,
-    mut tensor<f32, [H]> sm,
+    mut tensor<f32, [H, C]> pr,
+    mut tensor<f32, [S, QD]> cpart,
     mut tensor<f32, [QD]> ctx,
     mut tensor<f32, [D]> ao,
     mut tensor<f32, [D]> h1,
@@ -217,9 +222,10 @@ fn layer_wide<size D, size QD, size KVD, size F, size H, size C, size Q, size R,
     ds.gemv(wqkv, xn, mut qkvr)
     ds.qkv_rope(qkvr, mut qkv, pos, pqd, pkvd, pdh, plntheta, prope)
     ds.kv_write_wide(kvdom, qkv, mut kin, mut vin, pos, pqd)
-    ds.scores_wide(qkv, kin, mut sc, pos, pdh, pgroup, pscale)
-    ds.softmax_wide(sc, mut mx, mut sm, pos)
-    ds.attn_wide(sc, mx, sm, vin, mut ctx, pos, pdh, pgroup)
+    ds.scores_masked(qkv, kin, mut sc, pos, pdh, pgroup, pscale)
+    ds.row_softmax(sc, mut pr)
+    ds.context_part(pr, vin, mut cpart, pos, pdh, pgroup)
+    ds.context_fin(cpart, mut ctx)
     ds.gemv(wo, ctx, mut ao)
     ds.residual_add(hin, ao, mut h1)
     ds.rms_part(h1, mut rp)
