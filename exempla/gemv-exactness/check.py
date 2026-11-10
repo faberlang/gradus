@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exact-math check of decode_step's split GEMV (gemv_part + gemv_fin_residual, P = 64).
+"""Exact-math check of decode_step's GEMV (the `⇇ ·` glyph, `decode_step.gemv`).
 
 The Faber program builds weights and input as exact multiples of 2^-10 on the device:
 
@@ -94,10 +94,13 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--faber", required=True)
     parser.add_argument("--library-home", required=True)
+    parser.add_argument("--devices", default="metal,cpu",
+                        help="comma-separated routes; route agreement needs metal and cpu")
     args = parser.parse_args()
+    devices = [d for d in args.devices.split(",") if d]
 
     oracle = {n: [exact_row(i, n) for i in range(ROWS)] for n in CASES}
-    routes = {device: run(args.faber, args.library_home, device) for device in ("metal", "cpu")}
+    routes = {device: run(args.faber, args.library_home, device) for device in devices}
     failures = 0
 
     for device, results in routes.items():
@@ -118,7 +121,7 @@ def main():
             print(f"{device:5s} K={n:4d} rows={ROWS} max={max(ratios):.4f} median={statistics.median(ratios):.4f} "
                   f"bound C={C} rows with |sum| < sum|xw|/8: {cancelling}")
 
-    for n in CASES:
+    for n in CASES if {"metal", "cpu"} <= routes.keys() else ():
         worst = 0.0
         for i, (_, magnitude) in enumerate(oracle[n]):
             gap = abs(routes["metal"][n][i] - routes["cpu"][n][i]) / (magnitude / (1 << 22))
