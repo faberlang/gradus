@@ -1,0 +1,541 @@
+# =============================================================================
+# Serve — the HTTP server: /health, /model, /generate (JSON and SSE)
+# =============================================================================
+#
+# HTTP goes through `norma:http/server` (bind / accept / reply / open_sse).
+# `/generate` answers JSON by default; `Accept: text/event-stream` or
+# `?stream=1` emits one SSE event per token, written to the open response as
+# each token is generated.
+#
+# The /generate pipeline is a chain of stages that throw a Refusal (the HTTP
+# status and body to reply with): method gate → state gate → cancellation
+# checkpoint → body read → JSON parse → prompt-length gate → cancellation
+# checkpoint → encode → engine generate (prefill + decode with the admitted
+# tokenizer EOG stop set and the max_tokens budget) → response assembly. The
+# engine owns the domain validation (the gradus reject rows) with typed causes;
+# this module maps them to 400/500.
+
+import from "norma:fault" fault
+import from "norma:http/headers" headers
+import from "norma:http/request" httpreq
+import from "norma:http/server" server
+import from "norma:http/sse" sse
+import from "norma:text" text
+
+import from "gradus:generation/config" config
+import from "gradus:generation/decoder" decoder
+import from "gradus:tokenizer/bpe" tokenizator
+
+import from "./port_generate" pgen
+import from "./port_weights" port
+import from "./cli" const ServeConfig
+import from "./state" lifecycle
+import from "./state" const ServerState, admitted_state, exit_code_for, failed_state, new_state
+import from "./request" const GenerateConfig, GenerateRequest, build_generate_config, parse_generate_body
+import from "./response" const classify_generate_error, error_body, generate_response_body, health_body, model_body, model_unready_body, state_body
+import from "./generate" const ResidentModel, build_tokenizer, check_generate_port, encode_prompt, port_resident, run_generate_port, run_generate_port_unstreamed, tokens_text
+import from "./admission" const AdmittedModel, admit_serving, load_port_model
+import from "./io" const exit_with, stderr_write
+
+const string CANCELLED = "generation cancelled (shutdown)"
+const string BODY_UNAVAILABLE = "request body unavailable: bytes→text decode failed"
+
+# Pre-encode prompt-length gate (S-F4 / B5-U2): a text-length bound in the
+# runtime string-length unit. The HTTP body cap stays the outer bound and
+# max_prompt keeps its post-encode generation meaning.
+const int MAX_PROMPT_LENGTH = 65536
+
+# ---------------------------------------------------------------------------
+# Refusals
+# ---------------------------------------------------------------------------
+
+# A reply that ends a request early: the HTTP status and the JSON body.
+@ public
+class Refusal {
+    let int status
+    let string body
+}
+
+fn refused(int status, string cause) → Refusal {
+    return Refusal { status = status, body = error_body(cause) }
+}
+
+# A cause whose status the cause itself decides (request-side typed causes are
+# 400, engine-side failures 500).
+fn classified(string cause) → Refusal {
+    return refused(classify_generate_error(cause), cause)
+}
+
+# An engine failure replies by its cause.
+@ public
+@ conversion
+fn refusal_of_generation(config.GenerationError err) → Refusal {
+    return classified(err.message)
+}
+
+# ---------------------------------------------------------------------------
+# HTTP helpers
+# ---------------------------------------------------------------------------
+
+fn json_headers() → headers.Headers {
+    let headers.Headers head ← headers.empty()
+    head.append("content-type", "application/json")
+    return head
+}
+
+# A reply that cannot be written (the peer went away) drops that one request:
+# it is logged and the serve loop continues.
+fn reply_json(server.Incoming incoming, int status, string body) → void {
+    do {
+        server.reply(incoming, status, json_headers(), body)
+    }
+    catch err {
+        stderr_write("inferentia: reply dropped: §\n"(err))
+    }
+}
+
+fn wants_sse(server.Incoming incoming) → bool {
+    let string accept ← incoming.req.header("accept") coalesce ""
+    let string stream ← incoming.req.query_field("stream") coalesce ""
+    return accept.contains("text/event-stream") or stream ≡ "1" or stream ≡ "true"
+}
+
+# The text of a request body. The provider delivers it as text; a value
+# carrying a `list<b8>` is also accepted and decoded as UTF-8. An absent body is
+# empty text. Only a failed byte→text decode (invalid UTF-8) is an error.
+fn body_text(value body) → string ⇥ string {
+    if body is string {
+        return body ↦ string
+    }
+    # No body at all, or one that is not bytes, reads as empty.
+    let list<b8> raw ← body ↦ list<b8> ⊥ ||
+    do {
+        return raw ↦ string
+    }
+    catch err {
+        throw BODY_UNAVAILABLE
+    }
+}
+
+# The body of an accepted request carrier. A carrier that is not a map has no
+# readable body.
+fn request_body(value request) → string ⇥ Refusal {
+    do {
+        let map<string, value> carrier ↤ request
+        return body_text(carrier.get("body"))
+    }
+    catch err {
+        throw refused(500, BODY_UNAVAILABLE)
+    }
+}
+
+# ---------------------------------------------------------------------------
+# SSE
+# ---------------------------------------------------------------------------
+
+# One SSE event written and flushed to the open response. false when the peer
+# went away (the write failed): the decode loop then ends the generation.
+fn send_sse_event(server.Stream stream, string name, string data) → bool {
+    do {
+        server.send_event(stream, sse.Event { name = name, data = data, id = "", retry = "" })
+        return true
+    }
+    catch err {
+        stderr_write("inferentia: stream dropped: §\n"(err))
+        return false
+    }
+}
+
+# Stream one /generate over SSE. Request validation runs before the stream
+# opens, so a rejected request is still a JSON 4xx. Then the response opens, the
+# decode loop writes one `token` event per chosen id between decode steps (each
+# flushed to the client as it is written), and the stream ends with a `done`
+# event carrying the JSON body, or an `error` event if generation or detokenize
+# fails after the stream is open (the status line has already gone out).
+fn stream_generate(server.Incoming incoming, ServerState st, Prepared job, ResidentModel model) → void ⇥ Refusal {
+    check_generate_port(job.cfg, job.ids, model)
+    do {
+        let server.Stream stream ← server.open_sse(incoming)
+        if stream_run(stream, st, job, model) {
+            server.finish_stream(stream, server.keep_alive(incoming.req.headers))
+        }
+    }
+    catch err {
+        stderr_write("inferentia: stream dropped: §\n"(err))
+    }
+}
+
+# The decode loop of one open stream. true when the stream is still writable,
+# so the caller may finish it; false once a write failed.
+fn stream_run(server.Stream stream, ServerState st, Prepared job, ResidentModel model) → bool {
+    let (int) → bool sink ← (int id) → bool ∴ send_sse_event(stream, "token", "§"(id))
+    do {
+        let pgen.PortResult run ← run_generate_port(job.cfg, job.ids, model, decoder.eog_stop(), false, sink)
+        if st.cancelled {
+            return send_sse_event(stream, "error", error_body(CANCELLED))
+        }
+        return final_event(stream, st, job, model, run)
+    }
+    catch err {
+        return send_sse_event(stream, "error", error_body(err.message))
+    }
+}
+
+# The closing event of a finished run: `done` with the response body, or
+# `error` when the ids do not detokenize.
+fn final_event(server.Stream stream, ServerState st, Prepared job, ResidentModel model, pgen.PortResult run) → bool {
+    do {
+        return send_sse_event(stream, "done", finished_body(st, job, model, run))
+    }
+    catch cause {
+        return send_sse_event(stream, "error", error_body(cause))
+    }
+}
+
+# ---------------------------------------------------------------------------
+# /model
+# ---------------------------------------------------------------------------
+
+# The pipeline: method gate → state gate → response assembly. GET is the only
+# method (D3); any other method is a reject. Before ready the endpoint answers
+# 503 with the state; on ready it answers 200 with the exact pinned identity body.
+fn handle_model(server.Incoming incoming, ServerState st, ServeConfig serving) → void {
+    if incoming.req.method ≢ "GET" {
+        reply_json(incoming, 400, error_body("method must be GET for /model"))
+    } elif st.phase ≢ lifecycle.Phase.Ready {
+        reply_json(incoming, 503, model_unready_body(st))
+    } else {
+        reply_json(incoming, 200, model_body(st, serving.max_tokens, serving.backend))
+    }
+}
+
+# ---------------------------------------------------------------------------
+# /generate
+# ---------------------------------------------------------------------------
+
+# Size gate for the /generate prompt, before it flows to encode. Pure so the
+# gate rows can feed it prompts as inputs.
+fn check_prompt_length(string prompt) → void ⇥ Refusal {
+    reject prompt.length() ≻ MAX_PROMPT_LENGTH throw refused(400, "prompt length § exceeds the bound §"(prompt.length(), MAX_PROMPT_LENGTH))
+}
+
+# What the pipeline resolves before the engine runs: the generation config and
+# the prompt's token ids.
+class Prepared {
+    let GenerateConfig cfg
+    let list<int> ids
+}
+
+fn parse_request(string body) → GenerateRequest ⇥ Refusal {
+    do {
+        return parse_generate_body(body)
+    }
+    catch cause {
+        throw refused(400, cause)
+    }
+}
+
+# Text → token ids through the admitted model's real G3 tokenizer.
+fn encode_request(ResidentModel model, string prompt) → list<int> ⇥ Refusal {
+    do {
+        return encode_prompt(model.tokenizer, prompt)
+    }
+    catch cause {
+        throw refused(400, cause)
+    }
+}
+
+# The state gate: 503 with the state before the model is ready (D3).
+fn ready_model(ServerState st, ResidentModel ∪ none model) → ResidentModel ⇥ Refusal {
+    if st.phase ≢ lifecycle.Phase.Ready or model is none {
+        throw Refusal { status = 503, body = state_body(st) }
+    }
+    return model
+}
+
+# Body → parsed request → prompt gate → encode → config. The cancellation
+# checkpoints (D6 seam; no signal source is wired yet, a recorded U6 gap) sit
+# before the body read and before encode.
+fn prepare_generate(value request, ServerState st, ServeConfig serving, ResidentModel model) → Prepared ⇥ Refusal {
+    reject st.cancelled throw refused(503, CANCELLED)
+    let GenerateRequest parsed ← parse_request(request_body(request))
+    check_prompt_length(parsed.prompt)
+    reject st.cancelled throw refused(503, CANCELLED)
+    return Prepared { cfg = build_generate_config(parsed, serving), ids = encode_request(model, parsed.prompt) }
+}
+
+# The body of a finished run. Detokenize happens before any body is assembled:
+# a typed decode failure fails closed instead of emitting a partial body.
+fn finished_body(ServerState st, Prepared job, ResidentModel model, pgen.PortResult run) → string ⇥ string {
+    let string text ← tokens_text(model.tokenizer, run.ids)
+    return generate_response_body(st, text, run.ids, job.ids, job.cfg.max_tokens)
+}
+
+fn json_generate(ServerState st, Prepared job, ResidentModel model) → string ⇥ Refusal {
+    let pgen.PortResult run ← run_generate_port_unstreamed(job.cfg, job.ids, model, decoder.eog_stop(), false)
+    reject st.cancelled throw refused(503, CANCELLED)
+    do {
+        return finished_body(st, job, model, run)
+    }
+    catch cause {
+        throw classified(cause)
+    }
+}
+
+fn handle_generate(server.Incoming incoming, value request, ServerState st, ServeConfig serving, ResidentModel ∪ none model) → void {
+    do {
+        reject incoming.req.method ≢ "POST" throw refused(400, "method must be POST for /generate")
+        let ResidentModel resident ← ready_model(st, model)
+        let Prepared job ← prepare_generate(request, st, serving, resident)
+        if wants_sse(incoming) {
+            stream_generate(incoming, st, job, resident)
+        } else {
+            reply_json(incoming, 200, json_generate(st, job, resident))
+        }
+    }
+    catch refusal {
+        reply_json(incoming, refusal.status, refusal.body)
+    }
+}
+
+# Respond to one request carrier. /health is always 200 once the listener is
+# up; any other path is 404 (D3).
+fn handle_request(value request, ServerState st, ServeConfig serving, ResidentModel ∪ none model) → void {
+    if request is map<string, value> {
+        let server.Incoming incoming ← server.incoming_of(request)
+        switch incoming.req.path {
+            case "/health" {
+                reply_json(incoming, 200, health_body(st))
+            }
+            case "/model" {
+                handle_model(incoming, st, serving)
+            }
+            case "/generate" {
+                handle_generate(incoming, request, st, serving, model)
+            }
+            default {
+                reply_json(incoming, 404, "not found")
+            }
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Lifecycle
+# ---------------------------------------------------------------------------
+
+# The server's state after boot, and the resident model when it is ready.
+class Boot {
+    let ServerState state
+    let ResidentModel ∪ none model
+}
+
+# U4 generation readiness: load the port weights exactly once and keep them
+# resident; every /generate reuses them with a fresh K/V cache pair. A failed
+# load is an admission/load failure (D5 → exit 2): the load re-verifies the
+# digest at materialization (admit → load TOCTOU), so a file swapped between
+# admit and load lands in the failed state here.
+fn load_boot(ServeConfig serving, ServerState ready, AdmittedModel admitted) → Boot {
+    do {
+        let port.PortWeights weights ← load_port_model(serving.model, admitted.sha, serving.expected_digest, admitted.manifest)
+        let ResidentModel model ← port_resident(admitted.manifest, build_tokenizer(admitted.manifest), weights)
+        stderr_write("inferentia: model loaded once (resident) - generation ready\n")
+        return Boot { state = ready, model = model }
+    }
+    catch err {
+        stderr_write("inferentia: model load failed: §\n"(err.message))
+        return Boot { state = failed_state(ready, "model load failed: §"(err.message)), model = null }
+    }
+}
+
+# U2 admission ordering: admit BEFORE any allocation. `admit_serving` computes
+# the whole-file digest, pins the pinned-row structure (BD-2 gate), and binds
+# that digest to the pinned row (S-F1) and to any operator --expected-digest.
+fn boot_server(ServeConfig serving) → Boot {
+    let ServerState starting ← new_state(serving.model)
+    do {
+        let AdmittedModel admitted ← admit_serving(serving.model, serving.expected_digest)
+        stderr_write("inferentia: model admitted (sha256 §)\n"(admitted.sha))
+        return load_boot(serving, admitted_state(starting, admitted.sha), admitted)
+    }
+    catch err {
+        stderr_write("inferentia: admission failed: §\n"(err.message))
+        return Boot { state = failed_state(starting, err.message), model = null }
+    }
+}
+
+# Does this accept fault end the loop? A stopped listener is Closed and a
+# cancelled accept is Cancelled; every other fault is request-level.
+fn accept_fault_ends(fault.IoFault f) → bool {
+    match f {
+        case fault.IoFault.Closed let path {
+            return true
+        }
+        case fault.IoFault.Cancelled let path {
+            return true
+        }
+        default {
+            return false
+        }
+    }
+}
+
+# Accept-loop step on a fault: keep serving unless the listener was stopped or
+# the accept was cancelled; log other request-level rejects (oversize body,
+# malformed request) and continue (D6).
+fn keep_serving(fault.IoFault err) → bool {
+    if accept_fault_ends(err) {
+        return false
+    }
+    stderr_write("inferentia: request dropped at accept: §\n"(err))
+    return true
+}
+
+# Bind the listener. A bind fault is a trap: the process cannot serve.
+fn bind_listener(int port_number) → server.Listener {
+    do {
+        return server.bind(port_number)
+    }
+    catch err {
+        panic "listener bind failed: §"(err)
+    }
+}
+
+@ public
+fn serve(ServeConfig serving) → void {
+    let server.Listener listener ← bind_listener(serving.port)
+    stderr_write("inferentia: listening on 127.0.0.1:§\n"(serving.port))
+    let Boot boot ← boot_server(serving)
+
+    mut bool accepting ← true
+    while accepting {
+        do {
+            let value request ← server.accept(listener.handle)
+            handle_request(request, boot.state, serving, boot.model)
+        }
+        catch err {
+            # A request-level reject must not end the serve loop; only a
+            # stopped/cancelled listener does. The decision lives in a helper:
+            # the MIR stepper (`faber test`) cannot lower a conditional inside
+            # a `cape` block that wraps a local call into a host route (a
+            # recorded toolchain limitation).
+            accepting ← keep_serving(err)
+        }
+    }
+
+    # Loop-end shutdown path (reachable when the listener stops / accept is
+    # cancelled). The D5 exit-code decision maps failed admission to exit 2
+    # and successful admission / clean shutdown to exit 0. SIGTERM → http:stop
+    # is the recorded U6 signal gap: with no signal route wired, SIGTERM kills
+    # the process by signal (observed exit 143) and this path is not reached.
+    # The executable exit-code proof runs under tests/admission-gate/ and
+    # tests/process-exit/.
+    let int code ← exit_code_for(boot.state.phase)
+    stderr_write("inferentia: shutting down (exit code §)\n"(code))
+    exit_with(code)
+}
+
+# Exact-length ASCII prompt for the gate rows: one digit per position.
+fn prompt_of_length(int n) → string {
+    return text.join(((0 ‥ n) ↦ list<int>).map((int position) → string ∴ "§"(position % 10)), "")
+}
+
+# The refusal body of a prompt gate, "" when the prompt passes.
+fn prompt_refusal(string prompt) → string {
+    do {
+        check_prompt_length(prompt)
+        return ""
+    }
+    catch refusal {
+        return refusal.body
+    }
+}
+
+# The text of a request body, or the error that ended the read.
+fn body_or_error(value body) → string {
+    do {
+        return body_text(body)
+    }
+    catch cause {
+        return "error: §"(cause)
+    }
+}
+
+fn gate_status(ServerState st) → int {
+    do {
+        ready_model(st, null)
+        return 0
+    }
+    catch refusal {
+        return refusal.status
+    }
+}
+
+describe "generate prompt length gate" tag "inferentia" {
+    test "in-bound prompt passes the gate" {
+        assert prompt_refusal("hello") ≡ ""
+    }
+    test "prompt at the bound passes the gate" {
+        assert prompt_refusal(prompt_of_length(MAX_PROMPT_LENGTH)) ≡ ""
+    }
+    test "prompt one over the bound is refused with the size diagnostic" {
+        let int n ← MAX_PROMPT_LENGTH + 1
+        let string body ← prompt_refusal(prompt_of_length(n))
+        assert body.contains("§"(n))
+        assert body.contains("§"(MAX_PROMPT_LENGTH))
+    }
+}
+
+describe "generate refusals" tag "inferentia" {
+    test "a request-side typed cause is a 400 and any other cause a 500" {
+        assert classified("prompt length exceeds max_prompt").status ≡ 400
+        assert classified("forward failed").status ≡ 500
+    }
+    test "the refusal body is the error body" {
+        assert refused(503, CANCELLED).body ≡ error_body(CANCELLED)
+    }
+    test "a model that is not ready answers 503 with the state" {
+        assert gate_status(new_state("/m.gguf")) ≡ 503
+        assert gate_status(admitted_state(new_state("/m.gguf"), "sha")) ≡ 503
+    }
+}
+
+describe "http module" tag "inferentia" {
+    test "server genera import from norma:http/server" {
+        let server.Listener listener ← server.Listener { handle = 1 }
+        let server.Incoming incoming ← server.Incoming {
+            id = "http-1",
+            connection = 2,
+            req = httpreq.Request { method = "GET", path = "/health", query = "", body = "" }
+        }
+        assert listener.handle ≡ 1
+        assert incoming.id ≡ "http-1"
+        assert incoming.connection ≡ 2
+        assert not wants_sse(incoming)
+    }
+    test "string value body extracts as text" {
+        assert body_or_error(«{"prompt":"hi"}» ↦ value) ≡ «{"prompt":"hi"}»
+    }
+    test "list<b8> value body extracts as UTF-8 text" {
+        let list<b8> payload ← «{"prompt":"hi"}» ↦ list<b8>
+        assert body_or_error(payload ↦ value) ≡ «{"prompt":"hi"}»
+    }
+    test "bytes that are not UTF-8 are an unreadable body" {
+        let list<b8> payload ← [255, 254] ↦ list<b8>
+        assert body_or_error(payload ↦ value) ≡ "error: §"(BODY_UNAVAILABLE)
+    }
+    test "json headers carry content-type" {
+        assert json_headers().get("content-type") coalesce "" ≡ "application/json"
+    }
+    test "incoming_of splits stream query and wants sse" {
+        let map<string, value> raw ← {"id": "http-1", "connection": 1, "method": "POST", "path": "/generate?stream=1", "headers": [], "body": ""}
+        let server.Incoming incoming ← server.incoming_of(raw ↦ value)
+        assert incoming.req.path ≡ "/generate"
+        assert wants_sse(incoming)
+    }
+    test "accept text/event-stream wants sse" {
+        let map<string, value> raw ← {"id": "http-1", "connection": 1, "method": "POST", "path": "/generate", "headers": [{"name": "Accept", "value": "text/event-stream"}], "body": ""}
+        let server.Incoming incoming ← server.incoming_of(raw ↦ value)
+        assert wants_sse(incoming)
+    }
+}

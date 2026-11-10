@@ -1,0 +1,261 @@
+# =============================================================================
+# Response — JSON bodies, escaping and error classification
+# =============================================================================
+#
+# Field order and bytes of every body are the D3 wire format; the committed
+# model body is tests/model-gate/expected-model-body.json. `norma:json`
+# serializes objects with their keys sorted, which would reorder the wire
+# format, so each body is a template over fixed keys. What Norma does supply is
+# the one thing templates cannot, the escaping of a string: `json_string` renders
+# a string value through `norma:json`, and every untrusted value (a path, an
+# error, decoded model text) passes through it.
+
+import from "norma:json" codec
+import from "norma:text" text
+
+import from "./state" const ServerState, admitted_state, failed_state, new_state, phase_name
+import from "./pinned" const PINNED_ARCHITECTURE, PINNED_CONTEXT_LENGTH, PINNED_FILE_SIZE, PINNED_NAME, PINNED_QUANTIZATION, PINNED_VOCAB_SIZE
+
+# The causes `config.construct_generation` and the prompt-fit checks report for a
+# bad request; engine-side failures (prefill, forward, decode) are not among them.
+const list<string> REQUEST_ERROR_PREFIXES = [
+    "maximum generated tokens",
+    "needs at least one prompt token",
+    "prompt length",
+    "seed must",
+    "temperature must",
+    "top-p must",
+    "top-k must",
+    "min-p must",
+    "repetition penalty",
+    "context length",
+    "prompt batch",
+    "malformed generation",
+    "unsupported generation",
+    "unknown generation"
+]
+
+# A one-field record: Norma serializes records, so the JSON form of a string is
+# what a record holding it serializes to, less its wrapper.
+@ json
+class JsonString {
+    mut string value
+}
+
+# The object wrapper `{"value":` that precedes the string in that serialization.
+const string JSON_STRING_PREFIX = «{"value":»
+
+# The JSON string literal for `raw`, quotes included: `"` `\` and every
+# U+0000..U+001F control escaped, everything else (multi-byte characters
+# too) passed through.
+@ public
+fn json_string(string raw) → string {
+    do {
+        let json document ← JsonString { value = raw } ↦ json
+        let string wire ← codec.stringify(document)
+        return wire.slice(JSON_STRING_PREFIX.length(), wire.length() - 1)
+    }
+    catch err {
+        panic "json_string: the wrapper object did not serialize as expected: §"(err)
+    }
+}
+
+# The machine surface of generated ids: `[30,198,198]`.
+@ public
+fn tokens_json(list<int> tokens) → string {
+    return «[§]»(text.join(tokens.map((int id) → string ∴ "§"(id)), ","))
+}
+
+# D3 finish_reason: "length" at max_tokens; "eos" when the engine stopped
+# early at an admitted tokenizer EOG id (the pinned engine excludes EOG ids
+# from the top-1 surface, so with the frozen row the ceiling always binds).
+@ public
+fn finish_reason(int generated, int max_tokens) → string {
+    return generated ≥ max_tokens ✓ "length" ✗ "eos"
+}
+
+# The /generate response body. `model` carries the minimal identity facts held
+# by this server (sha256 + path). `decoded` is the detokenized string (the
+# caller fails closed before assembly); `tokens` keeps the machine surface.
+@ public
+fn generate_response_body(ServerState st, string decoded, list<int> tokens, list<int> prompt_ids, int max_tokens) → string {
+    let int prompt_count ← prompt_ids.length()
+    let int completion_count ← tokens.length()
+    return «{"model":{"sha256":§,"path":§},"text":§,"tokens":§,"finish_reason":"§","usage":{"prompt_tokens":§,"completion_tokens":§,"total_tokens":§}}»(
+        json_string(st.sha256), json_string(st.model_path), json_string(decoded), tokens_json(tokens),
+        finish_reason(completion_count, max_tokens), prompt_count, completion_count, prompt_count + completion_count
+    )
+}
+
+@ public
+fn error_body(string error) → string {
+    return «{"error":§}»(json_string(error))
+}
+
+# D3: 503 before ready carries the state.
+@ public
+fn state_body(ServerState st) → string {
+    return «{"state":"§","error":§}»(phase_name(st.phase), json_string(st.error_text))
+}
+
+# G2 generate / construct_generation error → HTTP status. Request-side causes
+# are the typed config rows (field domains, prompt fit, the context cursor):
+# 400. Engine-side failures (prefill/forward/decode) are 500.
+@ public
+fn classify_generate_error(string err) → int {
+    return REQUEST_ERROR_PREFIXES.any((string prefix) → bool ∴ err.starts_with(prefix)) ✓ 400 ✗ 500
+}
+
+# The /health body per D3. The model identity on ready carries the verified
+# whole-file SHA-256 (the only identity fact the BD-2 admit route returns) and
+# the configured path; on failed it carries the typed cause. Every string value
+# is JSON-escaped so a configured path or a typed error can never produce
+# invalid JSON. (The D3 `pid` field is not served: there is no process-identity
+# call form.)
+@ public
+fn health_body(ServerState st) → string {
+    match st.phase {
+        case Starting {
+            return «{"state":"starting","model":null}»
+        }
+        case Failed {
+            return «{"state":"failed","model":{"error":§}}»(json_string(st.error_text))
+        }
+        case Ready {
+            return «{"state":"ready","model":{"sha256":§,"path":§}}»(json_string(st.sha256), json_string(st.model_path))
+        }
+    }
+}
+
+# The /model response body (D3 exact schema, in this field order): the pinned
+# row's identity, the admitted `sha256`, and the server defaults.
+@ public
+fn model_body(ServerState st, int max_output_tokens, string backend) → string {
+    return «{"name":"§","architecture":"§","quantization":"§","file_size_bytes":§,"sha256":§,"context_length":§,"vocab_size":§,"max_output_tokens":§,"backend":"§"}»(
+        PINNED_NAME, PINNED_ARCHITECTURE, PINNED_QUANTIZATION, PINNED_FILE_SIZE, json_string(st.sha256),
+        PINNED_CONTEXT_LENGTH, PINNED_VOCAB_SIZE, max_output_tokens, backend
+    )
+}
+
+# D3: 503 before ready / on failure carries the minimal state body
+# (`{"state":"starting"|"failed"}` — the typed cause is served by /health).
+@ public
+fn model_unready_body(ServerState st) → string {
+    return «{"state":"§"}»(phase_name(st.phase))
+}
+
+# The ASCII character with this code.
+fn character(int code) → string {
+    do {
+        return [code] ↦ list<b8> ↦ string
+    }
+    catch err {
+        panic "no ASCII character for code §: §"(code, err)
+    }
+}
+
+describe "json strings" tag "inferentia" {
+    test "plain text is unchanged" {
+        assert json_string("plain text") ≡ «"plain text"»
+        assert json_string("") ≡ «""»
+    }
+    test "quotes and backslashes are escaped" {
+        assert json_string(«a"b\\c») ≡ «"a\\"b\\\\c"»
+    }
+    test "named controls use their short escapes" {
+        assert json_string("line1\nline2\tend\r") ≡ «"line1\\nline2\\tend\\r"»
+    }
+    test "every ASCII character escapes as the retired hand-written escape did" {
+        # The golden is the retired json_escape over all 128 characters in order:
+        # U+0000..U+001F escaped (short forms for \b \f \n \r \t, \u00xx otherwise),
+        # `"` and `\` escaped, DEL and the rest passed through.
+        let string ascii ← text.join(((0 ‥ 128) ↦ list<int>).map((int code) → string ∴ character(code)), "")
+        assert json_string(ascii) ≡ «"\\u0000\\u0001\\u0002\\u0003\\u0004\\u0005\\u0006\\u0007\\b\\t\\n\\u000b\\f\\r\\u000e\\u000f\\u0010\\u0011\\u0012\\u0013\\u0014\\u0015\\u0016\\u0017\\u0018\\u0019\\u001a\\u001b\\u001c\\u001d\\u001e\\u001f !\\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\\\]^_`abcdefghijklmnopqrstuvwxyz{|}~\u{7f}"»
+    }
+    test "multi-byte characters pass through" {
+        assert json_string("λ𝄞 café ünï") ≡ «"λ𝄞 café ünï"»
+    }
+}
+
+describe "response bodies" tag "inferentia" {
+    test "health body starting" {
+        assert health_body(new_state("/models/x.gguf")) ≡ «{"state":"starting","model":null}»
+    }
+    test "health body ready carries model identity" {
+        assert health_body(admitted_state(new_state("/models/x.gguf"), "2fa3f013dcdd7b99")) ≡ «{"state":"ready","model":{"sha256":"2fa3f013dcdd7b99","path":"/models/x.gguf"}}»
+    }
+    test "health body failed carries typed cause, escaped" {
+        assert health_body(failed_state(new_state("/models/x.gguf"), «io error: "boom" at \\tmp\nline»)) ≡ «{"state":"failed","model":{"error":"io error: \\"boom\\" at \\\\tmp\\nline"}}»
+    }
+    test "health body ready escapes quotes, backslashes and controls in the path and digest" {
+        assert health_body(admitted_state(new_state(«/models/a"b\\c\nd.gguf»), «a"b»)) ≡ «{"state":"ready","model":{"sha256":"a\\"b","path":"/models/a\\"b\\\\c\\nd.gguf"}}»
+    }
+    test "state body carries the phase and the escaped error" {
+        let ServerState starting ← new_state("/models/x.gguf")
+        assert state_body(starting) ≡ «{"state":"starting","error":""}»
+        assert state_body(admitted_state(starting, "2fa3f013dcdd7b99")) ≡ «{"state":"ready","error":""}»
+        assert state_body(failed_state(starting, «io error: "boom" at \\tmp\nline»)) ≡ «{"state":"failed","error":"io error: \\"boom\\" at \\\\tmp\\nline"}»
+    }
+    test "error body escapes embedded quotes" {
+        assert error_body("malformed generation config wire") ≡ «{"error":"malformed generation config wire"}»
+        assert error_body(«unknown field "x" at \\p\tq») ≡ «{"error":"unknown field \\"x\\" at \\\\p\\tq"}»
+    }
+    test "model body matches the committed expected body at the server default" {
+        # Exact D3 wire format (field order, no whitespace) — the same literal
+        # committed as tests/model-gate/expected-model-body.json, which the
+        # live curl proof diffs against.
+        let ServerState st ← admitted_state(new_state("/Users/ianzepp/ai/models/SmolLM2-360M-Instruct-f32.gguf"), "07735177a3542cbc0b0665051ce1922b55c4c9698de65131e65f2aea87a935e0")
+        assert model_body(st, 32, "metal") ≡ «{"name":"SmolLM2-360M-Instruct-F32","architecture":"llama","quantization":"f32","file_size_bytes":1449071040,"sha256":"07735177a3542cbc0b0665051ce1922b55c4c9698de65131e65f2aea87a935e0","context_length":8192,"vocab_size":49152,"max_output_tokens":32,"backend":"metal"}»
+    }
+    test "model body reports the configured backend and token ceiling" {
+        let ServerState st ← admitted_state(new_state("/m.gguf"), "2fa3f013dcdd7b99")
+        assert model_body(st, 32, "metal") ≡ «{"name":"SmolLM2-360M-Instruct-F32","architecture":"llama","quantization":"f32","file_size_bytes":1449071040,"sha256":"2fa3f013dcdd7b99","context_length":8192,"vocab_size":49152,"max_output_tokens":32,"backend":"metal"}»
+        assert model_body(admitted_state(new_state("/m.gguf"), «a"b»), 1, "metal") ≡ «{"name":"SmolLM2-360M-Instruct-F32","architecture":"llama","quantization":"f32","file_size_bytes":1449071040,"sha256":"a\\"b","context_length":8192,"vocab_size":49152,"max_output_tokens":1,"backend":"metal"}»
+    }
+    test "model unready body carries the state" {
+        assert model_unready_body(new_state("/m.gguf")) ≡ «{"state":"starting"}»
+        assert model_unready_body(failed_state(new_state("/m.gguf"), "io error: No such file")) ≡ «{"state":"failed"}»
+    }
+}
+
+describe "generate response" tag "inferentia" {
+    test "finish reason is length at the budget and eos below it" {
+        assert finish_reason(16, 16) ≡ "length"
+        assert finish_reason(5, 16) ≡ "eos"
+        assert finish_reason(0, 1) ≡ "eos"
+    }
+    test "tokens json machine surface" {
+        let list<int> tokens ← [30, 198, 198]
+        assert tokens_json(tokens) ≡ "[30,198,198]"
+        let list<int> no_tokens ← []
+        assert tokens_json(no_tokens) ≡ "[]"
+    }
+    test "generate response body shape" {
+        let ServerState st ← admitted_state(new_state("/models/x.gguf"), "2fa3f013dcdd7b99")
+        assert generate_response_body(st, "abab", [2, 0, 1], [504, 2365], 16) ≡ «{"model":{"sha256":"2fa3f013dcdd7b99","path":"/models/x.gguf"},"text":"abab","tokens":[2,0,1],"finish_reason":"eos","usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}»
+        let list<int> no_tokens ← []
+        assert generate_response_body(st, "", no_tokens, [1, 2, 3], 4) ≡ «{"model":{"sha256":"2fa3f013dcdd7b99","path":"/models/x.gguf"},"text":"","tokens":[],"finish_reason":"eos","usage":{"prompt_tokens":3,"completion_tokens":0,"total_tokens":3}}»
+        assert generate_response_body(st, "x", [30, 198, 198], [5], 3) ≡ «{"model":{"sha256":"2fa3f013dcdd7b99","path":"/models/x.gguf"},"text":"x","tokens":[30,198,198],"finish_reason":"length","usage":{"prompt_tokens":1,"completion_tokens":3,"total_tokens":4}}»
+    }
+    test "generate response body escapes decoded text, path and digest" {
+        let ServerState st ← admitted_state(new_state(«/models/a"b\\c\nd.gguf»), «a"b»)
+        assert generate_response_body(st, «a"b\\c\n\td λ», [0], [1], 1) ≡ «{"model":{"sha256":"a\\"b","path":"/models/a\\"b\\\\c\\nd.gguf"},"text":"a\\"b\\\\c\\n\\td λ","tokens":[0],"finish_reason":"length","usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}»
+    }
+}
+
+describe "generate error classification" tag "inferentia" {
+    test "gradus reject-row causes map to 400" {
+        assert classify_generate_error("maximum generated tokens must fit within the context") ≡ 400
+        assert classify_generate_error("malformed generation config wire") ≡ 400
+        assert classify_generate_error("prompt length does not fit context") ≡ 400
+        assert classify_generate_error("needs at least one prompt token") ≡ 400
+        assert classify_generate_error("seed must be at least one") ≡ 400
+        assert classify_generate_error("temperature must be non-negative") ≡ 400
+    }
+    test "engine-side failures map to 500" {
+        assert classify_generate_error("prefill failed: op mismatch") ≡ 500
+        assert classify_generate_error("decode failed: layout") ≡ 500
+        assert classify_generate_error("pinned model unavailable") ≡ 500
+        assert classify_generate_error("") ≡ 500
+    }
+}

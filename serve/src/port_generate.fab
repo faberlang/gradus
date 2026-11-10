@@ -1,0 +1,573 @@
+# =============================================================================
+# Port generation — the A1 decode loop on the gradus wide decode-token launches
+# =============================================================================
+#
+# Given the bulk-loaded `port.PortWeights` (port_weights.fab), the prompt token
+# ids, a new-token ceiling and the stop policy, this module runs
+#
+#   prefill   each prompt token, one at a time, through embed_wide + 32 x
+#             layer_wide; head_step_wide only after the LAST prompt token
+#   decode    head_step_wide -> device argmax -> the chosen id stays on the device
+#             as the next token's gather index and is read back once (one i32), and
+#             appended, until an EOG id (stop) or the ceiling (length)
+#
+# Structure (the Gradus decode-token bench): per layer weight tensors passed as plain
+# arguments, the K/V caches held as one `tensor<f32, [C, 320]>` K cache and one V
+# cache per layer, updated in place by `layer_wide` (it writes the row at `pos`), a
+# run-time cache extent `const size C ← c`, `pos` an i32, and the caches only ever
+# passed to launches (never indexed, flattened or copied on the host). The caller
+# owns every scratch tensor (PortScratch, allocated once with the weights); a request
+# allocates its own caches and
+# score matrix, once per call (P3), and the hidden state ping-pongs between two
+# resident buffers. Nothing is allocated per token.
+#
+# Greedy picks stay on the device (P4, P8): `decode_step.argmax_token` is the language's
+# `reduce via argmax`, so the lowest index wins ties and a NaN never wins. Under
+# `trace` it runs twice for the top two ids and logits; under ignore_eos the EOG ids
+# are masked out of the logits first. The sampled paths read the per-chunk top-M
+# candidates (or the whole logits) to the host.
+#
+# Greedy by default; `port_generate_sampled` adds the seeded sampled choice. The
+# finish reasons are `stop` (an EOG id was chosen; the EOG id is part of the
+# returned ids, as in the host path), `length`, and `cancelled` (the stream sink
+# asked to stop).
+# =============================================================================
+
+import from "gradus:decode_token" dt
+import from "gradus:decode_step" ds
+import from "gradus:sampling" sampling
+import from "gradus:train" train
+
+import from "./port_weights" port
+import from "./io" output
+
+@ public
+class PortResult {
+    let list<int> ids
+    let string finish
+}
+
+# The two best logits of a step, for the oracle trace.
+@ public
+class PortTop {
+    let int id1
+    let f32 val1
+    let int id2
+    let f32 val2
+}
+
+# Candidate logits and their vocabulary ids for the sampled path.
+@ public
+class PortCandidates {
+    let list<f32> values
+    let list<int> ids
+}
+
+class PortPair {
+    let int id
+    let f32 value
+}
+
+# The lowest f32: a masked logit never wins the argmax.
+const f32 LOWEST = -3.4028235e38
+
+# The ignore_eos mask of the sampled path: not the lowest f32, which becomes -inf
+# after the temperature division or the penalty and is rejected by
+# `sampling.require_logits`.
+const f32 SAMPLE_FLOOR = -1000000000.0
+
+# Per-chunk candidates the device returns (topm_chunks M).
+const int TOPM = 16
+
+# ---------------------------------------------------------------------------
+# Pure parts
+# ---------------------------------------------------------------------------
+
+# K/V cache capacity for one request: the context limit, or the prompt plus
+# the new-token ceiling when that is smaller. At least 1.
+@ public
+fn port_capacity(int context, int prompt_len, int max_new) → int {
+    let int want ← prompt_len + max_new
+    let int cap ← context ≺ want ✓ context ✗ want
+    return cap ≺ 1 ✓ 1 ✗ cap
+}
+
+# The finish reason of a run: `stop` when it ended on an EOG id, else `length`.
+@ public
+fn port_finish(bool hit_eog) → string {
+    return hit_eog ✓ "stop" ✗ "length"
+}
+
+# Whether the loop ends after choosing a token: an EOG id under the stop
+# policy, the new-token ceiling, or no cache row left to feed the token into.
+@ public
+fn port_ends(bool stop_on_eog, bool is_eog, int generated, int max_new, int next_pos, int capacity) → bool {
+    return (stop_on_eog and is_eog) or generated ≥ max_new or next_pos ≥ capacity
+}
+
+# The oracle trace line for one generated step.
+@ public
+fn port_trace_line(int step, int id, int id1, f32 val1, int id2, f32 val2) → string {
+    return "trace step=§ id=§ top1=§:§ top2=§:§"(step, id, id1, val1, id2, val2)
+}
+
+# A token id as the i32 the gather reads. Ids come from the tokenizer or the device
+# and are far below 2^31; one that does not fit is a broken caller, not input.
+fn token_i32(int id) → i32 {
+    do {
+        return id ↦ i32
+    }
+    catch err {
+        panic "token id § does not fit i32"(id)
+    }
+}
+
+# A vocabulary index the device kernel returned as f32 (exact below 2^24; -1.0 marks
+# an unfilled slot). A NaN or infinity cannot come from the index arithmetic.
+fn index_of(f32 x) → int {
+    do {
+        return x ↦ int via Trunc
+    }
+    catch err {
+        panic "device index § is not an integer"(x)
+    }
+}
+
+# Sets the ids in `skip` (the EOG ids under ignore_eos) to `floor`, so they never
+# win the choice. Overwrites `logits`: the next head launch rewrites the whole vector.
+@ public
+fn port_mask<size V>(mut tensor<f32, [V]> logits, list<int> skip, f32 floor) → void {
+    for from skip let id {
+        logits[[id]] ← floor
+    }
+}
+
+# The repetition penalty on the host logits, before the device narrowing (it
+# changes the ranking). The llama rule of `sampling.repetition_penalty`: a
+# positive logit is divided, a non-positive one multiplied, and an id repeated
+# in `history` is penalised once per occurrence. `history` holds the generated
+# ids only (the prompt is not in it).
+@ public
+fn port_penalize<size V>(mut tensor<f32, [V]> logits, list<int> history, f32 penalty) → void {
+    for from history let id {
+        let f32 logit ← logits[[id]]
+        logits[[id]] ← logit ≻ 0.0 ✓ logit / penalty ✗ logit * penalty
+    }
+}
+
+# The best and second best logits (the lowest index wins ties), read through the
+# device argmax: the winner is lowered to the floor for the second pass.
+@ public
+fn port_top<size V>(mut tensor<f32, [V]> logits, mut tensor<i32, [1]> first, mut tensor<i32, [1]> second) → PortTop {
+    ds.argmax_token(logits, mut first)
+    let int id1 ← first[[0]] ↦ int
+    let f32 val1 ← logits[[id1]]
+    logits[[id1]] ← LOWEST
+    ds.argmax_token(logits, mut second)
+    let int id2 ← second[[0]] ↦ int
+    return PortTop { id1 = id1, val1 = val1, id2 = id2, val2 = logits[[id2]] }
+}
+
+# The per-chunk top-M (value, global index) pairs read back from the device
+# (indices are f32, exact below 2^24), as the candidate list in ascending
+# vocabulary-id order: the order `sampling.sample_candidates` needs so its float
+# sums run in the full-list order. A slot the kernel left unfilled (a chunk with
+# fewer than M elements) carries the value -3.4028235e38 and the index -1.0; the
+# INDEX is the marker, not the value (a real logit can be very negative), so every
+# pair with a negative index is dropped. Ids are distinct, so the stable sort by id
+# is the order a stable insertion sort gives.
+@ public
+fn port_candidates(list<f32> vals, list<f32> idxs) → PortCandidates {
+    mut list<PortPair> pairs ← []
+    for range 0 ‥ vals.length() let i {
+        let int id ← index_of(idxs[i])
+        if id ≥ 0 {
+            pairs.append(PortPair { id = id, value = vals[i] })
+        }
+    }
+    let list<PortPair> sorted ← sort via asc from pairs let pair {
+        return pair.id
+    }
+    return PortCandidates { values = sorted.map((PortPair pair) → f32 ∴ pair.value), ids = sorted.map((PortPair pair) → int ∴ pair.id) }
+}
+
+# Whether the kept set of a top-p or min-p filter is provably exact: its lowest
+# kept logit must be strictly greater than `chunk_floor`, the largest per-chunk
+# M-th value, since an element a chunk did not return is at most that floor.
+@ public
+fn port_exact(f32 kept_min, f32 chunk_floor) → bool {
+    return kept_min ≻ chunk_floor
+}
+
+# The choice of a step: "greedy" (temperature <= 0; every other knob, the
+# repetition penalty included, is ignored, as in `sampling.sample`),
+# "candidates" (sampled from the device per-chunk top-M) or "full" (sampled from
+# the full logits read to the host). The candidate set holds the global top-k
+# only for 1 <= top_k <= M, and a sampled path with top_k == 0 or top_k > M needs
+# the whole distribution (softmax denominators, top-p/min-p over the tail), so
+# those take the full-logits fallback, still on the Metal logits.
+@ public
+fn port_branch(sampling.Config c) → string {
+    if c.temperature ≤ 0.0 {
+        return "greedy"
+    }
+    return c.top_k ≥ 1 and c.top_k ≤ TOPM ✓ "candidates" ✗ "full"
+}
+
+# How a run ends after a chosen token: its finish reason, or "" to go on. The EOG
+# stop, the ceiling and a full cache end it first; a sink that no longer wants ids
+# cancels it.
+fn finish_after(bool stop_on_eog, bool is_eog, int generated, int max_new, int next_pos, int capacity, bool wanted) → string {
+    if port_ends(stop_on_eog, is_eog, generated, max_new, next_pos, capacity) {
+        return port_finish(stop_on_eog and is_eog)
+    }
+    return wanted ✓ "" ✗ "cancelled"
+}
+
+# ---------------------------------------------------------------------------
+# One step
+# ---------------------------------------------------------------------------
+
+fn progress(string text) → void {
+    output.stderr_write("port: §"(text))
+}
+
+# One layer launch group: hout = layer(hin) at `pos`, over the request's scratch.
+# Every scratch tensor passes through its own `mut` binding (one writable name per
+# argument).
+fn layer_pass<size C>(mut port.PortScratch s, port.PortLayer ly, tensor<f32, [960]> hin, mut tensor<f32, [960]> hout, mut tensor<f32, [C, 320]> kin, mut tensor<f32, [C, 320]> vin, mut tensor<f32, [15, C]> sc, i32 pos) → void {
+    mut tensor<f32, [32]> rp ← s.rp
+    mut tensor<f32, [1600, 64]> qkvp ← s.qkvp
+    mut tensor<f32, [1600]> qkv ← s.qkv
+    mut tensor<f32, [15]> mx ← s.mx
+    mut tensor<f32, [15]> sm ← s.sm
+    mut tensor<f32, [960]> ctx ← s.ctx
+    mut tensor<f32, [960, 64]> op ← s.op
+    mut tensor<f32, [960]> h1 ← s.h1
+    mut tensor<f32, [2560, 64]> gp ← s.gp
+    mut tensor<f32, [2560, 64]> up ← s.up
+    mut tensor<f32, [2560]> act ← s.act
+    mut tensor<f32, [960, 64]> dp ← s.dp
+    dt.layer_wide(hin, mut hout, ly.attn_norm, ly.wq, ly.wk, ly.wv, ly.wo, ly.ffn_norm, ly.wg, ly.wu, ly.wd, mut kin, mut vin, mut rp, mut qkvp, mut qkv, s.kvdom, mut sc, mut mx, mut sm, mut ctx, mut op, mut h1, mut gp, mut up, mut act, mut dp, pos, port.PORT_QD, port.PORT_KVD, port.PORT_HEAD_WIDTH, port.PORT_GROUP, port.PORT_ROPE_PAIRS, port.PORT_EPS, port.PORT_LN_THETA, port.PORT_ATTN_SCALE)
+}
+
+# The id chosen from the logits of the last head launch. Greedy leaves the id on the
+# device in `ids` (the next gather reads it there); the sampled paths choose on the
+# host, and the caller stores the id.
+fn choose<size V, size P, size M>(mut tensor<f32, [V]> logits, mut tensor<i32, [1]> ids, mut tensor<i32, [1]> second, tensor<f32, [P, M]> tmdom, mut tensor<f32, [P, M]> tmval, mut tensor<f32, [P, M]> tmidx, string branch, sampling.Config sconf, list<int> skip, list<int> history, bool trace, int step, mut train.Seed rng) → int ⇥ sampling.SamplingError {
+    if branch ≡ "candidates" {
+        # EOG mask first (-1e9), then the penalty on the device logits, so the
+        # ranking narrowed on the device is the penalised one; the history
+        # passed to the sampler is therefore empty (no second penalty).
+        port_mask(mut logits, skip, SAMPLE_FLOOR)
+        port_penalize(mut logits, history, sconf.repetition_penalty)
+        ds.topm_chunks(tmdom, logits, mut tmval, mut tmidx, port.PORT_TOPM_CHUNK)
+        let PortCandidates cand ← port_candidates(tmval.flatten(), tmidx.flatten())
+        let sampling.Sampler pick ← sampling.sample_candidates(cand.values, cand.ids, sconf, [], rng)
+        let int id ← pick.token_id
+        rng ← pick.seed
+        return id
+    }
+    if branch ≡ "full" {
+        # Full-logits fallback: `sampling.sample` applies the penalty itself.
+        port_mask(mut logits, skip, SAMPLE_FLOOR)
+        let sampling.Sampler pick ← sampling.sample(logits.flatten(), sconf, history, rng)
+        let int id ← pick.token_id
+        rng ← pick.seed
+        return id
+    }
+    port_mask(mut logits, skip, LOWEST)
+    if trace {
+        let PortTop top ← port_top(mut logits, mut ids, mut second)
+        output.stderr_write(port_trace_line(step, top.id1, top.id1, top.val1, top.id2, top.val2))
+        return top.id1
+    }
+    ds.argmax_token(logits, mut ids)
+    return ids[[0]] ↦ int
+}
+
+# ---------------------------------------------------------------------------
+# Generation
+# ---------------------------------------------------------------------------
+
+# `prompt` must hold at least one id and fewer than `context`; `max_new` >= 1; the
+# caller validates both (generate.fab). `eog_ids` is the admitted tokenizer's EOG
+# set; with `stop_on_eog` false the EOG ids are masked out of the choice (the
+# ignore_eos policy). `sconf` and `seed` select the choice per step (`port_branch`):
+# temperature <= 0 keeps the greedy device path; otherwise a seeded draw (one
+# `next_f32` per generated token) from the device per-chunk top-M candidates, or
+# from the full logits read to the host when `port_branch` says "full". The
+# repetition history is the generated ids only.
+#
+# `on_token` is the stream sink: it is called with each chosen id (the EOG id
+# included) as soon as the id is chosen, before the next decode step starts, so a
+# caller can write the id to an open HTTP response while the rest is still being
+# generated. It returns false to end the generation early (the peer went away);
+# the finish reason is then `cancelled`.
+@ public
+fn port_generate_sampled(port.PortWeights w, list<int> prompt, int max_new, list<int> eog_ids, bool stop_on_eog, int context, bool trace, sampling.Config sconf, train.Seed seed, (int) → bool on_token) → PortResult ⇥ sampling.SamplingError {
+    let int np ← prompt.length()
+    let int c ← port_capacity(context, np, max_new)
+    const size C ← c
+    mut port.PortScratch s ← port.new_scratch()
+    mut tensor<f32, [960]> ha ← tf32[960] {}
+    mut tensor<f32, [960]> hb ← tf32[960] {}
+    mut tensor<f32, [49152]> logits ← tf32[49152] {}
+    mut tensor<i32, [1]> ids ← ti32[1] {}
+    mut tensor<i32, [1]> second ← ti32[1] {}
+    let tensor<f32, [256, 16]> tmdom ← tf32[256, 16] {}
+    mut tensor<f32, [256, 16]> tmval ← tf32[256, 16] {}
+    mut tensor<f32, [256, 16]> tmidx ← tf32[256, 16] {}
+    mut list<tensor<f32, [C, 320]>> ka ← empty
+    mut list<tensor<f32, [C, 320]>> va ← empty
+    for range 0 ‥ port.PORT_LAYERS let l {
+        let tensor<f32, [C, 320]> kcache ← tf32[C, 320] {}
+        let tensor<f32, [C, 320]> vcache ← tf32[C, 320] {}
+        ka.append(kcache)
+        va.append(vcache)
+    }
+    mut tensor<f32, [15, C]> sc ← tf32[15, C] {}
+
+
+    mut tensor<f32, [32]> rp_head ← s.rp
+    let string branch ← port_branch(sconf)
+    let list<int> skip ← stop_on_eog ✓ [] ✗ eog_ids
+    mut train.Seed rng ← copy seed
+    mut list<int> out ← []
+    mut string finish ← "length"
+    ids[[0]] ← token_i32(prompt[0])
+    progress("prefill-start prompt=§ capacity=§"(np, c))
+    # One forward pass per prompt token, then one per generated token: at most
+    # np + max_new passes, and the run leaves the loop on its finish reason.
+    for range 0 ‥ np + max_new let t {
+        let i32 pos ← token_i32(t)
+        dt.embed_wide(w.embed, ids, mut ha)
+        # The hidden state ping-pongs between ha and hb; an even layer count ends in ha.
+        for range 0 ‥ port.PORT_LAYERS let ll {
+            mut tensor<f32, [C, 320]> kin ← ka[ll]
+            mut tensor<f32, [C, 320]> vin ← va[ll]
+            if ll % 2 ≡ 0 {
+                layer_pass(mut s, w.layers[ll], ha, mut hb, mut kin, mut vin, mut sc, pos)
+            } else {
+                layer_pass(mut s, w.layers[ll], hb, mut ha, mut kin, mut vin, mut sc, pos)
+            }
+        }
+        if t ≺ np - 1 {
+            ids[[0]] ← token_i32(prompt[t + 1])
+        } else {
+            dt.head_step_wide(ha, w.out_norm, w.embed, mut rp_head, mut logits, port.PORT_EPS)
+            let int step ← out.length()
+            let int chosen ← choose(mut logits, mut ids, mut second, tmdom, mut tmval, mut tmidx, branch, sconf, skip, out, trace, step, mut rng)
+            out.append(chosen)
+            if step ≡ 0 {
+                progress("decode-start")
+            }
+            let bool is_eog ← chosen ∈ eog_ids
+            let bool wanted ← on_token(chosen)
+            let string ended ← finish_after(stop_on_eog, is_eog, out.length(), max_new, t + 1, c, wanted)
+            if ended ≢ "" {
+                finish ← ended
+                break
+            }
+            if branch ≢ "greedy" {
+                ids[[0]] ← token_i32(chosen)
+            }
+        }
+    }
+    progress("decode-done tokens=§"(out.length()))
+    return PortResult { ids = out, finish = finish }
+}
+
+# ---------------------------------------------------------------------------
+# Tests (pure parts; a 16-entry vocabulary stands in for the model's)
+# ---------------------------------------------------------------------------
+
+describe "port generate capacity" tag "inferentia" {
+    test "capacity is the prompt plus the ceiling when that fits the context" {
+        assert port_capacity(8192, 25, 64) ≡ 89
+        assert port_capacity(8192, 9, 32) ≡ 41
+    }
+    test "capacity is clamped to the context limit" {
+        assert port_capacity(50, 25, 64) ≡ 50
+    }
+    test "capacity is at least one row" {
+        assert port_capacity(0, 0, 0) ≡ 1
+    }
+}
+
+describe "port generate stop policy" tag "inferentia" {
+    test "finish reasons are stop and length" {
+        assert port_finish(true) ≡ "stop"
+        assert port_finish(false) ≡ "length"
+    }
+    test "an EOG id ends the run under the stop policy" {
+        assert port_ends(true, true, 2, 32, 11, 41)
+    }
+    test "an EOG id does not end the run under ignore_eos" {
+        assert not port_ends(false, true, 2, 32, 11, 41)
+    }
+    test "the ceiling ends the run" {
+        assert port_ends(true, false, 32, 32, 41, 100)
+    }
+    test "a full cache ends the run" {
+        assert port_ends(true, false, 3, 32, 41, 41)
+    }
+    test "an ordinary token continues" {
+        assert not port_ends(true, false, 3, 32, 12, 41)
+        assert finish_after(true, false, 3, 32, 12, 41, true) ≡ ""
+    }
+    test "a run ends with its finish reason" {
+        assert finish_after(true, true, 2, 32, 11, 41, true) ≡ "stop"
+        assert finish_after(false, true, 32, 32, 41, 100, true) ≡ "length"
+        assert finish_after(true, false, 3, 32, 12, 41, false) ≡ "cancelled"
+    }
+    test "the hidden state ping-pong ends in the first buffer" {
+        assert port.PORT_LAYERS % 2 ≡ 0
+    }
+}
+
+describe "port generate trace line" tag "inferentia" {
+    test "the line carries the step, the chosen id and the top two logits" {
+        assert port_trace_line(0, 30, 30, 12.5 ∷ f32, 1270, 9.25 ∷ f32) ≡ "trace step=0 id=30 top1=30:12.5 top2=1270:9.25"
+    }
+}
+
+describe "port generate best two" tag "inferentia" {
+    test "the top two take the first index on ties" {
+        mut tensor<f32, [16]> t ← tf32[16] {}
+        mut tensor<i32, [1]> first ← ti32[1] {}
+        mut tensor<i32, [1]> second ← ti32[1] {}
+        t[[7]] ← 3.0 ∷ f32
+        t[[9]] ← 3.0 ∷ f32
+        t[[12]] ← 1.0 ∷ f32
+        let PortTop top ← port_top(mut t, mut first, mut second)
+        assert top.id1 ≡ 7
+        assert top.val1 ≅ 3.0 ∷ f32
+        assert top.id2 ≡ 9
+        assert top.val2 ≅ 3.0 ∷ f32
+        assert first[[0]] ↦ int ≡ 7
+    }
+    test "skipped ids never win" {
+        mut tensor<f32, [16]> t ← tf32[16] {}
+        mut tensor<i32, [1]> first ← ti32[1] {}
+        mut tensor<i32, [1]> second ← ti32[1] {}
+        t[[7]] ← 5.0 ∷ f32
+        t[[9]] ← 3.0 ∷ f32
+        t[[11]] ← 2.0 ∷ f32
+        port_mask(mut t, [7], LOWEST)
+        let PortTop top ← port_top(mut t, mut first, mut second)
+        assert top.id1 ≡ 9
+        assert top.id2 ≡ 11
+    }
+}
+
+# Whether the candidate lists hold exactly these ids and values, in order.
+fn same_candidates(PortCandidates c, list<int> ids, list<f32> values) → bool {
+    if c.ids.length() ≢ ids.length() or c.values.length() ≢ values.length() {
+        return false
+    }
+    for range 0 ‥ ids.length() let i {
+        if c.ids[i] ≢ ids[i] or not (c.values[i] ≅ values[i]) {
+            return false
+        }
+    }
+    return true
+}
+
+describe "port generate sampling helpers" tag "inferentia" {
+    test "the penalty divides positive logits and multiplies non-positive ones" {
+        mut tensor<f32, [16]> t ← tf32[16] {}
+        t[[3]] ← 4.0 ∷ f32
+        t[[5]] ← -2.0 ∷ f32
+        t[[8]] ← 6.0 ∷ f32
+        port_penalize(mut t, [3, 5], 2.0 ∷ f32)
+        assert t[[3]] ≅ 2.0 ∷ f32
+        assert t[[5]] ≅ -4.0 ∷ f32
+        assert t[[8]] ≅ 6.0 ∷ f32
+    }
+    test "a repeated history id is penalised repeatedly" {
+        mut tensor<f32, [16]> t ← tf32[16] {}
+        t[[3]] ← 8.0 ∷ f32
+        port_penalize(mut t, [3, 3], 2.0 ∷ f32)
+        assert t[[3]] ≅ 2.0 ∷ f32
+    }
+    test "an empty history leaves the logits unchanged" {
+        mut tensor<f32, [16]> t ← tf32[16] {}
+        t[[3]] ← 4.0 ∷ f32
+        port_penalize(mut t, [], 2.0 ∷ f32)
+        assert t[[3]] ≅ 4.0 ∷ f32
+    }
+    test "the mask sets the skipped ids to the floor and nothing else" {
+        mut tensor<f32, [16]> t ← tf32[16] {}
+        t[[7]] ← 5.0 ∷ f32
+        t[[9]] ← 3.0 ∷ f32
+        port_mask(mut t, [7], SAMPLE_FLOOR)
+        assert t[[7]] ≅ -1000000000.0 ∷ f32
+        assert t[[9]] ≅ 3.0 ∷ f32
+    }
+    test "candidates keep an already ascending order with their values" {
+        let list<f32> vals ← [4.0, 3.0, 2.0, 1.0]
+        let PortCandidates c ← port_candidates(vals, [0.0, 1.0, 2.0, 3.0])
+        assert same_candidates(c, [0, 1, 2, 3], vals)
+    }
+    test "chunk-ordered pairs sort by id" {
+        let PortCandidates c ← port_candidates([1.0, 2.0, 3.0, 4.0], [192.0, 15.0, 207.0, 0.0])
+        assert same_candidates(c, [0, 15, 192, 207], [4.0, 2.0, 1.0, 3.0])
+    }
+    test "unfilled slots (index -1) are dropped and the real pairs sort by id" {
+        let PortCandidates c ← port_candidates([2.0, -3.4028235e38, -3.4028235e38, 7.0], [300.0, -1.0, -1.0, 100.0])
+        assert same_candidates(c, [100, 300], [7.0, 2.0])
+    }
+    test "only unfilled slots give empty lists" {
+        let PortCandidates c ← port_candidates([-3.4028235e38, -3.4028235e38], [-1.0, -1.0])
+        assert c.ids.length() ≡ 0
+        assert c.values.length() ≡ 0
+    }
+    test "the kept set is exact only when its minimum beats the chunk floor" {
+        assert port_exact(3.0 ∷ f32, 2.0 ∷ f32)
+        assert not port_exact(2.0 ∷ f32, 2.0 ∷ f32)
+        assert not port_exact(1.0 ∷ f32, 2.0 ∷ f32)
+    }
+}
+
+describe "port generate sampled branch" tag "inferentia" {
+    test "temperature zero is greedy whatever the other knobs say" {
+        let sampling.Config c ← sampling.Config { temperature = 0.0 ∷ f32, top_k = 8, top_p = 0.9 ∷ f32, min_p = 0.1 ∷ f32, repetition_penalty = 1.3 ∷ f32 }
+        assert port_branch(c) ≡ "greedy"
+    }
+    test "a top_k within the per-chunk M samples from the candidates" {
+        let sampling.Config a ← sampling.Config { temperature = 0.8 ∷ f32, top_k = 1, top_p = 1.0 ∷ f32, min_p = 0.0 ∷ f32, repetition_penalty = 1.0 ∷ f32 }
+        let sampling.Config b ← sampling.Config { temperature = 0.8 ∷ f32, top_k = 16, top_p = 0.95 ∷ f32, min_p = 0.05 ∷ f32, repetition_penalty = 1.1 ∷ f32 }
+        assert port_branch(a) ≡ "candidates"
+        assert port_branch(b) ≡ "candidates"
+    }
+    test "top_k zero or above M takes the full-logits fallback" {
+        let sampling.Config a ← sampling.Config { temperature = 0.8 ∷ f32, top_k = 0, top_p = 1.0 ∷ f32, min_p = 0.0 ∷ f32, repetition_penalty = 1.0 ∷ f32 }
+        let sampling.Config b ← sampling.Config { temperature = 0.8 ∷ f32, top_k = 17, top_p = 1.0 ∷ f32, min_p = 0.0 ∷ f32, repetition_penalty = 1.0 ∷ f32 }
+        let sampling.Config d ← sampling.Config { temperature = 1.0 ∷ f32, top_k = 0, top_p = 0.9 ∷ f32, min_p = 0.0 ∷ f32, repetition_penalty = 1.0 ∷ f32 }
+        assert port_branch(a) ≡ "full"
+        assert port_branch(b) ≡ "full"
+        assert port_branch(d) ≡ "full"
+    }
+    test "the candidate path equals the full path for a top_k within M" {
+        # Pairs in id order; ids 1, 3, 5, 9 hold the logits, all other vocabulary
+        # positions are dropped (exact 0.0 after top_k).
+        let sampling.Config c ← sampling.Config { temperature = 0.7 ∷ f32, top_k = 3, top_p = 1.0 ∷ f32, min_p = 0.0 ∷ f32, repetition_penalty = 1.0 ∷ f32 }
+        let train.Seed s ← train.Seed { status = 7 }
+        let PortCandidates cand ← port_candidates([2.0, 4.0, 3.0, 1.0, -3.4028235e38], [9.0, 1.0, 5.0, 3.0, -1.0])
+        mut tensor<f32, [16]> full ← tf32[16] {}
+        full[[1]] ← 4.0 ∷ f32
+        full[[3]] ← 1.0 ∷ f32
+        full[[5]] ← 3.0 ∷ f32
+        full[[9]] ← 2.0 ∷ f32
+        do {
+            let sampling.Sampler a ← sampling.sample_candidates(cand.values, cand.ids, c, [], s)
+            let sampling.Sampler b ← sampling.sample(full.flatten(), c, [], s)
+            assert a.token_id ≡ b.token_id
+            assert a.seed.status ≡ b.seed.status
+        }
+        catch err {
+            assert false
+        }
+    }
+}

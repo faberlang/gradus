@@ -1,0 +1,336 @@
+# =============================================================================
+# Port weights — the A1 weight load (U-G) and the shapes it loads into
+# =============================================================================
+#
+# Each F32 tensor of the SmolLM2-360M GGUF is read ONCE (one range read at the
+# manifest's absolute offset) and reinterpreted in bulk (P7),
+#
+#     raw ↦ tensor<f32, [size N, size K]> via Le
+#
+# GGUF stores a matrix with `ne` = [in, out] (ne0 is the innermost, fastest axis);
+# the row-major shape the token step wants (`gradus:decode_token`) is the
+# REVERSED `ne` = [out, in]. The byte order of the file is already that row-major
+# order, so no transpose pass exists on this path, and the tied embedding [V, D]
+# serves the gather and the lm_head alike.
+#
+# One source of truth for shape: the destination type. `load_matrix` and
+# `load_vector` are generic over the extents `N`, `K`; the expected dims are those
+# extents, and the conversion itself checks the byte length. The only check that
+# remains separate is the dims check (a transposed tensor has the right byte count)
+# and the element type. A tensor whose type or reversed `ne` differ is refused by a
+# named GgufManifestError (UnknownLayout for the type, BadBounds for the dims or the
+# length); nothing is silently reshaped.
+#
+# The literal extents of this model are written exactly once, in the three classes
+# below (the Faber type system takes literals or `size` generics, and a generic class
+# whose extents are lifted at run time cannot be returned or captured yet; see the
+# report). The model's metadata is read and checked against the constants here at
+# load (`verify_dims`), so a manifest of another shape is refused before any tensor.
+#
+# The digest-bound entry (`load_port_model`) is in admission.fab.
+# =============================================================================
+
+import from "gradus:model/gguf_manifest" gguf_manifest
+
+import from "./io" output
+
+# ---------------------------------------------------------------------------
+# The model row: metadata constants, checked against the manifest at load, and the
+# scalars the decode launches take.
+# ---------------------------------------------------------------------------
+
+@ public
+const int PORT_LAYERS = 32
+
+@ public
+const int PORT_VOCAB = 49152
+
+@ public
+const int PORT_DIM = 960
+
+@ public
+const int PORT_FFN = 2560
+
+@ public
+const int PORT_HEADS = 15
+
+@ public
+const int PORT_KV_HEADS = 5
+
+@ public
+const int PORT_HEAD_DIM = 64
+
+# Query and key/value widths (heads x head dim), the head width, and the GQA group
+# (query heads per key/value head), as the i32 scalars the launches take.
+@ public
+const i32 PORT_QD = 960
+
+@ public
+const i32 PORT_KVD = 320
+
+@ public
+const i32 PORT_HEAD_WIDTH = 64
+
+@ public
+const i32 PORT_GROUP = 3
+
+# The GGUF q/k weights are stored for llama.cpp's NORM rope (consecutive pairs
+# (2p, 2p + 1)): rope convention 1 (gradus `rope_pairs`), weights used as stored.
+@ public
+const i32 PORT_ROPE_PAIRS = 1
+
+@ public
+const f32 PORT_EPS = 0.00001
+
+@ public
+const f32 PORT_LN_THETA = 11.512925
+
+@ public
+const f32 PORT_ATTN_SCALE = 0.125
+
+# The sampled path's device top-M: 256 chunks of 192 logits, 16 candidates per chunk.
+@ public
+const i32 PORT_TOPM_CHUNK = 192
+
+# ggml type code of F32 in the GGUF tensor table.
+const int GGML_TYPE_F32 = 0
+
+# ---------------------------------------------------------------------------
+# Shapes
+# ---------------------------------------------------------------------------
+
+@ public
+class PortLayer {
+    let tensor<f32, [960]> attn_norm
+    let tensor<f32, [960, 960]> wq
+    let tensor<f32, [320, 960]> wk
+    let tensor<f32, [320, 960]> wv
+    let tensor<f32, [960, 960]> wo
+    let tensor<f32, [960]> ffn_norm
+    let tensor<f32, [2560, 960]> wg
+    let tensor<f32, [2560, 960]> wu
+    let tensor<f32, [960, 2560]> wd
+}
+
+# The device scratch of the fused layer launches (the caller owns every scratch
+# tensor: Gradus allocates none in the wide path). A request allocates one and primes
+# it before its first launch; the loader reads the extents of its destination shapes
+# from one.
+@ public
+class PortScratch {
+    mut tensor<f32, [32]> rp
+    mut tensor<f32, [1600, 64]> qkvp
+    mut tensor<f32, [1600]> qkv
+    let tensor<f32, [320]> kvdom
+    mut tensor<f32, [15]> mx
+    mut tensor<f32, [15]> sm
+    mut tensor<f32, [960]> ctx
+    mut tensor<f32, [960, 64]> op
+    mut tensor<f32, [960]> h1
+    mut tensor<f32, [2560, 64]> gp
+    mut tensor<f32, [2560, 64]> up
+    mut tensor<f32, [2560]> act
+    mut tensor<f32, [960, 64]> dp
+}
+
+@ public
+class PortWeights {
+    let tensor<f32, [49152, 960]> embed
+    let tensor<f32, [960]> out_norm
+    let list<PortLayer> layers
+}
+
+@ public
+fn new_scratch() → PortScratch {
+    let tensor<f32, [32]> rp ← tf32[32] {}
+    let tensor<f32, [1600, 64]> qkvp ← tf32[1600, 64] {}
+    let tensor<f32, [1600]> qkv ← tf32[1600] {}
+    let tensor<f32, [320]> kvdom ← tf32[320] {}
+    let tensor<f32, [15]> mx ← tf32[15] {}
+    let tensor<f32, [15]> sm ← tf32[15] {}
+    let tensor<f32, [960]> ctx ← tf32[960] {}
+    let tensor<f32, [960, 64]> op ← tf32[960, 64] {}
+    let tensor<f32, [960]> h1 ← tf32[960] {}
+    let tensor<f32, [2560, 64]> gp ← tf32[2560, 64] {}
+    let tensor<f32, [2560, 64]> up ← tf32[2560, 64] {}
+    let tensor<f32, [2560]> act ← tf32[2560] {}
+    let tensor<f32, [960, 64]> dp ← tf32[960, 64] {}
+    return PortScratch { rp = rp, qkvp = qkvp, qkv = qkv, kvdom = kvdom, mx = mx, sm = sm, ctx = ctx, op = op, h1 = h1, gp = gp, up = up, act = act, dp = dp }
+}
+
+# ---------------------------------------------------------------------------
+# Validation (pure over primitives, so synthetic manifests are plain lists)
+# ---------------------------------------------------------------------------
+
+# GGUF tensor name: a per-layer suffix under "blk.<layer>.".
+@ public
+fn layer_tensor(int layer, string suffix) → string {
+    return "blk.§.§"(layer, suffix)
+}
+
+# `ne` is the manifest shape (ne0 first); `expected` the destination's row-major
+# dims. They must be the same dims in reverse order, and the type must be F32.
+@ public
+fn check_dims(string name, list<int> ne, int dtype, list<int> expected) → void ⇥ gguf_manifest.GgufManifestError {
+    reject dtype ≢ GGML_TYPE_F32 throw variant gguf_manifest.GgufManifestError.UnknownLayout { message = "tensor § is not F32 (ggml type §)"(name, dtype) }
+    reject ne.invert() ≢ expected throw variant gguf_manifest.GgufManifestError.BadBounds { message = "tensor § ne § differs from the expected row-major dims § reversed"(name, ne, expected) }
+}
+
+fn expect_number(gguf_manifest.GgufManifest m, string key, int expected) → void ⇥ gguf_manifest.GgufManifestError {
+    let int actual ← gguf_manifest.number(m, key)
+    reject actual ≢ expected throw variant gguf_manifest.GgufManifestError.BadBounds { message = "metadata § is § (expected §)"(key, actual, expected) }
+}
+
+# The manifest's metadata dims equal this module's constants.
+@ public
+fn verify_dims(gguf_manifest.GgufManifest m) → void ⇥ gguf_manifest.GgufManifestError {
+    expect_number(m, "llama.block_count", PORT_LAYERS)
+    expect_number(m, "llama.vocab_size", PORT_VOCAB)
+    expect_number(m, "llama.embedding_length", PORT_DIM)
+    expect_number(m, "llama.feed_forward_length", PORT_FFN)
+    expect_number(m, "llama.attention.head_count", PORT_HEADS)
+    expect_number(m, "llama.attention.head_count_kv", PORT_KV_HEADS)
+    expect_number(m, "llama.attention.key_length", PORT_HEAD_DIM)
+}
+
+# ---------------------------------------------------------------------------
+# Loading
+# ---------------------------------------------------------------------------
+
+# ONE range read per tensor through the caller's bounds-checked source, after the
+# type and dims checks.
+fn tensor_bytes((int, int) → list<b8> ⇥ gguf_manifest.GgufManifestError source, gguf_manifest.GgufManifest m, string name, list<int> expected) → list<b8> ⇥ gguf_manifest.GgufManifestError {
+    let gguf_manifest.GgufTensorDescriptor d ← gguf_manifest.find_tensor(m, name)
+    check_dims(name, d.shape, d.dtype_ggml, expected)
+    let tuple<int, int> limit ← gguf_manifest.payload_limit(m, name)
+    return source(limit[0], limit[1])
+}
+
+# `rows` and `cols` name the extents N and K: the expected dims are their lengths,
+# and a generic extent that appears in no argument has no carrier for the run-time
+# shape of the conversion.
+fn load_matrix<size N, size K>((int, int) → list<b8> ⇥ gguf_manifest.GgufManifestError source, gguf_manifest.GgufManifest m, string name, tensor<f32, [N]> rows, tensor<f32, [K]> cols) → tensor<f32, [N, K]> ⇥ gguf_manifest.GgufManifestError {
+    let list<b8> raw ← tensor_bytes(source, m, name, [rows.length(), cols.length()])
+    do {
+        let tensor<f32, [N, K]> loaded ← raw ↦ tensor<f32, [size N, size K]> via Le
+        output.stderr_write("port: loaded §"(name))
+        return loaded
+    }
+    catch err {
+        throw variant gguf_manifest.GgufManifestError.BadBounds { message = "tensor §: §"(name, err) }
+    }
+}
+
+fn load_vector<size N>((int, int) → list<b8> ⇥ gguf_manifest.GgufManifestError source, gguf_manifest.GgufManifest m, string name, tensor<f32, [N]> extent) → tensor<f32, [N]> ⇥ gguf_manifest.GgufManifestError {
+    let list<b8> raw ← tensor_bytes(source, m, name, [extent.length()])
+    do {
+        let tensor<f32, [N]> loaded ← raw ↦ tensor<f32, [size N]> via Le
+        output.stderr_write("port: loaded §"(name))
+        return loaded
+    }
+    catch err {
+        throw variant gguf_manifest.GgufManifestError.BadBounds { message = "tensor §: §"(name, err) }
+    }
+}
+
+fn load_layer((int, int) → list<b8> ⇥ gguf_manifest.GgufManifestError source, gguf_manifest.GgufManifest m, int n, PortScratch s) → PortLayer ⇥ gguf_manifest.GgufManifestError {
+    return PortLayer {
+        attn_norm = load_vector(source, m, layer_tensor(n, "attn_norm.weight"), s.ctx),
+        wq = load_matrix(source, m, layer_tensor(n, "attn_q.weight"), s.ctx, s.ctx),
+        wk = load_matrix(source, m, layer_tensor(n, "attn_k.weight"), s.kvdom, s.ctx),
+        wv = load_matrix(source, m, layer_tensor(n, "attn_v.weight"), s.kvdom, s.ctx),
+        wo = load_matrix(source, m, layer_tensor(n, "attn_output.weight"), s.ctx, s.ctx),
+        ffn_norm = load_vector(source, m, layer_tensor(n, "ffn_norm.weight"), s.ctx),
+        wg = load_matrix(source, m, layer_tensor(n, "ffn_gate.weight"), s.act, s.ctx),
+        wu = load_matrix(source, m, layer_tensor(n, "ffn_up.weight"), s.act, s.ctx),
+        wd = load_matrix(source, m, layer_tensor(n, "ffn_down.weight"), s.ctx, s.act)
+    }
+}
+
+# Every one of the 290 tensors, each read once, after the metadata dims check.
+# `source` is the caller's bounds-checked range reader (absolute file offset,
+# length).
+@ public
+fn load_weights((int, int) → list<b8> ⇥ gguf_manifest.GgufManifestError source, gguf_manifest.GgufManifest m) → PortWeights ⇥ gguf_manifest.GgufManifestError {
+    verify_dims(m)
+    let PortScratch s ← new_scratch()
+    let tensor<f32, [49152]> vocab ← tf32[49152] {}
+    let tensor<f32, [49152, 960]> embed ← load_matrix(source, m, "token_embd.weight", vocab, s.ctx)
+    let tensor<f32, [960]> out_norm ← load_vector(source, m, "output_norm.weight", s.ctx)
+    mut list<PortLayer> layers ← []
+    for range 0 ‥ PORT_LAYERS let n {
+        layers.append(load_layer(source, m, n, s))
+    }
+    return PortWeights { embed = embed, out_norm = out_norm, layers = layers }
+}
+
+describe "port weights model row" tag "inferentia" {
+    test "the kernel scalars follow from the metadata dims" {
+        assert PORT_QD ↦ int ≡ PORT_HEADS * PORT_HEAD_DIM
+        assert PORT_KVD ↦ int ≡ PORT_KV_HEADS * PORT_HEAD_DIM
+        assert PORT_HEAD_WIDTH ↦ int ≡ PORT_HEAD_DIM
+        assert PORT_GROUP ↦ int ≡ PORT_HEADS / PORT_KV_HEADS
+        assert PORT_QD ↦ int ≡ PORT_DIM
+        assert PORT_ATTN_SCALE * PORT_ATTN_SCALE * (PORT_HEAD_DIM ↦ f32) ≅ 1.0 ∷ f32
+    }
+    test "the load covers 290 tensors" {
+        assert 2 + PORT_LAYERS * 9 ≡ 290
+    }
+}
+
+describe "port weights name table" tag "inferentia" {
+    test "per-layer names carry the block index" {
+        assert layer_tensor(0, "attn_q.weight") ≡ "blk.0.attn_q.weight"
+        assert layer_tensor(31, "ffn_down.weight") ≡ "blk.31.ffn_down.weight"
+    }
+}
+
+# The refusal text of a dims check, "" when the tensor passes.
+fn dims_refusal(string name, list<int> ne, int dtype, list<int> expected) → string {
+    do {
+        check_dims(name, ne, dtype, expected)
+        return ""
+    }
+    catch err {
+        return err.message
+    }
+}
+
+describe "port weights validation" tag "inferentia" {
+    test "reversed ne with type F32 passes" {
+        assert dims_refusal("blk.0.ffn_gate.weight", [960, 2560], 0, [2560, 960]) ≡ ""
+        assert dims_refusal("blk.0.attn_norm.weight", [960], 0, [960]) ≡ ""
+    }
+    test "ne in row-major order (not reversed) is refused" {
+        assert dims_refusal("blk.0.ffn_gate.weight", [2560, 960], 0, [2560, 960]).contains("differs from the expected")
+    }
+    test "a wrong dimension is refused" {
+        assert dims_refusal("blk.0.attn_k.weight", [960, 321], 0, [320, 960]).contains("blk.0.attn_k.weight")
+    }
+    test "a wrong rank is refused" {
+        assert dims_refusal("blk.0.attn_norm.weight", [960, 1], 0, [960]).contains("differs from the expected")
+    }
+    test "a non-F32 type is refused as UnknownLayout" {
+        assert dims_refusal("blk.0.attn_q.weight", [960, 960], 12, [960, 960]) ≡ "tensor blk.0.attn_q.weight is not F32 (ggml type 12)"
+    }
+}
+
+# The refusal text of converting a byte string to a [4] vector, "" when it converts.
+fn vector_refusal(list<b8> raw) → string {
+    do {
+        let tensor<f32, [4]> loaded ← raw ↦ tensor<f32, [size 4]> via Le
+        return loaded.length() ≡ 4 ✓ "" ✗ "wrong length"
+    }
+    catch err {
+        return "§"(err)
+    }
+}
+
+describe "port weights conversion refusal" tag "inferentia" {
+    test "four floats convert to a [4] vector" {
+        assert vector_refusal(|00 00 80 3f 00 00 00 40 00 00 40 40 00 00 80 40|) ≡ ""
+    }
+    test "a short byte range is a recoverable error, not a reshape" {
+        assert vector_refusal(|00 00 80 3f|) ≢ ""
+    }
+}
