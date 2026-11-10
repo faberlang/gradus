@@ -10,7 +10,8 @@ import from "gradus:decode_step" ds
 # The decode path (`gradus:decode_token` / `gradus:decode_step`) runs one token per
 # launch chain, so a prompt of T tokens costs T chains. Here every step of a layer
 # runs over all T rows at once: the projections are `⇇ ·` matrix products over the
-# transposed stacked weights (the radix corpus/training gemm-layer shape), the norms
+# stacked weights in [in, out] layout (radix corpus/inference prefill-layer form 1;
+# `transpose_copy` builds them at load from the decode layout), the norms
 # are the language's row operation, and attention takes the decode form widened to
 # T query rows (masked scores, the row softmax, the context sum). The K/V rows of
 # all T positions are written to the caches in one launch, so decoding continues
@@ -18,8 +19,10 @@ import from "gradus:decode_step" ds
 #
 # Shapes (D hidden, QD query width, KVD key/value width, F ffn width, H query heads,
 # C cache rows, T prompt rows, HT = H * T, R = QD + 2 * KVD, G = 2 * F). The weights
-# are those of `layer_wide`: wqkv [R, D] (q, k, v stacked row-wise), wo [D, QD],
-# wgu [G, D] (gate and up stacked), wd [D, F], all [out, in].
+# are those of `layer_wide` transposed to [in, out]: wqkvt [D, R] (q, k, v stacked),
+# wot [QD, D], wgut [D, G] (gate and up stacked), wdt [F, D]. (A product through a
+# `.transpose()` view of the decode layout would need no copies, but it is
+# materialized per call on Metal today, and read back wrong in some programs.)
 # Scratch (the caller allocates each once per prompt):
 #   xn [T, D]   qkvr [T, R]   qkv [T, R]   sc [HT, C]
 #   pr [HT, C]   ctx [T, QD]   ao [T, D]   h1 [T, D]   gu [T, G]   act [T, F]   dn [T, D]
@@ -44,12 +47,21 @@ fn rms_norm_rows<size T, size D>(tensor<f32, [T, D]> rrx, tensor<f32, [D]> rrw, 
     rro ⇇ rrx.norm_rms(axis 1, rreps, rrw)
 }
 
-# Row-batched projection against a weight stored [out, in]: mty = mtx · mtwᵀ.
+# Row-batched projection against a weight stored [in, out]: mpy = mpx · mpw.
 @ kernel
 @ public
-fn matmul_t<size T, size K, size N>(tensor<f32, [T, K]> mtx, tensor<f32, [N, K]> mtw, mut tensor<f32, [T, N]> mty) → void {
-    let _ mtwt ← mtw.transpose()
-    mty ⇇ mtx · mtwt
+fn matmul<size T, size K, size N>(tensor<f32, [T, K]> mpx, tensor<f32, [K, N]> mpw, mut tensor<f32, [T, N]> mpy) → void {
+    mpy ⇇ mpx · mpw
+}
+
+# A weight copied into the [in, out] layout the plain product reads: tco[k, n] = tcw[n, k].
+# Load-time, once per weight.
+@ kernel
+@ public
+fn transpose_copy<size N, size K>(tensor<f32, [N, K]> tcw, mut tensor<f32, [K, N]> tco) → void {
+    for from tco at [k, n] thread lane let e {
+        tco[[k, n]] ← tcw[[n, k]]
+    }
 }
 
 # RoPE of every row of the stacked q/k/v projection, row t at position rrpos + t:
@@ -211,11 +223,11 @@ fn prefill_layer<size D, size QD, size KVD, size F, size C, size T, size HT, siz
     tensor<f32, [T, D]> hin,
     mut tensor<f32, [T, D]> hout,
     tensor<f32, [D]> anorm,
-    tensor<f32, [R, D]> wqkv,
-    tensor<f32, [D, QD]> wo,
+    tensor<f32, [D, R]> wqkvt,
+    tensor<f32, [QD, D]> wot,
     tensor<f32, [D]> fnorm,
-    tensor<f32, [G, D]> wgu,
-    tensor<f32, [D, F]> wd,
+    tensor<f32, [D, G]> wgut,
+    tensor<f32, [F, D]> wdt,
     mut tensor<f32, [C, KVD]> kin,
     mut tensor<f32, [C, KVD]> vin,
     mut tensor<f32, [T, D]> xn,
@@ -241,17 +253,17 @@ fn prefill_layer<size D, size QD, size KVD, size F, size C, size T, size HT, siz
     f32 pscale
 ) → void {
     rms_norm_rows(hin, anorm, mut xn, peps)
-    matmul_t(xn, wqkv, mut qkvr)
+    matmul(xn, wqkvt, mut qkvr)
     rope_rows(qkvr, mut qkv, pos0, pqd, pkvd, pdh, plntheta, prope)
     kv_write_rows(qkv, mut kin, mut vin, pos0, pqd)
     scores_rows(qkv, kin, mut sc, prows, pos0, pdh, pgroup, pscale)
     ds.row_softmax(sc, mut pr)
     context_rows(pr, vin, mut ctx, prows, pos0, pdh, pgroup)
-    matmul_t(ctx, wo, mut ao)
+    matmul(ctx, wot, mut ao)
     add_rows(hin, ao, mut h1)
     rms_norm_rows(h1, fnorm, mut xn, peps)
-    matmul_t(xn, wgu, mut gu)
+    matmul(xn, wgut, mut gu)
     swiglu_rows(gu, mut act)
-    matmul_t(act, wd, mut dn)
+    matmul(act, wdt, mut dn)
     add_rows(h1, dn, mut hout)
 }

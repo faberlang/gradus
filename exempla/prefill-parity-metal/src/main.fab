@@ -11,8 +11,10 @@ locale = "en"
 # through `decode_token.layer_wide` at positions 0 .. 5; the batched path runs all
 # six through `prefill.prefill_layer` at once. Both write their own K/V caches.
 # The program prints the worst absolute difference of the key cache rows, the
-# value cache rows and the output rows, and `parity ok` when all three are within
-# 1e-4 (f32, different summation orders), `parity FAIL` otherwise.
+# value cache rows and the output rows, and `parity ok` when each is within
+# 1e-5 + 1e-4 * the tensor's largest magnitude (f32, different summation orders),
+# `parity FAIL` otherwise. The prefill weights are the decode weights copied to
+# [in, out] by `prefill.transpose_copy`, as gradus:model/smollm2_weights does.
 
 import from "gradus:decode_step" ds
 import from "gradus:decode_token" dt
@@ -50,6 +52,18 @@ fn put_row<size T, size D>(tensor<f32, [D]> prsrc, mut tensor<f32, [T, D]> prdst
             prdst[[t, j]] ← prsrc[[j]]
         }
     }
+}
+
+fn max_abs<size N, size K>(tensor<f32, [N, K]> a, int rows) → f32 {
+    mut f32 top ← 0.0
+    for range 0 ‥ rows let i {
+        for range 0 ‥ K let k {
+            if a[[i, k]].abs() ≻ top {
+                top ← a[[i, k]].abs()
+            }
+        }
+    }
+    return top
 }
 
 fn max_diff<size N, size K>(tensor<f32, [N, K]> a, tensor<f32, [N, K]> b, int rows) → f32 {
@@ -146,13 +160,25 @@ main {
     mut tensor<f32, [T, 5120]> pgu ← tf32[T, 5120] {}
     mut tensor<f32, [T, 2560]> pact ← tf32[T, 2560] {}
     mut tensor<f32, [T, 960]> pdn ← tf32[T, 960] {}
-    pf.prefill_layer(xin, mut got, anorm, wqkv, wo, fnorm, wgu, wd, mut kb, mut vb, mut pxn, mut pqkvr, mut pqkv, mut psc, mut ppr, mut pctx, mut pao, mut ph1, mut pgu, mut pact, mut pdn, rows ↦ i32, 0, 960, 320, 64, 3, 1, 0.00001, 11.512925, 0.125)
+    mut tensor<f32, [960, 1600]> wqkvt ← tf32[960, 1600] {}
+    pf.transpose_copy(wqkv, mut wqkvt)
+    mut tensor<f32, [960, 960]> wot ← tf32[960, 960] {}
+    pf.transpose_copy(wo, mut wot)
+    mut tensor<f32, [960, 5120]> wgut ← tf32[960, 5120] {}
+    pf.transpose_copy(wgu, mut wgut)
+    mut tensor<f32, [2560, 960]> wdt ← tf32[2560, 960] {}
+    pf.transpose_copy(wd, mut wdt)
+    pf.prefill_layer(xin, mut got, anorm, wqkvt, wot, fnorm, wgut, wdt, mut kb, mut vb, mut pxn, mut pqkvr, mut pqkv, mut psc, mut ppr, mut pctx, mut pao, mut ph1, mut pgu, mut pact, mut pdn, rows ↦ i32, 0, 960, 320, 64, 3, 1, 0.00001, 11.512925, 0.125)
 
     let f32 dk ← max_diff(ka, kb, ROWS)
     let f32 dv ← max_diff(va, vb, ROWS)
     let f32 dout ← max_diff(want, got, ROWS)
     print "max_abs_diff key_cache=§0 value_cache=§1 output=§2"(dk, dv, dout)
-    if dk ≤ 0.0001 and dv ≤ 0.0001 and dout ≤ 0.0001 {
+    # Judged against each tensor's scale (f32, different summation orders: P15).
+    let f32 bk ← 0.00001 + 0.0001 * max_abs(ka, ROWS)
+    let f32 bv ← 0.00001 + 0.0001 * max_abs(va, ROWS)
+    let f32 bout ← 0.00001 + 0.0001 * max_abs(want, ROWS)
+    if dk ≤ bk and dv ≤ bv and dout ≤ bout {
         print "parity ok"
     }
     else {
