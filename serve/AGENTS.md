@@ -15,7 +15,7 @@ truth. When they disagree, working code and observed behavior win.
 
 ## Ownership boundaries
 
-- Keep product policy in this repository.
+- Keep product policy in this package.
 - Put reusable ML semantics in Gradus only when Inferentia proves the need.
 - Put compiler and Faber build-tool work in private Radix.
 - Put physical effects behind the appropriate Host provider.
@@ -64,8 +64,7 @@ run passes `--strict-engine`.
 
 Engine rule (operator, 2026-11-05): inference never runs on the MIR
 interpreter. The manifest sets `[run] strict-engine = true`: `live` and `serve`
-run their host half on the Cranelift JIT (radix peer/main abbc34c3f3 or later,
-Gradus peer/main 57ac132 or later), and any interpreter fallback refuses with
+run their host half on the Cranelift JIT (radix vivi/main 86298446da or later), and any interpreter fallback refuses with
 exit 69. Never remove the key to get a run; a refusal names the gap to close.
 
 Token-correctness run (strict through the manifest; about 16 s on an M5 Max, most of it model load):
@@ -84,8 +83,7 @@ The gate packages under `tests/` (`admission-gate`, `model-gate`,
 `generate-gate`) run as `"$FABER" run --device reference --library-home
 "$LIBRARY_HOME" "$INF/tests/<gate>" -- <model>`. `tests/admission-gate/run.sh`
 and `tests/process-exit/run.sh` still expect a native `target/debug/inferentia`
-binary from the retired Rust build and do not run. `tests/port-load/run.sh` and
-`tests/oracle/*.py` take the `faber` and library home as arguments.
+binary from the retired Rust build and do not run. `tests/oracle/*.py` take the `faber` and library home as arguments.
 
 Streaming proof (need 86f2d64a): `/generate` with `Accept: text/event-stream` writes
 each token to the open response as it is chosen. `python3 tests/oracle/a1_stream_test.py

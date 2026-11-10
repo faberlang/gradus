@@ -2,9 +2,11 @@
 
 Inferentia is a local-first GGUF inference server written in Faber.
 
-The repository holds the Faber CLI (`live` one-shot generation and `serve` over
-HTTP), the SmolLM2-360M F32 decode path on the Gradus launches, its tests, and
-the master development campaign. One model row is verified:
+This package lives in the Gradus repository at `serve/`. It holds the Faber CLI
+(`live` one-shot generation and `serve` over HTTP), its tests, and the master
+development campaign. The SmolLM2-360M F32 decode path it runs is Gradus library
+code: `gradus:model/smollm2_weights` (the bulk weight load) and
+`gradus:generation/smollm2_decode` (the decode loop). One model row is verified:
 `SmolLM2-360M-Instruct-f32.gguf` (1,449,071,040 bytes, sha-256
 `07735177a3542cbc0b0665051ce1922b55c4c9698de65131e65f2aea87a935e0`).
 
@@ -36,7 +38,7 @@ build rather than the `faber` on `PATH` (which lags main):
 ```sh
 FABER=<radix>/target/release/faber        # cargo build --release -p faber, in radix
 LIBRARY_HOME=<dir>                        # a directory whose `gradus` entry is the Gradus checkout
-INF="$(pwd)"                              # absolute package path (this repository)
+INF="$(pwd)"                              # absolute package path (gradus/serve)
 MODEL=<dir>/SmolLM2-360M-Instruct-f32.gguf
 
 "$FABER" check --library-home "$LIBRARY_HOME" "$INF"
@@ -66,8 +68,7 @@ MODEL=<dir>/SmolLM2-360M-Instruct-f32.gguf
   `[run] strict-engine = true`, so `live` and `serve` run their host half on
   the Cranelift JIT and their kernels on the device, and any fallback to the
   interpreter refuses the run (exit 69, `ENGINE001`/`ENGINE002`) instead of
-  running slowly. Needs radix peer/main abbc34c3f3 or later and Gradus
-  peer/main 57ac132 or later.
+  running slowly. Needs radix vivi/main 86298446da or later.
 
 Token correctness: the `live` command above must print the same 40 ids as
 llama.cpp (greedy): `30 198 198 788 451 6330 28 260 33197 476 269 18 4271 288

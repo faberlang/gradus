@@ -2,7 +2,9 @@
 # Port generation — the A1 decode loop on the gradus wide decode-token launches
 # =============================================================================
 #
-# Given the bulk-loaded `port.PortWeights` (port_weights.fab), the prompt token
+# Public import: import from "gradus:generation/smollm2_decode" smollm2_decode
+#
+# Given the bulk-loaded `port.PortWeights` (gradus:model/smollm2_weights), the prompt token
 # ids, a new-token ceiling and the stop policy, this module runs
 #
 #   prefill   each prompt token, one at a time, through embed_wide + 32 x
@@ -36,10 +38,9 @@
 import from "gradus:decode_token" dt
 import from "gradus:decode_step" ds
 import from "gradus:sampling" sampling
-import from "gradus:train" train
+import from "gradus:random" random
 
-import from "./port_weights" port
-import from "./io" output
+import from "gradus:model/smollm2_weights" port
 
 @ public
 class PortResult {
@@ -228,10 +229,6 @@ fn finish_after(bool stop_on_eog, bool is_eog, int generated, int max_new, int n
 # One step
 # ---------------------------------------------------------------------------
 
-fn progress(string text) → void {
-    output.stderr_write("port: §"(text))
-}
-
 # One layer launch group: hout = layer(hin) at `pos`, over the request's scratch.
 # Every scratch tensor passes through its own `mut` binding (one writable name per
 # argument).
@@ -254,7 +251,7 @@ fn layer_pass<size C>(mut port.PortScratch s, port.PortLayer ly, tensor<f32, [96
 # The id chosen from the logits of the last head launch. Greedy leaves the id on the
 # device in `ids` (the next gather reads it there); the sampled paths choose on the
 # host, and the caller stores the id.
-fn choose<size V, size P, size M>(mut tensor<f32, [V]> logits, mut tensor<i32, [1]> ids, mut tensor<i32, [1]> second, tensor<f32, [P, M]> tmdom, mut tensor<f32, [P, M]> tmval, mut tensor<f32, [P, M]> tmidx, string branch, sampling.Config sconf, list<int> skip, list<int> history, bool trace, int step, mut train.Seed rng) → int ⇥ sampling.SamplingError {
+fn choose<size V, size P, size M>(mut tensor<f32, [V]> logits, mut tensor<i32, [1]> ids, mut tensor<i32, [1]> second, tensor<f32, [P, M]> tmdom, mut tensor<f32, [P, M]> tmval, mut tensor<f32, [P, M]> tmidx, string branch, sampling.Config sconf, list<int> skip, list<int> history, bool trace, int step, mut random.Seed rng, (string) → void report) → int ⇥ sampling.SamplingError {
     if branch ≡ "candidates" {
         # EOG mask first (-1e9), then the penalty on the device logits, so the
         # ranking narrowed on the device is the penalised one; the history
@@ -279,7 +276,7 @@ fn choose<size V, size P, size M>(mut tensor<f32, [V]> logits, mut tensor<i32, [
     port_mask(mut logits, skip, LOWEST)
     if trace {
         let PortTop top ← port_top(mut logits, mut ids, mut second)
-        output.stderr_write(port_trace_line(step, top.id1, top.id1, top.val1, top.id2, top.val2))
+        report(port_trace_line(step, top.id1, top.id1, top.val1, top.id2, top.val2))
         return top.id1
     }
     ds.argmax_token(logits, mut ids)
@@ -305,10 +302,10 @@ fn choose<size V, size P, size M>(mut tensor<f32, [V]> logits, mut tensor<i32, [
 # generated. It returns false to end the generation early (the peer went away);
 # the finish reason is then `cancelled`.
 @ public
-fn port_generate_sampled(port.PortWeights w, list<int> prompt, int max_new, list<int> eog_ids, bool stop_on_eog, int context, bool trace, sampling.Config sconf, train.Seed seed, (int) → bool on_token) → PortResult ⇥ sampling.SamplingError {
+fn port_generate_sampled(port.PortWeights w, list<int> prompt, int max_new, list<int> eog_ids, bool stop_on_eog, int context, bool trace, sampling.Config sconf, random.Seed seed, (int) → bool on_token, (string) → void report) → PortResult ⇥ sampling.SamplingError {
     let int np ← prompt.length()
     let int c ← port_capacity(context, np, max_new)
-    const size C ← c
+    let size C ← c
     mut port.PortScratch s ← port.new_scratch()
     mut tensor<f32, [960]> ha ← tf32[960] {}
     mut tensor<f32, [960]> hb ← tf32[960] {}
@@ -332,11 +329,11 @@ fn port_generate_sampled(port.PortWeights w, list<int> prompt, int max_new, list
     mut tensor<f32, [32]> rp_head ← s.rp
     let string branch ← port_branch(sconf)
     let list<int> skip ← stop_on_eog ✓ [] ✗ eog_ids
-    mut train.Seed rng ← copy seed
+    mut random.Seed rng ← copy seed
     mut list<int> out ← []
     mut string finish ← "length"
     ids[[0]] ← token_i32(prompt[0])
-    progress("prefill-start prompt=§ capacity=§"(np, c))
+    report("port: prefill-start prompt=§ capacity=§"(np, c))
     # One forward pass per prompt token, then one per generated token: at most
     # np + max_new passes, and the run leaves the loop on its finish reason.
     for range 0 ‥ np + max_new let t {
@@ -357,10 +354,10 @@ fn port_generate_sampled(port.PortWeights w, list<int> prompt, int max_new, list
         } else {
             dt.head_step_wide(ha, w.out_norm, w.embed, mut rp_head, mut logits, port.PORT_EPS)
             let int step ← out.length()
-            let int chosen ← choose(mut logits, mut ids, mut second, tmdom, mut tmval, mut tmidx, branch, sconf, skip, out, trace, step, mut rng)
+            let int chosen ← choose(mut logits, mut ids, mut second, tmdom, mut tmval, mut tmidx, branch, sconf, skip, out, trace, step, mut rng, report)
             out.append(chosen)
             if step ≡ 0 {
-                progress("decode-start")
+                report("port: decode-start")
             }
             let bool is_eog ← chosen ∈ eog_ids
             let bool wanted ← on_token(chosen)
@@ -374,7 +371,7 @@ fn port_generate_sampled(port.PortWeights w, list<int> prompt, int max_new, list
             }
         }
     }
-    progress("decode-done tokens=§"(out.length()))
+    report("port: decode-done tokens=§"(out.length()))
     return PortResult { ids = out, finish = finish }
 }
 
@@ -553,7 +550,7 @@ describe "port generate sampled branch" tag "inferentia" {
         # Pairs in id order; ids 1, 3, 5, 9 hold the logits, all other vocabulary
         # positions are dropped (exact 0.0 after top_k).
         let sampling.Config c ← sampling.Config { temperature = 0.7 ∷ f32, top_k = 3, top_p = 1.0 ∷ f32, min_p = 0.0 ∷ f32, repetition_penalty = 1.0 ∷ f32 }
-        let train.Seed s ← train.Seed { status = 7 }
+        let random.Seed s ← random.Seed { status = 7 }
         let PortCandidates cand ← port_candidates([2.0, 4.0, 3.0, 1.0, -3.4028235e38], [9.0, 1.0, 5.0, 3.0, -1.0])
         mut tensor<f32, [16]> full ← tf32[16] {}
         full[[1]] ← 4.0 ∷ f32
