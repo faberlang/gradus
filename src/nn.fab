@@ -1,9 +1,10 @@
 +++
 locale = "en"
 +++
-# Differentiable NN primitives facade.
+# Neural-network primitives, train/eval mode, and dropout policy.
 #
-# Public import: import from "gradus:nn" nn
+# Public import: import from "gradus:nn" nn. Mode is explicit and dropout
+# shares the explicit seed state owned by gradus:random.
 #
 # Architectural rule: primitives do not know the architectures built from
 # them. This module must not import from gradus:attention or
@@ -89,6 +90,8 @@ import from "gradus:shape" shape
 
 import from "gradus:tensor" tensor
 
+import from "gradus:random" random
+
 # =========================================================================
 # PML3-U1 — production surface (shape-generic, forward-only, typed errors)
 # =========================================================================
@@ -113,7 +116,12 @@ union NnError {
     DtypeMismatch,
     ElementMismatch,
     InvalidEpsilon,
-    IndexOutOfBounds
+    IndexOutOfBounds,
+    UnknownMode,
+    InvalidDropout,
+    TensorFailure {
+        tensor.TensorError inner
+    }
 }
 
 @ conversion
@@ -126,6 +134,11 @@ fn from_shape_error(shape.ShapeError err) → NnError {
         case shape.ShapeError.ElementMismatch let message { return variant ElementMismatch {message = message} }
         case _ { return variant ShapeMismatch {message = err.message} }
     }
+}
+
+@ conversion
+fn from_tensor_error(tensor.TensorError err) → NnError {
+    return variant TensorFailure { message = err.message, inner = err }
 }
 
 @ conversion
@@ -606,4 +619,120 @@ fn swiglu_carrier(tensor.NumericBlock gate, tensor.NumericBlock up, tensor.Numer
     let tensor.NumericBlock g ← silu_carrier(gate)
     let tensor.NumericBlock h ← math.mul_carrier(g, up)
     return linear_carrier(h, down_weight, down_bias)
+}
+
+
+# =========================================================================
+# Explicit train/eval mode and dropout policy
+# =========================================================================
+# -------------------------------------------------------------------------
+# Mode — train/eval mode. An EXPLICIT argument to any mode-dependent
+# call: forward evaluation consults the mode it is called with, never a
+# hidden global (the shared-layer rule). Names are the wire contract:
+# "train" | "eval".
+# -------------------------------------------------------------------------
+
+
+@ public
+union Mode {
+    Discipline,
+    Estimate
+}
+
+# Canonical mode name (text surface for consumers).
+@ public
+fn mode_name(Mode m) → string {
+    match m {
+        case Discipline {
+            return "train"
+        }
+        case Estimate {
+            return "eval"
+        }
+    }
+}
+
+@ public
+fn is_discipline(Mode m) → bool {
+    match m {
+        case Discipline {
+            return true
+        }
+        case Estimate {
+            return false
+        }
+    }
+}
+
+@ public
+fn is_estimate(Mode m) → bool {
+    return not is_discipline(m)
+}
+
+# Construct a mode from its canonical name — fail closed on an unknown
+# name (the string entry; enum variants do not cross module
+# boundaries, dtype.fab SEM001 note).
+@ public
+fn mode(string name) → Mode ⇥ NnError {
+    if name ≡ "train" then return variant Discipline
+    if name ≡ "eval" then return variant Estimate
+    throw variant UnknownMode { message = "unknown mode name" }
+}
+
+# -------------------------------------------------------------------------
+# dropout_probability — the dropout/RNG policy gate. The effective dropout rate
+# for a forward evaluation called with an explicit mode: eval → 0 (no
+# dropout — the standard evaluation identity), train → the configured
+# rate. The rate domain is [0, 1] (finite, fail closed). The stochastic
+# mask applied at the effective rate comes from an explicit RNG state —
+# the U5 seed/RNG seam; the deterministic mode gate is this unit's.
+# -------------------------------------------------------------------------
+
+@ public
+fn dropout_probability(Mode m, f32 rate) → f32 ⇥ NnError {
+    require dtype.finite(rate) throw variant InvalidDropout { message = "dropout rate must be in [0, 1]" }
+    require rate ≥ 0.0 throw variant InvalidDropout { message = "dropout rate must be in [0, 1]" }
+    require rate ≤ 1.0 throw variant InvalidDropout { message = "dropout rate must be in [0, 1]" }
+    if is_estimate(m) then return 0.0 ∷ f32
+    return rate
+}
+
+# -------------------------------------------------------------------------
+# dropout — the dropout-mask composition (the U5 machinery the U4
+# dropout_probability gate controls). Eval mode (or rate 0) is identity and the
+# RNG is untouched — the standard evaluation policy, deterministic. Train
+# mode applies a per-element Bernoulli(1−rate) mask scaled by 1/(1−rate)
+# (inverted dropout): x_i ← x_i·m_i/(1−rate), m_i = 1 if r_i ≥ rate.
+# The mask is drawn from the explicit Seed state, which advances; the
+# same (tensor, seed, mode, rate) reproduces the same output.
+# -------------------------------------------------------------------------
+
+
+@ public
+class Dropout {
+    mut tensor.NumericBlock payload
+    mut random.Seed seed
+}
+
+@ public
+fn dropout(tensor.NumericBlock x, random.Seed s, Mode m, f32 rate) → Dropout ⇥ NnError {
+    let f32 par ← dropout_probability(m, rate)
+    if par ≡ 0.0 ∷ f32 then return Dropout { payload = x, seed = s }
+    let f32 scale ← 1.0 / (1.0 - par)
+    let list<f32> data ← x.data
+    mut list<f32> out ← empty
+    mut random.Seed s2 ← copy s
+    for from data let v {
+        let random.DrawF32 f ← random.next_f32(s2)
+        s2 ← f.seed
+        if f.payload ≥ par {
+            out.append(v * scale)
+        }
+        else {
+            out.append(0.0 ∷ f32)
+        }
+    }
+    mut tensor.NumericBlock updated ← tensor.default()
+    updated ← tensor.construct(out, x.shape)
+    return Dropout { payload = updated, seed = s2 }
 }

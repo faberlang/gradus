@@ -8,8 +8,8 @@ locale = "en"
 #
 # With `--device cpu` the proba route runs each `@ kernel` in host form on the
 # sequential oracle, so every row below executes the kernel body and compares
-# against a hand-computed expectation. The real-shape Metal == cpu pin lives in
-# radix/acceptance/a1-decode-parts (hardware test), not here.
+# against a hand-computed expectation. The public layer_step reference/Metal
+# pin, including the real shape, lives in exempla/decode-layer-pin.
 
 import from "gradus:decode_step" ds
 
@@ -174,6 +174,81 @@ test "decode_step kv_write appends in place and preserves other rows" {
     assert cache[[2, 1]] ≡ (201.0 ↦ f32)
 }
 
+test "decode_step kv_write_block changes only written rows and clips at capacity" {
+    mut tensor<f32, [9, 2]> cache ← tf32[9, 2] {}
+    mut tensor<f32, [1, 2]> one ← tf32[1, 2] {}
+    mut tensor<f32, [7, 2]> seven ← tf32[7, 2] {}
+    mut tensor<f32, [9, 2]> all ← tf32[9, 2] {}
+    mut tensor<f32, [4, 2]> tail ← tf32[4, 2] {}
+    for range 0‥9 let r {
+        for range 0‥2 let c {
+            cache[[r, c]] ← (r * 10 + c) ↦ f32
+        }
+    }
+    one[[0, 0]] ← 100.0
+    one[[0, 1]] ← 101.0
+    ds.kv_write_block(mut cache, one, 3)
+    for range 0‥9 let r {
+        for range 0‥2 let c {
+            if r ≡ 3 {
+                assert cache[[r, c]] ≡ (100 + c) ↦ f32
+            }
+            else {
+                assert cache[[r, c]] ≡ (r * 10 + c) ↦ f32
+            }
+        }
+    }
+
+    for range 0‥7 let r {
+        for range 0‥2 let c {
+            seven[[r, c]] ← (200 + r * 10 + c) ↦ f32
+        }
+    }
+    ds.kv_write_block(mut cache, seven, 1)
+    for range 0‥9 let r {
+        for range 0‥2 let c {
+            if r ≻ 0 and r ≺ 8 {
+                assert cache[[r, c]] ≡ (200 + (r - 1) * 10 + c) ↦ f32
+            }
+            elif r ≡ 0 {
+                assert cache[[r, c]] ≡ (c ↦ f32)
+            }
+            else {
+                assert cache[[r, c]] ≡ (80 + c) ↦ f32
+            }
+        }
+    }
+
+    for range 0‥9 let r {
+        for range 0‥2 let c {
+            all[[r, c]] ← (300 + r * 10 + c) ↦ f32
+        }
+    }
+    ds.kv_write_block(mut cache, all, 0)
+    for range 0‥9 let r {
+        for range 0‥2 let c {
+            assert cache[[r, c]] ≡ (300 + r * 10 + c) ↦ f32
+        }
+    }
+
+    for range 0‥4 let r {
+        for range 0‥2 let c {
+            tail[[r, c]] ← (400 + r * 10 + c) ↦ f32
+        }
+    }
+    ds.kv_write_block(mut cache, tail, 7)
+    for range 0‥9 let r {
+        for range 0‥2 let c {
+            if r ≻ 6 {
+                assert cache[[r, c]] ≡ (400 + (r - 7) * 10 + c) ↦ f32
+            }
+            else {
+                assert cache[[r, c]] ≡ (300 + r * 10 + c) ↦ f32
+            }
+        }
+    }
+}
+
 test "decode_step softmax_stats and softmax_apply normalise a row" {
     mut tensor<f32, [1]> dom ← tf32[1] {}
     mut tensor<f32, [1, 3]> s ← tf32[1, 3] {}
@@ -252,11 +327,9 @@ test "decode_step residual_add and swiglu are elementwise" {
     assert close(act[[1]], 2.1931758)
 }
 
-# Greedy pick on the device: argmax_token leaves the index of the largest element
-# in atid[0], the lowest index on ties.
-test "decode_step argmax_token picks the index of the largest element" {
+test "decode_step argmax_token writes the global best index" {
     mut tensor<f32, [12]> x ← tf32[12] {}
-    mut tensor<i32, [1]> id ← ti32[1] {}
+    mut tensor<i32, [1]> idx ← tensor<i32, [1]> {}
     x[[0]] ← 1.0
     x[[1]] ← 5.0
     x[[2]] ← 5.0
@@ -269,38 +342,34 @@ test "decode_step argmax_token picks the index of the largest element" {
     x[[9]] ← -9.0
     x[[10]] ← -8.0
     x[[11]] ← 7.0
-    ds.argmax_token(x, mut id)
-    assert id[[0]] ≡ 11
+    ds.argmax_token(x, mut idx)
+    assert idx[0] ≡ 11
 }
 
-test "decode_step argmax_token: ties keep the lowest index" {
+test "decode_step argmax_token ties keep the lowest global index" {
     mut tensor<f32, [12]> x ← tf32[12] {}
-    mut tensor<i32, [1]> id ← ti32[1] {}
+    mut tensor<i32, [1]> idx ← tensor<i32, [1]> {}
     for range 0‥12 let i {
         x[[i]] ← -4.0
     }
-    # the maximum 2.5 recurs at 2, 3 and 8
     x[[2]] ← 2.5
     x[[3]] ← 2.5
     x[[8]] ← 2.5
-    ds.argmax_token(x, mut id)
-    assert id[[0]] ≡ 2
+    ds.argmax_token(x, mut idx)
+    assert idx[0] ≡ 2
 }
 
-test "decode_step argmax_token: all equal picks index 0, and a lone winner anywhere is found" {
+test "decode_step argmax_token all-equal picks zero and later maximum wins" {
     mut tensor<f32, [12]> x ← tf32[12] {}
-    mut tensor<i32, [1]> id ← ti32[1] {}
+    mut tensor<i32, [1]> idx ← tensor<i32, [1]> {}
     for range 0‥12 let i {
         x[[i]] ← 0.25
     }
-    ds.argmax_token(x, mut id)
-    assert id[[0]] ≡ 0
+    ds.argmax_token(x, mut idx)
+    assert idx[0] ≡ 0
     x[[6]] ← 0.5
-    ds.argmax_token(x, mut id)
-    assert id[[0]] ≡ 6
-    x[[11]] ← 0.75
-    ds.argmax_token(x, mut id)
-    assert id[[0]] ≡ 11
+    ds.argmax_token(x, mut idx)
+    assert idx[0] ≡ 6
 }
 
 test "decode_step topm_chunks writes each chunk's top-M pairs in descending value, ties to the lowest index" {

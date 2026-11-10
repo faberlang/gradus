@@ -5,7 +5,7 @@ locale = "en"
 # slicing of token-id corpora.
 #
 # Public import: import from "gradus:data" data
-# Depends on: gradus:train (Seed/Draw — the ONLY RNG; this module advances no
+# Depends on: gradus:random (Seed/Draw — the ONLY RNG; this module advances no
 # second generator).
 #
 # Nested-leaf plan: this file splits into nested leaves when a second
@@ -24,7 +24,7 @@ locale = "en"
 # corpus and a future safetensors dataset feed the same training loop through
 # the same batch interface.
 
-import from "gradus:train" train
+import from "gradus:random" random
 import from "norma:fs" fs
 import from "norma:fault" fault
 
@@ -43,7 +43,33 @@ union DataError {
     InvalidBatchSize,
     InvalidVocabularyId,
     InvalidWindowLength,
-    InvalidValidationModulus
+    InvalidValidationModulus,
+    InvalidPairLengths,
+    InputWidthMismatch {
+        int expected_width
+        int actual_width
+    },
+    TargetWidthMismatch {
+        int expected_width
+        int actual_width
+    },
+    TensorFailure {
+        tensor.TensorError inner
+    },
+    InvalidSamplerState,
+    RandomFailure {
+        random.RandomError inner
+    }
+}
+
+@ conversion
+fn from_random_error(random.RandomError err) → DataError {
+    return variant RandomFailure { message = err.message, inner = err }
+}
+
+@ conversion
+fn from_tensor_error(tensor.TensorError err) → DataError {
+    return variant TensorFailure { message = err.message, inner = err }
 }
 
 # Shared corpus gate: non-empty. Message identity is the proba pin surface.
@@ -53,10 +79,10 @@ fn require_ids(list<int> ids) → void ⇥ DataError {
 
 # -------------------------------------------------------------------------
 # shuffle — deterministic Fisher–Yates over the corpus order, driven by
-# gradus:train Seed/Draw (the training RNG; no second generator).
+# gradus:random Seed/Draw (the training RNG; no second generator).
 #   for i in 0 ‥ n−1: one xorshift64 draw;
 #   pick j = i + ((draw ∧ MASK_63) mod (n − i)); swap positions i and j.
-# The draw is masked to its low 63 bits (sign-agnostic, the train.next_f32
+# The draw is masked to its low 63 bits (sign-agnostic, the random.next_f32
 # precedent) so the modulo span is never negative. Deterministic: the same
 # (ids, seed) reproduces the same order. A single-element corpus consumes
 # no draw and the seed is returned unchanged. The advanced seed rides the
@@ -70,19 +96,19 @@ const int MASK_63 = 9223372036854775807
 @ public
 class Shuffled {
     mut list<int> payload
-    mut train.Seed seed
+    mut random.Seed seed
 }
 
 @ public
-fn shuffle(list<int> ids, train.Seed seed) → Shuffled ⇥ DataError {
+fn shuffle(list<int> ids, random.Seed seed) → Shuffled ⇥ DataError {
     require_ids(ids)
     let list<int> source ← ids
     let int n ← source.length()
     mut list<int> data ← copy source
-    mut train.Seed s ← copy seed
+    mut random.Seed s ← copy seed
     let int last ← n - 1
     for range 0 ‥ last let i {
-        let train.Draw d ← train.next(s)
+        let random.Draw d ← random.next(s)
         s ← d.seed
         let int pick ← i + ((d.payload ∧ MASK_63) % (n - i))
         let int tmp ← data.get(i) coalesce 0
@@ -117,8 +143,265 @@ fn batch(list<int> ids, int batch_size) → list<list<int>> ⇥ DataError {
 }
 
 # -------------------------------------------------------------------------
+# Local supervised examples. Each sample is a fixed-width list<int>; batches
+# materialize row-major F32 NumericBlock tensors with shape [rows, width].
+# Input samples share one width and target samples share one width (the two
+# widths may differ). Integer IDs are represented as f32. The final batch is
+# retained short, never dropped or padded.
+# -------------------------------------------------------------------------
+
+import from "gradus:tensor" tensor
+
+@ public
+class Batch {
+    let tensor.NumericBlock x
+    let tensor.NumericBlock y
+}
+
+@ public
+class SupervisedSet {
+    let list<list<int>> inputs
+    let list<list<int>> targets
+}
+
+@ public
+class SupervisedSplit {
+    let list<int> training
+    let list<int> held_out
+}
+
+@ public
+class ModulusSplit {
+    let list<int> training_positions
+    let list<int> held_out_positions
+}
+
+@ public
+class SupervisedSampler {
+    let string corpus
+    let int seed
+    let int epoch
+    let int position
+}
+
+# One ordered sequence identity format serves both LM document corpora and
+# supervised index lists. This preserves the LM identity bytes exactly.
+@ public
+fn data_identity(list<list<int>> sequences) → string {
+    mut string identity ← ""
+    for range 0 ‥ sequences.length() let i {
+        let list<int> sequence ← sequences.get(i) coalesce ([] ∷ list<int>)
+        identity ← identity + "d§:"(sequence.length() ↦ string)
+        for range 0 ‥ sequence.length() let j {
+            if j ≢ 0 { identity ← identity + "," }
+            identity ← identity + (sequence.get(j) coalesce 0 ↦ string)
+        }
+        identity ← identity + ";"
+    }
+    return identity
+}
+
+# Shared modulus split returns positions, preserving input order in each side.
+# Consumers provide a key per item: supervised rows use their index and LM
+# documents use lm_document_score(document).
+fn modulus_split(list<int> keys, int modulus) → ModulusSplit ⇥ DataError {
+    require modulus ≥ 2 throw variant InvalidValidationModulus { message = "held-out modulus must be at least 2" }
+    mut list<int> training ← empty
+    mut list<int> held_out ← empty
+    for range 0 ‥ keys.length() let i {
+        if (keys.get(i) coalesce 0) % modulus ≡ 0 { held_out.append(i) } else { training.append(i) }
+    }
+    return ModulusSplit { training_positions = training, held_out_positions = held_out }
+}
+
+@ public
+fn supervised_set(list<list<int>> inputs, list<list<int>> targets) → SupervisedSet ⇥ DataError {
+    require inputs.length() ≡ targets.length() throw variant InvalidPairLengths { message = "input and target sample counts differ" }
+    if inputs.length() ≻ 0 {
+        let int input_width ← (inputs.get(0) coalesce ([] ∷ list<int>)).length()
+        let int target_width ← (targets.get(0) coalesce ([] ∷ list<int>)).length()
+        for range 0 ‥ inputs.length() let i {
+            let int actual_input_width ← (inputs.get(i) coalesce ([] ∷ list<int>)).length()
+            let int actual_target_width ← (targets.get(i) coalesce ([] ∷ list<int>)).length()
+            require actual_input_width ≡ input_width throw variant InputWidthMismatch { message = "input sample widths differ: expected " + (input_width ↦ string) + ", got " + (actual_input_width ↦ string), expected_width = input_width, actual_width = actual_input_width }
+            require actual_target_width ≡ target_width throw variant TargetWidthMismatch { message = "target sample widths differ: expected " + (target_width ↦ string) + ", got " + (actual_target_width ↦ string), expected_width = target_width, actual_width = actual_target_width }
+        }
+    }
+    return SupervisedSet { inputs = inputs, targets = targets }
+}
+
+fn supervised_tensor(list<list<int>> rows, int width) → tensor.NumericBlock ⇥ DataError {
+    mut list<f32> flat ← empty
+    for range 0 ‥ rows.length() let r {
+        let list<int> row ← rows.get(r) coalesce ([] ∷ list<int>)
+        for range 0 ‥ width let c { flat.append((row.get(c) coalesce 0) ↦ f32) }
+    }
+    return tensor.construct(flat, [rows.length(), width])
+}
+
+@ public
+fn supervised_split(int count, int held_out_modulus) → SupervisedSplit ⇥ DataError {
+    mut list<int> indices ← empty
+    for range 0 ‥ count let i { indices.append(i) }
+    let ModulusSplit split ← modulus_split(indices, held_out_modulus)
+    return SupervisedSplit { training = split.training_positions, held_out = split.held_out_positions }
+}
+
+@ public
+fn epoch_order(list<int> train_set, random.Seed seed) → Shuffled ⇥ DataError {
+    return shuffle(train_set, seed)
+}
+
+# Batch indices are positions in the shuffled epoch order; paired input and
+# target samples are gathered with the same index before a batch is emitted.
+# The final batch is short when needed; no sample is dropped or padded.
+@ public
+fn supervised_batches(SupervisedSet set, list<int> order, int batch_size) → list<Batch> ⇥ DataError {
+    require_ids(order)
+    require batch_size ≥ 1 throw variant InvalidBatchSize { message = "batch size must be at least 1" }
+    mut list<Batch> out ← empty
+    mut int start ← 0
+    while start ≺ order.length() {
+        mut int stop ← start + batch_size
+        if stop ≻ order.length() { stop ← order.length() }
+        mut list<list<int>> xs ← empty
+        mut list<list<int>> ys ← empty
+        for range start ‥ stop let p {
+            let int index ← order.get(p) coalesce -1
+            require index ≥ 0 and index ≺ set.inputs.length() and index ≺ set.targets.length() throw variant InvalidSamplerState { message = "sample index is outside the supervised set" }
+            xs.append(set.inputs.get(index) coalesce ([] ∷ list<int>))
+            ys.append(set.targets.get(index) coalesce ([] ∷ list<int>))
+        }
+        let int x_width ← (set.inputs.get(0) coalesce ([] ∷ list<int>)).length()
+        let int y_width ← (set.targets.get(0) coalesce ([] ∷ list<int>)).length()
+        out.append(Batch { x = supervised_tensor(xs, x_width), y = supervised_tensor(ys, y_width) })
+        start ← stop
+    }
+    return out
+}
+
+@ public
+fn supervised_indices_identity(list<int> indices) → string {
+    return data_identity([indices])
+}
+
+@ public
+fn supervised_sampler_start(list<int> train_set, random.Seed seed) → SupervisedSampler {
+    return SupervisedSampler { corpus = supervised_indices_identity(train_set), seed = seed.status, epoch = 0, position = 0 }
+}
+
+# One versioned, # separated wire format and parser serve LM cursors and
+# supervised sampler checkpoints. Field bytes are passed through unchanged.
+fn versioned_wire(string version, list<string> fields) → string {
+    mut string wire ← version
+    for from fields let field { wire ← wire + "#" + field }
+    return wire
+}
+
+fn parse_versioned_wire(string wire, string version, int field_count) → list<string> ∪ none {
+    let list<string> parts ← wire.split("#")
+    if parts.length() ≢ field_count or (parts.get(0) coalesce "") ≢ version then return null
+    return parts
+}
+
+@ public
+fn supervised_sampler_wire(SupervisedSampler state) → string {
+    return versioned_wire("supervised-sampler-v1", [state.corpus, state.seed ↦ string, state.epoch ↦ string, state.position ↦ string])
+}
+
+fn parse_integer(string text) → int ∪ none {
+    if text.length() ≡ 0 then return null
+    mut int start ← 0
+    if (text.slice(0, 1) ⊥ "") ≡ "-" {
+        start ← 1
+        if start ≡ text.length() then return null
+    }
+    for range start ‥ text.length() let i {
+        let string c ← text.slice(i, i + 1) ⊥ ""
+        if c ≢ "0" and c ≢ "1" and c ≢ "2" and c ≢ "3" and c ≢ "4" and c ≢ "5" and c ≢ "6" and c ≢ "7" and c ≢ "8" and c ≢ "9" {
+            return null
+        }
+    }
+    mut int value ← 0
+    do { value ↤ text }
+    catch err { return null }
+    return value
+}
+
+@ public
+fn supervised_sampler_parse(string wire) → SupervisedSampler ∪ none {
+    let _ parts_value ← parse_versioned_wire(wire, "supervised-sampler-v1", 5)
+    if parts_value is none then return null
+    let list<string> parts ← parts_value coalesce ([] ∷ list<string>)
+    let _ seed_value ← parse_integer(parts.get(2) coalesce "")
+    let _ epoch_value ← parse_integer(parts.get(3) coalesce "")
+    let _ position_value ← parse_integer(parts.get(4) coalesce "")
+    if seed_value is none or epoch_value is none or position_value is none then return null
+    let int seed ← seed_value coalesce 0
+    let int epoch ← epoch_value coalesce 0
+    let int position ← position_value coalesce 0
+    if epoch ≺ 0 or position ≺ 0 then return null
+    return SupervisedSampler { corpus = parts.get(1) coalesce "", seed = seed, epoch = epoch, position = position }
+}
+
+@ public
+fn supervised_sampler_order(list<int> train_set, SupervisedSampler state) → Shuffled ∪ none {
+    if state.corpus ≢ supervised_indices_identity(train_set) then return null
+    mut random.Seed seed ← random.default()
+    do { seed ← random.construct_seed(state.seed) }
+    catch err { return null }
+    do { return shuffle(train_set, seed) }
+    catch err { return null }
+}
+
+@ public
+class SupervisedStep {
+    let Batch batch
+    let SupervisedSampler state
+}
+
+@ public
+fn supervised_sampler_step(SupervisedSet set, list<int> train_set, int batch_size, SupervisedSampler state) → SupervisedStep ∪ none ⇥ DataError {
+    if state.corpus ≢ supervised_indices_identity(train_set) or batch_size ≤ 0 or train_set.length() ≡ 0 then return null
+    mut int epoch ← state.epoch
+    mut int position ← state.position
+    if position ≥ train_set.length() {
+        epoch ← epoch + 1
+        position ← 0
+    }
+    mut random.Seed seed ← random.default()
+    do { seed ← random.construct_seed(state.seed + epoch) }
+    catch err { return null }
+    let Shuffled shuffled ← epoch_order(train_set, seed)
+    mut int stop ← position + batch_size
+    if stop ≻ train_set.length() { stop ← train_set.length() }
+    mut list<int> selected ← empty
+    for range position ‥ stop let i { selected.append(shuffled.payload.get(i) coalesce -1) }
+    let list<Batch> batches ← supervised_batches(set, selected, batch_size)
+    let Batch next_batch ← batches.get(0) coalesce Batch { x = tensor.default(), y = tensor.default() }
+    let SupervisedSampler next_state ← SupervisedSampler { corpus = state.corpus, seed = state.seed, epoch = epoch, position = stop }
+    return SupervisedStep { batch = next_batch, state = next_state }
+}
+
+@ public
+fn supervised_sampler_save(string path, SupervisedSampler state) → bool {
+    do { lm_cursor_write_text(path, supervised_sampler_wire(state)) }
+    catch err { return false }
+    return true
+}
+
+@ public
+fn supervised_sampler_load(string path) → SupervisedSampler ∪ none {
+    mut string wire ← ""
+    do { wire ← lm_cursor_read_text(path) }
+    catch err { return null }
+    return supervised_sampler_parse(wire)
+}
+
+# -------------------------------------------------------------------------
 # Language-model byte vocabulary and stable corpus identity.
 # -------------------------------------------------------------------------
+
 
 @ public
 const int LM_PAD_ID = 256
@@ -153,19 +436,7 @@ fn lm_document_score(list<int> document) → int {
 
 @ public
 fn lm_corpus_identity(list<list<int>> documents) → string {
-    mut string identity ← ""
-    for range 0 ‥ documents.length() let i {
-        let list<int> document ← documents.get(i) coalesce ([] ∷ list<int>)
-        identity ← identity + "d§:"(document.length())
-        for from document at [j] let token {
-            if j ≢ 0 {
-                identity ← identity + ","
-            }
-            identity ← "§§"(identity, token)
-        }
-        identity ← identity + ";"
-    }
-    return identity
+    return data_identity(documents)
 }
 
 # -------------------------------------------------------------------------
@@ -227,17 +498,15 @@ class LmSplit {
 
 @ public
 fn lm_split_documents(list<list<int>> documents, int validation_modulus) → LmSplit ⇥ DataError {
-    require validation_modulus ≥ 2 throw variant InvalidValidationModulus { message = "validation modulus must be at least 2" }
+    mut list<int> scores ← empty
+    for range 0 ‥ documents.length() let i {
+        scores.append(lm_document_score(documents.get(i) coalesce ([] ∷ list<int>)))
+    }
+    let ModulusSplit split ← modulus_split(scores, validation_modulus)
     mut list<list<int>> training ← empty
     mut list<list<int>> validation ← empty
-    for range 0 ‥ documents.length() let i {
-        let list<int> document ← documents.get(i) coalesce ([] ∷ list<int>)
-        if lm_document_score(document) % validation_modulus ≡ 0 {
-            validation.append(document)
-        } else {
-            training.append(document)
-        }
-    }
+    for from split.training_positions let i { training.append(documents.get(i) coalesce ([] ∷ list<int>)) }
+    for from split.held_out_positions let i { validation.append(documents.get(i) coalesce ([] ∷ list<int>)) }
     return LmSplit { training = training, validation = validation }
 }
 
@@ -265,43 +534,20 @@ fn lm_cursor_start(string corpus, string split) → LmCursor {
 
 @ public
 fn lm_cursor_wire(LmCursor cursor) → string {
-    return "lm-cursor-v1#§#§#§#§"(cursor.corpus, cursor.split, cursor.document, cursor.window)
-}
-
-fn lm_cursor_parse_integer(string text) → int ∪ none {
-    if text.length() ≡ 0 then return null
-    mut int start ← 0
-    if text[0 ‥ 1] ≡ "-" {
-        start ← 1
-        if start ≡ text.length() then return null
-    }
-    for range start ‥ text.length() let i {
-        let string c ← text[i ‥ i + 1]
-        if c ≢ "0" and c ≢ "1" and c ≢ "2" and c ≢ "3" and c ≢ "4" and c ≢ "5" and c ≢ "6" and c ≢ "7" and c ≢ "8" and c ≢ "9" {
-            return null
-        }
-    }
-    mut int value ← 0
-    do {
-        value ↤ text
-    }
-    catch err {
-        return null
-    }
-    return value
+    return versioned_wire("lm-cursor-v1", [cursor.corpus, cursor.split, cursor.document ↦ string, cursor.window ↦ string])
 }
 
 @ public
 fn lm_cursor_parse(string wire) → LmCursor ∪ none {
-    let list<string> parts ← wire.split("#")
-    if parts.length() ≢ 5 then return null
-    if parts.get(0) coalesce "" ≢ "lm-cursor-v1" then return null
+    let _ parts_value ← parse_versioned_wire(wire, "lm-cursor-v1", 5)
+    if parts_value is none then return null
+    let list<string> parts ← parts_value coalesce ([] ∷ list<string>)
     let string corpus ← parts.get(1) coalesce ""
     let string split ← parts.get(2) coalesce ""
     let string document_text ← parts.get(3) coalesce ""
     let string window_text ← parts.get(4) coalesce ""
-    let _ parsed_document ← lm_cursor_parse_integer(document_text)
-    let _ parsed_window ← lm_cursor_parse_integer(window_text)
+    let _ parsed_document ← parse_integer(document_text)
+    let _ parsed_window ← parse_integer(window_text)
     if parsed_document is none or parsed_window is none then return null
     let int document ← parsed_document coalesce 0
     let int window ← parsed_window coalesce 0

@@ -1,59 +1,43 @@
-# training-loop-mlp — the PML4-U6 composed training loop
+# training-loop-mlp — seeded MLP training loop
 
-The bounded-convergence workload for the PML4 phase gate
-(`gradus/docs/factory/production-ml-library/pml4-delivery.md` PML4-U6):
-a 4×4 two-layer MLP (linear → GELU → linear → MSE), 100 steps, lr 0.1 —
-the accepted MLP training-proof shape (`examples/training/mlp`, the pinned
-CPU/FMIR oracle).
+The bounded-convergence workload is a 4×4 two-layer MLP (linear → GELU →
+linear → MSE), trained for 100 steps at lr 0.1 from three fixed seeds (1, 7,
+42). All trainable tensors come from `random.initialize_fan_uniform`; no
+weights are literal constants. The executable prints the per-seed
+final/initial ratio and convergence-gate result.
 
-**Tier**: executed (FMIR stepper). Oracle pins below match `src/train.proba`
-(PML4-U6). The 100-step loop runs through the generic list-driven optimizer
-step (`optimize.sgd_step`) over the 4×4 fixture; printed losses match the pins
-(final `0.017928625511508454`).
+**Tier**: executed (MIR interpreter). The shared typed forward, optimizer,
+metrics, and checkpoint round-trip remain visible in each run.
 
-## What the loop composes (the U6 residual from PML4-U5)
+## Convergence and trajectory
+
+The gate is `final/initial < 0.1`. Measured f32 losses at steps 0, 10, 25,
+50, 75, and 99 are pinned below; final ratios are printed by the executable.
+All three seeds pass.
+
+| Seed | Step 0 | Step 10 | Step 25 | Step 50 | Step 75 | Step 99 | Final/initial |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1.1323851 | 0.5709054 | 0.27122456 | 0.070147224 | 0.0129020875 | 0.0037757207 | 0.0033343078 |
+| 7 | 1.017981 | 0.6513029 | 0.3317264 | 0.12416615 | 0.05316765 | 0.026682222 | 0.02539877 |
+| 42 | 1.1955258 | 0.68769 | 0.37669003 | 0.08676115 | 0.015014685 | 0.0030090334 | 0.002359472 |
+
+The former single-seed oracle pins were step 0 `1.576448169383708`, step 10
+`0.7815377070077427`, step 25 `0.4303461875641296`, step 50
+`0.13848813116166797`, step 75 `0.04746405569680761`, and step 99
+`0.017928625511508454` (ratio `0.01137`). They are replaced by the seeded
+trajectory table above. `src/mlp.proba` pins the seed-1 gate and descending
+trajectory at steps 0/10/50/75.
+
+## Composed training path
 
 | Step | Surface |
 | --- | --- |
-| Schedule → optimizer-state binding | `schedule.scheduled_rate` feeds `optimize.construct`'s `rate` each step — the accepted constant lr 0.1 is the schedule `Schedule(0.1, 0, 1, 0.1)` (vertex == end) |
-| Shared-layer training path | `mlp.forward_mlp_loss` (loss) + the compiler-generated companion `forward_mlp_loss_backward` (gradients) |
-| Per-parameter gradients | `gradient.construct` records (U2): identity + generation = the parameter version at the backward |
-| Optimizer steps | Tensor SGD: `optimize.sgd_step` generic list form over the 4×4 fixture. Parameter/checkpoint: `optimize.step` (U3) fresh-gradient rules, fail-closed; `parameter.mutate` bumps version |
-| Per-step metric log | `metrics.metric` (U5): `loss` = the loss (the accepted trajectory); `accuracy` = the documented regression-match rate (`|pred − target| ≤ 0.1` over the 16 output elements, read from the bare shared forward `mlp.forward_mlp`) |
-| Checkpoint in/out | `train.construct_checkpoint` (U5): whole-optimizer state wire (U3 `serialize`) + RNG state + epoch/step; `serialize_checkpoint` → `deserialize_checkpoint` is the resume round-trip (`checkpoint_equal`) |
+| Schedule → optimizer-state binding | `schedule.scheduled_rate` feeds the constant lr 0.1 into optimizer state each step |
+| Shared-layer training path | `mlp.forward_mlp_loss` + generated `forward_mlp_loss_backward` |
+| Forward agreement | The typed shared `mlp.forward_mlp` is checked against the training loss each step |
+| Per-parameter gradients | `gradient.construct` records identity and generation |
+| Optimizer steps | `optimize.sgd_step` updates tensors; `optimize.step` tracks parameter/checkpoint state |
+| Per-step metric log | `metrics.metric` records loss and regression-match rate |
+| Checkpoint in/out | Optimizer state and RNG state survive the checkpoint wire round-trip |
 
-## Convergence target (accepted oracle, f64 evaluations)
-
-Pinned in `src/train.proba` (PML4-U6). The proba asserts the gate
-`final/initial < 0.1` and the trajectory points below (step 25 is part of
-the documented target series; the proba binds l0/l10/l50/l75/l99 for the
-ratio checks):
-
-| Step | Loss |
-| --- | --- |
-| 0 | 1.576448169383708 |
-| 10 | 0.7815377070077427 |
-| 25 | 0.4303461875641296 |
-| 50 | 0.13848813116166797 |
-| 75 | 0.04746405569680761 |
-| 99 | 0.017928625511508454 |
-
-Convergence ratio `final/initial = 0.01137 < 0.1` (the accepted gate).
-
-## Execution record (train-step-optimizer-call unit 4)
-
-The library-backed composition **executes** on the FMIR stepper.
-Library-to-library calls resolve (radix `43c0102ba`). The tensor SGD
-update is `optimize.sgd_step` in generic list form over the 4×4 fixture. Printed
-per-step losses match the pins above (final `0.017928625511508454`);
-values did not move vs the pre-delegation oracle.
-
-Run: `faber run src/main.fab` from this package (or
-`faber run gradus/exempla/training-loop-mlp/src/main.fab` from the
-container), with `FABER_LIBRARY_HOME` pointing at `faberlang/`.
-
-## Related
-
-- Seam consumers: `exempla/gradient-seam/`, `exempla/gradient-seam-nolib/`
-- Token generation: `exempla/token-generation/`
-- Diagnostics: `docs/diagnostics.md`
+Run with `faber run --library-home "$LIBHOME" exempla/training-loop-mlp`.

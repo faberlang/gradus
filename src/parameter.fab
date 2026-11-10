@@ -30,14 +30,22 @@ locale = "en"
 #                parameters never mutate, so their version never bumps.
 #   owner  — owner path (e.g. "model.block0.linear.weight").
 #
-# Mutation rules:
-#   * mutation replaces VALUES only — the identity's shape and dtype are
-#     pinned by construction; mutate takes the flat value list (the tensor's
-#     movable form) and rebuilds the value against the pinned identity;
-#   * mutating a frozen parameter fails closed (FrozenMutation);
-#   * a successful mutation bumps version by 1;
-#   * value-domain enforcement of the flat data is the dtype cast
-#     contract (U2) — this module checks count/shape, not value ranges.
+# Mutation rules / public payload-path audit:
+#   * mutate(p, data, expected_version) changes values only; it rejects stale
+#     versions (StaleVersion) and frozen parameters (FrozenMutation).
+#   * Registry.replace(owner, name, payload, expected_version) resolves the
+#     registered slot (including aliases), rejects stale versions, then calls
+#     guarded mutate; frozen parameters are rejected by mutate.
+#   * add registers an existing payload, rejecting duplicate (owner,name); it
+#     does not change payload bytes.
+#   * tie removes an independent slot and redirects its path; it checks distinct
+#     registered identities and matching dtype, shape, and trainability, but
+#     does not change payload bytes. These are all public payload-related paths.
+#   Every successful mutation bumps version; frozen parameters never mutate.
+#   Registry-over-record evidence in parameter.proba establishes ownership:
+#   registry slots own authoritative Parameter/payload values keyed by record
+#   field paths; typed model records are construction/read views. Linear and
+#   nested two-layer models retrieve fields in repeatable registry order.
 #
 # Traversal:
 #   * status: Trainable (trainable) | Frozen (frozen);
@@ -123,6 +131,7 @@ union ParameterError {
     FrozenMutation,
     DuplicateName,
     UnknownName,
+    IncompatibleTie,
     InvalidVersion,
     StaleVersion,
     BadWire,
@@ -303,24 +312,82 @@ fn construct_frozen(string name, string owner, string dtype_name, list<int> shap
     return assemble(name, owner, dtype_name, shape, data, variant Frozen)
 }
 
-# -------------------------------------------------------------------------
-# Mutation rules.
+# Mutation rules:
 #   * values only — shape and dtype are pinned by identity;
 #   * frozen parameters reject mutation (FrozenMutation);
+#   * every payload-changing API is audited here: mutate(p, data,
+#     expected_version) rejects frozen parameters and stale versions;
+#     Registry.replace(owner, name, payload, expected_version) resolves ties,
+#     checks the current version, then delegates to mutate;
+#     add only registers an existing payload and does not change it;
+#     tie removes an independent slot and redirects lookup, without changing
+#     either payload. No other public API changes payload bytes.
 #   * a successful mutation bumps version by 1.
+#
+# Registry over records: parameter.proba registers linear and nested two-layer
+# record fields under their full field-path owners, then retrieves all fields
+# in deterministic registry order on repeated runs. Evidence from that example
+# establishes ownership: the registry owns immutable Parameter/payload values
+# and record-typed models are typed views/inputs; registry slots keyed by field
+# paths are the authoritative update identities (records are not mutated).
 # -------------------------------------------------------------------------
 
 @ public
-fn mutate(Parameter p, list<f32> data) → Parameter ⇥ ParameterError {
+fn mutate(Parameter p, list<f32> data, int expected_version) → Parameter ⇥ ParameterError {
+    reject p.version() ≢ expected_version throw variant StaleVersion { message = "stale parameter version" }
     reject status_is_frozen(p.status) throw variant FrozenMutation { message = "frozen parameter cannot be mutated" }
     let tensor.NumericBlock out ← tensor.construct_f32(data, p.shape())
     return Parameter { identity = Identity { name = p.name(), dtype = p.identity.dtype, shape = p.shape(), version = p.version() + 1, owner = p.owner() }, status = p.status, payload = out }
 }
 
 # -------------------------------------------------------------------------
+# Registry helpers. Alias rows are kept flat and always point at a live
+# canonical slot, so lookup and retargeting never follow chains.
+# -------------------------------------------------------------------------
+
+fn alias_matches(list<string> alias, string owner, string name) → bool {
+    return (alias.get(0) coalesce "") ≡ owner and (alias.get(1) coalesce "") ≡ name
+}
+
+fn find_alias_target(list<Parameter> parameters, list<string> alias) → Parameter ⇥ ParameterError {
+    let string target_owner ← alias.get(2) coalesce ""
+    let string target_name ← alias.get(3) coalesce ""
+    for from parameters let p {
+        if p.owner() ≡ target_owner and p.name() ≡ target_name then return p
+    }
+    throw variant UnknownName { message = "no parameter with that identity" }
+}
+
+fn tie_compatible(Parameter canonical, Parameter aliased) → bool {
+    return canonical.dtype_name() ≡ aliased.dtype_name() and canonical.shape() ≡ aliased.shape() and status_is_frozen(canonical.status) ≡ status_is_frozen(aliased.status)
+}
+
+fn parameters_without(list<Parameter> parameters, Parameter excluded) → list<Parameter> {
+    mut list<Parameter> next ← empty
+    for from parameters let p {
+        if p.owner() ≢ excluded.owner() or p.name() ≢ excluded.name() {
+            next.append(p)
+        }
+    }
+    return next
+}
+
+fn retarget_ties(list<list<string>> ties, Parameter old_target, Parameter new_target) → list<list<string>> {
+    mut list<list<string>> next ← empty
+    for from ties let alias {
+        if (alias.get(2) coalesce "") ≡ old_target.owner() and (alias.get(3) coalesce "") ≡ old_target.name() {
+            next.append([(alias.get(0) coalesce ""), (alias.get(1) coalesce ""), new_target.owner(), new_target.name()] ↦ list<string>)
+        } else {
+            next.append(alias)
+        }
+    }
+    return next
+}
+
+# -------------------------------------------------------------------------
 # Registrum — parameter collection. Enforces (owner, name) uniqueness
 # and owns the traversal order contract: trainable first, then frozen,
-# insertion order within each class.
+# insertion order within each class. Ties are aliases, never extra slots.
 # -------------------------------------------------------------------------
 
 
@@ -328,24 +395,33 @@ fn mutate(Parameter p, list<f32> data) → Parameter ⇥ ParameterError {
 @ public
 class Registry {
     mut list<Parameter> parameters
+    # Each tie row is [alias owner, alias name, canonical owner, canonical name].
+    let list<list<string>> ties
 
     # Parameter count.
     fn count() → int {
         return self.parameters.length()
     }
 
-    # Identity membership by (owner, name).
+    # Identity membership by (owner, name), including tied aliases.
     fn contains(string owner, string name) → bool {
         for from self.parameters let p {
             if p.owner() ≡ owner and p.name() ≡ name then return true
         }
+        for from self.ties let alias {
+            if alias_matches(alias, owner, name) then return true
+        }
         return false
     }
 
-    # Identity resolution by (owner, name) — fail closed on a miss.
+    # Identity resolution by (owner, name) — a tied alias resolves to its
+    # canonical parameter identity; fail closed on a miss.
     fn find(string owner, string name) → Parameter ⇥ ParameterError {
         for from self.parameters let p {
             if p.owner() ≡ owner and p.name() ≡ name then return p
+        }
+        for from self.ties let alias {
+            if alias_matches(alias, owner, name) then return find_alias_target(self.parameters, alias)
         }
         throw variant UnknownName { message = "no parameter with that identity" }
     }
@@ -382,19 +458,37 @@ class Registry {
         return out
     }
 
+    # Tie a registered independent slot to a canonical parameter. The second
+    # path becomes an alias; its old payload is discarded. A tie is one
+    # update identity, so shape, dtype, and trainability must agree.
+    fn tie(string owner, string name, string alias_owner, string alias_name) → Registry ⇥ ParameterError {
+        let Parameter canonical ← self.find(owner, name)
+        let Parameter aliased ← self.find(alias_owner, alias_name)
+        reject canonical.owner() ≡ aliased.owner() and canonical.name() ≡ aliased.name() throw variant IncompatibleTie { message = "cannot tie a parameter to itself" }
+        reject aliased.owner() ≢ alias_owner or aliased.name() ≢ alias_name throw variant IncompatibleTie { message = "tie alias must name an independent registered parameter" }
+        require tie_compatible(canonical, aliased) throw variant IncompatibleTie { message = "tied parameters must match in dtype, shape, and trainability" }
+
+        let list<Parameter> next_parameters ← parameters_without(self.parameters, aliased)
+        mut list<list<string>> next_ties ← retarget_ties(self.ties, aliased, canonical)
+        next_ties.append([alias_owner, alias_name, canonical.owner(), canonical.name()] ↦ list<string>)
+        return Registry { parameters = next_parameters, ties = next_ties }
+    }
+
     # Replace a registered payload only when the caller's observed version
-    # is current. A successful replacement increments that parameter's
-    # version; frozen parameters and stale updates fail closed.
+    # is current. A tied alias and its canonical path address the same slot.
+    # A successful replacement increments that parameter's version;
+    # frozen parameters and stale updates fail closed.
     fn replace(string owner, string name, list<f32> payload, int expected_version) → Registry ⇥ ParameterError {
         let Parameter current ← self.find(owner, name)
         reject current.version() ≢ expected_version throw variant StaleVersion { message = "stale parameter version" }
-        let Parameter updated ← mutate(current, payload)
+        let Parameter updated ← mutate(current, payload, current.version())
+        let list<list<string>> next_ties ← copy self.ties
         mut list<Parameter> next ← copy self.parameters
         for range 0 ‥ next.length() let i {
             let Parameter candidate ← next.get(i) coalesce default()
-            if candidate.owner() ≡ owner and candidate.name() ≡ name {
+            if candidate.owner() ≡ current.owner() and candidate.name() ≡ current.name() {
                 next[i] ← updated
-                return Registry { parameters = next }
+                return Registry { parameters = next, ties = next_ties }
             }
         }
         throw variant UnknownName { message = "no parameter with that identity" }
@@ -404,7 +498,7 @@ class Registry {
 # Empty registry.
 @ public
 fn empty_registry() → Registry {
-    return Registry { parameters = empty }
+    return Registry { parameters = empty, ties = empty }
 }
 
 # Register a parameter. Rejects a duplicate (owner, name) identity
@@ -414,7 +508,8 @@ fn add(Registry r, Parameter p) → Registry ⇥ ParameterError {
     reject r.contains(p.owner(), p.name()) throw variant DuplicateName { message = "parameter identity already registered" }
     mut list<Parameter> next ← copy r.parameters
     next.append(p)
-    return Registry { parameters = next }
+    let list<list<string>> next_ties ← copy r.ties
+    return Registry { parameters = next, ties = next_ties }
 }
 
 # -------------------------------------------------------------------------

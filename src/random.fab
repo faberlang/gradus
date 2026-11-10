@@ -1,0 +1,179 @@
++++
+locale = "en"
++++
+# Deterministic random-number generation for Gradus.
+#
+# Public import: import from "gradus:random" random
+# This leaf owns the seed state, xorshift64 draws, and its versioned wire.
+# It has no Gradus dependencies, so data, decoding, sampling, and generation
+# can share one explicit RNG without depending on training controls.
+
+import from "gradus:tensor" tensor
+
+# RandomError — failures owned by seed construction and wire decoding.
+@ public
+union RandomError {
+    @ shared
+    string message
+
+    InvalidSeed,
+    InvalidInitializerShape,
+    BadWire,
+    UnknownVersion,
+    TensorFailure {
+        tensor.TensorError inner
+    }
+}
+
+@ conversion
+fn from_tensor_error(tensor.TensorError err) → RandomError {
+    return variant TensorFailure { message = err.message, inner = err }
+}
+
+const string schema_version = "1.0.0"
+
+# Seed the xorshift64 generator. Zero is rejected because it is a fixed point.
+@ public
+class Seed {
+    mut int status
+}
+
+@ public
+fn construct_seed(int seed) → Seed ⇥ RandomError {
+    require seed ≢ 0 throw variant InvalidSeed { message = "seed must be non-zero" }
+    return Seed { status = seed }
+}
+
+# Placeholder Default for `var Seed` bindings. It is not a valid seed and
+# must be overwritten before drawing.
+@ public
+fn default() → Seed {
+    return Seed { status = 0 }
+}
+
+@ public
+class Draw {
+    mut int payload
+    mut Seed seed
+}
+
+# xorshift64 step: x ^= x<<13; x ^= x>>7; x ^= x<<17. The wrapping ring
+# preserves the 64-bit state without multiplication or overflow concerns.
+@ public
+fn next(Seed s) → Draw {
+    mut wrapping<i64> x ← s.status ↦ wrapping<i64>
+    x ← x ⊻ x ⇐ 13
+    x ← x ⊻ x ⇒ 7
+    x ← x ⊻ x ⇐ 17
+    let int state ← x ↦ int
+    return Draw { payload = state, seed = Seed { status = state } }
+}
+
+# Sign-bit mask: the [0,1) draw uses only the low 63 bits.
+const int MASK_63 = 9223372036854775807
+const f32 POW2_52 = 4503599627370496.0 ∷ f32
+
+@ public
+class DrawF32 {
+    mut f32 payload
+    mut Seed seed
+}
+
+# Map the top 52 bits of the sign-masked state into [0, 1).
+@ public
+fn next_f32(Seed s) → DrawF32 {
+    let Draw f ← next(s)
+    let f32 v ← (((f.payload ∧ MASK_63) ⇒ 11) ↦ f32) / POW2_52
+    return DrawF32 { payload = v, seed = f.seed }
+}
+
+fn initializer_substream(Seed seed, int entry) → Seed {
+    mut Seed substate ← Seed { status = seed.status ⊻ (entry + 1) }
+    if substate.status ≡ 0 {
+        substate.status ← 1
+    }
+    let Draw mix1 ← next(substate)
+    let Draw mix2 ← next(mix1.seed)
+    let Draw mix3 ← next(mix2.seed)
+    return mix3.seed
+}
+
+# Fan-in/fan-out initializer for an ordered parameter record. Shapes and bias
+# flags are supplied in deterministic record-label order. Each rank-2
+# [fan_in, fan_out] weight uses a private substream: copy the input state,
+# XOR with the one-based entry index (using 1 if that is zero), then apply
+# three xorshift steps. Entries draw independently from that substream in
+# element order, uniformly within ±sqrt(6/(fan_in+fan_out)). Biases are
+# zero-filled and consume no draws. The returned Seed is the input state
+# advanced once per entry, independent of shapes and bias flags.
+@ public
+class Initialized {
+    mut list<tensor.NumericBlock> tensors
+    mut Seed seed
+}
+
+@ public
+fn initialize_fan_uniform(list<list<int>> shapes, list<bool> biases, Seed seed) → Initialized ⇥ RandomError {
+    require shapes.length() ≡ biases.length() throw variant InvalidInitializerShape { message = "shape and bias lists must have equal length" }
+    mut list<tensor.NumericBlock> values ← empty
+    mut Seed final_state ← copy seed
+    mut int entry ← 0
+    for from shapes let dims {
+        let bool bias ← biases.get(entry) coalesce false
+        require dims.length() ≥ 1 throw variant InvalidInitializerShape { message = "initializer shape must have at least one dimension" }
+        mut int count ← 1
+        for from dims let dim {
+            require dim ≻ 0 throw variant InvalidInitializerShape { message = "initializer dimensions must be positive" }
+            count ← count * dim
+        }
+        mut list<f32> data ← empty
+        if bias {
+            for range 0‥count let _ {
+                data.append(0.0)
+            }
+        }
+        else {
+            require dims.length() ≡ 2 throw variant InvalidInitializerShape { message = "weight shapes must be rank two" }
+            let int fan_in ← dims.get(0) coalesce 0
+            let int fan_out ← dims.get(1) coalesce 0
+            let f32 bound ← (6.0 / ((fan_in + fan_out) ↦ f32)).power(0.5)
+            mut Seed state ← copy initializer_substream(seed, entry)
+            for range 0‥count let _ {
+                let DrawF32 draw ← next_f32(state)
+                state ← draw.seed
+                data.append((2.0 * draw.payload - 1.0) * bound)
+            }
+        }
+        let tensor.NumericBlock value ← tensor.construct(data, dims)
+        values.append(value)
+        let Draw advanced ← next(final_state)
+        final_state ← advanced.seed
+        entry ← entry + 1
+    }
+    return Initialized { tensors = values, seed = final_state }
+}
+
+# The RNG wire remains byte-for-byte compatible with the former train surface.
+@ public
+fn serialize_seed(Seed s) → string {
+    return "train/rng/§/§"(schema_version, s.status ↦ string)
+}
+
+@ public
+fn deserialize_seed(string wire) → Seed ⇥ RandomError {
+    let list<string> parts ← wire.split("/")
+    require parts.length() ≡ 4 throw variant BadWire { message = "malformed rng wire" }
+    require parts.get(0) coalesce "" ≡ "train" throw variant BadWire { message = "unknown rng marker" }
+    require parts.get(1) coalesce "" ≡ "rng" throw variant BadWire { message = "unknown rng marker" }
+    require parts.get(2) coalesce "" ≡ schema_version throw variant UnknownVersion { message = "unknown rng schema version" }
+    let string status_text ← parts.get(3) coalesce ""
+    require status_text.length() ≢ 0 throw variant BadWire { message = "malformed rng state" }
+    mut int status ← 0
+    do {
+        status ↤ status_text
+    }
+    catch err {
+        throw variant BadWire { message = "malformed rng state" }
+    }
+    return construct_seed(status)
+}

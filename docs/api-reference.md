@@ -334,7 +334,7 @@ One-token decode, prefill, explicit sessions, cancellation, replica-loop mechani
 - `fn fresh_cancellation() → Cancellation`
 - `fn cancellation_cancelled() → Cancellation`
 - `fn observe_cancellation(Cancellation c) → Cancellation ⇥ DecodeError`
-- `fn replay(list<list<f32>> logit_rows, sampling.Config c, list<int> history, train.Seed seed, Cancellation cancellation) → list<int> ⇥ DecodeError`
+- `fn replay(list<list<f32>> logit_rows, sampling.Config c, list<int> history, random.Seed seed, Cancellation cancellation) → list<int> ⇥ DecodeError`
 
 ## gradus:dtype
 
@@ -416,7 +416,7 @@ Generation configuration, sampling projection, serialized config, cursor limits,
 - `fn support_flags() → list<string>`
 - `fn admitted_features(string name) → bool`
 - `fn config(GenerationConfig g) → sampling.Config ⇥ GenerationError`
-- `fn seed(GenerationConfig g) → train.Seed ⇥ GenerationError`
+- `fn seed(GenerationConfig g) → random.Seed ⇥ GenerationError`
 - `fn serialize_generation(GenerationConfig g) → string`
 - `fn deserialize_generation(string wire) → GenerationConfig ⇥ GenerationError`
 - `fn fresh_cursor(GenerationConfig g) → GenerationCursor ⇥ GenerationError`
@@ -555,8 +555,9 @@ Classification accuracy and validated loss/accuracy metric records.
 
 ## gradus:mlp
 
-Two-layer MLP: decoded-carrier `forward_mlp` over the nn carrier and the
-annotated training-path companion `forward_mlp_loss`.
+Two-layer MLP and linear model: typed shared `forward_mlp` and `forward_linear`,
+the runtime-shape decoded-carrier inference path `forward_mlp_carrier`, and
+annotated training-path loss companions composed from the same layer rows.
 
 **Source**: `src/mlp.fab`
 
@@ -567,9 +568,21 @@ annotated training-path companion `forward_mlp_loss`.
 ### Public functions
 
 - `fn message(GradusError e) → string`
-- `fn forward_mlp(tensor.NumericBlock x, tensor.NumericBlock w1, tensor.NumericBlock b1, tensor.NumericBlock w2, tensor.NumericBlock b2) → tensor.NumericBlock ⇥ GradusError`
+- `fn forward_mlp_carrier(tensor.NumericBlock x, tensor.NumericBlock w1, tensor.NumericBlock b1, tensor.NumericBlock w2, tensor.NumericBlock b2) → tensor.NumericBlock ⇥ GradusError`
+- `fn layer_linear<size M, size K, size N>(tensor<f32, [M, K]> x, tensor<f32, [K, N]> w, tensor<f32, [M, N]> b) → tensor<f32, [M, N]>`
+- `fn layer_linear_channel<size M, size K, size N>(tensor<f32, [M, K]> x, tensor<f32, [K, N]> w, tensor<f32, [N]> b) → tensor<f32, [M, N]>`
+- `fn layer_gelu<size M, size N>(tensor<f32, [M, N]> x) → tensor<f32, [M, N]>`
+- `fn forward_mlp<size M, size K, size H, size N>(tensor<f32, [M, K]> input, tensor<f32, [K, H]> weight1, tensor<f32, [M, H]> bias1, tensor<f32, [H, N]> weight2, tensor<f32, [M, N]> bias2) → tensor<f32, [M, N]>` — same-shape biases
+- `fn forward_linear<size M, size K, size N>(tensor<f32, [M, K]> x, tensor<f32, [K, N]> w, tensor<f32, [N]> b) → tensor<f32, [M, N]>` — per-channel bias
 - `fn nil() → void`
-- `fn forward_mlp_loss(tensor<f32, [4, 4]> input, tensor<f32, [4, 4]> weight1, tensor<f32, [4, 4]> bias1, tensor<f32, [4, 4]> weight2, tensor<f32, [4, 4]> bias2, tensor<f32, [4, 4]> target) → f32`
+- `fn forward_mlp_loss<size M, size K, size H, size N>(tensor<f32, [M, K]> input, tensor<f32, [K, H]> weight1, tensor<f32, [M, H]> bias1, tensor<f32, [H, N]> weight2, tensor<f32, [M, N]> bias2, tensor<f32, [M, N]> target) → f32` — companion ABI: `forward_mlp_loss_backward(input, weight1, bias1, weight2, bias2, target, nil(), upstream) → iuncta(grad_input, grad_w1, grad_b1, grad_w2, grad_b2, grad_target)`
+- `fn forward_linear_loss<size M, size K, size N>(tensor<f32, [M, K]> input, tensor<f32, [K, N]> weight, tensor<f32, [N]> bias, tensor<f32, [M, N]> target) → f32` — companion ABI: `forward_linear_loss_backward(input, weight, bias, target, nil(), upstream) → iuncta(grad_input, grad_weight, grad_bias, grad_target)`
+
+### Typed backward contract and evidence status
+
+Differentiation is supported for `@ radix { lane = "air" }` typed F32 tensor rows and `@ radix backward` on a same-package typed scalar loss that composes those rows. The admitted path exercised here is MatMul, Add, AddedBias, GELU, Sub, Hadamard Mul, and Mean. Cross-package use of an annotated layer in that reverse-mode call graph is refused with SEM004 (`namespace_missing_export`); other operations outside the admitted differentiable set are rejected by reverse-mode validation. The generated companion's positional `iuncta` tuple ABI is interim until record-shaped backward lands.
+
+Typed inference `forward_mlp` and annotated `forward_mlp_loss` compose the same typed layer rows. `src/mlp.proba` checks a rectangular explicit layer composition against `forward_mlp`, and its MSE against `forward_mlp_loss`; it has corresponding `forward_linear`/`forward_linear_loss` checks. The `linear-channel-train` and `mlp-rect-train` packages exercise the generated companions and check inference/loss agreement after training. A one-line proba call to `forward_linear_loss_backward` is blocked by `faber test` with `faberscript unsupported: provider package:gradus:mlp::mlp::forward_linear_loss_backward`, so proba provides no companion or finite-difference gradient check. These runs establish only their tested shapes and fixed workloads, not arbitrary-shape/backend identity or general numerical bounds.
 
 ## gradus:model/artifact
 
@@ -991,17 +1004,29 @@ decoded F32 values are produced only by materialization.
 
 ## gradus:nn
 
-Differentiable tensor primitives: linear, GELU, LayerNorm, RMSNorm, SiLU, and SwiGLU.
+Differentiable tensor primitives plus explicit train/eval mode and dropout: linear, GELU, LayerNorm, RMSNorm, SiLU, and SwiGLU.
 
 **Source**: `src/nn.fab`
 
 ### Public types
 
-- `union NnError` — NegativeDimension, DimensionAboveLimit, ProductAboveLimit, GradusMismatch, ShapeMismatch, Incompatible, DtypeMismatch, ElementMismatch, InvalidEpsilon
+- `union NnError` — NegativeDimension, DimensionAboveLimit, ProductAboveLimit, GradusMismatch, ShapeMismatch, Incompatible, DtypeMismatch, ElementMismatch, InvalidEpsilon, IndexOutOfBounds, UnknownMode, InvalidDropout, TensorFailure
+- `union Mode` — Discipline, Estimate
+- `class Dropout`
+  - fields: tensor.NumericBlock payload, random.Seed seed
+  - methods:
+    - `fn payload() → tensor.NumericBlock`
+    - `fn seed() → random.Seed`
 
 ### Public functions
 
 - `fn message(NnError e) → string`
+- `fn mode_name(Mode m) → string`
+- `fn is_discipline(Mode m) → bool`
+- `fn is_estimate(Mode m) → bool`
+- `fn mode(string name) → Mode ⇥ NnError`
+- `fn dropout_probability(Mode m, f32 rate) → f32 ⇥ NnError`
+- `fn dropout(tensor.NumericBlock x, random.Seed s, Mode m, f32 rate) → Dropout ⇥ NnError`
 - `fn linear<size M, size K, size N>(tensor<f32, [M, K]> x, tensor<f32, [K, N]> w, tensor<f32, [M, N]> b) → tensor<f32, [M, N]>`
 - `fn linear_channel<size M, size K, size N>(tensor<f32, [M, K]> x, tensor<f32, [K, N]> w, tensor<f32, [N]> b) → tensor<f32, [M, N]>`
 - `fn gelu<size M, size N>(tensor<f32, [M, N]> x) → tensor<f32, [M, N]>`
@@ -1141,10 +1166,10 @@ Deterministic greedy/filtering/sampling pipeline and sampler configuration.
     - `fn min_p() → f32`
     - `fn repetition_penalty() → f32`
 - `class Sampler`
-  - fields: int token_id, train.Seed seed
+  - fields: int token_id, random.Seed seed
   - methods:
     - `fn token_id() → int`
-    - `fn seed() → train.Seed`
+    - `fn seed() → random.Seed`
 
 ### Public functions
 
@@ -1154,7 +1179,7 @@ Deterministic greedy/filtering/sampling pipeline and sampler configuration.
 - `fn default() → Sampler`
 - `fn max(list<f32> logits) → int ⇥ SamplingError`
 - `fn distribution(list<f32> logits, Config c, list<int> history) → list<f32> ⇥ SamplingError`
-- `fn sample(list<f32> logits, Config c, list<int> history, train.Seed seed) → Sampler ⇥ SamplingError`
+- `fn sample(list<f32> logits, Config c, list<int> history, random.Seed seed) → Sampler ⇥ SamplingError`
 
 ## gradus:serialize
 
@@ -1359,18 +1384,23 @@ Warmup and cosine learning-rate schedules.
 - `fn default_schedule() → Schedule`
 - `fn scheduled_rate(Schedule s, int step) → f32 ⇥ ScheduleError`
 
-## gradus:train
+## gradus:random
 
-Learning-rate schedules live in `gradus:schedule`; this module provides
-train/eval mode, RNG, dropout, and checkpoints. Parameter updates are
-composed from explicit gradients and optimizer state.
+Deterministic xorshift64 seed state, draws, and the versioned RNG wire.
+`initialize_fan_uniform` initializes rank-2 weights in record-label order.
+For entry index i (zero-based), it copies the input Seed, XORs its state with
+i+1 (substituting 1 if zero), applies three xorshift64 steps, then draws that
+entry's elements in tensor order from its private substream. Thus changing an
+entry's shape cannot shift another entry's values. The returned Seed is the
+input Seed advanced once for each entry, independent of all shapes and bias
+flags. Weights are uniform within ±sqrt(6/(fan_in+fan_out)); bias entries
+(rank one or two) are zero-filled and consume no substream draws.
 
-**Source**: `src/train.fab`
+**Source**: `src/random.fab`
 
 ### Public types
 
-- `union TrainError` — UnknownMode, InvalidDropout, InvalidSeed, BadPayload, InvalidPosition, EmptyState, UnknownVersion, BadWire
-- `union Mode` — Discipline, Estimate
+- `union RandomError` — InvalidSeed, BadWire, UnknownVersion
 - `class Seed`
   - fields: int status
   - methods:
@@ -1385,39 +1415,43 @@ composed from explicit gradients and optimizer state.
   - methods:
     - `fn payload() → f32`
     - `fn seed() → Seed`
-- `class Dropout`
-  - fields: tensor.NumericBlock payload, Seed seed
-  - methods:
-    - `fn payload() → tensor.NumericBlock`
-    - `fn seed() → Seed`
+
+### Public functions
+
+- `fn construct_seed(int seed) → Seed ⇥ RandomError`
+- `fn default() → Seed`
+- `fn next(Seed s) → Draw`
+- `fn next_f32(Seed s) → DrawF32`
+- `fn initialize_fan_uniform(list<list<int>> shapes, list<bool> biases, Seed seed) → Initialized ⇥ RandomError` — shape/bias lists follow deterministic record-label order; each weight has a private substream derived from the input state and its one-based entry index by XOR and three xorshift steps. Weight elements draw in tensor order, within ±sqrt(6/(fan_in+fan_out)). Bias entries are zero-filled and consume no draws. The returned Seed advances once per entry, irrespective of shape or bias.
+- `class Initialized` — tensors in input order and final Seed
+- `fn serialize_seed(Seed s) → string`
+- `fn deserialize_seed(string wire) → Seed ⇥ RandomError`
+
+## gradus:checkpoint
+
+Versioned checkpoint envelope with epoch, step, RNG state, and an embedded
+optimizer-state wire carried verbatim.
+
+**Source**: `src/checkpoint.fab`
+
+### Public types
+
+- `union CheckpointError` — InvalidSeed, InvalidPosition, EmptyState, UnknownVersion, BadWire
 - `class Checkpoint`
-  - fields: int age, int step, Seed rng, string state_wire
+  - fields: int age, int step, random.Seed rng, string state_wire
   - methods:
     - `fn age() → int`
     - `fn step() → int`
-    - `fn rng() → Seed`
+    - `fn rng() → random.Seed`
     - `fn state_wire() → string`
 
 ### Public functions
 
-- `fn message(TrainError e) → string`
-- `fn mode_name(Mode m) → string`
-- `fn is_discipline(Mode m) → bool`
-- `fn is_estimate(Mode m) → bool`
-- `fn mode(string name) → Mode ⇥ TrainError`
-- `fn dropout_probability(Mode m, f32 rate) → f32 ⇥ TrainError`
-- `fn construct_seed(int seed) → Seed ⇥ TrainError`
-- `fn default() → Seed`
-- `fn next(Seed s) → Draw`
-- `fn next_f32(Seed s) → DrawF32`
-- `fn dropout(tensor.NumericBlock x, Seed s, Mode m, f32 rate) → Dropout ⇥ TrainError`
-- `fn serialize_seed(Seed s) → string`
-- `fn deserialize_seed(string wire) → Seed ⇥ TrainError`
-- `fn construct_checkpoint(int age, int step, Seed rng, string state_wire) → Checkpoint ⇥ TrainError`
+- `fn construct_checkpoint(int age, int step, random.Seed rng, string state_wire) → Checkpoint ⇥ CheckpointError`
 - `fn default_checkpoint() → Checkpoint`
 - `fn checkpoint_equal(Checkpoint a, Checkpoint b) → bool`
 - `fn serialize_checkpoint(Checkpoint c) → string`
-- `fn deserialize_checkpoint(string wire) → Checkpoint ⇥ TrainError`
+- `fn deserialize_checkpoint(string wire) → Checkpoint ⇥ CheckpointError`
 
 ## gradus:transformer
 
