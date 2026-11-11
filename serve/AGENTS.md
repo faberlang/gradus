@@ -59,13 +59,14 @@ decode launches' run-time tensor shapes.
 
 Inferentia keeps no CPU backend: CPU inference is the same kernels under
 `faber run --device cpu`. Inference never runs on the MIR interpreter:
-`--device reference` is a correctness oracle only, and every timed or served
-run passes `--strict-engine`.
+`--device reference` is a correctness oracle only, and every other run refuses
+an interpreter landing.
 
 Engine rule (operator, 2026-11-05): inference never runs on the MIR
-interpreter. The manifest sets `[run] strict-engine = true`: `live` and `serve`
-run their host half on the Cranelift JIT (radix vivi/main 86298446da or later), and any interpreter fallback refuses with
-exit 69. Never remove the key to get a run; a refusal names the gap to close.
+interpreter. Faber has no interpreter fallback: `live` and `serve` run their host
+half on the Cranelift JIT, and a host half or kernel that would land on the
+interpreter refuses with exit 69 (`ENGINE001`/`ENGINE002`). Only `--device
+reference` runs the interpreter. A refusal names the gap to close.
 
 Token-correctness run (strict through the manifest; about 16 s on an M5 Max, most of it model load):
 

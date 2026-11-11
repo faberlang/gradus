@@ -6,7 +6,7 @@ engine declines the host half of a program that builds a generic class holding
 tensors.
 
 ```text
-faber run exempla/generic-scratch-class-red --library-home <parent> --device metal --strict-engine
+faber run exempla/generic-scratch-class-red --library-home <parent> --device metal
 error[ENGINE001:refused]: ... clif-jit declined the host half of this kernel program: unsupported type
 ```
 

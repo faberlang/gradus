@@ -29,7 +29,7 @@ training run needs one. The library never imports an application. Model code an
 application needs (weight loading, decode loops, sampling) belongs in `src/`, and
 the application passes in any console or file effects, e.g. the `report` sink of
 `gradus:model/smollm2_weights` and `gradus:generation/smollm2_decode`. Inference
-runs only on the Cranelift JIT (`--strict-engine`): check it with `serve`'s `live`
+runs only on the Cranelift JIT, and any interpreter landing refuses the run: check it with `serve`'s `live`
 40-token match against llama.cpp (serve/README.md), never with `faber test`.
 
 GPU architecture follows the canonical public

@@ -64,11 +64,10 @@ MODEL=<dir>/SmolLM2-360M-Instruct-f32.gguf
   the kernel route; the device is the `faber run --device` choice. Inferentia
   has no CPU backend of its own: `--device cpu` runs the same kernels on
   several cores; `--device reference` is a correctness oracle only.
-- Engine: inference never runs on the MIR interpreter. The manifest sets
-  `[run] strict-engine = true`, so `live` and `serve` run their host half on
-  the Cranelift JIT and their kernels on the device, and any fallback to the
-  interpreter refuses the run (exit 69, `ENGINE001`/`ENGINE002`) instead of
-  running slowly. Needs radix vivi/main 86298446da or later.
+- Engine: inference never runs on the MIR interpreter. `live` and `serve` run
+  their host half on the Cranelift JIT and their kernels on the device; Faber
+  has no interpreter fallback, so a host half or kernel that would land there
+  refuses the run (exit 69, `ENGINE001`/`ENGINE002`) instead of running slowly.
 
 Token correctness: the `live` command above must print the same 40 ids as
 llama.cpp (greedy): `30 198 198 788 451 6330 28 260 33197 476 269 18 4271 288

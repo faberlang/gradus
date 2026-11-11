@@ -69,7 +69,7 @@ def run(faber, library_home, device):
     command = [
         faber, "run", str(PACKAGE),
         "--library-home", str(library_home),
-        "--device", device, "--strict-engine",
+        "--device", device,
     ]
     done = subprocess.run(command, capture_output=True, text=True, check=False)
     if done.returncode != 0:
