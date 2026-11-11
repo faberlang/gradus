@@ -12,20 +12,21 @@ import from "gradus:decode_step" ds
 # runs over all T rows at once: the projections are `⇇ ·` matrix products over the
 # stacked weights in [in, out] layout (radix corpus/inference prefill-layer form 1;
 # `transpose_copy` builds them at load from the decode layout), the norms
-# are the language's row operation, and attention takes the decode form widened to
-# T query rows (masked scores, the row softmax, the context sum). The K/V rows of
-# all T positions are written to the caches in one launch, so decoding continues
-# from position `pos0 + T` exactly as if the prompt had been fed token by token.
+# are the language's row operation, and attention is batched `⇇ ·` products over the
+# key/value groups (scores, the masked row softmax, the context). The K/V rows of all
+# T positions are written to the caches in one launch, so decoding continues from
+# position T exactly as if the prompt had been fed token by token. The prompt starts
+# at position 0.
 #
 # Shapes (D hidden, QD query width, KVD key/value width, F ffn width, H query heads,
-# C cache rows, T prompt rows, HT = H * T, R = QD + 2 * KVD, G = 2 * F). The weights
-# are those of `layer_wide` transposed to [in, out]: wqkvt [D, R] (q, k, v stacked),
-# wot [QD, D], wgut [D, G] (gate and up stacked), wdt [F, D]. (A product through a
-# `.transpose()` view of the decode layout would need no copies, but it is
-# materialized per call on Metal today, and read back wrong in some programs.)
+# C cache rows, T prompt rows, HT = H * T, R = QD + 2 * KVD, G = 2 * F, KG key/value
+# groups, RQ = (H / KG) * T, DH head width). The weights are those of `layer_wide`
+# transposed to [in, out]: wqkvt [D, R] (q, k, v stacked), wot [QD, D], wgut [D, G]
+# (gate and up stacked), wdt [F, D].
 # Scratch (the caller allocates each once per prompt):
-#   xn [T, D]   qkvr [T, R]   qkv [T, R]   sc [HT, C]
-#   pr [HT, C]   ctx [T, QD]   ao [T, D]   h1 [T, D]   gu [T, G]   act [T, F]   dn [T, D]
+#   xn [T, D]   qkvr [T, R]   qkv [T, R]   qg [KG, RQ, DH]   kt [KG, DH, T]   vg [KG, T, DH]
+#   s3 [KG, RQ, T]   sc [HT, T]   pr [HT, T]   cg [KG, RQ, DH]   ctx [T, QD]   ao [T, D]
+#   h1 [T, D]   gu [T, G]   act [T, F]   dn [T, D]
 
 # ---------------------------------------------------------------------------
 # Kernels
@@ -134,46 +135,100 @@ fn kv_write_rows<size T, size C, size K, size R>(tensor<f32, [T, R]> rkqkv, mut 
     }
 }
 
-# GQA scores of every (head, prompt row) against the cache, causally masked:
-# rssc[h * T + t, c] = (q[t, h * dh + :] . kc[c, (h / group) * dh + :]) * rsscale for
-# c <= rspos + t, and -3.0e38 past it, so `decode_step.row_softmax` gives those 0.
-@ kernel relaxed
+# Attention over the prompt as batched `⇇ ·` products (the prompt starts at position
+# 0, so a query row attends to the prompt rows at or before it and to nothing else).
+# The KG key/value groups are the batch; a group's `group` query heads are stacked as
+# RQ = group * T rows, row hh * T + t being head KG-group * group + hh at query t:
+#
+#   qg [KG, RQ, DH]   kt [KG, DH, T]   vg [KG, T, DH]
+#   s  = qg · kt      [KG, RQ, T]      (scores)
+#   sc = mask(s)      [HT, T]          (scaled; -3.0e38 past the query's own position)
+#   pr = softmax(sc)  [HT, T]          (the row softmax is rank 2: a batched softmax with
+#                                       run-time sizes has no device plan yet)
+#   s  = unflat(pr)   [KG, RQ, T]
+#   cg = s · vg       [KG, RQ, DH]     (context), merged back to ctx [T, QD]
+
+# Query heads grouped by key/value group: hqg[g, hh * T + t, d] = hqkv[t, (g * group + hh) * dh + d].
+@ kernel
 @ public
-fn scores_rows<size T, size HT, size C, size R, size KVD>(tensor<f32, [T, R]> rsqkv, tensor<f32, [C, KVD]> rskc, mut tensor<f32, [HT, C]> rssc, i32 rsrows, i32 rspos, i32 rsdh, i32 rsgroup, f32 rsscale) → void {
-    for from rssc at [r, c] thread lane let e {
-        mut f32 score ← -3.0e38
-        if rsrows ≥ 1 and rsrows ≤ 1000000 and rsgroup ≻ 0 and rsdh ≥ 1 and rsdh ≤ 960 and rspos ≥ 0 and rspos ≤ 1000000 {
-            let i32 h ← r / rsrows
-            let i32 t ← r % rsrows
-            if c ≤ rspos + t {
-                let i32 base ← (h / rsgroup) * rsdh
-                mut f32 acc ← 0.0
-                for range 0 ‥ rsdh let k {
-                    acc ← acc + rsqkv[[t, h * rsdh + k]] * rskc[[c, base + k]]
-                }
-                score ← acc * rsscale
-            }
+fn q_heads<size T, size R, size KG, size RQ, size DH>(tensor<f32, [T, R]> hqkv, mut tensor<f32, [KG, RQ, DH]> hqg, i32 hqrows, i32 hqgroup, i32 hqdh) → void {
+    for from hqg at [g, r, d] thread lane let old {
+        if hqrows ≥ 1 and hqrows ≤ 1000000 and hqgroup ≥ 1 and hqgroup ≤ 64 and hqdh ≥ 1 and hqdh ≤ 960 {
+            let i32 hh ← r / hqrows
+            let i32 t ← r % hqrows
+            hqg[[g, r, d]] ← hqkv[[t, (g * hqgroup + hh) * hqdh + d]]
         }
-        rssc[[r, c]] ← score
     }
 }
 
-# Attention context of every prompt row: rcctx[t, j] = sum over c <= rcpos + t of
-# rcpr[h * T + t, c] * rcvc[c, (h / group) * dh + d], j = h * dh + d.
+# Keys per group, transposed: hkt[g, d, t] = hkqkv[t, hkqd + g * dh + d].
 @ kernel
 @ public
-fn context_rows<size T, size QD, size HT, size C, size KVD>(tensor<f32, [HT, C]> rcpr, tensor<f32, [C, KVD]> rcvc, mut tensor<f32, [T, QD]> rcctx, i32 rcrows, i32 rcpos, i32 rcdh, i32 rcgroup) → void {
-    for from rcctx at [t, j] thread lane let e {
-        if rcrows ≥ 1 and rcrows ≤ 1000000 and rcgroup ≻ 0 and rcdh ≥ 1 and rcdh ≤ 960 and rcpos ≥ 0 and rcpos ≤ 1000000 and rcpos + t ≺ C {
-            let i32 h ← j / rcdh
-            let i32 d ← j % rcdh
-            let i32 base ← (h / rcgroup) * rcdh
-            let i32 r ← h * rcrows + t
-            mut f32 acc ← 0.0
-            for range 0 ‥ rcpos + t + 1 let c {
-                acc ← acc + rcpr[[r, c]] * rcvc[[c, base + d]]
+fn k_heads_t<size T, size R, size KG, size DH>(tensor<f32, [T, R]> hkqkv, mut tensor<f32, [KG, DH, T]> hkt, i32 hkqd, i32 hkdh) → void {
+    for from hkt at [g, d, t] thread lane let old {
+        if hkqd ≥ 0 and hkqd ≤ 1000000 and hkdh ≥ 1 and hkdh ≤ 960 {
+            hkt[[g, d, t]] ← hkqkv[[t, hkqd + g * hkdh + d]]
+        }
+    }
+}
+
+# Values per group: hvg[g, t, d] = hvqkv[t, hvqd + hvkvd + g * dh + d].
+@ kernel
+@ public
+fn v_heads<size T, size R, size KG, size DH>(tensor<f32, [T, R]> hvqkv, mut tensor<f32, [KG, T, DH]> hvg, i32 hvqd, i32 hvkvd, i32 hvdh) → void {
+    for from hvg at [g, t, d] thread lane let old {
+        if hvqd ≥ 0 and hvqd ≤ 1000000 and hvkvd ≥ 0 and hvkvd ≤ 1000000 and hvdh ≥ 1 and hvdh ≤ 960 {
+            hvg[[g, t, d]] ← hvqkv[[t, hvqd + hvkvd + g * hvdh + d]]
+        }
+    }
+}
+
+# Batched product: bmo[b] = bma[b] · bmb[b / (B / BR)], the key/value group shared by its heads.
+@ kernel
+@ public
+fn batched_matmul<size B, size M, size K, size N>(tensor<f32, [B, M, K]> bma, tensor<f32, [B, K, N]> bmb, mut tensor<f32, [B, M, N]> bmo) → void {
+    bmo ⇇ bma · bmb
+}
+
+# Scale and causal mask into the rank-2 rows the row softmax takes:
+# msc[g * RQ + r, c] = mss[g, r, c] * msscale for c <= r % T, and -3.0e38 past it.
+@ kernel
+@ public
+fn mask_scores<size KG, size RQ, size T, size HT>(tensor<f32, [KG, RQ, T]> mss, mut tensor<f32, [HT, T]> msc, i32 msrows, i32 msrq, f32 msscale) → void {
+    for from msc at [row, c] thread lane let old {
+        if msrows ≥ 1 and msrows ≤ 1000000 and msrq ≥ 1 and msrq ≤ 64000000 {
+            let i32 g ← row / msrq
+            let i32 r ← row % msrq
+            if c ≤ r % msrows {
+                msc[[row, c]] ← mss[[g, r, c]] * msscale
             }
-            rcctx[[t, j]] ← acc
+            else {
+                msc[[row, c]] ← -3.0e38
+            }
+        }
+    }
+}
+
+# The softmax rows back in batched form: ufo[g, r, c] = ufi[g * RQ + r, c].
+@ kernel
+@ public
+fn unflat_scores<size KG, size RQ, size T, size HT>(tensor<f32, [HT, T]> ufi, mut tensor<f32, [KG, RQ, T]> ufo, i32 ufrq) → void {
+    for from ufo at [g, r, c] thread lane let old {
+        if ufrq ≥ 1 and ufrq ≤ 64000000 {
+            ufo[[g, r, c]] ← ufi[[g * ufrq + r, c]]
+        }
+    }
+}
+
+# Context heads back to rows: mhctx[t, h * dh + d] = mhcg[h / group, (h % group) * T + t, d].
+@ kernel
+@ public
+fn merge_heads<size KG, size RQ, size DH, size T, size QD>(tensor<f32, [KG, RQ, DH]> mhcg, mut tensor<f32, [T, QD]> mhctx, i32 mhrows, i32 mhgroup, i32 mhdh) → void {
+    for from mhctx at [t, j] thread lane let old {
+        if mhrows ≥ 1 and mhrows ≤ 1000000 and mhgroup ≥ 1 and mhgroup ≤ 64 and mhdh ≥ 1 and mhdh ≤ 960 {
+            let i32 h ← j / mhdh
+            let i32 d ← j % mhdh
+            mhctx[[t, j]] ← mhcg[[h / mhgroup, (h % mhgroup) * mhrows + t, d]]
         }
     }
 }
@@ -215,11 +270,11 @@ fn take_row<size T, size D>(tensor<f32, [T, D]> trx, mut tensor<f32, [D]> tro, i
 # One layer over T prompt rows
 # ---------------------------------------------------------------------------
 
-# hout = layer(hin) for prompt rows at positions pos0 .. pos0 + T - 1, writing their
-# K/V cache rows. `prows` is T as an i32 (the attention kernels divide by it).
-# 14 launches, whatever T is.
+# hout = layer(hin) for the T prompt rows at positions 0 .. T - 1, writing their K/V
+# cache rows. `prows` is T as an i32 (the attention kernels divide by it).
+# 21 launches, whatever T is.
 @ public
-fn prefill_layer<size D, size QD, size KVD, size F, size C, size T, size HT, size R, size G>(
+fn prefill_layer<size D, size QD, size KVD, size F, size C, size T, size HT, size R, size G, size KG, size RQ, size DH>(
     tensor<f32, [T, D]> hin,
     mut tensor<f32, [T, D]> hout,
     tensor<f32, [D]> anorm,
@@ -233,8 +288,13 @@ fn prefill_layer<size D, size QD, size KVD, size F, size C, size T, size HT, siz
     mut tensor<f32, [T, D]> xn,
     mut tensor<f32, [T, R]> qkvr,
     mut tensor<f32, [T, R]> qkv,
-    mut tensor<f32, [HT, C]> sc,
-    mut tensor<f32, [HT, C]> pr,
+    mut tensor<f32, [KG, RQ, DH]> qg,
+    mut tensor<f32, [KG, DH, T]> kt,
+    mut tensor<f32, [KG, T, DH]> vg,
+    mut tensor<f32, [KG, RQ, T]> s3,
+    mut tensor<f32, [HT, T]> sc,
+    mut tensor<f32, [HT, T]> pr,
+    mut tensor<f32, [KG, RQ, DH]> cg,
     mut tensor<f32, [T, QD]> ctx,
     mut tensor<f32, [T, D]> ao,
     mut tensor<f32, [T, D]> h1,
@@ -242,7 +302,6 @@ fn prefill_layer<size D, size QD, size KVD, size F, size C, size T, size HT, siz
     mut tensor<f32, [T, F]> act,
     mut tensor<f32, [T, D]> dn,
     i32 prows,
-    i32 pos0,
     i32 pqd,
     i32 pkvd,
     i32 pdh,
@@ -254,11 +313,17 @@ fn prefill_layer<size D, size QD, size KVD, size F, size C, size T, size HT, siz
 ) → void {
     rms_norm_rows(hin, anorm, mut xn, peps)
     matmul(xn, wqkvt, mut qkvr)
-    rope_rows(qkvr, mut qkv, pos0, pqd, pkvd, pdh, plntheta, prope)
-    kv_write_rows(qkv, mut kin, mut vin, pos0, pqd)
-    scores_rows(qkv, kin, mut sc, prows, pos0, pdh, pgroup, pscale)
+    rope_rows(qkvr, mut qkv, 0, pqd, pkvd, pdh, plntheta, prope)
+    kv_write_rows(qkv, mut kin, mut vin, 0, pqd)
+    q_heads(qkv, mut qg, prows, pgroup, pdh)
+    k_heads_t(qkv, mut kt, pqd, pdh)
+    v_heads(qkv, mut vg, pqd, pkvd, pdh)
+    batched_matmul(qg, kt, mut s3)
+    mask_scores(s3, mut sc, prows, prows * pgroup, pscale)
     ds.row_softmax(sc, mut pr)
-    context_rows(pr, vin, mut ctx, prows, pos0, pdh, pgroup)
+    unflat_scores(pr, mut s3, prows * pgroup)
+    batched_matmul(s3, vg, mut cg)
+    merge_heads(cg, mut ctx, prows, pgroup, pdh)
     matmul(ctx, wot, mut ao)
     add_rows(hin, ao, mut h1)
     rms_norm_rows(h1, fnorm, mut xn, peps)
