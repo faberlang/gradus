@@ -75,7 +75,7 @@ mir-swarm rungs, not grow workarounds.
 ## Rules
 
 - Keep public modules under `src/**/*.fab`.
-- Keep package tests as co-located `src/**/*.proba` (`name.fab` + `name.proba`).
+- Keep package tests in `+++ faber test` sections inside `src/**/*.fab` (or test-only `.fab` files with `+++ faber test` only).
 - Keep instructional demos under `exempla/**/*.fab`.
 - Do not add `@ externa` or `@ subsidia`.
 - Optional genus fields use `sponte`.
@@ -84,7 +84,7 @@ mir-swarm rungs, not grow workarounds.
   / generators only.
 - Nested package directories need at least two leaves (prefer three+).
 - Do not import from Norma or any sibling library. Gradus is self-contained.
-- Never `importa` a `.proba` file; shared helpers stay in `.fab` modules.
+- Keep test helpers inside `+++ faber test` sections or dedicated `.fab` modules.
 - `@ radix backward` annotations live behind the `gradient` module wrapper, not
   leaked into every public function signature.
 

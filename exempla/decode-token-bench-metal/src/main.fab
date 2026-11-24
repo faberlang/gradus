@@ -1,6 +1,7 @@
-+++
++++ toml
 locale = "en"
-+++
+
++++ faber
 # decode-token-bench-metal: one SmolLM2-360M f32 decode step per token, timed on Metal.
 #
 # Shapes of SmolLM2-360M (32 layers, hidden 960, 15 query heads and 5 KV heads of
@@ -23,9 +24,9 @@ locale = "en"
 # same program with `--stats --debug` (interpreter route, diagnosis only, never a
 # speed) to read them.
 
-import from "gradus:decode_step" ds
-import from "gradus:decode_token" dt
-import from "norma:time" time
+import from "gradus:decode_step" let ds
+import from "gradus:decode_token" let dt
+import from "norma:time" let time
 
 const int LAYERS = 32
 const int NTOK = 32
@@ -44,23 +45,30 @@ class Layer {
 }
 
 # Deterministic pseudo-random matrix: values in (-amp, amp) from a sine hash.
-@ kernel
 @ public
-fn synth_mat<size N, size K>(tensor<f32, [N, K]> sdom, mut tensor<f32, [N, K]> sout, i32 sseed, f32 samp) → void {
+kernel synth_mat<size N, size K>(tensor<f32, [N, K]> sdom, mut tensor<f32, [N, K]> sout, i32 sseed, f32 samp) → void {
     for from sdom at [i, k] thread lane let e {
-        let i32 a ← (i * 31 + k * 17 + sseed) % 65521
-        let f32 h ← ((a ↦ f32) + 0.5) * 0.7123
-        sout[[i, k]] ← h.sin() * samp
+        let i32 ii ← i ↦ i32
+        let i32 kk ← k ↦ i32
+
+        if ii ≥ 0 and ii ≤ 65536 and kk ≥ 0 and kk ≤ 65536 and sseed ≥ 0 and sseed ≤ 65536 {
+            let i32 a ← (ii * 31 + kk * 17 + sseed) % 65521
+            let f32 h ← ((a ↦ f32) + 0.5) * 0.7123
+            sout[[i, k]] ← h.sin() * samp
+        }
     }
 }
 
 # Deterministic norm weights near 1.
-@ kernel
 @ public
-fn synth_vec<size N>(tensor<f32, [N]> sdom, mut tensor<f32, [N]> sout, i32 sseed) → void {
+kernel synth_vec<size N>(tensor<f32, [N]> sdom, mut tensor<f32, [N]> sout, i32 sseed) → void {
     for from sdom at [i] thread lane let e {
-        let i32 a ← ((i % 251) * 31 + sseed) % 17
-        sout[[i]] ← 1.0 + ((a ↦ f32) - 8.0) * 0.01
+        let i32 ii ← i ↦ i32
+
+        if ii ≥ 0 and ii ≤ 65536 and sseed ≥ 0 and sseed ≤ 65536 {
+            let i32 a ← ((ii % 251) * 31 + sseed) % 17
+            sout[[i]] ← 1.0 + ((a ↦ f32) - 8.0) * 0.01
+        }
     }
 }
 
@@ -91,89 +99,25 @@ fn make_layer(i32 sd) → Layer {
     return Layer { anorm = anorm, wq = wq, wk = wk, wv = wv, wo = wo, fnorm = fnorm, wg = wg, wu = wu, wd = wd }
 }
 
-# Persistent scratch of `dt.layer_wide` (shapes documented in decode_token.fab):
-# 15 query heads of width 64, 5 KV heads, group 3, P = 64 lanes per GEMV row, Q = 32
-# RMSNorm partial sums, 64 cache rows.
-class Scratch {
-    mut tensor<f32, [32]> rp
-    mut tensor<f32, [1600, 64]> qkvp
-    mut tensor<f32, [1600]> qkv
-    let tensor<f32, [320]> kvdom
-    mut tensor<f32, [15, 64]> sc
-    mut tensor<f32, [15]> mx
-    mut tensor<f32, [15]> sm
-    mut tensor<f32, [960]> ctx
-    mut tensor<f32, [960, 64]> op
-    mut tensor<f32, [960]> h1
-    mut tensor<f32, [2560, 64]> gp
-    mut tensor<f32, [2560, 64]> up
-    mut tensor<f32, [2560]> act
-    mut tensor<f32, [960, 64]> dp
-}
-
-fn make_scratch() → Scratch {
-    let tensor<f32, [32]> rp ← tf32[32] {}
-    let tensor<f32, [1600, 64]> qkvp ← tf32[1600, 64] {}
-    let tensor<f32, [1600]> qkv ← tf32[1600] {}
-    let tensor<f32, [320]> kvdom ← tf32[320] {}
-    let tensor<f32, [15, 64]> sc ← tf32[15, 64] {}
-    let tensor<f32, [15]> mx ← tf32[15] {}
-    let tensor<f32, [15]> sm ← tf32[15] {}
-    let tensor<f32, [960]> ctx ← tf32[960] {}
-    let tensor<f32, [960, 64]> op ← tf32[960, 64] {}
-    let tensor<f32, [960]> h1 ← tf32[960] {}
-    let tensor<f32, [2560, 64]> gp ← tf32[2560, 64] {}
-    let tensor<f32, [2560, 64]> up ← tf32[2560, 64] {}
-    let tensor<f32, [2560]> act ← tf32[2560] {}
-    let tensor<f32, [960, 64]> dp ← tf32[960, 64] {}
-    return Scratch { rp = rp, qkvp = qkvp, qkv = qkv, kvdom = kvdom, sc = sc, mx = mx, sm = sm, ctx = ctx, op = op, h1 = h1, gp = gp, up = up, act = act, dp = dp }
-}
-
-# A `mut` class field cannot be a call argument under the strict engine, so each
-# function below binds the fields it passes to locals first.
-fn prime_scratch(mut Scratch s, mut tensor<f32, [1]> sink) → void {
-    mut tensor<f32, [32]> rp ← s.rp
-    mut tensor<f32, [1600, 64]> qkvp ← s.qkvp
-    mut tensor<f32, [1600]> qkv ← s.qkv
-    mut tensor<f32, [15, 64]> sc ← s.sc
-    mut tensor<f32, [15]> mx ← s.mx
-    mut tensor<f32, [15]> sm ← s.sm
-    mut tensor<f32, [960]> ctx ← s.ctx
-    mut tensor<f32, [960, 64]> op ← s.op
-    mut tensor<f32, [960]> h1 ← s.h1
-    mut tensor<f32, [2560, 64]> gp ← s.gp
-    mut tensor<f32, [2560, 64]> up ← s.up
-    mut tensor<f32, [2560]> act ← s.act
-    mut tensor<f32, [960, 64]> dp ← s.dp
-    dt.prime_layer_wide(mut rp, mut qkvp, mut qkv, mut sc, mut mx, mut sm, mut ctx, mut op, mut h1, mut gp, mut up, mut act, mut dp, mut sink)
-}
-
-fn run_layer(mut Scratch s, tensor<f32, [960]> hin, mut tensor<f32, [960]> hout, Layer ly, mut tensor<f32, [64, 320]> kin, mut tensor<f32, [64, 320]> vin, i32 pos) → void {
-    mut tensor<f32, [32]> rp ← s.rp
-    mut tensor<f32, [1600, 64]> qkvp ← s.qkvp
-    mut tensor<f32, [1600]> qkv ← s.qkv
-    let tensor<f32, [320]> kvdom ← s.kvdom
-    mut tensor<f32, [15, 64]> sc ← s.sc
-    mut tensor<f32, [15]> mx ← s.mx
-    mut tensor<f32, [15]> sm ← s.sm
-    mut tensor<f32, [960]> ctx ← s.ctx
-    mut tensor<f32, [960, 64]> op ← s.op
-    mut tensor<f32, [960]> h1 ← s.h1
-    mut tensor<f32, [2560, 64]> gp ← s.gp
-    mut tensor<f32, [2560, 64]> up ← s.up
-    mut tensor<f32, [2560]> act ← s.act
-    mut tensor<f32, [960, 64]> dp ← s.dp
-    # pqd 960, pkvd 320, head width 64, GQA group 3, consecutive-pair RoPE (1),
-    # epsilon 1e-5, ln(theta) = ln(100000), attention scale 1/8.
-    dt.layer_wide(hin, mut hout, ly.anorm, ly.wq, ly.wk, ly.wv, ly.wo, ly.fnorm, ly.wg, ly.wu, ly.wd, mut kin, mut vin, mut rp, mut qkvp, mut qkv, kvdom, mut sc, mut mx, mut sm, mut ctx, mut op, mut h1, mut gp, mut up, mut act, mut dp, pos, 960, 320, 64, 3, 1, 0.00001, 11.512925, 0.125)
-}
-
-fn run_head(mut Scratch s, tensor<f32, [960]> hidden, tensor<f32, [960]> onorm, tensor<f32, [49152, 960]> embed, mut tensor<f32, [49152]> logits) → void {
-    mut tensor<f32, [32]> rp ← s.rp
-    dt.head_step_wide(hidden, onorm, embed, mut rp, mut logits, 0.00001)
-}
-
 main {
+    let tensor<f32, [15, 64]> hcdom ← tf32[15, 64] {}
+    let tensor<f32, [32, 960]> cpdom ← tf32[32, 960] {}
+    let tensor<f32, [960]> qdom ← tf32[960] {}
+    mut tensor<f32, [960]> xn ← tf32[960] {}
+    mut tensor<f32, [960]> q ← tf32[960] {}
+    mut tensor<f32, [960]> qr ← tf32[960] {}
+    mut tensor<f32, [320]> k ← tf32[320] {}
+    mut tensor<f32, [320]> kr ← tf32[320] {}
+    mut tensor<f32, [320]> v ← tf32[320] {}
+    mut tensor<f32, [15, 64]> sc ← tf32[15, 64] {}
+    mut tensor<f32, [15, 64]> pr ← tf32[15, 64] {}
+    mut tensor<f32, [32, 960]> cp ← tf32[32, 960] {}
+    mut tensor<f32, [960]> ctx ← tf32[960] {}
+    mut tensor<f32, [960]> h1 ← tf32[960] {}
+    mut tensor<f32, [2560]> gate ← tf32[2560] {}
+    mut tensor<f32, [2560]> up ← tf32[2560] {}
+    mut tensor<f32, [2560]> act ← tf32[2560] {}
+
     let tensor<f32, [49152, 960]> embdom ← tf32[49152, 960] {}
     mut tensor<f32, [49152, 960]> emb ← tf32[49152, 960] {}
     synth_mat(embdom, mut emb, 99 ∷ i32, 0.5 ∷ f32)
@@ -198,14 +142,13 @@ main {
     mut tensor<f32, [49152]> logits ← tf32[49152] {}
     mut tensor<f32, [960]> ha ← tf32[960] {}
     mut tensor<f32, [960]> hb ← tf32[960] {}
-    mut Scratch scr ← make_scratch()
     mut tensor<f32, [1]> sink ← tf32[1] {}
 
     # Prime every kernel-written tensor before its first write.
     ds.prime1(ha, mut sink)
     ds.prime1(hb, mut sink)
     ds.prime1(logits, mut sink)
-    prime_scratch(mut scr, mut sink)
+    dt.prime_layer_wide(mut xn, mut q, mut qr, mut k, mut kr, mut v, mut sc, mut pr, mut cp, mut ctx, mut h1, mut gate, mut up, mut act, mut sink)
     for range 0 ‥ LAYERS let l {
         mut tensor<f32, [64, 320]> pk ← ka[l]
         mut tensor<f32, [64, 320]> pv ← va[l]
@@ -225,13 +168,13 @@ main {
                 mut tensor<f32, [64, 320]> kin ← ka[ll]
                 mut tensor<f32, [64, 320]> vin ← va[ll]
                 if ll % 2 ≡ 0 {
-                    run_layer(mut scr, ha, mut hb, ly, mut kin, mut vin, pos)
+                    dt.layer_wide(ha, mut hb, ly.anorm, ly.wq, ly.wk, ly.wv, ly.wo, ly.fnorm, ly.wg, ly.wu, ly.wd, mut kin, mut vin, hcdom, cpdom, qdom, mut xn, mut q, mut qr, mut k, mut kr, mut v, mut sc, mut pr, mut cp, mut ctx, mut h1, mut gate, mut up, mut act, pos, 64, 32, 3, 1, 0.00001, 11.512925, 0.125)
                 }
                 else {
-                    run_layer(mut scr, hb, mut ha, ly, mut kin, mut vin, pos)
+                    dt.layer_wide(hb, mut ha, ly.anorm, ly.wq, ly.wk, ly.wv, ly.wo, ly.fnorm, ly.wg, ly.wu, ly.wd, mut kin, mut vin, hcdom, cpdom, qdom, mut xn, mut q, mut qr, mut k, mut kr, mut v, mut sc, mut pr, mut cp, mut ctx, mut h1, mut gate, mut up, mut act, pos, 64, 32, 3, 1, 0.00001, 11.512925, 0.125)
                 }
             }
-            run_head(mut scr, ha, onorm, emb, mut logits)
+            dt.head_step_wide(ha, onorm, emb, mut xn, mut logits, 0.00001)
             ds.argmax_token(logits, mut ids)
             let int id ← ids[[0]] ↦ int
             sum ← sum + id
