@@ -1,0 +1,268 @@
++++ toml
+locale = "en"
+
++++ faber
+# GGML IQ4_NL as a named block genus and one decode function (Rule 17, issue #44).
+#
+# Public import: import from "gradus:quant/iq4_nl" iq4_nl
+#
+# --- Contract ------------------------------------------------------------
+#
+# An IQ4_NL block quantizes 32 weights to 4-bit indices into GGML's 16-entry
+# non-linear signed lookup table `kvalues_iq4nl` with one half scale `d`.
+# On disk a block is 18 bytes, little-endian, with no padding:
+#
+#     block_iq4_nl { ggml_half d; uint8_t qs[16]; }           (ggml-common.h)
+#
+# Low nibbles `qs[j] & 0x0F` decode to elements `0..15`, and high nibbles
+# `qs[j] >> 4` decode to elements `16..31`:
+#
+#     y[j]      = f32(d) * f32(kvalues_iq4nl[qs[j] & 0x0F])
+#     y[j + 16] = f32(d) * f32(kvalues_iq4nl[qs[j] >> 4])
+#
+# matching `dequantize_row_iq4_nl` (`ggml-quants.c`).
+
+# Elements per block.
+@ public
+const int IQ4_NL_ELEMENTS = 32
+
+# Bytes per block: 2 (half scale d) + 16 (nibble pairs).
+@ public
+const int IQ4_NL_BYTES = 18
+
+# GGML's 16-entry signed non-linear codebook (`kvalues_iq4nl`).
+@ public
+const list<int> KVALUES_IQ4NL = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113]
+
+# The block genus. Field order is the on-disk order.
+@ public
+class IQ4_NL {
+    let f16 d
+    let list<u8, size 16> qs
+}
+
+# Typed fail-closed diagnostics of the loader.
+#   BadBlock — byte length is not IQ4_NL_BYTES (truncated or padded block).
+#   BadScale — the half scale `d` is NaN.
+@ public
+union IQ4_NLError {
+    @ shared
+    string message
+
+    BadBlock,
+    BadScale
+}
+
+# Weight `k` (0 ≤ k < 32) of block `b` as f32: `kvalues_iq4nl[q] * f32(d)`.
+@ public
+fn decode(IQ4_NL b, i32 k) → f32 {
+    let int idx ← k ↦ int
+    mut int q ← 0
+
+    if idx ≺ 16 {
+        q ← (b.qs[idx] ↦ int) % 16
+    }
+    else {
+        q ← ((b.qs[idx - 16] ↦ int) ⇒ 4) % 16
+    }
+
+    return (KVALUES_IQ4NL[q] ↦ f32) * (b.d ↦ f32)
+}
+
+# One block from its 18 on-disk bytes (scale `d`, then 16 packed nibble bytes).
+@ public
+fn from_bytes(list<u8> raw) → IQ4_NL ⇥ IQ4_NLError {
+    if raw.length() ≢ IQ4_NL_BYTES {
+        throw variant BadBlock { message = "IQ4_NL block byte length mismatch" }
+    }
+
+    let list<b8> buf ↤ raw
+    let int bits ← (buf[0 ‥ 2] ↦ u16 via Le) ↦ int
+
+    if (bits ⇒ 10) % 32 ≡ 31 {
+        if bits % 1024 ≢ 0 {
+            throw variant BadScale { message = "NaN half scale in IQ4_NL block" }
+        }
+    }
+
+    let f16 d ← ((buf[0 ‥ 2] ↦ u16 via Le) ↦ b16) ↦ f16
+    let list<u8> quants ← buf[2 ‥ 18] ↦ list<u8>
+
+    do {
+        return IQ4_NL { d = d, qs = quants ↦ list<u8, size 16> }
+    }
+    catch err {
+        throw variant BadBlock { message = "IQ4_NL block byte length mismatch" }
+    }
+}
+
+# The 32 weights of one block from its 18 bytes (`from_bytes`, then `decode`
+# for every `k`).
+@ public
+fn decode_block(list<u8> raw) → list<f32> ⇥ IQ4_NLError {
+    let IQ4_NL b ← from_bytes(raw)
+    mut list<f32> y ← empty
+
+    for range 0 ‥ IQ4_NL_ELEMENTS let k {
+        y.append(decode(b, k ↦ i32 ⊥ 0))
+    }
+
+    return y
+}
+
++++ faber test
+import from "gradus:quant/iq4_nl" iq4_nl
+
+import from "gradus:model/dequant" dequant
+
+import from "gradus:storage" storage
+
+const list<string> GOLDEN_NAMES = ["zeroes", "all-lut-entries-unit-d", "neg-d-all-lut-entries", "fractional-d-mixed", "subnormal-d-extremes"]
+
+const list<list<int>> GOLDEN_BLOCKS = [
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 60, 240, 225, 210, 195, 180, 165, 150, 135, 120, 105, 90, 75, 60, 45, 30, 15],
+    [0, 192, 240, 225, 210, 195, 180, 165, 150, 135, 120, 105, 90, 75, 60, 45, 30, 15],
+    [102, 46, 112, 195, 22, 105, 188, 15, 82, 165, 248, 75, 158, 225, 52, 135, 218, 45],
+    [1, 0, 240, 15, 240, 15, 240, 15, 240, 15, 240, 15, 240, 15, 240, 15, 240, 15]
+]
+
+const list<list<int>> GOLDEN_BITS = [
+    [2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648],
+    [3271426048, 3268411392, 3265658880, 3263299584, 3259236352, 3255566336, 3249537024, 3240099840, 1065353216, 1095761920, 1103626240, 1108869120, 1112801280, 1116340224, 1118961664, 1122107392, 1122107392, 1118961664, 1116340224, 1112801280, 1108869120, 1103626240, 1095761920, 1065353216, 3240099840, 3249537024, 3255566336, 3259236352, 3263299584, 3265658880, 3268411392, 3271426048],
+    [1132331008, 1129316352, 1126563840, 1124204544, 1120141312, 1116471296, 1110441984, 1101004800, 3221225472, 3251634176, 3259498496, 3264741376, 3268673536, 3272212480, 3274833920, 3277979648, 3277979648, 3274833920, 3272212480, 3268673536, 3264741376, 3259498496, 3251634176, 3221225472, 1101004800, 1110441984, 1116471296, 1120141312, 1124204544, 1126563840, 1129316352, 1132331008],
+    [3242927744, 3234853632, 3222062080, 1067867136, 1084854016, 1093976448, 3238315136, 3227513344, 1036828672, 1081287680, 1091460480, 3240516608, 3231499008, 3212832768, 1075836416, 1088208640, 3212832768, 1084854016, 3240516608, 3222062080, 1081287680, 3242927744, 3227513344, 1075836416, 1093976448, 3231499008, 1067867136, 1091460480, 3234853632, 1036828672, 1088208640, 3238315136],
+    [3070099456, 920780800, 3070099456, 920780800, 3070099456, 920780800, 3070099456, 920780800, 3070099456, 920780800, 3070099456, 920780800, 3070099456, 920780800, 3070099456, 920780800, 920780800, 3070099456, 920780800, 3070099456, 920780800, 3070099456, 920780800, 3070099456, 920780800, 3070099456, 920780800, 3070099456, 920780800, 3070099456, 920780800, 3070099456]
+]
+
+fn bytes_of(list<int> vals) → list<u8> {
+    mut list<u8> bs ← empty
+    for from vals let v {
+        bs.append(v ↦ u8 ⊥ 0)
+    }
+    return bs
+}
+
+fn bits_of(f32 v) → int {
+    return v ↦ b32 ↦ u32 ↦ int
+}
+
+fn filled_block(int lo, int hi, int fill) → list<u8> {
+    mut list<int> raw ← [lo, hi]
+    for range 0 ‥ 16 let i {
+        raw.append(fill)
+    }
+    return bytes_of(raw)
+}
+
+fn block_result(list<u8> raw) → string {
+    do {
+        iq4_nl.from_bytes(raw)
+        return "ok"
+    }
+    catch err {
+        return err.message
+    }
+}
+
+fn weights(list<u8> raw) → list<f32> {
+    do {
+        let iq4_nl.IQ4_NL blk ← iq4_nl.from_bytes(raw)
+        mut list<f32> out ← empty
+        for range 0 ‥ 32 let k {
+            out.append(iq4_nl.decode(blk, k ↦ i32 ⊥ 0))
+        }
+        return out
+    }
+    catch err {
+        return empty
+    }
+}
+
+fn host_bits(list<u8> raw) → list<int> {
+    do {
+        let list<b8> buf ↤ raw
+        let list<f32> y ← dequant.decode_block_f32(dequant.representation_for(20), buf)
+        mut list<int> out ← empty
+        for from y let v {
+            out.append(bits_of(v))
+        }
+        return out
+    }
+    catch err {
+        return empty
+    }
+}
+
+fn geometry_bytes(storage.Representation kind) → int {
+    do {
+        return dequant.block_bytes(kind)
+    }
+    catch err {
+        return 0
+    }
+}
+
+fn geometry_elements(storage.Representation kind) → int {
+    do {
+        return dequant.block_elements(kind)
+    }
+    catch err {
+        return 0
+    }
+}
+
+test "IQ4_NL layout: 18 bytes per 32 weights, no padding" {
+    assert iq4_nl.IQ4_NL_ELEMENTS ≡ 32
+    assert iq4_nl.IQ4_NL_BYTES ≡ 18
+    assert iq4_nl.IQ4_NL_BYTES ≡ 2 + iq4_nl.IQ4_NL_ELEMENTS / 2
+}
+
+test "IQ4_NL layout equals host dequant geometry" {
+    let storage.Representation rep ← dequant.representation_for(20)
+    assert geometry_bytes(rep) ≡ iq4_nl.IQ4_NL_BYTES
+    assert geometry_elements(rep) ≡ iq4_nl.IQ4_NL_ELEMENTS
+}
+
+test "IQ4_NL decode matches independent golden bit for bit on every block" {
+    assert GOLDEN_NAMES.length() ≡ 5
+    for range 0 ‥ 5 let i {
+        let list<f32> y ← weights(bytes_of(GOLDEN_BLOCKS[i]))
+        assert y.length() ≡ 32
+        for range 0 ‥ 32 let j {
+            assert bits_of(y[j]) ≡ GOLDEN_BITS[i][j]
+        }
+    }
+}
+
+test "IQ4_NL genus decode equals host dequant on every golden block" {
+    for range 0 ‥ 5 let i {
+        let list<int> h ← host_bits(bytes_of(GOLDEN_BLOCKS[i]))
+        let list<f32> y ← weights(bytes_of(GOLDEN_BLOCKS[i]))
+        assert h.length() ≡ 32
+        assert y.length() ≡ 32
+        for range 0 ‥ 32 let j {
+            assert bits_of(y[j]) ≡ h[j]
+        }
+    }
+}
+
+test "IQ4_NL truncated and padded blocks are refused" {
+    let list<u8> full ← filled_block(0, 60, 0)
+    mut list<u8> trim ← empty
+    for range 0 ‥ 17 let i {
+        trim.append(full[i])
+    }
+    assert block_result(trim) ≡ "IQ4_NL block byte length mismatch"
+    assert block_result(bytes_of([])) ≡ "IQ4_NL block byte length mismatch"
+
+    mut list<u8> pad ← copy full
+    pad.append(0 ↦ u8)
+    assert block_result(pad) ≡ "IQ4_NL block byte length mismatch"
+}
+
+test "IQ4_NL NaN half scale is refused" {
+    assert block_result(filled_block(0, 126, 0)) ≡ "NaN half scale in IQ4_NL block"
+    assert block_result(filled_block(1, 124, 0)) ≡ "NaN half scale in IQ4_NL block"
+    assert block_result(filled_block(0, 124, 0)) ≡ "ok"
+}
