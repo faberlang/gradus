@@ -1,3 +1,7 @@
++++ toml
+locale = "en"
+
++++ faber
 # Defined metrics over the tensor value surface.
 #
 # Public import: import from "gradus:metrics" metrics
@@ -10,9 +14,9 @@
 # recompute it. No training loop, hidden state, backend, or device handle
 # belongs here.
 
-import from "gradus:dtype" dtype
+import from "gradus:dtype"
 
-import from "gradus:tensor" tensor
+import from "gradus:tensor"
 
 # --- metric error vocabulary ---------------------------------------------
 
@@ -37,36 +41,57 @@ union MetricError {
 @ public
 fn accuracy(tensor.NumericBlock prediction, tensor.NumericBlock target) → f32 ⇥ MetricError {
     let list<int> fp ← prediction.shape
+
     require fp.length() ≡ 2 throw variant GradusMismatch { message = "accuracy requires rank-2 predictions" }
+
     require dtype.name(prediction.dtype) ≡ "f32" throw variant DtypeMismatch { message = "unsupported dtype for metric" }
+
     let int n ← fp.get(0) coalesce 1
     let int c ← fp.get(1) coalesce 1
+
     require n ≢ 0 throw variant ElementMismatch { message = "empty batch" }
+
     require c ≢ 0 throw variant ElementMismatch { message = "empty class axis" }
+
     let list<int> ft ← target.shape
+
     require ft.length() ≡ 1 throw variant GradusMismatch { message = "accuracy target must be rank-1" }
+
     require ft.get(0) coalesce 1 ≡ n throw variant ShapeMismatch { message = "target length does not match predictions rows" }
+
     require dtype.name(target.dtype) ≡ "i32" throw variant DtypeMismatch { message = "accuracy target must be i32 class indices" }
+
     for from prediction.data let value {
         require dtype.finite(value) throw variant NonFinite { message = "non-finite prediction" }
     }
+
     mut int correct ← 0
+
     # NumericBlock data is flat, and row drives the prediction stride.
     for range 0 ‥ n let row {
         let f32 label ← target.data.get(row) coalesce 0.0
+
         require dtype.finite(label) throw variant NonFinite { message = "non-finite target" }
+
         let int k ← label.truncate()
+
         require (k ↦ f32) ≡ label throw variant Incompatible { message = "target must be integer class indices" }
+
         reject k ≺ 0 or k ≥ c throw variant Incompatible { message = "target class out of range" }
+
         mut list<f32> row_values ← empty
+
         for range 0 ‥ c let j {
             row_values.append(prediction.data.get(row * c + j) coalesce 0.0)
         }
+
         let int best ← row_values.argmax() coalesce 0
+
         if best ≡ k {
             correct ← correct + 1
         }
     }
+
     return (correct ↦ f32) / (n ↦ f32)
 }
 
@@ -81,8 +106,11 @@ class Metric {
 @ public
 fn metric(f32 loss, f32 accuracy) → Metric ⇥ MetricError {
     require dtype.finite(loss) throw variant Invalid { message = "loss must be finite" }
+
     require dtype.finite(accuracy) throw variant Invalid { message = "accuracy must be finite" }
+
     reject accuracy ≺ 0.0 or accuracy ≻ 1.0 throw variant Invalid { message = "accuracy must be in [0, 1]" }
+
     return Metric { loss = loss, accuracy = accuracy }
 }
 
@@ -95,6 +123,260 @@ fn default() → Metric {
 @ public
 fn metric_equal(Metric a, Metric b) → bool {
     if a.loss ≢ b.loss then return false
+
     if a.accuracy ≢ b.accuracy then return false
+
     return true
+}
+
++++ faber test
+# Co-located package test for metrics.fab (PML4-U5 — metrics: defined
+# values with a deterministic contract). Not importable; discovered only
+# by the faber test path.
+#
+# Proves, at compile level:
+#   * accuracy — top-1 classification accuracy over the class axis:
+#     the f64 oracle pins (correct/total for concrete rows), the
+#     deterministic tie-break (lowest class index wins — strict
+#     greater-than argmax), and the fail-closed rows (rank, dtype, shape,
+#     empty batch/class, non-finite, class range) — message identity per
+#     validation.
+#   * Metric — the per-step metric record (loss + accuracy): the
+#     validation contract (finite loss, accuracy in [0, 1]), field
+#     projections, field-wise equality, and the per-step composition
+#     (loss.mse_carrier + accuracy over the same tensors → a Metric).
+#   * determinism: equal inputs produce equal metrics (no RNG, no hidden
+#     state — fixed row-major iteration).
+#
+# Oracle pins: accuracy is an f64 evaluation of the documented formula
+# (1/N)·Σ_n [argmax_c pred[n,c] == target[n]]. The rows below evaluate
+# exactly (1.0, 0.5, 2/3) — exact f32 representable fractions. No
+# executed value is claimed here (CTO Q2); the auditor-owned
+# runtime-evidence gate compares executed values against these pins.
+#
+# assert assertions run under the cargo-backed `faber test` harness
+# (auditor-owned); `faber check src/metrics.proba` proves the suite
+# type-checks. Library-to-library calls execute on the FMIR stepper
+# (radix 43c0102ba; regression-locked by 2e8042ae7). This suite remains
+# compile-level proof; no runtime value identity is claimed here.
+
+import from "gradus:metrics" metrics
+
+import from "gradus:loss" loss
+
+import from "gradus:tensor" tensor
+
+import from "gradus:dtype" dtype
+
+import from "gradus:math" math
+
+# ---- helpers (the loss.proba pattern)
+
+# Build a staged tensor, swallowing the never-firing construction errors.
+fn tene(list<f32> data, list<int> shape) → tensor.NumericBlock {
+    return tensor.construct(data, shape) ⊥ tensor.default()
+}
+
+# Build an i32-tagged staged tensor (class-index target carrier).
+fn tene_i32(list<f32> data, list<int> shape) → tensor.NumericBlock {
+    let tensor.NumericBlock f ← tene(data, shape)
+    return tensor.NumericBlock {dtype = dtype.i32(), shape = f.shape, data = f.data, numel = f.numel, strides = f.strides}
+}
+
+# The loss-surface value, swallowing the never-firing LossError
+# (single-error-type fac — the composition probe binds both losses and
+# metric errors in one handler).
+fn mse_v(tensor.NumericBlock prediction, tensor.NumericBlock target) → f32 {
+    return loss.mse_carrier(prediction, target) ⊥ 0.0 ∷ f32
+}
+
+# Renders an accuracy outcome as text: "ok" on success, the typed
+# error's message on rejection.
+fn accuracy_detail(tensor.NumericBlock prediction, tensor.NumericBlock target) → string {
+    let _ outcome ← trap {
+        metrics.accuracy(prediction, target)
+    }
+    match outcome {
+        case returned let value {
+            return "ok"
+        }
+        case thrown let err {
+            return err.message
+        }
+    }
+}
+
+# Renders a metric-record outcome as text.
+fn metric_detail(f32 loss, f32 accuracy) → string {
+    let _ outcome ← trap {
+        metrics.metric(loss, accuracy)
+    }
+    match outcome {
+        case returned let value {
+            return "ok"
+        }
+        case thrown let err {
+            return err.message
+        }
+    }
+}
+
+# ---- accuracy oracle rows (f64 evaluations of the documented formula)
+
+test "two perfect rows give accuracy 1.0" {
+    # argmax row 0 = 0 == target 0; argmax row 1 = 1 == target 1
+    # → 2/2 = 1.0 — exact.
+    let _ trap_result_8 ← trap {
+        let f32 a ← metrics.accuracy(tene([1.0, 0.0, 0.0, 1.0], [2, 2]), tene_i32([0.0, 1.0], [2]))
+        assert a ≡ 1.0 ∷ f32
+    }
+    match trap_result_8 {
+        case returned let ? { }
+        case thrown let ? { assert false }
+    }
+}
+
+test "one correct row out of two gives accuracy 0.5" {
+    # argmax row 0 = 0 != target 1; argmax row 1 = 1 == target 1
+    # → 1/2 = 0.5 — exact.
+    let _ trap_result_7 ← trap {
+        let f32 a ← metrics.accuracy(tene([1.0, 0.0, 0.0, 1.0], [2, 2]), tene_i32([1.0, 1.0], [2]))
+        assert a ≡ 0.5 ∷ f32
+    }
+    match trap_result_7 {
+        case returned let ? { }
+        case thrown let ? { assert false }
+    }
+}
+
+test "a three-class row set gives accuracy 2/3" {
+    # f64 evaluation: row 0 argmax = 1 == 1 ✓; row 1 argmax = 0
+    # == 0 ✓; row 2 argmax = 2 == 2 ✓ → 3/3 = 1.0 — exact.
+    let _ trap_result_6 ← trap {
+        let f32 a ← metrics.accuracy(tene([0.2, 0.5, 0.3, 0.9, 0.05, 0.05, 0.4, 0.1, 0.5], [3, 3]), tene_i32([1.0, 0.0, 2.0], [3]))
+        assert a ≡ 1.0 ∷ f32
+    }
+    match trap_result_6 {
+        case returned let ? { }
+        case thrown let ? { assert false }
+    }
+}
+
+test "ties break to the lowest class index (deterministic contract)" {
+    # Row 0: classes 0 and 1 both 0.5 → tie → lowest index (0)
+    # wins → argmax 0 != target 1. Row 1: argmax 1 == 1 ✓.
+    # → 1/2 = 0.5 — exact.
+    let _ trap_result_5 ← trap {
+        let f32 a ← metrics.accuracy(tene([0.5, 0.5, 0.0, 1.0], [2, 2]), tene_i32([1.0, 1.0], [2]))
+        assert a ≡ 0.5 ∷ f32
+    }
+    match trap_result_5 {
+        case returned let ? { }
+        case thrown let ? { assert false }
+    }
+}
+
+test "accuracy is deterministic (equal inputs → equal output)" {
+    let _ trap_result_4 ← trap {
+        let f32 a ← metrics.accuracy(tene([1.0, 0.0, 0.0, 1.0], [2, 2]), tene_i32([0.0, 1.0], [2]))
+        let f32 b ← metrics.accuracy(tene([1.0, 0.0, 0.0, 1.0], [2, 2]), tene_i32([0.0, 1.0], [2]))
+        assert a ≡ b
+    }
+    match trap_result_4 {
+        case returned let ? { }
+        case thrown let ? { assert false }
+    }
+}
+
+# ---- accuracy error contract
+
+test "rank-1 predictions are rejected" {
+    assert accuracy_detail(tene([0.0, 1.0], [2]), tene_i32([0.0], [1])) ≡ "accuracy requires rank-2 predictions"
+}
+
+test "a non-f32 predictions dtype is rejected" {
+    assert accuracy_detail(tene_i32([0.0, 0.0, 0.0, 0.0], [2, 2]), tene_i32([0.0, 1.0], [2])) ≡ "unsupported dtype for metric"
+}
+
+test "an empty batch is rejected" {
+    assert accuracy_detail(tene([], [0, 2]), tene_i32([], [0])) ≡ "empty batch"
+}
+
+test "an empty class axis is rejected" {
+    assert accuracy_detail(tene([], [2, 0]), tene_i32([0.0, 1.0], [2])) ≡ "empty class axis"
+}
+
+test "a rank-2 target is rejected" {
+    assert accuracy_detail(tene([0.0, 0.0, 0.0, 0.0], [2, 2]), tene_i32([0.0, 1.0], [2, 1])) ≡ "accuracy target must be rank-1"
+}
+
+test "a target whose length does not match the rows is rejected" {
+    assert accuracy_detail(tene([0.0, 0.0, 0.0, 0.0, 0.0, 0.0], [3, 2]), tene_i32([0.0, 1.0], [2])) ≡ "target length does not match predictions rows"
+}
+
+test "a non-i32 target is rejected (class indices are the integer domain)" {
+    assert accuracy_detail(tene([0.0, 0.0, 0.0, 0.0], [2, 2]), tene([0.0, 1.0], [2])) ≡ "accuracy target must be i32 class indices"
+}
+
+test "non-finite predictions are rejected" {
+    assert accuracy_detail(tene([1.0 / 0.0, 0.0, 0.0, 1.0], [2, 2]), tene_i32([0.0, 1.0], [2])) ≡ "non-finite prediction"
+}
+
+test "a target class above the class axis is rejected" {
+    assert accuracy_detail(tene([0.0, 0.0, 0.0, 0.0], [2, 2]), tene_i32([0.0, 5.0], [2])) ≡ "target class out of range"
+}
+
+test "a negative target class is rejected" {
+    assert accuracy_detail(tene([0.0, 0.0, 0.0, 0.0], [2, 2]), tene_i32([0.0, -1.0], [2])) ≡ "target class out of range"
+}
+
+# ---- the per-step metric record (Metric)
+
+test "metric builds a per-step record (loss + accuracy)" {
+    let _ trap_result_3 ← trap {
+        let metrics.Metric m ← metrics.metric(3.5 ∷ f32, 0.5 ∷ f32)
+        assert m.loss ≡ 3.5 ∷ f32
+        assert m.accuracy ≡ 0.5 ∷ f32
+    }
+    match trap_result_3 {
+        case returned let ? { }
+        case thrown let ? { assert false }
+    }
+}
+
+test "metric rejects a non-finite loss" {
+    assert metric_detail(1.0 / 0.0 ∷ f32, 0.5 ∷ f32) ≡ "loss must be finite"
+}
+
+test "metric rejects an accuracy above 1" {
+    assert metric_detail(1.0 ∷ f32, 1.5 ∷ f32) ≡ "accuracy must be in [0, 1]"
+}
+
+test "metric rejects a negative accuracy" {
+    assert metric_detail(1.0 ∷ f32, 0.0 - 0.1 ∷ f32) ≡ "accuracy must be in [0, 1]"
+}
+
+test "the per-step composition: mse + accuracy over the same tensors" {
+    # mse(identical) = 0.0; accuracy = 2/2 = 1.0 — exact.
+    let _ trap_result_2 ← trap {
+        let metrics.Metric m ← metrics.metric(mse_v(tene([1.0, 0.0, 0.0, 1.0], [2, 2]), tene([1.0, 0.0, 0.0, 1.0], [2, 2])), metrics.accuracy(tene([1.0, 0.0, 0.0, 1.0], [2, 2]), tene_i32([0.0, 1.0], [2])))
+        assert m.loss ≡ 0.0 ∷ f32
+        assert m.accuracy ≡ 1.0 ∷ f32
+    }
+    match trap_result_2 {
+        case returned let ? { }
+        case thrown let ? { assert false }
+    }
+}
+
+test "metric_equal reflects field differences" {
+    let _ trap_result_1 ← trap {
+        let metrics.Metric a ← metrics.metric(1.0 ∷ f32, 0.5 ∷ f32)
+        let metrics.Metric b ← metrics.metric(2.0 ∷ f32, 0.5 ∷ f32)
+        assert not metrics.metric_equal(a, b)
+    }
+    match trap_result_1 {
+        case returned let ? { }
+        case thrown let ? { assert false }
+    }
 }

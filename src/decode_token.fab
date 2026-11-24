@@ -1,104 +1,42 @@
-+++
++++ toml
 locale = "en"
-+++
-# Decode-token composition (A1-PORT-2): ONE token of a llama-family decoder as a
-# chain of `decode_step` lane-kernel launches, with no host touch of the hidden
-# state or the K/V caches between launches.
+
++++ faber
+# Single-token decode step: embedding gather + L layer blocks + final RMSNorm +
+# tied lm_head + argmax. Shape-generic over every model axis.
 #
 # Public import: import from "gradus:decode_token" dt
+# Depends on: gradus:decode_step.
 #
-#   embed_step   token id -> hidden[D]           (1 launch)
-#   layer_step   one transformer layer           (22 launches)
-#   head_step    final norm + tied lm_head       (3 launches)  -> logits[V]
-#   argmax_host  greedy pick of a logits tensor  (host scan)
-#
-# These allocate scratch inside the generic function, which `--strict-engine` refuses
-# and which makes every kernel-written scratch tensor an observation point (a
-# download and a blocking wait per launch). The wide path further down is the
-# strict-engine route: `embed_wide`, `layer_wide`, `head_step_wide`, with the token
-# picked on the device by `decode_step.argmax_token`.
-#
-# A 32-layer token on the serial path is 1 + 32 * 22 + 3 + 1 = 709 launches. Layer
-# launch order (22 launches):
-#   rms_stats, rms_apply (attn norm); gemv_lane x3 (q, k, v); rope_half or rope_pairs x2;
-#   kv_write x2; attn_scores; softmax_stats; softmax_apply; attn_context;
-#   gemv_lane (o); residual_add; rms_stats, rms_apply (ffn norm);
-#   gemv_lane x2 (gate, up); swiglu; gemv_lane (down); residual_add.
-#
-# The layer loop and the per-layer weight lists live in the CALLER, not here:
-# a `list<tensor<f32, [N, K]>>` whose extents are run-time sizes cannot cross a
-# generic host call today (`invalid MIR: call argument type mismatch`, expected
-# `FunctionParameterAxis` extents against the caller's `ScalarBinding` extents),
-# so a gradus-side `token_step(list, ...)` is not expressible; each layer's
-# tensors pass as plain arguments instead.
-#
-# K/V cache protocol: `kv_write` updates the selected row in each mutable
-# stream cache. There is one K cache and one V cache per layer and stream.
-#
-# Weights are laid out [out, in] (a GGUF `[ne1, ne0]` row-major matrix).
-# `pos`, dimensions, GQA group and head_dim are `i32` arguments (no `int ↦ i32`
-# outside main; see decode_step.fab).
+# Calls `decode_step` kernels in sequence so the host stays allocation-free and
+# blocking-free across layers. Both the convenience `*_step` entrypoints and the
+# streaming `*_wide` entrypoints launch natively on Metal GPU and Cranelift CPU.
 
-import from "gradus:decode_step" ds
+import from "gradus:decode_step" let ds
 
-# hidden[D] <- embed[ids[0], :]
+# Embedding lookup: hidden[D] <- embed[ids[0], :].
 @ public
 fn embed_step<size V, size D>(tensor<f32, [V, D]> embed, tensor<i32, [1]> ids, mut tensor<f32, [D]> hidden) → void {
-    mut tensor<f32, [D]> dom ← tf32[D] {}
+    let tensor<f32, [D]> dom ← tf32[D] {}
     ds.gather_row(dom, embed, ids, mut hidden)
 }
 
-# One layer: hout = layer(hin) at position `pos`. `prope` picks the RoPE
-# convention and the caller always passes it: 0 = rotate-half pairs (j, j + span)
-# (`rope_half`, NEOX), 1 = consecutive pairs (2p, 2p + 1) (`rope_pairs`, llama.cpp
-# NORM, the layout of llama-arch GGUF q/k weights). `hdom` is a zero [H] tensor (the
-# row domain of the softmax statistics launch; it also carries the head count).
+# Transformer layer block: hout = layer(hin) at position `pos`, updating `kin` and
+# `vin` row `pos`. Convenience path with internal scratch; for zero-allocation
+# multi-layer streaming under `--strict-engine`, use `layer_wide`.
 @ public
-fn layer_step<size D, size QD, size KVD, size F, size H, size C>(
-    tensor<f32, [H]> hdom,
-    tensor<f32, [D]> hin,
-    mut tensor<f32, [D]> hout,
-    tensor<f32, [D]> anorm,
-    tensor<f32, [QD, D]> wq,
-    tensor<f32, [KVD, D]> wk,
-    tensor<f32, [KVD, D]> wv,
-    tensor<f32, [D, QD]> wo,
-    tensor<f32, [D]> fnorm,
-    tensor<f32, [F, D]> wg,
-    tensor<f32, [F, D]> wu,
-    tensor<f32, [D, F]> wd,
-    mut tensor<f32, [C, KVD]> kin,
-    mut tensor<f32, [C, KVD]> vin,
-    i32 pos,
-    i32 pd,
-    i32 pqd,
-    i32 pf,
-    i32 pc,
-    i32 pdh,
-    i32 pspan,
-    i32 pgroup,
-    f32 peps,
-    f32 plntheta,
-    f32 pscale,
-    i32 prope
-) → void {
-    mut tensor<f32, [1]> dom1 ← tf32[1] {}
-    mut tensor<f32, [1]> st1 ← tf32[1] {}
+fn layer_step<size D, size QD, size KVD, size F, size H, size C>(tensor<f32, [H]> hdom, tensor<f32, [D]> hin, mut tensor<f32, [D]> hout, tensor<f32, [D]> anorm, tensor<f32, [QD, D]> wq, tensor<f32, [KVD, D]> wk, tensor<f32, [KVD, D]> wv, tensor<f32, [D, QD]> wo, tensor<f32, [D]> fnorm, tensor<f32, [F, D]> wg, tensor<f32, [F, D]> wu, tensor<f32, [D, F]> wd, mut tensor<f32, [C, KVD]> kin, mut tensor<f32, [C, KVD]> vin, i32 pos, i32 pd, i32 pqd, i32 pf, i32 pc, i32 pdh, i32 pspan, i32 pgroup, f32 peps, f32 plntheta, f32 pscale, i32 prope) → void {
     mut tensor<f32, [D]> an ← tf32[D] {}
-    ds.rms_stats(dom1, hin, mut st1, pd, peps)
-    ds.rms_apply(hin, st1, anorm, mut an)
+    ds.rmsnorm(hin, anorm, mut an, peps)
 
-    mut tensor<f32, [QD]> qdom ← tf32[QD] {}
-    mut tensor<f32, [KVD]> kvdom ← tf32[KVD] {}
     mut tensor<f32, [QD]> q ← tf32[QD] {}
     mut tensor<f32, [KVD]> k ← tf32[KVD] {}
     mut tensor<f32, [KVD]> v ← tf32[KVD] {}
-    ds.gemv_lane(qdom, wq, an, mut q, pd)
-    ds.gemv_lane(kvdom, wk, an, mut k, pd)
-    ds.gemv_lane(kvdom, wv, an, mut v, pd)
+    ds.qkv_proj(wq, wk, wv, an, mut q, mut k, mut v)
 
     mut tensor<f32, [QD]> qr ← tf32[QD] {}
     mut tensor<f32, [KVD]> kr ← tf32[KVD] {}
+
     if prope ≡ 1 {
         ds.rope_pairs(q, mut qr, pos, pspan, plntheta)
         ds.rope_pairs(k, mut kr, pos, pspan, plntheta)
@@ -107,159 +45,97 @@ fn layer_step<size D, size QD, size KVD, size F, size H, size C>(
         ds.rope_half(q, mut qr, pos, pspan, plntheta)
         ds.rope_half(k, mut kr, pos, pspan, plntheta)
     }
-    ds.kv_write(mut kin, kr, pos)
-    ds.kv_write(mut vin, v, pos)
 
-    mut tensor<f32, [H, C]> hc ← tf32[H, C] {}
+    ds.kv_write_kv(kr, v, mut kin, mut vin, pos)
+
+    let tensor<f32, [H, C]> hcdom ← tf32[H, C] {}
+    let tensor<f32, [QD]> qdom ← tf32[QD] {}
     mut tensor<f32, [H, C]> sc ← tf32[H, C] {}
-    mut tensor<f32, [H]> mx ← tf32[H] {}
-    mut tensor<f32, [H]> sm ← tf32[H] {}
     mut tensor<f32, [H, C]> pr ← tf32[H, C] {}
     mut tensor<f32, [QD]> ctx ← tf32[QD] {}
-    ds.attn_scores(hc, qr, kin, mut sc, pos, pgroup, pdh, pscale)
-    ds.softmax_stats(hdom, sc, mut mx, mut sm, pc)
-    ds.softmax_apply(sc, mx, sm, mut pr)
+    ds.attn_scores(hcdom, qr, kin, mut sc, pos, pgroup, pdh, pscale)
+    ds.row_softmax(sc, mut pr)
     ds.attn_context(qdom, pr, vin, mut ctx, pos, pgroup, pdh)
 
-    mut tensor<f32, [D]> ddom ← tf32[D] {}
     mut tensor<f32, [D]> ao ← tf32[D] {}
     mut tensor<f32, [D]> h1 ← tf32[D] {}
-    ds.gemv_lane(ddom, wo, ctx, mut ao, pqd)
+    ds.gemv(wo, ctx, mut ao)
     ds.residual_add(hin, ao, mut h1)
 
     mut tensor<f32, [D]> fnx ← tf32[D] {}
-    ds.rms_stats(dom1, h1, mut st1, pd, peps)
-    ds.rms_apply(h1, st1, fnorm, mut fnx)
+    ds.rmsnorm(h1, fnorm, mut fnx, peps)
 
-    mut tensor<f32, [F]> fdom ← tf32[F] {}
     mut tensor<f32, [F]> gate ← tf32[F] {}
     mut tensor<f32, [F]> up ← tf32[F] {}
     mut tensor<f32, [F]> act ← tf32[F] {}
     mut tensor<f32, [D]> down ← tf32[D] {}
-    ds.gemv_lane(fdom, wg, fnx, mut gate, pd)
-    ds.gemv_lane(fdom, wu, fnx, mut up, pd)
+    ds.gate_up_proj(wg, wu, fnx, mut gate, mut up)
     ds.swiglu(gate, up, mut act)
-    ds.gemv_lane(ddom, wd, act, mut down, pf)
+    ds.gemv(wd, act, mut down)
     ds.residual_add(h1, down, mut hout)
 }
 
 # logits[V] = embed @ rmsnorm(hidden) (tied lm_head: `embed` is the token table).
 @ public
 fn head_step<size V, size D>(tensor<f32, [D]> hidden, tensor<f32, [D]> onorm, tensor<f32, [V, D]> embed, mut tensor<f32, [V]> logits, i32 pd, f32 peps) → void {
-    mut tensor<f32, [1]> dom1 ← tf32[1] {}
-    mut tensor<f32, [1]> st1 ← tf32[1] {}
     mut tensor<f32, [D]> hn ← tf32[D] {}
-    mut tensor<f32, [V]> vdom ← tf32[V] {}
-    ds.rms_stats(dom1, hidden, mut st1, pd, peps)
-    ds.rms_apply(hidden, st1, onorm, mut hn)
-    ds.gemv_lane(vdom, embed, hn, mut logits, pd)
+    ds.rmsnorm(hidden, onorm, mut hn, peps)
+    ds.gemv(embed, hn, mut logits)
 }
 
 # ---------------------------------------------------------------------------
-# Wide path (strict-engine safe): 14 launches per layer instead of 22, none of them a
-# serial 960-term dot in one lane, and no allocation inside the generic functions
-# (a generic host function that allocates `tf32[D] {}` is refused by `--strict-engine`).
-# The CALLER owns every scratch tensor, allocates it once, and primes it with
-# `prime_layer_wide` / `decode_step.prime1` / `prime2` before the first token; an
-# unprimed kernel-written tensor makes every later launch download it and block. The
-# caches `kin` / `vin` are primed with `decode_step.prime2`.
-#
-# Scratch shapes (D hidden, QD query width, KVD key/value width, F ffn width, H query
-# heads, C cache rows; R = QD + 2 * KVD; P lanes per GEMV row, a power of two, 64 is
-# the measured sweet spot; Q partial sums for RMSNorm, 32):
-#   rp [Q]   qkvp [R, P]   qkv [R]   kvdom [KVD] (zeros)   sc [H, C]   mx [H]   sm [H]
-#   ctx [QD]   op [D, P]   h1 [D]   gp [F, P]   up [F, P]   act [F]   dp [D, P]
-# `pqd` / `pkvd` are QD / KVD, `pdh` the head width, `pgroup` = QD / KVD, `prope` the
-# RoPE pair convention (as in `layer_step`), `pos` the token position.
+# Streaming wide path (strict-engine safe): zero allocation inside generic
+# functions. The caller owns every scratch tensor, allocates it once, and
+# primes it with `prime_layer_wide` / `decode_step.prime1` / `prime2` before
+# the first token. Uses fused QKV/gate+up, native RMSNorm and softmax, and
+# split-K attention context over `P` parallel partitions.
 # ---------------------------------------------------------------------------
-
-# Prime every scratch tensor of `layer_wide` (one launch and one wait each, at setup).
+# Prime every scratch tensor written by `layer_wide` and `head_step_wide`.
 @ public
-fn prime_layer_wide<size D, size QD, size F, size H, size C, size P, size Q, size R>(
-    mut tensor<f32, [Q]> rp,
-    mut tensor<f32, [R, P]> qkvp,
-    mut tensor<f32, [R]> qkv,
-    mut tensor<f32, [H, C]> sc,
-    mut tensor<f32, [H]> mx,
-    mut tensor<f32, [H]> sm,
-    mut tensor<f32, [QD]> ctx,
-    mut tensor<f32, [D, P]> op,
-    mut tensor<f32, [D]> h1,
-    mut tensor<f32, [F, P]> gp,
-    mut tensor<f32, [F, P]> up,
-    mut tensor<f32, [F]> act,
-    mut tensor<f32, [D, P]> dp,
-    mut tensor<f32, [1]> sink
-) → void {
-    ds.prime1(rp, mut sink)
-    ds.prime2(qkvp, mut sink)
-    ds.prime1(qkv, mut sink)
+fn prime_layer_wide<size D, size QD, size KVD, size F, size H, size C, size P>(mut tensor<f32, [D]> xn, mut tensor<f32, [QD]> q, mut tensor<f32, [QD]> qr, mut tensor<f32, [KVD]> k, mut tensor<f32, [KVD]> kr, mut tensor<f32, [KVD]> v, mut tensor<f32, [H, C]> sc, mut tensor<f32, [H, C]> pr, mut tensor<f32, [P, QD]> cp, mut tensor<f32, [QD]> ctx, mut tensor<f32, [D]> h1, mut tensor<f32, [F]> gate, mut tensor<f32, [F]> up, mut tensor<f32, [F]> act, mut tensor<f32, [1]> sink) → void {
+    ds.prime1(xn, mut sink)
+    ds.prime1(q, mut sink)
+    ds.prime1(qr, mut sink)
+    ds.prime1(k, mut sink)
+    ds.prime1(kr, mut sink)
+    ds.prime1(v, mut sink)
     ds.prime2(sc, mut sink)
-    ds.prime1(mx, mut sink)
-    ds.prime1(sm, mut sink)
+    ds.prime2(pr, mut sink)
+    ds.prime2(cp, mut sink)
     ds.prime1(ctx, mut sink)
-    ds.prime2(op, mut sink)
     ds.prime1(h1, mut sink)
-    ds.prime2(gp, mut sink)
-    ds.prime2(up, mut sink)
+    ds.prime1(gate, mut sink)
+    ds.prime1(up, mut sink)
     ds.prime1(act, mut sink)
-    ds.prime2(dp, mut sink)
 }
 
-# One layer: hout = layer(hin) at position `pos`, in 14 launches.
+# One layer: hout = layer(hin) at position `pos`, zero host allocations.
 @ public
-fn layer_wide<size D, size QD, size KVD, size F, size H, size C, size P, size Q, size R>(
-    tensor<f32, [D]> hin,
-    mut tensor<f32, [D]> hout,
-    tensor<f32, [D]> anorm,
-    tensor<f32, [QD, D]> wq,
-    tensor<f32, [KVD, D]> wk,
-    tensor<f32, [KVD, D]> wv,
-    tensor<f32, [D, QD]> wo,
-    tensor<f32, [D]> fnorm,
-    tensor<f32, [F, D]> wg,
-    tensor<f32, [F, D]> wu,
-    tensor<f32, [D, F]> wd,
-    mut tensor<f32, [C, KVD]> kin,
-    mut tensor<f32, [C, KVD]> vin,
-    mut tensor<f32, [Q]> rp,
-    mut tensor<f32, [R, P]> qkvp,
-    mut tensor<f32, [R]> qkv,
-    tensor<f32, [KVD]> kvdom,
-    mut tensor<f32, [H, C]> sc,
-    mut tensor<f32, [H]> mx,
-    mut tensor<f32, [H]> sm,
-    mut tensor<f32, [QD]> ctx,
-    mut tensor<f32, [D, P]> op,
-    mut tensor<f32, [D]> h1,
-    mut tensor<f32, [F, P]> gp,
-    mut tensor<f32, [F, P]> up,
-    mut tensor<f32, [F]> act,
-    mut tensor<f32, [D, P]> dp,
-    i32 pos,
-    i32 pqd,
-    i32 pkvd,
-    i32 pdh,
-    i32 pgroup,
-    i32 prope,
-    f32 peps,
-    f32 plntheta,
-    f32 pscale
-) → void {
-    ds.rms_part(hin, mut rp)
-    ds.qkv_part(hin, rp, anorm, wq, wk, wv, mut qkvp, peps)
-    ds.qkv_fin(qkvp, mut qkv, pos, pqd, pkvd, pdh, plntheta, prope)
-    ds.kv_write_wide(kvdom, qkv, mut kin, mut vin, pos, pqd)
-    ds.scores_wide(qkv, kin, mut sc, pos, pdh, pgroup, pscale)
-    ds.softmax_wide(sc, mut mx, mut sm, pos)
-    ds.attn_wide(sc, mx, sm, vin, mut ctx, pos, pdh, pgroup)
-    ds.gemv_part(ctx, wo, mut op)
-    ds.gemv_fin_residual(op, hin, mut h1)
-    ds.rms_part(h1, mut rp)
-    ds.gateup_part(h1, rp, fnorm, wg, wu, mut gp, mut up, peps)
-    ds.swiglu_fin(gp, up, mut act)
-    ds.gemv_part(act, wd, mut dp)
-    ds.gemv_fin_residual(dp, h1, mut hout)
+fn layer_wide<size D, size QD, size KVD, size F, size H, size C, size P>(tensor<f32, [D]> hin, mut tensor<f32, [D]> hout, tensor<f32, [D]> anorm, tensor<f32, [QD, D]> wq, tensor<f32, [KVD, D]> wk, tensor<f32, [KVD, D]> wv, tensor<f32, [D, QD]> wo, tensor<f32, [D]> fnorm, tensor<f32, [F, D]> wg, tensor<f32, [F, D]> wu, tensor<f32, [D, F]> wd, mut tensor<f32, [C, KVD]> kin, mut tensor<f32, [C, KVD]> vin, tensor<f32, [H, C]> hcdom, tensor<f32, [P, QD]> cpdom, tensor<f32, [QD]> qdom, mut tensor<f32, [D]> xn, mut tensor<f32, [QD]> q, mut tensor<f32, [QD]> qr, mut tensor<f32, [KVD]> k, mut tensor<f32, [KVD]> kr, mut tensor<f32, [KVD]> v, mut tensor<f32, [H, C]> sc, mut tensor<f32, [H, C]> pr, mut tensor<f32, [P, QD]> cp, mut tensor<f32, [QD]> ctx, mut tensor<f32, [D]> h1, mut tensor<f32, [F]> gate, mut tensor<f32, [F]> up, mut tensor<f32, [F]> act, i32 pos, i32 pdh, i32 pspan, i32 pgroup, i32 prope, f32 peps, f32 plntheta, f32 pscale) → void {
+    ds.rmsnorm(hin, anorm, mut xn, peps)
+    ds.qkv_proj(wq, wk, wv, xn, mut q, mut k, mut v)
+
+    if prope ≡ 1 {
+        ds.rope_pairs(q, mut qr, pos, pspan, plntheta)
+        ds.rope_pairs(k, mut kr, pos, pspan, plntheta)
+    }
+    else {
+        ds.rope_half(q, mut qr, pos, pspan, plntheta)
+        ds.rope_half(k, mut kr, pos, pspan, plntheta)
+    }
+
+    ds.kv_write_kv(kr, v, mut kin, mut vin, pos)
+    ds.attn_scores(hcdom, qr, kin, mut sc, pos, pgroup, pdh, pscale)
+    ds.row_softmax(sc, mut pr)
+    ds.context_part(cpdom, pr, vin, mut cp, pos, pgroup, pdh)
+    ds.context_fin(qdom, cp, mut ctx)
+    ds.gemv(wo, ctx, mut xn)
+    ds.residual_add(hin, xn, mut h1)
+    ds.rmsnorm(h1, fnorm, mut xn, peps)
+    ds.gate_up_proj(wg, wu, xn, mut gate, mut up)
+    ds.swiglu(gate, up, mut act)
+    ds.gemv(wd, act, mut xn)
+    ds.residual_add(h1, xn, mut hout)
 }
 
 # hidden[D] <- embed[ids[0], :] (the id is read on the device).
@@ -268,24 +144,119 @@ fn embed_wide<size V, size D>(tensor<f32, [V, D]> embed, tensor<i32, [1]> ids, m
     ds.gather_wide(embed, ids, mut hidden)
 }
 
-# logits[V] = embed @ rmsnorm(hidden), the final norm folded into the lm_head GEMV.
+# logits[V] = embed @ rmsnorm(hidden) (reusing normalized scratch `hn`).
 @ public
-fn head_step_wide<size V, size D, size Q>(tensor<f32, [D]> hidden, tensor<f32, [D]> onorm, tensor<f32, [V, D]> embed, mut tensor<f32, [Q]> rp, mut tensor<f32, [V]> logits, f32 peps) → void {
-    ds.rms_part(hidden, mut rp)
-    ds.head_wide(hidden, rp, onorm, embed, mut logits, peps)
+fn head_step_wide<size V, size D>(tensor<f32, [D]> hidden, tensor<f32, [D]> onorm, tensor<f32, [V, D]> embed, mut tensor<f32, [D]> hn, mut tensor<f32, [V]> logits, f32 peps) → void {
+    ds.rmsnorm(hidden, onorm, mut hn, peps)
+    ds.gemv(embed, hn, mut logits)
 }
 
-# Greedy pick on the host: the index of the largest logit (first on ties). The wide
-# path uses `decode_step.argmax_token` instead, which leaves the id on the device.
+# Greedy pick on the host: the index of the largest logit (first on ties). The
+# streaming path uses `decode_step.argmax_token` instead, which leaves the id
+# on the device.
 @ public
 fn argmax_host<size V>(tensor<f32, [V]> logits) → int {
     mut int best ← 0
     mut f32 top ← logits[[0]]
+
     for range 1 ‥ V let i {
         if logits[[i]] ≻ top {
             top ← logits[[i]]
             best ← i
         }
     }
+
     return best
+}
+
++++ faber test
+# Co-located package test for decode_token.fab. Runs through KIR on CPU and Metal.
+
+import from "gradus:decode_token" dt
+
+fn close(f32 a, f32 b) → bool {
+    return (a - b).abs() ≺ 0.0001
+}
+
+test "decode_token embed_step gathers the row named by ids[0]" {
+    mut tensor<f32, [5, 4]> tab ← tf32[5, 4] {}
+    mut tensor<i32, [1]> ids ← tensor<i32, [1]> {}
+    mut tensor<f32, [4]> h ← tf32[4] {}
+    for range 0‥5 let r {
+        for range 0‥4 let c {
+            tab[[r, c]] ← (r * 10 + c) ↦ f32
+        }
+    }
+    ids[0] ← 3
+    dt.embed_step(tab, ids, mut h)
+    assert close(h[[0]], 30.0)
+    assert close(h[[3]], 33.0)
+}
+
+test "decode_token argmax_host picks the largest logit, first on ties" {
+    mut tensor<f32, [5]> lg ← tf32[5] {}
+    lg[[0]] ← 0.5
+    lg[[1]] ← 2.0
+    lg[[2]] ← 2.0
+    lg[[3]] ← -1.0
+    lg[[4]] ← 1.0
+    assert dt.argmax_host(lg) ≡ 1
+}
+
+test "decode_token head_step is the tied lm_head over the normalised hidden" {
+    mut tensor<f32, [4]> h ← tf32[4] {}
+    mut tensor<f32, [4]> w ← tf32[4] {}
+    mut tensor<f32, [5, 4]> tab ← tf32[5, 4] {}
+    mut tensor<f32, [5]> lg ← tf32[5] {}
+    for range 0‥4 let j {
+        h[[j]] ← 2.0
+        w[[j]] ← 1.0
+    }
+    for range 0‥5 let r {
+        tab[[r, 0]] ← r ↦ f32
+    }
+    dt.head_step(h, w, tab, mut lg, 4, 0.0)
+    # rmsnorm of [2,2,2,2] is [1,1,1,1]; logit r = tab[r] . 1 = r
+    assert close(lg[[0]], 0.0)
+    assert close(lg[[3]], 3.0)
+    assert close(lg[[4]], 4.0)
+}
+
+test "decode_token layer_step with zero weights is the identity on the residual stream" {
+    mut tensor<f32, [2]> hd ← tf32[2] {}
+    mut tensor<f32, [4]> hin ← tf32[4] {}
+    mut tensor<f32, [4]> hout ← tf32[4] {}
+    mut tensor<f32, [4]> an ← tf32[4] {}
+    mut tensor<f32, [4]> fn2 ← tf32[4] {}
+    mut tensor<f32, [4, 4]> wq ← tf32[4, 4] {}
+    mut tensor<f32, [2, 4]> wk ← tf32[2, 4] {}
+    mut tensor<f32, [2, 4]> wv ← tf32[2, 4] {}
+    mut tensor<f32, [4, 4]> wo ← tf32[4, 4] {}
+    mut tensor<f32, [6, 4]> wg ← tf32[6, 4] {}
+    mut tensor<f32, [6, 4]> wu ← tf32[6, 4] {}
+    mut tensor<f32, [4, 6]> wd ← tf32[4, 6] {}
+    mut tensor<f32, [4, 2]> kin ← tf32[4, 2] {}
+    mut tensor<f32, [4, 2]> vin ← tf32[4, 2] {}
+    for range 0‥4 let j {
+        hin[[j]] ← (j ↦ f32) + 1.0
+        an[[j]] ← 1.0
+        fn2[[j]] ← 1.0
+    }
+    kin[[1, 0]] ← 7.0
+    kin[[1, 1]] ← 8.0
+    vin[[1, 0]] ← 9.0
+    vin[[1, 1]] ← 10.0
+    dt.layer_step(hd, hin, mut hout, an, wq, wk, wv, wo, fn2, wg, wu, wd, mut kin, mut vin, 0, 4, 4, 6, 4, 2, 1, 2, 0.00001, 11.512925, 0.5, 0)
+    assert close(hout[[0]], 1.0)
+    assert close(hout[[1]], 2.0)
+    assert close(hout[[3]], 4.0)
+    assert kin[[0, 0]] ≡ (0.0 ↦ f32)
+    assert kin[[1, 0]] ≡ (7.0 ↦ f32)
+    assert kin[[1, 1]] ≡ (8.0 ↦ f32)
+    assert vin[[1, 0]] ≡ (9.0 ↦ f32)
+    assert vin[[1, 1]] ≡ (10.0 ↦ f32)
+    # The consecutive-pair convention is the identity here too.
+    dt.layer_step(hd, hin, mut hout, an, wq, wk, wv, wo, fn2, wg, wu, wd, mut kin, mut vin, 0, 4, 4, 6, 4, 2, 1, 2, 0.00001, 11.512925, 0.5, 1)
+    assert close(hout[[0]], 1.0)
+    assert close(hout[[3]], 4.0)
 }
