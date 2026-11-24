@@ -1,0 +1,1010 @@
++++ toml
+locale = "en"
+
++++ faber
+# LinearWeight — per-module operator binding from TensorDirectory sibling
+# presence and host-side linear_matvec dispatch (issue #50).
+#
+# Public import: import from "gradus:model/linear_weight" lw
+# Depends on: gradus:model/bundle, gradus:model/tensor_directory,
+#   gradus:model/dequant, gradus:quant/group_affine, gradus:quant/q8_0,
+#   gradus:quant/q4_1, gradus:quant/q5_0, gradus:quant/iq4_nl,
+#   gradus:decode_step, gradus:kernel, gradus:storage.
+#
+# --- Contract ------------------------------------------------------------
+#
+# Binds a single linear site (q_proj, k_proj, v_proj, o_proj, gate_proj,
+# up_proj, down_proj, lm_head) to a typed LinearWeight descriptor by
+# inspecting resident sibling tensors first:
+#   .weight + .scales + .biases  -> GroupAffine (u32 or u8, 4/6/8-bit)
+#   single GGML block tensor     -> GgmlBlock (Q8_0 / Q4_1 / Q5_0 / IQ4_NL /
+#                                   Q4_K / Q5_K / Q6_K)
+#   .weight [+ .bias]            -> DenseF32 / DenseBf16 / DenseF16
+#
+# Optional QuantConfigHint supplies secondary validation/parameter defaults
+# (e.g. bits, group_size from config.json) while ignoring stale `mode`
+# overrides (such as `mode: "nvfp4"`) when GroupAffine siblings are present.
+#
+# Host-side linear_matvec and kernel dispatchers operate per module so two
+# projections in the same layer can hold different quantization schemes
+# without expanding full weight matrices to F32.
+
+import from "gradus:decode_step" let decode_step
+import from "gradus:kernel" let kern
+import from "gradus:model/bundle" let bundle
+import from "gradus:model/dequant" let dequant
+import from "gradus:model/tensor_directory" let td
+import from "gradus:quant/group_affine" let ga
+import from "gradus:storage" let storage
+
+@ public
+union LinearWeightError {
+    @ shared
+    string message
+
+    BadBinding,
+    UnsupportedFormat,
+    BadShape,
+    BadConfig,
+    DirectoryFailure {
+        td.DirectoryError inner
+    },
+    GroupAffineFailure {
+        ga.GroupAffineError inner
+    },
+    DequantFailure {
+        dequant.DequantError inner
+    }
+}
+
+@ conversion
+fn from_directory_error(td.DirectoryError err) → LinearWeightError {
+    return variant DirectoryFailure { message = err.message, inner = err }
+}
+
+@ conversion
+fn from_group_affine_error(ga.GroupAffineError err) → LinearWeightError {
+    return variant GroupAffineFailure { message = err.message, inner = err }
+}
+
+@ conversion
+fn from_dequant_error(dequant.DequantError err) → LinearWeightError {
+    return variant DequantFailure { message = err.message, inner = err }
+}
+
+@ public
+union LinearWeightKind {
+    DenseF32,
+    DenseBf16,
+    DenseF16,
+    GgmlBlockQ8_0,
+    GgmlBlockQ4_1,
+    GgmlBlockQ5_0,
+    GgmlBlockIQ4_NL,
+    GgmlBlockQ4_K,
+    GgmlBlockQ5_K,
+    GgmlBlockQ6_K,
+    GroupAffineU32,
+    GroupAffineU8
+}
+
+@ public
+class QuantConfigHint {
+    let string ∪ none mode
+    let int ∪ none bits
+    let int ∪ none group_size
+}
+
+@ public
+fn default_hint() → QuantConfigHint {
+    return QuantConfigHint { mode = null, bits = null, group_size = null }
+}
+
+@ public
+class LinearWeight {
+    let LinearWeightKind kind
+    let int out_features
+    let int in_features
+    let int bits
+    let int group_size
+    let int packed_cols
+    let int group_cols
+    let bool has_bias
+}
+
+@ public
+union WeightPayload {
+    DensePayload {
+        list<f32> weight
+        list<f32> bias
+    },
+    GroupAffineU32Payload {
+        list<u32> weight
+        list<f32> scales
+        list<f32> biases
+        list<f32> bias
+    },
+    GroupAffineU8Payload {
+        list<u8> weight
+        list<f32> scales
+        list<f32> biases
+        list<f32> bias
+    },
+    GgmlBlockPayload {
+        list<u8> raw_blocks
+        list<f32> bias
+    }
+}
+
+# -------------------------------------------------------------------------
+# Binding from TensorDirectory sibling presence
+# -------------------------------------------------------------------------
+
+fn is_ggml_block_dtype(string raw_dtype) → bool {
+    return raw_dtype ≡ "Q8_0" or raw_dtype ≡ "Q4_1" or raw_dtype ≡ "Q5_0" or raw_dtype ≡ "IQ4_NL" or raw_dtype ≡ "Q4_K" or raw_dtype ≡ "Q5_K" or raw_dtype ≡ "Q6_K"
+}
+
+fn ggml_kind_for(string raw_dtype) → LinearWeightKind ⇥ LinearWeightError {
+    switch raw_dtype {
+        case "Q8_0" {
+            return variant LinearWeightKind.GgmlBlockQ8_0
+        }
+        case "Q4_1" {
+            return variant LinearWeightKind.GgmlBlockQ4_1
+        }
+        case "Q5_0" {
+            return variant LinearWeightKind.GgmlBlockQ5_0
+        }
+        case "IQ4_NL" {
+            return variant LinearWeightKind.GgmlBlockIQ4_NL
+        }
+        case "Q4_K" {
+            return variant LinearWeightKind.GgmlBlockQ4_K
+        }
+        case "Q5_K" {
+            return variant LinearWeightKind.GgmlBlockQ5_K
+        }
+        case "Q6_K" {
+            return variant LinearWeightKind.GgmlBlockQ6_K
+        }
+        default {
+            throw variant UnsupportedFormat { message = "unsupported GGML block dtype: §"(raw_dtype) }
+        }
+    }
+}
+
+fn ggml_block_elements(LinearWeightKind kind) → int ⇥ LinearWeightError {
+    match kind {
+        case LinearWeightKind.GgmlBlockQ8_0 {
+            return 32
+        }
+        case LinearWeightKind.GgmlBlockQ4_1 {
+            return 32
+        }
+        case LinearWeightKind.GgmlBlockQ5_0 {
+            return 32
+        }
+        case LinearWeightKind.GgmlBlockIQ4_NL {
+            return 32
+        }
+        case LinearWeightKind.GgmlBlockQ4_K {
+            return 256
+        }
+        case LinearWeightKind.GgmlBlockQ5_K {
+            return 256
+        }
+        case LinearWeightKind.GgmlBlockQ6_K {
+            return 256
+        }
+        default {
+            throw variant UnsupportedFormat { message = "not a GGML block kind" }
+        }
+    }
+}
+
+fn ggml_block_bytes(LinearWeightKind kind) → int ⇥ LinearWeightError {
+    match kind {
+        case LinearWeightKind.GgmlBlockQ8_0 {
+            return 34
+        }
+        case LinearWeightKind.GgmlBlockQ4_1 {
+            return 20
+        }
+        case LinearWeightKind.GgmlBlockQ5_0 {
+            return 22
+        }
+        case LinearWeightKind.GgmlBlockIQ4_NL {
+            return 18
+        }
+        case LinearWeightKind.GgmlBlockQ4_K {
+            return 144
+        }
+        case LinearWeightKind.GgmlBlockQ5_K {
+            return 176
+        }
+        case LinearWeightKind.GgmlBlockQ6_K {
+            return 210
+        }
+        default {
+            throw variant UnsupportedFormat { message = "not a GGML block kind" }
+        }
+    }
+}
+
+fn dense_kind_for(string raw_dtype) → LinearWeightKind ⇥ LinearWeightError {
+    switch raw_dtype {
+        case "F32" {
+            return variant LinearWeightKind.DenseF32
+        }
+        case "BF16" {
+            return variant LinearWeightKind.DenseBf16
+        }
+        case "F16" {
+            return variant LinearWeightKind.DenseF16
+        }
+        default {
+            throw variant UnsupportedFormat { message = "unsupported dense dtype: §"(raw_dtype) }
+        }
+    }
+}
+
+fn bind_group_affine(td.DirectoryEntry weight, td.DirectoryEntry scales, td.DirectoryEntry biases, bool has_bias, QuantConfigHint hint) → LinearWeight ⇥ LinearWeightError {
+    let int out_features ← weight.shape.get(0) coalesce 0
+    let int packed_cols ← weight.shape.get(1) coalesce 0
+    require scales.shape.length() ≡ 2 and biases.shape.length() ≡ 2 throw variant BadShape { message = "scales and biases must be rank-2" }
+
+    let int s_rows ← scales.shape.get(0) coalesce 0
+    let int group_cols ← scales.shape.get(1) coalesce 0
+    let int b_rows ← biases.shape.get(0) coalesce 0
+    let int b_cols ← biases.shape.get(1) coalesce 0
+    require s_rows ≡ out_features and b_rows ≡ out_features and b_cols ≡ group_cols and group_cols ≥ 1 throw variant BadShape { message = "scales/biases shape mismatch against weight" }
+
+    let int group_size ← hint.group_size coalesce 64
+    require group_size ≥ 1 throw variant BadConfig { message = "group_size must be at least 1" }
+
+    let int in_features ← group_cols * group_size
+    mut int pack_width ← 32
+    mut ga.PackKind pack ← variant ga.PackKind.PackU32
+    mut LinearWeightKind kind ← variant LinearWeightKind.GroupAffineU32
+
+    if weight.raw_dtype ≡ "U32" {
+        pack_width ← 32
+        pack ← variant ga.PackKind.PackU32
+        kind ← variant LinearWeightKind.GroupAffineU32
+    }
+    elif weight.raw_dtype ≡ "U8" {
+        pack_width ← 8
+        pack ← variant ga.PackKind.PackU8
+        kind ← variant LinearWeightKind.GroupAffineU8
+    }
+    else {
+        throw variant UnsupportedFormat { message = "GroupAffine weight dtype must be U32 or U8, got §"(weight.raw_dtype) }
+    }
+
+    let int total_bits ← packed_cols * pack_width
+    mut int bits ← 0
+
+    if hint.bits is int {
+        let int hb ← hint.bits coalesce 0
+        require total_bits ≡ in_features * hb throw variant BadConfig { message = "hint.bits does not match packed GroupAffine shape" }
+        bits ← hb
+    }
+    else {
+        require total_bits % in_features ≡ 0 throw variant BadShape { message = "packed GroupAffine bit width not divisible by in_features" }
+        bits ← total_bits / in_features
+    }
+
+    let ga.GroupAffineSpec spec ← ga.admit_spec(out_features, in_features, bits, group_size, pack)
+    return LinearWeight { kind = kind, out_features = spec.out_features, in_features = spec.in_features, bits = spec.bits, group_size = spec.group_size, packed_cols = spec.packed_cols, group_cols = spec.group_cols, has_bias = has_bias }
+}
+
+@ public
+fn bind_with_config(td.TensorDirectory dir, bundle.MemberRole role, string module_prefix, QuantConfigHint hint) → LinearWeight ⇥ LinearWeightError {
+    let td.SiblingSet sib ← td.siblings(dir, role, module_prefix)
+    let td.DirectoryEntry weight ← sib.weight
+
+    require weight.shape.length() ≡ 2 throw variant BadShape { message = "weight shape must be rank-2" }
+
+    let int out_features ← weight.shape.get(0) coalesce 0
+    let int col_extent ← weight.shape.get(1) coalesce 0
+    require out_features ≥ 1 and col_extent ≥ 1 throw variant BadShape { message = "weight shape must have positive extents" }
+
+    let bool has_bias ← td.has_tensor(dir, role, "§.bias"(module_prefix))
+
+    # 1. GroupAffine: .weight + .scales + .biases (overrides stale config mode)
+    let td.DirectoryEntry ∪ none maybe_scales ← sib.scales
+    let td.DirectoryEntry ∪ none maybe_biases ← sib.biases
+    if maybe_scales is td.DirectoryEntry and maybe_biases is td.DirectoryEntry {
+        return bind_group_affine(weight, maybe_scales, maybe_biases, has_bias, hint)
+    }
+
+    # 2. GgmlBlock: single GGML block tensor
+    if is_ggml_block_dtype(weight.raw_dtype) {
+        let LinearWeightKind kind ← ggml_kind_for(weight.raw_dtype)
+        let int block_elems ← ggml_block_elements(kind)
+        require col_extent % block_elems ≡ 0 throw variant BadShape { message = "GGML weight in_features must be divisible by block element count" }
+        return LinearWeight { kind = kind, out_features = out_features, in_features = col_extent, bits = 0, group_size = 0, packed_cols = 0, group_cols = 0, has_bias = has_bias }
+    }
+
+    # 3. Dense: .weight [+ .bias]
+    let LinearWeightKind kind ← dense_kind_for(weight.raw_dtype)
+    return LinearWeight { kind = kind, out_features = out_features, in_features = col_extent, bits = 0, group_size = 0, packed_cols = 0, group_cols = 0, has_bias = has_bias }
+}
+
+@ public
+fn bind(td.TensorDirectory dir, bundle.MemberRole role, string module_prefix) → LinearWeight ⇥ LinearWeightError {
+    return bind_with_config(dir, role, module_prefix, default_hint())
+}
+
+@ public
+fn to_group_affine_spec(LinearWeight lw) → ga.GroupAffineSpec ⇥ LinearWeightError {
+    match lw.kind {
+        case LinearWeightKind.GroupAffineU32 {
+            return ga.admit_spec(lw.out_features, lw.in_features, lw.bits, lw.group_size, variant ga.PackKind.PackU32)
+        }
+        case LinearWeightKind.GroupAffineU8 {
+            return ga.admit_spec(lw.out_features, lw.in_features, lw.bits, lw.group_size, variant ga.PackKind.PackU8)
+        }
+        default {
+            throw variant UnsupportedFormat { message = "LinearWeight is not GroupAffine" }
+        }
+    }
+}
+
+# -------------------------------------------------------------------------
+# Host-side linear_matvec dispatch (without expanding weights to F32)
+# -------------------------------------------------------------------------
+
+fn apply_optional_bias(mut list<f32> y, list<f32> bias, int out_features) → void ⇥ LinearWeightError {
+    if bias.length() ≻ 0 {
+        require bias.length() ≡ out_features throw variant BadShape { message = "bias length mismatch" }
+        for exclusive out_features let r {
+            y[r] ← y[r] + bias[r]
+        }
+    }
+}
+
+@ public
+fn linear_matvec_dense(int out_features, int in_features, list<f32> w_dense, list<f32> bias, list<f32> x) → list<f32> ⇥ LinearWeightError {
+    require w_dense.length() ≡ out_features * in_features throw variant BadShape { message = "dense weight length mismatch" }
+    require x.length() ≡ in_features throw variant BadShape { message = "input vector length mismatch" }
+
+    mut list<f32> y ← empty
+
+    for exclusive out_features let r {
+        mut f32 acc ← 0.0 ∷ f32
+        let int base ← r * in_features
+
+        for exclusive in_features let j {
+            acc ← acc + w_dense[base + j] * x[j]
+        }
+
+        y.append(acc)
+    }
+
+    apply_optional_bias(mut y, bias, out_features)
+    return y
+}
+
+fn unpack_u32_at(list<u32> weight, int w_base, int j, int bits) → int {
+    let int bit_pos ← j * bits
+    let int word_idx ← bit_pos / 32
+    let int shift ← bit_pos % 32
+    let int w0 ← weight[w_base + word_idx] ↦ int
+
+    if bits ≡ 8 {
+        return (w0 ⇒ shift) % 256
+    }
+
+    if bits ≡ 4 {
+        return (w0 ⇒ shift) % 16
+    }
+
+    if shift ≤ 26 {
+        return (w0 ⇒ shift) % 64
+    }
+
+    let int w1 ← weight[w_base + word_idx + 1] ↦ int
+    let int lo ← w0 ⇒ shift
+    let int hi ← w1 ⇐ (32 - shift)
+    return (lo ∨ hi) % 64
+}
+
+fn unpack_u8_at(list<u8> weight, int w_base, int j, int bits) → int {
+    if bits ≡ 8 {
+        return weight[w_base + j] ↦ int
+    }
+
+    let int b ← weight[w_base + j / 2] ↦ int
+    let int shift ← (j % 2) * 4
+    return (b ⇒ shift) % 16
+}
+
+@ public
+fn linear_matvec_group_affine_u32(ga.GroupAffineSpec spec, list<u32> weight, list<f32> scales, list<f32> biases, list<f32> bias, list<f32> x) → list<f32> ⇥ LinearWeightError {
+    match spec.pack {
+        case PackU32 {}
+        default {
+            throw variant BadBinding { message = "expected PackU32 spec" }
+        }
+    }
+
+    require weight.length() ≡ spec.out_features * spec.packed_cols throw variant BadShape { message = "weight length mismatch" }
+    require scales.length() ≡ spec.out_features * spec.group_cols throw variant BadShape { message = "scales length mismatch" }
+    require biases.length() ≡ spec.out_features * spec.group_cols throw variant BadShape { message = "biases length mismatch" }
+    require x.length() ≡ spec.in_features throw variant BadShape { message = "input vector length mismatch" }
+
+    mut list<f32> y ← empty
+
+    for exclusive spec.out_features let r {
+        let int w_base ← r * spec.packed_cols
+        let int g_base ← r * spec.group_cols
+        mut f32 acc ← 0.0 ∷ f32
+
+        for exclusive spec.in_features let j {
+            let int q ← unpack_u32_at(weight, w_base, j, spec.bits)
+            let int g ← j / spec.group_size
+            let f32 w ← (q ↦ f32) * scales[g_base + g] + biases[g_base + g]
+            acc ← acc + w * x[j]
+        }
+
+        y.append(acc)
+    }
+
+    apply_optional_bias(mut y, bias, spec.out_features)
+    return y
+}
+
+@ public
+fn linear_matvec_group_affine_u8(ga.GroupAffineSpec spec, list<u8> weight, list<f32> scales, list<f32> biases, list<f32> bias, list<f32> x) → list<f32> ⇥ LinearWeightError {
+    match spec.pack {
+        case PackU8 {}
+        default {
+            throw variant BadBinding { message = "expected PackU8 spec" }
+        }
+    }
+
+    require weight.length() ≡ spec.out_features * spec.packed_cols throw variant BadShape { message = "weight length mismatch" }
+    require scales.length() ≡ spec.out_features * spec.group_cols throw variant BadShape { message = "scales length mismatch" }
+    require biases.length() ≡ spec.out_features * spec.group_cols throw variant BadShape { message = "biases length mismatch" }
+    require x.length() ≡ spec.in_features throw variant BadShape { message = "input vector length mismatch" }
+
+    mut list<f32> y ← empty
+
+    for exclusive spec.out_features let r {
+        let int w_base ← r * spec.packed_cols
+        let int g_base ← r * spec.group_cols
+        mut f32 acc ← 0.0 ∷ f32
+
+        for exclusive spec.in_features let j {
+            let int q ← unpack_u8_at(weight, w_base, j, spec.bits)
+            let int g ← j / spec.group_size
+            let f32 w ← (q ↦ f32) * scales[g_base + g] + biases[g_base + g]
+            acc ← acc + w * x[j]
+        }
+
+        y.append(acc)
+    }
+
+    apply_optional_bias(mut y, bias, spec.out_features)
+    return y
+}
+
+fn ggml_representation(LinearWeightKind kind) → storage.Representation ⇥ LinearWeightError {
+    match kind {
+        case LinearWeightKind.GgmlBlockQ8_0 {
+            return storage.ggml_representation(8)
+        }
+        case LinearWeightKind.GgmlBlockQ4_1 {
+            return storage.ggml_representation(3)
+        }
+        case LinearWeightKind.GgmlBlockQ5_0 {
+            return storage.ggml_representation(6)
+        }
+        case LinearWeightKind.GgmlBlockIQ4_NL {
+            return storage.ggml_representation(20)
+        }
+        case LinearWeightKind.GgmlBlockQ4_K {
+            return storage.ggml_representation(12)
+        }
+        case LinearWeightKind.GgmlBlockQ5_K {
+            return storage.ggml_representation(13)
+        }
+        case LinearWeightKind.GgmlBlockQ6_K {
+            return storage.ggml_representation(14)
+        }
+        default {
+            throw variant UnsupportedFormat { message = "not a GGML block kind" }
+        }
+    }
+}
+
+fn decode_ggml_block_f32(LinearWeightKind kind, list<u8> block_bytes_list) → list<f32> ⇥ LinearWeightError {
+    let storage.Representation rep ← ggml_representation(kind)
+    return dequant.decode_block_u8(rep, block_bytes_list)
+}
+
+@ public
+fn linear_matvec_ggml_block(LinearWeight lw, list<u8> raw_blocks, list<f32> bias, list<f32> x) → list<f32> ⇥ LinearWeightError {
+    let int out_features ← lw.out_features
+    let int in_features ← lw.in_features
+    let int block_elements ← ggml_block_elements(lw.kind)
+    let int block_bytes ← ggml_block_bytes(lw.kind)
+    let int total_blocks ← in_features / block_elements
+    let int expected_bytes ← out_features * total_blocks * block_bytes
+
+    require raw_blocks.length() ≡ expected_bytes throw variant BadShape { message = "raw block byte length mismatch" }
+    require x.length() ≡ in_features throw variant BadShape { message = "input vector length mismatch" }
+
+    mut list<f32> y ← empty
+
+    for exclusive out_features let r {
+        mut f32 acc ← 0.0 ∷ f32
+
+        for exclusive total_blocks let b {
+            let int base ← (r * total_blocks + b) * block_bytes
+            mut list<u8> block_slice ← empty
+            for exclusive block_bytes let bi {
+                block_slice.append(raw_blocks[base + bi])
+            }
+            let list<f32> block_weights ← decode_ggml_block_f32(lw.kind, block_slice)
+            let int x_base ← b * block_elements
+
+            for exclusive block_elements let k {
+                acc ← acc + block_weights[k] * x[x_base + k]
+            }
+        }
+
+        y.append(acc)
+    }
+
+    apply_optional_bias(mut y, bias, out_features)
+    return y
+}
+
+@ public
+fn linear_matvec(LinearWeight lw, WeightPayload payload, list<f32> x) → list<f32> ⇥ LinearWeightError {
+    match payload {
+        case DensePayload let weight, bias {
+            match lw.kind {
+                case DenseF32 {}
+                case DenseBf16 {}
+                case DenseF16 {}
+                default {
+                    throw variant BadBinding { message = "LinearWeight kind does not match DensePayload" }
+                }
+            }
+            if lw.has_bias {
+                require bias.length() ≻ 0 throw variant BadBinding { message = "LinearWeight requires bias" }
+            }
+            return linear_matvec_dense(lw.out_features, lw.in_features, weight, bias, x)
+        }
+        case GroupAffineU32Payload let weight, scales, biases, bias {
+            let ga.GroupAffineSpec spec ← to_group_affine_spec(lw)
+            if lw.has_bias {
+                require bias.length() ≻ 0 throw variant BadBinding { message = "LinearWeight requires bias" }
+            }
+            return linear_matvec_group_affine_u32(spec, weight, scales, biases, bias, x)
+        }
+        case GroupAffineU8Payload let weight, scales, biases, bias {
+            let ga.GroupAffineSpec spec ← to_group_affine_spec(lw)
+            if lw.has_bias {
+                require bias.length() ≻ 0 throw variant BadBinding { message = "LinearWeight requires bias" }
+            }
+            return linear_matvec_group_affine_u8(spec, weight, scales, biases, bias, x)
+        }
+        case GgmlBlockPayload let raw_blocks, bias {
+            if lw.has_bias {
+                require bias.length() ≻ 0 throw variant BadBinding { message = "LinearWeight requires bias" }
+            }
+            return linear_matvec_ggml_block(lw, raw_blocks, bias, x)
+        }
+    }
+}
+
+# -------------------------------------------------------------------------
+# Device @ kernel contractions & host dispatchers (CPU + Metal)
+# -------------------------------------------------------------------------
+
+@ public
+kernel add_bias<size Out>(tensor<f32, [Out]> bias, mut tensor<f32, [Out]> y) → void {
+    for from y at [row] thread lane let e {
+        y[[row]] ← e + bias[[row]]
+    }
+}
+
+@ public
+kernel ggml_q8_0_matvec<size Out, size Blocks, size RowBytes, size In>(tensor<u8, [Out, RowBytes]> raw_blocks, tensor<f32, [In]> x, mut tensor<f32, [Out]> y) → void {
+    for from y at [row] thread lane let e {
+        let i32 rr ← (row ↦ i32) ∧ 65535
+        mut f32 acc ← 0.0 ∷ f32
+
+        for exclusive Blocks let b {
+            let i32 bi ← (b ↦ i32) ∧ 65535
+            let i32 base ← bi * 34
+            let i32 lo ← (raw_blocks[[rr, base]] ↦ i32 ⊥ 0) ∧ 255
+            let i32 hi ← (raw_blocks[[rr, base + 1]] ↦ i32 ⊥ 0) ∧ 255
+            let i32 bits ← lo + hi * 256
+            let i32 sign_bit ← (bits / 32768) ∧ 1
+            let i32 exp_bits ← (bits / 1024) ∧ 31
+            let i32 mant_bits ← bits ∧ 1023
+
+            mut f32 d ← 0.0 ∷ f32
+            if exp_bits ≡ 0 {
+                if mant_bits ≢ 0 {
+                    d ← (mant_bits ↦ f32) / (16777216.0 ∷ f32)
+                }
+            }
+            elif exp_bits ≺ 31 {
+                mut f32 mag ← (1.0 ∷ f32) + (mant_bits ↦ f32) / (1024.0 ∷ f32)
+                let i32 shift_exp ← exp_bits - 15
+                if shift_exp ≻ 0 {
+                    for exclusive shift_exp let p {
+                        mag ← mag * (2.0 ∷ f32)
+                    }
+                }
+                elif shift_exp ≺ 0 {
+                    let i32 neg_exp ← 0 - shift_exp
+                    for exclusive neg_exp let p {
+                        mag ← mag / (2.0 ∷ f32)
+                    }
+                }
+                d ← mag
+            }
+
+            if sign_bit ≢ 0 {
+                d ← (0.0 ∷ f32) - d
+            }
+
+            let i32 x_base ← bi * 32
+            for exclusive 32 let k {
+                let i32 ki ← (k ↦ i32 ⊥ 0) ∧ 31
+                let i32 q_u ← (raw_blocks[[rr, base + 2 + ki]] ↦ i32 ⊥ 0)
+                mut i32 q_s ← q_u
+                if q_u ≥ 128 {
+                    q_s ← q_u - 256
+                }
+                let f32 w ← (q_s ↦ f32) * d
+                acc ← acc + w * x[[x_base + ki]]
+            }
+        }
+
+        y[[row]] ← acc
+    }
+}
+
+@ public
+fn dispatch_add_bias<size Out>(LinearWeight lw, tensor<f32, [Out]> bias, mut tensor<f32, [Out]> y) → void ⇥ LinearWeightError {
+    require lw.has_bias throw variant BadBinding { message = "LinearWeight does not have bias" }
+    require lw.out_features ≡ Out throw variant BadShape { message = "bias shape mismatch in dispatch_add_bias" }
+    add_bias<size Out>(bias, mut y)
+}
+
+@ public
+fn dispatch_dense_f32<size Out, size In>(LinearWeight lw, tensor<f32, [Out, In]> weight, tensor<f32, [In]> x, mut tensor<f32, [Out]> y) → void ⇥ LinearWeightError {
+    match lw.kind {
+        case DenseF32 {}
+        default {
+            throw variant BadBinding { message = "expected DenseF32 LinearWeight" }
+        }
+    }
+    require lw.out_features ≡ Out and lw.in_features ≡ In throw variant BadShape { message = "shape mismatch in dispatch_dense_f32" }
+
+    decode_step.gemv<size Out, size In>(weight, x, mut y)
+}
+
+@ public
+fn dispatch_dense_bf16<size Out, size In>(LinearWeight lw, tensor<bf16, [Out, In]> weight, tensor<f32, [In]> x, mut tensor<f32, [Out]> y) → void ⇥ LinearWeightError {
+    match lw.kind {
+        case DenseBf16 {}
+        default {
+            throw variant BadBinding { message = "expected DenseBf16 LinearWeight" }
+        }
+    }
+    require lw.out_features ≡ Out and lw.in_features ≡ In throw variant BadShape { message = "shape mismatch in dispatch_dense_bf16" }
+
+    kern.gemv_bf16_f32acc<size Out, size In>(weight, x, mut y)
+}
+
+@ public
+fn dispatch_group_affine_u32<size Out, size PackedIn, size Groups, size In>(LinearWeight lw, tensor<u32, [Out, PackedIn]> weight, tensor<f32, [Out, Groups]> scales, tensor<f32, [Out, Groups]> biases, tensor<f32, [In]> x, mut tensor<f32, [Out]> y) → void ⇥ LinearWeightError {
+    match lw.kind {
+        case GroupAffineU32 {}
+        default {
+            throw variant BadBinding { message = "expected GroupAffineU32 LinearWeight" }
+        }
+    }
+    require lw.out_features ≡ Out and lw.in_features ≡ In and lw.packed_cols ≡ PackedIn and lw.group_cols ≡ Groups throw variant BadShape { message = "shape mismatch in dispatch_group_affine_u32" }
+
+    ga.linear_matvec_u32<size Out, size PackedIn, size Groups, size In>(weight, scales, biases, x, mut y, lw.bits ↦ i32 ⊥ 8, lw.group_size ↦ i32 ⊥ 64)
+}
+
+@ public
+fn dispatch_group_affine_u8<size Out, size PackedIn, size Groups, size In>(LinearWeight lw, tensor<u8, [Out, PackedIn]> weight, tensor<f32, [Out, Groups]> scales, tensor<f32, [Out, Groups]> biases, tensor<f32, [In]> x, mut tensor<f32, [Out]> y) → void ⇥ LinearWeightError {
+    match lw.kind {
+        case GroupAffineU8 {}
+        default {
+            throw variant BadBinding { message = "expected GroupAffineU8 LinearWeight" }
+        }
+    }
+    require lw.out_features ≡ Out and lw.in_features ≡ In and lw.packed_cols ≡ PackedIn and lw.group_cols ≡ Groups throw variant BadShape { message = "shape mismatch in dispatch_group_affine_u8" }
+
+    ga.linear_matvec_u8<size Out, size PackedIn, size Groups, size In>(weight, scales, biases, x, mut y, lw.bits ↦ i32 ⊥ 4, lw.group_size ↦ i32 ⊥ 64)
+}
+
+@ public
+fn dispatch_ggml_q8_0<size Out, size Blocks, size RowBytes, size In>(LinearWeight lw, tensor<u8, [Out, RowBytes]> raw_blocks, tensor<f32, [In]> x, mut tensor<f32, [Out]> y) → void ⇥ LinearWeightError {
+    match lw.kind {
+        case GgmlBlockQ8_0 {}
+        default {
+            throw variant BadBinding { message = "expected GgmlBlockQ8_0 LinearWeight" }
+        }
+    }
+    require lw.out_features ≡ Out and lw.in_features ≡ In and In ≡ Blocks * 32 and RowBytes ≡ Blocks * 34 throw variant BadShape { message = "shape mismatch in dispatch_ggml_q8_0" }
+
+    ggml_q8_0_matvec<size Out, size Blocks, size RowBytes, size In>(raw_blocks, x, mut y)
+}
+
++++ faber test
+import from "gradus:model/artifact" let artifact
+import from "gradus:model/bundle" let bundle
+import from "gradus:model/capsule" let capsule
+import from "gradus:model/linear_weight" let lw
+import from "gradus:model/tensor_directory" let td
+
+fn id_with(string hex_char, int len) → artifact.ContentIdentity {
+    mut string hex ← ""
+    for exclusive 64 let i {
+        hex ← hex + hex_char
+    }
+    return artifact.ContentIdentity { algorithm = "sha-256", digest = hex, length = len }
+}
+
+fn st_manifest(int artifact_len, int data_len, list<capsule.SafetensorsTensorDescriptor> tensors) → capsule.SafetensorsManifest {
+    return capsule.SafetensorsManifest { format = "safetensors", version = "1.0.0", artifact_length = artifact_len, data_length = data_len, metadata = [], tensors = tensors }
+}
+
+fn st_desc(string name, string dtype, list<int> shape, int start, int end, int elems) → capsule.SafetensorsTensorDescriptor {
+    return capsule.SafetensorsTensorDescriptor { name = name, dtype = dtype, shape = shape, start = start, end = end, elements = elems }
+}
+
+fn mk_unindexed(list<artifact.ContentIdentity> shards) → bundle.ModelBundle {
+    do {
+        return bundle.safetensors_unindexed(shards, null, null, null, null, null)
+    }
+    catch err {
+        assert false
+        return bundle.ModelBundle { schema = "", primary_container = variant bundle.ContainerKind.Safetensors, backbone_shards = [], drafter = null, vision = null, config = null, quant_config = null, shard_index = null, tokenizer = null, shard_map = variant bundle.ShardMapping.Unindexed { shard_count = 0 } }
+    }
+}
+
+fn build_dir(bundle.ModelBundle b, capsule.SafetensorsManifest m) → td.TensorDirectory ∪ none {
+    do {
+        return td.build(b, [
+            variant td.ShardSource.SafetensorsSource { role = variant bundle.MemberRole.Backbone, shard_index = 0, manifest = m }
+        ], [], [])
+    }
+    catch err {
+        return null
+    }
+}
+
+fn close(f32 a, f32 b) → bool {
+    let f32 diff ← (a - b).abs()
+    let f32 tol ← (1.0e-5 ∷ f32) + (1.0e-4 ∷ f32) * b.abs()
+    return diff ≤ tol
+}
+
+test "LinearWeight binds GroupAffine 8-bit U32, 6-bit U32, and 4-bit U8 from siblings" {
+    let artifact.ContentIdentity bb_id ← id_with("a", 8192)
+    let bundle.ModelBundle b ← mk_unindexed([bb_id])
+    let capsule.SafetensorsManifest m ← st_manifest(8192, 6144, [
+        st_desc("model.layers.0.self_attn.q_proj.weight", "U32", [576, 144], 0, 1024, 256),
+        st_desc("model.layers.0.self_attn.q_proj.scales", "BF16", [576, 9], 1024, 1536, 256),
+        st_desc("model.layers.0.self_attn.q_proj.biases", "BF16", [576, 9], 1536, 2048, 256),
+        st_desc("model.layers.0.self_attn.k_proj.weight", "U32", [576, 108], 2048, 3072, 256),
+        st_desc("model.layers.0.self_attn.k_proj.scales", "BF16", [576, 9], 3072, 3584, 256),
+        st_desc("model.layers.0.self_attn.k_proj.biases", "BF16", [576, 9], 3584, 4096, 256),
+        st_desc("model.layers.0.self_attn.v_proj.weight", "U8", [576, 288], 4096, 5120, 256),
+        st_desc("model.layers.0.self_attn.v_proj.scales", "BF16", [576, 9], 5120, 5632, 256),
+        st_desc("model.layers.0.self_attn.v_proj.biases", "BF16", [576, 9], 5632, 6144, 256)
+    ])
+
+    let td.TensorDirectory ∪ none maybe_dir ← build_dir(b, m)
+    assert maybe_dir is td.TensorDirectory
+    if maybe_dir is td.TensorDirectory {
+        let lw.QuantConfigHint stale_hint ← lw.QuantConfigHint { mode = "nvfp4", bits = null, group_size = null }
+        do {
+            let lw.LinearWeight wq ← lw.bind_with_config(maybe_dir, variant bundle.MemberRole.Backbone, "model.layers.0.self_attn.q_proj", stale_hint)
+            assert wq.kind ≡ variant lw.LinearWeightKind.GroupAffineU32
+            assert wq.out_features ≡ 576
+            assert wq.in_features ≡ 576
+            assert wq.bits ≡ 8
+            assert wq.group_size ≡ 64
+            assert wq.packed_cols ≡ 144
+            assert wq.group_cols ≡ 9
+            assert wq.has_bias ≡ false
+
+            let lw.LinearWeight wk ← lw.bind_with_config(maybe_dir, variant bundle.MemberRole.Backbone, "model.layers.0.self_attn.k_proj", stale_hint)
+            assert wk.kind ≡ variant lw.LinearWeightKind.GroupAffineU32
+            assert wk.bits ≡ 6
+            assert wk.in_features ≡ 576
+            assert wk.packed_cols ≡ 108
+
+            let lw.LinearWeight wv ← lw.bind(maybe_dir, variant bundle.MemberRole.Backbone, "model.layers.0.self_attn.v_proj")
+            assert wv.kind ≡ variant lw.LinearWeightKind.GroupAffineU8
+            assert wv.bits ≡ 4
+            assert wv.in_features ≡ 576
+            assert wv.packed_cols ≡ 288
+        }
+        catch err {
+            assert false
+        }
+    }
+}
+
+test "LinearWeight binds heterogeneous Dense + GroupAffine + GgmlBlock in one layer" {
+    let artifact.ContentIdentity bb_id ← id_with("b", 4096)
+    let bundle.ModelBundle b ← mk_unindexed([bb_id])
+    let capsule.SafetensorsManifest m ← st_manifest(4096, 2048, [
+        st_desc("model.layers.0.self_attn.q_proj.weight", "F32", [4, 8], 0, 128, 32),
+        st_desc("model.layers.0.self_attn.q_proj.bias", "F32", [4], 128, 144, 4),
+        st_desc("model.layers.0.self_attn.k_proj.weight", "BF16", [4, 8], 144, 208, 32),
+        st_desc("model.layers.0.self_attn.v_proj.weight", "Q8_0", [4, 32], 208, 344, 128),
+        st_desc("model.layers.0.self_attn.o_proj.weight", "Q6_K", [4, 256], 344, 1184, 1024)
+    ])
+
+    let td.TensorDirectory ∪ none maybe_dir ← build_dir(b, m)
+    assert maybe_dir is td.TensorDirectory
+    if maybe_dir is td.TensorDirectory {
+        do {
+            let lw.LinearWeight wq ← lw.bind(maybe_dir, variant bundle.MemberRole.Backbone, "model.layers.0.self_attn.q_proj")
+            assert wq.kind ≡ variant lw.LinearWeightKind.DenseF32
+            assert wq.has_bias ≡ true
+
+            let lw.LinearWeight wk ← lw.bind(maybe_dir, variant bundle.MemberRole.Backbone, "model.layers.0.self_attn.k_proj")
+            assert wk.kind ≡ variant lw.LinearWeightKind.DenseBf16
+            assert wk.has_bias ≡ false
+
+            let lw.LinearWeight wv ← lw.bind(maybe_dir, variant bundle.MemberRole.Backbone, "model.layers.0.self_attn.v_proj")
+            assert wv.kind ≡ variant lw.LinearWeightKind.GgmlBlockQ8_0
+            assert wv.out_features ≡ 4
+            assert wv.in_features ≡ 32
+
+            let lw.LinearWeight wo ← lw.bind(maybe_dir, variant bundle.MemberRole.Backbone, "model.layers.0.self_attn.o_proj")
+            assert wo.kind ≡ variant lw.LinearWeightKind.GgmlBlockQ6_K
+            assert wo.out_features ≡ 4
+            assert wo.in_features ≡ 256
+        }
+        catch err {
+            assert false
+        }
+    }
+}
+
+test "LinearWeight host linear_matvec Dense" {
+    let lw.LinearWeight lw_dense ← lw.LinearWeight { kind = variant lw.LinearWeightKind.DenseF32, out_features = 2, in_features = 4, bits = 0, group_size = 0, packed_cols = 0, group_cols = 0, has_bias = true }
+    let list<f32> w_dense ← [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+    let list<f32> b_dense ← [0.5, -1.0]
+    let list<f32> x4 ← [1.0, -1.0, 2.0, 0.5]
+
+    do {
+        let list<f32> host_dense ← lw.linear_matvec(lw_dense, variant lw.WeightPayload.DensePayload { weight = w_dense, bias = b_dense }, x4)
+        assert close(host_dense[0], 7.5)
+        assert close(host_dense[1], 16.0)
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "LinearWeight host linear_matvec GroupAffine" {
+    let list<f32> x4 ← [1.0, -1.0, 2.0, 0.5]
+    let lw.LinearWeight lw_ga32 ← lw.LinearWeight { kind = variant lw.LinearWeightKind.GroupAffineU32, out_features = 1, in_features = 4, bits = 8, group_size = 2, packed_cols = 1, group_cols = 2, has_bias = false }
+    let list<u32> w_u32 ← [0x04030201 ∷ u32]
+    let list<f32> s_u32 ← [0.5, 2.0]
+    let list<f32> bi_u32 ← [-1.0, 0.25]
+
+    let lw.LinearWeight lw_ga8 ← lw.LinearWeight { kind = variant lw.LinearWeightKind.GroupAffineU8, out_features = 1, in_features = 4, bits = 4, group_size = 2, packed_cols = 2, group_cols = 2, has_bias = false }
+    let list<u8> w_u8 ← [0x21 ∷ u8, 0x43 ∷ u8]
+
+    do {
+        let list<f32> no_bias ← empty
+        let list<f32> host_u32 ← lw.linear_matvec(lw_ga32, variant lw.WeightPayload.GroupAffineU32Payload { weight = w_u32, scales = s_u32, biases = bi_u32, bias = no_bias }, x4)
+        assert close(host_u32[0], 16.125)
+
+        let list<f32> host_u8 ← lw.linear_matvec(lw_ga8, variant lw.WeightPayload.GroupAffineU8Payload { weight = w_u8, scales = s_u32, biases = bi_u32, bias = no_bias }, x4)
+        assert close(host_u8[0], 16.125)
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "LinearWeight host linear_matvec Q8_0" {
+    let lw.LinearWeight lw_q8 ← lw.LinearWeight { kind = variant lw.LinearWeightKind.GgmlBlockQ8_0, out_features = 1, in_features = 32, bits = 0, group_size = 0, packed_cols = 0, group_cols = 0, has_bias = false }
+    mut list<u8> q8_bytes ← [0x00 ∷ u8, 0x38 ∷ u8]
+    mut list<f32> x32 ← empty
+    for exclusive 32 let k {
+        q8_bytes.append(1 ∷ u8)
+        x32.append(1.0 ∷ f32)
+    }
+
+    do {
+        let list<f32> no_bias ← empty
+        let list<f32> host_q8 ← lw.linear_matvec(lw_q8, variant lw.WeightPayload.GgmlBlockPayload { raw_blocks = q8_bytes, bias = no_bias }, x32)
+        assert close(host_q8[0], 16.0)
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "LinearWeight kernel dispatchers match across Dense, GroupAffine, and Q8_0" {
+    let lw.LinearWeight lw_dense ← lw.LinearWeight { kind = variant lw.LinearWeightKind.DenseF32, out_features = 2, in_features = 4, bits = 0, group_size = 0, packed_cols = 0, group_cols = 0, has_bias = true }
+    let list<f32> w_dense ← [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+    let list<f32> b_dense ← [0.5, -1.0]
+    let list<f32> x4 ← [1.0, -1.0, 2.0, 0.5]
+
+    mut tensor<f32, [2, 4]> tw_dense ← tf32[2, 4] {}
+    for exclusive 2 let r {
+        for exclusive 4 let c {
+            tw_dense[[r, c]] ← w_dense[r * 4 + c]
+        }
+    }
+    mut tensor<f32, [2]> tb_dense ← tf32[2] {}
+    tb_dense[[0]] ← b_dense[0]
+    tb_dense[[1]] ← b_dense[1]
+    mut tensor<f32, [4]> tx4 ← tf32[4] {}
+    for exclusive 4 let j {
+        tx4[[j]] ← x4[j]
+    }
+    mut tensor<f32, [2]> ty_dense ← tf32[2] {}
+
+    let lw.LinearWeight lw_ga32 ← lw.LinearWeight { kind = variant lw.LinearWeightKind.GroupAffineU32, out_features = 1, in_features = 4, bits = 8, group_size = 2, packed_cols = 1, group_cols = 2, has_bias = false }
+    mut tensor<u32, [1, 1]> tw_u32 ← tu32[1, 1] {}
+    tw_u32[[0, 0]] ← 0x04030201 ∷ u32
+    mut tensor<f32, [1, 2]> ts_u32 ← tf32[1, 2] {}
+    ts_u32[[0, 0]] ← 0.5
+    ts_u32[[0, 1]] ← 2.0
+    mut tensor<f32, [1, 2]> tbi_u32 ← tf32[1, 2] {}
+    tbi_u32[[0, 0]] ← -1.0
+    tbi_u32[[0, 1]] ← 0.25
+    mut tensor<f32, [1]> ty_u32 ← tf32[1] {}
+
+    let lw.LinearWeight lw_ga8 ← lw.LinearWeight { kind = variant lw.LinearWeightKind.GroupAffineU8, out_features = 1, in_features = 4, bits = 4, group_size = 2, packed_cols = 2, group_cols = 2, has_bias = false }
+    mut tensor<u8, [1, 2]> tw_u8 ← tu8[1, 2] {}
+    tw_u8[[0, 0]] ← 0x21 ∷ u8
+    tw_u8[[0, 1]] ← 0x43 ∷ u8
+    mut tensor<f32, [1]> ty_u8 ← tf32[1] {}
+
+    let lw.LinearWeight lw_q8 ← lw.LinearWeight { kind = variant lw.LinearWeightKind.GgmlBlockQ8_0, out_features = 1, in_features = 32, bits = 0, group_size = 0, packed_cols = 0, group_cols = 0, has_bias = false }
+    mut tensor<u8, [1, 34]> tw_q8 ← tu8[1, 34] {}
+    tw_q8[[0, 0]] ← 0x00 ∷ u8
+    tw_q8[[0, 1]] ← 0x38 ∷ u8
+    mut tensor<f32, [32]> tx32 ← tf32[32] {}
+    for exclusive 32 let k {
+        tw_q8[[0, 2 + k]] ← 1 ∷ u8
+        tx32[[k]] ← 1.0
+    }
+    mut tensor<f32, [1]> ty_q8 ← tf32[1] {}
+
+    do {
+        lw.dispatch_dense_f32<size 2, size 4>(lw_dense, tw_dense, tx4, mut ty_dense)
+        lw.dispatch_add_bias<size 2>(lw_dense, tb_dense, mut ty_dense)
+        assert close(ty_dense[[0]], 7.5)
+        assert close(ty_dense[[1]], 16.0)
+
+        lw.dispatch_group_affine_u32<size 1, size 1, size 2, size 4>(lw_ga32, tw_u32, ts_u32, tbi_u32, tx4, mut ty_u32)
+        assert close(ty_u32[[0]], 16.125)
+
+        lw.dispatch_group_affine_u8<size 1, size 2, size 2, size 4>(lw_ga8, tw_u8, ts_u32, tbi_u32, tx4, mut ty_u8)
+        assert close(ty_u8[[0]], 16.125)
+
+        lw.dispatch_ggml_q8_0<size 1, size 1, size 34, size 32>(lw_q8, tw_q8, tx32, mut ty_q8)
+        assert close(ty_q8[[0]], 16.0)
+    }
+    catch err {
+        assert false
+    }
+}
