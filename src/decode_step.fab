@@ -272,6 +272,77 @@ kernel context_fin<size P, size QD>(tensor<f32, [QD]> cfdom, tensor<f32, [P, QD]
     }
 }
 
+# Circular ring-buffer KV-row write at `kwpos % kwwin` (arbitrary non-power-of-two
+# window `kwwin <= W`). Negative `kwpos` or invalid window leaves the ring unchanged.
+@ public
+fn kv_ring_write_row<size W, size K>(tensor<f32, [K]> kwrow, mut tensor<f32, [W, K]> kwcache, i32 kwpos, i32 kwwin) → void {
+    if kwpos ≥ 0 and kwwin ≥ 1 and kwwin ≤ W {
+        let i32 slot ← kwpos % kwwin
+        kv_write_row(kwrow, mut kwcache, slot)
+    }
+}
+
+# Fused circular ring-buffer K and V row write at `kwpos % kwwin`.
+@ public
+fn kv_ring_write_kv<size W, size K>(tensor<f32, [K]> kwk, tensor<f32, [K]> kwv, mut tensor<f32, [W, K]> kwkc, mut tensor<f32, [W, K]> kwvc, i32 kwpos, i32 kwwin) → void {
+    if kwpos ≥ 0 and kwwin ≥ 1 and kwwin ≤ W {
+        let i32 slot ← kwpos % kwwin
+        kv_write_kv(kwk, kwv, mut kwkc, mut kwvc, slot)
+    }
+}
+
+# Windowed GQA decode scores over circular ring `[W, KVD]` with active window
+# `aswin <= W`. Slots `>= aswin`, or `> aspos` when `aspos < aswin`, are masked
+# to `-3.0e38` so `row_softmax` zeroes them.
+@ public
+kernel attn_scores_ring<size H, size W, size QD, size KVD>(tensor<f32, [H, W]> asdom, tensor<f32, [QD]> asq, tensor<f32, [W, KVD]> askc, mut tensor<f32, [H, W]> assc, i32 aspos, i32 aswin, i32 asgroup, i32 asdh, f32 asscale) → void {
+    for from asdom at [h, s] thread lane let e {
+        if aspos ≺ 0 or aswin ≺ 1 or s ≥ aswin or s ≻ aspos {
+            assc[[h, s]] ← -3.0e38
+        }
+        elif asgroup ≻ 0 and asdh ≥ 1 and asdh ≤ 960 and asgroup ≤ 128 and h ∈ 0 … 4095 and s ∈ 0 … 16777215 {
+            let i32 hh ← h ∧ 4095
+            let i32 ss ← s ∧ 16777215
+            let i32 qbase ← hh * asdh
+            let i32 kbase ← hh / asgroup * asdh
+            mut f32 acc ← 0.0
+
+            for range 0 ‥ asdh let kk {
+                acc ← acc + asq[[qbase + kk]] * askc[[ss, kbase + kk]]
+            }
+
+            assc[[h, s]] ← acc * asscale
+        }
+    }
+}
+
+# Windowed GQA decode context over circular ring `[W, KVD]` with active window `acwin <= W`.
+@ public
+kernel attn_context_ring<size QD, size H, size W, size KVD>(tensor<f32, [QD]> acdom, tensor<f32, [H, W]> acp, tensor<f32, [W, KVD]> acvc, mut tensor<f32, [QD]> acctx, i32 acpos, i32 acwin, i32 acgroup, i32 acdh) → void {
+    for from acdom at [j] thread lane let e {
+        if acgroup ≻ 0 and acdh ≥ 1 and acdh ≤ 960 and acpos ≥ 0 and acwin ≥ 1 and acwin ≤ W {
+            let i32 dh ← acdh
+            let i32 h ← j / dh
+            let i32 d ← j % dh
+            mut i32 n ← acpos + 1
+
+            if n ≻ acwin {
+                n ← acwin
+            }
+
+            let i32 base ← h / acgroup * dh
+            let i32 vcol ← base + d
+            mut f32 acc ← 0.0
+
+            for range 0 ‥ n let s {
+                acc ← acc + acp[[h, s]] * acvc[[s, vcol]]
+            }
+
+            acctx[[j]] ← acc
+        }
+    }
+}
+
 # Residual add: reo[j] = rea[j] + reb[j].
 @ public
 kernel residual_add<size D>(tensor<f32, [D]> rea, tensor<f32, [D]> reb, mut tensor<f32, [D]> reo) → void {
@@ -694,6 +765,51 @@ test "decode_step GQA decode attention masks past pos and shares a KV head" {
     assert close(ctx_split[[1]], ctx[[1]])
     assert close(ctx_split[[2]], ctx[[2]])
     assert close(ctx_split[[3]], ctx[[3]])
+}
+
+test "decode_step ring KV write and windowed attention wrap around window" {
+    # 2 query heads of dh 2, 1 KV head (group 2); ring window 3, pos 3 wraps to slot 0.
+    mut tensor<f32, [2, 3]> hc ← tf32[2, 3] {}
+    mut tensor<f32, [4]> qdom ← tf32[4] {}
+    mut tensor<f32, [4]> q ← tf32[4] {}
+    mut tensor<f32, [2]> k_row ← tf32[2] {}
+    mut tensor<f32, [2]> v_row ← tf32[2] {}
+    mut tensor<f32, [3, 2]> kc ← tf32[3, 2] {}
+    mut tensor<f32, [3, 2]> vc ← tf32[3, 2] {}
+    mut tensor<f32, [2, 3]> sc ← tf32[2, 3] {}
+    mut tensor<f32, [2, 3]> p ← tf32[2, 3] {}
+    mut tensor<f32, [4]> ctx ← tf32[4] {}
+    q[[0]] ← 1.0
+    q[[3]] ← 1.0
+    # Write pos 0, 1, 2, then pos 3 (overwrites slot 0)
+    k_row[[0]] ← 9.0
+    v_row[[0]] ← 9.0
+    ds.kv_ring_write_kv(k_row, v_row, mut kc, mut vc, 0, 3)
+    k_row[[0]] ← 0.0
+    k_row[[1]] ← 1.0
+    v_row[[0]] ← 0.0
+    v_row[[1]] ← 1.0
+    ds.kv_ring_write_kv(k_row, v_row, mut kc, mut vc, 1, 3)
+    k_row[[0]] ← 0.0
+    k_row[[1]] ← 0.0
+    v_row[[0]] ← 0.0
+    v_row[[1]] ← 0.0
+    ds.kv_ring_write_kv(k_row, v_row, mut kc, mut vc, 2, 3)
+    k_row[[0]] ← 1.0
+    k_row[[1]] ← 0.0
+    v_row[[0]] ← 1.0
+    v_row[[1]] ← 0.0
+    ds.kv_ring_write_kv(k_row, v_row, mut kc, mut vc, 3, 3)
+
+    ds.attn_scores_ring(hc, q, kc, mut sc, 3, 3, 2, 2, 1.0)
+    assert close(sc[[0, 0]], 1.0)
+    assert close(sc[[0, 1]], 0.0)
+    assert close(sc[[0, 2]], 0.0)
+    assert close(sc[[1, 1]], 1.0)
+    ds.row_softmax(sc, mut p)
+    ds.attn_context_ring(qdom, p, vc, mut ctx, 3, 3, 2, 2)
+    assert ctx[[0]] ≻ 0.5
+    assert ctx[[3]] ≻ 0.5
 }
 
 test "decode_step residual_add and swiglu are elementwise" {
