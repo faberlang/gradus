@@ -18,13 +18,13 @@ locale = "en"
 # followed by the 16 high-nibble weights, matching
 # gradus:model/dequant dequant_q5_0 and ggml-quants.c.
 #
-# Rule 17: the format lives in Gradus. decode reads the fields in place
-# and copies no block.
+# Rule 17: the format lives in Gradus. `decode` reads the fields in place
+# and copies no block or field list.
 #
-# The genus, decode and from_bytes stay module-private for the same
-# reason as gradus:quant/q8_0: a public export whose type carries
-# list<T, size N> is refused at the file-interface seam. decode_block
-# is the public host entry until that seam can snapshot a sized list.
+# `Q5_0`, `decode`, and `from_bytes` are `@ public` (file_interface exports
+# `list<T, size N>`), and `decode_block` stays `@ public` as a host helper.
+# Device/Metal execution over `tensor<Q5_0, [N]>` remains blocked on compiler
+# record-tensor lowering (`f16` / array record fields in KIR and device bridge).
 
 # Elements per block.
 @ public
@@ -35,6 +35,7 @@ const int Q5_0_ELEMENTS = 32
 const int Q5_0_BYTES = 22
 
 # The block genus. Field order is the on-disk order.
+@ public
 class Q5_0 {
     let f16 d
     let list<u8, size 4> qh
@@ -53,27 +54,22 @@ union Q5_0Error {
     BadScale
 }
 
-# The 32-bit high-bit mask, little-endian, from the four on-disk bytes.
-fn qh_bits(Q5_0 b) → int {
-    let list<u8> raw ← b.qh ↦ list<u8>
-    let list<b8> buf ↤ raw
-    return (buf[0 ‥ 4] ↦ u32 via Le) ↦ int
-}
-
-# Weight k (0 ≤ k < 32) of block b as f32. An out-of-range k ends the run.
+# Weight k (0 ≤ k < 32) of block b as f32. An out-of-range k ends the run
+# on the `b.qs[j]` bounds check before any high-bit shift runs.
+@ public
 fn decode(Q5_0 b, i32 k) → f32 {
     let int ki ← k ↦ int
     let int j ← ki ≺ 16 ✓ ki ✗ ki - 16
-    let int shift ← ki ≺ 16 ✓ j ✗ j + 16
-    let int qh ← qh_bits(b)
-    let int xh ← (qh ⇒ shift) % 2 * 16
     let int byte ← b.qs[j] ↦ int
+    let int qh_byte ← b.qh[ki / 8] ↦ int
+    let int xh ← (qh_byte ⇒ ki % 8) % 2 * 16
     let int nib ← ki ≺ 16 ✓ byte % 16 ✗ (byte ⇒ 4) % 16
     let int x ← (nib ∨ xh) - 16
     return (x ↦ f32) * (b.d ↦ f32)
 }
 
 # One block from its 22 on-disk bytes.
+@ public
 fn from_bytes(list<u8> raw) → Q5_0 ⇥ Q5_0Error {
     if raw.length() ≢ Q5_0_BYTES {
         throw variant BadBlock { message = "Q5_0 block byte length mismatch" }
@@ -299,11 +295,50 @@ test "padded block is refused by name" {
     assert block_result(pad) ≡ "Q5_0 block byte length mismatch"
 }
 
+test "Q5_0 public from_bytes and decode read fields directly" {
+    do {
+        let q5_0.Q5_0 blk ← q5_0.from_bytes(branch_block())
+        assert q5_0.decode(blk, 0) ≡ 0.0 ∷ f32
+        assert q5_0.decode(blk, 1) ≡ -1.0 ∷ f32
+        assert q5_0.decode(blk, 16) ≡ 1.0 ∷ f32
+        assert q5_0.decode(blk, 17) ≡ -16.0 ∷ f32
+    }
+    catch err {
+        assert false
+    }
+}
+
 test "NaN half scale is refused by name" {
-    # 0x7e00 quiet NaN at the scale slot, rest zero.
-    mut list<int> raw ← [0, 126]
+    # 0x7e00 quiet NaN and 0x7c01 signalling NaN at the scale slot, rest zero.
+    mut list<int> qnan ← [0, 126]
+    mut list<int> snan ← [1, 124]
+    for range 0‥20 let i {
+        qnan.append(0)
+        snan.append(0)
+    }
+    assert block_result(bytes_of(qnan)) ≡ "NaN half scale in Q5_0 block"
+    assert block_result(bytes_of(snan)) ≡ "NaN half scale in Q5_0 block"
+}
+
+test "infinite half scale is data, not an error" {
+    # 0x7c00 = +inf; the loader admits it (only NaN is malformed).
+    mut list<int> raw ← [0, 124]
     for range 0‥20 let i {
         raw.append(0)
     }
-    assert block_result(bytes_of(raw)) ≡ "NaN half scale in Q5_0 block"
+    assert block_result(bytes_of(raw)) ≡ "ok"
+}
+
+test "negative zero scale preserves IEEE-754 sign bits" {
+    # 0x8000 = -0.0; k=0 (nib=0, qh=1 → x=0) gives -0.0, k=1 (nib=15, qh=0 → x=-1) gives +0.0,
+    # and k=16 (nib=1, qh=1 → x=+1) gives -0.0.
+    mut list<int> raw ← [0, 128, 1, 0, 1, 0, 16, 15]
+    for range 0‥14 let i {
+        raw.append(0)
+    }
+    let list<f32> y ← weights(bytes_of(raw))
+    assert y.length() ≡ 32
+    assert bits_of(y[0]) ≡ 0x80000000
+    assert bits_of(y[1]) ≡ 0x00000000
+    assert bits_of(y[16]) ≡ 0x80000000
 }
