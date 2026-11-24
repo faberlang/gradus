@@ -1,0 +1,467 @@
++++ toml
+locale = "en"
+
++++ faber
+# SessionState — slot-indexed FullKvArena and artifact-sized RingKvArena
+# over ExecutionSchedule `slot_id` (issue #49).
+#
+# Public import: import from "gradus:cache/session" session
+# Depends on: gradus:model/schedule, gradus:decode_step.
+#
+# --- Contract ------------------------------------------------------------
+#
+# Allocates typed device-ready `tensor<f32, [C, KVD]>` (`FullKvArena`) and
+# circular `tensor<f32, [W, KVD]>` (`RingKvArena`) buffers indexed by
+# `ExecutionSchedule.slots` (`slot_id`), with per-slot `window_size` taken
+# from admitted artifact metadata (e.g. 513 on Flint, 1024 on Inkling,
+# 1025 on dflash — arbitrary non-power-of-two integers).
+#
+# Zero `NumericBlock` (`list<f32>`) usage: all KV storage is typed device
+# tensors compatible with Cranelift CPU and Metal KIR kernels.
+
+import from "gradus:decode_step" let ds
+import from "gradus:model/schedule" let schedule
+
+const int ARENA_FULL_KV = 0
+const int ARENA_RING_KV = 1
+const int ARENA_RECURRENT_SSM = 2
+const int ARENA_NO_STATE = 3
+
+@ public
+union SessionError {
+    @ shared
+    string message
+
+    InvalidSchedule,
+    InvalidCapacity,
+    InvalidSlot,
+    SlotArenaMismatch,
+    OutOfBoundsPosition
+}
+
+@ public
+class ValidSpan {
+    let int start_pos
+    let int end_pos
+    let int valid_count
+    let int write_slot
+}
+
+@ public
+class FullKvArena<size C, size KVD> {
+    let int capacity
+    let int kv_dim
+    let list<int> slot_ids
+    mut list<tensor<f32, [C, KVD]>> keys
+    mut list<tensor<f32, [C, KVD]>> values
+    mut list<int> lengths
+}
+
+@ public
+class RingKvArena<size W, size KVD> {
+    let int max_window
+    let int kv_dim
+    let list<int> slot_ids
+    let list<int> window_sizes
+    mut list<tensor<f32, [W, KVD]>> keys
+    mut list<tensor<f32, [W, KVD]>> values
+    mut list<int> total_written
+}
+
+@ public
+class SessionState<size C, size W, size KVD> {
+    let schedule.ExecutionSchedule sched
+    mut FullKvArena<size C, size KVD> full_kv
+    mut RingKvArena<size W, size KVD> ring_kv
+    let list<int> slot_arena_kind
+    let list<int> slot_local_index
+    let list<int> slot_window_sizes
+}
+
+# -------------------------------------------------------------------------
+# Pure indexing and valid-span bounds helpers
+# -------------------------------------------------------------------------
+
+@ public
+fn ring_slot(int pos, int window) → int ⇥ SessionError {
+    require pos ≥ 0 throw variant OutOfBoundsPosition { message = "ring position must be non-negative" }
+    require window ≥ 1 throw variant InvalidCapacity { message = "ring window size must be positive" }
+
+    return pos % window
+}
+
+@ public
+fn ring_span(int total_written, int window) → ValidSpan ⇥ SessionError {
+    require total_written ≥ 0 throw variant OutOfBoundsPosition { message = "total_written must be non-negative" }
+    require window ≥ 1 throw variant InvalidCapacity { message = "ring window size must be positive" }
+
+    if total_written ≡ 0 {
+        return ValidSpan { start_pos = 0, end_pos = 0, valid_count = 0, write_slot = 0 }
+    }
+
+    mut int start ← total_written - window
+
+    if start ≺ 0 {
+        start ← 0
+    }
+
+    let int count ← total_written - start
+    let int last_slot ← (total_written - 1) % window
+    return ValidSpan { start_pos = start, end_pos = total_written, valid_count = count, write_slot = last_slot }
+}
+
+@ public
+fn full_span(int total_written, int capacity) → ValidSpan ⇥ SessionError {
+    require total_written ≥ 0 and total_written ≤ capacity throw variant OutOfBoundsPosition { message = "full KV length § exceeds capacity §"(total_written ↦ string, capacity ↦ string) }
+    require capacity ≥ 1 throw variant InvalidCapacity { message = "full KV capacity must be positive" }
+
+    if total_written ≡ 0 {
+        return ValidSpan { start_pos = 0, end_pos = 0, valid_count = 0, write_slot = 0 }
+    }
+
+    return ValidSpan { start_pos = 0, end_pos = total_written, valid_count = total_written, write_slot = total_written - 1 }
+}
+
+# -------------------------------------------------------------------------
+# Construction from ExecutionSchedule
+# -------------------------------------------------------------------------
+
+@ public
+fn from_schedule<size C, size W, size KVD>(schedule.ExecutionSchedule sched) → SessionState<size C, size W, size KVD> ⇥ SessionError {
+    require C ≥ 1 and W ≥ 1 and KVD ≥ 1 throw variant InvalidCapacity { message = "SessionState extents C, W, and KVD must be positive" }
+
+    mut list<int> full_slot_ids ← empty
+    mut list<tensor<f32, [C, KVD]>> full_keys ← empty
+    mut list<tensor<f32, [C, KVD]>> full_values ← empty
+    mut list<int> full_lengths ← empty
+
+    mut list<int> ring_slot_ids ← empty
+    mut list<int> ring_windows ← empty
+    mut list<tensor<f32, [W, KVD]>> ring_keys ← empty
+    mut list<tensor<f32, [W, KVD]>> ring_values ← empty
+    mut list<int> ring_written ← empty
+
+    mut list<int> slot_arena_kind ← empty
+    mut list<int> slot_local_index ← empty
+    mut list<int> slot_window_sizes ← empty
+
+    for exclusive sched.slots.length() let expected_slot {
+        let schedule.SlotSpec sp ← sched.slots[expected_slot]
+
+        require sp.slot_id ≡ expected_slot throw variant InvalidSchedule { message = "schedule slots must be contiguous from 0 (expected §, got §)"(expected_slot ↦ string, sp.slot_id ↦ string) }
+
+        match sp.arena {
+            case schedule.ArenaKind.FullKv {
+                let int local_idx ← full_slot_ids.length()
+                let tensor<f32, [C, KVD]> fk ← tf32[C, KVD] {}
+                let tensor<f32, [C, KVD]> fv ← tf32[C, KVD] {}
+                full_slot_ids.append(sp.slot_id)
+                full_keys.append(fk)
+                full_values.append(fv)
+                full_lengths.append(0)
+                slot_arena_kind.append(ARENA_FULL_KV)
+                slot_local_index.append(local_idx)
+                slot_window_sizes.append(C)
+            }
+            case schedule.ArenaKind.RingKv let window {
+                require window ≥ 1 and window ≤ W throw variant InvalidCapacity { message = "slot § ring window § exceeds arena capacity §"(sp.slot_id ↦ string, window ↦ string, W ↦ string) }
+
+                let int local_idx ← ring_slot_ids.length()
+                let tensor<f32, [W, KVD]> rk ← tf32[W, KVD] {}
+                let tensor<f32, [W, KVD]> rv ← tf32[W, KVD] {}
+                ring_slot_ids.append(sp.slot_id)
+                ring_windows.append(window)
+                ring_keys.append(rk)
+                ring_values.append(rv)
+                ring_written.append(0)
+                slot_arena_kind.append(ARENA_RING_KV)
+                slot_local_index.append(local_idx)
+                slot_window_sizes.append(window)
+            }
+            case schedule.ArenaKind.RecurrentSsm {
+                slot_arena_kind.append(ARENA_RECURRENT_SSM)
+                slot_local_index.append(-1)
+                slot_window_sizes.append(0)
+            }
+            case schedule.ArenaKind.NoState {
+                slot_arena_kind.append(ARENA_NO_STATE)
+                slot_local_index.append(-1)
+                slot_window_sizes.append(0)
+            }
+        }
+    }
+
+    let FullKvArena<size C, size KVD> full_arena ← FullKvArena { capacity = C, kv_dim = KVD, slot_ids = full_slot_ids, keys = full_keys, values = full_values, lengths = full_lengths }
+    let RingKvArena<size W, size KVD> ring_arena ← RingKvArena { max_window = W, kv_dim = KVD, slot_ids = ring_slot_ids, window_sizes = ring_windows, keys = ring_keys, values = ring_values, total_written = ring_written }
+    return SessionState { sched = sched, full_kv = full_arena, ring_kv = ring_arena, slot_arena_kind = slot_arena_kind, slot_local_index = slot_local_index, slot_window_sizes = slot_window_sizes }
+}
+
+@ public
+fn from_dense_schedule<size C, size KVD>(schedule.ExecutionSchedule sched) → SessionState<size C, size 1, size KVD> ⇥ SessionError {
+    return from_schedule<size C, size 1, size KVD>(sched)
+}
+
+# -------------------------------------------------------------------------
+# Slot inspection
+# -------------------------------------------------------------------------
+
+fn check_slot<size C, size W, size KVD>(SessionState<size C, size W, size KVD> sess, int slot_id) → void ⇥ SessionError {
+    require slot_id ≥ 0 and slot_id ≺ sess.slot_arena_kind.length() throw variant InvalidSlot { message = "slot_id § out of range"(slot_id ↦ string) }
+}
+
+@ public
+fn slot_kind<size C, size W, size KVD>(SessionState<size C, size W, size KVD> sess, int slot_id) → schedule.ArenaKind ⇥ SessionError {
+    check_slot(sess, slot_id)
+    return sess.sched.slots[slot_id].arena
+}
+
+@ public
+fn slot_valid_span<size C, size W, size KVD>(SessionState<size C, size W, size KVD> sess, int slot_id) → ValidSpan ⇥ SessionError {
+    check_slot(sess, slot_id)
+    let int kind ← sess.slot_arena_kind[slot_id]
+    let int idx ← sess.slot_local_index[slot_id]
+
+    if kind ≡ ARENA_FULL_KV {
+        return full_span(sess.full_kv.lengths[idx], C)
+    }
+    elif kind ≡ ARENA_RING_KV {
+        return ring_span(sess.ring_kv.total_written[idx], sess.slot_window_sizes[slot_id])
+    }
+
+    throw variant SlotArenaMismatch { message = "slot § is not a KV arena"(slot_id ↦ string) }
+}
+
+# -------------------------------------------------------------------------
+# Device-ready KV write, windowed attention score, and context dispatch
+# -------------------------------------------------------------------------
+
+@ public
+fn write_kv<size C, size W, size KVD>(mut SessionState<size C, size W, size KVD> sess, int slot_id, tensor<f32, [KVD]> k, tensor<f32, [KVD]> v, i32 pos) → void ⇥ SessionError {
+    check_slot(sess, slot_id)
+    let int kind ← sess.slot_arena_kind[slot_id]
+    let int idx ← sess.slot_local_index[slot_id]
+    let int p ← pos ↦ int
+
+    if kind ≡ ARENA_FULL_KV {
+        require p ≥ 0 and p ≺ C throw variant OutOfBoundsPosition { message = "FullKv position § out of capacity §"(p ↦ string, C ↦ string) }
+
+        mut tensor<f32, [C, KVD]> kc ← sess.full_kv.keys[idx]
+        mut tensor<f32, [C, KVD]> vc ← sess.full_kv.values[idx]
+        ds.kv_write_row(k, mut kc, pos)
+        ds.kv_write_row(v, mut vc, pos)
+        sess.full_kv.keys[idx] ← kc
+        sess.full_kv.values[idx] ← vc
+        if p + 1 ≻ sess.full_kv.lengths[idx] {
+            sess.full_kv.lengths[idx] ← p + 1
+        }
+        return
+    }
+    elif kind ≡ ARENA_RING_KV {
+        require p ≥ 0 throw variant OutOfBoundsPosition { message = "RingKv position § must be non-negative"(p ↦ string) }
+
+        let i32 win ← sess.slot_window_sizes[slot_id] ↦ i32 ⊥ 0
+        mut tensor<f32, [W, KVD]> kc ← sess.ring_kv.keys[idx]
+        mut tensor<f32, [W, KVD]> vc ← sess.ring_kv.values[idx]
+        ds.kv_ring_write_row(k, mut kc, pos, win)
+        ds.kv_ring_write_row(v, mut vc, pos, win)
+        sess.ring_kv.keys[idx] ← kc
+        sess.ring_kv.values[idx] ← vc
+        if p + 1 ≻ sess.ring_kv.total_written[idx] {
+            sess.ring_kv.total_written[idx] ← p + 1
+        }
+        return
+    }
+
+    throw variant SlotArenaMismatch { message = "slot § is not a KV arena"(slot_id ↦ string) }
+}
+
+fn find_arena_slot(list<int> slot_ids, int slot_id) → int ⇥ SessionError {
+    for exclusive slot_ids.length() let i {
+        if slot_ids[i] ≡ slot_id then return i
+    }
+
+    throw variant SlotArenaMismatch { message = "slot § is not in this KV arena"(slot_id ↦ string) }
+}
+
+@ public
+fn score_full<size C, size KVD, size H, size QD>(FullKvArena<size C, size KVD> arena, int slot_id, tensor<f32, [H, C]> dom, tensor<f32, [QD]> q, mut tensor<f32, [H, C]> sc, i32 pos, i32 group, i32 dh, f32 scale) → void ⇥ SessionError {
+    let int idx ← find_arena_slot(arena.slot_ids, slot_id)
+    let tensor<f32, [C, KVD]> kc ← arena.keys[idx]
+    ds.attn_scores(dom, q, kc, mut sc, pos, group, dh, scale)
+}
+
+@ public
+fn context_full<size C, size KVD, size H, size QD>(FullKvArena<size C, size KVD> arena, int slot_id, tensor<f32, [QD]> dom, tensor<f32, [H, C]> probs, mut tensor<f32, [QD]> ctx, i32 pos, i32 group, i32 dh) → void ⇥ SessionError {
+    let int idx ← find_arena_slot(arena.slot_ids, slot_id)
+    let tensor<f32, [C, KVD]> vc ← arena.values[idx]
+    ds.attn_context(dom, probs, vc, mut ctx, pos, group, dh)
+}
+
+@ public
+fn score_ring<size W, size KVD, size H, size QD>(RingKvArena<size W, size KVD> arena, int slot_id, tensor<f32, [H, W]> dom, tensor<f32, [QD]> q, mut tensor<f32, [H, W]> sc, i32 pos, i32 group, i32 dh, f32 scale) → void ⇥ SessionError {
+    let int idx ← find_arena_slot(arena.slot_ids, slot_id)
+    let i32 win ← arena.window_sizes[idx] ↦ i32 ⊥ 0
+    let tensor<f32, [W, KVD]> kc ← arena.keys[idx]
+    ds.attn_scores_ring(dom, q, kc, mut sc, pos, win, group, dh, scale)
+}
+
+@ public
+fn context_ring<size W, size KVD, size H, size QD>(RingKvArena<size W, size KVD> arena, int slot_id, tensor<f32, [QD]> dom, tensor<f32, [H, W]> probs, mut tensor<f32, [QD]> ctx, i32 pos, i32 group, i32 dh) → void ⇥ SessionError {
+    let int idx ← find_arena_slot(arena.slot_ids, slot_id)
+    let i32 win ← arena.window_sizes[idx] ↦ i32 ⊥ 0
+    let tensor<f32, [W, KVD]> vc ← arena.values[idx]
+    ds.attn_context_ring(dom, probs, vc, mut ctx, pos, win, group, dh)
+}
+
+@ public
+fn softmax_full<size H, size C>(tensor<f32, [H, C]> sc, mut tensor<f32, [H, C]> probs) → void {
+    ds.row_softmax(sc, mut probs)
+}
+
+@ public
+fn softmax_ring<size H, size W>(tensor<f32, [H, W]> sc, mut tensor<f32, [H, W]> probs) → void {
+    ds.row_softmax(sc, mut probs)
+}
+
++++ faber test
+import from "gradus:cache/session" let session
+import from "gradus:model/schedule" let schedule
+
+fn close(f32 a, f32 b) → bool {
+    return (a - b).abs() ≺ 0.0001
+}
+
+fn mk_dense_sched(int layers) → schedule.ExecutionSchedule {
+    do {
+        return schedule.dense_schedule(layers, variant schedule.RopeKind.Standard, variant schedule.FfnKind.Dense, [])
+    }
+    catch err {
+        assert false
+        return schedule.ExecutionSchedule { layers = [], segments = [], steps = [], slots = [], residual = variant schedule.ResidualKind.Standard, taps = [] }
+    }
+}
+
+fn mk_hybrid_flint_sched() → schedule.ExecutionSchedule {
+    # Hybrid FullKv + RingKv(513) schedule (Slice B0 Flint pattern)
+    let list<schedule.AttentionKind> attns ← [
+        variant schedule.AttentionKind.SlidingWindow { window = 513 },
+        variant schedule.AttentionKind.Full,
+        variant schedule.AttentionKind.SlidingWindow { window = 513 }
+    ]
+    let list<schedule.RopeKind> ropes ← [
+        variant schedule.RopeKind.Standard,
+        variant schedule.RopeKind.None,
+        variant schedule.RopeKind.Standard
+    ]
+    do {
+        return schedule.patterned_schedule(attns, ropes, 2, [])
+    }
+    catch err {
+        assert false
+        return schedule.ExecutionSchedule { layers = [], segments = [], steps = [], slots = [], residual = variant schedule.ResidualKind.Standard, taps = [] }
+    }
+}
+
+test "SessionState Slice A dense FullKvArena (30 slots, SmolLM2-135M shape)" {
+    let schedule.ExecutionSchedule sched ← mk_dense_sched(30)
+    do {
+        mut session.SessionState<8, 1, 4> sess ← session.from_dense_schedule<size 8, size 4>(sched)
+        assert sess.full_kv.slot_ids.length() ≡ 30
+        assert sess.ring_kv.slot_ids.length() ≡ 0
+
+        mut tensor<f32, [4]> k0 ← tf32[4] {}
+        mut tensor<f32, [4]> v0 ← tf32[4] {}
+        for exclusive 4 let j {
+            k0[[j]] ← (j + 1) ↦ f32
+            v0[[j]] ← ((j + 1) * 10) ↦ f32
+        }
+
+        session.write_kv(mut sess, 0, k0, v0, 0 ∷ i32)
+        session.write_kv(mut sess, 29, k0, v0, 2 ∷ i32)
+
+        let session.ValidSpan sp0 ← session.slot_valid_span(sess, 0)
+        assert sp0.start_pos ≡ 0
+        assert sp0.end_pos ≡ 1
+        assert sp0.valid_count ≡ 1
+
+        let session.ValidSpan sp29 ← session.slot_valid_span(sess, 29)
+        assert sp29.end_pos ≡ 3
+        assert sp29.write_slot ≡ 2
+
+        let tensor<f32, [1, 8]> dom ← tf32[1, 8] {}
+        let tensor<f32, [4]> q ← k0
+        mut tensor<f32, [1, 8]> sc ← tf32[1, 8] {}
+        session.score_full(sess.full_kv, 0, dom, q, mut sc, 0 ∷ i32, 1 ∷ i32, 4 ∷ i32, 0.5 ∷ f32)
+        # q . k0 = 1+4+9+16 = 30; * 0.5 = 15.0 at c=0, masked -3e38 at c=1
+        assert close(sc[[0, 0]], 15.0)
+        assert sc[[0, 1]] ≺ -1.0e30
+
+        mut tensor<f32, [1, 8]> pr ← tf32[1, 8] {}
+        session.softmax_full(sc, mut pr)
+        let tensor<f32, [4]> cdom ← tf32[4] {}
+        mut tensor<f32, [4]> ctx ← tf32[4] {}
+        session.context_full(sess.full_kv, 0, cdom, pr, mut ctx, 0 ∷ i32, 1 ∷ i32, 4 ∷ i32)
+        assert close(ctx[[0]], 10.0)
+        assert close(ctx[[3]], 40.0)
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "SessionState hybrid FullKvArena + RingKvArena(513) wraparound and windowed attention" {
+    let schedule.ExecutionSchedule sched ← mk_hybrid_flint_sched()
+    do {
+        mut session.SessionState<16, 513, 4> sess ← session.from_schedule<size 16, size 513, size 4>(sched)
+        assert sess.full_kv.slot_ids.length() ≡ 1
+        assert sess.ring_kv.slot_ids.length() ≡ 2
+        assert sess.ring_kv.window_sizes[0] ≡ 513
+
+        # Write at pos = 0, 512, 513 (wraps to slot 0!), and 514 (wraps to slot 1!)
+        mut tensor<f32, [4]> k_a ← tf32[4] {}
+        mut tensor<f32, [4]> v_a ← tf32[4] {}
+        mut tensor<f32, [4]> k_b ← tf32[4] {}
+        mut tensor<f32, [4]> v_b ← tf32[4] {}
+        for exclusive 4 let j {
+            k_a[[j]] ← 1.0
+            v_a[[j]] ← 2.0
+            k_b[[j]] ← 3.0
+            v_b[[j]] ← 4.0
+        }
+
+        session.write_kv(mut sess, 0, k_a, v_a, 0 ∷ i32)
+        session.write_kv(mut sess, 0, k_a, v_a, 512 ∷ i32)
+        session.write_kv(mut sess, 0, k_b, v_b, 513 ∷ i32)
+
+        let session.ValidSpan sp ← session.slot_valid_span(sess, 0)
+        assert sp.start_pos ≡ 1
+        assert sp.end_pos ≡ 514
+        assert sp.valid_count ≡ 513
+        assert sp.write_slot ≡ 0
+
+        # Non-power-of-two window 1025 span check
+        let session.ValidSpan sp1025 ← session.ring_span(1027, 1025)
+        assert sp1025.start_pos ≡ 2
+        assert sp1025.valid_count ≡ 1025
+        assert sp1025.write_slot ≡ 1
+
+        # Score and context on ring slot 0 at pos=513 (wrapped: slot 0 has k_b=[3..], slot 512 has k_a=[1..])
+        let tensor<f32, [1, 513]> rdom ← tf32[1, 513] {}
+        let tensor<f32, [4]> q ← k_a
+        mut tensor<f32, [1, 513]> rsc ← tf32[1, 513] {}
+        session.score_ring(sess.ring_kv, 0, rdom, q, mut rsc, 513 ∷ i32, 1 ∷ i32, 4 ∷ i32, 0.5 ∷ f32)
+        # slot 0: (1*3)*4 * 0.5 = 6.0; slot 512: (1*1)*4 * 0.5 = 2.0
+        assert close(rsc[[0, 0]], 6.0)
+        assert close(rsc[[0, 512]], 2.0)
+
+        mut tensor<f32, [1, 513]> rpr ← tf32[1, 513] {}
+        session.softmax_ring(rsc, mut rpr)
+        let tensor<f32, [4]> cdom ← tf32[4] {}
+        mut tensor<f32, [4]> rctx ← tf32[4] {}
+        session.context_ring(sess.ring_kv, 0, cdom, rpr, mut rctx, 513 ∷ i32, 1 ∷ i32, 4 ∷ i32)
+        assert rctx[[0]] ≻ 1.7 and rctx[[0]] ≺ 1.85
+    }
+    catch err {
+        assert false
+    }
+}
