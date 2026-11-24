@@ -297,17 +297,20 @@ kernel argmax_token<size V>(tensor<f32, [V]> atx, mut tensor<i32, [1]> atid) →
     } coalesce 0
 }
 
-# Chunked top-M: lane (p, m) of [P, M] writes the m-th best (value, global index)
-# pair of chunk p (descending value, ties to lowest index).
+# Chunked top-M: lane (p, m) of [P, M] writes the m-th best pair of chunk p
+# (descending value, ties to the lowest index). Values stay f32. Indices are
+# i32, including the -1 sentinel, so a later kernel can read them. The old
+# f32 index scratch existed only because an i32 store across kernel passes
+# was refused; that refusal is gone.
 @ public
-kernel topm_chunks<size P, size V, size M>(tensor<f32, [P, M]> tmdom, tensor<f32, [V]> tmx, mut tensor<f32, [P, M]> tmval, mut tensor<f32, [P, M]> tmidx, i32 tmchunk) → void {
+kernel topm_chunks<size P, size V, size M>(tensor<f32, [P, M]> tmdom, tensor<f32, [V]> tmx, mut tensor<f32, [P, M]> tmval, mut tensor<i32, [P, M]> tmidx, i32 tmchunk) → void {
     for from tmdom at [p, m] thread lane let e {
         if tmchunk ≥ 1 {
             let i32 n ← tmchunk
             let i32 start ← p * n
             let i32 stop ← start + n
             mut f32 pv ← 3.4028235e38
-            mut f32 pf ← -1.0
+            mut i32 pf ← -1
 
             for range 0 … m let rank {
                 mut f32 best ← -3.4028235e38
@@ -316,7 +319,7 @@ kernel topm_chunks<size P, size V, size M>(tensor<f32, [P, M]> tmdom, tensor<f32
                 for range start ‥ stop let k {
                     let f32 v ← tmx[[k]]
 
-                    if v ≺ pv or v ≡ pv and (k ↦ f32) ≻ pf {
+                    if v ≺ pv or (v ≡ pv and k ≻ pf) {
                         if bi ≺ 0 or v ≻ best {
                             best ← v
                             bi ← k
@@ -325,7 +328,7 @@ kernel topm_chunks<size P, size V, size M>(tensor<f32, [P, M]> tmdom, tensor<f32
                 }
 
                 pv ← best
-                pf ← bi ↦ f32
+                pf ← bi
             }
 
             tmval[[p, m]] ← pv
@@ -760,7 +763,7 @@ test "decode_step topm_chunks writes each chunk's top-M pairs in descending valu
     mut tensor<f32, [2, 3]> dom ← tf32[2, 3] {}
     mut tensor<f32, [8]> x ← tf32[8] {}
     mut tensor<f32, [2, 3]> val ← tf32[2, 3] {}
-    mut tensor<f32, [2, 3]> idx ← tf32[2, 3] {}
+    mut tensor<i32, [2, 3]> idx ← ti32[2, 3] {}
     # chunks of 4: [0 1 2 3] [4 5 6 7]
     x[[0]] ← 1.0
     x[[1]] ← 5.0
@@ -772,24 +775,24 @@ test "decode_step topm_chunks writes each chunk's top-M pairs in descending valu
     x[[7]] ← 2.0
     ds.topm_chunks(dom, x, mut val, mut idx, 4)
     assert close(val[[0, 0]], 5.0)
-    assert close(idx[[0, 0]], 1.0)
+    assert idx[[0, 0]] ≡ 1
     assert close(val[[0, 1]], 5.0)
-    assert close(idx[[0, 1]], 2.0)
+    assert idx[[0, 1]] ≡ 2
     assert close(val[[0, 2]], 3.0)
-    assert close(idx[[0, 2]], 3.0)
+    assert idx[[0, 2]] ≡ 3
     assert close(val[[1, 0]], 9.0)
-    assert close(idx[[1, 0]], 5.0)
+    assert idx[[1, 0]] ≡ 5
     assert close(val[[1, 1]], 2.0)
-    assert close(idx[[1, 1]], 7.0)
+    assert idx[[1, 1]] ≡ 7
     assert close(val[[1, 2]], -1.0)
-    assert close(idx[[1, 2]], 4.0)
+    assert idx[[1, 2]] ≡ 4
 }
 
 test "decode_step topm_chunks: a tie across a chunk boundary keeps the lowest index per chunk" {
     mut tensor<f32, [2, 2]> dom ← tf32[2, 2] {}
     mut tensor<f32, [8]> x ← tf32[8] {}
     mut tensor<f32, [2, 2]> val ← tf32[2, 2] {}
-    mut tensor<f32, [2, 2]> idx ← tf32[2, 2] {}
+    mut tensor<i32, [2, 2]> idx ← ti32[2, 2] {}
     for range 0‥8 let i {
         x[[i]] ← -4.0
     }
@@ -797,27 +800,78 @@ test "decode_step topm_chunks: a tie across a chunk boundary keeps the lowest in
     x[[4]] ← 2.5
     x[[6]] ← 2.5
     ds.topm_chunks(dom, x, mut val, mut idx, 4)
-    assert close(idx[[0, 0]], 3.0)
+    assert idx[[0, 0]] ≡ 3
     assert close(val[[0, 1]], -4.0)
-    assert close(idx[[0, 1]], 0.0)
-    assert close(idx[[1, 0]], 4.0)
-    assert close(idx[[1, 1]], 6.0)
+    assert idx[[0, 1]] ≡ 0
+    assert idx[[1, 0]] ≡ 4
+    assert idx[[1, 1]] ≡ 6
 }
 
 test "decode_step topm_chunks: a chunk shorter than M fills the trailing slots with the sentinel index -1" {
     mut tensor<f32, [2, 3]> dom ← tf32[2, 3] {}
     mut tensor<f32, [4]> x ← tf32[4] {}
     mut tensor<f32, [2, 3]> val ← tf32[2, 3] {}
-    mut tensor<f32, [2, 3]> idx ← tf32[2, 3] {}
+    mut tensor<i32, [2, 3]> idx ← ti32[2, 3] {}
     x[[0]] ← 1.0
     x[[1]] ← 4.0
     x[[2]] ← 2.0
     x[[3]] ← 2.0
     ds.topm_chunks(dom, x, mut val, mut idx, 2)
-    assert close(idx[[0, 0]], 1.0)
-    assert close(idx[[0, 1]], 0.0)
-    assert close(idx[[0, 2]], -1.0)
-    assert close(idx[[1, 0]], 2.0)
-    assert close(idx[[1, 1]], 3.0)
-    assert close(idx[[1, 2]], -1.0)
+    assert idx[[0, 0]] ≡ 1
+    assert idx[[0, 1]] ≡ 0
+    assert idx[[0, 2]] ≡ -1
+    assert idx[[1, 0]] ≡ 2
+    assert idx[[1, 1]] ≡ 3
+    assert idx[[1, 2]] ≡ -1
+}
+
+@ public
+kernel read_topm_indices<size P, size M>(tensor<i32, [P, M]> ridx, mut tensor<i32, [P]> rsum) → void {
+    for from rsum at [p] thread lane let e {
+        mut i32 acc ← 0
+
+        for range 0 ‥ M let m {
+            let i32 picked ← ridx[[p, m]]
+
+            if picked ≥ 0 {
+                acc ← acc + picked
+            }
+        }
+
+        rsum[[p]] ← acc
+    }
+}
+
+test "decode_step topm_chunks selects lower-index elements after a tie" {
+    mut tensor<f32, [1, 3]> dom ← tf32[1, 3] {}
+    mut tensor<f32, [4]> x ← tf32[4] {}
+    mut tensor<f32, [1, 3]> val ← tf32[1, 3] {}
+    mut tensor<i32, [1, 3]> idx ← ti32[1, 3] {}
+    x[[0]] ← 3.0
+    x[[1]] ← 5.0
+    x[[2]] ← 5.0
+    x[[3]] ← 1.0
+    ds.topm_chunks(dom, x, mut val, mut idx, 4)
+    assert close(val[[0, 0]], 5.0)
+    assert idx[[0, 0]] ≡ 1
+    assert close(val[[0, 1]], 5.0)
+    assert idx[[0, 1]] ≡ 2
+    assert close(val[[0, 2]], 3.0)
+    assert idx[[0, 2]] ≡ 0
+}
+
+test "decode_step topm_chunks i32 indices and -1 sentinels are readable by a downstream kernel" {
+    mut tensor<f32, [2, 3]> dom ← tf32[2, 3] {}
+    mut tensor<f32, [4]> x ← tf32[4] {}
+    mut tensor<f32, [2, 3]> val ← tf32[2, 3] {}
+    mut tensor<i32, [2, 3]> idx ← ti32[2, 3] {}
+    mut tensor<i32, [2]> sum ← ti32[2] {}
+    x[[0]] ← 1.0
+    x[[1]] ← 4.0
+    x[[2]] ← 2.0
+    x[[3]] ← 2.0
+    ds.topm_chunks(dom, x, mut val, mut idx, 2)
+    read_topm_indices(idx, mut sum)
+    assert sum[[0]] ≡ 1
+    assert sum[[1]] ≡ 5
 }
