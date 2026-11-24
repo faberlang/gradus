@@ -1,0 +1,626 @@
++++ toml
+locale = "en"
+
++++ faber
+# ExecutionSchedule — explicit separation of physical_layer_id, visit_id,
+# and slot_id across Dense, Interval-Hybrid, and Patterned models (issue #46).
+#
+# Public import: import from "gradus:model/schedule" schedule
+#
+# --- Contract ------------------------------------------------------------
+#
+# Every model execution topology maps a sequence of visits (`visit_id`) to
+# physical layers (`physical_layer_id`) and stateful cache/SSM slots
+# (`slot_id`):
+#   * Dense Llama / Qwen2: `LinearSegment(0..L)` where
+#     `visit_id == physical_layer_id == slot_id`.
+#   * Interval-Hybrid (Qwen3.6): `PatternedSegment` with periodic
+#     `Full` vs `LinearSsm` layers (plus optional trailing `Nextn`).
+#   * Patterned (Flint 49-layer): `PatternedSegment` with arbitrary
+#     per-layer `AttentionKind` (`Full` vs `SlidingWindow { window }`),
+#     `RopeKind` (including inverted no-RoPE on full-attention layers), and
+#     `FfnKind` (`Dense` leading blocks + `MoE` remaining blocks).
+#
+# Reserved hook points for Inkling Slice C: `LoopedSegment` and
+# `ResidualKind.AttnRes`.
+
+@ public
+union ScheduleError {
+    @ shared
+    string message
+
+    InvalidConfig,
+    InvalidSegment,
+    InvalidLayer,
+    InvalidTap,
+    InvalidSlot
+}
+
+@ public
+union AttentionKind {
+    Full,
+    SlidingWindow {
+        int window
+    },
+    LinearSsm,
+    Nextn
+}
+
+@ public
+union RopeKind {
+    None,
+    Standard,
+    Sectional {
+        list<int> dimension_sections
+    },
+    RelativeBias
+}
+
+@ public
+union FfnKind {
+    Dense,
+    MoE
+}
+
+@ public
+union ArenaKind {
+    FullKv,
+    RingKv {
+        int window
+    },
+    RecurrentSsm,
+    NoState
+}
+
+@ public
+union ResidualKind {
+    Standard,
+    AttnRes
+}
+
+@ public
+class TapBuffer {
+    let string name
+    let int visit_id
+}
+
+@ public
+class LayerSpec {
+    let int physical_layer_id
+    let AttentionKind attention
+    let RopeKind rope
+    let FfnKind ffn
+}
+
+@ public
+class LinearSegment {
+    let int start_layer
+    let int end_layer
+}
+
+@ public
+class PatternedSegment {
+    let int start_layer
+    let int end_layer
+}
+
+# Reserved for Inkling Slice C cross-pass looping.
+@ public
+class LoopedSegment {
+    let int start_layer
+    let int end_layer
+    let int pass_count
+}
+
+@ public
+union ScheduleSegment {
+    Linear {
+        LinearSegment seg
+    },
+    Patterned {
+        PatternedSegment seg
+    },
+    Looped {
+        LoopedSegment seg
+    }
+}
+
+@ public
+class ExecutionStep {
+    let int visit_id
+    let int physical_layer_id
+    let int slot_id
+    let AttentionKind attention
+    let RopeKind rope
+    let FfnKind ffn
+}
+
+@ public
+class SlotSpec {
+    let int slot_id
+    let int physical_layer_id
+    let ArenaKind arena
+}
+
+@ public
+class ExecutionSchedule {
+    let list<LayerSpec> layers
+    let list<ScheduleSegment> segments
+    let list<ExecutionStep> steps
+    let list<SlotSpec> slots
+    let ResidualKind residual
+    let list<TapBuffer> taps
+}
+
+# -------------------------------------------------------------------------
+# Internal validation and arena mapping
+# -------------------------------------------------------------------------
+
+fn arena_for_attention(AttentionKind attn) → ArenaKind {
+    match attn {
+        case Full {
+            return variant FullKv
+        }
+        case SlidingWindow let w {
+            return variant RingKv { window = w }
+        }
+        case LinearSsm {
+            return variant RecurrentSsm
+        }
+        case Nextn {
+            return variant NoState
+        }
+    }
+}
+
+fn validate_layer(LayerSpec layer, int expected_id) → bool ⇥ ScheduleError {
+    require layer.physical_layer_id ≡ expected_id throw variant InvalidLayer { message = "physical_layer_id mismatch at layer §"(expected_id ↦ string) }
+
+    match layer.attention {
+        case SlidingWindow let w {
+            require w ≥ 1 throw variant InvalidLayer { message = "sliding window must be at least 1 at layer §"(expected_id ↦ string) }
+        }
+        default {
+        }
+    }
+
+    match layer.rope {
+        case Sectional let secs {
+            require secs.length() ≥ 1 throw variant InvalidLayer { message = "sectional RoPE requires non-empty dimension_sections at layer §"(expected_id ↦ string) }
+        }
+        default {
+        }
+    }
+
+    return true
+}
+
+fn segment_bounds(ScheduleSegment seg, int layer_count) → list<int> ⇥ ScheduleError {
+    mut int start ← 0
+    mut int end ← 0
+    mut int passes ← 1
+
+    match seg {
+        case Linear let s {
+            start ← s.start_layer
+            end ← s.end_layer
+        }
+        case Patterned let s {
+            start ← s.start_layer
+            end ← s.end_layer
+        }
+        case Looped let s {
+            start ← s.start_layer
+            end ← s.end_layer
+            passes ← s.pass_count
+            require passes ≥ 1 throw variant InvalidSegment { message = "looped segment pass_count must be at least 1" }
+        }
+    }
+
+    require start ≥ 0 and start ≺ end and end ≤ layer_count throw variant InvalidSegment { message = "segment bounds [§..§) invalid for § layers"(start ↦ string, end ↦ string, layer_count ↦ string) }
+
+    return [start, end, passes]
+}
+
+# -------------------------------------------------------------------------
+# General schedule constructor (fail-closed)
+# -------------------------------------------------------------------------
+
+@ public
+fn build_schedule(list<LayerSpec> layers, list<ScheduleSegment> segments, ResidualKind residual, list<TapBuffer> taps) → ExecutionSchedule ⇥ ScheduleError {
+    require layers.length() ≥ 1 throw variant InvalidConfig { message = "schedule requires at least one physical layer" }
+
+    require segments.length() ≥ 1 throw variant InvalidConfig { message = "schedule requires at least one segment" }
+
+    for range 0 ‥ layers.length() let i {
+        validate_layer(layers[i], i)
+    }
+
+    mut list<ExecutionStep> steps ← empty
+    mut list<SlotSpec> slots ← empty
+    mut int next_visit ← 0
+    mut int next_slot ← 0
+
+    for from segments let seg {
+        let list<int> bounds ← segment_bounds(seg, layers.length())
+        let int start ← bounds[0]
+        let int end ← bounds[1]
+        let int passes ← bounds[2]
+
+        for range 0 ‥ passes let pass_idx {
+            for range start ‥ end let phys {
+                let LayerSpec layer ← layers[phys]
+                let ArenaKind arena ← arena_for_attention(layer.attention)
+                let int slot_id ← next_slot
+                next_slot ↑
+                slots.append(SlotSpec { slot_id = slot_id, physical_layer_id = phys, arena = arena })
+                steps.append(ExecutionStep { visit_id = next_visit, physical_layer_id = phys, slot_id = slot_id, attention = layer.attention, rope = layer.rope, ffn = layer.ffn })
+                next_visit ↑
+            }
+        }
+    }
+
+    for from taps let tap {
+        require tap.name.length() ≥ 1 throw variant InvalidTap { message = "tap buffer name must not be empty" }
+
+        require tap.visit_id ≥ 0 and tap.visit_id ≺ steps.length() throw variant InvalidTap { message = "tap visit_id § outside [0..§)"(tap.visit_id ↦ string, steps.length() ↦ string) }
+    }
+
+    return ExecutionSchedule { layers = layers, segments = segments, steps = steps, slots = slots, residual = residual, taps = taps }
+}
+
+# -------------------------------------------------------------------------
+# Family constructors: Dense, Interval-Hybrid (Qwen3.6), Patterned (Flint)
+# -------------------------------------------------------------------------
+
+# Dense Llama / Qwen2: LinearSegment(0..L) where visit_id == physical_layer_id == slot_id.
+@ public
+fn dense_schedule(int layer_count, RopeKind rope, FfnKind ffn, list<TapBuffer> taps) → ExecutionSchedule ⇥ ScheduleError {
+    require layer_count ≥ 1 throw variant InvalidConfig { message = "dense schedule requires at least one layer" }
+
+    mut list<LayerSpec> layers ← empty
+
+    for range 0 ‥ layer_count let i {
+        layers.append(LayerSpec { physical_layer_id = i, attention = variant Full, rope = rope, ffn = ffn })
+    }
+
+    let list<ScheduleSegment> segs ← [variant Linear { seg = LinearSegment { start_layer = 0, end_layer = layer_count } }]
+    return build_schedule(layers, segs, variant ResidualKind.Standard, taps)
+}
+
+# Interval-Hybrid (Qwen3.6-35B-A3B): periodic Full vs LinearSsm trunk plus
+# optional trailing Nextn layers.
+@ public
+fn interval_hybrid_schedule(int block_count, int nextn_predict_layers, int full_attention_interval, RopeKind full_rope, FfnKind ffn, list<TapBuffer> taps) → ExecutionSchedule ⇥ ScheduleError {
+    require block_count ≥ 1 throw variant InvalidConfig { message = "block_count must be at least 1" }
+
+    require nextn_predict_layers ≥ 0 and nextn_predict_layers ≺ block_count throw variant InvalidConfig { message = "nextn_predict_layers must be in [0..block_count)" }
+
+    require full_attention_interval ≥ 1 throw variant InvalidConfig { message = "full_attention_interval must be at least 1" }
+
+    let int trunk ← block_count - nextn_predict_layers
+    mut list<LayerSpec> layers ← empty
+
+    for range 0 ‥ block_count let b {
+        mut AttentionKind attn ← variant LinearSsm
+        mut RopeKind rope ← variant None
+
+        if b ≥ trunk {
+            attn ← variant Nextn
+            rope ← full_rope
+        }
+        else {
+            if (b + 1) % full_attention_interval ≡ 0 {
+                attn ← variant Full
+                rope ← full_rope
+            }
+        }
+
+        layers.append(LayerSpec { physical_layer_id = b, attention = attn, rope = rope, ffn = ffn })
+    }
+
+    let list<ScheduleSegment> segs ← [variant Patterned { seg = PatternedSegment { start_layer = 0, end_layer = block_count } }]
+    return build_schedule(layers, segs, variant ResidualKind.Standard, taps)
+}
+
+# Patterned (Flint 49-layer): explicit per-layer AttentionKind and RopeKind
+# tables, with `leading_dense_blocks` Dense FFN layers followed by MoE layers.
+@ public
+fn patterned_schedule(list<AttentionKind> layer_types, list<RopeKind> rope_pattern, int leading_dense_blocks, list<TapBuffer> taps) → ExecutionSchedule ⇥ ScheduleError {
+    let int n ← layer_types.length()
+
+    require n ≥ 1 throw variant InvalidConfig { message = "patterned schedule requires at least one layer" }
+
+    require rope_pattern.length() ≡ n throw variant InvalidConfig { message = "rope_pattern length must match layer_types length" }
+
+    require leading_dense_blocks ≥ 0 and leading_dense_blocks ≤ n throw variant InvalidConfig { message = "leading_dense_blocks outside [0..layer_count]" }
+
+    mut list<LayerSpec> layers ← empty
+
+    for range 0 ‥ n let i {
+        mut FfnKind ffn ← variant MoE
+
+        if i ≺ leading_dense_blocks {
+            ffn ← variant Dense
+        }
+
+        layers.append(LayerSpec { physical_layer_id = i, attention = layer_types[i], rope = rope_pattern[i], ffn = ffn })
+    }
+
+    let list<ScheduleSegment> segs ← [variant Patterned { seg = PatternedSegment { start_layer = 0, end_layer = n } }]
+    return build_schedule(layers, segs, variant ResidualKind.Standard, taps)
+}
+
+# -------------------------------------------------------------------------
+# Queries for SessionState (Seam 4) and drivers
+# -------------------------------------------------------------------------
+
+@ public
+fn physical_layer_count(ExecutionSchedule s) → int {
+    return s.layers.length()
+}
+
+@ public
+fn step_count(ExecutionSchedule s) → int {
+    return s.steps.length()
+}
+
+@ public
+fn slot_count(ExecutionSchedule s) → int {
+    return s.slots.length()
+}
+
+@ public
+fn step_at(ExecutionSchedule s, int visit_id) → ExecutionStep ⇥ ScheduleError {
+    require visit_id ≥ 0 and visit_id ≺ s.steps.length() throw variant InvalidConfig { message = "visit_id outside schedule" }
+
+    return s.steps[visit_id]
+}
+
+@ public
+fn slot_arena(ExecutionSchedule s, int slot_id) → ArenaKind ⇥ ScheduleError {
+    require slot_id ≥ 0 and slot_id ≺ s.slots.length() throw variant InvalidSlot { message = "slot_id outside schedule" }
+
+    return s.slots[slot_id].arena
+}
+
+@ public
+fn slot_arenas(ExecutionSchedule s) → list<ArenaKind> {
+    mut list<ArenaKind> out ← empty
+
+    for from s.slots let slot {
+        out.append(slot.arena)
+    }
+
+    return out
+}
+
+@ public
+fn full_kv_slot_count(ExecutionSchedule s) → int {
+    mut int n ← 0
+
+    for from s.slots let slot {
+        match slot.arena {
+            case FullKv {
+                n ↑
+            }
+            default {
+            }
+        }
+    }
+
+    return n
+}
+
+@ public
+fn ring_kv_slot_count(ExecutionSchedule s) → int {
+    mut int n ← 0
+
+    for from s.slots let slot {
+        match slot.arena {
+            case RingKv let r {
+                n ↑
+            }
+            default {
+            }
+        }
+    }
+
+    return n
+}
+
+@ public
+fn recurrent_ssm_slot_count(ExecutionSchedule s) → int {
+    mut int n ← 0
+
+    for from s.slots let slot {
+        match slot.arena {
+            case RecurrentSsm {
+                n ↑
+            }
+            default {
+            }
+        }
+    }
+
+    return n
+}
+
++++ faber test
+import from "gradus:model/schedule" sched
+
+fn flint_full_indices() → list<int> {
+    return [0, 1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41, 45, 48]
+}
+
+fn is_in_list(list<int> xs, int v) → bool {
+    for from xs let x {
+        if x ≡ v then return true
+    }
+    return false
+}
+
+fn build_result_dense(int layers) → string {
+    do {
+        sched.dense_schedule(layers, variant sched.RopeKind.Standard, variant Dense, empty)
+        return "ok"
+    }
+    catch err {
+        return err.message
+    }
+}
+
+fn build_result_tap(int visit_id, string name) → string {
+    do {
+        sched.dense_schedule(4, variant sched.RopeKind.Standard, variant Dense, [sched.TapBuffer { name = name, visit_id = visit_id }])
+        return "ok"
+    }
+    catch err {
+        return err.message
+    }
+}
+
+test "Dense Llama/Qwen2 LinearSegment has visit_id == physical_layer_id == slot_id" {
+    do {
+        let sched.ExecutionSchedule s ← sched.dense_schedule(24, variant sched.RopeKind.Standard, variant Dense, [sched.TapBuffer { name = "post_embed", visit_id = 0 }, sched.TapBuffer { name = "final_trunk", visit_id = 23 }])
+        assert sched.physical_layer_count(s) ≡ 24
+        assert sched.step_count(s) ≡ 24
+        assert sched.slot_count(s) ≡ 24
+        assert sched.full_kv_slot_count(s) ≡ 24
+        assert sched.ring_kv_slot_count(s) ≡ 0
+        assert sched.recurrent_ssm_slot_count(s) ≡ 0
+
+        for range 0 ‥ 24 let i {
+            let sched.ExecutionStep st ← sched.step_at(s, i)
+            assert st.visit_id ≡ i
+            assert st.physical_layer_id ≡ i
+            assert st.slot_id ≡ i
+        }
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "Qwen3.6-35B-A3B interval hybrid: 10 full KV + 30 linear SSM, sectional RoPE" {
+    do {
+        let sched.RopeKind qwen_rope ← variant Sectional { dimension_sections = [11, 11, 10, 0] }
+        let sched.ExecutionSchedule s ← sched.interval_hybrid_schedule(40, 0, 4, qwen_rope, variant MoE, empty)
+        assert sched.physical_layer_count(s) ≡ 40
+        assert sched.step_count(s) ≡ 40
+        assert sched.slot_count(s) ≡ 40
+        assert sched.full_kv_slot_count(s) ≡ 10
+        assert sched.recurrent_ssm_slot_count(s) ≡ 30
+        assert sched.ring_kv_slot_count(s) ≡ 0
+
+        let sched.ArenaKind a0 ← sched.slot_arena(s, 0)
+        let sched.ArenaKind a3 ← sched.slot_arena(s, 3)
+        match a0 {
+            case RecurrentSsm {
+                assert true
+            }
+            default {
+                assert false
+            }
+        }
+        match a3 {
+            case FullKv {
+                assert true
+            }
+            default {
+                assert false
+            }
+        }
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "Flint 49-layer patterned table: SWA 513, inverted RoPE, 2 leading dense FFN blocks" {
+    do {
+        let list<int> full_idx ← flint_full_indices()
+        mut list<sched.AttentionKind> attn ← empty
+        mut list<sched.RopeKind> rope ← empty
+
+        for range 0 ‥ 49 let i {
+            if is_in_list(full_idx, i) {
+                attn.append(variant Full)
+                rope.append(variant None)
+            }
+            else {
+                attn.append(variant SlidingWindow { window = 513 })
+                rope.append(variant sched.RopeKind.Standard)
+            }
+        }
+
+        let sched.ExecutionSchedule s ← sched.patterned_schedule(attn, rope, 2, empty)
+        assert sched.physical_layer_count(s) ≡ 49
+        assert sched.step_count(s) ≡ 49
+        assert sched.slot_count(s) ≡ 49
+        assert sched.full_kv_slot_count(s) ≡ 14
+        assert sched.ring_kv_slot_count(s) ≡ 35
+        assert sched.recurrent_ssm_slot_count(s) ≡ 0
+
+        let sched.ExecutionStep s0 ← sched.step_at(s, 0)
+        let sched.ExecutionStep s2 ← sched.step_at(s, 2)
+        match s0.ffn {
+            case Dense {
+                assert true
+            }
+            default {
+                assert false
+            }
+        }
+        match s2.ffn {
+            case MoE {
+                assert true
+            }
+            default {
+                assert false
+            }
+        }
+
+        let sched.ArenaKind a2 ← sched.slot_arena(s, 2)
+        match a2 {
+            case RingKv let w {
+                assert w ≡ 513
+            }
+            default {
+                assert false
+            }
+        }
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "LoopedSegment exercises visit_id != physical_layer_id and distinct slots per visit" {
+    do {
+        let list<sched.LayerSpec> layers ← [
+            sched.LayerSpec { physical_layer_id = 0, attention = variant Full, rope = variant sched.RopeKind.Standard, ffn = variant Dense },
+            sched.LayerSpec { physical_layer_id = 1, attention = variant Full, rope = variant sched.RopeKind.Standard, ffn = variant Dense }
+        ]
+        let list<sched.ScheduleSegment> segs ← [
+            variant Looped { seg = sched.LoopedSegment { start_layer = 0, end_layer = 2, pass_count = 3 } }
+        ]
+        let sched.ExecutionSchedule s ← sched.build_schedule(layers, segs, variant sched.ResidualKind.Standard, empty)
+        assert sched.physical_layer_count(s) ≡ 2
+        assert sched.step_count(s) ≡ 6
+        assert sched.slot_count(s) ≡ 6
+        let sched.ExecutionStep st4 ← sched.step_at(s, 4)
+        assert st4.visit_id ≡ 4
+        assert st4.physical_layer_id ≡ 0
+        assert st4.slot_id ≡ 4
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "Schedule validation fails closed on bad layer counts and out-of-range taps" {
+    assert build_result_dense(0) ≡ "dense schedule requires at least one layer"
+    assert build_result_tap(4, "bad") ≡ "tap visit_id 4 outside [0..4)"
+    assert build_result_tap(0, "") ≡ "tap buffer name must not be empty"
+}
