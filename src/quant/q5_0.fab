@@ -1,0 +1,344 @@
++++ toml
+locale = "en"
+
++++ faber
+# GGML Q5_0 as a named block genus and one decode function (gradus #25).
+#
+# Public import: import from "gradus:quant/q5_0" q5_0
+#
+# A Q5_0 block quantizes 32 weights to 5-bit values with one half scale.
+# On disk a block is 22 bytes, little-endian, with no padding:
+#
+#     block_q5_0 { ggml_half d; uint8_t qh[4]; uint8_t qs[16]; }
+#
+# Weight k in 0..15 is the low nibble of qs[k] plus high bit k of qh,
+# then minus 16. Weight k in 16..31 is the high nibble of qs[k - 16]
+# plus high bit (k) of qh, then minus 16. The product with the half
+# scale is one f32 multiply. Output order is the 16 low-nibble weights
+# followed by the 16 high-nibble weights, matching
+# gradus:model/dequant dequant_q5_0 and ggml-quants.c.
+#
+# Rule 17: the format lives in Gradus. `decode` reads the fields in place
+# and copies no block or field list.
+#
+# `Q5_0`, `decode`, and `from_bytes` are `@ public` (file_interface exports
+# `list<T, size N>`), and `decode_block` stays `@ public` as a host helper.
+# Device/Metal execution over `tensor<Q5_0, [N]>` remains blocked on compiler
+# record-tensor lowering (`f16` / array record fields in KIR and device bridge).
+
+# Elements per block.
+@ public
+const int Q5_0_ELEMENTS = 32
+
+# Bytes per block: 2 (half scale) + 4 (high-bit mask) + 16 (nibbles).
+@ public
+const int Q5_0_BYTES = 22
+
+# The block genus. Field order is the on-disk order.
+@ public
+class Q5_0 {
+    let f16 d
+    let list<u8, size 4> qh
+    let list<u8, size 16> qs
+}
+
+# Typed fail-closed diagnostics of the loader.
+#   BadBlock — byte length is not Q5_0_BYTES.
+#   BadScale — the half scale is NaN.
+@ public
+union Q5_0Error {
+    @ shared
+    string message
+
+    BadBlock,
+    BadScale
+}
+
+# Weight k (0 ≤ k < 32) of block b as f32. An out-of-range k ends the run
+# on the `b.qs[j]` bounds check before any high-bit shift runs.
+@ public
+fn decode(Q5_0 b, i32 k) → f32 {
+    let int ki ← k ↦ int
+    let int j ← ki ≺ 16 ✓ ki ✗ ki - 16
+    let int byte ← b.qs[j] ↦ int
+    let int qh_byte ← b.qh[ki / 8] ↦ int
+    let int xh ← (qh_byte ⇒ ki % 8) % 2 * 16
+    let int nib ← ki ≺ 16 ✓ byte % 16 ✗ (byte ⇒ 4) % 16
+    let int x ← (nib ∨ xh) - 16
+    return (x ↦ f32) * (b.d ↦ f32)
+}
+
+# One block from its 22 on-disk bytes.
+@ public
+fn from_bytes(list<u8> raw) → Q5_0 ⇥ Q5_0Error {
+    if raw.length() ≢ Q5_0_BYTES {
+        throw variant BadBlock { message = "Q5_0 block byte length mismatch" }
+    }
+
+    let list<b8> buf ↤ raw
+    let int bits ← (buf[0 ‥ 2] ↦ u16 via Le) ↦ int
+
+    if (bits ⇒ 10) % 32 ≡ 31 {
+        if bits % 1024 ≢ 0 {
+            throw variant BadScale { message = "NaN half scale in Q5_0 block" }
+        }
+    }
+
+    let f16 d ← ((buf[0 ‥ 2] ↦ u16 via Le) ↦ b16) ↦ f16
+    let list<u8> qh_raw ← buf[2 ‥ 6] ↦ list<u8>
+    let list<u8> qs_raw ← buf[6 ‥ 22] ↦ list<u8>
+
+    do {
+        return Q5_0 { d = d, qh = qh_raw ↦ list<u8, size 4>, qs = qs_raw ↦ list<u8, size 16> }
+    }
+    catch err {
+        throw variant BadBlock { message = "Q5_0 block byte length mismatch" }
+    }
+}
+
+# The 32 weights of one block from its 22 bytes.
+@ public
+fn decode_block(list<u8> raw) → list<f32> ⇥ Q5_0Error {
+    let Q5_0 b ← from_bytes(raw)
+    mut list<f32> y ← empty
+
+    for range 0 ‥ Q5_0_ELEMENTS let k {
+        y.append(decode(b, k ↦ i32 ⊥ 0))
+    }
+
+    return y
+}
+
++++ faber test
+# Co-located package test for q5_0.fab (gradus #25).
+#
+# GOLDEN_* are the 7 Q5_0 fixtures of fixtures/gguf/gguf-dequant-goldens.json
+# copied verbatim. Comparison is on f32 bit patterns. The same blocks are
+# decoded by gradus:model/dequant and compared bit for bit.
+
+import from "gradus:quant/q5_0" q5_0
+
+import from "gradus:model/dequant" dequant
+
+import from "gradus:storage" storage
+
+const list<string> GOLDEN_NAMES = ["real blk.0.attn_q.weight block 0", "real blk.0.attn_q.weight block 14400", "real blk.0.attn_q.weight block 28799", "adversarial zeroes", "adversarial max-scale-qh-ones", "adversarial subnormal-mixed-qh", "adversarial negative-d-qh-low"]
+
+const list<list<int>> GOLDEN_BLOCKS = [
+    [8, 43, 119, 109, 62, 184, 32, 0, 33, 111, 51, 16, 208, 254, 228, 14, 240, 50, 28, 17, 242, 10],
+    [102, 36, 183, 77, 140, 1, 178, 240, 19, 63, 212, 214, 223, 35, 85, 31, 64, 211, 237, 255, 241, 253],
+    [75, 35, 223, 179, 42, 103, 1, 96, 176, 17, 149, 75, 55, 199, 96, 52, 46, 117, 134, 17, 191, 216],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [255, 123, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
+    [1, 0, 0, 255, 0, 255, 0, 16, 240, 15, 171, 205, 239, 18, 52, 86, 120, 144, 170, 187, 204, 221],
+    [0, 192, 255, 255, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255]
+]
+
+const list<list<int>> GOLDEN_BITS = [
+    [0, 0, 1029767168, 3177250816, 1042857984, 0, 0, 3185639424, 1046544384, 3185639424, 0, 1038155776, 3194028032, 1029767168, 1038155776, 3198730240, 3208962048, 0, 1038155776, 1051246592, 1042857984, 1029767168, 3190341632, 3177250816, 3185639424, 3210805248, 3177250816, 1042857984, 1029767168, 1029767168, 3177250816, 0],
+    [1024245760, 0, 1028857856, 3163340800, 1032634368, 1037246464, 3163340800, 1028857856, 1034940416, 3163340800, 0, 1028857856, 3176341504, 3163340800, 1015857152, 3176341504, 3182424064, 3163340800, 1015857152, 1028857856, 3176341504, 3176341504, 3176341504, 1024245760, 1034940416, 3196318720, 3193118720, 3176341504, 3171729408, 3163340800, 3163340800, 3163340800],
+    [1013538816, 0, 0, 1013538816, 1032969216, 3180452864, 1036792832, 1036792832, 0, 1030316032, 3169411072, 3189797376, 1034881024, 1013538816, 3161022464, 1038704640, 3194576896, 1034881024, 3180452864, 1013538816, 3184276480, 1030316032, 3191709184, 3177799680, 1034881024, 1026492416, 1021927424, 3187885568, 3186188288, 1013538816, 1042313728, 3173976064],
+    [2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648],
+    [1232069120, 1232069120, 1232069120, 1232069120, 1232069120, 1232069120, 1232069120, 1232069120, 1232069120, 1232069120, 1232069120, 1232069120, 1232069120, 1232069120, 1232069120, 1232069120, 1232069120, 1232069120, 1232069120, 1232069120, 1232069120, 1232069120, 1232069120, 1232069120, 1232069120, 1232069120, 1232069120, 1232069120, 1232069120, 1232069120, 1232069120, 1232069120],
+    [3045064704, 3045064704, 3045064704, 3011510272, 3030384640, 3024093184, 3011510272, 3042967552, 880803840, 884998144, 889192448, 0, 891289600, 892338176, 893386752, 894435328, 3045064704, 3044016128, 3011510272, 3045064704, 3032481792, 3028287488, 3019898880, 3044016128, 876609536, 882900992, 887095296, 890241024, 891289600, 892338176, 893386752, 894435328],
+    [3253731328, 3253731328, 3253731328, 3253731328, 3253731328, 3253731328, 3253731328, 3253731328, 3253731328, 3253731328, 3253731328, 3253731328, 3253731328, 3253731328, 3253731328, 3253731328, 1073741824, 1073741824, 1073741824, 1073741824, 1073741824, 1073741824, 1073741824, 1073741824, 1073741824, 1073741824, 1073741824, 1073741824, 1073741824, 1073741824, 1073741824, 1073741824]
+]
+
+fn bytes_of(list<int> vals) → list<u8> {
+    mut list<u8> bs ← empty
+    for from vals let v {
+        bs.append(v ↦ u8 ⊥ 0)
+    }
+    return bs
+}
+
+fn bits_of(f32 v) → int {
+    return v ↦ b32 ↦ u32 ↦ int
+}
+
+fn block_result(list<u8> raw) → string {
+    do {
+        q5_0.decode_block(raw)
+        return "ok"
+    }
+    catch err {
+        return err.message
+    }
+}
+
+fn weights(list<u8> raw) → list<f32> {
+    do {
+        return q5_0.decode_block(raw)
+    }
+    catch err {
+        return empty
+    }
+}
+
+fn host_bits(list<u8> raw) → list<int> {
+    do {
+        let list<b8> buf ↤ raw
+        let list<f32> y ← dequant.decode_block_f32(dequant.representation_for(6), buf)
+        mut list<int> out ← empty
+        for from y let v {
+            out.append(bits_of(v))
+        }
+        return out
+    }
+    catch err {
+        return empty
+    }
+}
+
+fn golden_mismatches(int i) → int {
+    let list<f32> y ← weights(bytes_of(GOLDEN_BLOCKS[i]))
+    if y.length() ≢ 32 then return 32
+    mut int bad ← 0
+    for range 0‥32 let j {
+        if bits_of(y[j]) ≢ GOLDEN_BITS[i][j] then bad ← bad + 1
+    }
+    return bad
+}
+
+fn geometry_bytes(storage.Representation kind) → int {
+    do {
+        return dequant.block_bytes(kind)
+    }
+    catch err {
+        return 0
+    }
+}
+
+fn geometry_elements(storage.Representation kind) → int {
+    do {
+        return dequant.block_elements(kind)
+    }
+    catch err {
+        return 0
+    }
+}
+
+test "Q5_0 layout: 22 bytes per 32 weights, no padding" {
+    assert q5_0.Q5_0_ELEMENTS ≡ 32
+    assert q5_0.Q5_0_BYTES ≡ 22
+    assert q5_0.Q5_0_BYTES ≡ 2 + 4 + 16
+}
+
+test "Q5_0 layout equals the host dequant geometry" {
+    let storage.Representation q5 ← dequant.representation_for(6)
+    assert geometry_bytes(q5) ≡ q5_0.Q5_0_BYTES
+    assert geometry_elements(q5) ≡ q5_0.Q5_0_ELEMENTS
+}
+
+test "the golden table is the seven Q5_0 fixtures" {
+    assert GOLDEN_NAMES.length() ≡ 7
+    assert GOLDEN_BLOCKS.length() ≡ 7
+    assert GOLDEN_BITS.length() ≡ 7
+}
+
+test "decode matches the independent golden bit for bit on every block" {
+    for range 0‥7 let i {
+        assert golden_mismatches(i) ≡ 0
+    }
+}
+
+test "genus decode equals host dequant on every golden block" {
+    for range 0‥7 let i {
+        let list<int> h ← host_bits(bytes_of(GOLDEN_BLOCKS[i]))
+        let list<f32> y ← weights(bytes_of(GOLDEN_BLOCKS[i]))
+        assert h.length() ≡ 32
+        assert y.length() ≡ 32
+        for range 0‥32 let j {
+            assert bits_of(y[j]) ≡ h[j]
+        }
+    }
+}
+
+# Scale 1.0 (f16 0x3c00), qh bits 0 and 16 set, qs[0] = 0x10, qs[1] = 0x0F.
+# Covers both nibbles and both high-bit positions.
+#   k = 0  → low nibble 0 | high bit → 0
+#   k = 1  → low nibble 15           → -1
+#   k = 16 → high nibble 1 | high bit → 1
+#   k = 17 → high nibble 0           → -16
+fn branch_block() → list<u8> {
+    mut list<int> raw ← [0, 60, 1, 0, 1, 0, 16, 15]
+    for range 0‥14 let i {
+        raw.append(0)
+    }
+    return bytes_of(raw)
+}
+
+test "high-bit and nibble branches match the hand formula" {
+    let list<f32> y ← weights(branch_block())
+    assert y.length() ≡ 32
+    assert y[0] ≡ 0.0 ∷ f32
+    assert y[1] ≡ -1.0 ∷ f32
+    assert y[16] ≡ 1.0 ∷ f32
+    assert y[17] ≡ -16.0 ∷ f32
+    assert y[2] ≡ -16.0 ∷ f32
+}
+
+test "truncated block is refused by name" {
+    let list<u8> full ← bytes_of(GOLDEN_BLOCKS[0])
+    mut list<u8> trim ← empty
+    for range 0‥21 let i {
+        trim.append(full[i])
+    }
+    assert block_result(trim) ≡ "Q5_0 block byte length mismatch"
+    assert block_result(bytes_of([])) ≡ "Q5_0 block byte length mismatch"
+}
+
+test "padded block is refused by name" {
+    let list<u8> full ← bytes_of(GOLDEN_BLOCKS[0])
+    mut list<u8> pad ← copy full
+    pad.append(0 ↦ u8)
+    assert block_result(pad) ≡ "Q5_0 block byte length mismatch"
+}
+
+test "Q5_0 public from_bytes and decode read fields directly" {
+    do {
+        let q5_0.Q5_0 blk ← q5_0.from_bytes(branch_block())
+        assert q5_0.decode(blk, 0) ≡ 0.0 ∷ f32
+        assert q5_0.decode(blk, 1) ≡ -1.0 ∷ f32
+        assert q5_0.decode(blk, 16) ≡ 1.0 ∷ f32
+        assert q5_0.decode(blk, 17) ≡ -16.0 ∷ f32
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "NaN half scale is refused by name" {
+    # 0x7e00 quiet NaN and 0x7c01 signalling NaN at the scale slot, rest zero.
+    mut list<int> qnan ← [0, 126]
+    mut list<int> snan ← [1, 124]
+    for range 0‥20 let i {
+        qnan.append(0)
+        snan.append(0)
+    }
+    assert block_result(bytes_of(qnan)) ≡ "NaN half scale in Q5_0 block"
+    assert block_result(bytes_of(snan)) ≡ "NaN half scale in Q5_0 block"
+}
+
+test "infinite half scale is data, not an error" {
+    # 0x7c00 = +inf; the loader admits it (only NaN is malformed).
+    mut list<int> raw ← [0, 124]
+    for range 0‥20 let i {
+        raw.append(0)
+    }
+    assert block_result(bytes_of(raw)) ≡ "ok"
+}
+
+test "negative zero scale preserves IEEE-754 sign bits" {
+    # 0x8000 = -0.0; k=0 (nib=0, qh=1 → x=0) gives -0.0, k=1 (nib=15, qh=0 → x=-1) gives +0.0,
+    # and k=16 (nib=1, qh=1 → x=+1) gives -0.0.
+    mut list<int> raw ← [0, 128, 1, 0, 1, 0, 16, 15]
+    for range 0‥14 let i {
+        raw.append(0)
+    }
+    let list<f32> y ← weights(bytes_of(raw))
+    assert y.length() ≡ 32
+    assert bits_of(y[0]) ≡ 0x80000000
+    assert bits_of(y[1]) ≡ 0x00000000
+    assert bits_of(y[16]) ≡ 0x80000000
+}
