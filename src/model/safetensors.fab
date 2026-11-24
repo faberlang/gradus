@@ -264,25 +264,25 @@ fn u64_le(list<u8> b) → int ⇥ SafetensorError {
     return r0 ∨ r1 ⇐ 8 ∨ r2 ⇐ 16 ∨ r3 ⇐ 24 ∨ r4 ⇐ 32 ∨ r5 ⇐ 40 ∨ r6 ⇐ 48 ∨ r7 ⇐ 56
 }
 
-# Container-header validation: the 8-byte LE N is the JSON-only header
-# length, followed by bounds and UTF-8 header extraction. N need not be
-# aligned; data starts immediately after the N header bytes.
-# Ceilings are checked BEFORE the header slice is materialized.
-fn header(list<u8> corpus) → HeaderCursor ⇥ SafetensorError {
+# Container-header validation from a bounded `[0..8+N)` slice against a
+# declared `artifact_length` (which may be multi-GB).
+fn header_with_length(list<u8> buf, int artifact_length) → HeaderCursor ⇥ SafetensorError {
     # --- header length + bounds (fail closed) -----------------------------
-    let int header ← u64_le(corpus)
+    let int header ← u64_le(buf)
 
     require header ≥ 1 throw variant BadFormat { message = "invalid safetensors header size" }
 
     require header ≤ HEADER_LIMIT throw variant BadBounds { message = "header size above ceiling" }
 
-    require 8 + header ≤ corpus.length() throw variant BadFormat { message = "truncated header — header size beyond file" }
+    require 8 + header ≤ artifact_length throw variant BadFormat { message = "truncated header — header size beyond file" }
+
+    require 8 + header ≤ buf.length() throw variant BadFormat { message = "truncated header — header size beyond file" }
 
     # --- header slice + UTF-8 extraction ----------------------------------
     mut list<u8> sub ← empty
 
     for range 8 ‥ 8 + header let i {
-        sub.append(corpus.get(i) coalesce 0 ∷ u8)
+        sub.append(buf.get(i) coalesce 0 ∷ u8)
     }
 
     let list<b8> o ↤ sub
@@ -293,6 +293,10 @@ fn header(list<u8> corpus) → HeaderCursor ⇥ SafetensorError {
     catch err {
         throw variant BadFormat { message = "header is not valid UTF-8" }
     }
+}
+
+fn header(list<u8> corpus) → HeaderCursor ⇥ SafetensorError {
+    return header_with_length(corpus, corpus.length())
 }
 
 # -------------------------------------------------------------------------
@@ -943,6 +947,41 @@ fn int_at(list<int> xs, int i) → int ⇥ SafetensorError {
     throw variant BadBounds { message = "integer index out of range" }
 }
 
+# Fail-closed byte width for the 8 raw MLX/HuggingFace checkpoint dtypes
+# `{F32, F16, BF16, U32, U8, I32, I8, F8_E4M3}`.
+@ public
+fn dtype_byte_width(string kind) → int ⇥ SafetensorError {
+    switch kind {
+        case "F32" {
+            return 4
+        }
+        case "F16" {
+            return 2
+        }
+        case "BF16" {
+            return 2
+        }
+        case "U32" {
+            return 4
+        }
+        case "U8" {
+            return 1
+        }
+        case "I32" {
+            return 4
+        }
+        case "I8" {
+            return 1
+        }
+        case "F8_E4M3" {
+            return 1
+        }
+        default {
+            throw variant UnknownDtype { message = "unsupported Safetensors dtype: §"(kind) }
+        }
+    }
+}
+
 # The public Gradus DType union covers the currently materializable floating
 # and integer types. Other standards-valid Safetensors names stay in the
 # generic manifest text and are rejected only by this typed range handoff.
@@ -999,19 +1038,24 @@ fn admit_selected(string name, string kind, list<int> shape, list<b8> payload, s
     return SelectedTensor { name = name, dtype_tag = dtype_tag, shape = shape, artifact_digest = digest, artifact_length = artifact_length, data_start = data_start, relative_start = relative_start, relative_end = relative_end, absolute_start = absolute_start, payload = payload }
 }
 
-# Parse one whole Safetensors member into the generic schema-2 capsule. The
-# manifest preserves metadata and every descriptor but applies no model,
-# tokenizer, or naming policy.
-@ public
-fn admit(list<u8> corpus, string digest) → capsule.Capsule ⇥ SafetensorError {
-    let HeaderCursor cc ← header(corpus)
-    let int header ← cc.header
-    let string header_text ← cc.text
-    let int data_length ← corpus.length() - 8 - header
+fn validate_identity(artifact.ContentIdentity id, int artifact_length) → artifact.ContentIdentity ⇥ SafetensorError {
+    require artifact_length ≻ 0 throw variant BadBounds { message = "invalid artifact length" }
+
+    require id.length ≡ artifact_length throw variant BadBounds { message = "content identity length does not match artifact length" }
+
+    do {
+        return artifact.identity(id.algorithm, id.digest, id.length)
+    }
+    catch err {
+        throw variant BadDigest { message = err.message }
+    }
+}
+
+fn admit_header_parts(int header_len, string header_text, int artifact_length, artifact.ContentIdentity identity) → capsule.Capsule ⇥ SafetensorError {
+    let artifact.ContentIdentity clean_id ← validate_identity(identity, artifact_length)
+    let int data_length ← artifact_length - 8 - header_len
 
     require data_length ≻ 0 throw variant BadBounds { message = "empty Safetensors data region" }
-
-    require hex_ok(digest) throw variant BadDigest { message = "malformed digest value" }
 
     let list<Token> tks ← scan(header_text)
     let Structure st ← walk(tks)
@@ -1030,7 +1074,7 @@ fn admit(list<u8> corpus, string digest) → capsule.Capsule ⇥ SafetensorError
     mut list<TensorRange> ranges ← empty
     let list<int> empty_dims ← empty
 
-    for range 0 ‥ n let i {
+    for exclusive n let i {
         let string name ← st.names.get(i) coalesce ""
         let string kind ← st.dtypes.get(i) coalesce ""
         let list<int> dimensions ← st.shapes.get(i) coalesce empty_dims
@@ -1062,14 +1106,70 @@ fn admit(list<u8> corpus, string digest) → capsule.Capsule ⇥ SafetensorError
     }
 
     do {
-        let artifact.ContentIdentity identity ← artifact.ContentIdentity { algorithm = DIGEST_SHA256, digest = digest, length = corpus.length() }
-        let capsule.SafetensorsManifest manifest ← capsule.SafetensorsManifest { format = "safetensors", version = "1.0.0", artifact_length = corpus.length(), data_length = data_length, metadata = metadata(st.meta_keys, st.meta_values), tensors = descriptors }
-        let capsule.Capsule c ← capsule.construct_manifest(capsule.schema_version_text(), identity, capsule.safetensors_manifest(manifest))
+        let capsule.SafetensorsManifest manifest ← capsule.SafetensorsManifest { format = "safetensors", version = "1.0.0", artifact_length = artifact_length, data_length = data_length, metadata = metadata(st.meta_keys, st.meta_values), tensors = descriptors }
+        let capsule.Capsule c ← capsule.construct_manifest(capsule.schema_version_text(), clean_id, capsule.safetensors_manifest(manifest))
         return c
     }
     catch err {
         throw variant BadAdmission { message = "capsule admission rejected: §"(err.message) }
     }
+}
+
+# Header-only admission from `[0..8+N)` bytes, declared `artifact_length`,
+# and `artifact.ContentIdentity` (zero whole-file buffering).
+@ public
+fn admit_header(list<u8> header_bytes, int artifact_length, artifact.ContentIdentity identity) → capsule.Capsule ⇥ SafetensorError {
+    let HeaderCursor cc ← header_with_length(header_bytes, artifact_length)
+    return admit_header_parts(cc.header, cc.text, artifact_length, identity)
+}
+
+# Range-based header inspection: reads `[0..8)` length prefix, then
+# `[8..8+N)` JSON header from `source(offset, length)` without buffering
+# the tensor data region.
+@ public
+fn inspect((int, int) → list<b8> ⇥ SafetensorError source, int artifact_length, artifact.ContentIdentity identity) → capsule.Capsule ⇥ SafetensorError {
+    require artifact_length ≥ 8 throw variant BadFormat { message = "truncated safetensors header prefix" }
+
+    let list<b8> prefix_wire ← source(0, 8)
+
+    require prefix_wire.length() ≡ 8 throw variant BadFormat { message = "truncated safetensors header prefix" }
+
+    let list<u8> prefix ← prefix_wire ↦ list<u8>
+    let int header_len ← u64_le(prefix)
+
+    require header_len ≥ 1 throw variant BadFormat { message = "invalid safetensors header size" }
+
+    require header_len ≤ HEADER_LIMIT throw variant BadBounds { message = "header size above ceiling" }
+
+    require 8 + header_len ≤ artifact_length throw variant BadFormat { message = "truncated header — header size beyond file" }
+
+    let list<b8> header_wire ← source(8, header_len)
+
+    require header_wire.length() ≡ header_len throw variant BadFormat { message = "truncated header — header size beyond file" }
+
+    mut string header_text ← ""
+
+    do {
+        header_text ← header_wire ↦ string
+    }
+    catch err {
+        throw variant BadFormat { message = "header is not valid UTF-8" }
+    }
+
+    return admit_header_parts(header_len, header_text, artifact_length, identity)
+}
+
+# Parse one whole Safetensors member into the generic schema-2 capsule. The
+# manifest preserves metadata and every descriptor but applies no model,
+# tokenizer, or naming policy.
+@ public
+fn admit(list<u8> corpus, string digest) → capsule.Capsule ⇥ SafetensorError {
+    let HeaderCursor cc ← header(corpus)
+
+    require hex_ok(digest) throw variant BadDigest { message = "malformed digest value" }
+
+    let artifact.ContentIdentity identity ← artifact.ContentIdentity { algorithm = DIGEST_SHA256, digest = digest, length = corpus.length() }
+    return admit_header_parts(cc.header, cc.text, corpus.length(), identity)
 }
 
 +++ faber test
@@ -1406,5 +1506,78 @@ test "selected admission rejects a future dtype at materialization" {
     }
     catch err {
         assert true
+    }
+}
+
+fn header_slice_only(string header_json) → list<u8> {
+    let list<u8> hdr ← text_bytes(header_json)
+    return join(header8(hdr.length()), hdr)
+}
+
+const string MULTI_DTYPE_JSON = «{"w.f32":{"dtype":"F32","shape":[2],"data_offsets":[0,8]},"w.f16":{"dtype":"F16","shape":[2],"data_offsets":[8,12]},"w.bf16":{"dtype":"BF16","shape":[2],"data_offsets":[12,16]},"w.u32":{"dtype":"U32","shape":[2],"data_offsets":[16,24]},"w.u8":{"dtype":"U8","shape":[2],"data_offsets":[24,26]},"w.i32":{"dtype":"I32","shape":[2],"data_offsets":[26,34]},"w.i8":{"dtype":"I8","shape":[2],"data_offsets":[34,36]},"w.fp8":{"dtype":"F8_E4M3","shape":[2],"data_offsets":[36,38]}}»
+
+fn range_source_multi(int offset, int len) → list<b8> ⇥ safetensors.SafetensorError {
+    let list<u8> hdr ← header_slice_only(MULTI_DTYPE_JSON)
+    if offset ≺ 0 or offset + len ≻ hdr.length() {
+        throw variant safetensors.SafetensorError.BadOffset { message = "test range source only buffers header bytes" }
+    }
+    mut list<u8> out ← empty
+    for exclusive len let i {
+        out.append(hdr.get(offset + i) coalesce 0 ∷ u8)
+    }
+    let list<b8> wire ↤ out
+    return wire
+}
+
+test "range-based inspect admits a 4GB multi-dtype artifact using only header bytes" {
+    let int big_len ← 4000000000
+    let artifact.ContentIdentity id ← artifact.ContentIdentity { algorithm = "sha-256", digest = ALT_DIGEST, length = big_len }
+    do {
+        let capsule.Capsule c ← safetensors.inspect(range_source_multi, big_len, id)
+        assert c.length() ≡ big_len
+        assert c.tensor_count() ≡ 8
+        let capsule.SafetensorsManifest m ← c.safetensors_manifest() coalesce capsule.SafetensorsManifest { format = "", version = "", artifact_length = 0, data_length = 0, metadata = [], tensors = [] }
+        assert m.tensors[3].dtype ≡ "U32"
+        assert m.tensors[4].dtype ≡ "U8"
+        assert m.tensors[7].dtype ≡ "F8_E4M3"
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "admit_header admits header-only slice with declared artifact_length" {
+    let list<u8> hdr ← header_slice_only(MULTI_DTYPE_JSON)
+    let int total_len ← hdr.length() + 38
+    let artifact.ContentIdentity id ← artifact.ContentIdentity { algorithm = "sha-256", digest = ALT_DIGEST, length = total_len }
+    do {
+        let capsule.Capsule c ← safetensors.admit_header(hdr, total_len, id)
+        assert c.tensor_count() ≡ 8
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "dtype_byte_width covers all 8 raw dtypes and rejects unknown dtypes" {
+    do {
+        assert safetensors.dtype_byte_width("F32") ≡ 4
+        assert safetensors.dtype_byte_width("F16") ≡ 2
+        assert safetensors.dtype_byte_width("BF16") ≡ 2
+        assert safetensors.dtype_byte_width("U32") ≡ 4
+        assert safetensors.dtype_byte_width("U8") ≡ 1
+        assert safetensors.dtype_byte_width("I32") ≡ 4
+        assert safetensors.dtype_byte_width("I8") ≡ 1
+        assert safetensors.dtype_byte_width("F8_E4M3") ≡ 1
+    }
+    catch err {
+        assert false
+    }
+    do {
+        safetensors.dtype_byte_width("Q9_X")
+        assert false
+    }
+    catch err {
+        assert err.message ≡ "unsupported Safetensors dtype: Q9_X"
     }
 }
