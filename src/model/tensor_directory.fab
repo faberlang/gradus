@@ -1,0 +1,789 @@
++++ toml
+locale = "en"
+
++++ faber
+# TensorDirectory — logical cross-shard lookup, cross-role borrow, and
+# declarative load-time structural views over an admitted ModelBundle (issue #48).
+#
+# Public import: import from "gradus:model/tensor_directory" td
+# Depends on: gradus:model/bundle, gradus:model/capsule,
+#   gradus:model/gguf_manifest.
+#
+# --- Contract ------------------------------------------------------------
+#
+# A TensorDirectory maps canonical and source tensor names across shards and
+# roles (`backbone`, `drafter`, `vision`) to pathless descriptors:
+#   (member_id, shard_index, byte_offset, byte_length, raw_dtype, shape)
+#
+# Supports:
+#   * Single and dual GGUF manifests (e.g. `backbone` + `drafter`).
+#   * Indexed multi-shard Safetensors (`ShardMapping.Indexed`) with shard
+#     index verification.
+#   * Index-optional zero-based Safetensors shards (`ShardMapping.Unindexed`).
+#   * Cross-role borrow declarations (`drafter` borrowing `embed_tokens` /
+#     `lm_head` from `backbone`).
+#   * Declarative load-time structural views (`RowPrefix` for padded vocab,
+#     `Conv1d` `[C, K, 1]` metadata, `FusedGateUpSplit`).
+#
+# Fails closed on duplicate tensor names within a role, out-of-bounds byte
+# ranges, shard index mismatches, invalid view parameters, and missing
+# borrow targets.
+
+import from "gradus:model/bundle"
+import from "gradus:model/capsule"
+import from "gradus:model/gguf_manifest"
+
+@ public
+union DirectoryError {
+    @ shared
+    string message
+
+    DuplicateTensor,
+    UnknownTensor,
+    OutOfBoundsRange,
+    BadShard,
+    MissingRole,
+    BadBorrow,
+    BadView
+}
+
+@ public
+union LoadView {
+    Full,
+    RowPrefix {
+        int rows
+    },
+    Conv1d {
+        int channels
+        int kernel_size
+    },
+    FusedGateUpSplit {
+        int gate_rows
+        int up_rows
+        bool select_up
+    }
+}
+
+@ public
+class DirectoryEntry {
+    let string canonical_name
+    let string source_name
+    let bundle.MemberRole role
+    let bundle.MemberRole source_role
+    let string member_id
+    let int shard_index
+    let bundle.ContainerKind container
+    let int byte_offset
+    let int byte_length
+    let string raw_dtype
+    let int raw_dtype_id
+    let list<int> shape
+    let LoadView view
+}
+
+@ public
+class SiblingSet {
+    let DirectoryEntry weight
+    let DirectoryEntry ∪ none scales
+    let DirectoryEntry ∪ none biases
+    let DirectoryEntry ∪ none global_scale
+}
+
+@ public
+union ShardSource {
+    GgufSource {
+        bundle.MemberRole role
+        gguf_manifest.GgufManifest manifest
+    },
+    SafetensorsSource {
+        bundle.MemberRole role
+        int shard_index
+        capsule.SafetensorsManifest manifest
+    }
+}
+
+@ public
+class BorrowSpec {
+    let bundle.MemberRole target_role
+    let string canonical_name
+    let bundle.MemberRole source_role
+    let string source_canonical_name
+    let LoadView view
+}
+
+@ public
+class ViewSpec {
+    let bundle.MemberRole role
+    let string canonical_name
+    let LoadView view
+}
+
+@ public
+class TensorDirectory {
+    let bundle.ModelBundle bundle
+    let list<DirectoryEntry> entries
+}
+
+# -------------------------------------------------------------------------
+# Canonicalization helpers
+# -------------------------------------------------------------------------
+
+fn gguf_suffix_to_canonical(string suffix) → string {
+    switch suffix {
+        case "attn_norm.weight" {
+            return "input_layernorm.weight"
+        }
+        case "attn_q.weight" {
+            return "self_attn.q_proj.weight"
+        }
+        case "attn_k.weight" {
+            return "self_attn.k_proj.weight"
+        }
+        case "attn_v.weight" {
+            return "self_attn.v_proj.weight"
+        }
+        case "attn_output.weight" {
+            return "self_attn.o_proj.weight"
+        }
+        case "attn_o.weight" {
+            return "self_attn.o_proj.weight"
+        }
+        case "attn_q.bias" {
+            return "self_attn.q_proj.bias"
+        }
+        case "attn_k.bias" {
+            return "self_attn.k_proj.bias"
+        }
+        case "attn_v.bias" {
+            return "self_attn.v_proj.bias"
+        }
+        case "ffn_norm.weight" {
+            return "post_attention_layernorm.weight"
+        }
+        case "ffn_gate.weight" {
+            return "mlp.gate_proj.weight"
+        }
+        case "ffn_up.weight" {
+            return "mlp.up_proj.weight"
+        }
+        case "ffn_down.weight" {
+            return "mlp.down_proj.weight"
+        }
+        default {
+            return suffix
+        }
+    }
+}
+
+fn find_dot_from(string s, int start) → int {
+    let int n ← s.length()
+
+    for range start ‥ n let i {
+        if (s.slice(i, i + 1) ⊥ "") ≡ "." then return i
+    }
+
+    return -1
+}
+
+fn is_ascii_digits(string s) → bool {
+    if s.length() ≡ 0 then return false
+
+    for from s let c {
+        if not "0123456789".contains(c ↦ string) then return false
+    }
+
+    return true
+}
+
+@ public
+fn canonicalize_gguf_name(string name) → string {
+    if name ≡ "token_embd.weight" then return "model.embed_tokens.weight"
+
+    if name ≡ "output_norm.weight" then return "model.norm.weight"
+
+    if name ≡ "output.weight" then return "lm_head.weight"
+
+    if name.length() ≻ 4 and (name.slice(0, 4) ⊥ "") ≡ "blk." {
+        let int dot ← find_dot_from(name, 4)
+
+        if dot ≻ 4 {
+            let string layer ← name.slice(4, dot) ⊥ ""
+
+            if is_ascii_digits(layer) {
+                let string rest ← name.slice(dot + 1, name.length()) ⊥ ""
+                let string mapped ← gguf_suffix_to_canonical(rest)
+                return "model.layers.§.§"(layer, mapped)
+            }
+        }
+    }
+
+    return name
+}
+
+fn ggml_dtype_name(int dtype_id) → string {
+    switch dtype_id {
+        case 0 {
+            return "F32"
+        }
+        case 1 {
+            return "F16"
+        }
+        case 2 {
+            return "Q4_0"
+        }
+        case 3 {
+            return "Q4_1"
+        }
+        case 6 {
+            return "Q5_0"
+        }
+        case 7 {
+            return "Q5_1"
+        }
+        case 8 {
+            return "Q8_0"
+        }
+        case 12 {
+            return "Q4_K"
+        }
+        case 14 {
+            return "Q6_K"
+        }
+        case 30 {
+            return "BF16"
+        }
+        default {
+            return "GGML_§"(dtype_id ↦ string)
+        }
+    }
+}
+
+fn member_id_for(bundle.BundleMember m) → string {
+    return "§:§:§"(m.identity.algorithm, m.identity.digest, m.identity.length ↦ string)
+}
+
+fn same_role(bundle.MemberRole a, bundle.MemberRole b) → bool {
+    return bundle.role_name(a) ≡ bundle.role_name(b)
+}
+
+fn validate_view(LoadView view) → void ⇥ DirectoryError {
+    match view {
+        case Full {
+            pass
+        }
+        case RowPrefix let rows {
+            require rows ≻ 0 throw variant BadView { message = "RowPrefix rows must be positive" }
+        }
+        case Conv1d let channels, kernel_size {
+            require channels ≻ 0 and kernel_size ≻ 0 throw variant BadView { message = "Conv1d channels and kernel_size must be positive" }
+        }
+        case FusedGateUpSplit let gate_rows, up_rows, select_up {
+            require gate_rows ≻ 0 and up_rows ≻ 0 throw variant BadView { message = "FusedGateUpSplit gate_rows and up_rows must be positive" }
+        }
+    }
+}
+
+fn role_member(bundle.ModelBundle b, bundle.MemberRole role, int shard_index) → bundle.BundleMember ⇥ DirectoryError {
+    match role {
+        case bundle.MemberRole.Backbone {
+            for from b.backbone_shards let m {
+                if m.shard_index ≡ shard_index then return m
+            }
+
+            throw variant BadShard { message = "backbone shard § missing from ModelBundle"(shard_index ↦ string) }
+        }
+        case bundle.MemberRole.Drafter {
+            if b.drafter not is none {
+                let bundle.BundleMember m ← b.drafter
+                require m.shard_index ≡ shard_index throw variant BadShard { message = "drafter shard index mismatch" }
+                return m
+            }
+
+            throw variant MissingRole { message = "ModelBundle has no drafter member" }
+        }
+        case bundle.MemberRole.Vision {
+            if b.vision not is none {
+                let bundle.BundleMember m ← b.vision
+                require m.shard_index ≡ shard_index throw variant BadShard { message = "vision shard index mismatch" }
+                return m
+            }
+
+            throw variant MissingRole { message = "ModelBundle has no vision member" }
+        }
+        default {
+            throw variant MissingRole { message = "role § cannot hold weight tensors"(bundle.role_name(role)) }
+        }
+    }
+}
+
+fn indexed_shard_for(bundle.ShardMapping map, string name) → int ∪ none {
+    match map {
+        case bundle.ShardMapping.Indexed let entries {
+            for from entries let e {
+                if e.tensor_name ≡ name then return e.shard_index
+            }
+
+            return null
+        }
+        case bundle.ShardMapping.Unindexed let shard_count {
+            return null
+        }
+    }
+}
+
+fn find_entry_index(list<DirectoryEntry> entries, bundle.MemberRole role, string name) → int {
+    for exclusive entries.length() let i {
+        let DirectoryEntry e ← entries[i]
+
+        if same_role(e.role, role) and (e.canonical_name ≡ name or e.source_name ≡ name) then return i
+    }
+
+    return -1
+}
+
+fn append_checked(mut list<DirectoryEntry> entries, DirectoryEntry entry) → void ⇥ DirectoryError {
+    for from entries let existing {
+        if same_role(existing.role, entry.role) {
+            reject existing.canonical_name ≡ entry.canonical_name throw variant DuplicateTensor { message = "duplicate canonical tensor § in role §"(entry.canonical_name, bundle.role_name(entry.role)) }
+            reject existing.source_name ≡ entry.source_name throw variant DuplicateTensor { message = "duplicate source tensor § in role §"(entry.source_name, bundle.role_name(entry.role)) }
+        }
+    }
+
+    entries.append(entry)
+}
+
+fn ingest_gguf(mut list<DirectoryEntry> entries, bundle.BundleMember member, gguf_manifest.GgufManifest m) → void ⇥ DirectoryError {
+    require m.artifact_length ≤ member.identity.length and m.data_start ≥ 0 and m.data_start ≤ m.artifact_length throw variant OutOfBoundsRange { message = "GGUF manifest bounds exceed bundle member length" }
+
+    let string mid ← member_id_for(member)
+
+    for from m.tensors let t {
+        let int byte_offset ← m.data_start + t.relative_offset
+        mut int byte_length ← 0
+
+        match t.layout {
+            case gguf_manifest.GgmlLayout.Known let elements_per_block, bytes_per_block, blen {
+                byte_length ← blen
+            }
+            case gguf_manifest.GgmlLayout.Unknown let kind {
+                byte_length ← 0
+            }
+        }
+
+        require byte_offset ≥ m.data_start and byte_length ≥ 0 and byte_offset + byte_length ≤ m.artifact_length throw variant OutOfBoundsRange { message = "GGUF tensor § range exceeds artifact bounds"(t.name) }
+
+        let string canon ← canonicalize_gguf_name(t.name)
+        let DirectoryEntry entry ← DirectoryEntry { canonical_name = canon, source_name = t.name, role = member.role, source_role = member.role, member_id = mid, shard_index = member.shard_index, container = member.container, byte_offset = byte_offset, byte_length = byte_length, raw_dtype = ggml_dtype_name(t.dtype_ggml), raw_dtype_id = t.dtype_ggml, shape = t.shape, view = variant Full }
+        append_checked(mut entries, entry)
+    }
+}
+
+fn ingest_safetensors(mut list<DirectoryEntry> entries, bundle.ModelBundle b, bundle.BundleMember member, capsule.SafetensorsManifest m) → void ⇥ DirectoryError {
+    require m.artifact_length ≤ member.identity.length and m.data_length ≻ 0 and m.data_length ≤ m.artifact_length - 8 throw variant OutOfBoundsRange { message = "Safetensors manifest bounds exceed bundle member length" }
+
+    let int data_start ← m.artifact_length - m.data_length
+    let string mid ← member_id_for(member)
+
+    for from m.tensors let t {
+        let int byte_offset ← data_start + t.start
+        let int byte_length ← t.end - t.start
+
+        require t.start ≥ 0 and byte_length ≻ 0 and byte_offset + byte_length ≤ m.artifact_length throw variant OutOfBoundsRange { message = "Safetensors tensor § range exceeds artifact bounds"(t.name) }
+
+        if same_role(member.role, variant bundle.MemberRole.Backbone) {
+            match b.shard_map {
+                case bundle.ShardMapping.Indexed let shard_entries {
+                    let int ∪ none expected ← indexed_shard_for(b.shard_map, t.name)
+
+                    require expected not is none throw variant BadShard { message = "indexed shard map missing tensor §"(t.name) }
+
+                    let int exp_idx ← expected
+                    require exp_idx ≡ member.shard_index throw variant BadShard { message = "tensor § belongs to shard §, found in shard §"(t.name, exp_idx ↦ string, member.shard_index ↦ string) }
+                }
+                case bundle.ShardMapping.Unindexed let shard_count {
+                    require member.shard_index ≥ 0 and member.shard_index ≺ shard_count throw variant BadShard { message = "shard index § out of range"(member.shard_index ↦ string) }
+                }
+            }
+        }
+
+        let DirectoryEntry entry ← DirectoryEntry { canonical_name = t.name, source_name = t.name, role = member.role, source_role = member.role, member_id = mid, shard_index = member.shard_index, container = member.container, byte_offset = byte_offset, byte_length = byte_length, raw_dtype = t.dtype, raw_dtype_id = -1, shape = t.shape, view = variant Full }
+        append_checked(mut entries, entry)
+    }
+}
+
+# -------------------------------------------------------------------------
+# Public construction and lookup
+# -------------------------------------------------------------------------
+
+@ public
+fn build(bundle.ModelBundle b, list<ShardSource> sources, list<BorrowSpec> borrows, list<ViewSpec> views) → TensorDirectory ⇥ DirectoryError {
+    mut list<DirectoryEntry> entries ← empty
+    mut int backbone_seen ← 0
+
+    for from sources let src {
+        match src {
+            case GgufSource let role, manifest {
+                let bundle.BundleMember member ← role_member(b, role, 0)
+
+                require bundle.container_name(member.container) ≡ "gguf" throw variant BadShard { message = "bundle member for § is not GGUF"(bundle.role_name(role)) }
+
+                ingest_gguf(mut entries, member, manifest)
+
+                if same_role(role, variant bundle.MemberRole.Backbone) then backbone_seen ↑
+            }
+            case SafetensorsSource let role, shard_index, manifest {
+                let bundle.BundleMember member ← role_member(b, role, shard_index)
+
+                require bundle.container_name(member.container) ≡ "safetensors" throw variant BadShard { message = "bundle member for § is not Safetensors"(bundle.role_name(role)) }
+
+                ingest_safetensors(mut entries, b, member, manifest)
+
+                if same_role(role, variant bundle.MemberRole.Backbone) then backbone_seen ↑
+            }
+        }
+    }
+
+    require backbone_seen ≡ b.backbone_shards.length() throw variant BadShard { message = "expected § backbone shard sources, got §"(b.backbone_shards.length() ↦ string, backbone_seen ↦ string) }
+
+    for from views let vs {
+        validate_view(vs.view)
+        let int idx ← find_entry_index(entries, vs.role, vs.canonical_name)
+
+        require idx ≥ 0 throw variant UnknownTensor { message = "view target § not found in role §"(vs.canonical_name, bundle.role_name(vs.role)) }
+
+        let DirectoryEntry base ← entries[idx]
+        entries[idx] ← DirectoryEntry { canonical_name = base.canonical_name, source_name = base.source_name, role = base.role, source_role = base.source_role, member_id = base.member_id, shard_index = base.shard_index, container = base.container, byte_offset = base.byte_offset, byte_length = base.byte_length, raw_dtype = base.raw_dtype, raw_dtype_id = base.raw_dtype_id, shape = base.shape, view = vs.view }
+    }
+
+    for from borrows let br {
+        validate_view(br.view)
+
+        reject same_role(br.target_role, br.source_role) throw variant BadBorrow { message = "cross-role borrow requires distinct target and source roles" }
+
+        let int existing_idx ← find_entry_index(entries, br.target_role, br.canonical_name)
+
+        reject existing_idx ≥ 0 throw variant BadBorrow { message = "target role § already defines §"(bundle.role_name(br.target_role), br.canonical_name) }
+
+        let int src_idx ← find_entry_index(entries, br.source_role, br.source_canonical_name)
+
+        require src_idx ≥ 0 throw variant BadBorrow { message = "borrow source § missing from role §"(br.source_canonical_name, bundle.role_name(br.source_role)) }
+
+        let DirectoryEntry src ← entries[src_idx]
+        let DirectoryEntry borrowed ← DirectoryEntry { canonical_name = br.canonical_name, source_name = src.source_name, role = br.target_role, source_role = src.source_role, member_id = src.member_id, shard_index = src.shard_index, container = src.container, byte_offset = src.byte_offset, byte_length = src.byte_length, raw_dtype = src.raw_dtype, raw_dtype_id = src.raw_dtype_id, shape = src.shape, view = br.view }
+        append_checked(mut entries, borrowed)
+    }
+
+    return TensorDirectory { bundle = b, entries = entries }
+}
+
+@ public
+fn lookup(TensorDirectory dir, bundle.MemberRole role, string name) → DirectoryEntry ⇥ DirectoryError {
+    let int idx ← find_entry_index(dir.entries, role, name)
+
+    require idx ≥ 0 throw variant UnknownTensor { message = "tensor § not found in role §"(name, bundle.role_name(role)) }
+
+    return dir.entries[idx]
+}
+
+@ public
+fn lookup_backbone(TensorDirectory dir, string name) → DirectoryEntry ⇥ DirectoryError {
+    return lookup(dir, variant bundle.MemberRole.Backbone, name)
+}
+
+@ public
+fn has_tensor(TensorDirectory dir, bundle.MemberRole role, string name) → bool {
+    return find_entry_index(dir.entries, role, name) ≥ 0
+}
+
+@ public
+fn entries_for_role(TensorDirectory dir, bundle.MemberRole role) → list<DirectoryEntry> {
+    mut list<DirectoryEntry> out ← empty
+
+    for from dir.entries let e {
+        if same_role(e.role, role) then out.append(e)
+    }
+
+    return out
+}
+
+@ public
+fn siblings(TensorDirectory dir, bundle.MemberRole role, string module_prefix) → SiblingSet ⇥ DirectoryError {
+    let DirectoryEntry weight ← lookup(dir, role, "§.weight"(module_prefix))
+    let int s_idx ← find_entry_index(dir.entries, role, "§.scales"(module_prefix))
+    let int b_idx ← find_entry_index(dir.entries, role, "§.biases"(module_prefix))
+    let int g_idx ← find_entry_index(dir.entries, role, "§.global_scale"(module_prefix))
+    mut DirectoryEntry ∪ none scales ← null
+    mut DirectoryEntry ∪ none biases ← null
+    mut DirectoryEntry ∪ none global_scale ← null
+
+    if s_idx ≥ 0 then scales ← dir.entries[s_idx]
+
+    if b_idx ≥ 0 then biases ← dir.entries[b_idx]
+
+    if g_idx ≥ 0 then global_scale ← dir.entries[g_idx]
+
+    return SiblingSet { weight = weight, scales = scales, biases = biases, global_scale = global_scale }
+}
+
++++ faber test
+import from "gradus:model/artifact" let artifact
+import from "gradus:model/bundle" let bundle
+import from "gradus:model/capsule" let capsule
+import from "gradus:model/dense_llama" let dense_llama
+import from "gradus:model/dense_qwen2" let dense_qwen2
+import from "gradus:model/tensor_directory" let td
+
+fn id_with(string hex_char, int len) → artifact.ContentIdentity {
+    mut string hex ← ""
+    for exclusive 64 let i {
+        hex ← hex + hex_char
+    }
+    return artifact.ContentIdentity { algorithm = "sha-256", digest = hex, length = len }
+}
+
+fn st_manifest(int artifact_len, int data_len, list<capsule.SafetensorsTensorDescriptor> tensors) → capsule.SafetensorsManifest {
+    return capsule.SafetensorsManifest { format = "safetensors", version = "1.0.0", artifact_length = artifact_len, data_length = data_len, metadata = [], tensors = tensors }
+}
+
+fn st_desc(string name, string dtype, list<int> shape, int start, int end, int elems) → capsule.SafetensorsTensorDescriptor {
+    return capsule.SafetensorsTensorDescriptor { name = name, dtype = dtype, shape = shape, start = start, end = end, elements = elems }
+}
+
+fn mk_unindexed(list<artifact.ContentIdentity> shards, artifact.ContentIdentity ∪ none cfg, artifact.ContentIdentity ∪ none tok, artifact.ContentIdentity ∪ none drafter) → bundle.ModelBundle {
+    do {
+        return bundle.safetensors_unindexed(shards, cfg, null, tok, drafter, null)
+    }
+    catch err {
+        assert false
+        return bundle.ModelBundle { schema = "", primary_container = variant bundle.ContainerKind.Safetensors, backbone_shards = [], drafter = null, vision = null, config = null, quant_config = null, shard_index = null, tokenizer = null, shard_map = variant bundle.ShardMapping.Unindexed { shard_count = 0 } }
+    }
+}
+
+fn mk_indexed(list<artifact.ContentIdentity> shards, artifact.ContentIdentity idx_id, list<bundle.ShardEntry> entries) → bundle.ModelBundle {
+    do {
+        return bundle.safetensors_indexed(shards, idx_id, entries, null, null, null, null, null)
+    }
+    catch err {
+        assert false
+        return bundle.ModelBundle { schema = "", primary_container = variant bundle.ContainerKind.Safetensors, backbone_shards = [], drafter = null, vision = null, config = null, quant_config = null, shard_index = null, tokenizer = null, shard_map = variant bundle.ShardMapping.Unindexed { shard_count = 0 } }
+    }
+}
+
+test "TensorDirectory Slice A admission (SmolLM2-135M-Instruct-8bit layout)" {
+    let artifact.ContentIdentity bb_id ← id_with("a", 4096)
+    let artifact.ContentIdentity cfg_id ← id_with("b", 512)
+    let artifact.ContentIdentity tok_id ← id_with("c", 1024)
+    let bundle.ModelBundle b ← mk_unindexed([bb_id], cfg_id, tok_id, null)
+    do {
+
+        # 1 Safetensors shard: embed_tokens (BF16) + layer 0 q_proj (.weight U32, .scales BF16, .biases BF16)
+        let capsule.SafetensorsManifest m ← st_manifest(4096, 3072, [
+            st_desc("model.embed_tokens.weight", "BF16", [49152, 576], 0, 1024, 512),
+            st_desc("model.layers.0.self_attn.q_proj.weight", "U32", [576, 144], 1024, 2048, 256),
+            st_desc("model.layers.0.self_attn.q_proj.scales", "BF16", [576, 9], 2048, 2560, 256),
+            st_desc("model.layers.0.self_attn.q_proj.biases", "BF16", [576, 9], 2560, 3072, 256)
+        ])
+
+        let td.TensorDirectory dir ← td.build(b, [
+            variant td.ShardSource.SafetensorsSource { role = variant bundle.MemberRole.Backbone, shard_index = 0, manifest = m }
+        ], [], [])
+
+        let td.DirectoryEntry emb ← td.lookup_backbone(dir, "model.embed_tokens.weight")
+        assert emb.raw_dtype ≡ "BF16"
+        assert emb.byte_offset ≡ 1024
+        assert emb.byte_length ≡ 1024
+        assert emb.shard_index ≡ 0
+
+        let td.SiblingSet q ← td.siblings(dir, variant bundle.MemberRole.Backbone, "model.layers.0.self_attn.q_proj")
+        assert q.weight.raw_dtype ≡ "U32"
+        assert q.weight.byte_offset ≡ 2048
+        assert q.scales not is none
+        assert q.biases not is none
+        assert q.global_scale is none
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "TensorDirectory indexed and unindexed cross-shard lookup + views" {
+    let artifact.ContentIdentity s0 ← id_with("1", 2048)
+    let artifact.ContentIdentity s1 ← id_with("2", 2048)
+    let list<bundle.ShardEntry> idx_entries ← [
+        bundle.ShardEntry { tensor_name = "model.embed_tokens.weight", shard_index = 0 },
+        bundle.ShardEntry { tensor_name = "model.layers.0.conv.weight", shard_index = 1 },
+        bundle.ShardEntry { tensor_name = "model.layers.0.mlp.gate_up_proj.weight", shard_index = 1 }
+    ]
+    let bundle.ModelBundle b ← mk_indexed([s0, s1], id_with("3", 256), idx_entries)
+    do {
+        let capsule.SafetensorsManifest m0 ← st_manifest(2048, 1024, [
+            st_desc("model.embed_tokens.weight", "BF16", [201024, 1024], 0, 1024, 512)
+        ])
+        let capsule.SafetensorsManifest m1 ← st_manifest(2048, 1024, [
+            st_desc("model.layers.0.conv.weight", "BF16", [1024, 4, 1], 0, 512, 256),
+            st_desc("model.layers.0.mlp.gate_up_proj.weight", "U32", [4096, 128], 512, 1024, 128)
+        ])
+
+        let td.TensorDirectory dir ← td.build(b, [
+            variant td.ShardSource.SafetensorsSource { role = variant bundle.MemberRole.Backbone, shard_index = 0, manifest = m0 },
+            variant td.ShardSource.SafetensorsSource { role = variant bundle.MemberRole.Backbone, shard_index = 1, manifest = m1 }
+        ], [], [
+            td.ViewSpec { role = variant bundle.MemberRole.Backbone, canonical_name = "model.embed_tokens.weight", view = variant td.LoadView.RowPrefix { rows = 200058 } },
+            td.ViewSpec { role = variant bundle.MemberRole.Backbone, canonical_name = "model.layers.0.conv.weight", view = variant td.LoadView.Conv1d { channels = 1024, kernel_size = 4 } }
+        ])
+
+        let td.DirectoryEntry emb ← td.lookup_backbone(dir, "model.embed_tokens.weight")
+        assert emb.shard_index ≡ 0
+        match emb.view {
+            case td.LoadView.RowPrefix let rows {
+                assert rows ≡ 200058
+            }
+            default {
+                assert false
+            }
+        }
+
+        let td.DirectoryEntry conv ← td.lookup_backbone(dir, "model.layers.0.conv.weight")
+        assert conv.shard_index ≡ 1
+        match conv.view {
+            case td.LoadView.Conv1d let channels, kernel_size {
+                assert channels ≡ 1024
+                assert kernel_size ≡ 4
+            }
+            default {
+                assert false
+            }
+        }
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "TensorDirectory fails closed on duplicate names and out-of-bounds ranges" {
+    let artifact.ContentIdentity s0 ← id_with("4", 1024)
+    let bundle.ModelBundle b ← mk_unindexed([s0], null, null, null)
+    do {
+
+        # Duplicate tensor name in same role
+        let capsule.SafetensorsManifest dup_m ← st_manifest(1024, 512, [
+            st_desc("w", "F32", [4], 0, 16, 4),
+            st_desc("w", "F32", [4], 16, 32, 4)
+        ])
+        mut bool caught_dup ← false
+        do {
+            td.build(b, [variant td.ShardSource.SafetensorsSource { role = variant bundle.MemberRole.Backbone, shard_index = 0, manifest = dup_m }], [], [])
+        }
+        catch err {
+            caught_dup ← true
+        }
+        assert caught_dup
+
+        # Out-of-bounds range
+        let capsule.SafetensorsManifest oob_m ← st_manifest(1024, 512, [
+            st_desc("w", "F32", [4], 0, 900, 4)
+        ])
+        mut bool caught_oob ← false
+        do {
+            td.build(b, [variant td.ShardSource.SafetensorsSource { role = variant bundle.MemberRole.Backbone, shard_index = 0, manifest = oob_m }], [], [])
+        }
+        catch err {
+            caught_oob ← true
+        }
+        assert caught_oob
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "TensorDirectory cross-role borrow (drafter borrows embed_tokens and lm_head from backbone)" {
+    let artifact.ContentIdentity bb_id ← id_with("5", 4096)
+    let artifact.ContentIdentity dr_id ← id_with("6", 2048)
+    let bundle.ModelBundle b ← mk_unindexed([bb_id], null, null, dr_id)
+    do {
+        let capsule.SafetensorsManifest bb_m ← st_manifest(4096, 2048, [
+            st_desc("model.embed_tokens.weight", "BF16", [201024, 1024], 0, 1024, 512),
+            st_desc("lm_head.weight", "BF16", [201024, 1024], 1024, 2048, 512)
+        ])
+        let capsule.SafetensorsManifest dr_m ← st_manifest(2048, 1024, [
+            st_desc("model.layers.0.self_attn.q_proj.weight", "BF16", [1024, 1024], 0, 1024, 512)
+        ])
+
+        let td.TensorDirectory dir ← td.build(b, [
+            variant td.ShardSource.SafetensorsSource { role = variant bundle.MemberRole.Backbone, shard_index = 0, manifest = bb_m },
+            variant td.ShardSource.SafetensorsSource { role = variant bundle.MemberRole.Drafter, shard_index = 0, manifest = dr_m }
+        ], [
+            td.BorrowSpec { target_role = variant bundle.MemberRole.Drafter, canonical_name = "model.embed_tokens.weight", source_role = variant bundle.MemberRole.Backbone, source_canonical_name = "model.embed_tokens.weight", view = variant td.LoadView.RowPrefix { rows = 200058 } },
+            td.BorrowSpec { target_role = variant bundle.MemberRole.Drafter, canonical_name = "lm_head.weight", source_role = variant bundle.MemberRole.Backbone, source_canonical_name = "lm_head.weight", view = variant td.LoadView.RowPrefix { rows = 200058 } }
+        ], [])
+
+        let td.DirectoryEntry dr_emb ← td.lookup(dir, variant bundle.MemberRole.Drafter, "model.embed_tokens.weight")
+        assert bundle.role_name(dr_emb.role) ≡ "drafter"
+        assert bundle.role_name(dr_emb.source_role) ≡ "backbone"
+        assert dr_emb.byte_offset ≡ 2048
+        assert dr_emb.byte_length ≡ 1024
+
+        let td.DirectoryEntry dr_head ← td.lookup(dir, variant bundle.MemberRole.Drafter, "lm_head.weight")
+        assert bundle.role_name(dr_head.source_role) ≡ "backbone"
+        assert dr_head.byte_offset ≡ 3072
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "TensorDirectory dense_llama and dense_qwen2 resolve from directory without hardcoded constants" {
+    let artifact.ContentIdentity bb_id ← id_with("7", 8192)
+    let bundle.ModelBundle b ← mk_unindexed([bb_id], id_with("8", 512), id_with("9", 512), null)
+    let capsule.SafetensorsManifest m ← st_manifest(8192, 4096, [
+        st_desc("model.embed_tokens.weight", "BF16", [49152, 576], 0, 512, 256),
+        st_desc("model.layers.0.input_layernorm.weight", "BF16", [576], 512, 1024, 256),
+        st_desc("model.layers.0.self_attn.q_proj.weight", "U32", [576, 144], 1024, 1536, 256),
+        st_desc("model.layers.0.self_attn.q_proj.bias", "BF16", [576], 1536, 2048, 256),
+        st_desc("model.norm.weight", "BF16", [576], 2048, 2560, 256),
+        st_desc("lm_head.weight", "BF16", [49152, 576], 2560, 3072, 256)
+    ])
+
+    mut td.TensorDirectory ∪ none dir_opt ← null
+    do {
+        dir_opt ← td.build(b, [
+            variant td.ShardSource.SafetensorsSource { role = variant bundle.MemberRole.Backbone, shard_index = 0, manifest = m }
+        ], [], [])
+    }
+    catch err {
+        assert false
+    }
+    if dir_opt is none {
+        assert false
+    }
+    else {
+        let td.TensorDirectory dir ← dir_opt
+
+        # dense_llama with SmolLM2-135M dims + untied lm_head detected from directory
+        let dense_llama.LlamaArch l_arch ← dense_llama.arch_from_directory("SmolLM2-135M", 30, 9, 3, 64, 576, 49152, dir)
+        assert not l_arch.tied
+        do {
+            let td.DirectoryEntry l_q ← dense_llama.resolve_in_directory(dir, l_arch, "model.layers.self_attn.q_proj", 0)
+            assert l_q.raw_dtype ≡ "U32"
+            let td.DirectoryEntry l_head ← dense_llama.resolve_in_directory(dir, l_arch, "lm_head", 0)
+            assert l_head.canonical_name ≡ "lm_head.weight"
+        }
+        catch err {
+            assert false
+        }
+
+        # dense_qwen2 with dims + vocab derived from directory + QKV bias
+        do {
+            let dense_qwen2.DenseQwen2Config q_cfg ← dense_qwen2.config_from_directory(24, 14, 2, 896, 1000000, dir)
+            assert q_cfg.vocab ≡ 49152
+            assert q_cfg.head_dim ≡ 64
+            assert not q_cfg.tied
+            let td.DirectoryEntry q_bias ← dense_qwen2.resolve_in_directory(dir, q_cfg, "model.layers.0.self_attn.q_proj.bias")
+            assert q_bias.raw_dtype ≡ "BF16"
+        }
+        catch err {
+            assert false
+        }
+    }
+}
