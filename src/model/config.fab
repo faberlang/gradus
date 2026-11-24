@@ -1,0 +1,689 @@
++++ toml
+locale = "en"
+
++++ faber
+# ModelConfig — fail-closed JSON parser for HuggingFace/MLX `config.json` and
+# `quant_config` artifacts (unblocks Slice A #52 and heterogeneous models).
+#
+# Public import: import from "gradus:model/config" cfg
+#
+# --- Contract ------------------------------------------------------------
+#
+# Parses standard `config.json` and `quantization` / `hf_quant_config.json`
+# payloads into typed `ModelConfig` and `QuantConfig` records without
+# hardcoding model dimensions. Unknown fields (such as `architectures`,
+# `torch_dtype`, `rope_scaling`, etc.) are safely skipped so real HF/MLX
+# configs admit directly, while malformed JSON, missing required fields, or
+# non-positive dimensions fail closed.
+
+@ public
+union ConfigError {
+    @ shared
+    string message
+
+    BadJson,
+    MissingField,
+    BadType,
+    BadValue
+}
+
+@ public
+class QuantConfig {
+    let string ∪ none mode
+    let int ∪ none bits
+    let int ∪ none group_size
+}
+
+@ public
+class ModelConfig {
+    let string model_type
+    let int hidden_size
+    let int num_hidden_layers
+    let int num_attention_heads
+    let int num_key_value_heads
+    let int head_dim
+    let int intermediate_size
+    let int vocab_size
+    let int max_position_embeddings
+    let f32 rms_norm_eps
+    let f32 rope_theta
+    let bool tie_word_embeddings
+    let int ∪ none sliding_window
+    let int ∪ none full_attention_interval
+    let list<string> layer_types
+    let list<bool> rope_pattern
+    let int kv_key_bits
+    let int kv_value_bits
+    let int kv_group_size
+    let QuantConfig ∪ none quantization
+}
+
+# -------------------------------------------------------------------------
+# Minimal fail-closed JSON parser
+# -------------------------------------------------------------------------
+
+class JsonEntry {
+    let string key
+    let JsonValue val
+}
+
+union JsonValue {
+    JNull,
+    JBool {
+        bool value
+    },
+    JNum {
+        string raw
+    },
+    JStr {
+        string value
+    },
+    JArr {
+        list<JsonValue> items
+    },
+    JObj {
+        list<JsonEntry> entries
+    }
+}
+
+class ParseResult {
+    let JsonValue val
+    let int next_pos
+}
+
+class StrResult {
+    let string text
+    let int next_pos
+}
+
+fn is_ws(string ch) → bool {
+    return ch ≡ " " or ch ≡ "\n" or ch ≡ "\r" or ch ≡ "\t"
+}
+
+fn is_digit(string ch) → bool {
+    return ch ≡ "0" or ch ≡ "1" or ch ≡ "2" or ch ≡ "3" or ch ≡ "4" or ch ≡ "5" or ch ≡ "6" or ch ≡ "7" or ch ≡ "8" or ch ≡ "9"
+}
+
+fn is_hex(string ch) → bool {
+    return is_digit(ch) or ch ≡ "a" or ch ≡ "b" or ch ≡ "c" or ch ≡ "d" or ch ≡ "e" or ch ≡ "f" or ch ≡ "A" or ch ≡ "B" or ch ≡ "C" or ch ≡ "D" or ch ≡ "E" or ch ≡ "F"
+}
+
+fn skip_ws(string src, int start) → int {
+    mut int i ← start
+    let int n ← src.length()
+    while i ≺ n {
+        let string ch ← src.slice(i, i + 1) ⊥ ""
+        if is_ws(ch) {
+            i ← i + 1
+        }
+        else {
+            return i
+        }
+    }
+    return i
+}
+
+fn parse_json_string(string src, int start) → StrResult ⇥ ConfigError {
+    let int n ← src.length()
+    require start ≺ n throw variant BadJson { message = "unexpected end of input while reading string" }
+    let string q ← src.slice(start, start + 1) ⊥ ""
+    require q ≡ "\"" throw variant BadJson { message = "expected '\"' to start JSON string" }
+
+    mut int i ← start + 1
+    mut string out ← ""
+    while i ≺ n {
+        let string ch ← src.slice(i, i + 1) ⊥ ""
+        if ch ≡ "\"" {
+            return StrResult { text = out, next_pos = i + 1 }
+        }
+        if ch ≡ "\\" {
+            i ← i + 1
+            require i ≺ n throw variant BadJson { message = "unterminated escape sequence in JSON string" }
+            let string esc ← src.slice(i, i + 1) ⊥ ""
+            if esc ≡ "\"" or esc ≡ "\\" or esc ≡ "/" {
+                out ← out + esc
+                i ← i + 1
+            }
+            elif esc ≡ "n" {
+                out ← out + "\n"
+                i ← i + 1
+            }
+            elif esc ≡ "r" {
+                out ← out + "\r"
+                i ← i + 1
+            }
+            elif esc ≡ "t" {
+                out ← out + "\t"
+                i ← i + 1
+            }
+            elif esc ≡ "b" or esc ≡ "f" {
+                out ← out + " "
+                i ← i + 1
+            }
+            elif esc ≡ "u" {
+                require i + 4 ≺ n throw variant BadJson { message = "truncated \\uXXXX escape in JSON string" }
+                for exclusive 4 let h {
+                    let string hx ← src.slice(i + 1 + h, i + 2 + h) ⊥ ""
+                    require is_hex(hx) throw variant BadJson { message = "invalid hex digit in \\uXXXX escape" }
+                }
+                out ← out + src.slice(i - 1, i + 5) ⊥ ""
+                i ← i + 5
+            }
+            else {
+                throw variant BadJson { message = "invalid escape character in JSON string" }
+            }
+        }
+        else {
+            out ← out + ch
+            i ← i + 1
+        }
+    }
+
+    throw variant BadJson { message = "unterminated JSON string" }
+}
+
+fn parse_json_number(string src, int start) → ParseResult ⇥ ConfigError {
+    let int n ← src.length()
+    mut int i ← start
+    if i ≺ n and (src.slice(i, i + 1) ⊥ "") ≡ "-" {
+        i ← i + 1
+    }
+    require i ≺ n and is_digit(src.slice(i, i + 1) ⊥ "") throw variant BadJson { message = "invalid JSON number" }
+
+    if (src.slice(i, i + 1) ⊥ "") ≡ "0" {
+        i ← i + 1
+    }
+    else {
+        while i ≺ n and is_digit(src.slice(i, i + 1) ⊥ "") {
+            i ← i + 1
+        }
+    }
+
+    if i ≺ n and (src.slice(i, i + 1) ⊥ "") ≡ "." {
+        i ← i + 1
+        require i ≺ n and is_digit(src.slice(i, i + 1) ⊥ "") throw variant BadJson { message = "expected digit after decimal point in JSON number" }
+        while i ≺ n and is_digit(src.slice(i, i + 1) ⊥ "") {
+            i ← i + 1
+        }
+    }
+
+    if i ≺ n {
+        let string exp_ch ← src.slice(i, i + 1) ⊥ ""
+        if exp_ch ≡ "e" or exp_ch ≡ "E" {
+            i ← i + 1
+            if i ≺ n {
+                let string sign_ch ← src.slice(i, i + 1) ⊥ ""
+                if sign_ch ≡ "+" or sign_ch ≡ "-" {
+                    i ← i + 1
+                }
+            }
+            require i ≺ n and is_digit(src.slice(i, i + 1) ⊥ "") throw variant BadJson { message = "expected exponent digit in JSON number" }
+            while i ≺ n and is_digit(src.slice(i, i + 1) ⊥ "") {
+                i ← i + 1
+            }
+        }
+    }
+
+    let string raw ← src.slice(start, i) ⊥ ""
+    return ParseResult { val = variant JsonValue.JNum { raw = raw }, next_pos = i }
+}
+
+fn parse_json_value(string src, int start) → ParseResult ⇥ ConfigError {
+    let int i ← skip_ws(src, start)
+    let int n ← src.length()
+    require i ≺ n throw variant BadJson { message = "unexpected end of JSON input" }
+
+    let string ch ← src.slice(i, i + 1) ⊥ ""
+    if ch ≡ "\"" {
+        let StrResult sr ← parse_json_string(src, i)
+        return ParseResult { val = variant JsonValue.JStr { value = sr.text }, next_pos = sr.next_pos }
+    }
+    if ch ≡ "{" {
+        return parse_json_object(src, i)
+    }
+    if ch ≡ "[" {
+        return parse_json_array(src, i)
+    }
+    if ch ≡ "t" {
+        require i + 4 ≤ n and (src.slice(i, i + 4) ⊥ "") ≡ "true" throw variant BadJson { message = "invalid literal in JSON" }
+        return ParseResult { val = variant JsonValue.JBool { value = true }, next_pos = i + 4 }
+    }
+    if ch ≡ "f" {
+        require i + 5 ≤ n and (src.slice(i, i + 5) ⊥ "") ≡ "false" throw variant BadJson { message = "invalid literal in JSON" }
+        return ParseResult { val = variant JsonValue.JBool { value = false }, next_pos = i + 5 }
+    }
+    if ch ≡ "n" {
+        require i + 4 ≤ n and (src.slice(i, i + 4) ⊥ "") ≡ "null" throw variant BadJson { message = "invalid literal in JSON" }
+        return ParseResult { val = variant JsonValue.JNull, next_pos = i + 4 }
+    }
+    if ch ≡ "-" or is_digit(ch) {
+        return parse_json_number(src, i)
+    }
+
+    throw variant BadJson { message = "unexpected character in JSON: §"(ch) }
+}
+
+fn parse_json_array(string src, int start) → ParseResult ⇥ ConfigError {
+    let int n ← src.length()
+    mut int i ← skip_ws(src, start + 1)
+    mut list<JsonValue> items ← empty
+
+    if i ≺ n and (src.slice(i, i + 1) ⊥ "") ≡ "]" {
+        return ParseResult { val = variant JsonValue.JArr { items = items }, next_pos = i + 1 }
+    }
+
+    while i ≺ n {
+        let ParseResult elem ← parse_json_value(src, i)
+        items.append(elem.val)
+        i ← skip_ws(src, elem.next_pos)
+        require i ≺ n throw variant BadJson { message = "unterminated JSON array" }
+        let string sep ← src.slice(i, i + 1) ⊥ ""
+        if sep ≡ "]" {
+            return ParseResult { val = variant JsonValue.JArr { items = items }, next_pos = i + 1 }
+        }
+        require sep ≡ "," throw variant BadJson { message = "expected ',' or ']' in JSON array" }
+        i ← skip_ws(src, i + 1)
+    }
+
+    throw variant BadJson { message = "unterminated JSON array" }
+}
+
+fn parse_json_object(string src, int start) → ParseResult ⇥ ConfigError {
+    let int n ← src.length()
+    mut int i ← skip_ws(src, start + 1)
+    mut list<JsonEntry> entries ← empty
+
+    if i ≺ n and (src.slice(i, i + 1) ⊥ "") ≡ "}" {
+        return ParseResult { val = variant JsonValue.JObj { entries = entries }, next_pos = i + 1 }
+    }
+
+    while i ≺ n {
+        let StrResult key_res ← parse_json_string(src, i)
+        i ← skip_ws(src, key_res.next_pos)
+        require i ≺ n and (src.slice(i, i + 1) ⊥ "") ≡ ":" throw variant BadJson { message = "expected ':' after JSON object key" }
+        let ParseResult val_res ← parse_json_value(src, i + 1)
+        entries.append(JsonEntry { key = key_res.text, val = val_res.val })
+        i ← skip_ws(src, val_res.next_pos)
+        require i ≺ n throw variant BadJson { message = "unterminated JSON object" }
+        let string sep ← src.slice(i, i + 1) ⊥ ""
+        if sep ≡ "}" {
+            return ParseResult { val = variant JsonValue.JObj { entries = entries }, next_pos = i + 1 }
+        }
+        require sep ≡ "," throw variant BadJson { message = "expected ',' or '}' in JSON object" }
+        i ← skip_ws(src, i + 1)
+    }
+
+    throw variant BadJson { message = "unterminated JSON object" }
+}
+
+fn parse_root_object(string src) → list<JsonEntry> ⇥ ConfigError {
+    let ParseResult res ← parse_json_value(src, 0)
+    let int tail ← skip_ws(src, res.next_pos)
+    require tail ≡ src.length() throw variant BadJson { message = "trailing characters after JSON root object" }
+    match res.val {
+        case JObj let entries {
+            return entries
+        }
+        default {
+            throw variant BadType { message = "JSON root must be an object" }
+        }
+    }
+}
+
+# -------------------------------------------------------------------------
+# Typed field extraction helpers
+# -------------------------------------------------------------------------
+
+fn find_field(list<JsonEntry> entries, string key) → JsonValue {
+    mut JsonValue found ← variant JsonValue.JNull
+    for from entries let e {
+        if e.key ≡ key {
+            found ← e.val
+        }
+    }
+    return found
+}
+
+fn parse_int_raw(string raw, string field_name) → int ⇥ ConfigError {
+    do {
+        return raw ↦ int
+    }
+    catch err {
+        throw variant BadValue { message = "invalid integer for '§': §"(field_name, raw) }
+    }
+}
+
+fn parse_f32_raw(string raw, string field_name) → f32 ⇥ ConfigError {
+    do {
+        return raw ↦ f32
+    }
+    catch err {
+        throw variant BadValue { message = "invalid float for '§': §"(field_name, raw) }
+    }
+}
+
+fn get_opt_string(list<JsonEntry> entries, string key) → string ∪ none ⇥ ConfigError {
+    let JsonValue v ← find_field(entries, key)
+    match v {
+        case JNull {
+            return null
+        }
+        case JStr let value {
+            return value
+        }
+        default {
+            throw variant BadType { message = "field '§' must be a string"(key) }
+        }
+    }
+}
+
+fn get_req_string(list<JsonEntry> entries, string key) → string ⇥ ConfigError {
+    let string ∪ none v ← get_opt_string(entries, key)
+    if v is string {
+        require v.length() ≥ 1 throw variant BadValue { message = "field '§' must be non-empty"(key) }
+        return v
+    }
+    throw variant MissingField { message = "missing required string field '§'"(key) }
+}
+
+fn get_opt_int(list<JsonEntry> entries, string key) → int ∪ none ⇥ ConfigError {
+    let JsonValue v ← find_field(entries, key)
+    match v {
+        case JNull {
+            return null
+        }
+        case JNum let raw {
+            return parse_int_raw(raw, key)
+        }
+        default {
+            throw variant BadType { message = "field '§' must be an integer"(key) }
+        }
+    }
+}
+
+fn get_req_pos_int(list<JsonEntry> entries, string key) → int ⇥ ConfigError {
+    let int ∪ none v ← get_opt_int(entries, key)
+    if v is int {
+        let int val ← v coalesce 0
+        require val ≥ 1 throw variant BadValue { message = "field '§' must be positive"(key) }
+        return val
+    }
+    throw variant MissingField { message = "missing required integer field '§'"(key) }
+}
+
+fn get_opt_f32(list<JsonEntry> entries, string key) → f32 ∪ none ⇥ ConfigError {
+    let JsonValue v ← find_field(entries, key)
+    match v {
+        case JNull {
+            return null
+        }
+        case JNum let raw {
+            return parse_f32_raw(raw, key)
+        }
+        default {
+            throw variant BadType { message = "field '§' must be a number"(key) }
+        }
+    }
+}
+
+fn get_opt_bool(list<JsonEntry> entries, string key) → bool ∪ none ⇥ ConfigError {
+    let JsonValue v ← find_field(entries, key)
+    match v {
+        case JNull {
+            return null
+        }
+        case JBool let value {
+            return value
+        }
+        default {
+            throw variant BadType { message = "field '§' must be a boolean"(key) }
+        }
+    }
+}
+
+fn get_opt_string_list(list<JsonEntry> entries, string key) → list<string> ⇥ ConfigError {
+    let JsonValue v ← find_field(entries, key)
+    mut list<string> out ← empty
+    match v {
+        case JNull {
+            return out
+        }
+        case JArr let items {
+            for from items let item {
+                match item {
+                    case JStr let s {
+                        out.append(s)
+                    }
+                    default {
+                        throw variant BadType { message = "array '§' must contain strings"(key) }
+                    }
+                }
+            }
+            return out
+        }
+        default {
+            throw variant BadType { message = "field '§' must be an array of strings"(key) }
+        }
+    }
+}
+
+fn get_opt_bool_list(list<JsonEntry> entries, string key) → list<bool> ⇥ ConfigError {
+    let JsonValue v ← find_field(entries, key)
+    mut list<bool> out ← empty
+    match v {
+        case JNull {
+            return out
+        }
+        case JArr let items {
+            for from items let item {
+                match item {
+                    case JBool let b {
+                        out.append(b)
+                    }
+                    default {
+                        throw variant BadType { message = "array '§' must contain booleans"(key) }
+                    }
+                }
+            }
+            return out
+        }
+        default {
+            throw variant BadType { message = "field '§' must be an array of booleans"(key) }
+        }
+    }
+}
+
+fn extract_quant_config(list<JsonEntry> entries) → QuantConfig ⇥ ConfigError {
+    mut string ∪ none mode ← get_opt_string(entries, "mode")
+    if mode is none {
+        mode ← get_opt_string(entries, "quant_method")
+    }
+    if mode is none {
+        mode ← get_opt_string(entries, "quant_algo")
+    }
+    let int ∪ none bits ← get_opt_int(entries, "bits")
+    if bits is int {
+        let int b ← bits coalesce 0
+        require b ≥ 1 throw variant BadValue { message = "quantization.bits must be positive" }
+    }
+    let int ∪ none group_size ← get_opt_int(entries, "group_size")
+    if group_size is int {
+        let int g ← group_size coalesce 0
+        require g ≥ 1 throw variant BadValue { message = "quantization.group_size must be positive" }
+    }
+    return QuantConfig { mode = mode, bits = bits, group_size = group_size }
+}
+
+# -------------------------------------------------------------------------
+# Public entry points
+# -------------------------------------------------------------------------
+
+@ public
+fn parse_quant_config(string json_text) → QuantConfig ⇥ ConfigError {
+    let list<JsonEntry> entries ← parse_root_object(json_text)
+    return extract_quant_config(entries)
+}
+
+@ public
+fn parse_json(string json_text) → ModelConfig ⇥ ConfigError {
+    let list<JsonEntry> entries ← parse_root_object(json_text)
+
+    let string model_type ← get_req_string(entries, "model_type")
+    let int hidden_size ← get_req_pos_int(entries, "hidden_size")
+    let int num_hidden_layers ← get_req_pos_int(entries, "num_hidden_layers")
+    let int num_attention_heads ← get_req_pos_int(entries, "num_attention_heads")
+    let int intermediate_size ← get_req_pos_int(entries, "intermediate_size")
+    let int vocab_size ← get_req_pos_int(entries, "vocab_size")
+
+    let int num_key_value_heads ← get_opt_int(entries, "num_key_value_heads") coalesce num_attention_heads
+    require num_key_value_heads ≥ 1 throw variant BadValue { message = "num_key_value_heads must be positive" }
+    require num_attention_heads % num_key_value_heads ≡ 0 throw variant BadValue { message = "num_attention_heads must be divisible by num_key_value_heads" }
+
+    let int ∪ none explicit_head_dim ← get_opt_int(entries, "head_dim")
+    mut int head_dim ← 0
+    if explicit_head_dim is int {
+        head_dim ← explicit_head_dim coalesce 0
+    }
+    else {
+        require hidden_size % num_attention_heads ≡ 0 throw variant BadValue { message = "hidden_size must be divisible by num_attention_heads when head_dim is omitted" }
+        head_dim ← hidden_size / num_attention_heads
+    }
+    require head_dim ≥ 1 throw variant BadValue { message = "head_dim must be positive" }
+
+    let int max_position_embeddings ← get_opt_int(entries, "max_position_embeddings") coalesce 2048
+    require max_position_embeddings ≥ 1 throw variant BadValue { message = "max_position_embeddings must be positive" }
+
+    let f32 rms_norm_eps ← get_opt_f32(entries, "rms_norm_eps") coalesce (1.0e-5 ∷ f32)
+    let f32 rope_theta ← get_opt_f32(entries, "rope_theta") coalesce (10000.0 ∷ f32)
+    let bool tie_word_embeddings ← get_opt_bool(entries, "tie_word_embeddings") coalesce true
+    let int ∪ none sliding_window ← get_opt_int(entries, "sliding_window")
+    let int ∪ none full_attention_interval ← get_opt_int(entries, "full_attention_interval")
+    let list<string> layer_types ← get_opt_string_list(entries, "layer_types")
+    let list<bool> rope_pattern ← get_opt_bool_list(entries, "rope_pattern")
+    let int kv_key_bits ← get_opt_int(entries, "kv_key_bits") coalesce 0
+    let int kv_value_bits ← get_opt_int(entries, "kv_value_bits") coalesce 0
+    let int kv_group_size ← get_opt_int(entries, "kv_group_size") coalesce 0
+
+    mut JsonValue quant_val ← find_field(entries, "quantization")
+    match quant_val {
+        case JNull {
+            quant_val ← find_field(entries, "quantization_config")
+        }
+        default {
+            pass
+        }
+    }
+    mut QuantConfig ∪ none quantization ← null
+    match quant_val {
+        case JNull {
+            quantization ← null
+        }
+        case JObj let q_entries {
+            quantization ← extract_quant_config(q_entries)
+        }
+        default {
+            throw variant BadType { message = "quantization must be a JSON object" }
+        }
+    }
+
+    return ModelConfig { model_type = model_type, hidden_size = hidden_size, num_hidden_layers = num_hidden_layers, num_attention_heads = num_attention_heads, num_key_value_heads = num_key_value_heads, head_dim = head_dim, intermediate_size = intermediate_size, vocab_size = vocab_size, max_position_embeddings = max_position_embeddings, rms_norm_eps = rms_norm_eps, rope_theta = rope_theta, tie_word_embeddings = tie_word_embeddings, sliding_window = sliding_window, full_attention_interval = full_attention_interval, layer_types = layer_types, rope_pattern = rope_pattern, kv_key_bits = kv_key_bits, kv_value_bits = kv_value_bits, kv_group_size = kv_group_size, quantization = quantization }
+}
+
+@ public
+fn parse_bytes(list<b8> raw) → ModelConfig ⇥ ConfigError {
+    mut string text ← ""
+    do {
+        text ← raw ↦ string
+    }
+    catch err {
+        throw variant BadJson { message = "config is not valid UTF-8" }
+    }
+    return parse_json(text)
+}
+
++++ faber test
+import from "gradus:model/config" let cfg
+
+fn parse_error(string json_text) → string {
+    do {
+        cfg.parse_json(json_text)
+        return "ok"
+    }
+    catch err {
+        return err.message
+    }
+}
+
+test "ModelConfig parses SmolLM2-135M-Instruct-8bit config.json" {
+    let string raw ← "{\"architectures\": [\"LlamaForCausalLM\"], \"model_type\": \"llama\", \"hidden_size\": 576, \"num_hidden_layers\": 30, \"num_attention_heads\": 9, \"num_key_value_heads\": 3, \"intermediate_size\": 1536, \"vocab_size\": 49152, \"max_position_embeddings\": 8192, \"rms_norm_eps\": 1e-05, \"rope_theta\": 100000.0, \"tie_word_embeddings\": true, \"quantization\": {\"group_size\": 64, \"bits\": 8}}"
+    do {
+        let cfg.ModelConfig c ← cfg.parse_json(raw)
+        assert c.model_type ≡ "llama"
+        assert c.hidden_size ≡ 576
+        assert c.num_hidden_layers ≡ 30
+        assert c.num_attention_heads ≡ 9
+        assert c.num_key_value_heads ≡ 3
+        assert c.head_dim ≡ 64
+        assert c.intermediate_size ≡ 1536
+        assert c.vocab_size ≡ 49152
+        assert c.max_position_embeddings ≡ 8192
+        assert c.rms_norm_eps ≻ (0.0 ∷ f32) and c.rms_norm_eps ≺ (1.0e-4 ∷ f32)
+        assert c.rope_theta ≻ (99999.0 ∷ f32) and c.rope_theta ≺ (100001.0 ∷ f32)
+        assert c.tie_word_embeddings ≡ true
+        let cfg.QuantConfig ∪ none maybe_q ← c.quantization
+        assert maybe_q is cfg.QuantConfig
+        if maybe_q is cfg.QuantConfig {
+            assert (maybe_q.bits coalesce 0) ≡ 8
+            assert (maybe_q.group_size coalesce 0) ≡ 64
+        }
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "ModelConfig parses Flint-style pattern tables, KV-quant, and stale mode hints" {
+    let string raw ← "{\"model_type\": \"flint\", \"hidden_size\": 2048, \"num_hidden_layers\": 49, \"num_attention_heads\": 32, \"num_key_value_heads\": 4, \"head_dim\": 128, \"intermediate_size\": 1024, \"vocab_size\": 150144, \"tie_word_embeddings\": false, \"sliding_window\": 513, \"layer_types\": [\"full_attention\", \"sliding_attention\"], \"rope_pattern\": [false, true], \"kv_key_bits\": 8, \"kv_value_bits\": 8, \"kv_group_size\": 64, \"quantization\": {\"mode\": \"nvfp4\", \"bits\": 4, \"group_size\": 64}}"
+    do {
+        let cfg.ModelConfig c ← cfg.parse_json(raw)
+        assert c.model_type ≡ "flint"
+        assert c.head_dim ≡ 128
+        assert c.tie_word_embeddings ≡ false
+        assert (c.sliding_window coalesce 0) ≡ 513
+        assert c.layer_types.length() ≡ 2
+        assert c.layer_types[0] ≡ "full_attention"
+        assert c.rope_pattern.length() ≡ 2
+        assert c.rope_pattern[0] ≡ false
+        assert c.rope_pattern[1] ≡ true
+        assert c.kv_key_bits ≡ 8
+        assert c.kv_value_bits ≡ 8
+        assert c.kv_group_size ≡ 64
+        let cfg.QuantConfig ∪ none maybe_q ← c.quantization
+        assert maybe_q is cfg.QuantConfig
+        if maybe_q is cfg.QuantConfig {
+            assert (maybe_q.mode coalesce "") ≡ "nvfp4"
+            assert (maybe_q.bits coalesce 0) ≡ 4
+            assert (maybe_q.group_size coalesce 0) ≡ 64
+        }
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "ModelConfig parse_quant_config and fail-closed errors" {
+    do {
+        let cfg.QuantConfig q ← cfg.parse_quant_config("{\"quant_method\": \"fp4\", \"bits\": 4, \"group_size\": 16}")
+        assert (q.mode coalesce "") ≡ "fp4"
+        assert (q.bits coalesce 0) ≡ 4
+        assert (q.group_size coalesce 0) ≡ 16
+    }
+    catch err {
+        assert false
+    }
+
+    assert parse_error("[]") ≢ "ok"
+    assert parse_error("{\"model_type\": \"llama\"}") ≢ "ok"
+    assert parse_error("{\"model_type\": \"llama\", \"hidden_size\": 0, \"num_hidden_layers\": 1, \"num_attention_heads\": 1, \"intermediate_size\": 1, \"vocab_size\": 1}") ≢ "ok"
+    assert parse_error("{bad") ≢ "ok"
+}
