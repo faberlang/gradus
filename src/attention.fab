@@ -18,8 +18,10 @@ import from "gradus:attention/gqa"
 # -------------------------------------------------------------------------
 # scaled_dot_product_static — static-shape generic scaled dot-product
 #   attention on compiler tensors (shape-generics Phase 2).
-#   scores = qb·kbᵀ·scale, attn = softmax(scores), context = attn·vb.
-#   qb/kb/vb are the [B,D] projections; scale is the [B,B] dk_scale factor.
+#   scores = (qb·kbᵀ)·scale, attn = softmax(scores), context = attn·vb.
+#   qb/kb/vb are the [B,D] projections; scale is the SCALAR dk_scale factor
+#   (1/sqrt(dk)) — multiplied elementwise, never a [B,B] constant tensor
+#   (issue #73).
 #   Typed-tensor ops only, so symbolic shapes stay in the type. This is the
 #   sole typed attention surface; the staged-carrier SDPA lives in
 #   gradus:attention/gqa. Callers: examples/training/bert-tiny-fragment and
@@ -27,10 +29,10 @@ import from "gradus:attention/gqa"
 # -------------------------------------------------------------------------
 
 @ public
-kernel scaled_dot_product_static<size B, size D>(tensor<f32, [B, D]> qb, tensor<f32, [B, D]> kb, tensor<f32, [B, D]> vb, tensor<f32, [B, B]> scale) → tensor<f32, [B, D]> {
+kernel scaled_dot_product_static<size B, size D>(tensor<f32, [B, D]> qb, tensor<f32, [B, D]> kb, tensor<f32, [B, D]> vb, f32 scale) → tensor<f32, [B, D]> {
     let _ kt ← kbᵀ
     let _ scores ← qb · kt
-    let _ scaled ← scores ⊙ scale
+    let _ scaled ← scores * scale
     let _ attn ← scaled.softmax()
     let _ context ← attn · vb
     return context
@@ -866,16 +868,16 @@ test "rejects a rope dim outside the admitted range" {
 # The imported attention.scaled_dot_product_static is a typed-tensor
 # signature and is not probe-callable (SEM006/SEM010 — the nn.proba
 # fixed-shape precedent). This local mirror is the compile-level pin of
-# the method-spelled Depth-2 body (transpose/matmul/multiply/softmax);
-# implicit D1 binding is witnessed by [2, 8] and a non-2x8 [2, 2] call.
-# No new concrete overload. The admitted 2x8 and the PML3-U2 runtime
-# carrier stay untouched.
+# the method-spelled Depth-2 body (transpose/matmul/scalar multiply/
+# softmax); implicit D1 binding is witnessed by [2, 8] and a non-2x8
+# [2, 2] call. No new concrete overload. The admitted 2x8 and the PML3-U2
+# runtime carrier stay untouched.
 # -------------------------------------------------------------------------
 
-fn sdpa_static<size B, size D>(tensor<f32, [B, D]> qb, tensor<f32, [B, D]> kb, tensor<f32, [B, D]> vb, tensor<f32, [B, B]> scale) → tensor<f32, [B, D]> {
+fn sdpa_static<size B, size D>(tensor<f32, [B, D]> qb, tensor<f32, [B, D]> kb, tensor<f32, [B, D]> vb, f32 scale) → tensor<f32, [B, D]> {
     let _ kt ← kb.transpose()
     let _ scores ← qb · kt
-    let _ scaled ← scores ⊙ scale
+    let _ scaled ← scores * scale
     let _ attn ← scaled.softmax()
     let _ context ← attn · vb
     return context
@@ -888,9 +890,7 @@ test "static-shape generic sdpa binds the admitted [2, 8] witness" {
     kb ← kb.fill(1.0)
     mut tf32[2, 8] vb ← tf32[2, 8] {}
     vb ← vb.fill(4.0)
-    mut tf32[2, 2] scale ← tf32[2, 2] {}
-    scale ← scale.fill(1.0)
-    let _ ctx ← sdpa_static(qb, kb, vb, scale)
+    let _ ctx ← sdpa_static(qb, kb, vb, 1.0 ∷ f32)
     assert ctx[[0, 0]] ≡ 4.0 ∷ f32
 }
 
@@ -901,9 +901,7 @@ test "static-shape generic sdpa also binds a non-2x8 witness [1, 3]" {
     kb ← kb.fill(1.0)
     mut tf32[1, 3] vb ← tf32[1, 3] {}
     vb ← vb.fill(4.0)
-    mut tf32[1, 1] scale ← tf32[1, 1] {}
-    scale ← scale.fill(1.0)
-    let _ ctx ← sdpa_static(qb, kb, vb, scale)
+    let _ ctx ← sdpa_static(qb, kb, vb, 0.5 ∷ f32)
     assert ctx[[0, 0]] ≡ 4.0 ∷ f32
     assert ctx[[0, 1]] ≡ 4.0 ∷ f32
     assert ctx[[0, 2]] ≡ 4.0 ∷ f32
@@ -939,7 +937,8 @@ test "empty-cache multi-head equals the no-cache full row" {
         let tensor.NumericBlock v ← tene([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], [2, 4])
         let tensor.NumericBlock wo ← tene([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0], [4, 4])
         let tensor.NumericBlock full ← gqa.multi_head_attention(q, k, v, wo, 1, 1, 1.0 ∷ f32, [0, 1], 4, c)
-        let gqa.CachedAttention step ← gqa.multi_head_attention_cached(q, k, v, wo, cache_p(4), 1, 1, 1.0 ∷ f32, [0, 1], 4, c, [3, 4])
+        mut kv.KVCache cache ← cache_p(4)
+        let gqa.CachedAttention step ← gqa.multi_head_attention_cached(q, k, v, wo, mut cache, 1, 1, 1.0 ∷ f32, [0, 1], 4, c, [3, 4])
         assert step.context.shape ≡ full.shape
         assert e2(step.context, 0, 0).approx(e2(full, 0, 0), TOLERANCE)
         assert e2(step.context, 1, 0).approx(e2(full, 1, 0), TOLERANCE)
@@ -963,11 +962,12 @@ test "incremental cached attention matches the last full-row position" {
         let tensor.NumericBlock q0 ← tene([1.0, 2.0, 3.0, 4.0], [1, 4])
         let tensor.NumericBlock k0 ← tene([1.0, 2.0, 3.0, 4.0], [1, 4])
         let tensor.NumericBlock v0 ← tene([1.0, 2.0, 3.0, 4.0], [1, 4])
-        let gqa.CachedAttention s0 ← gqa.multi_head_attention_cached(q0, k0, v0, wo, cache_p(4), 1, 1, 1.0 ∷ f32, [0], 4, c, [3])
+        mut kv.KVCache base0 ← cache_p(4)
+        mut gqa.CachedAttention s0 ← gqa.multi_head_attention_cached(q0, k0, v0, wo, mut base0, 1, 1, 1.0 ∷ f32, [0], 4, c, [3])
         let tensor.NumericBlock q1 ← tene([5.0, 6.0, 7.0, 8.0], [1, 4])
         let tensor.NumericBlock k1 ← tene([5.0, 6.0, 7.0, 8.0], [1, 4])
         let tensor.NumericBlock v1 ← tene([5.0, 6.0, 7.0, 8.0], [1, 4])
-        let gqa.CachedAttention s1 ← gqa.multi_head_attention_cached(q1, k1, v1, wo, s0.state, 1, 1, 1.0 ∷ f32, [1], 4, c, [4])
+        let gqa.CachedAttention s1 ← gqa.multi_head_attention_cached(q1, k1, v1, wo, mut s0.state, 1, 1, 1.0 ∷ f32, [1], 4, c, [4])
         assert e2(s1.context, 0, 0).approx(e2(full, 1, 0), TOLERANCE)
         assert e2(s1.context, 0, 1).approx(e2(full, 1, 1), TOLERANCE)
         assert s1.state.length() ≡ 2
@@ -989,9 +989,9 @@ test "incremental cached attention matches the last full-row position" {
 # PARKED (batch 11): a caller asserts the success row (≡ "no error") and
 # the NumericBlock success arm of trap narrowing fails at runtime
 # ("missing struct field"). Kept on do/catch. Do not convert.
-fn sdp_cached_detail(tensor.NumericBlock q, tensor.NumericBlock k, tensor.NumericBlock v, f32 scale, list<int> positions, int dim, kv.KVCache layer, list<int> tokens) → string {
+fn sdp_cached_detail(tensor.NumericBlock q, tensor.NumericBlock k, tensor.NumericBlock v, f32 scale, list<int> positions, int dim, mut kv.KVCache layer, list<int> tokens) → string {
     do {
-        gqa.scaled_dot_product_causal_rope_cached(q, k, v, scale, positions, dim, layer, tokens)
+        gqa.scaled_dot_product_causal_rope_cached(q, k, v, scale, positions, dim, mut layer, tokens)
         return "no error"
     }
     catch err {
@@ -1002,7 +1002,7 @@ fn sdp_cached_detail(tensor.NumericBlock q, tensor.NumericBlock k, tensor.Numeri
 # PARKED (batch 11): a caller asserts the success row (≡ "no error") and
 # the NumericBlock success arm of trap narrowing fails at runtime
 # ("missing struct field"). Kept on do/catch. Do not convert.
-fn mha_cached_detail(tensor.NumericBlock q, tensor.NumericBlock k, tensor.NumericBlock v, tensor.NumericBlock wo, kv.KVCache layer, int num_heads, int num_kv_heads, f32 scale, list<int> positions, int rope_dim, list<int> tokens) → string {
+fn mha_cached_detail(tensor.NumericBlock q, tensor.NumericBlock k, tensor.NumericBlock v, tensor.NumericBlock wo, mut kv.KVCache layer, int num_heads, int num_kv_heads, f32 scale, list<int> positions, int rope_dim, list<int> tokens) → string {
     mut rope.RopeConfig c ← rope.default()
     do {
         c ← rope.construct_rope_config(100000.0 ∷ f32, 1.0 ∷ f32, rope.consecutive_policy())
@@ -1011,7 +1011,7 @@ fn mha_cached_detail(tensor.NumericBlock q, tensor.NumericBlock k, tensor.Numeri
         return err.message
     }
     do {
-        gqa.multi_head_attention_cached(q, k, v, wo, layer, num_heads, num_kv_heads, scale, positions, rope_dim, c, tokens)
+        gqa.multi_head_attention_cached(q, k, v, wo, mut layer, num_heads, num_kv_heads, scale, positions, rope_dim, c, tokens)
         return "no error"
     }
     catch err {
@@ -1025,14 +1025,21 @@ test "cached prefill attends [0, i+1) and stores K after RoPE with V unchanged" 
         let tensor.NumericBlock k ← tene([1.0, 0.0, 0.0, 1.0], [2, 2])
         let tensor.NumericBlock v ← tene([1.0, 1.0, 2.0, 2.0], [2, 2])
         let tensor.NumericBlock full ← gqa.scaled_dot_product_causal_rope(q, k, v, 1.0 ∷ f32, [0, 1], 2)
-        let gqa.CachedAttention step ← gqa.scaled_dot_product_causal_rope_cached(q, k, v, 1.0 ∷ f32, [0, 1], 2, cache_p(2), [3, 4])
+        mut kv.KVCache cache ← cache_p(2)
+        let gqa.CachedAttention step ← gqa.scaled_dot_product_causal_rope_cached(q, k, v, 1.0 ∷ f32, [0, 1], 2, mut cache, [3, 4])
         let tensor.NumericBlock stored_k ← gqa.rotary_position_embedding(k, [0, 1], 2)
         assert step.context.shape ≡ full.shape
         assert e2(step.context, 0, 0).approx(e2(full, 0, 0), TOLERANCE)
         assert e2(step.context, 1, 0).approx(e2(full, 1, 0), TOLERANCE)
         assert step.state.length() ≡ 2
-        assert step.state.key.data ≡ stored_k.data
-        assert step.state.payload.data ≡ v.data
+        assert e2(step.state.key, 0, 0) ≡ e2(stored_k, 0, 0)
+        assert e2(step.state.key, 0, 1) ≡ e2(stored_k, 0, 1)
+        assert e2(step.state.key, 1, 0) ≡ e2(stored_k, 1, 0)
+        assert e2(step.state.key, 1, 1) ≡ e2(stored_k, 1, 1)
+        assert e2(step.state.payload, 0, 0) ≡ e2(v, 0, 0)
+        assert e2(step.state.payload, 0, 1) ≡ e2(v, 0, 1)
+        assert e2(step.state.payload, 1, 0) ≡ e2(v, 1, 0)
+        assert e2(step.state.payload, 1, 1) ≡ e2(v, 1, 1)
         assert e2(step.state.key, 1, 0) ≢ e2(k, 1, 0)
     }
     match trap_result_5 {
@@ -1050,11 +1057,12 @@ test "M=1 cached decode attends [0, L+1) including the just-written absolute row
         let tensor.NumericBlock q0 ← tene([1.0, 0.0], [1, 2])
         let tensor.NumericBlock k0 ← tene([1.0, 0.0], [1, 2])
         let tensor.NumericBlock v0 ← tene([1.0, 1.0], [1, 2])
-        let gqa.CachedAttention s0 ← gqa.scaled_dot_product_causal_rope_cached(q0, k0, v0, 1.0 ∷ f32, [0], 2, cache_p(2), [3])
+        mut kv.KVCache cache0 ← cache_p(2)
+        mut gqa.CachedAttention s0 ← gqa.scaled_dot_product_causal_rope_cached(q0, k0, v0, 1.0 ∷ f32, [0], 2, mut cache0, [3])
         let tensor.NumericBlock q1 ← tene([0.0, 1.0], [1, 2])
         let tensor.NumericBlock k1 ← tene([0.0, 1.0], [1, 2])
         let tensor.NumericBlock v1 ← tene([2.0, 2.0], [1, 2])
-        let gqa.CachedAttention s1 ← gqa.scaled_dot_product_causal_rope_cached(q1, k1, v1, 1.0 ∷ f32, [1], 2, s0.state, [4])
+        let gqa.CachedAttention s1 ← gqa.scaled_dot_product_causal_rope_cached(q1, k1, v1, 1.0 ∷ f32, [1], 2, mut s0.state, [4])
         let tensor.NumericBlock stored_k ← gqa.rotary_position_embedding(k1, [1], 2)
         assert e2(s1.context, 0, 0).approx(e2(full, 1, 0), TOLERANCE)
         assert e2(s1.context, 0, 1).approx(e2(full, 1, 1), TOLERANCE)
@@ -1076,12 +1084,13 @@ test "cached decode rejects a local row-zero RoPE position" {
         let tensor.NumericBlock q0 ← tene([1.0, 0.0], [1, 2])
         let tensor.NumericBlock k0 ← tene([1.0, 0.0], [1, 2])
         let tensor.NumericBlock v0 ← tene([1.0, 1.0], [1, 2])
-        let gqa.CachedAttention s0 ← gqa.scaled_dot_product_causal_rope_cached(q0, k0, v0, 1.0 ∷ f32, [0], 2, cache_p(2), [3])
+        mut kv.KVCache cache0 ← cache_p(2)
+        mut gqa.CachedAttention s0 ← gqa.scaled_dot_product_causal_rope_cached(q0, k0, v0, 1.0 ∷ f32, [0], 2, mut cache0, [3])
         let tensor.NumericBlock q1 ← tene([0.0, 1.0], [1, 2])
         let tensor.NumericBlock k1 ← tene([0.0, 1.0], [1, 2])
         let tensor.NumericBlock v1 ← tene([2.0, 2.0], [1, 2])
-        assert sdp_cached_detail(q1, k1, v1, 1.0 ∷ f32, [0], 2, s0.state, [4]) ≡ "position must be the absolute prefix row"
-        assert sdp_cached_detail(q1, k1, v1, 1.0 ∷ f32, [1], 2, s0.state, [4]) ≡ "no error"
+        assert sdp_cached_detail(q1, k1, v1, 1.0 ∷ f32, [0], 2, mut s0.state, [4]) ≡ "position must be the absolute prefix row"
+        assert sdp_cached_detail(q1, k1, v1, 1.0 ∷ f32, [1], 2, mut s0.state, [4]) ≡ "no error"
     }
     match trap_result_3 {
         case returned let ? { }
@@ -1097,22 +1106,30 @@ test "GQA cached prefill and M=1 decode match the full row including the just-wr
         let tensor.NumericBlock v ← tene([1.0, 2.0, 3.0, 4.0], [2, 2])
         let tensor.NumericBlock wo ← tene([1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0], [4, 4])
         let tensor.NumericBlock full ← gqa.multi_head_attention(q, k, v, wo, 2, 1, 1.0 ∷ f32, [0, 1], 2, c)
-        let gqa.CachedAttention prefill ← gqa.multi_head_attention_cached(q, k, v, wo, cache_p(2), 2, 1, 1.0 ∷ f32, [0, 1], 2, c, [3, 4])
+        mut kv.KVCache cache ← cache_p(2)
+        let gqa.CachedAttention prefill ← gqa.multi_head_attention_cached(q, k, v, wo, mut cache, 2, 1, 1.0 ∷ f32, [0, 1], 2, c, [3, 4])
         assert prefill.context.shape ≡ full.shape
         assert e2(prefill.context, 0, 0).approx(e2(full, 0, 0), TOLERANCE)
         assert e2(prefill.context, 1, 0).approx(e2(full, 1, 0), TOLERANCE)
         assert prefill.state.length() ≡ 2
         let tensor.NumericBlock stored_k ← gqa.rotary_position_embedding(k, [0, 1], 2)
-        assert prefill.state.key.data ≡ stored_k.data
-        assert prefill.state.payload.data ≡ v.data
+        assert e2(prefill.state.key, 0, 0) ≡ e2(stored_k, 0, 0)
+        assert e2(prefill.state.key, 0, 1) ≡ e2(stored_k, 0, 1)
+        assert e2(prefill.state.key, 1, 0) ≡ e2(stored_k, 1, 0)
+        assert e2(prefill.state.key, 1, 1) ≡ e2(stored_k, 1, 1)
+        assert e2(prefill.state.payload, 0, 0) ≡ e2(v, 0, 0)
+        assert e2(prefill.state.payload, 0, 1) ≡ e2(v, 0, 1)
+        assert e2(prefill.state.payload, 1, 0) ≡ e2(v, 1, 0)
+        assert e2(prefill.state.payload, 1, 1) ≡ e2(v, 1, 1)
         let tensor.NumericBlock q0 ← tene([1.0, 0.0, 0.0, 1.0], [1, 4])
         let tensor.NumericBlock k0 ← tene([1.0, 0.0], [1, 2])
         let tensor.NumericBlock v0 ← tene([1.0, 2.0], [1, 2])
-        let gqa.CachedAttention s0 ← gqa.multi_head_attention_cached(q0, k0, v0, wo, cache_p(2), 2, 1, 1.0 ∷ f32, [0], 2, c, [3])
+        mut kv.KVCache cache0 ← cache_p(2)
+        mut gqa.CachedAttention s0 ← gqa.multi_head_attention_cached(q0, k0, v0, wo, mut cache0, 2, 1, 1.0 ∷ f32, [0], 2, c, [3])
         let tensor.NumericBlock q1 ← tene([0.0, 1.0, 1.0, 0.0], [1, 4])
         let tensor.NumericBlock k1 ← tene([0.0, 1.0], [1, 2])
         let tensor.NumericBlock v1 ← tene([3.0, 4.0], [1, 2])
-        let gqa.CachedAttention s1 ← gqa.multi_head_attention_cached(q1, k1, v1, wo, s0.state, 2, 1, 1.0 ∷ f32, [1], 2, c, [4])
+        let gqa.CachedAttention s1 ← gqa.multi_head_attention_cached(q1, k1, v1, wo, mut s0.state, 2, 1, 1.0 ∷ f32, [1], 2, c, [4])
         assert e2(s1.context, 0, 0).approx(e2(full, 1, 0), TOLERANCE)
         assert e2(s1.context, 0, 1).approx(e2(full, 1, 1), TOLERANCE)
         assert e2(s1.context, 0, 2).approx(e2(full, 1, 2), TOLERANCE)
@@ -1128,7 +1145,8 @@ test "GQA cached prefill and M=1 decode match the full row including the just-wr
 }
 
 test "cached GQA rejects a head count that does not divide query heads" {
-    assert mha_cached_detail(tene([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], [2, 4]), tene([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], [2, 4]), tene([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], [2, 4]), tene([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0], [4, 4]), cache_p(4), 4, 3, 1.0 ∷ f32, [0, 1], 2, [3, 4]) ≡ "num_heads must be a multiple of num_kv_heads"
+    mut kv.KVCache cache ← cache_p(4)
+    assert mha_cached_detail(tene([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], [2, 4]), tene([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], [2, 4]), tene([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], [2, 4]), tene([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0], [4, 4]), mut cache, 4, 3, 1.0 ∷ f32, [0, 1], 2, [3, 4]) ≡ "num_heads must be a multiple of num_kv_heads"
 }
 
 test "cached GQA rejects a local row-zero RoPE position" {
@@ -1138,12 +1156,13 @@ test "cached GQA rejects a local row-zero RoPE position" {
         let tensor.NumericBlock k0 ← tene([1.0, 0.0], [1, 2])
         let tensor.NumericBlock v0 ← tene([1.0, 2.0], [1, 2])
         let tensor.NumericBlock wo ← tene([1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0], [4, 4])
-        let gqa.CachedAttention s0 ← gqa.multi_head_attention_cached(q0, k0, v0, wo, cache_p(2), 2, 1, 1.0 ∷ f32, [0], 2, c, [3])
+        mut kv.KVCache cache0 ← cache_p(2)
+        mut gqa.CachedAttention s0 ← gqa.multi_head_attention_cached(q0, k0, v0, wo, mut cache0, 2, 1, 1.0 ∷ f32, [0], 2, c, [3])
         let tensor.NumericBlock q1 ← tene([0.0, 1.0, 1.0, 0.0], [1, 4])
         let tensor.NumericBlock k1 ← tene([0.0, 1.0], [1, 2])
         let tensor.NumericBlock v1 ← tene([3.0, 4.0], [1, 2])
-        assert mha_cached_detail(q1, k1, v1, wo, s0.state, 2, 1, 1.0 ∷ f32, [0], 2, [4]) ≡ "position must be the absolute prefix row"
-        assert mha_cached_detail(q1, k1, v1, wo, s0.state, 2, 1, 1.0 ∷ f32, [1], 2, [4]) ≡ "no error"
+        assert mha_cached_detail(q1, k1, v1, wo, mut s0.state, 2, 1, 1.0 ∷ f32, [0], 2, [4]) ≡ "position must be the absolute prefix row"
+        assert mha_cached_detail(q1, k1, v1, wo, mut s0.state, 2, 1, 1.0 ∷ f32, [1], 2, [4]) ≡ "no error"
     }
     match trap_result_1 {
         case returned let ? { }

@@ -71,38 +71,18 @@ fn transpose(tensor.NumericBlock t) → tensor.NumericBlock {
     return tensor.stage_f32(trans, out)
 }
 
-# Filled-tensor construction through the attention error vocabulary
-# (tensor.fill → AttentionError, message text preserved).
-fn fill(list<int> f, f32 payload) → tensor.NumericBlock ⇥ rope.AttentionError {
-    do {
-        return tensor.fill(f, payload)
-    }
-    catch err {
-        match err {
-            case tensor.TensorError.InvalidShape let message {
-                throw variant rope.AttentionError.ShapeMismatch { message = message }
-            }
-            case tensor.TensorError.ElementMismatch let message {
-                throw variant rope.AttentionError.ElementMismatch { message = message }
-            }
-            case tensor.TensorError.IndexOutOfBounds let message {
-                throw variant rope.AttentionError.ShapeMismatch { message = message }
-            }
-            case tensor.TensorError.ShapeFailure let message, ? {
-                throw variant rope.AttentionError.ShapeMismatch { message = message }
-            }
-        }
-    }
-}
-
 # Row softmax over the LAST axis of a rank-2 tensor, numerically stable via
-# max subtraction (the stepper tensor_softmax identity). With causal =
+# max subtraction (the stepper tensor_softmax identity), with the scalar
+# score scale fused on read: each element is scaled (v * scale, the same
+# single f32 rounding the former materialized [Tq, Tk] scale product
+# produced) before the max/exp/normalize pass, so no constant scale tensor
+# and no scaled-score intermediate is allocated (issue #73). With causal =
 # true it is the GI3 masked stable row softmax: row i keeps columns
 # j ≤ prefix_before + i (diagonal included) and outputs zeros past the prefix.
 # The causal-softmax device construct is not admitted for this staged library
 # carrier, so this parameterized helper remains the single pending hand path.
 # legacy-L5 pending construct admission
-fn softmax(tensor.NumericBlock x, int prefix_before, bool causal) → tensor.NumericBlock {
+fn softmax_scaled(tensor.NumericBlock x, f32 scale, int prefix_before, bool causal) → tensor.NumericBlock {
     # legacy-L3: shape recovery pending shape-binding/S0-R1.
     let list<int> f ← x.shape
     let int rows ← f.get(0) coalesce 1
@@ -117,9 +97,11 @@ fn softmax(tensor.NumericBlock x, int prefix_before, bool causal) → tensor.Num
         # Row max over the valid prefix. W0 stay: this is bounded
         # participation producing a value, not an unmasked index; no bounded
         # argmax twin is admitted.
-        mut f32 maximum ← x.data.get(i * cols) coalesce 0.0 ∷ f32
+        let f32 first ← x.data.get(i * cols) coalesce 0.0 ∷ f32
+        mut f32 maximum ← first * scale
         for range 0‥end let j {
-            let f32 v ← x.data.get(i * cols + j) coalesce 0.0 ∷ f32
+            let f32 raw ← x.data.get(i * cols + j) coalesce 0.0 ∷ f32
+            let f32 v ← raw * scale
             if v ≻ maximum {
                 maximum ← v
             }
@@ -129,8 +111,8 @@ fn softmax(tensor.NumericBlock x, int prefix_before, bool causal) → tensor.Num
         mut list<f32> exps ← empty
         mut f32 total ← 0.0 ∷ f32
         for range 0‥end let j2 {
-            let f32 v ← x.data.get(i * cols + j2) coalesce 0.0 ∷ f32
-            let f32 e ← (v - maximum).exp()
+            let f32 raw ← x.data.get(i * cols + j2) coalesce 0.0 ∷ f32
+            let f32 e ← (raw * scale - maximum).exp()
             exps.append(e)
             total ← total + e
         }
@@ -277,18 +259,17 @@ fn validate_rope(tensor.NumericBlock x, list<int> positions, int dim) → list<i
     return f
 }
 
-# The attention computation core: scores = (q·kᵀ)·scale, row softmax (with
-# or without the causal prefix), context = attn·v. Math failures are mapped
-# into AttentionError preserving the message text (the nn.fab linear pattern).
-fn attention_core(tensor.NumericBlock q, tensor.NumericBlock k, tensor.NumericBlock v, f32 scale, bool causal) → tensor.NumericBlock ⇥ rope.AttentionError {
-    let list<int> fq ← q.shape
-    let int t ← fq.get(0) coalesce 1
-    let tensor.NumericBlock kt ← transpose(k)
-    let tensor.NumericBlock scale_t ← fill([t, t], scale)
+# The attention computation core over a PRE-TRANSPOSED key argument kt
+# ([d, Tk]): scores = q·kt with the scalar scale fused into the softmax
+# pass (softmax_scaled — no [Tq, Tk] constant scale tensor and no scaled
+# intermediate), then context = attn·v. Hoisting the transpose out lets
+# GQA share one kt per KV head across its ratio query heads (issue #73).
+# Math failures are mapped into AttentionError preserving the message text
+# (the nn.fab linear pattern).
+fn attention_core_kt(tensor.NumericBlock q, tensor.NumericBlock kt, tensor.NumericBlock v, f32 scale, int prefix_before, bool causal) → tensor.NumericBlock ⇥ rope.AttentionError {
     do {
         let tensor.NumericBlock scores ← math.matmul(q, kt)
-        let tensor.NumericBlock scaled ← math.mul_carrier(scores, scale_t)
-        let tensor.NumericBlock attn ← softmax(scaled, 0, causal)
+        let tensor.NumericBlock attn ← softmax_scaled(scores, scale, prefix_before, causal)
         let tensor.NumericBlock context ← math.matmul(attn, v)
         return context
     }
@@ -320,6 +301,11 @@ fn attention_core(tensor.NumericBlock q, tensor.NumericBlock k, tensor.NumericBl
             }
         }
     }
+}
+
+# Single-head wrapper: transposes k here and runs the fused core.
+fn attention_core(tensor.NumericBlock q, tensor.NumericBlock k, tensor.NumericBlock v, f32 scale, bool causal) → tensor.NumericBlock ⇥ rope.AttentionError {
+    return attention_core_kt(q, transpose(k), v, scale, 0, causal)
 }
 
 # Column slice of a rank-2 staged tensor: columns [start, start + width)
@@ -526,32 +512,54 @@ fn scaled_dot_product_causal_rope(tensor.NumericBlock q, tensor.NumericBlock k, 
 # fixed-shape constants. The F32 row is the admitted row.
 # -------------------------------------------------------------------------
 
+# Shared RoPE table for the configurable-policy attention rows: precompute
+# ONCE per forward boundary and pass it to the `_table` variants below, so
+# per-layer callers share one table across every layer and head (issue #73
+# — recomputing it per layer costs O(L·T·rope_dim) trig). The table layout
+# is the rope_table contract: [positions, dim/2, 3] reduced as
+# [angle, cos, sin] triples.
+@ public
+fn shared_rope_table(list<int> positions, int dim, rope.RopeConfig config) → list<f32> {
+    return rope_table(positions, dim, config.base, config.scale)
+}
+
 @ public
 fn multi_head_attention(tensor.NumericBlock q, tensor.NumericBlock k, tensor.NumericBlock v, tensor.NumericBlock wo, int num_heads, int num_kv_heads, f32 scale, list<int> positions, int rope_dim, rope.RopeConfig rope_config) → tensor.NumericBlock ⇥ rope.AttentionError {
+    return multi_head_attention_table(q, k, v, wo, num_heads, num_kv_heads, scale, positions, rope_dim, rope_config, shared_rope_table(positions, rope_dim, rope_config))
+}
+
+# multi_head_attention_table — the GQA composition over a CALLER-SHARED
+# RoPE table (built once by shared_rope_table, reused across layers).
+# K/V head slicing, K-RoPE, and the K transpose run ONCE per KV head
+# (0‥num_kv_heads); each query head only splits and rotates q, then reuses
+# its group's pre-rotated, pre-transposed key (issue #73 — the ratio×
+# redundant per-query-head K work is gone).
+@ public
+fn multi_head_attention_table(tensor.NumericBlock q, tensor.NumericBlock k, tensor.NumericBlock v, tensor.NumericBlock wo, int num_heads, int num_kv_heads, f32 scale, list<int> positions, int rope_dim, rope.RopeConfig rope_config, list<f32> table) → tensor.NumericBlock ⇥ rope.AttentionError {
     # --- config + shape validation (fail closed) --------------------------
     let int d ← validate_multi(q, k, v, wo, num_heads, num_kv_heads, positions, rope_dim)
 
-    # --- rope config + shared table ---------------------------------------
+    # --- rope config -------------------------------------------------------
     let int ratio ← num_heads / num_kv_heads
-    let f32 base ← rope_config.base
-    let f32 rope_scale ← rope_config.scale
     let bool interposita ← interleaved(rope_config.policy)
-    let list<f32> table ← rope_table(positions, rope_dim, base, rope_scale)
 
-    # --- per-head blocks (GQA split → RoPE → causal) ----------------------
+    # --- per-KV-head blocks (split → RoPE → transpose, once per group) ----
+    mut list<tensor.NumericBlock> group_kts ← empty
+    mut list<tensor.NumericBlock> group_vs ← empty
+    for exclusive num_kv_heads let g {
+        let tensor.NumericBlock kg ← head(k, g * d, d)
+        let tensor.NumericBlock kr ← rope_curve(kg, rope_dim, table, interposita)
+        group_kts.append(transpose(kr))
+        group_vs.append(head(v, g * d, d))
+    }
+
+    # --- per-query-head blocks (q split → RoPE → causal over the group) ---
     mut list<tensor.NumericBlock> heads ← empty
-    for range 0‥num_heads let h {
-        # --- GQA group + per-head split -----------------------------------
+    for exclusive num_heads let h {
         let int g ← h / ratio
         let tensor.NumericBlock qh ← head(q, h * d, d)
-        let tensor.NumericBlock kg ← head(k, g * d, d)
-        let tensor.NumericBlock vg ← head(v, g * d, d)
-
-        # --- RoPE rotation + causal attention -----------------------------
         let tensor.NumericBlock qr ← rope_curve(qh, rope_dim, table, interposita)
-        let tensor.NumericBlock kr ← rope_curve(kg, rope_dim, table, interposita)
-        let tensor.NumericBlock ctx ← attention_core(qr, kr, vg, scale, true)
-        heads.append(ctx)
+        heads.append(attention_core_kt(qr, group_kts.get(g) coalesce tensor.default(), group_vs.get(g) coalesce tensor.default(), scale, 0, true))
     }
 
     # --- head concatenation -----------------------------------------------
@@ -589,7 +597,9 @@ fn default_cached() → CachedAttention {
 
 # Attention core for q [Tq, D] against full k/v [prefix_before + Tq, D].
 # Query row i attends [0, prefix_before + i + 1), including the just-written
-# row at absolute position prefix_before + i.
+# row at absolute position prefix_before + i. The transpose stays inside
+# this single-head wrapper; the GQA path shares one kt per KV head instead
+# (attention_core_kt).
 fn attention_core_offset(tensor.NumericBlock q, tensor.NumericBlock k, tensor.NumericBlock v, f32 scale, int prefix_before) → tensor.NumericBlock ⇥ rope.AttentionError {
     let list<int> fq ← q.shape
     let list<int> fk ← k.shape
@@ -597,43 +607,7 @@ fn attention_core_offset(tensor.NumericBlock q, tensor.NumericBlock k, tensor.Nu
     let int tk ← fk.get(0) coalesce 1
     require prefix_before ≥ 0 throw variant rope.AttentionError.InvalidPosition {message = "negative position"}
     require tk ≡ prefix_before + tq throw variant rope.AttentionError.ShapeMismatch {message = "attention prefix excludes the just-written row"}
-    let tensor.NumericBlock kt ← transpose(k)
-    let tensor.NumericBlock scale_t ← fill([tq, tk], scale)
-    do {
-        let tensor.NumericBlock scores ← math.matmul(q, kt)
-        let tensor.NumericBlock scaled ← math.mul_carrier(scores, scale_t)
-        let tensor.NumericBlock attn ← softmax(scaled, prefix_before, true)
-        let tensor.NumericBlock context ← math.matmul(attn, v)
-        return context
-    }
-    catch err {
-        match err {
-            case math.MathError.GradusMismatch let message {
-                throw variant rope.AttentionError.GradusMismatch { message = message }
-            }
-            case math.MathError.Incompatible let message {
-                throw variant rope.AttentionError.Incompatible { message = message }
-            }
-            case math.MathError.DtypeMismatch let message {
-                throw variant rope.AttentionError.DtypeMismatch { message = message }
-            }
-            case math.MathError.ProductAboveLimit let message {
-                throw variant rope.AttentionError.ProductAboveLimit { message = message }
-            }
-            case math.MathError.DimensionAboveLimit let message {
-                throw variant rope.AttentionError.DimensionAboveLimit { message = message }
-            }
-            case math.MathError.NegativeDimension let message {
-                throw variant rope.AttentionError.NegativeDimension { message = message }
-            }
-            case math.MathError.ShapeMismatch let message {
-                throw variant rope.AttentionError.ShapeMismatch { message = message }
-            }
-            case _ {
-                throw variant rope.AttentionError.ShapeMismatch { message = err.message }
-            }
-        }
-    }
+    return attention_core_kt(q, transpose(k), v, scale, prefix_before, true)
 }
 
 fn concat_rows(tensor.NumericBlock a, tensor.NumericBlock b) → tensor.NumericBlock ⇥ rope.AttentionError {
@@ -650,9 +624,12 @@ fn concat_rows(tensor.NumericBlock a, tensor.NumericBlock b) → tensor.NumericB
     throw variant rope.AttentionError.ShapeMismatch {message = "unreachable concatenate"}
 }
 
-fn write_cache(kv.KVCache layer, list<int> tokens, tensor.NumericBlock key, tensor.NumericBlock payload) → kv.KVCache ⇥ rope.AttentionError {
+fn write_cache(mut kv.KVCache layer, list<int> tokens, tensor.NumericBlock key, tensor.NumericBlock payload) → kv.KVCache ⇥ rope.AttentionError {
     do {
-        return kv.extend(layer, tokens, key, payload)
+        # The pre-allocated cache buffers take the new rows in place at
+        # write_pos — no second full-history copy after the attention read
+        # (issue #73).
+        return kv.extend(mut layer, tokens, key, payload)
     }
     catch err {
         throw variant rope.AttentionError.CacheFailure {message = err.message, inner = err}
@@ -704,18 +681,27 @@ fn validate_cached_triplet(tensor.NumericBlock q, tensor.NumericBlock k, tensor.
 # q/k/v are the NEW rows [T, D]. prefix_before is the logical cache length
 # L before this write. Q and K rotate at absolute positions L..L+T-1; K is
 # stored after that RoPE, V is stored raw. The query attends [0, L+i+1)
-# including the just-written row, then the new rows are extended.
+# including the just-written row, then the new rows are written in place
+# into the layer's pre-allocated cache buffers (the layer receiver is mut
+# for that in-place write).
 # -------------------------------------------------------------------------
 
 @ public
-fn scaled_dot_product_causal_rope_cached(tensor.NumericBlock q, tensor.NumericBlock k, tensor.NumericBlock v, f32 scale, list<int> positions, int dim, kv.KVCache layer, list<int> tokens) → CachedAttention ⇥ rope.AttentionError {
+fn scaled_dot_product_causal_rope_cached(tensor.NumericBlock q, tensor.NumericBlock k, tensor.NumericBlock v, f32 scale, list<int> positions, int dim, mut kv.KVCache layer, list<int> tokens) → CachedAttention ⇥ rope.AttentionError {
+    return scaled_dot_product_causal_rope_cached_table(q, k, v, scale, positions, dim, mut layer, tokens, rope_table(positions, dim, ROPE_FREQ_BASE, 1.0 ∷ f32))
+}
+
+# The same composition over a CALLER-SHARED RoPE table (per-layer callers
+# precompute the frozen llama-recipe table once and reuse it across
+# layers — issue #73).
+@ public
+fn scaled_dot_product_causal_rope_cached_table(tensor.NumericBlock q, tensor.NumericBlock k, tensor.NumericBlock v, f32 scale, list<int> positions, int dim, mut kv.KVCache layer, list<int> tokens, list<f32> table) → CachedAttention ⇥ rope.AttentionError {
     # --- cache + triplet + positions (fail closed) ------------------------
     let int prefix_before ← validate_cached_triplet(q, k, v, layer, tokens)
     validate_rope(q, positions, dim)
     validate_absolute_positions(prefix_before, positions, q.shape.get(0) coalesce 0)
 
-    # --- rope table + q/k rotation ----------------------------------------
-    let list<f32> table ← rope_table(positions, dim, ROPE_FREQ_BASE, 1.0 ∷ f32)
+    # --- q/k rotation over the shared table --------------------------------
     let tensor.NumericBlock qr ← rope_curve(q, dim, table, false)
     let tensor.NumericBlock kr ← rope_curve(k, dim, table, false)
 
@@ -727,7 +713,14 @@ fn scaled_dot_product_causal_rope_cached(tensor.NumericBlock q, tensor.NumericBl
     let tensor.NumericBlock context ← attention_core_offset(qr, full_k, full_v, scale, prefix_before)
 
     # --- cache write + result ---------------------------------------------
-    return CachedAttention {context = context, state = write_cache(layer, tokens, kr, v)}
+    # The rows are written IN PLACE at write_pos into the layer's
+    # pre-allocated buffers — no second full-history copy after the read
+    # (issue #73). Independent copies of the new rows feed the write (the
+    # read path above already borrowed them against the layer views).
+    let tensor.NumericBlock kr_write ← copy kr
+    let tensor.NumericBlock v_write ← copy v
+    let kv.KVCache state ← write_cache(mut layer, tokens, kr_write, v_write)
+    return CachedAttention {context = context, state = state}
 }
 
 fn validate_cached_multi(tensor.NumericBlock q, tensor.NumericBlock k, tensor.NumericBlock v, tensor.NumericBlock wo, kv.KVCache layer, int num_heads, int num_kv_heads, list<int> positions, int rope_dim, list<int> tokens) → int ⇥ rope.AttentionError {
@@ -752,46 +745,59 @@ fn validate_cached_multi(tensor.NumericBlock q, tensor.NumericBlock k, tensor.Nu
 # k/v [T, K·D] are the NEW packed rows. GQA requires H % K == 0; query
 # head h attends KV head h / (H/K). Cached K is post-RoPE at absolute
 # positions; V is stored unchanged. Query row i attends [0, L+i+1).
+# K/V slicing, K-RoPE, and the K transpose run ONCE per KV head over the
+# cached views, and the new rows land in place in the layer's pre-allocated
+# buffers (the layer receiver is mut for that write — issue #73).
 # -------------------------------------------------------------------------
 
 @ public
-fn multi_head_attention_cached(tensor.NumericBlock q, tensor.NumericBlock k, tensor.NumericBlock v, tensor.NumericBlock wo, kv.KVCache layer, int num_heads, int num_kv_heads, f32 scale, list<int> positions, int rope_dim, rope.RopeConfig rope_config, list<int> tokens) → CachedAttention ⇥ rope.AttentionError {
+fn multi_head_attention_cached(tensor.NumericBlock q, tensor.NumericBlock k, tensor.NumericBlock v, tensor.NumericBlock wo, mut kv.KVCache layer, int num_heads, int num_kv_heads, f32 scale, list<int> positions, int rope_dim, rope.RopeConfig rope_config, list<int> tokens) → CachedAttention ⇥ rope.AttentionError {
+    return multi_head_attention_cached_table(q, k, v, wo, mut layer, num_heads, num_kv_heads, scale, positions, rope_dim, rope_config, tokens, shared_rope_table(positions, rope_dim, rope_config))
+}
+
+# The same GQA composition over a CALLER-SHARED RoPE table (per-layer
+# callers precompute it once and reuse it across layers — issue #73).
+@ public
+fn multi_head_attention_cached_table(tensor.NumericBlock q, tensor.NumericBlock k, tensor.NumericBlock v, tensor.NumericBlock wo, mut kv.KVCache layer, int num_heads, int num_kv_heads, f32 scale, list<int> positions, int rope_dim, rope.RopeConfig rope_config, list<int> tokens, list<f32> table) → CachedAttention ⇥ rope.AttentionError {
     # --- cache + GQA validation (fail closed) -----------------------------
     let int d ← validate_cached_multi(q, k, v, wo, layer, num_heads, num_kv_heads, positions, rope_dim, tokens)
     let int prefix_before ← layer.length()
     validate_absolute_positions(prefix_before, positions, q.shape.get(0) coalesce 0)
 
-    # --- rope config + shared table ---------------------------------------
+    # --- rope config -------------------------------------------------------
     let int ratio ← num_heads / num_kv_heads
-    let f32 base ← rope_config.base
-    let f32 rope_scale ← rope_config.scale
     let bool interposita ← interleaved(rope_config.policy)
-    let list<f32> table ← rope_table(positions, rope_dim, base, rope_scale)
 
-    # --- rotate + reconcile new keys (per KV head) ------------------------
+    # --- rotate the new K rows once per KV head ----------------------------
+    # (shared by the ratio query heads of each group — issue #73).
     mut list<tensor.NumericBlock> new_ks ← empty
-    for range 0‥num_kv_heads let g {
-        let tensor.NumericBlock kg ← head(k, g * d, d)
-        new_ks.append(rope_curve(kg, rope_dim, table, interposita))
+    for exclusive num_kv_heads let g {
+        new_ks.append(rope_curve(head(k, g * d, d), rope_dim, table, interposita))
     }
     let tensor.NumericBlock new_k ← reconcile(new_ks)
 
-    # --- append to the cached prefix --------------------------------------
-    let tensor.NumericBlock full_k ← concat_rows(layer.key, new_k)
-    let tensor.NumericBlock full_v ← concat_rows(layer.payload, v)
+    # --- per-KV-head views over the cached prefix + the new rows -----------
+    # layer.key / layer.payload are [prefix, K·D] views over the
+    # pre-allocated buffers: head() reads only valid rows. Slice, concat
+    # with the new rows, and transpose ONCE per KV head; each query head
+    # reuses its group's kt and v (issue #73 — the ratio× redundant
+    # per-query-head K/V work is gone).
+    mut list<tensor.NumericBlock> group_kts ← empty
+    mut list<tensor.NumericBlock> group_vs ← empty
+    for exclusive num_kv_heads let g {
+        let tensor.NumericBlock full_kg ← concat_rows(head(layer.key, g * d, d), head(new_k, g * d, d))
+        let tensor.NumericBlock full_vg ← concat_rows(head(layer.payload, g * d, d), head(v, g * d, d))
+        group_kts.append(transpose(full_kg))
+        group_vs.append(full_vg)
+    }
 
-    # --- per-head blocks (GQA split → RoPE → causal) ----------------------
+    # --- per-query-head blocks (q split → RoPE → causal over the group) ---
     mut list<tensor.NumericBlock> heads ← empty
-    for range 0‥num_heads let h {
-        # --- GQA group + query split + RoPE -------------------------------
+    for exclusive num_heads let h {
         let int group ← h / ratio
         let tensor.NumericBlock qh ← head(q, h * d, d)
         let tensor.NumericBlock qr ← rope_curve(qh, rope_dim, table, interposita)
-
-        # --- cached K/V split + causal attention --------------------------
-        let tensor.NumericBlock kg_all ← head(full_k, group * d, d)
-        let tensor.NumericBlock vg_all ← head(full_v, group * d, d)
-        heads.append(attention_core_offset(qr, kg_all, vg_all, scale, prefix_before))
+        heads.append(attention_core_kt(qr, group_kts.get(group) coalesce tensor.default(), group_vs.get(group) coalesce tensor.default(), scale, prefix_before, true))
     }
 
     # --- head concatenation + output projection ---------------------------
@@ -799,5 +805,12 @@ fn multi_head_attention_cached(tensor.NumericBlock q, tensor.NumericBlock k, ten
     let tensor.NumericBlock context ← attention_matmul(concat, wo)
 
     # --- cache write + result ---------------------------------------------
-    return CachedAttention {context = context, state = write_cache(layer, tokens, new_k, v)}
+    # The rows are written IN PLACE at write_pos into the layer's
+    # pre-allocated buffers — no second full-history copy after the read
+    # (issue #73). Independent copies of the new rows feed the write (the
+    # read path above already borrowed them against the layer views).
+    let tensor.NumericBlock new_k_write ← copy new_k
+    let tensor.NumericBlock v_write ← copy v
+    let kv.KVCache state ← write_cache(mut layer, tokens, new_k_write, v_write)
+    return CachedAttention {context = context, state = state}
 }
