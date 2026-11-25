@@ -34,6 +34,7 @@ import from "gradus:kernel" let kern
 import from "gradus:model/bundle" let bundle
 import from "gradus:model/dequant" let dequant
 import from "gradus:model/tensor_directory" let td
+import from "gradus:storage" let storage
 import from "gradus:quant/group_affine" let ga
 import from "gradus:storage" let storage
 
@@ -305,9 +306,9 @@ fn bind_with_config(td.TensorDirectory dir, bundle.MemberRole role, string modul
 
     require weight.shape.length() ≡ 2 throw variant BadShape { message = "weight shape must be rank-2" }
 
-    let int out_features ← weight.shape.get(0) coalesce 0
-    let int col_extent ← weight.shape.get(1) coalesce 0
-    require out_features ≥ 1 and col_extent ≥ 1 throw variant BadShape { message = "weight shape must have positive extents" }
+    let int dim0 ← weight.shape.get(0) coalesce 0
+    let int dim1 ← weight.shape.get(1) coalesce 0
+    require dim0 ≥ 1 and dim1 ≥ 1 throw variant BadShape { message = "weight shape must have positive extents" }
 
     let bool has_bias ← td.has_tensor(dir, role, "§.bias"(module_prefix))
 
@@ -318,17 +319,29 @@ fn bind_with_config(td.TensorDirectory dir, bundle.MemberRole role, string modul
         return bind_group_affine(weight, maybe_scales, maybe_biases, has_bias, hint)
     }
 
+    # GGUF stores 2D weights in ne order [ne0 = in_features, ne1 = out_features],
+    # whereas Safetensors stores PyTorch [out_features, in_features] order.
+    mut int out_features ← dim0
+    mut int in_features ← dim1
+    match weight.container {
+        case bundle.ContainerKind.Gguf {
+            in_features ← dim0
+            out_features ← dim1
+        }
+        case bundle.ContainerKind.Safetensors {}
+    }
+
     # 2. GgmlBlock: single GGML block tensor
     if is_ggml_block_dtype(weight.raw_dtype) {
         let LinearWeightKind kind ← ggml_kind_for(weight.raw_dtype)
         let int block_elems ← ggml_block_elements(kind)
-        require col_extent % block_elems ≡ 0 throw variant BadShape { message = "GGML weight in_features must be divisible by block element count" }
-        return LinearWeight { kind = kind, out_features = out_features, in_features = col_extent, bits = 0, group_size = 0, packed_cols = 0, group_cols = 0, has_bias = has_bias }
+        require in_features % block_elems ≡ 0 throw variant BadShape { message = "GGML weight in_features must be divisible by block element count" }
+        return LinearWeight { kind = kind, out_features = out_features, in_features = in_features, bits = 0, group_size = 0, packed_cols = 0, group_cols = 0, has_bias = has_bias }
     }
 
     # 3. Dense: .weight [+ .bias]
     let LinearWeightKind kind ← dense_kind_for(weight.raw_dtype)
-    return LinearWeight { kind = kind, out_features = out_features, in_features = col_extent, bits = 0, group_size = 0, packed_cols = 0, group_cols = 0, has_bias = has_bias }
+    return LinearWeight { kind = kind, out_features = out_features, in_features = in_features, bits = 0, group_size = 0, packed_cols = 0, group_cols = 0, has_bias = has_bias }
 }
 
 @ public
@@ -749,8 +762,10 @@ fn dispatch_ggml_q8_0<size Out, size Blocks, size RowBytes, size In>(LinearWeigh
 import from "gradus:model/artifact" let artifact
 import from "gradus:model/bundle" let bundle
 import from "gradus:model/capsule" let capsule
+import from "gradus:model/gguf_manifest" let gguf_manifest
 import from "gradus:model/linear_weight" let lw
 import from "gradus:model/tensor_directory" let td
+import from "gradus:storage" let storage
 
 fn id_with(string hex_char, int len) → artifact.ContentIdentity {
     mut string hex ← ""
@@ -1006,5 +1021,81 @@ test "LinearWeight kernel dispatchers match across Dense, GroupAffine, and Q8_0"
     }
     catch err {
         assert false
+    }
+}
+
+fn mk_gguf_tensor(string name, list<int> shape, int dtype_id, int offset, int elems_per_block, int bytes_per_block, int byte_length) → gguf_manifest.GgufTensorDescriptor {
+    let int elem_count ← shape[0] * shape[1]
+    return gguf_manifest.GgufTensorDescriptor {
+        name = name,
+        shape = shape,
+        dtype_ggml = dtype_id,
+        representation = storage.ggml_representation(dtype_id),
+        relative_offset = offset,
+        elements = elem_count,
+        layout = variant gguf_manifest.GgmlLayout.Known { elements_per_block = elems_per_block, bytes_per_block = bytes_per_block, byte_length = byte_length },
+        block = storage.BlockMetadata { known = true, elements_per_block = elems_per_block, bytes_per_block = bytes_per_block, block_count = elem_count / elems_per_block, byte_length = byte_length }
+    }
+}
+
+fn mk_gguf_bundle(artifact.ContentIdentity bb_id) → bundle.ModelBundle {
+    do {
+        return bundle.gguf_single(bb_id)
+    }
+    catch err {
+        assert false
+        return bundle.ModelBundle { schema = "", primary_container = variant bundle.ContainerKind.Gguf, backbone_shards = [], drafter = null, vision = null, config = null, quant_config = null, shard_index = null, tokenizer = null, shard_map = variant bundle.ShardMapping.Unindexed { shard_count = 0 } }
+    }
+}
+
+fn mk_gguf_dir(bundle.ModelBundle b, gguf_manifest.GgufManifest gm) → td.TensorDirectory ∪ none {
+    do {
+        return td.build(b, [
+            variant td.ShardSource.GgufSource { role = variant bundle.MemberRole.Backbone, manifest = gm }
+        ], [], [])
+    }
+    catch err {
+        return null
+    }
+}
+
+test "LinearWeight binds non-square GgmlBlock and IQ4_NL from GgufSource in ne=[in, out] order" {
+    let artifact.ContentIdentity bb_id ← id_with("d", 16777216)
+    let bundle.ModelBundle b ← mk_gguf_bundle(bb_id)
+    let gguf_manifest.GgufManifest gm ← gguf_manifest.GgufManifest {
+        identity = bb_id,
+        version = 3,
+        alignment = 32,
+        data_start = 256,
+        artifact_length = 16777216,
+        metadata = [],
+        tensors = [
+            mk_gguf_tensor("blk.0.ffn_down.weight", [2560, 960], 12, 0, 256, 144, 1382400),
+            mk_gguf_tensor("blk.0.ffn_gate.weight", [960, 2560], 8, 1382400, 32, 34, 2611200),
+            mk_gguf_tensor("blk.0.ffn_up.weight", [64, 16], 20, 3993600, 32, 18, 576)
+        ]
+    }
+    let td.TensorDirectory ∪ none maybe_dir ← mk_gguf_dir(b, gm)
+    assert maybe_dir is td.TensorDirectory
+    if maybe_dir is td.TensorDirectory {
+        do {
+            let lw.LinearWeight w_down ← lw.bind(maybe_dir, variant bundle.MemberRole.Backbone, "model.layers.0.mlp.down_proj")
+            assert w_down.kind ≡ variant lw.LinearWeightKind.GgmlBlockQ4_K
+            assert w_down.in_features ≡ 2560
+            assert w_down.out_features ≡ 960
+
+            let lw.LinearWeight w_gate ← lw.bind(maybe_dir, variant bundle.MemberRole.Backbone, "model.layers.0.mlp.gate_proj")
+            assert w_gate.kind ≡ variant lw.LinearWeightKind.GgmlBlockQ8_0
+            assert w_gate.in_features ≡ 960
+            assert w_gate.out_features ≡ 2560
+
+            let lw.LinearWeight w_up ← lw.bind(maybe_dir, variant bundle.MemberRole.Backbone, "model.layers.0.mlp.up_proj")
+            assert w_up.kind ≡ variant lw.LinearWeightKind.GgmlBlockIQ4_NL
+            assert w_up.in_features ≡ 64
+            assert w_up.out_features ≡ 16
+        }
+        catch err {
+            assert false
+        }
     }
 }
