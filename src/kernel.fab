@@ -20,7 +20,7 @@ locale = "en"
 #   rope_q<T,D,d,P>    [T,D] · table [T,P,3]       → [T,D]
 #   rope_k<T,K,d,P>    [T,K] · table [T,P,3]       → [T,K]
 #   transpose<T,d>     [T,d]                       → [d,T]
-#   score_gemm<T,d>    [T,d] · [d,T] · scale [T,T] → [T,T]
+#   score_gemm<T,d>    [T,d] · [d,T] · f32 scale   → [T,T]
 #   causal_softmax<T>  [T,T]                       → [T,T]
 #   context_gemm<T,d>  [T,T] · [T,d]               → [T,d]
 #   swiglu<T,F>        [T,F] · [T,F]               → [T,F]
@@ -212,11 +212,10 @@ kernel transpose<size T, size d>(tensor<f32, [T, d]> input, mut tensor<f32, [d, 
     output ⇇ inputᵀ
 }
 
-# GEA2-U3 body 9 — score GEMM followed by a caller-supplied scale. The scale
-# view is shaped [T,T], which keeps the elementwise operation broadcast-free.
+# GEA2-U3 body 9 — score GEMM followed by scalar scale.
 @ public
-kernel score_gemm<size T, size d>(tensor<f32, [T, d]> query, tensor<f32, [d, T]> key_transposed, tensor<f32, [T, T]> attention_scale, mut tensor<f32, [T, T]> output) → void {
-    output ⇇ query · key_transposed ⊙ attention_scale
+kernel score_gemm<size T, size d>(tensor<f32, [T, d]> query, tensor<f32, [d, T]> key_transposed, f32 scale, mut tensor<f32, [T, T]> output) → void {
+    output ⇇ (query · key_transposed) * scale
 }
 
 # GEA2-U3 body 10 — stable causal row softmax. The `softmax_causal` method
@@ -261,7 +260,7 @@ kernel residual_add<size T, size D>(tensor<f32, [T, D]> left, tensor<f32, [T, D]
 #   kv_append_k<K>         row [K] · row [K]           → row [K]
 #   kv_append_v<K>         row [K] · row [K]           → row [K]
 #   decode_key_transpose<C,d> [C,d]                    → [d,C]
-#   decode_score_gemm<d,C> [1,d] · [d,C] · scale [1,C] → [1,C]
+#   decode_score_gemm<d,C> [1,d] · [d,C] · f32 scale → [1,C]
 #   decode_masked_softmax<C> [1,C] · mask [1,C]        → [1,C]
 #   decode_context_gemm<C,d> [1,C] · [C,d]              → [1,d]
 #   decode_residual_add<D> [1,D] · [1,D]               → [1,D]
@@ -346,11 +345,10 @@ kernel decode_key_transpose<size H, size C, size d>(tensor<f32, [H, C, d]> input
     output ⇇ inputᵀ
 }
 
-# GEA3-U3a body 11 — batched head-axis query-1 × keys-L score. The scale is
-# an identical-shape resident peer so the elementwise step stays explicit.
+# GEA3-U3a body 11 — batched head-axis query-1 × keys-L score with scalar scale.
 @ public
-kernel decode_score_gemm<size H, size Q, size T, size d, size C>(tensor<f32, [H, Q, T, d]> query, tensor<f32, [H, d, C]> key_transposed, tensor<f32, [H, Q, T, C]> attention_scale, mut tensor<f32, [H, Q, T, C]> output) → void {
-    output ⇇ query · key_transposed ⊙ attention_scale
+kernel decode_score_gemm<size H, size Q, size T, size d, size C>(tensor<f32, [H, Q, T, d]> query, tensor<f32, [H, d, C]> key_transposed, f32 scale, mut tensor<f32, [H, Q, T, C]> output) → void {
+    output ⇇ (query · key_transposed) * scale
 }
 
 # GEA3-U3a body 12 — declared-length masked softmax over the batched scores.
@@ -394,16 +392,13 @@ kernel decode_residual_add<size D>(tensor<f32, [1, D]> left, tensor<f32, [1, D]>
 #   prefill_rope_q<T,D,d,P>    [T,D] · table [T,P,3]       → [T,D]
 #   prefill_rope_k<T,K,d,P>    [T,K] · table [T,P,3]       → [T,K]
 #   prefill_key_transpose<T,d> [T,d]                       → [d,T]
-#   prefill_score_gemm<T,d>    [T,d] · [d,T] · scale [T,T] → [T,T]
+#   prefill_score_gemm<T,d>    [T,d] · [d,T] · f32 scale   → [T,T]
 #   prefill_causal_softmax<T>  [T,T]                       → [T,T]
 #   prefill_context_gemm<T,d>  [T,T] · [T,d]               → [T,d]
 #   prefill_residual_add<T,D>  [T,D] · [T,D]               → [T,D]
-#   prefill_kv_write<C,T,K>    [C,K] · block [C,T] · rows [T,K] → [C,K]
+#   prefill_kv_write<C,T,K>    [T,K] · pos → [C,K]
 #
-# KV row writes use the U3a append idiom at block granularity: block is the
-# resident [C,T] 0/1 indicator selecting history rows, so `block · rows`
-# writes the [T,K] rope'd K (or V) rows into exactly those slots of the
-# capacity buffer.
+# KV row writes update slots `pos .. pos + T` of the capacity buffer directly.
 
 # GEA3-U3b body 1 — prefill RMSNorm over the T_p rows.
 @ public
@@ -455,28 +450,21 @@ kernel prefill_rope_k<size T, size K, size d, size P>(tensor<f32, [T, K]> input,
     output ⇇ input.norm_rope<size d>(0, rope_table)
 }
 
-# GEA3-U3b bodies 8–9 — key transpose and prompt score GEMM with a resident
-# [T,T] scale constant.
+# GEA3-U3b bodies 8–9 — key transpose and prompt score GEMM with scalar scale.
 @ public
 kernel prefill_key_transpose<size T, size d>(tensor<f32, [T, d]> input, mut tensor<f32, [d, T]> output) → void {
     output ⇇ inputᵀ
 }
 
 @ public
-kernel prefill_score_gemm<size T, size d>(tensor<f32, [T, d]> query, tensor<f32, [d, T]> key_transposed, tensor<f32, [T, T]> attention_scale, mut tensor<f32, [T, T]> output) → void {
-    output ⇇ query · key_transposed ⊙ attention_scale
+kernel prefill_score_gemm<size T, size d>(tensor<f32, [T, d]> query, tensor<f32, [d, T]> key_transposed, f32 scale, mut tensor<f32, [T, T]> output) → void {
+    output ⇇ (query · key_transposed) * scale
 }
 
 # GEA3-U3b body 10 — causal row softmax over the T_p × T_p scores.
-# GEA3-U6 num-9 repair: the plain `.softmax()` body emitted a FULL-ROW
-# softmax — no causal masking at all (every row has non-zero mass; the first
-# must be [1, 0, …]). The additive-mask idiom of `decode_masked_softmax`
-# is the established surface: the resident causal_mask is 0 at or below
-# the diagonal and negative infinity above it, and the softmax collection
-# method owns the row-wise max-subtract/exp/sum recipe.
 @ public
-kernel prefill_causal_softmax<size T>(tensor<f32, [T, T]> scores, tensor<f32, [T, T]> causal_mask, mut tensor<f32, [T, T]> output) → void {
-    output ⇇ (scores + causal_mask).softmax()
+kernel prefill_causal_softmax<size T>(tensor<f32, [T, T]> scores, mut tensor<f32, [T, T]> output) → void {
+    output ⇇ scores.softmax_causal()
 }
 
 # GEA3-U3b body 11 — context GEMM at prompt rows.
@@ -499,16 +487,23 @@ kernel prefill_residual_add<size T, size D>(tensor<f32, [T, D]> left, tensor<f32
 }
 
 # GEA3-U3b bodies 14–15 — K/V row writes into the capacity-sized per-layer
-# history buffers. The [C,T] block is the resident 0/1 row indicator for the
-# prompt positions; rows are the rope'd K (or V) outputs.
+# history buffers at positions `pos .. pos + T`.
 @ public
-kernel prefill_kv_write_k<size C, size T, size K>(tensor<f32, [C, K]> history, tensor<f32, [C, T]> block, tensor<f32, [T, K]> rows, mut tensor<f32, [C, K]> output) → void {
-    output ⇇ history + block · rows
+kernel prefill_kv_write_k<size C, size T, size K>(tensor<f32, [T, K]> rows, mut tensor<f32, [C, K]> output, i32 pos) → void {
+    for from output at [r, j] thread lane let old {
+        if pos ≥ 0 and r ≥ pos and r - pos ≺ T {
+            output[[r, j]] ← rows[[r - pos, j]]
+        }
+    }
 }
 
 @ public
-kernel prefill_kv_write_v<size C, size T, size K>(tensor<f32, [C, K]> history, tensor<f32, [C, T]> block, tensor<f32, [T, K]> rows, mut tensor<f32, [C, K]> output) → void {
-    output ⇇ history + block · rows
+kernel prefill_kv_write_v<size C, size T, size K>(tensor<f32, [T, K]> rows, mut tensor<f32, [C, K]> output, i32 pos) → void {
+    for from output at [r, j] thread lane let old {
+        if pos ≥ 0 and r ≥ pos and r - pos ≺ T {
+            output[[r, j]] ← rows[[r - pos, j]]
+        }
+    }
 }
 
 # GEA3-U3c — head entries: final RMSNorm, tied lm_head GEMV, and the
@@ -822,9 +817,8 @@ test "gea2_transpose_static_f32_shape" {
 test "gea2_score_gemm_static_f32_shape" {
     mut tf32[8,64] query ← tf32[8,64] {}
     mut tf32[64,8] key_transposed ← tf32[64,8] {}
-    mut tf32[8,8] attention_scale ← tf32[8,8] {}
     mut tf32[8,8] output ← tf32[8,8] {}
-    kernel.score_gemm<size 8, size 64>(query, key_transposed, attention_scale, mut output)
+    kernel.score_gemm<size 8, size 64>(query, key_transposed, 0.125 ∷ f32, mut output)
     assert true
 
 }
@@ -966,9 +960,8 @@ test "gea3u3a_decode_key_transpose_static_f32_shape" {
 test "gea3u3a_decode_score_gemm_static_f32_shape" {
     mut tf32[5,3,1,64] query ← tf32[5,3,1,64] {}
     mut tf32[5,64,76] key_transposed ← tf32[5,64,76] {}
-    mut tf32[5,3,1,76] attention_scale ← tf32[5,3,1,76] {}
     mut tf32[5,3,1,76] output ← tf32[5,3,1,76] {}
-    kernel.decode_score_gemm<size 5, size 3, size 1, size 64, size 76>(query, key_transposed, attention_scale, mut output)
+    kernel.decode_score_gemm<size 5, size 3, size 1, size 64, size 76>(query, key_transposed, 0.125 ∷ f32, mut output)
     assert true
 
 }
@@ -1080,21 +1073,17 @@ test "gea3u3b_prefill_rope_k_static_f32_table_shape" {
 }
 
 test "gea3u3b_prefill_kv_write_k_static_f32_block_geometry" {
-    mut tf32[76,320] history ← tf32[76,320] {}
-    mut tf32[76,36] block ← tf32[76,36] {}
     mut tf32[36,320] rows ← tf32[36,320] {}
     mut tf32[76,320] output ← tf32[76,320] {}
-    kernel.prefill_kv_write_k<size 76, size 36, size 320>(history, block, rows, mut output)
+    kernel.prefill_kv_write_k<size 76, size 36, size 320>(rows, mut output, 0)
     assert true
 
 }
 
 test "gea3u3b_prefill_kv_write_v_static_f32_block_geometry" {
-    mut tf32[76,320] history ← tf32[76,320] {}
-    mut tf32[76,36] block ← tf32[76,36] {}
     mut tf32[36,320] rows ← tf32[36,320] {}
     mut tf32[76,320] output ← tf32[76,320] {}
-    kernel.prefill_kv_write_v<size 76, size 36, size 320>(history, block, rows, mut output)
+    kernel.prefill_kv_write_v<size 76, size 36, size 320>(rows, mut output, 0)
     assert true
 
 }
@@ -1110,18 +1099,16 @@ test "gea3u3b_prefill_key_transpose_static_f32_shape" {
 test "gea3u3b_prefill_score_gemm_static_f32_shape" {
     mut tf32[36,64] query ← tf32[36,64] {}
     mut tf32[64,36] key_transposed ← tf32[64,36] {}
-    mut tf32[36,36] attention_scale ← tf32[36,36] {}
     mut tf32[36,36] output ← tf32[36,36] {}
-    kernel.prefill_score_gemm<size 36, size 64>(query, key_transposed, attention_scale, mut output)
+    kernel.prefill_score_gemm<size 36, size 64>(query, key_transposed, 0.125 ∷ f32, mut output)
     assert true
 
 }
 
 test "gea3u3b_prefill_causal_softmax_static_f32_shape" {
     mut tf32[36,36] scores ← tf32[36,36] {}
-    mut tf32[36,36] causal_mask ← tf32[36,36] {}
     mut tf32[36,36] output ← tf32[36,36] {}
-    kernel.prefill_causal_softmax<size 36>(scores, causal_mask, mut output)
+    kernel.prefill_causal_softmax<size 36>(scores, mut output)
     assert true
 
 }
