@@ -1,0 +1,726 @@
++++ toml
+locale = "en"
+
++++ faber
+# HybridArenas — ConvStateArena, RecurrentStateArena, and unified
+# HybridSession over ExecutionSchedule `slot_id` (issue #51, #92).
+#
+# Public import: import from "gradus:cache/hybrid_arenas" hybrid
+# Depends on: gradus:cache/session, gradus:model/schedule.
+#
+# --- Contract ------------------------------------------------------------
+#
+# Allocates typed device-ready rolling convolution histories (`ConvStateArena`,
+# supporting 1-site Qwen3.6 DeltaNet and 4-site Inkling `K`/`V`/`post_attn`/
+# `post_ffn` `(kernel - 1)` histories) and recurrent state matrices
+# (`RecurrentStateArena`, supporting Gated DeltaNet / Markov RNN heads),
+# composed with `SessionState` into `HybridSession` with atomic
+# journal-backed `hybrid_branch`, `hybrid_commit_prefix`, and
+# `hybrid_rollback` supporting partial `m-of-k` acceptance across all arenas.
+#
+# Zero `NumericBlock` (`list<f32>`) usage: all state buffers are typed
+# device tensors compatible with Cranelift CPU and Metal KIR kernels.
+
+import from "gradus:cache/session" let sess_mod
+import from "gradus:model/schedule" let schedule
+
+@ public
+const int SITE_CONV_K = 0
+
+@ public
+const int SITE_CONV_V = 1
+
+@ public
+const int SITE_CONV_POST_ATTN = 2
+
+@ public
+const int SITE_CONV_POST_FFN = 3
+
+@ public
+class ConvStateArena<size ConvRows, size ConvCh> {
+    let int sites_per_slot
+    let int history_len
+    let int channels
+    let list<int> slot_ids
+    mut list<tensor<f32, [ConvRows, ConvCh]>> buffers
+    mut list<int> steps_written
+}
+
+@ public
+class RecurrentStateArena<size RecRows, size RecCols> {
+    let int rows
+    let int cols
+    let list<int> slot_ids
+    mut list<tensor<f32, [RecRows, RecCols]>> states
+    mut list<int> steps_written
+}
+
+@ public
+class HybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> {
+    mut sess_mod.SessionState<size C, size W, size KVD> kv
+    mut ConvStateArena<size ConvRows, size ConvCh> conv
+    mut RecurrentStateArena<size RecRows, size RecCols> recurrent
+}
+
+# One-shot speculative transaction over `HybridSession`.
+# Snapshots Conv and Recurrent buffers/steps at branch time, journals Conv
+# row pushes and Recurrent step states during the branch, and replays/restores
+# exact `m-of-k` state on `hybrid_commit_prefix(m)` or restores on `hybrid_rollback`.
+@ public
+class HybridTxn<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> {
+    mut sess_mod.SessionTxn<size C, size W, size KVD> kv_txn
+    let list<tensor<f32, [ConvRows, ConvCh]>> base_conv_buffers
+    let list<int> base_conv_steps
+    mut list<int> conv_draft_counts
+    mut list<int> conv_journal_local_idx
+    mut list<int> conv_journal_site_idx
+    mut list<tensor<f32, [ConvCh]>> conv_journal_row
+    let list<tensor<f32, [RecRows, RecCols]>> base_rec_states
+    let list<int> base_rec_steps
+    mut list<int> rec_draft_counts
+    mut list<int> rec_journal_local_idx
+    mut list<tensor<f32, [RecRows, RecCols]>> rec_journal_state
+    mut bool open
+}
+
+# -------------------------------------------------------------------------
+# Device @ kernel rolling conv update
+# -------------------------------------------------------------------------
+
+@ public
+kernel conv_shift_write<size ConvRows, size ConvCh>(tensor<f32, [ConvRows, ConvCh]> src, mut tensor<f32, [ConvRows, ConvCh]> dst, tensor<f32, [ConvCh]> new_row, i32 site_idx, i32 history_len) → void {
+    for from dst at [r, c] thread lane let e {
+        let i32 ri ← r ↦ i32 ⊥ 0
+        let i32 ci ← c ↦ i32 ⊥ 0
+        let i32 site_start ← site_idx * history_len
+        let i32 site_end ← site_start + history_len
+
+        if ri ≥ site_start and ri ≺ site_end - 1 {
+            dst[[r, c]] ← src[[ri + 1, ci]]
+        }
+        elif ri ≡ site_end - 1 {
+            dst[[r, c]] ← new_row[[ci]]
+        }
+        else {
+            dst[[r, c]] ← src[[r, c]]
+        }
+    }
+}
+
+# -------------------------------------------------------------------------
+# Construction from ExecutionSchedule
+# -------------------------------------------------------------------------
+
+@ public
+fn conv_from_schedule<size ConvRows, size ConvCh>(schedule.ExecutionSchedule sched, int sites_per_slot, int history_len, bool all_slots) → ConvStateArena<size ConvRows, size ConvCh> ⇥ sess_mod.SessionError {
+    require sites_per_slot ≥ 1 and history_len ≥ 1 and ConvCh ≥ 1 throw variant sess_mod.SessionError.InvalidCapacity { message = "ConvStateArena dimensions must be positive" }
+    require sites_per_slot * history_len ≤ ConvRows throw variant sess_mod.SessionError.InvalidCapacity { message = "ConvRows must fit sites_per_slot * history_len" }
+
+    mut list<int> slot_ids ← empty
+    mut list<tensor<f32, [ConvRows, ConvCh]>> buffers ← empty
+    mut list<int> steps_written ← empty
+
+    for exclusive sched.slots.length() let i {
+        let schedule.SlotSpec sp ← sched.slots[i]
+        mut bool include_slot ← all_slots
+        if not all_slots {
+            match sp.arena {
+                case RecurrentSsm {
+                    include_slot ← true
+                }
+                default {
+                    include_slot ← false
+                }
+            }
+        }
+        if include_slot {
+            slot_ids.append(sp.slot_id)
+            let tensor<f32, [ConvRows, ConvCh]> buf ← tf32[ConvRows, ConvCh] {}
+            buffers.append(buf)
+            steps_written.append(0)
+        }
+    }
+
+    return ConvStateArena { sites_per_slot = sites_per_slot, history_len = history_len, channels = ConvCh, slot_ids = slot_ids, buffers = buffers, steps_written = steps_written }
+}
+
+@ public
+fn recurrent_from_schedule<size RecRows, size RecCols>(schedule.ExecutionSchedule sched) → RecurrentStateArena<size RecRows, size RecCols> ⇥ sess_mod.SessionError {
+    require RecRows ≥ 1 and RecCols ≥ 1 throw variant sess_mod.SessionError.InvalidCapacity { message = "RecurrentStateArena dimensions must be positive" }
+
+    mut list<int> slot_ids ← empty
+    mut list<tensor<f32, [RecRows, RecCols]>> states ← empty
+    mut list<int> steps_written ← empty
+
+    for exclusive sched.slots.length() let i {
+        let schedule.SlotSpec sp ← sched.slots[i]
+        match sp.arena {
+            case RecurrentSsm {
+                slot_ids.append(sp.slot_id)
+                let tensor<f32, [RecRows, RecCols]> st ← tf32[RecRows, RecCols] {}
+                states.append(st)
+                steps_written.append(0)
+            }
+            default {
+                pass
+            }
+        }
+    }
+
+    return RecurrentStateArena { rows = RecRows, cols = RecCols, slot_ids = slot_ids, states = states, steps_written = steps_written }
+}
+
+@ public
+fn from_schedule<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols>(schedule.ExecutionSchedule sched, int sites_per_slot, int history_len, bool conv_all_slots) → HybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> ⇥ sess_mod.SessionError {
+    let sess_mod.SessionState<size C, size W, size KVD> kv ← sess_mod.from_schedule<size C, size W, size KVD>(sched)
+    let ConvStateArena<size ConvRows, size ConvCh> conv ← conv_from_schedule<size ConvRows, size ConvCh>(sched, sites_per_slot, history_len, conv_all_slots)
+    let RecurrentStateArena<size RecRows, size RecCols> rec ← recurrent_from_schedule<size RecRows, size RecCols>(sched)
+    return HybridSession { kv = kv, conv = conv, recurrent = rec }
+}
+
+# -------------------------------------------------------------------------
+# Conv and Recurrent state updates
+# -------------------------------------------------------------------------
+
+fn find_slot(list<int> slot_ids, int slot_id) → int ⇥ sess_mod.SessionError {
+    for exclusive slot_ids.length() let i {
+        if slot_ids[i] ≡ slot_id then return i
+    }
+    throw variant sess_mod.SessionError.SlotArenaMismatch { message = "slot § not in arena"(slot_id ↦ string) }
+}
+
+@ public
+fn conv_push_row<size ConvRows, size ConvCh>(mut ConvStateArena<size ConvRows, size ConvCh> arena, int slot_id, int site_idx, tensor<f32, [ConvCh]> new_row) → void ⇥ sess_mod.SessionError {
+    require site_idx ≥ 0 and site_idx ≺ arena.sites_per_slot throw variant sess_mod.SessionError.InvalidSlot { message = "conv site_idx out of range" }
+    let int idx ← find_slot(arena.slot_ids, slot_id)
+    let tensor<f32, [ConvRows, ConvCh]> src ← arena.buffers[idx]
+    mut tensor<f32, [ConvRows, ConvCh]> dst ← tf32[ConvRows, ConvCh] {}
+    conv_shift_write<size ConvRows, size ConvCh>(src, mut dst, new_row, site_idx ↦ i32 ⊥ 0, arena.history_len ↦ i32 ⊥ 1)
+    arena.buffers[idx] ← dst
+    arena.steps_written[idx] ← arena.steps_written[idx] + 1
+}
+
+@ public
+fn recurrent_update<size RecRows, size RecCols>(mut RecurrentStateArena<size RecRows, size RecCols> arena, int slot_id, tensor<f32, [RecRows, RecCols]> next_state) → void ⇥ sess_mod.SessionError {
+    let int idx ← find_slot(arena.slot_ids, slot_id)
+    mut tensor<f32, [RecRows, RecCols]> dst ← copy next_state
+    arena.states[idx] ← dst
+    arena.steps_written[idx] ← arena.steps_written[idx] + 1
+}
+
+# -------------------------------------------------------------------------
+# Atomic transactional branch / journaled partial commit / rollback
+# -------------------------------------------------------------------------
+
+@ public
+fn hybrid_branch<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols>(mut HybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> hs) → HybridTxn<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> ⇥ sess_mod.SessionError {
+    mut sess_mod.SessionState<size C, size W, size KVD> kv ← hs.kv
+    let sess_mod.SessionTxn<size C, size W, size KVD> kv_txn ← sess_mod.branch<size C, size W, size KVD>(mut kv)
+    hs.kv ← kv
+
+    mut list<tensor<f32, [ConvRows, ConvCh]>> base_conv_bufs ← empty
+    mut list<int> base_conv_steps ← empty
+    mut list<int> conv_counts ← empty
+    for exclusive hs.conv.slot_ids.length() let i {
+        mut tensor<f32, [ConvRows, ConvCh]> snap ← copy hs.conv.buffers[i]
+        base_conv_bufs.append(snap)
+        base_conv_steps.append(hs.conv.steps_written[i])
+        conv_counts.append(0)
+    }
+
+    mut list<tensor<f32, [RecRows, RecCols]>> base_rec_states ← empty
+    mut list<int> base_rec_steps ← empty
+    mut list<int> rec_counts ← empty
+    for exclusive hs.recurrent.slot_ids.length() let i {
+        mut tensor<f32, [RecRows, RecCols]> snap ← copy hs.recurrent.states[i]
+        base_rec_states.append(snap)
+        base_rec_steps.append(hs.recurrent.steps_written[i])
+        rec_counts.append(0)
+    }
+
+    mut list<int> conv_jidx ← empty
+    mut list<int> conv_jsite ← empty
+    mut list<tensor<f32, [ConvCh]>> conv_jrow ← empty
+    mut list<int> rec_jidx ← empty
+    mut list<tensor<f32, [RecRows, RecCols]>> rec_jstate ← empty
+
+    return HybridTxn { kv_txn = kv_txn, base_conv_buffers = base_conv_bufs, base_conv_steps = base_conv_steps, conv_draft_counts = conv_counts, conv_journal_local_idx = conv_jidx, conv_journal_site_idx = conv_jsite, conv_journal_row = conv_jrow, base_rec_states = base_rec_states, base_rec_steps = base_rec_steps, rec_draft_counts = rec_counts, rec_journal_local_idx = rec_jidx, rec_journal_state = rec_jstate, open = true }
+}
+
+@ public
+fn hybrid_txn_write_kv<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols>(mut HybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> hs, mut HybridTxn<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> txn, int slot_id, tensor<f32, [KVD]> k, tensor<f32, [KVD]> v, i32 pos) → void ⇥ sess_mod.SessionError {
+    require txn.open throw variant sess_mod.SessionError.NoOpenTxn { message = "hybrid_txn_write_kv requires an open HybridTxn" }
+    mut sess_mod.SessionState<size C, size W, size KVD> kv ← hs.kv
+    mut sess_mod.SessionTxn<size C, size W, size KVD> kv_txn ← txn.kv_txn
+    sess_mod.txn_write_kv(mut kv, mut kv_txn, slot_id, k, v, pos)
+    hs.kv ← kv
+    txn.kv_txn ← kv_txn
+}
+
+@ public
+fn hybrid_txn_conv_push<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols>(mut HybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> hs, mut HybridTxn<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> txn, int slot_id, int site_idx, tensor<f32, [ConvCh]> new_row) → void ⇥ sess_mod.SessionError {
+    require txn.open throw variant sess_mod.SessionError.NoOpenTxn { message = "hybrid_txn_conv_push requires an open HybridTxn" }
+    require hs.kv.txn_depth ≡ 1 throw variant sess_mod.SessionError.NoOpenTxn { message = "hybrid session has no open transaction" }
+
+    let int idx ← find_slot(hs.conv.slot_ids, slot_id)
+    mut ConvStateArena<size ConvRows, size ConvCh> conv ← hs.conv
+    conv_push_row(mut conv, slot_id, site_idx, new_row)
+    hs.conv ← conv
+
+    txn.conv_draft_counts[idx] ← txn.conv_draft_counts[idx] + 1
+    mut tensor<f32, [ConvCh]> jrow ← copy new_row
+    txn.conv_journal_local_idx.append(idx)
+    txn.conv_journal_site_idx.append(site_idx)
+    txn.conv_journal_row.append(jrow)
+}
+
+@ public
+fn hybrid_txn_recurrent_update<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols>(mut HybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> hs, mut HybridTxn<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> txn, int slot_id, tensor<f32, [RecRows, RecCols]> next_state) → void ⇥ sess_mod.SessionError {
+    require txn.open throw variant sess_mod.SessionError.NoOpenTxn { message = "hybrid_txn_recurrent_update requires an open HybridTxn" }
+    require hs.kv.txn_depth ≡ 1 throw variant sess_mod.SessionError.NoOpenTxn { message = "hybrid session has no open transaction" }
+
+    let int idx ← find_slot(hs.recurrent.slot_ids, slot_id)
+    mut RecurrentStateArena<size RecRows, size RecCols> rec ← hs.recurrent
+    recurrent_update(mut rec, slot_id, next_state)
+    hs.recurrent ← rec
+
+    txn.rec_draft_counts[idx] ← txn.rec_draft_counts[idx] + 1
+    mut tensor<f32, [RecRows, RecCols]> jstate ← copy next_state
+    txn.rec_journal_local_idx.append(idx)
+    txn.rec_journal_state.append(jstate)
+}
+
+fn hybrid_restore_conv<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols>(mut HybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> hs, HybridTxn<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> txn) → void {
+    for exclusive txn.base_conv_steps.length() let i {
+        mut tensor<f32, [ConvRows, ConvCh]> restored ← copy txn.base_conv_buffers[i]
+        hs.conv.buffers[i] ← restored
+        hs.conv.steps_written[i] ← txn.base_conv_steps[i]
+    }
+}
+
+fn hybrid_restore_recurrent<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols>(mut HybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> hs, HybridTxn<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> txn) → void {
+    for exclusive txn.base_rec_steps.length() let i {
+        mut tensor<f32, [RecRows, RecCols]> restored ← copy txn.base_rec_states[i]
+        hs.recurrent.states[i] ← restored
+        hs.recurrent.steps_written[i] ← txn.base_rec_steps[i]
+    }
+}
+
+@ public
+fn hybrid_commit_prefix<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols>(mut HybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> hs, mut HybridTxn<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> txn, int accepted_tokens) → void ⇥ sess_mod.SessionError {
+    require txn.open throw variant sess_mod.SessionError.NoOpenTxn { message = "hybrid_commit_prefix requires an open HybridTxn" }
+    require hs.kv.txn_depth ≡ 1 throw variant sess_mod.SessionError.NoOpenTxn { message = "hybrid session has no open transaction" }
+    require accepted_tokens ≥ 0 throw variant sess_mod.SessionError.InvalidCommitCount { message = "accepted_tokens must be non-negative" }
+
+    # Validate every touched arena (KV, Conv, Recurrent) before mutating any state.
+    mut bool any_kv_touched ← false
+    mut bool any_touched ← false
+    for exclusive txn.kv_txn.full_draft_counts.length() let i {
+        let int n ← txn.kv_txn.full_draft_counts[i]
+        if n ≻ 0 {
+            any_kv_touched ← true
+            any_touched ← true
+            require accepted_tokens ≤ n throw variant sess_mod.SessionError.InvalidCommitCount { message = "accepted_tokens § exceeds FullKv drafted writes §"(accepted_tokens ↦ string, n ↦ string) }
+        }
+    }
+    for exclusive txn.kv_txn.ring_draft_counts.length() let i {
+        let int n ← txn.kv_txn.ring_draft_counts[i]
+        if n ≻ 0 {
+            any_kv_touched ← true
+            any_touched ← true
+            require accepted_tokens ≤ n throw variant sess_mod.SessionError.InvalidCommitCount { message = "accepted_tokens § exceeds RingKv drafted writes §"(accepted_tokens ↦ string, n ↦ string) }
+        }
+    }
+
+    let int expected_conv_pushes ← accepted_tokens * hs.conv.sites_per_slot
+    for exclusive txn.conv_draft_counts.length() let i {
+        let int n ← txn.conv_draft_counts[i]
+        if n ≻ 0 {
+            any_touched ← true
+            require expected_conv_pushes ≤ n throw variant sess_mod.SessionError.InvalidCommitCount { message = "expected conv pushes § exceeds drafted writes §"(expected_conv_pushes ↦ string, n ↦ string) }
+        }
+    }
+
+    for exclusive txn.rec_draft_counts.length() let i {
+        let int n ← txn.rec_draft_counts[i]
+        if n ≻ 0 {
+            any_touched ← true
+            require accepted_tokens ≤ n throw variant sess_mod.SessionError.InvalidCommitCount { message = "accepted_tokens § exceeds Recurrent drafted writes §"(accepted_tokens ↦ string, n ↦ string) }
+        }
+    }
+
+    if accepted_tokens ≻ 0 {
+        require any_touched throw variant sess_mod.SessionError.InvalidCommitCount { message = "accepted_tokens § cannot be committed when no writes were drafted"(accepted_tokens ↦ string) }
+    }
+
+    if any_kv_touched {
+        sess_mod.commit_prefix(mut hs.kv, mut txn.kv_txn, accepted_tokens)
+    }
+    else {
+        sess_mod.rollback(mut hs.kv, mut txn.kv_txn)
+    }
+
+    hybrid_restore_conv(mut hs, txn)
+    if expected_conv_pushes ≻ 0 {
+        mut list<int> conv_replayed ← empty
+        for exclusive hs.conv.slot_ids.length() let i {
+            conv_replayed.append(0)
+        }
+        for exclusive txn.conv_journal_local_idx.length() let i {
+            let int idx ← txn.conv_journal_local_idx[i]
+            if conv_replayed[idx] ≺ expected_conv_pushes {
+                conv_replayed[idx] ← conv_replayed[idx] + 1
+                let tensor<f32, [ConvRows, ConvCh]> src ← hs.conv.buffers[idx]
+                mut tensor<f32, [ConvRows, ConvCh]> dst ← tf32[ConvRows, ConvCh] {}
+                conv_shift_write<size ConvRows, size ConvCh>(src, mut dst, txn.conv_journal_row[i], txn.conv_journal_site_idx[i] ↦ i32 ⊥ 0, hs.conv.history_len ↦ i32 ⊥ 1)
+                hs.conv.buffers[idx] ← dst
+                hs.conv.steps_written[idx] ← hs.conv.steps_written[idx] + 1
+            }
+        }
+    }
+
+    hybrid_restore_recurrent(mut hs, txn)
+    if accepted_tokens ≻ 0 {
+        mut list<int> rec_seen ← empty
+        for exclusive hs.recurrent.slot_ids.length() let i {
+            rec_seen.append(0)
+        }
+        for exclusive txn.rec_journal_local_idx.length() let i {
+            let int idx ← txn.rec_journal_local_idx[i]
+            rec_seen[idx] ← rec_seen[idx] + 1
+            if rec_seen[idx] ≡ accepted_tokens {
+                mut tensor<f32, [RecRows, RecCols]> chosen ← copy txn.rec_journal_state[i]
+                hs.recurrent.states[idx] ← chosen
+                hs.recurrent.steps_written[idx] ← txn.base_rec_steps[idx] + accepted_tokens
+            }
+        }
+    }
+
+    txn.open ← false
+}
+
+@ public
+fn hybrid_rollback<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols>(mut HybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> hs, mut HybridTxn<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> txn) → void ⇥ sess_mod.SessionError {
+    require txn.open throw variant sess_mod.SessionError.NoOpenTxn { message = "hybrid_rollback requires an open HybridTxn" }
+    require hs.kv.txn_depth ≡ 1 throw variant sess_mod.SessionError.NoOpenTxn { message = "hybrid session has no open transaction" }
+
+    sess_mod.rollback(mut hs.kv, mut txn.kv_txn)
+
+    hybrid_restore_conv(mut hs, txn)
+    hybrid_restore_recurrent(mut hs, txn)
+    txn.open ← false
+}
+
++++ faber test
+import from "gradus:cache/hybrid_arenas" let hybrid
+import from "gradus:cache/session" let session
+import from "gradus:model/schedule" let schedule
+
+fn close(f32 a, f32 b) → bool {
+    return (a - b).abs() ≺ 0.0001
+}
+
+fn mk_qwen36_sched() → schedule.ExecutionSchedule {
+    let list<schedule.AttentionKind> attns ← [
+        variant schedule.AttentionKind.LinearSsm,
+        variant schedule.AttentionKind.Full,
+        variant schedule.AttentionKind.LinearSsm
+    ]
+    let list<schedule.RopeKind> ropes ← [
+        variant schedule.RopeKind.None,
+        variant schedule.RopeKind.Sectional { dimension_sections = [11, 11, 10, 0] },
+        variant schedule.RopeKind.None
+    ]
+    do {
+        return schedule.patterned_schedule(attns, ropes, 0, [])
+    }
+    catch err {
+        assert false
+        return schedule.ExecutionSchedule { layers = [], segments = [], steps = [], slots = [], residual = variant schedule.ResidualKind.Standard, taps = [] }
+    }
+}
+
+test "HybridArenas allocates 1-site Qwen3.6 ConvStateArena + RecurrentStateArena and 4-site Inkling ConvStateArena" {
+    let schedule.ExecutionSchedule q_sched ← mk_qwen36_sched()
+    do {
+        mut hybrid.HybridSession<8, 1, 4, 3, 4, 2, 2> hs ← hybrid.from_schedule<size 8, size 1, size 4, size 3, size 4, size 2, size 2>(q_sched, 1, 3, false)
+        assert hs.kv.full_kv.slot_ids.length() ≡ 1
+        assert hs.conv.slot_ids.length() ≡ 2
+        assert hs.recurrent.slot_ids.length() ≡ 2
+
+        mut tensor<f32, [4]> r1 ← tf32[4] {}
+        mut tensor<f32, [4]> r2 ← tf32[4] {}
+        for exclusive 4 let j {
+            r1[[j]] ← 1.0
+            r2[[j]] ← 2.0
+        }
+        mut hybrid.ConvStateArena<3, 4> c_arena ← hs.conv
+        hybrid.conv_push_row(mut c_arena, 0, hybrid.SITE_CONV_K, r1)
+        hybrid.conv_push_row(mut c_arena, 0, hybrid.SITE_CONV_K, r2)
+        hs.conv ← c_arena
+
+        let tensor<f32, [3, 4]> buf0 ← hs.conv.buffers[0]
+        assert close(buf0[[0, 0]], 0.0)
+        assert close(buf0[[1, 0]], 1.0)
+        assert close(buf0[[2, 0]], 2.0)
+
+        mut hybrid.ConvStateArena<12, 4> ink_conv ← hybrid.conv_from_schedule<size 12, size 4>(q_sched, 4, 3, true)
+        assert ink_conv.slot_ids.length() ≡ 3
+        assert ink_conv.sites_per_slot ≡ 4
+
+        mut tensor<f32, [4]> sk ← tf32[4] {}
+        mut tensor<f32, [4]> sv ← tf32[4] {}
+        mut tensor<f32, [4]> spa ← tf32[4] {}
+        mut tensor<f32, [4]> spf ← tf32[4] {}
+        for exclusive 4 let j {
+            sk[[j]] ← 1.0
+            sv[[j]] ← 2.0
+            spa[[j]] ← 3.0
+            spf[[j]] ← 4.0
+        }
+        hybrid.conv_push_row(mut ink_conv, 0, hybrid.SITE_CONV_K, sk)
+        hybrid.conv_push_row(mut ink_conv, 0, hybrid.SITE_CONV_V, sv)
+        hybrid.conv_push_row(mut ink_conv, 0, hybrid.SITE_CONV_POST_ATTN, spa)
+        hybrid.conv_push_row(mut ink_conv, 0, hybrid.SITE_CONV_POST_FFN, spf)
+        let tensor<f32, [12, 4]> ink_buf ← ink_conv.buffers[0]
+        assert close(ink_buf[[0, 0]], 0.0)
+        assert close(ink_buf[[2, 0]], 1.0)
+        assert close(ink_buf[[3, 0]], 0.0)
+        assert close(ink_buf[[5, 0]], 2.0)
+        assert close(ink_buf[[6, 0]], 0.0)
+        assert close(ink_buf[[8, 0]], 3.0)
+        assert close(ink_buf[[9, 0]], 0.0)
+        assert close(ink_buf[[11, 0]], 4.0)
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "HybridArenas rollback and commit_prefix(0) restore KV, Conv, and Recurrent bit-for-bit" {
+    let schedule.ExecutionSchedule q_sched ← mk_qwen36_sched()
+    do {
+        mut hybrid.HybridSession<8, 1, 4, 3, 4, 2, 2> hs ← hybrid.from_schedule<size 8, size 1, size 4, size 3, size 4, size 2, size 2>(q_sched, 1, 3, false)
+
+        mut tensor<f32, [4]> seed_row ← tf32[4] {}
+        for exclusive 4 let j {
+            seed_row[[j]] ← 1.5
+        }
+        mut hybrid.ConvStateArena<3, 4> base_conv ← hs.conv
+        hybrid.conv_push_row(mut base_conv, 0, hybrid.SITE_CONV_K, seed_row)
+        hs.conv ← base_conv
+
+        mut tensor<f32, [2, 2]> seed_rec ← tf32[2, 2] {}
+        seed_rec[[0, 0]] ← 2.5
+        mut hybrid.RecurrentStateArena<2, 2> base_rec ← hs.recurrent
+        hybrid.recurrent_update(mut base_rec, 0, seed_rec)
+        hs.recurrent ← base_rec
+
+        mut hybrid.HybridTxn<8, 1, 4, 3, 4, 2, 2> txn1 ← hybrid.hybrid_branch(mut hs)
+        mut tensor<f32, [4]> bad_row ← tf32[4] {}
+        for exclusive 4 let j {
+            bad_row[[j]] ← 9.0
+        }
+        mut tensor<f32, [2, 2]> bad_rec ← tf32[2, 2] {}
+        bad_rec[[0, 0]] ← 99.0
+
+        hybrid.hybrid_txn_write_kv(mut hs, mut txn1, 1, bad_row, bad_row, 0 ∷ i32)
+        hybrid.hybrid_txn_conv_push(mut hs, mut txn1, 0, hybrid.SITE_CONV_K, bad_row)
+        hybrid.hybrid_txn_recurrent_update(mut hs, mut txn1, 0, bad_rec)
+        hybrid.hybrid_rollback(mut hs, mut txn1)
+
+        assert hs.kv.full_kv.lengths[0] ≡ 0
+        assert hs.conv.steps_written[0] ≡ 1
+        assert close(hs.conv.buffers[0][[2, 0]], 1.5)
+        assert hs.recurrent.steps_written[0] ≡ 1
+        assert close(hs.recurrent.states[0][[0, 0]], 2.5)
+
+        mut hybrid.HybridTxn<8, 1, 4, 3, 4, 2, 2> txn2 ← hybrid.hybrid_branch(mut hs)
+        hybrid.hybrid_txn_write_kv(mut hs, mut txn2, 1, bad_row, bad_row, 0 ∷ i32)
+        hybrid.hybrid_txn_conv_push(mut hs, mut txn2, 0, hybrid.SITE_CONV_K, bad_row)
+        hybrid.hybrid_txn_recurrent_update(mut hs, mut txn2, 0, bad_rec)
+        hybrid.hybrid_commit_prefix(mut hs, mut txn2, 0)
+
+        assert hs.kv.full_kv.lengths[0] ≡ 0
+        assert hs.conv.steps_written[0] ≡ 1
+        assert close(hs.conv.buffers[0][[2, 0]], 1.5)
+        assert hs.recurrent.steps_written[0] ≡ 1
+        assert close(hs.recurrent.states[0][[0, 0]], 2.5)
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "HybridArenas partial m-of-k commit advances KV, Conv, and Recurrent to exact step m" {
+    let schedule.ExecutionSchedule q_sched ← mk_qwen36_sched()
+    do {
+        mut hybrid.HybridSession<8, 1, 4, 3, 4, 2, 2> hs ← hybrid.from_schedule<size 8, size 1, size 4, size 3, size 4, size 2, size 2>(q_sched, 1, 3, false)
+
+        mut tensor<f32, [4]> r1 ← tf32[4] {}
+        mut tensor<f32, [4]> r2 ← tf32[4] {}
+        mut tensor<f32, [4]> r3 ← tf32[4] {}
+        for exclusive 4 let j {
+            r1[[j]] ← 10.0
+            r2[[j]] ← 20.0
+            r3[[j]] ← 30.0
+        }
+        mut tensor<f32, [2, 2]> rec1 ← tf32[2, 2] {}
+        mut tensor<f32, [2, 2]> rec2 ← tf32[2, 2] {}
+        mut tensor<f32, [2, 2]> rec3 ← tf32[2, 2] {}
+        rec1[[0, 0]] ← 11.0
+        rec2[[0, 0]] ← 22.0
+        rec3[[0, 0]] ← 33.0
+
+        # Draft k=3, commit m=1.
+        mut hybrid.HybridTxn<8, 1, 4, 3, 4, 2, 2> txn1 ← hybrid.hybrid_branch(mut hs)
+        hybrid.hybrid_txn_write_kv(mut hs, mut txn1, 1, r1, r1, 0 ∷ i32)
+        hybrid.hybrid_txn_write_kv(mut hs, mut txn1, 1, r2, r2, 1 ∷ i32)
+        hybrid.hybrid_txn_write_kv(mut hs, mut txn1, 1, r3, r3, 2 ∷ i32)
+        hybrid.hybrid_txn_conv_push(mut hs, mut txn1, 0, hybrid.SITE_CONV_K, r1)
+        hybrid.hybrid_txn_conv_push(mut hs, mut txn1, 0, hybrid.SITE_CONV_K, r2)
+        hybrid.hybrid_txn_conv_push(mut hs, mut txn1, 0, hybrid.SITE_CONV_K, r3)
+        hybrid.hybrid_txn_recurrent_update(mut hs, mut txn1, 0, rec1)
+        hybrid.hybrid_txn_recurrent_update(mut hs, mut txn1, 0, rec2)
+        hybrid.hybrid_txn_recurrent_update(mut hs, mut txn1, 0, rec3)
+
+        hybrid.hybrid_commit_prefix(mut hs, mut txn1, 1)
+
+        assert hs.kv.full_kv.lengths[0] ≡ 1
+        assert hs.conv.steps_written[0] ≡ 1
+        assert close(hs.conv.buffers[0][[1, 0]], 0.0)
+        assert close(hs.conv.buffers[0][[2, 0]], 10.0)
+        assert hs.recurrent.steps_written[0] ≡ 1
+        assert close(hs.recurrent.states[0][[0, 0]], 11.0)
+
+        # Next round: draft k=3 from step 1, commit m=2.
+        mut hybrid.HybridTxn<8, 1, 4, 3, 4, 2, 2> txn2 ← hybrid.hybrid_branch(mut hs)
+        hybrid.hybrid_txn_write_kv(mut hs, mut txn2, 1, r2, r2, 1 ∷ i32)
+        hybrid.hybrid_txn_write_kv(mut hs, mut txn2, 1, r3, r3, 2 ∷ i32)
+        hybrid.hybrid_txn_write_kv(mut hs, mut txn2, 1, r1, r1, 3 ∷ i32)
+        hybrid.hybrid_txn_conv_push(mut hs, mut txn2, 0, hybrid.SITE_CONV_K, r2)
+        hybrid.hybrid_txn_conv_push(mut hs, mut txn2, 0, hybrid.SITE_CONV_K, r3)
+        hybrid.hybrid_txn_conv_push(mut hs, mut txn2, 0, hybrid.SITE_CONV_K, r1)
+        hybrid.hybrid_txn_recurrent_update(mut hs, mut txn2, 0, rec2)
+        hybrid.hybrid_txn_recurrent_update(mut hs, mut txn2, 0, rec3)
+        hybrid.hybrid_txn_recurrent_update(mut hs, mut txn2, 0, rec1)
+
+        hybrid.hybrid_commit_prefix(mut hs, mut txn2, 2)
+
+        assert hs.kv.full_kv.lengths[0] ≡ 3
+        assert hs.conv.steps_written[0] ≡ 3
+        assert close(hs.conv.buffers[0][[0, 0]], 10.0)
+        assert close(hs.conv.buffers[0][[1, 0]], 20.0)
+        assert close(hs.conv.buffers[0][[2, 0]], 30.0)
+        assert hs.recurrent.steps_written[0] ≡ 3
+        assert close(hs.recurrent.states[0][[0, 0]], 33.0)
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "HybridArenas 4-site Inkling partial m-of-k commit across all conv sites" {
+    let schedule.ExecutionSchedule q_sched ← mk_qwen36_sched()
+    do {
+        mut hybrid.HybridSession<8, 1, 4, 12, 4, 2, 2> hs ← hybrid.from_schedule<size 8, size 1, size 4, size 12, size 4, size 2, size 2>(q_sched, 4, 3, true)
+        mut hybrid.HybridTxn<8, 1, 4, 12, 4, 2, 2> txn ← hybrid.hybrid_branch(mut hs)
+
+        mut tensor<f32, [4]> sk1 ← tf32[4] {}
+        mut tensor<f32, [4]> sv1 ← tf32[4] {}
+        mut tensor<f32, [4]> spa1 ← tf32[4] {}
+        mut tensor<f32, [4]> spf1 ← tf32[4] {}
+        mut tensor<f32, [4]> bad ← tf32[4] {}
+        for exclusive 4 let j {
+            sk1[[j]] ← 1.0
+            sv1[[j]] ← 2.0
+            spa1[[j]] ← 3.0
+            spf1[[j]] ← 4.0
+            bad[[j]] ← 99.0
+        }
+
+        # Step 1 (4 sites)
+        hybrid.hybrid_txn_write_kv(mut hs, mut txn, 1, sk1, sv1, 0 ∷ i32)
+        hybrid.hybrid_txn_conv_push(mut hs, mut txn, 0, hybrid.SITE_CONV_K, sk1)
+        hybrid.hybrid_txn_conv_push(mut hs, mut txn, 0, hybrid.SITE_CONV_V, sv1)
+        hybrid.hybrid_txn_conv_push(mut hs, mut txn, 0, hybrid.SITE_CONV_POST_ATTN, spa1)
+        hybrid.hybrid_txn_conv_push(mut hs, mut txn, 0, hybrid.SITE_CONV_POST_FFN, spf1)
+
+        # Step 2 (4 sites, to be rejected)
+        hybrid.hybrid_txn_write_kv(mut hs, mut txn, 1, bad, bad, 1 ∷ i32)
+        hybrid.hybrid_txn_conv_push(mut hs, mut txn, 0, hybrid.SITE_CONV_K, bad)
+        hybrid.hybrid_txn_conv_push(mut hs, mut txn, 0, hybrid.SITE_CONV_V, bad)
+        hybrid.hybrid_txn_conv_push(mut hs, mut txn, 0, hybrid.SITE_CONV_POST_ATTN, bad)
+        hybrid.hybrid_txn_conv_push(mut hs, mut txn, 0, hybrid.SITE_CONV_POST_FFN, bad)
+
+        hybrid.hybrid_commit_prefix(mut hs, mut txn, 1)
+
+        assert hs.kv.full_kv.lengths[0] ≡ 1
+        assert hs.conv.steps_written[0] ≡ 4
+        assert close(hs.conv.buffers[0][[2, 0]], 1.0)
+        assert close(hs.conv.buffers[0][[5, 0]], 2.0)
+        assert close(hs.conv.buffers[0][[8, 0]], 3.0)
+        assert close(hs.conv.buffers[0][[11, 0]], 4.0)
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "HybridArenas over-commit and empty-commit fail closed atomically" {
+    let schedule.ExecutionSchedule q_sched ← mk_qwen36_sched()
+    do {
+        mut hybrid.HybridSession<8, 1, 4, 3, 4, 2, 2> hs ← hybrid.from_schedule<size 8, size 1, size 4, size 3, size 4, size 2, size 2>(q_sched, 1, 3, false)
+        mut hybrid.HybridTxn<8, 1, 4, 3, 4, 2, 2> empty_txn ← hybrid.hybrid_branch(mut hs)
+
+        do {
+            hybrid.hybrid_commit_prefix(mut hs, mut empty_txn, 1)
+            assert false
+        }
+        catch err {
+            match err {
+                case session.SessionError.InvalidCommitCount let ? {
+                }
+                case _ {
+                    assert false
+                }
+            }
+        }
+        hybrid.hybrid_rollback(mut hs, mut empty_txn)
+
+        mut hybrid.HybridTxn<8, 1, 4, 3, 4, 2, 2> txn ← hybrid.hybrid_branch(mut hs)
+        mut tensor<f32, [4]> row1 ← tf32[4] {}
+        for exclusive 4 let j {
+            row1[[j]] ← 5.0
+        }
+        mut tensor<f32, [2, 2]> rec1 ← tf32[2, 2] {}
+        rec1[[0, 0]] ← 7.0
+        hybrid.hybrid_txn_write_kv(mut hs, mut txn, 1, row1, row1, 0 ∷ i32)
+        hybrid.hybrid_txn_conv_push(mut hs, mut txn, 0, hybrid.SITE_CONV_K, row1)
+        hybrid.hybrid_txn_recurrent_update(mut hs, mut txn, 0, rec1)
+
+        do {
+            hybrid.hybrid_commit_prefix(mut hs, mut txn, 2)
+            assert false
+        }
+        catch err {
+            match err {
+                case session.SessionError.InvalidCommitCount let ? {
+                }
+                case _ {
+                    assert false
+                }
+            }
+        }
+
+        hybrid.hybrid_rollback(mut hs, mut txn)
+        assert hs.kv.full_kv.lengths[0] ≡ 0
+        assert hs.conv.steps_written[0] ≡ 0
+        assert hs.recurrent.steps_written[0] ≡ 0
+        assert close(hs.conv.buffers[0][[2, 0]], 0.0)
+        assert close(hs.recurrent.states[0][[0, 0]], 0.0)
+    }
+    catch err {
+        assert false
+    }
+}
