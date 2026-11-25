@@ -428,7 +428,7 @@ fn pin_same_rank1<size N>(tensor.NumericBlock t, string name) → tensor<f32, [N
 }
 
 fn optional_bias((string, int) → tensor.NumericBlock ⇥ DenseError source, string name, int layer, int n) → BiasBag ⇥ DenseError {
-    mut tensor.NumericBlock b ← zeros_rank1(n)
+    mut tensor.NumericBlock b ← tensor.default()
     mut bool hit ← false
 
     do {
@@ -441,6 +441,11 @@ fn optional_bias((string, int) → tensor.NumericBlock ⇥ DenseError source, st
 
     if hit {
         shape(b, name, [n])
+    }
+    else {
+        # a miss keeps the absent-bias contract: the zero row is filled
+        # only now, never before the probe
+        b ← zeros_rank1(n)
     }
 
     return BiasBag { value = b, present = hit }
@@ -509,12 +514,17 @@ fn load<size D, size V, size Q, size K, size F>(DenseConfig cfg, (string, int) �
     # --- final norm + lm_head ---------------------------------------------
     let tensor.NumericBlock norm_b ← source("model.norm", 0)
     let tensor<f32, [D]> norm ← pin_rank1(norm_b, "model.norm", [cfg.hidden_dim])
-    mut tensor<f32, [D, V]> w_head ← embed_tokens.transpose().materialize()
 
-    if not cfg.tied {
-        let tensor.NumericBlock head_b ← source("lm_head", 0)
-        w_head ← pin_rank2(head_b, "lm_head", [cfg.hidden_dim, cfg.vocab])
+    # TIED head: the true row-major [D, V] materialization happens exactly
+    # once, here at load (never per decode token). UNTIED head: lm_head
+    # resolves separately and the embedding transpose never runs.
+    if cfg.tied {
+        let tensor<f32, [D, V]> w_head ← embed_tokens.transpose().materialize()
+        return DenseModel { cfg = cfg, embed = embed, embed_tokens = embed_tokens, norm = norm, w_head = w_head, layers = layers }
     }
+
+    let tensor.NumericBlock head_b ← source("lm_head", 0)
+    let tensor<f32, [D, V]> w_head ← pin_rank2(head_b, "lm_head", [cfg.hidden_dim, cfg.vocab])
 
     # --- construct model --------------------------------------------------
     return DenseModel { cfg = cfg, embed = embed, embed_tokens = embed_tokens, norm = norm, w_head = w_head, layers = layers }
@@ -608,14 +618,14 @@ fn forward(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ DenseError
     let tensor.NumericBlock hn ← rmsnorm(h, norm_s, epsilon)
 
     # --- output projection (tied transpose / untied lm_head) --------------
-    mut tensor.NumericBlock w_head ← transpose(embed_v)
+    let tensor.NumericBlock b_head ← no_bias()
 
-    if not cfg.tied {
-        w_head ← source("lm_head", 0)
-        shape(w_head, "lm_head", [cfg.hidden_dim, cfg.vocab])
+    if cfg.tied {
+        return linear(hn, transpose(embed_v), b_head)
     }
 
-    let tensor.NumericBlock b_head ← no_bias()
+    let tensor.NumericBlock w_head ← source("lm_head", 0)
+    shape(w_head, "lm_head", [cfg.hidden_dim, cfg.vocab])
     return linear(hn, w_head, b_head)
 }
 
@@ -729,14 +739,14 @@ fn decode_step(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ DenseE
     let tensor.NumericBlock hn ← rmsnorm(h, norm_s, epsilon)
 
     # --- output projection (tied transpose / untied lm_head) --------------
-    mut tensor.NumericBlock w_head ← transpose(embed_v)
+    let tensor.NumericBlock b_head ← no_bias()
 
-    if not cfg.tied {
-        w_head ← source("lm_head", 0)
-        shape(w_head, "lm_head", [cfg.hidden_dim, cfg.vocab])
+    if cfg.tied {
+        return DenseStep { logits = linear(hn, transpose(embed_v), b_head), layers = next }
     }
 
-    let tensor.NumericBlock b_head ← no_bias()
+    let tensor.NumericBlock w_head ← source("lm_head", 0)
+    shape(w_head, "lm_head", [cfg.hidden_dim, cfg.vocab])
     return DenseStep { logits = linear(hn, w_head, b_head), layers = next }
 }
 
@@ -840,14 +850,14 @@ fn decode_block(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ Dense
     let tensor.NumericBlock hn ← rmsnorm(h, norm_s, epsilon)
 
     # --- output projection (tied transpose / untied lm_head) --------------
-    mut tensor.NumericBlock w_head ← transpose(embed_v)
+    let tensor.NumericBlock b_head ← no_bias()
 
-    if not cfg.tied {
-        w_head ← source("lm_head", 0)
-        shape(w_head, "lm_head", [cfg.hidden_dim, cfg.vocab])
+    if cfg.tied {
+        return DenseStep { logits = linear(hn, transpose(embed_v), b_head), layers = next }
     }
 
-    let tensor.NumericBlock b_head ← no_bias()
+    let tensor.NumericBlock w_head ← source("lm_head", 0)
+    shape(w_head, "lm_head", [cfg.hidden_dim, cfg.vocab])
     return DenseStep { logits = linear(hn, w_head, b_head), layers = next }
 }
 
@@ -950,15 +960,212 @@ fn prefill_cached(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ Den
     let tensor.NumericBlock hn ← rmsnorm(h, norm_s, epsilon)
 
     # --- output projection (tied transpose / untied lm_head) --------------
-    mut tensor.NumericBlock w_head ← transpose(embed_v)
+    let tensor.NumericBlock b_head ← no_bias()
 
-    if not cfg.tied {
-        w_head ← source("lm_head", 0)
-        shape(w_head, "lm_head", [cfg.hidden_dim, cfg.vocab])
+    if cfg.tied {
+        return DenseStep { logits = linear(hn, transpose(embed_v), b_head), layers = next }
     }
 
-    let tensor.NumericBlock b_head ← no_bias()
+    let tensor.NumericBlock w_head ← source("lm_head", 0)
+    shape(w_head, "lm_head", [cfg.hidden_dim, cfg.vocab])
     return DenseStep { logits = linear(hn, w_head, b_head), layers = next }
+}
+
+# -------------------------------------------------------------------------
+# Pre-loaded model decode path (issue #71). decode_step_model /
+# decode_block_model / prefill_cached_model consume a pinned DenseModel
+# (built once by `load`) instead of a resolver: no per-token source(...)
+# re-resolution, no per-layer shape re-validation, no do/catch bias
+# probing (the has_* flags were resolved once at load), and no [V, D]
+# head staging — the tied-head transpose happened once in `load`, and
+# the output projection multiplies typed rows against the pinned head.
+# The resolver-based entries above stay for one-shot callers; a decode
+# loop should load once and call these.
+# -------------------------------------------------------------------------
+
+# Stage one pinned rank-1 compute weight onto the bag seam (the
+# transformer.to_block posture: `tensor ↦ list<f32>` copies, so the
+# model path pays one staging pass per call over the compute weights
+# only — never over the embedding or the head).
+fn stage1<size N>(tensor<f32, [N]> t, int n) → tensor.NumericBlock {
+    return tensor.stage_f32([n], t ↦ list<f32>)
+}
+
+# Stage one pinned rank-2 compute weight onto the bag seam.
+fn stage2<size A, size B>(tensor<f32, [A, B]> t, int a, int b) → tensor.NumericBlock {
+    return tensor.stage_f32([a, b], t ↦ list<f32>)
+}
+
+# Optional attention bias onto the bag seam: present keeps the pinned
+# [N] row, absent stays the rank-0 empty carrier (no zero fill, no
+# probing — the flag came from load).
+fn bias_stage<size N>(bool has, tensor<f32, [N]> b, int n) → tensor.NumericBlock {
+    if has then return stage1(b, n)
+
+    return no_bias()
+}
+
+# head_rows — the typed output projection. Each normalised row [1, D]
+# multiplies the pinned [D, V] head directly (tied and untied are both
+# [D, V] in the model), so the full-vocabulary head never crosses the
+# bag seam and no [V, D]-sized staging or transpose runs per token.
+fn head_rows<size D, size V>(tensor<f32, [D, V]> w_head, list<f32> hn_flat, int rows, int hidden, int vocab) → tensor.NumericBlock ⇥ DenseError {
+    mut list<f32> out ← empty
+
+    for exclusive rows let i {
+        do {
+            let list<f32> row ← hn_flat.slice(i * hidden, i * hidden + hidden)
+            let tensor<f32, [1, D]> x ← row ↦ tensor<f32, [1, D]>
+            let tensor<f32, [1, V]> logits ← x · w_head
+            let list<f32> flat ← logits ↦ list<f32>
+
+            for from flat let v {
+                out.append(v)
+            }
+        }
+        catch conv {
+            throw variant BadShape { message = "output head row pin failed" }
+        }
+    }
+
+    return tensor.stage_f32([rows, vocab], out)
+}
+
+# The shared pre-loaded cached core: the rows in `tokens` run over the
+# per-layer caches in `layers` (positions already frozen by the caller),
+# consuming only pinned DenseModel weights. Prefix admission and the
+# cache gap/overflow contracts live in the public wrappers.
+fn cached_model_pass<size D, size V, size Q, size K, size F>(DenseModel<size D, size V, size Q, size K, size F> model, list<int> tokens, list<int> positions, f32 epsilon, f32 scale, int rope_dim, rope.RopeConfig rope_cfg, list<kv.KVCache> layers) → DenseStep ⇥ DenseError {
+    let DenseConfig cfg ← model.cfg
+    let int hidden ← cfg.hidden_dim
+    let int qwidth ← cfg.heads * cfg.head_dim
+    let int kwidth ← cfg.kv_heads * cfg.head_dim
+
+    # --- embed gather (typed rows off the pinned [V, D] table) -----------
+    mut list<f32> rows ← empty
+
+    for from tokens let tok {
+        let tensor<f32, [1, D]> row ← nn.gather(model.embed_tokens, [tok])
+        let list<f32> flat ← row ↦ list<f32>
+
+        for from flat let x {
+            rows.append(x)
+        }
+    }
+
+    mut tensor.NumericBlock h ← tensor.stage_f32([tokens.length(), hidden], rows)
+    mut list<kv.KVCache> next ← empty
+    mut int layer_ix ← 0
+
+    for from model.layers let weights {
+        # --- staged bag views of the pinned compute weights -------------
+        let list<int, size 2> fwg ← weights.wg.shape()
+        let int f ← fwg.get(1) coalesce 1
+        let transformer.DenseAttentionWeights attention_weights ← transformer.DenseAttentionWeights { wq = stage2(weights.wq, hidden, qwidth), bq = bias_stage(weights.has_bq, weights.bq, qwidth), wk = stage2(weights.wk, hidden, kwidth), bk = bias_stage(weights.has_bk, weights.bk, kwidth), wv = stage2(weights.wv, hidden, kwidth), bv = bias_stage(weights.has_bv, weights.bv, kwidth), wo = stage2(weights.wo, qwidth, hidden) }
+        let transformer.DenseAttentionConfig attention_config ← transformer.DenseAttentionConfig { num_heads = cfg.heads, num_kv_heads = cfg.kv_heads, scale = scale, rope_dim = rope_dim, rope_config = rope_cfg }
+        let transformer.DenseMlpWeights mlp_weights ← transformer.DenseMlpWeights { wg = stage2(weights.wg, hidden, f), bg = no_bias(), wu = stage2(weights.wu, hidden, f), bu = no_bias(), wd = stage2(weights.wd, f, hidden), bd = no_bias() }
+        let transformer.DenseNormConfig norm_config ← transformer.DenseNormConfig { ln1_s = stage1(weights.ln1, hidden), ln2_s = stage1(weights.ln2, hidden), epsilon = epsilon }
+
+        # --- apply the cached block --------------------------------------
+        let kv.KVCache cache ← layers.get(layer_ix) coalesce kv.default()
+        let transformer.CachedBlock block ← block_cached(h, positions, cache, tokens, attention_weights, attention_config, mlp_weights, norm_config)
+        h ← block.output
+        next.append(block.state)
+        layer_ix ← layer_ix + 1
+    }
+
+    # --- final RMSNorm + typed head projection ---------------------------
+    let tensor.NumericBlock hn ← rmsnorm(h, stage1(model.norm, hidden), epsilon)
+    return DenseStep { logits = head_rows<size D, size V>(model.w_head, hn.data, tokens.length(), hidden, cfg.vocab), layers = next }
+}
+
+# decode_step_model — the pre-loaded ONE-token decode: the same scalar
+# contract as decode_step (position must equal the shared cache length;
+# overflow and gap reject before the cached block) over a pinned
+# DenseModel.
+
+@ public
+fn decode_step_model<size D, size V, size Q, size K, size F>(DenseModel<size D, size V, size Q, size K, size F> model, int token_id, int position, f32 epsilon, f32 scale, int rope_dim, rope.RopeConfig rope_cfg, list<kv.KVCache> layers) → DenseStep ⇥ DenseError {
+    let DenseConfig cfg ← model.cfg
+    require_cfg(cfg)
+
+    reject token_id ≺ 0 or token_id ≥ cfg.vocab throw variant IndexOutOfBounds { message = "token id out of range for the embedding" }
+
+    require position ≥ 0 throw variant BadConfig { message = "position must be non-negative" }
+
+    require layers.length() ≡ cfg.layers throw variant BadConfig { message = "cache layer count must equal the model layer count" }
+
+    let int prefix_before ← shared_prefix(layers)
+
+    require position ≡ prefix_before throw variant Gap { message = "position must equal the cache length" }
+
+    admit_cached(layers, 1)
+
+    return cached_model_pass(model, [token_id], [position], epsilon, scale, rope_dim, rope_cfg, layers)
+}
+
+# decode_block_model — the pre-loaded multi-row decode: the same
+# nonempty-prefix contract as decode_block (rows land at absolute
+# positions L..L+T-1) over a pinned DenseModel.
+
+@ public
+fn decode_block_model<size D, size V, size Q, size K, size F>(DenseModel<size D, size V, size Q, size K, size F> model, list<int> tokens, f32 epsilon, f32 scale, int rope_dim, rope.RopeConfig rope_cfg, list<kv.KVCache> layers) → DenseStep ⇥ DenseError {
+    let DenseConfig cfg ← model.cfg
+    require_cfg(cfg)
+
+    require tokens.length() ≥ 1 throw variant BadConfig { message = "token sequence must be non-empty" }
+
+    require layers.length() ≡ cfg.layers throw variant BadConfig { message = "cache layer count must equal the model layer count" }
+
+    for from tokens let token_id {
+        reject token_id ≺ 0 or token_id ≥ cfg.vocab throw variant IndexOutOfBounds { message = "token id out of range for the embedding" }
+    }
+
+    let int prefix_before ← shared_prefix(layers)
+
+    require prefix_before ≥ 1 throw variant Gap { message = "cache write leaves a gap" }
+
+    admit_cached(layers, tokens.length())
+
+    mut list<int> positions ← empty
+
+    for exclusive tokens.length() let i {
+        positions.append(prefix_before + i)
+    }
+
+    return cached_model_pass(model, tokens, positions, epsilon, scale, rope_dim, rope_cfg, layers)
+}
+
+# prefill_cached_model — the pre-loaded batched prefill: the same
+# empty-prefix contract as prefill_cached (rows land at [0, T), every
+# prompt row retained) over a pinned DenseModel.
+
+@ public
+fn prefill_cached_model<size D, size V, size Q, size K, size F>(DenseModel<size D, size V, size Q, size K, size F> model, list<int> tokens, f32 epsilon, f32 scale, int rope_dim, rope.RopeConfig rope_cfg, list<kv.KVCache> layers) → DenseStep ⇥ DenseError {
+    let DenseConfig cfg ← model.cfg
+    require_cfg(cfg)
+
+    require tokens.length() ≥ 1 throw variant BadConfig { message = "token sequence must be non-empty" }
+
+    require layers.length() ≡ cfg.layers throw variant BadConfig { message = "cache layer count must equal the model layer count" }
+
+    for from tokens let token_id {
+        reject token_id ≺ 0 or token_id ≥ cfg.vocab throw variant IndexOutOfBounds { message = "token id out of range for the embedding" }
+    }
+
+    let int prefix_before ← shared_prefix(layers)
+
+    require prefix_before ≡ 0 throw variant Gap { message = "cache write leaves a gap" }
+
+    admit_cached(layers, tokens.length())
+
+    mut list<int> positions ← empty
+
+    for exclusive tokens.length() let i {
+        positions.append(i)
+    }
+
+    return cached_model_pass(model, tokens, positions, epsilon, scale, rope_dim, rope_cfg, layers)
 }
 
 +++ faber test
@@ -1501,5 +1708,117 @@ describe "SD2-U2 — nonempty-prefix k-row cached forward" {
         assert block_text(cfg, source, [7, 1], empty_layers) ≡ "cache write leaves a gap"
         assert layer_at(empty_layers, 0).length() ≡ 0
         assert layer_at(empty_layers, 1).length() ≡ 0
+    }
+}
+
+# ---- P71: the pre-loaded DenseModel decode path (decode_step_model /
+# decode_block_model / prefill_cached_model over a once-loaded model —
+# no per-token re-resolution, no bias probing, no head transpose)
+
+fn model_t(bool tied) → dense.DenseModel<16, 8, 16, 8, 16> ⇥ dense.DenseError {
+    return dense.load<size 16, size 8, size 16, size 8, size 16>(dense.DenseConfig { layers = 2, heads = 4, kv_heads = 2, head_dim = 4, hidden_dim = 16, vocab = 8, tied = tied }, (string n, int s) → tensor.NumericBlock ⇥ dense.DenseError ∴ repertor(n, s, embed(), norm_s(), w_head(), l0(), l1(), false, false))
+}
+
+fn step_m(dense.DenseModel<16, 8, 16, 8, 16> model, int token_id, int position, list<kv.KVCache> layers) → dense.DenseStep {
+    return dense.decode_step_model(model, token_id, position, (0.00001 ∷ f32), (0.5 ∷ f32), 4, rq(), layers) ⊥ dense.default_step()
+}
+
+fn step_m_text(dense.DenseModel<16, 8, 16, 8, 16> model, int token_id, int position, list<kv.KVCache> layers) → string {
+    do {
+        let dense.DenseStep ? ← dense.decode_step_model(model, token_id, position, (0.00001 ∷ f32), (0.5 ∷ f32), 4, rq(), layers)
+        return "ok"
+    }
+    catch err {
+        return err.message
+    }
+}
+
+fn prefill_m(dense.DenseModel<16, 8, 16, 8, 16> model, list<int> tokens, list<kv.KVCache> layers) → dense.DenseStep {
+    return dense.prefill_cached_model(model, tokens, (0.00001 ∷ f32), (0.5 ∷ f32), 4, rq(), layers) ⊥ dense.default_step()
+}
+
+fn block_m(dense.DenseModel<16, 8, 16, 8, 16> model, list<int> tokens, list<kv.KVCache> layers) → dense.DenseStep {
+    return dense.decode_block_model(model, tokens, (0.00001 ∷ f32), (0.5 ∷ f32), 4, rq(), layers) ⊥ dense.default_step()
+}
+
+describe "P71 — pre-loaded model decode steps match full forward (tied)" {
+    test "two model-path cached steps reproduce the last full-forward row" {
+        do {
+            let dense.DenseModel<16, 8, 16, 8, 16> model ← model_t(true)
+            let dense.DenseStep s0 ← step_m(model, 0, 0, empty_p())
+            let dense.DenseStep s1 ← step_m(model, 7, 1, s0.layers)
+            let tensor.NumericBlock full ← model_p(dense.DenseConfig { layers = 2, heads = 4, kv_heads = 2, head_dim = 4, hidden_dim = 16, vocab = 8, tied = true }, (string n, int s) → tensor.NumericBlock ⇥ dense.DenseError ∴ repertor(n, s, embed(), norm_s(), w_head(), l0(), l1(), false, false), TOKENS, (0.00001 ∷ f32), (0.5 ∷ f32), POSITIONES, 4, rq())
+            assert s1.logits.shape ≡ ([1, 8] ↦ list<int>)
+            assert e2(s1.logits, 0, 0).approx(e2(full, 1, 0), TOLERATIO)
+            assert e2(s1.logits, 0, 3).approx(e2(full, 1, 3), TOLERATIO)
+            assert e2(s1.logits, 0, 7).approx(e2(full, 1, 7), TOLERATIO)
+            assert s1.layers.length() ≡ 2
+            let kv.KVCache last ← s1.layers.get(0) coalesce kv.default()
+            assert last.length() ≡ 2
+        }
+        catch err {
+            assert false
+        }
+    }
+}
+
+describe "P71 — pre-loaded model prefill and decode block match full recompute (tied)" {
+    test "model prefill fills every layer and a model decode block matches the longer recompute" {
+        do {
+            let dense.DenseModel<16, 8, 16, 8, 16> model ← model_t(true)
+            let dense.DenseStep pref ← prefill_m(model, TOKENS, empty_p())
+            let dense.DenseStep block ← block_m(model, [1], pref.layers)
+            let tensor.NumericBlock full ← model_p(dense.DenseConfig { layers = 2, heads = 4, kv_heads = 2, head_dim = 4, hidden_dim = 16, vocab = 8, tied = true }, (string n, int s) → tensor.NumericBlock ⇥ dense.DenseError ∴ repertor(n, s, embed(), norm_s(), w_head(), l0(), l1(), false, false), [0, 7, 1], (0.00001 ∷ f32), (0.5 ∷ f32), [0, 1, 2], 4, rq())
+            assert pref.logits.shape ≡ ([2, 8] ↦ list<int>)
+            assert e2(pref.logits, 0, 0).approx(e2(full, 0, 0), TOLERATIO)
+            assert e2(pref.logits, 1, 7).approx(e2(full, 1, 7), TOLERATIO)
+            assert block.logits.shape ≡ ([1, 8] ↦ list<int>)
+            assert e2(block.logits, 0, 0).approx(e2(full, 2, 0), TOLERATIO)
+            assert e2(block.logits, 0, 7).approx(e2(full, 2, 7), TOLERATIO)
+            assert layer_at(block.layers, 0).length() ≡ 3
+            assert layer_at(block.layers, 1).length() ≡ 3
+            assert layer_at(block.layers, 0).history ≡ ([0, 7, 1] ↦ list<int>)
+            assert layer_at(block.layers, 1).history ≡ ([0, 7, 1] ↦ list<int>)
+        }
+        catch err {
+            assert false
+        }
+    }
+}
+
+describe "P71 — pre-loaded model decode steps match full forward (untied)" {
+    test "untied model-path cached steps reproduce the last full-forward row and the untied pins" {
+        do {
+            let dense.DenseModel<16, 8, 16, 8, 16> model ← model_t(false)
+            let dense.DenseStep s0 ← step_m(model, 0, 0, empty_p())
+            let dense.DenseStep s1 ← step_m(model, 7, 1, s0.layers)
+            let tensor.NumericBlock full ← model_p(dense.DenseConfig { layers = 2, heads = 4, kv_heads = 2, head_dim = 4, hidden_dim = 16, vocab = 8, tied = false }, (string n, int s) → tensor.NumericBlock ⇥ dense.DenseError ∴ repertor(n, s, embed(), norm_s(), w_head(), l0(), l1(), false, false), TOKENS, (0.00001 ∷ f32), (0.5 ∷ f32), POSITIONES, 4, rq())
+            assert s1.logits.shape ≡ ([1, 8] ↦ list<int>)
+            assert e2(s1.logits, 0, 0).approx(e2(full, 1, 0), TOLERATIO)
+            assert e2(s1.logits, 0, 3).approx(e2(full, 1, 3), TOLERATIO)
+            assert e2(s1.logits, 0, 7).approx(e2(full, 1, 7), TOLERATIO)
+            assert e2(s1.logits, 0, 1).approx(LG_U_1_1, TOLERATIO)
+            assert e2(s1.logits, 0, 4).approx(LG_U_1_4, TOLERATIO)
+            assert e2(s1.logits, 0, 6).approx(LG_U_1_6, TOLERATIO)
+        }
+        catch err {
+            assert false
+        }
+    }
+}
+
+describe "P71 — pre-loaded model decode keeps the fail-closed cache contract" {
+    test "model decode rejects a position that is not the shared cache length" {
+        do {
+            let dense.DenseModel<16, 8, 16, 8, 16> model ← model_t(true)
+            assert step_m_text(model, 7, 1, empty_p()) ≡ "position must equal the cache length"
+            let dense.DenseStep pref ← prefill_m(model, TOKENS, empty_p())
+            assert step_m_text(model, 1, 3, pref.layers) ≡ "position must equal the cache length"
+            assert step_m_text(model, 1, 0, pref.layers) ≡ "position must equal the cache length"
+            assert step_m_text(model, 1, 2, pref.layers) ≡ "ok"
+        }
+        catch err {
+            assert false
+        }
     }
 }
