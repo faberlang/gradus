@@ -17,13 +17,15 @@ locale = "en"
 # output projection as a parameter, so a tied head passes the embedding table
 # and an untied model passes its own `lm_head` tensor.
 #
-# `prope` encodes the RoPE convention: 0 applies no rotation (the Flint
-# full-attention and Inkling pass-through), 1 the half-split convention,
-# 2 the consecutive-pairs convention.
+# `LayerParams.prope` is a `RopeKind` — `None` applies no rotation (the Flint
+# full-attention and Inkling pass-through), `Half` the half-split convention,
+# `Pairs` the consecutive-pairs convention — matched exhaustively, so no
+# unvalidated value can reach the rope/attention selection.
 #
-# QKV bias: `qkv_bias = 1` adds `bq`/`bk`/`bv` after the fused QKV projection;
-# `qkv_bias = 0` skips those launches. The bias tensors are always present
-# (zeros when unused) rather than `optional` fields. Probe finding
+# QKV bias: `LayerWeights.qkv_bias` is a `bool`; when true, `bq`/`bk`/`bv`
+# are added after the fused QKV projection, and the launches are skipped
+# entirely when false. The bias tensors are always present (zeros when
+# unused) rather than `optional` fields. Probe finding
 # (2026-11-25, radix #2517): an `optional` tensor field on a size-generic
 # class breaks device launch ("tensor shape axis argument is not a tensor or
 # vector" on the cpu device and Metal), and an `optional` tensor parameter
@@ -42,7 +44,7 @@ import from "gradus:decode_step" let ds
 
 # One layer's weights: attention and MLP norms and projections, plus the QKV
 # bias set. `qkv_bias` selects whether `bq`/`bk`/`bv` are added after the
-# fused QKV projection; when it is 0 the bias tensors are untouched zeros.
+# fused QKV projection; when false the bias tensors are untouched zeros.
 @ public
 class LayerWeights<size D, size QD, size KVD, size F> {
     let tensor<f32, [D]> anorm
@@ -54,20 +56,27 @@ class LayerWeights<size D, size QD, size KVD, size F> {
     let tensor<f32, [F, D]> wg
     let tensor<f32, [F, D]> wu
     let tensor<f32, [D, F]> wd
-    let i32 qkv_bias
+    let bool qkv_bias
     let tensor<f32, [QD]> bq
     let tensor<f32, [KVD]> bk
     let tensor<f32, [KVD]> bv
 }
 
-# Attention hyperparameters for one layer. `prope`: 0 no rotation,
-# 1 half-split RoPE, 2 consecutive-pairs RoPE.
+# The RoPE convention applied to q and k before the cache write and scores.
+@ public
+union RopeKind {
+    None,
+    Half,
+    Pairs
+}
+
+# Attention hyperparameters for one layer.
 @ public
 class LayerParams {
     let i32 pdh
     let i32 pspan
     let i32 pgroup
-    let i32 prope
+    let RopeKind prope
     let f32 peps
     let f32 plntheta
     let f32 pscale
@@ -128,7 +137,7 @@ fn layer_step<size D, size QD, size KVD, size F, size H, size C>(tensor<f32, [H,
     mut tensor<f32, [KVD]> v ← tf32[KVD] {}
     ds.qkv_proj(lw.wq, lw.wk, lw.wv, an, mut q, mut k, mut v)
 
-    if lw.qkv_bias ≡ 1 {
+    if lw.qkv_bias {
         ds.add_bias(lw.bq, mut q)
         ds.add_bias(lw.bk, mut k)
         ds.add_bias(lw.bv, mut v)
@@ -137,33 +146,28 @@ fn layer_step<size D, size QD, size KVD, size F, size H, size C>(tensor<f32, [H,
     mut tensor<f32, [QD]> qr ← tf32[QD] {}
     mut tensor<f32, [KVD]> kr ← tf32[KVD] {}
 
-    if lp.prope ≡ 1 {
-        ds.rope_half(q, mut qr, tpos, lp.pspan, lp.plntheta)
-        ds.rope_half(k, mut kr, tpos, lp.pspan, lp.plntheta)
-    }
-
-    if lp.prope ≡ 2 {
-        ds.rope_pairs(q, mut qr, tpos, lp.pspan, lp.plntheta)
-        ds.rope_pairs(k, mut kr, tpos, lp.pspan, lp.plntheta)
-    }
-
-    if lp.prope ≡ 0 {
-        ds.kv_write_kv(k, v, mut sv.kin, mut sv.vin, tpos)
-    }
-    else {
-        ds.kv_write_kv(kr, v, mut sv.kin, mut sv.vin, tpos)
-    }
-
     let tensor<f32, [QD]> qdom ← tf32[QD] {}
     mut tensor<f32, [H, C]> sc ← tf32[H, C] {}
     mut tensor<f32, [H, C]> pr ← tf32[H, C] {}
     mut tensor<f32, [QD]> ctx ← tf32[QD] {}
 
-    if lp.prope ≡ 0 {
-        ds.attn_scores(hcdom, q, sv.kin, mut sc, tpos, lp.pgroup, lp.pdh, lp.pscale)
-    }
-    else {
-        ds.attn_scores(hcdom, qr, sv.kin, mut sc, tpos, lp.pgroup, lp.pdh, lp.pscale)
+    match lp.prope {
+        case RopeKind.None {
+            ds.kv_write_kv(k, v, mut sv.kin, mut sv.vin, tpos)
+            ds.attn_scores(hcdom, q, sv.kin, mut sc, tpos, lp.pgroup, lp.pdh, lp.pscale)
+        }
+        case RopeKind.Half {
+            ds.rope_half(q, mut qr, tpos, lp.pspan, lp.plntheta)
+            ds.rope_half(k, mut kr, tpos, lp.pspan, lp.plntheta)
+            ds.kv_write_kv(kr, v, mut sv.kin, mut sv.vin, tpos)
+            ds.attn_scores(hcdom, qr, sv.kin, mut sc, tpos, lp.pgroup, lp.pdh, lp.pscale)
+        }
+        case RopeKind.Pairs {
+            ds.rope_pairs(q, mut qr, tpos, lp.pspan, lp.plntheta)
+            ds.rope_pairs(k, mut kr, tpos, lp.pspan, lp.plntheta)
+            ds.kv_write_kv(kr, v, mut sv.kin, mut sv.vin, tpos)
+            ds.attn_scores(hcdom, qr, sv.kin, mut sc, tpos, lp.pgroup, lp.pdh, lp.pscale)
+        }
     }
 
     ds.row_softmax(sc, mut pr)
@@ -205,7 +209,7 @@ fn head_step<size V, size D>(tensor<f32, [D]> hidden, tensor<f32, [D]> onorm, te
 # ---------------------------------------------------------------------------
 # Prime every scratch tensor written by `layer_wide` and `head_wide`.
 @ public
-fn prime_workspace<size D, size QD, size KVD, size F, size H, size C, size P>(mut Workspace<D, QD, KVD, F, H, C, P> ws, mut tensor<f32, [1]> sink) → void {
+fn prime_workspace<size D, size QD, size KVD, size F, size H, size C, size P>(Workspace<D, QD, KVD, F, H, C, P> ws, mut tensor<f32, [1]> sink) → void {
     ds.prime1(ws.xn, mut sink)
     ds.prime1(ws.q, mut sink)
     ds.prime1(ws.qr, mut sink)
@@ -229,29 +233,29 @@ fn layer_wide<size D, size QD, size KVD, size F, size H, size C, size P>(tensor<
     ds.rmsnorm(hin, lw.anorm, mut ws.xn, lp.peps)
     ds.qkv_proj(lw.wq, lw.wk, lw.wv, ws.xn, mut ws.q, mut ws.k, mut ws.v)
 
-    if lw.qkv_bias ≡ 1 {
+    if lw.qkv_bias {
         ds.add_bias(lw.bq, mut ws.q)
         ds.add_bias(lw.bk, mut ws.k)
         ds.add_bias(lw.bv, mut ws.v)
     }
 
-    if lp.prope ≡ 1 {
-        ds.rope_half(ws.q, mut ws.qr, tpos, lp.pspan, lp.plntheta)
-        ds.rope_half(ws.k, mut ws.kr, tpos, lp.pspan, lp.plntheta)
-    }
-
-    if lp.prope ≡ 2 {
-        ds.rope_pairs(ws.q, mut ws.qr, tpos, lp.pspan, lp.plntheta)
-        ds.rope_pairs(ws.k, mut ws.kr, tpos, lp.pspan, lp.plntheta)
-    }
-
-    if lp.prope ≡ 0 {
-        ds.kv_write_kv(ws.k, ws.v, mut sv.kin, mut sv.vin, tpos)
-        ds.attn_scores(ws.hcdom, ws.q, sv.kin, mut ws.sc, tpos, lp.pgroup, lp.pdh, lp.pscale)
-    }
-    else {
-        ds.kv_write_kv(ws.kr, ws.v, mut sv.kin, mut sv.vin, tpos)
-        ds.attn_scores(ws.hcdom, ws.qr, sv.kin, mut ws.sc, tpos, lp.pgroup, lp.pdh, lp.pscale)
+    match lp.prope {
+        case RopeKind.None {
+            ds.kv_write_kv(ws.k, ws.v, mut sv.kin, mut sv.vin, tpos)
+            ds.attn_scores(ws.hcdom, ws.q, sv.kin, mut ws.sc, tpos, lp.pgroup, lp.pdh, lp.pscale)
+        }
+        case RopeKind.Half {
+            ds.rope_half(ws.q, mut ws.qr, tpos, lp.pspan, lp.plntheta)
+            ds.rope_half(ws.k, mut ws.kr, tpos, lp.pspan, lp.plntheta)
+            ds.kv_write_kv(ws.kr, ws.v, mut sv.kin, mut sv.vin, tpos)
+            ds.attn_scores(ws.hcdom, ws.qr, sv.kin, mut ws.sc, tpos, lp.pgroup, lp.pdh, lp.pscale)
+        }
+        case RopeKind.Pairs {
+            ds.rope_pairs(ws.q, mut ws.qr, tpos, lp.pspan, lp.plntheta)
+            ds.rope_pairs(ws.k, mut ws.kr, tpos, lp.pspan, lp.plntheta)
+            ds.kv_write_kv(ws.kr, ws.v, mut sv.kin, mut sv.vin, tpos)
+            ds.attn_scores(ws.hcdom, ws.qr, sv.kin, mut ws.sc, tpos, lp.pgroup, lp.pdh, lp.pscale)
+        }
     }
 
     ds.row_softmax(ws.sc, mut ws.pr)

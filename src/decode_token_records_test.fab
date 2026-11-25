@@ -2,26 +2,118 @@
 locale = "en"
 
 +++ faber
-# Record-contract tests for the decode_token layer API (gradus #47).
-# Class construction and cross-module imports bind at module scope only, so
-# each proof runs as a module-scope check function and the co-located test
-# cases below call it through the test scope's synthesized own-module
-# binding. Runs through KIR on the CPU device route.
+# Record-contract proofs for the decode_token layer API (gradus #47).
+#
+# One self-contained test module: the imports, type aliases, private builders,
+# and module-scope check functions live here, and the thin `+++ faber test`
+# cases below call the check functions. Co-located test scopes cannot bind
+# imported class names with the current compiler (radix #2525), so the
+# constructions happen at module scope and the checks are the module's public
+# surface. Every proof runs one layer on a fully fresh workspace, slot, and
+# output buffer — no result buffer is ever written twice (the cpu-device run
+# route read a stale first value for twice-written buffers; radix #2524).
 
-import from "gradus:decode_token" let { layer_wide, layer_step, prime_workspace }
-import from "gradus:decode_token_test_support" let { close, weight, build_lw, build_sv, build_ws, build_lp, run_prope }
+import from "gradus:decode_token" let dt
+
+type LW = dt.LayerWeights<size 4, size 4, size 4, size 6>
+type SV = dt.SlotView<size 4, size 4>
+type WS = dt.Workspace<size 4, size 4, size 4, size 6, size 2, size 4, size 2>
+type LP = dt.LayerParams
+type RK = dt.RopeKind
+
+fn close(f32 a, f32 b) → bool {
+    return (a - b).abs() ≺ 0.0001
+}
+
+fn weight(int r, int c, int salt) → f32 {
+    return (((r * 7 + c * 3 + salt * 5) % 17 - 8) ↦ f32) * 0.025
+}
+
+fn build_lw(tensor<f32, [4]> lanorm, tensor<f32, [4, 4]> lwq, tensor<f32, [4, 4]> lwk, tensor<f32, [4, 4]> lwv, tensor<f32, [4, 4]> lwo, tensor<f32, [4]> lfnorm, tensor<f32, [6, 4]> lwg, tensor<f32, [6, 4]> lwu, tensor<f32, [4, 6]> lwd, bool lbias, tensor<f32, [4]> lbq, tensor<f32, [4]> lbk, tensor<f32, [4]> lbv) → LW {
+    return dt.LayerWeights<size 4, size 4, size 4, size 6> { anorm = lanorm, wq = lwq, wk = lwk, wv = lwv, wo = lwo, fnorm = lfnorm, wg = lwg, wu = lwu, wd = lwd, qkv_bias = lbias, bq = lbq, bk = lbk, bv = lbv }
+}
+
+fn build_sv(mut tensor<f32, [4, 4]> skin, mut tensor<f32, [4, 4]> svin, i32 spos) → SV {
+    return dt.SlotView<size 4, size 4> { kin = skin, vin = svin, pos = spos }
+}
+
+fn build_ws(tensor<f32, [2, 4]> whcdom, tensor<f32, [2, 4]> wcpdom, tensor<f32, [4]> wqdom, mut tensor<f32, [4]> wxn, mut tensor<f32, [4]> wq, mut tensor<f32, [4]> wqr, mut tensor<f32, [4]> wk, mut tensor<f32, [4]> wkr, mut tensor<f32, [4]> wv, mut tensor<f32, [2, 4]> wsc, mut tensor<f32, [2, 4]> wpr, mut tensor<f32, [2, 4]> wcp, mut tensor<f32, [4]> wctx, mut tensor<f32, [4]> wh1, mut tensor<f32, [6]> wgate, mut tensor<f32, [6]> wup, mut tensor<f32, [6]> wact) → WS {
+    return dt.Workspace<size 4, size 4, size 4, size 6, size 2, size 4, size 2> { hcdom = whcdom, cpdom = wcpdom, qdom = wqdom, xn = wxn, q = wq, qr = wqr, k = wk, kr = wkr, v = wv, sc = wsc, pr = wpr, cp = wcp, ctx = wctx, h1 = wh1, gate = wgate, up = wup, act = wact }
+}
+
+fn build_lp(i32 bpdh, i32 bpspan, i32 bpgroup, RK bprope, f32 beps, f32 blntheta, f32 bscale) → LP {
+    return dt.LayerParams { pdh = bpdh, pspan = bpspan, pgroup = bpgroup, prope = bprope, peps = beps, plntheta = blntheta, pscale = bscale }
+}
+
+# Fill the shared weight set once; every check reuses it (weights are
+# read-only and never written by a launch).
+fn fill_weights(mut tensor<f32, [4, 4]> wq, mut tensor<f32, [4, 4]> wk, mut tensor<f32, [4, 4]> wv, mut tensor<f32, [4, 4]> wo, mut tensor<f32, [6, 4]> wg, mut tensor<f32, [6, 4]> wu, mut tensor<f32, [4, 6]> wd) → void {
+    for exclusive 4 let r {
+        for exclusive 4 let c {
+            wq[[r, c]] ← weight(r, c, 1)
+            wk[[r, c]] ← weight(r, c, 2)
+            wv[[r, c]] ← weight(r, c, 3)
+            wo[[r, c]] ← weight(r, c, 4)
+        }
+    }
+    for exclusive 6 let r {
+        for exclusive 4 let c {
+            wg[[r, c]] ← weight(r, c, 5)
+            wu[[r, c]] ← weight(r, c, 6)
+        }
+    }
+    for exclusive 4 let r {
+        for exclusive 6 let c {
+            wd[[r, c]] ← weight(r, c, 7)
+        }
+    }
+}
+
+# One layer_wide pass on a private workspace and slot at position `rpos`.
+fn run_layer(LW rlw, LP rlp, tensor<f32, [4]> prhin, i32 rpos, mut tensor<f32, [1]> prsink, mut tensor<f32, [4]> prout) → SV {
+    let tensor<f32, [2, 4]> prhcdom ← tf32[2, 4] {}
+    let tensor<f32, [2, 4]> prcpdom ← tf32[2, 4] {}
+    let tensor<f32, [4]> prqdom ← tf32[4] {}
+    mut tensor<f32, [4]> prxn ← tf32[4] {}
+    mut tensor<f32, [4]> prq ← tf32[4] {}
+    mut tensor<f32, [4]> prqr ← tf32[4] {}
+    mut tensor<f32, [4]> prk ← tf32[4] {}
+    mut tensor<f32, [4]> prkr ← tf32[4] {}
+    mut tensor<f32, [4]> prv ← tf32[4] {}
+    mut tensor<f32, [2, 4]> prsc ← tf32[2, 4] {}
+    mut tensor<f32, [2, 4]> prpr ← tf32[2, 4] {}
+    mut tensor<f32, [2, 4]> prcp ← tf32[2, 4] {}
+    mut tensor<f32, [4]> prctx ← tf32[4] {}
+    mut tensor<f32, [4]> prh1 ← tf32[4] {}
+    mut tensor<f32, [6]> prgate ← tf32[6] {}
+    mut tensor<f32, [6]> prup ← tf32[6] {}
+    mut tensor<f32, [6]> pract ← tf32[6] {}
+    mut _ prws ← build_ws(prhcdom, prcpdom, prqdom, mut prxn, mut prq, mut prqr, mut prk, mut prkr, mut prv, mut prsc, mut prpr, mut prcp, mut prctx, mut prh1, mut prgate, mut prup, mut pract)
+    mut tensor<f32, [4, 4]> prkin ← tf32[4, 4] {}
+    mut tensor<f32, [4, 4]> prvin ← tf32[4, 4] {}
+    for exclusive 2 let r {
+        for exclusive 4 let c {
+            prkin[[r, c]] ← ((r + 1) * (c + 1) ↦ f32) * 0.1
+            prvin[[r, c]] ← ((r * 2 + c + 1) ↦ f32) * 0.05
+        }
+    }
+    mut _ prsv ← build_sv(mut prkin, mut prvin, rpos)
+    dt.prime_workspace(prws, mut prsink)
+    dt.layer_wide(prhin, mut prout, rlw, mut prsv, rlp, mut prws)
+    return prsv
+}
 
 @ public
 fn check_layer_step_identity() → bool {
     let tensor<f32, [2, 4]> hcdom ← tf32[2, 4] {}
     mut tensor<f32, [4]> hin ← tf32[4] {}
     mut tensor<f32, [4]> hout ← tf32[4] {}
-    let tensor<f32, [4]> an ← tf32[4] {}
+    mut tensor<f32, [4]> an ← tf32[4] {}
     let tensor<f32, [4, 4]> wq ← tf32[4, 4] {}
     let tensor<f32, [4, 4]> wk ← tf32[4, 4] {}
     let tensor<f32, [4, 4]> wv ← tf32[4, 4] {}
     let tensor<f32, [4, 4]> wo ← tf32[4, 4] {}
-    let tensor<f32, [4]> fn2 ← tf32[4] {}
+    mut tensor<f32, [4]> fn2 ← tf32[4] {}
     let tensor<f32, [6, 4]> wg ← tf32[6, 4] {}
     let tensor<f32, [6, 4]> wu ← tf32[6, 4] {}
     let tensor<f32, [4, 6]> wd ← tf32[4, 6] {}
@@ -39,10 +131,10 @@ fn check_layer_step_identity() → bool {
     kin[[1, 1]] ← 8.0
     vin[[1, 0]] ← 9.0
     vin[[1, 1]] ← 10.0
-    let _ lw ← build_lw(an, wq, wk, wv, wo, fn2, wg, wu, wd, 0, bq0, bk0, bv0)
+    let _ lw ← build_lw(an, wq, wk, wv, wo, fn2, wg, wu, wd, false, bq0, bk0, bv0)
     mut _ sv ← build_sv(mut kin, mut vin, 0)
-    let _ lp ← build_lp(2, 2, 1, 2, 0.00001, 11.512925, 0.5)
-    layer_step(hcdom, hin, mut hout, lw, mut sv, lp)
+    let _ lp ← build_lp(2, 2, 1, variant dt.RopeKind.Pairs, 0.00001, 11.512925, 0.5)
+    dt.layer_step(hcdom, hin, mut hout, lw, mut sv, lp)
     assert close(hout[[0]], 1.0)
     assert close(hout[[1]], 2.0)
     assert close(hout[[3]], 4.0)
@@ -56,75 +148,51 @@ fn check_layer_step_identity() → bool {
 
 @ public
 fn check_layer_wide_identity() → bool {
-    let tensor<f32, [2, 4]> hcdom ← tf32[2, 4] {}
-    let tensor<f32, [2, 4]> cpdom ← tf32[2, 4] {}
-    let tensor<f32, [4]> qdom ← tf32[4] {}
-    mut tensor<f32, [4]> xn ← tf32[4] {}
-    mut tensor<f32, [4]> q ← tf32[4] {}
-    mut tensor<f32, [4]> qr ← tf32[4] {}
-    mut tensor<f32, [4]> k ← tf32[4] {}
-    mut tensor<f32, [4]> kr ← tf32[4] {}
-    mut tensor<f32, [4]> v ← tf32[4] {}
-    mut tensor<f32, [2, 4]> sc ← tf32[2, 4] {}
-    mut tensor<f32, [2, 4]> pr ← tf32[2, 4] {}
-    mut tensor<f32, [2, 4]> cp ← tf32[2, 4] {}
-    mut tensor<f32, [4]> ctx ← tf32[4] {}
-    mut tensor<f32, [4]> h1 ← tf32[4] {}
-    mut tensor<f32, [6]> gate ← tf32[6] {}
-    mut tensor<f32, [6]> up ← tf32[6] {}
-    mut tensor<f32, [6]> act ← tf32[6] {}
-    mut _ ws ← build_ws(hcdom, cpdom, qdom, mut xn, mut q, mut qr, mut k, mut kr, mut v, mut sc, mut pr, mut cp, mut ctx, mut h1, mut gate, mut up, mut act)
-
-    mut tensor<f32, [1]> sink ← tf32[1] {}
-    mut tensor<f32, [4]> hin ← tf32[4] {}
-    mut tensor<f32, [4]> hout ← tf32[4] {}
-    let tensor<f32, [4]> an ← tf32[4] {}
+    mut tensor<f32, [4]> an ← tf32[4] {}
+    mut tensor<f32, [4]> fn2 ← tf32[4] {}
+    for exclusive 4 let j {
+        an[[j]] ← 1.0
+        fn2[[j]] ← 1.0
+    }
     let tensor<f32, [4, 4]> wq ← tf32[4, 4] {}
     let tensor<f32, [4, 4]> wk ← tf32[4, 4] {}
     let tensor<f32, [4, 4]> wv ← tf32[4, 4] {}
     let tensor<f32, [4, 4]> wo ← tf32[4, 4] {}
-    let tensor<f32, [4]> fn2 ← tf32[4] {}
     let tensor<f32, [6, 4]> wg ← tf32[6, 4] {}
     let tensor<f32, [6, 4]> wu ← tf32[6, 4] {}
     let tensor<f32, [4, 6]> wd ← tf32[4, 6] {}
     let tensor<f32, [4]> bq0 ← tf32[4] {}
     let tensor<f32, [4]> bk0 ← tf32[4] {}
     let tensor<f32, [4]> bv0 ← tf32[4] {}
+    let _ lw ← build_lw(an, wq, wk, wv, wo, fn2, wg, wu, wd, false, bq0, bk0, bv0)
+    let _ lp ← build_lp(2, 2, 1, variant dt.RopeKind.Pairs, 0.00001, 11.512925, 0.5)
+    mut tensor<f32, [1]> sink ← tf32[1] {}
+    mut tensor<f32, [4]> hin ← tf32[4] {}
     for exclusive 4 let j {
         hin[[j]] ← (j ↦ f32) + 1.0
-        an[[j]] ← 1.0
-        fn2[[j]] ← 1.0
     }
-    let _ lw ← build_lw(an, wq, wk, wv, wo, fn2, wg, wu, wd, 0, bq0, bk0, bv0)
-    mut tensor<f32, [4, 4]> kin ← tf32[4, 4] {}
-    mut tensor<f32, [4, 4]> vin ← tf32[4, 4] {}
-    kin[[1, 0]] ← 7.0
-    kin[[1, 1]] ← 8.0
-    vin[[1, 0]] ← 9.0
-    vin[[1, 1]] ← 10.0
-    mut _ sv ← build_sv(mut kin, mut vin, 0)
-    let _ lp ← build_lp(2, 2, 1, 2, 0.00001, 11.512925, 0.5)
-
-    prime_workspace(mut ws, mut sink)
-    layer_wide(hin, mut hout, lw, mut sv, lp, mut ws)
-    assert close(hout[[0]], 1.0)
-    assert close(hout[[1]], 2.0)
-    assert close(hout[[3]], 4.0)
-    assert kin[[0, 0]] ≡ (0.0 ↦ f32)
-    assert kin[[1, 0]] ≡ (7.0 ↦ f32)
-    assert vin[[1, 0]] ≡ (9.0 ↦ f32)
-    # A second token through the same workspace stays the identity.
-    sv.pos ← 1
-    layer_wide(hin, mut hout, lw, mut sv, lp, mut ws)
-    assert close(hout[[0]], 1.0)
-    assert close(hout[[3]], 4.0)
-    assert kin[[1, 0]] ≡ (0.0 ↦ f32)
+    # Token 0 on a fully fresh workspace and slot: the layer is the identity
+    # on the residual stream and writes the (zero) rotated keys to row 0.
+    mut tensor<f32, [4]> hout0 ← tf32[4] {}
+    mut _ sv0 ← run_layer(lw, lp, hin, 0, mut sink, mut hout0)
+    assert close(hout0[[0]], 1.0)
+    assert close(hout0[[1]], 2.0)
+    assert close(hout0[[3]], 4.0)
+    assert sv0.kin[[0, 0]] ≡ (0.0 ↦ f32)
+    # Token 1 on another fully fresh workspace and slot: same identity, and
+    # the cache write lands on row 1.
+    mut tensor<f32, [4]> hout1 ← tf32[4] {}
+    mut _ sv1 ← run_layer(lw, lp, hin, 1, mut sink, mut hout1)
+    assert close(hout1[[0]], 1.0)
+    assert close(hout1[[3]], 4.0)
+    assert sv1.kin[[1, 0]] ≡ (0.0 ↦ f32)
     return true
 }
+
 @ public
 fn check_qkv_bias_moves_output() → bool {
-    let tensor<f32, [4]> an ← tf32[4] {}
-    let tensor<f32, [4]> fn2 ← tf32[4] {}
+    mut tensor<f32, [4]> an ← tf32[4] {}
+    mut tensor<f32, [4]> fn2 ← tf32[4] {}
     for exclusive 4 let j {
         an[[j]] ← 1.0
         fn2[[j]] ← 1.0
@@ -136,125 +204,64 @@ fn check_qkv_bias_moves_output() → bool {
     mut tensor<f32, [6, 4]> wg ← tf32[6, 4] {}
     mut tensor<f32, [6, 4]> wu ← tf32[6, 4] {}
     mut tensor<f32, [4, 6]> wd ← tf32[4, 6] {}
-    for exclusive 4 let r {
-        for exclusive 4 let c {
-            wq[[r, c]] ← weight(r, c, 1)
-            wk[[r, c]] ← weight(r, c, 2)
-            wv[[r, c]] ← weight(r, c, 3)
-            wo[[r, c]] ← weight(r, c, 4)
-        }
-    }
-    for exclusive 6 let r {
-        for exclusive 4 let c {
-            wg[[r, c]] ← weight(r, c, 5)
-            wu[[r, c]] ← weight(r, c, 6)
-        }
-    }
-    for exclusive 4 let r {
-        for exclusive 6 let c {
-            wd[[r, c]] ← weight(r, c, 7)
-        }
-    }
-    let tensor<f32, [4]> bq0 ← tf32[4] {}
-    let tensor<f32, [4]> bk0 ← tf32[4] {}
-    let tensor<f32, [4]> bv0 ← tf32[4] {}
+    fill_weights(mut wq, mut wk, mut wv, mut wo, mut wg, mut wu, mut wd)
+    let tensor<f32, [4]> bqz ← tf32[4] {}
+    let tensor<f32, [4]> bkz ← tf32[4] {}
+    let tensor<f32, [4]> bvz ← tf32[4] {}
     mut tensor<f32, [4]> bq1 ← tf32[4] {}
     mut tensor<f32, [4]> bk1 ← tf32[4] {}
+    mut tensor<f32, [4]> bv1 ← tf32[4] {}
     for exclusive 4 let j {
         bq1[[j]] ← 1.0
         bk1[[j]] ← 1.0
+        bv1[[j]] ← 1.0
     }
-    let tensor<f32, [4]> bv1 ← tf32[4] {}
-    let _ lw0 ← build_lw(an, wq, wk, wv, wo, fn2, wg, wu, wd, 0, bq0, bk0, bv0)
-    let _ lw1 ← build_lw(an, wq, wk, wv, wo, fn2, wg, wu, wd, 1, bq1, bk1, bv0)
-    let _ lp ← build_lp(2, 2, 1, 2, 0.00001, 11.512925, 0.5)
+    # Three fully fresh runs at pos 1:
+    # (a) flag off, zero bias tensors — the reference.
+    # (b) flag off, NONZERO bias tensors — the gate must skip them entirely.
+    # (c) flag on, the same nonzero bias tensors — the bias must apply.
+    let _ lwz ← build_lw(an, wq, wk, wv, wo, fn2, wg, wu, wd, false, bqz, bkz, bvz)
+    let _ lwn ← build_lw(an, wq, wk, wv, wo, fn2, wg, wu, wd, false, bq1, bk1, bv1)
+    let _ lwt ← build_lw(an, wq, wk, wv, wo, fn2, wg, wu, wd, true, bq1, bk1, bv1)
+    let _ lp ← build_lp(2, 2, 1, variant dt.RopeKind.Pairs, 0.00001, 11.512925, 0.5)
     mut tensor<f32, [1]> sink ← tf32[1] {}
     mut tensor<f32, [4]> hin ← tf32[4] {}
     for exclusive 4 let j {
         hin[[j]] ← (j ↦ f32) + 1.0
     }
-
-    # Run 1: unbiased weights on a fresh workspace, slot, and output.
-    let tensor<f32, [2, 4]> hcdom0 ← tf32[2, 4] {}
-    let tensor<f32, [2, 4]> cpdom0 ← tf32[2, 4] {}
-    let tensor<f32, [4]> qdom0 ← tf32[4] {}
-    mut tensor<f32, [4]> xn0 ← tf32[4] {}
-    mut tensor<f32, [4]> q0 ← tf32[4] {}
-    mut tensor<f32, [4]> qr0 ← tf32[4] {}
-    mut tensor<f32, [4]> k0 ← tf32[4] {}
-    mut tensor<f32, [4]> kr0 ← tf32[4] {}
-    mut tensor<f32, [4]> v0 ← tf32[4] {}
-    mut tensor<f32, [2, 4]> sc0 ← tf32[2, 4] {}
-    mut tensor<f32, [2, 4]> pr0 ← tf32[2, 4] {}
-    mut tensor<f32, [2, 4]> cp0 ← tf32[2, 4] {}
-    mut tensor<f32, [4]> ctx0 ← tf32[4] {}
-    mut tensor<f32, [4]> h10 ← tf32[4] {}
-    mut tensor<f32, [6]> gate0 ← tf32[6] {}
-    mut tensor<f32, [6]> up0 ← tf32[6] {}
-    mut tensor<f32, [6]> act0 ← tf32[6] {}
-    mut _ ws0 ← build_ws(hcdom0, cpdom0, qdom0, mut xn0, mut q0, mut qr0, mut k0, mut kr0, mut v0, mut sc0, mut pr0, mut cp0, mut ctx0, mut h10, mut gate0, mut up0, mut act0)
-    mut tensor<f32, [4, 4]> kin0 ← tf32[4, 4] {}
-    mut tensor<f32, [4, 4]> vin0 ← tf32[4, 4] {}
-    for exclusive 2 let r {
-        for exclusive 4 let c {
-            kin0[[r, c]] ← ((r + 1) * (c + 1) ↦ f32) * 0.1
-            vin0[[r, c]] ← ((r * 2 + c + 1) ↦ f32) * 0.05
-        }
-    }
-    mut _ sv0 ← build_sv(mut kin0, mut vin0, 1)
-    mut tensor<f32, [4]> out0 ← tf32[4] {}
-    prime_workspace(mut ws0, mut sink)
-    layer_wide(hin, mut out0, lw0, mut sv0, lp, mut ws0)
-
-    # Run 2: the same layer with the unit QKV bias, all-fresh state.
-    let tensor<f32, [2, 4]> hcdom1 ← tf32[2, 4] {}
-    let tensor<f32, [2, 4]> cpdom1 ← tf32[2, 4] {}
-    let tensor<f32, [4]> qdom1 ← tf32[4] {}
-    mut tensor<f32, [4]> xn1 ← tf32[4] {}
-    mut tensor<f32, [4]> q1 ← tf32[4] {}
-    mut tensor<f32, [4]> qr1 ← tf32[4] {}
-    mut tensor<f32, [4]> k1 ← tf32[4] {}
-    mut tensor<f32, [4]> kr1 ← tf32[4] {}
-    mut tensor<f32, [4]> v1 ← tf32[4] {}
-    mut tensor<f32, [2, 4]> sc1 ← tf32[2, 4] {}
-    mut tensor<f32, [2, 4]> pr1 ← tf32[2, 4] {}
-    mut tensor<f32, [2, 4]> cp1 ← tf32[2, 4] {}
-    mut tensor<f32, [4]> ctx1 ← tf32[4] {}
-    mut tensor<f32, [4]> h11 ← tf32[4] {}
-    mut tensor<f32, [6]> gate1 ← tf32[6] {}
-    mut tensor<f32, [6]> up1 ← tf32[6] {}
-    mut tensor<f32, [6]> act1 ← tf32[6] {}
-    mut _ ws1 ← build_ws(hcdom1, cpdom1, qdom1, mut xn1, mut q1, mut qr1, mut k1, mut kr1, mut v1, mut sc1, mut pr1, mut cp1, mut ctx1, mut h11, mut gate1, mut up1, mut act1)
-    mut tensor<f32, [4, 4]> kin1 ← tf32[4, 4] {}
-    mut tensor<f32, [4, 4]> vin1 ← tf32[4, 4] {}
-    for exclusive 2 let r {
-        for exclusive 4 let c {
-            kin1[[r, c]] ← ((r + 1) * (c + 1) ↦ f32) * 0.1
-            vin1[[r, c]] ← ((r * 2 + c + 1) ↦ f32) * 0.05
-        }
-    }
-    mut _ sv1 ← build_sv(mut kin1, mut vin1, 1)
-    mut tensor<f32, [4]> out1 ← tf32[4] {}
-    prime_workspace(mut ws1, mut sink)
-    layer_wide(hin, mut out1, lw1, mut sv1, lp, mut ws1)
-
-    # The unit bias shifts every query and key, so the mixed-weight layer
-    # output must move somewhere in the residual stream.
-    mut f32 dmax ← 0.0
+    mut tensor<f32, [4]> outz ← tf32[4] {}
+    mut tensor<f32, [4]> outn ← tf32[4] {}
+    mut tensor<f32, [4]> outt ← tf32[4] {}
+    mut _ svz ← run_layer(lwz, lp, hin, 1, mut sink, mut outz)
+    mut _ svn ← run_layer(lwn, lp, hin, 1, mut sink, mut outn)
+    mut _ svt ← run_layer(lwt, lp, hin, 1, mut sink, mut outt)
+    # Flag off: the nonzero bias tensors change nothing, bit for bit.
     for exclusive 4 let j {
-        let f32 d ← (out0[[j]] - out1[[j]]).abs()
+        assert outn[[j]] ≡ outz[[j]]
+        assert svn.vin[[1, j]] ≡ svz.vin[[1, j]]
+    }
+    # Flag on: the V bias moves the cached value row and the Q/K bias moves
+    # the scores, so the output and the cache must both move.
+    mut f32 dmax ← 0.0
+    mut bool vmoved ← false
+    for exclusive 4 let j {
+        let f32 d ← (outz[[j]] - outt[[j]]).abs()
         if d ≻ dmax {
             dmax ← d
         }
+        if svn.vin[[1, j]] ≢ svt.vin[[1, j]] {
+            vmoved ← true
+        }
     }
     assert dmax ≻ 0.001
+    assert vmoved
     return true
 }
 
 @ public
 fn check_prope_modes_differ() → bool {
-    let tensor<f32, [4]> an ← tf32[4] {}
-    let tensor<f32, [4]> fn2 ← tf32[4] {}
+    mut tensor<f32, [4]> an ← tf32[4] {}
+    mut tensor<f32, [4]> fn2 ← tf32[4] {}
     for exclusive 4 let j {
         an[[j]] ← 1.0
         fn2[[j]] ← 1.0
@@ -266,49 +273,24 @@ fn check_prope_modes_differ() → bool {
     mut tensor<f32, [6, 4]> wg ← tf32[6, 4] {}
     mut tensor<f32, [6, 4]> wu ← tf32[6, 4] {}
     mut tensor<f32, [4, 6]> wd ← tf32[4, 6] {}
-    for exclusive 4 let r {
-        for exclusive 4 let c {
-            wq[[r, c]] ← weight(r, c, 1)
-            wk[[r, c]] ← weight(r, c, 2)
-            wv[[r, c]] ← weight(r, c, 3)
-            wo[[r, c]] ← weight(r, c, 4)
-        }
-    }
-    for exclusive 6 let r {
-        for exclusive 4 let c {
-            wg[[r, c]] ← weight(r, c, 5)
-            wu[[r, c]] ← weight(r, c, 6)
-        }
-    }
-    for exclusive 4 let r {
-        for exclusive 6 let c {
-            wd[[r, c]] ← weight(r, c, 7)
-        }
-    }
+    fill_weights(mut wq, mut wk, mut wv, mut wo, mut wg, mut wu, mut wd)
     let tensor<f32, [4]> bq0 ← tf32[4] {}
     let tensor<f32, [4]> bk0 ← tf32[4] {}
     let tensor<f32, [4]> bv0 ← tf32[4] {}
-    let _ lw ← build_lw(an, wq, wk, wv, wo, fn2, wg, wu, wd, 0, bq0, bk0, bv0)
-    let _ lpnone ← build_lp(2, 2, 1, 0, 0.00001, 11.512925, 2.0)
-    let _ lphalf ← build_lp(2, 2, 1, 1, 0.00001, 11.512925, 2.0)
-    let _ lppairs ← build_lp(2, 2, 1, 2, 0.00001, 11.512925, 2.0)
+    let _ lw ← build_lw(an, wq, wk, wv, wo, fn2, wg, wu, wd, false, bq0, bk0, bv0)
     mut tensor<f32, [1]> sink ← tf32[1] {}
     mut tensor<f32, [4]> hin ← tf32[4] {}
     for exclusive 4 let j {
         hin[[j]] ← (j ↦ f32) + 1.0
     }
-
-    # One fully fresh workspace, slot, and output per run: none, half, pairs,
-    # then half again for the determinism proof.
     mut tensor<f32, [4]> outnone ← tf32[4] {}
     mut tensor<f32, [4]> outhalf ← tf32[4] {}
     mut tensor<f32, [4]> outpairs ← tf32[4] {}
     mut tensor<f32, [4]> outhalf2 ← tf32[4] {}
-    run_prope(lw, lpnone, hin, mut sink, mut outnone)
-    run_prope(lw, lphalf, hin, mut sink, mut outhalf)
-    run_prope(lw, lppairs, hin, mut sink, mut outpairs)
-    run_prope(lw, lphalf, hin, mut sink, mut outhalf2)
-
+    run_layer(lw, build_lp(2, 2, 1, variant dt.RopeKind.None, 0.00001, 11.512925, 2.0), hin, 1, mut sink, mut outnone)
+    run_layer(lw, build_lp(2, 2, 1, variant dt.RopeKind.Half, 0.00001, 11.512925, 2.0), hin, 1, mut sink, mut outhalf)
+    run_layer(lw, build_lp(2, 2, 1, variant dt.RopeKind.Pairs, 0.00001, 11.512925, 2.0), hin, 1, mut sink, mut outpairs)
+    run_layer(lw, build_lp(2, 2, 1, variant dt.RopeKind.Half, 0.00001, 11.512925, 2.0), hin, 1, mut sink, mut outhalf2)
     # Rotation at pos 1 changes the attention result; the bypass differs from
     # both conventions and the two conventions differ from each other. The
     # differences are small at these weight scales, so take the largest move
@@ -351,6 +333,6 @@ test "decode_token layer_wide applies the QKV bias when the flag is set" {
     assert check_qkv_bias_moves_output()
 }
 
-test "decode_token layer_wide prope 0 skips RoPE while 1 and 2 rotate" {
+test "decode_token layer_wide prope modes differ and replay deterministically" {
     assert check_prope_modes_differ()
 }
