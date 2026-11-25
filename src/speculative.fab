@@ -48,6 +48,10 @@ locale = "en"
 #   * greedy first-divergence acceptance and sampled typed reject — SD0-U4
 #   * context-lookup search policy and propose implementation — SD4
 #   * cache branch/commit — SD1 (kv-cache-branching)
+#   * rolling-acceptance adaptive depth controller and generalized drafter
+#     input context — SD6 (draft-and-verify coordinator); the coordinator
+#     loop itself lives in gradus:draft_verify (it owns the session
+#     transaction, which this purity-frozen leaf does not import)
 
 import from "gradus:generation/config" let generation
 
@@ -69,6 +73,7 @@ union SpeculativeError {
     MalformedResult,
     InvalidProvenance,
     PolicyDisabled,
+    ModeNotImplemented,
     PolicyMismatch,
     SampledAccelerationRejected
 }
@@ -164,6 +169,177 @@ fn admit_greedy(generation.AccelerationPolicy policy, generation.GenerationConfi
     }
 
     return variant AdmittedGreedy
+}
+
+# -------------------------------------------------------------------------
+# AdaptiveBudget — the rolling-acceptance draft-depth controller (SD6-U1).
+# -------------------------------------------------------------------------
+
+# Pure controller state. The draft depth starts at the minimum and moves
+# within [min_depth, max_depth]: one fully accepted draft block raises the
+# next depth by one (capped at the maximum), and any short block — a
+# divergence or a shorter-than-depth proposal — lowers it by one (floored
+# at the minimum). The controller observes only (drafted, accepted) per
+# verify round: no RNG, clock, cache, or generation state enters, so equal
+# observation sequences produce equal controllers. A round with no draft
+# at all (the zero-tax PLD degeneracy) is not observed.
+@ public
+class AdaptiveBudget {
+    mut int min_depth
+    mut int max_depth
+    mut int depth
+    mut int blocks
+    mut int drafted_total
+    mut int accepted_total
+}
+
+# Placeholder for `var AdaptiveBudget` bindings. Not valid controller
+# state (an empty interval); the caller overwrites it.
+@ public
+fn default_budget() → AdaptiveBudget {
+    return AdaptiveBudget { min_depth = 1, max_depth = 1, depth = 1, blocks = 0, drafted_total = 0, accepted_total = 0 }
+}
+
+@ public
+fn budget_equal(AdaptiveBudget a, AdaptiveBudget b) → bool {
+    if a.min_depth ≢ b.min_depth then return false
+
+    if a.max_depth ≢ b.max_depth then return false
+
+    if a.depth ≢ b.depth then return false
+
+    if a.blocks ≢ b.blocks then return false
+
+    if a.drafted_total ≢ b.drafted_total then return false
+
+    return a.accepted_total ≡ b.accepted_total
+}
+
+# Construct a controller over an adaptive-depth interval. The interval is
+# the policy's [min_depth, max_depth]; the envelope cap and the block-bound
+# containment are the policy's own admission (gradus:generation/config).
+@ public
+fn construct_budget(int min_depth, int max_depth) → AdaptiveBudget ⇥ SpeculativeError {
+    require min_depth ≥ 1 throw variant InvalidBlockSize { message = "adaptive depth must be at least one" }
+
+    require max_depth ≥ 1 throw variant InvalidBlockSize { message = "adaptive depth must be at least one" }
+
+    require min_depth ≤ max_depth throw variant InvalidBlockSize { message = "adaptive depth minimum must not exceed the maximum" }
+
+    return AdaptiveBudget { min_depth = min_depth, max_depth = max_depth, depth = min_depth, blocks = 0, drafted_total = 0, accepted_total = 0 }
+}
+
+# Project a controller from an admitted AccelerationPolicy's depth bounds.
+@ public
+fn budget_from_policy(generation.AccelerationPolicy policy) → AdaptiveBudget ⇥ SpeculativeError {
+    return construct_budget(policy.min_depth, policy.max_depth)
+}
+
+# The draft depth for the current round.
+@ public
+fn next_depth(AdaptiveBudget b) → int {
+    return b.depth
+}
+
+# Observe one verify round and return the advanced controller. A fully
+# accepted block (accepted ≡ drafted) raises the next depth by one; a
+# short block lowers it by one; both clamp at the interval bounds.
+@ public
+fn observe_block(AdaptiveBudget b, int drafted, int accepted) → AdaptiveBudget ⇥ SpeculativeError {
+    require drafted ≥ 1 throw variant MalformedResult { message = "an observed draft block has at least one candidate" }
+
+    require accepted ≥ 0 throw variant MalformedResult { message = "an accepted count is never negative" }
+
+    require accepted ≤ drafted throw variant MalformedResult { message = "an accepted count never exceeds the drafted block" }
+
+    mut int depth ← b.depth
+
+    if accepted ≡ drafted {
+        depth ← depth + 1
+
+        if depth ≻ b.max_depth {
+            depth ← b.max_depth
+        }
+    }
+    else {
+        depth ← depth - 1
+
+        if depth ≺ b.min_depth {
+            depth ← b.min_depth
+        }
+    }
+
+    return AdaptiveBudget { min_depth = b.min_depth, max_depth = b.max_depth, depth = depth, blocks = b.blocks + 1, drafted_total = b.drafted_total + drafted, accepted_total = b.accepted_total + accepted }
+}
+
+# -------------------------------------------------------------------------
+# DrafterContext — the generalized drafter input contract (SD6-U2).
+# -------------------------------------------------------------------------
+
+# The drafter's input record. The weightless PLD provider consumes only
+# token_history and adaptive_budget — the zero-tax degeneracy with an
+# empty tap buffer, no backbone views, and no drafter state. The coupled
+# MTP drafter (feature-tapped DSpark/DFlash, standalone NextN) additionally
+# reads the target tap buffer (the last accepted hidden state), the shared
+# backbone views (arena slot references into the target backbone), and its
+# own session state (the drafter's arena slot map); those fields stay
+# empty until the feature-tap seam lands, and no provider may read them
+# today.
+@ public
+class DrafterContext {
+    mut list<int> token_history
+    mut list<f32> target_tap_buffer
+    mut list<int> shared_backbone_views
+    mut list<int> drafter_session_state
+    mut AdaptiveBudget adaptive_budget
+}
+
+# Placeholder for `var DrafterContext` bindings. The caller overwrites it.
+@ public
+fn default_context() → DrafterContext {
+    return DrafterContext { token_history = empty, target_tap_buffer = empty, shared_backbone_views = empty, drafter_session_state = empty, adaptive_budget = default_budget() }
+}
+
+@ public
+fn context_equal(DrafterContext a, DrafterContext b) → bool {
+    if not (a.token_history ≡ b.token_history) then return false
+
+    if not (a.target_tap_buffer ≡ b.target_tap_buffer) then return false
+
+    if not (a.shared_backbone_views ≡ b.shared_backbone_views) then return false
+
+    if not (a.drafter_session_state ≡ b.drafter_session_state) then return false
+
+    return budget_equal(a.adaptive_budget, b.adaptive_budget)
+}
+
+# The PLD degeneracy: only the accepted token history and the adaptive
+# budget are supplied; every coupled-MTP field is empty by construction,
+# so the degeneracy cannot carry unread tap, view, or drafter state.
+@ public
+fn construct_pld_context(list<int> token_history, AdaptiveBudget adaptive_budget) → DrafterContext ⇥ SpeculativeError {
+    return construct_drafter_context(token_history, empty, empty, empty, adaptive_budget)
+}
+
+# The generalized constructor. The tap buffer carries float taps, the
+# backbone views and the drafter session state carry arena slot
+# references; all may be empty, and only a landed feature-tap provider
+# may read the non-empty forms.
+@ public
+fn construct_drafter_context(list<int> token_history, list<f32> target_tap_buffer, list<int> shared_backbone_views, list<int> drafter_session_state, AdaptiveBudget adaptive_budget) → DrafterContext ⇥ SpeculativeError {
+    for from token_history let t {
+        require t ≥ 0 throw variant MalformedRequest { message = "token id must be non-negative" }
+    }
+
+    for from shared_backbone_views let slot {
+        require slot ≥ 0 throw variant MalformedRequest { message = "backbone view slot must be non-negative" }
+    }
+
+    for from drafter_session_state let slot {
+        require slot ≥ 0 throw variant MalformedRequest { message = "drafter session slot must be non-negative" }
+    }
+
+    return DrafterContext { token_history = token_history, target_tap_buffer = target_tap_buffer, shared_backbone_views = shared_backbone_views, drafter_session_state = drafter_session_state, adaptive_budget = adaptive_budget }
 }
 
 # -------------------------------------------------------------------------
@@ -616,7 +792,7 @@ describe "SD0-U3 — candidate-provider seam" {
 # ---- SD0-U4 fixtures
 
 fn lookup_policy_p() → config.AccelerationPolicy {
-    return config.construct_acceleration("1.0.0", config.acceleration_context_lookup(), 2, 8) ⊥ config.default_acceleration()
+    return config.construct_acceleration("1.1.0", config.acceleration_context_lookup(), 2, 8, 2, 8) ⊥ config.default_acceleration()
 }
 
 fn config_with_sampling(f32 temperature, int top_k, f32 top_p, f32 min_p) → config.GenerationConfig {
@@ -715,6 +891,158 @@ describe "SD0-U4 — greedy acceptance and sampled admission" {
         match trap_result_12 {
             case returned let ? { }
             case thrown let ? { assert false }
+        }
+    }
+}
+
+# ---- SD6 fixtures
+
+# Renders a budget-construction outcome as text.
+fn budget_detail(int min_depth, int max_depth) → string {
+    do {
+        let speculative.AdaptiveBudget ? ← speculative.construct_budget(min_depth, max_depth)
+        return "ok"
+    }
+    catch err {
+        return err.message
+    }
+}
+
+# Renders one block observation as the next depth, or the rejection text.
+fn observe_detail(speculative.AdaptiveBudget b, int drafted, int accepted) → string {
+    do {
+        let speculative.AdaptiveBudget next ← speculative.observe_block(b, drafted, accepted)
+        let int d ← speculative.next_depth(next)
+        return d ↦ string
+    }
+    catch err {
+        return err.message
+    }
+}
+
+describe "SD6-U1 — rolling-acceptance adaptive depth controller" {
+    test "a controller starts at the interval minimum and admits 1..8 by default" {
+        let _ trap_result_13 ← trap {
+            let speculative.AdaptiveBudget b ← speculative.construct_budget(1, 8)
+            assert speculative.next_depth(b) ≡ 1
+            assert b.blocks ≡ 0
+            assert b.drafted_total ≡ 0
+            assert b.accepted_total ≡ 0
+            let speculative.AdaptiveBudget from_policy ← speculative.budget_from_policy(lookup_policy_p())
+            assert from_policy.min_depth ≡ 2
+            assert from_policy.max_depth ≡ 8
+        }
+        match trap_result_13 {
+            case returned let ? { }
+            case thrown let ? { assert false }
+        }
+    }
+    test "a fully accepted block raises the depth and a short block lowers it" {
+        let _ trap_result_14 ← trap {
+            let speculative.AdaptiveBudget b0 ← speculative.construct_budget(1, 8)
+            let speculative.AdaptiveBudget b1 ← speculative.observe_block(b0, 3, 3)
+            assert speculative.next_depth(b1) ≡ 2
+            let speculative.AdaptiveBudget b2 ← speculative.observe_block(b1, 3, 1)
+            assert speculative.next_depth(b2) ≡ 1
+            let speculative.AdaptiveBudget b3 ← speculative.observe_block(b2, 3, 0)
+            assert speculative.next_depth(b3) ≡ 1
+        }
+        match trap_result_14 {
+            case returned let ? { }
+            case thrown let ? { assert false }
+        }
+    }
+    test "the depth clamps at both interval bounds" {
+        let _ trap_result_15 ← trap {
+            let speculative.AdaptiveBudget b ← speculative.construct_budget(2, 4)
+            let speculative.AdaptiveBudget raised ← speculative.observe_block(b, 2, 2)
+            let speculative.AdaptiveBudget raised_more ← speculative.observe_block(raised, 2, 2)
+            let speculative.AdaptiveBudget capped ← speculative.observe_block(raised_more, 2, 2)
+            assert speculative.next_depth(capped) ≡ 4
+            let speculative.AdaptiveBudget lowered ← speculative.observe_block(capped, 2, 0)
+            assert speculative.next_depth(lowered) ≡ 3
+        }
+        match trap_result_15 {
+            case returned let ? { }
+            case thrown let ? { assert false }
+        }
+    }
+    test "observation is pure: the input controller is unchanged" {
+        let _ trap_result_16 ← trap {
+            let speculative.AdaptiveBudget b ← speculative.construct_budget(1, 8)
+            let speculative.AdaptiveBudget snapshot ← b
+            let speculative.AdaptiveBudget ? ← speculative.observe_block(b, 4, 2)
+            assert speculative.budget_equal(b, snapshot)
+        }
+        match trap_result_16 {
+            case returned let ? { }
+            case thrown let ? { assert false }
+        }
+    }
+    test "counters accumulate and malformed observations reject" {
+        let _ trap_result_17 ← trap {
+            let speculative.AdaptiveBudget b0 ← speculative.construct_budget(1, 8)
+            let speculative.AdaptiveBudget b1 ← speculative.observe_block(b0, 4, 2)
+            let speculative.AdaptiveBudget b2 ← speculative.observe_block(b1, 3, 3)
+            assert b2.blocks ≡ 2
+            assert b2.drafted_total ≡ 7
+            assert b2.accepted_total ≡ 5
+        }
+        match trap_result_17 {
+            case returned let ? { }
+            case thrown let ? { assert false }
+        }
+        assert budget_detail(0, 8) ≡ "adaptive depth must be at least one"
+        assert budget_detail(1, 0) ≡ "adaptive depth must be at least one"
+        assert budget_detail(8, 1) ≡ "adaptive depth minimum must not exceed the maximum"
+        let speculative.AdaptiveBudget b ← speculative.construct_budget(1, 8) ⊥ speculative.default_budget()
+        assert observe_detail(b, 0, 0) ≡ "an observed draft block has at least one candidate"
+        assert observe_detail(b, 2, -1) ≡ "an accepted count is never negative"
+        assert observe_detail(b, 2, 3) ≡ "an accepted count never exceeds the drafted block"
+    }
+}
+
+describe "SD6-U2 — generalized drafter input context" {
+    test "the PLD degeneracy carries only history and budget" {
+        let _ trap_result_18 ← trap {
+            let speculative.AdaptiveBudget budget ← speculative.construct_budget(1, 8)
+            let speculative.DrafterContext ctx ← speculative.construct_pld_context([7, 8, 9], budget)
+            assert ctx.token_history ≡ ([7, 8, 9] ↦ list<int>)
+            assert ctx.target_tap_buffer.length() ≡ 0
+            assert ctx.shared_backbone_views.length() ≡ 0
+            assert ctx.drafter_session_state.length() ≡ 0
+            assert speculative.budget_equal(ctx.adaptive_budget, budget)
+        }
+        match trap_result_18 {
+            case returned let ? { }
+            case thrown let ? { assert false }
+        }
+    }
+    test "the generalized constructor binds every field and validates ids and slots" {
+        let _ trap_result_19 ← trap {
+            let speculative.AdaptiveBudget budget ← speculative.construct_budget(1, 8)
+            let speculative.DrafterContext ctx ← speculative.construct_drafter_context([1, 2], [0.5 ∷ f32, 0.25 ∷ f32], [3], [0, 1], budget)
+            assert ctx.target_tap_buffer ≡ ([0.5 ∷ f32, 0.25 ∷ f32] ↦ list<f32>)
+            assert ctx.shared_backbone_views ≡ ([3] ↦ list<int>)
+            assert ctx.drafter_session_state ≡ ([0, 1] ↦ list<int>)
+            let speculative.DrafterContext pld ← speculative.construct_pld_context([1, 2], budget)
+            assert not (speculative.context_equal(ctx, pld))
+        }
+        match trap_result_19 {
+            case returned let ? { }
+            case thrown let ? { assert false }
+        }
+        let _ negative_history ← trap {
+            let speculative.DrafterContext ? ← speculative.construct_pld_context([1, -2], speculative.construct_budget(1, 8) ⊥ speculative.default_budget())
+            assert false
+        }
+        match negative_history {
+            case thrown let err {
+                assert err.message ≡ "token id must be non-negative"
+            }
+            case returned let ? {
+                assert false
+            }
         }
     }
 }
