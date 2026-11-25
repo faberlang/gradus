@@ -12,11 +12,14 @@ locale = "en"
 #   faber run exempla/decode-token-bench-metal --library-home <gradus parent> \
 #       --device metal --strict-engine
 #
-# A token is the wide launch set of `gradus:decode_token`: `embed_wide`, 32 x
-# `layer_wide` (14 launches each), `head_step_wide`, then `decode_step.argmax_token`,
-# which leaves the next token id in a device tensor. The program is one device
-# stream: every scratch and cache tensor is primed once (see `decode_step.prime1`),
-# so the only host read of a token is the id itself (one blocking wait).
+# A token is the wide launch set of `gradus:decode_token` over its record
+# contract (gradus #47): `embed_wide`, 32 x `layer_wide` on record-typed
+# `LayerWeights` / `SlotView` / `LayerParams` / `Workspace` (14 launches each),
+# `head_wide`, then `decode_step.argmax_token`, which leaves the next token id
+# in a device tensor. The program is one device stream: every scratch and
+# cache tensor is allocated once, primed once (see `decode_step.prime1`), and
+# carried in the workspace and slot views, so the only host read of a token is
+# the id itself (one blocking wait).
 #
 # Output: one `bench ...` line per measured pass (the minimum over passes is the
 # number to quote) and the first eight `verify` lines (token id and its logit).
@@ -32,17 +35,10 @@ const int LAYERS = 32
 const int NTOK = 32
 const int PASSES = 6
 
-class Layer {
-    let tensor<f32, [960]> anorm
-    let tensor<f32, [960, 960]> wq
-    let tensor<f32, [320, 960]> wk
-    let tensor<f32, [320, 960]> wv
-    let tensor<f32, [960, 960]> wo
-    let tensor<f32, [960]> fnorm
-    let tensor<f32, [2560, 960]> wg
-    let tensor<f32, [2560, 960]> wu
-    let tensor<f32, [960, 2560]> wd
-}
+type BLW = dt.LayerWeights<size 960, size 960, size 320, size 2560>
+type BSV = dt.SlotView<size 64, size 320>
+type BWS = dt.Workspace<size 960, size 960, size 320, size 2560, size 15, size 64, size 32>
+type BLP = dt.LayerParams
 
 # Deterministic pseudo-random matrix: values in (-amp, amp) from a sine hash.
 @ public
@@ -72,7 +68,7 @@ kernel synth_vec<size N>(tensor<f32, [N]> sdom, mut tensor<f32, [N]> sout, i32 s
     }
 }
 
-fn make_layer(i32 sd) → Layer {
+fn make_layer(i32 sd, tensor<f32, [960]> zbq, tensor<f32, [320]> zbk, tensor<f32, [320]> zbv) → BLW {
     let tensor<f32, [960]> d960 ← tf32[960] {}
     mut tensor<f32, [960]> anorm ← tf32[960] {}
     mut tensor<f32, [960]> fnorm ← tf32[960] {}
@@ -96,7 +92,7 @@ fn make_layer(i32 sd) → Layer {
     let tensor<f32, [960, 2560]> d960x2560 ← tf32[960, 2560] {}
     mut tensor<f32, [960, 2560]> wd ← tf32[960, 2560] {}
     synth_mat(d960x2560, mut wd, sd + 10, 0.02 ∷ f32)
-    return Layer { anorm = anorm, wq = wq, wk = wk, wv = wv, wo = wo, fnorm = fnorm, wg = wg, wu = wu, wd = wd }
+    return dt.LayerWeights<size 960, size 960, size 320, size 2560> { anorm = anorm, wq = wq, wk = wk, wv = wv, wo = wo, fnorm = fnorm, wg = wg, wu = wu, wd = wd, qkv_bias = false, bq = zbq, bk = zbk, bv = zbv }
 }
 
 main {
@@ -117,6 +113,7 @@ main {
     mut tensor<f32, [2560]> gate ← tf32[2560] {}
     mut tensor<f32, [2560]> up ← tf32[2560] {}
     mut tensor<f32, [2560]> act ← tf32[2560] {}
+    mut BWS ws ← dt.Workspace<size 960, size 960, size 320, size 2560, size 15, size 64, size 32> { hcdom = hcdom, cpdom = cpdom, qdom = qdom, xn = xn, q = q, qr = qr, k = k, kr = kr, v = v, sc = sc, pr = pr, cp = cp, ctx = ctx, h1 = h1, gate = gate, up = up, act = act }
 
     let tensor<f32, [49152, 960]> embdom ← tf32[49152, 960] {}
     mut tensor<f32, [49152, 960]> emb ← tf32[49152, 960] {}
@@ -125,18 +122,26 @@ main {
     mut tensor<f32, [960]> onorm ← tf32[960] {}
     synth_vec(d960, mut onorm, 5 ∷ i32)
 
-    mut list<Layer> layers ← empty
+    let tensor<f32, [960]> zbq ← tf32[960] {}
+    let tensor<f32, [320]> zbk ← tf32[320] {}
+    let tensor<f32, [320]> zbv ← tf32[320] {}
+    mut list<BLW> layers ← empty
+    mut list<BSV> svs ← empty
     mut list<tensor<f32, [64, 320]>> ka ← empty
     mut list<tensor<f32, [64, 320]>> va ← empty
     mut i32 seed ← 7 ∷ i32
-    for range 0 ‥ LAYERS let l {
-        layers.append(make_layer(seed))
+    for exclusive LAYERS let l {
+        layers.append(make_layer(seed, zbq, zbk, zbv))
         let tensor<f32, [64, 320]> kc ← tf32[64, 320] {}
         let tensor<f32, [64, 320]> vc ← tf32[64, 320] {}
         ka.append(kc)
         va.append(vc)
+        mut BSV sv ← dt.SlotView<size 64, size 320> { kin = kc, vin = vc, pos = 0 }
+        svs.append(sv)
         seed ← seed + 1000
     }
+
+    let BLP lp ← dt.LayerParams { pdh = 64 ∷ i32, pspan = 32 ∷ i32, pgroup = 3 ∷ i32, prope = variant dt.RopeKind.Pairs, peps = 0.00001 ∷ f32, plntheta = 11.512925 ∷ f32, pscale = 0.125 }
 
     mut tensor<i32, [1]> ids ← ti32[1] {}
     mut tensor<f32, [49152]> logits ← tf32[49152] {}
@@ -148,33 +153,32 @@ main {
     ds.prime1(ha, mut sink)
     ds.prime1(hb, mut sink)
     ds.prime1(logits, mut sink)
-    dt.prime_layer_wide(mut xn, mut q, mut qr, mut k, mut kr, mut v, mut sc, mut pr, mut cp, mut ctx, mut h1, mut gate, mut up, mut act, mut sink)
-    for range 0 ‥ LAYERS let l {
-        mut tensor<f32, [64, 320]> pk ← ka[l]
-        mut tensor<f32, [64, 320]> pv ← va[l]
-        ds.prime2(pk, mut sink)
-        ds.prime2(pv, mut sink)
+    dt.prime_workspace(ws, mut sink)
+    for exclusive LAYERS let l {
+        mut BSV psv ← svs[l]
+        ds.prime2(psv.kin, mut sink)
+        ds.prime2(psv.vin, mut sink)
     }
 
-    for range 0 ‥ PASSES let pass_no {
+    for exclusive PASSES let pass_no {
         ids[0] ← 1 ∷ i32
         mut i32 pos ← 0 ∷ i32
         mut int sum ← 0
         let int started ← time.monotonic()
-        for range 0 ‥ NTOK let t {
+        for exclusive NTOK let t {
             dt.embed_wide(emb, ids, mut ha)
-            for range 0 ‥ LAYERS let ll {
-                let Layer ly ← layers[ll]
-                mut tensor<f32, [64, 320]> kin ← ka[ll]
-                mut tensor<f32, [64, 320]> vin ← va[ll]
+            for exclusive LAYERS let ll {
+                let BLW ly ← layers[ll]
+                mut BSV sv ← svs[ll]
+                sv.pos ← pos
                 if ll % 2 ≡ 0 {
-                    dt.layer_wide(ha, mut hb, ly.anorm, ly.wq, ly.wk, ly.wv, ly.wo, ly.fnorm, ly.wg, ly.wu, ly.wd, mut kin, mut vin, hcdom, cpdom, qdom, mut xn, mut q, mut qr, mut k, mut kr, mut v, mut sc, mut pr, mut cp, mut ctx, mut h1, mut gate, mut up, mut act, pos, 64, 32, 3, 1, 0.00001, 11.512925, 0.125)
+                    dt.layer_wide(ha, mut hb, ly, mut sv, lp, mut ws)
                 }
                 else {
-                    dt.layer_wide(hb, mut ha, ly.anorm, ly.wq, ly.wk, ly.wv, ly.wo, ly.fnorm, ly.wg, ly.wu, ly.wd, mut kin, mut vin, hcdom, cpdom, qdom, mut xn, mut q, mut qr, mut k, mut kr, mut v, mut sc, mut pr, mut cp, mut ctx, mut h1, mut gate, mut up, mut act, pos, 64, 32, 3, 1, 0.00001, 11.512925, 0.125)
+                    dt.layer_wide(hb, mut ha, ly, mut sv, lp, mut ws)
                 }
             }
-            dt.head_step_wide(ha, onorm, emb, mut xn, mut logits, 0.00001)
+            dt.head_wide(ha, onorm, emb, mut xn, mut logits, 0.00001)
             ds.argmax_token(logits, mut ids)
             let int id ← ids[[0]] ↦ int
             sum ← sum + id
