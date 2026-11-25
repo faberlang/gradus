@@ -91,6 +91,7 @@ One `.fab` file → one import path. Nested dirs for packages.
 | `gradus:generation/config` | GenerationConfig, GenerationError, acceleration policy |
 | `gradus:generation/decoder` | Cursor, stop policy, decoder generate |
 | `gradus:generation/dense` | DenseEngine and dense generate |
+| `gradus:sampling` | Deterministic token sampling (greedy/sample, repetition penalty, temperature/top-k/top-p/min-p, explicit `Seed` RNG seam) |
 | `gradus:speculative` | Candidate-provider seam (speculative-decode contract): adaptive-depth `AdaptiveBudget`, generalized `DrafterContext` |
 | `gradus:context_lookup` | Deterministic context-lookup search contract |
 | `gradus:draft_verify` | Draft-and-verify coordinator: PLD draft → `SessionTxn` branch/verify → `commit_prefix`/`rollback`, greedy-exact against the Disabled baseline |
