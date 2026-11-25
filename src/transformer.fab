@@ -510,9 +510,15 @@ fn dense_block_cached(tensor.NumericBlock x, list<int> positions, kv.KVCache lay
 }
 
 # -------------------------------------------------------------------------
-# Typed dense_block twins — ordinary assemblers over pinned tensors.
-# Attention stays on the bag seam until GQA+RoPE is typed. Runtime ints
-# are the bag-conversion geometry (T/D/Q/K/F as values).
+# Typed dense_block twins — ordinary assemblers over pinned tensors, with
+# GQA + RoPE attention and the output projection on typed tensors and @
+# kernels end to end (issue 72: no per-step tensor ↔ list<f32> host
+# round-trip of Q/K/V or layer.wo). Size parameters beyond the layer
+# geometry: H = query heads, R = T * H flattened score rows, and (cached
+# twin only) C = cache prefix + T context rows. The head counts inside
+# DenseAttentionConfig stay runtime ints and are validated against the
+# static extents; the derived geometry (head width, GQA ratio) travels as
+# runtime kernel arguments, the decode_step posture.
 # -------------------------------------------------------------------------
 
 @ public
@@ -540,45 +546,61 @@ class TypedCachedBlock<size T, size D> {
     mut kv.KVCache state
 }
 
-fn to_block<size A, size B>(tensor<f32, [A, B]> t, int a, int b) → tensor.NumericBlock {
-    return tensor.stage_f32([a, b], t ↦ list<f32>)
-}
+# Position pin for the typed RoPE kernel: one i32 slot per row (issue 72 —
+# the only host data staged per step is the T-length position vector).
+fn pin_positions<size T>(list<int> positions) → tensor<i32, [T]> ⇥ TransformerError {
+    mut list<i32> converted ← empty
 
-fn from_block<size A, size B>(tensor.NumericBlock t) → tensor<f32, [A, B]> ⇥ TransformerError {
+    for from positions let p {
+        converted.append(p ↦ i32 ⊥ 0)
+    }
+
     do {
-        return t.data ↦ tensor<f32, [A, B]>
+        return converted ↦ tensor<i32, [T]>
     }
     catch conv {
-        throw variant ShapeMismatch { message = "attention context pin failed" }
+        throw variant ShapeMismatch { message = "positions pin failed" }
     }
 }
 
-# KRS-4 absent-bias zero vector (tree rule 6: the host supplies the tensor).
-# No typed zeros constructor exists (card hazard 1) — the zero is built
-# host-side as a fill loop + construct + list→tensor pin, mirroring
-# model/dense `_zeros_rank1` + `_pin_same_rank1`. Never a fill kernel.
-fn zero_block(int n) → tensor.NumericBlock ⇥ TransformerError {
-    mut list<f32> out ← empty
-
-    for range 0 ‥ n {
-        out.append(0.0 ∷ f32)
-    }
-
-    do {
-        return tensor.construct(out, [n])
-    }
-    catch err {
-        throw variant ShapeMismatch { message = "zero bias fill failed" }
+# RoPE pair-policy flag from the typed config: 0 = consecutive-pair llama
+# NORM, 1 = interleaved-pair qwen2. Infallible.
+fn rope_policy_flag(rope.RopeConfig cfg) → int {
+    match cfg.policy {
+        case rope.RopePolicy.Consecutive {
+            return 0
+        }
+        case rope.RopePolicy.Interleaved {
+            return 1
+        }
     }
 }
 
-fn zero_bias<size N>(tensor.NumericBlock z) → tensor<f32, [N]> ⇥ TransformerError {
-    do {
-        return z.data ↦ tensor<f32, [N]>
+# KRS-4 bias policy, load-time half (issue 72): absent biases become proven
+# zeros ONCE on the record — the typed literal zero tensor, host-built
+# (hazard-1 posture: never a fill kernel). The step path then reads
+# bq/bk/bv unconditionally; the has_* flags stay as the model-provenance
+# record. Call this at layer-assembly time; the block twins trust its
+# result and never allocate bias zeros per step.
+@ public
+fn zeroed_biases<size D, size Q, size K, size F>(TypedDenseLayer<size D, size Q, size K, size F> layer) → TypedDenseLayer<size D, size Q, size K, size F> {
+    mut tensor<f32, [Q]> bq ← copy layer.bq
+    mut tensor<f32, [K]> bk ← copy layer.bk
+    mut tensor<f32, [K]> bv ← copy layer.bv
+
+    if not layer.has_bq {
+        bq ← tf32[Q] {}
     }
-    catch conv {
-        throw variant ShapeMismatch { message = "zero bias pin failed" }
+
+    if not layer.has_bk {
+        bk ← tf32[K] {}
     }
+
+    if not layer.has_bv {
+        bv ← tf32[K] {}
+    }
+
+    return TypedDenseLayer<size D, size Q, size K, size F> {ln1 = layer.ln1, wq = layer.wq, bq = bq, has_bq = layer.has_bq, wk = layer.wk, bk = bk, has_bk = layer.has_bk, wv = layer.wv, bv = bv, has_bv = layer.has_bv, wo = layer.wo, ln2 = layer.ln2, wg = layer.wg, wu = layer.wu, wd = layer.wd}
 }
 
 # KRS-4 region — the shared QKV projection of both static twins. The bias
@@ -593,34 +615,208 @@ kernel dense_qkv<size T, size D, size Q, size K>(tensor<f32, [T, D]> ln1, tensor
     return tuple<tensor<f32, [T, Q]>, tensor<f32, [T, K]>, tensor<f32, [T, K]>> [q, k, v]
 }
 
-# KRS-4 wrapper-side bias policy: has_* true → the real layer bias;
-# false → a proven zero of the matching width (qwidth/kwidth are the
-# runtime [Q]/[K] widths).
-fn bias_or_zero<size N>(bool has, tensor<f32, [N]> real, int width) → tensor<f32, [N]> ⇥ TransformerError {
-    if has then return real
+# Static-geometry validation shared by both typed twins: the runtime head
+# counts of DenseAttentionConfig against the static extents, the packed
+# widths, the positions, and the rope dim (the gqa multi-head contract,
+# thrown through the same TransformerError variants the staged path maps
+# to). Returns the head width.
+fn validate_static_geometry<size T, size R, size Q, size K, size H>(DenseAttentionConfig attention_config, list<int> positions) → int ⇥ TransformerError {
+    let int num_heads ← attention_config.num_heads
+    let int num_kv_heads ← attention_config.num_kv_heads
+    require num_heads ≥ 1 throw variant ShapeMismatch { message = "num_heads must be positive" }
+    require num_kv_heads ≥ 1 throw variant ShapeMismatch { message = "num_kv_heads must be positive" }
+    require num_kv_heads ≤ num_heads throw variant ShapeMismatch { message = "num_kv_heads must not exceed num_heads" }
+    require num_heads % num_kv_heads ≡ 0 throw variant ShapeMismatch { message = "num_heads must be a multiple of num_kv_heads" }
+    let int rows ← T ↦ int
+    require rows ≢ 0 throw variant ElementMismatch { message = "empty attention input" }
+    require positions.length() ≡ rows throw variant ShapeMismatch { message = "positions must match the token count" }
+    for from positions let p {
+        require p ≥ 0 throw variant InvalidPosition { message = "negative position" }
+        require p ≤ 16777215 throw variant InvalidPosition { message = "position exceeds the portable range" }
+    }
+    let int query_width ← Q ↦ int
+    require query_width % num_heads ≡ 0 throw variant ShapeMismatch { message = "query width must be a multiple of num_heads" }
+    let int head_width ← query_width / num_heads
+    require head_width ≢ 0 throw variant ShapeMismatch { message = "head dim must be positive" }
+    require (K ↦ int) ≡ num_kv_heads * head_width throw variant ShapeMismatch { message = "key width must equal num_kv_heads * head dim" }
+    require num_heads ≡ H ↦ int throw variant Incompatible { message = "static head count must match the attention config" }
+    require (R ↦ int) ≡ rows * num_heads throw variant Incompatible { message = "static score rows must equal rows times heads" }
+    require attention_config.rope_dim ≥ 2 throw variant InvalidDimension { message = "rope dim must be at least 2" }
+    require attention_config.rope_dim % 2 ≡ 0 throw variant InvalidDimension { message = "rope dim must be even" }
+    require attention_config.rope_dim ≤ head_width throw variant InvalidDimension { message = "rope dim exceeds head width" }
+    return head_width
+}
 
-    return zero_bias(zero_block(width))
+# Typed RoPE over packed head rows [T, N] (N = heads * head_width): each
+# head-width slice rotates its first rot_width columns at the row position
+# theta convention pos * scale * base^(-2k / rot_width). Policy 0 is the
+# consecutive-pair llama NORM rotation (2k, 2k+1); policy 1 is the
+# interleaved-pair qwen2 rotation (k, k + rot_width / 2). Columns at or
+# beyond rot_width pass through unchanged. Numerically the gqa rope_curve
+# row (validated against it in the co-located tests).
+@ public
+kernel dense_rope<size T, size N>(tensor<f32, [T, N]> input, tensor<i32, [T]> positions, mut tensor<f32, [T, N]> output, i32 head_width, i32 rot_width, i32 policy, f32 ln_theta, f32 pos_scale) → void {
+    for from output at [t, j] thread lane let e {
+        if head_width ≥ 1 and head_width ≤ 960 and rot_width ≥ 2 and rot_width ≤ head_width and policy ≥ 0 and policy ≤ 1 {
+            let i32 hw ← head_width
+            let i32 rw ← rot_width
+            let i32 half ← rw / 2
+            let i32 jj ← j % hw
+            let i32 base ← j - jj
+            let f32 p ← (positions[[t]] ↦ f32) * pos_scale
+            if jj ≺ rw {
+                if policy ≡ 0 {
+                    let i32 k ← jj / 2
+                    let f32 freq ← (-(2.0 * (k ↦ f32)) / (rw ↦ f32) * ln_theta).exp()
+                    let f32 ang ← p * freq
+                    let f32 c ← ang.cos()
+                    let f32 s ← ang.sin()
+                    if jj % 2 ≡ 0 {
+                        output[[t, j]] ← input[[t, j]] * c - input[[t, j + 1]] * s
+                    }
+                    else {
+                        output[[t, j]] ← input[[t, j - 1]] * s + input[[t, j]] * c
+                    }
+                }
+                else {
+                    let i32 k ← jj % half
+                    let f32 freq ← (-(2.0 * (k ↦ f32)) / (rw ↦ f32) * ln_theta).exp()
+                    let f32 ang ← p * freq
+                    let f32 c ← ang.cos()
+                    let f32 s ← ang.sin()
+                    if jj ≺ half {
+                        output[[t, j]] ← input[[t, j]] * c - input[[t, base + k + half]] * s
+                    }
+                    else {
+                        output[[t, j]] ← input[[t, base + k]] * s + input[[t, j]] * c
+                    }
+                }
+            }
+            else {
+                output[[t, j]] ← input[[t, j]]
+            }
+        }
+    }
+}
+
+# Typed GQA causal scores over the packed projections, flattened score rows
+# r = i * heads + h (rank-2 lanes keep the launch inside the portable
+# integer range, the decode_step attn_scores posture): scores[r, j] is
+# query row i, head h against context row j, scaled, masked to -3.0e38
+# beyond the causal window prefix + i so the softmax zeroes it.
+@ public
+kernel dense_scores<size T, size R, size C, size Q, size K>(tensor<f32, [R, C]> domain, tensor<f32, [T, Q]> q, tensor<f32, [C, K]> k, mut tensor<f32, [R, C]> scores, i32 heads, i32 prefix, i32 ratio, i32 head_width, f32 scale) → void {
+    for from domain at [r, j] thread lane let e {
+        if heads ≥ 1 and heads ≤ 4096 and ratio ≥ 1 and ratio ≤ 128 and head_width ≥ 1 and head_width ≤ 960 and r ∈ 0 … 16777215 and j ∈ 0 … 16777215 {
+            let i32 rr ← r ∧ 16777215
+            let i32 jj ← j ∧ 16777215
+            let i32 ii ← rr / heads
+            let i32 hh ← rr % heads
+            if jj ≻ prefix + ii or prefix ≺ 0 {
+                scores[[r, j]] ← -3.0e38
+            }
+            else {
+                let i32 qbase ← hh * head_width
+                let i32 kbase ← hh / ratio * head_width
+                mut f32 acc ← 0.0
+
+                for range 0 ‥ head_width let d {
+                    acc ← acc + q[[ii, qbase + d]] * k[[jj, kbase + d]]
+                }
+
+                scores[[r, j]] ← acc * scale
+            }
+        }
+    }
+}
+
+# Row softmax over the context axis of the flattened score rows.
+@ public
+kernel dense_softmax<size R, size C>(tensor<f32, [R, C]> scores, mut tensor<f32, [R, C]> weights) → void {
+    weights ⇇ scores.softmax()
+}
+
+# Typed GQA context accumulation into the packed [T, Q] head layout:
+# context[i, col] sums weights[i * heads + h, j] * v[j, group * head_width
+# + d] over the causal window j < prefix + i + 1 (query head h attends KV
+# head h / ratio).
+@ public
+kernel dense_context<size T, size R, size C, size Q, size K>(tensor<f32, [T, Q]> domain, tensor<f32, [R, C]> weights, tensor<f32, [C, K]> v, mut tensor<f32, [T, Q]> context, i32 heads, i32 prefix, i32 ratio, i32 head_width) → void {
+    for from domain at [i, col] thread lane let e {
+        if heads ≥ 1 and heads ≤ 4096 and ratio ≥ 1 and ratio ≤ 128 and head_width ≥ 1 and head_width ≤ 960 and prefix ≥ 0 and prefix ≺ C {
+            let i32 ii ← i ∧ 4095
+            let i32 h ← col / head_width
+            let i32 d ← col % head_width
+            let i32 row ← ii * heads + h
+            let i32 vbase ← h / ratio * head_width + d
+            let i32 n ← prefix + i + 1
+            mut f32 acc ← 0.0
+
+            for range 0 ‥ n let j {
+                acc ← acc + weights[[row, j]] * v[[j, vbase]]
+            }
+
+            context[[i, col]] ← acc
+        }
+    }
+}
+
+# Attention output projection: the [T, Q] packed context times the [Q, D]
+# layer.wo weight, one typed matmul (issue 72: layer.wo never converts to
+# host list<f32>).
+@ public
+kernel dense_out<size T, size Q, size D>(tensor<f32, [T, Q]> context, tensor<f32, [Q, D]> wo) → tensor<f32, [T, D]> {
+    return context · wo
+}
+
+# Fused residual add + RMSNorm (issue 72): one launch writes both the
+# residual stream row (residual 2 consumes it) and its normalized form,
+# replacing the separate math.add + nn.rmsnorm launches.
+@ public
+kernel dense_add_norm<size T, size D>(tensor<f32, [T, D]> left, tensor<f32, [T, D]> right, tensor<f32, [D]> weight, f32 epsilon) → tuple<tensor<f32, [T, D]>, tensor<f32, [T, D]>> {
+    let tensor<f32, [T, D]> residual ← left + right
+    let tensor<f32, [T, D]> normalized ← residual.norm_rms(axis 1, epsilon, weight)
+    return tuple<tensor<f32, [T, D]>, tensor<f32, [T, D]>> [residual, normalized]
 }
 
 @ public
-fn dense_block_static<size T, size D, size Q, size K, size F>(tensor<f32, [T, D]> x, list<int> positions, TypedDenseLayer<size D, size Q, size K, size F> layer, DenseAttentionConfig attention_config, f32 epsilon, int rows, int hidden, int qwidth, int kwidth) → tensor<f32, [T, D]> ⇥ TransformerError {
-    # --- input RMSNorm + QKV region (always-add bias; zeros on absent) ---
+fn dense_block_static<size T, size D, size Q, size K, size F, size H, size R>(tensor<f32, [T, D]> x, list<int> positions, TypedDenseLayer<size D, size Q, size K, size F> layer, DenseAttentionConfig attention_config, f32 epsilon) → tensor<f32, [T, D]> ⇥ TransformerError {
+    # --- geometry validation (fail closed) ---------------------------------
+    let int head_width ← validate_static_geometry<size T, size R, size Q, size K, size H>(attention_config, positions)
+    let int num_heads ← attention_config.num_heads
+    let int ratio ← num_heads / attention_config.num_kv_heads
+    let int policy ← rope_policy_flag(attention_config.rope_config)
+    let f32 ln_theta ← attention_config.rope_config.base.ln()
+
+    # --- input RMSNorm + QKV region (always-add bias; zeros at load time) --
     let tensor<f32, [T, D]> ln1 ← nn.rmsnorm(x, layer.ln1, epsilon)
-    let tensor<f32, [Q]> bq ← bias_or_zero(layer.has_bq, layer.bq, qwidth)
-    let tensor<f32, [K]> bk ← bias_or_zero(layer.has_bk, layer.bk, kwidth)
-    let tensor<f32, [K]> bv ← bias_or_zero(layer.has_bv, layer.bv, kwidth)
-    let tuple<tensor<f32, [T, Q]>, tensor<f32, [T, K]>, tensor<f32, [T, K]>> qkv ← dense_qkv(ln1, layer.wq, bq, layer.wk, bk, layer.wv, bv)
+    let tuple<tensor<f32, [T, Q]>, tensor<f32, [T, K]>, tensor<f32, [T, K]>> qkv ← dense_qkv(ln1, layer.wq, layer.bq, layer.wk, layer.bk, layer.wv, layer.bv)
     let tensor<f32, [T, Q]> qb ← qkv[0]
     let tensor<f32, [T, K]> kb ← qkv[1]
     let tensor<f32, [T, K]> vb ← qkv[2]
 
-    # --- multi-head attention + context pin -------------------------------
-    let tensor.NumericBlock ctx_b ← multi_attention(to_block(qb, rows, qwidth), to_block(kb, rows, kwidth), to_block(vb, rows, kwidth), to_block(layer.wo, qwidth, hidden), attention_config.num_heads, attention_config.num_kv_heads, attention_config.scale, positions, attention_config.rope_dim, attention_config.rope_config)
-    let tensor<f32, [T, D]> ctx ← from_block(ctx_b)
+    # --- RoPE at the row positions -----------------------------------------
+    let tensor<i32, [T]> pos ← pin_positions<size T>(positions)
+    mut tensor<f32, [T, Q]> qr ← tf32[T, Q] {}
+    mut tensor<f32, [T, K]> kr ← tf32[T, K] {}
+    dense_rope(qb, pos, mut qr, head_width, attention_config.rope_dim, policy, ln_theta, attention_config.rope_config.scale)
+    dense_rope(kb, pos, mut kr, head_width, attention_config.rope_dim, policy, ln_theta, attention_config.rope_config.scale)
 
-    # --- residual 1 + post-attn RMSNorm -----------------------------------
-    let tensor<f32, [T, D]> r1 ← math.add(x, ctx)
-    let tensor<f32, [T, D]> ln2 ← nn.rmsnorm(r1, layer.ln2, epsilon)
+    # --- GQA causal attention over the new rows (flattened r = i * H + h) --
+    let tensor<f32, [R, T]> domain ← tf32[R, T] {}
+    mut tensor<f32, [R, T]> scores ← tf32[R, T] {}
+    mut tensor<f32, [R, T]> weights ← tf32[R, T] {}
+    dense_scores<size T, size R, size T, size Q, size K>(domain, qr, kr, mut scores, num_heads, 0, ratio, head_width, attention_config.scale)
+    dense_softmax<size R, size T>(scores, mut weights)
+
+    let tensor<f32, [T, Q]> qdom ← tf32[T, Q] {}
+    mut tensor<f32, [T, Q]> context ← tf32[T, Q] {}
+    dense_context<size T, size R, size T, size Q, size K>(qdom, weights, vb, mut context, num_heads, 0, ratio, head_width)
+
+    # --- output projection + fused residual/RMSNorm ------------------------
+    let tuple<tensor<f32, [T, D]>, tensor<f32, [T, D]>> post ← dense_add_norm(x, dense_out(context, layer.wo), layer.ln2, epsilon)
+    let tensor<f32, [T, D]> r1 ← post[0]
+    let tensor<f32, [T, D]> ln2 ← post[1]
 
     # --- SwiGLU + residual 2 ----------------------------------------------
     return dense_mlp(r1, ln2, layer.wg, layer.wu, layer.wd)
@@ -630,33 +826,99 @@ fn dense_block_static<size T, size D, size Q, size K, size F>(tensor<f32, [T, D]
 kernel dense_mlp<size T, size D, size F>(tensor<f32, [T, D]> residual, tensor<f32, [T, D]> ln2, tensor<f32, [D, F]> wg, tensor<f32, [D, F]> wu, tensor<f32, [F, D]> wd) → tensor<f32, [T, D]> {
     let tensor<f32, [T, F]> gate ← ln2 · wg
     let tensor<f32, [T, F]> up ← ln2 · wu
-    let tensor<f32, [T, F]> hidden_act ← nn.swiglu_hidden(gate, up)
-    let tensor<f32, [T, D]> h ← hidden_act · wd
-    return math.add(residual, h)
+    let tensor<f32, [T, F]> activated ← gate.silu()
+    let tensor<f32, [T, F]> fused ← activated ⊙ up
+    let tensor<f32, [T, D]> h ← fused · wd
+    return residual + h
 }
 
 @ public
-fn dense_block_cached_static<size T, size D, size Q, size K, size F>(tensor<f32, [T, D]> x, list<int> positions, kv.KVCache cache, list<int> tokens, TypedDenseLayer<size D, size Q, size K, size F> layer, DenseAttentionConfig attention_config, f32 epsilon, int rows, int hidden, int qwidth, int kwidth) → TypedCachedBlock<size T, size D> ⇥ TransformerError {
-    # --- input RMSNorm + QKV region (always-add bias; zeros on absent) ---
+fn dense_block_cached_static<size T, size D, size Q, size K, size F, size H, size R, size C>(tensor<f32, [T, D]> x, list<int> positions, kv.KVCache cache, list<int> tokens, TypedDenseLayer<size D, size Q, size K, size F> layer, DenseAttentionConfig attention_config, f32 epsilon) → TypedCachedBlock<size T, size D> ⇥ TransformerError {
+    # --- geometry validation (fail closed) ---------------------------------
+    let int head_width ← validate_static_geometry<size T, size R, size Q, size K, size H>(attention_config, positions)
+    let int num_heads ← attention_config.num_heads
+    let int ratio ← num_heads / attention_config.num_kv_heads
+    let int policy ← rope_policy_flag(attention_config.rope_config)
+    let f32 ln_theta ← attention_config.rope_config.base.ln()
+
+    # --- cache validation (the gqa cached-multi contract) ------------------
+    require kv.decoded_f32(cache) throw variant DtypeMismatch { message = "cached K/V are not decoded F32 storage" }
+    let int rows ← T ↦ int
+    require tokens.length() ≡ rows throw variant ShapeMismatch { message = "tokens must match the token count" }
+    require cache.dimension ≡ K ↦ int throw variant ShapeMismatch { message = "cache dimension must equal num_kv_heads * head dim" }
+    let int prefix ← cache.length()
+    let list<int> key_shape ← cache.key.shape
+    let list<int> value_shape ← cache.payload.shape
+    require key_shape.length() ≡ 2 throw variant GradusMismatch { message = "cache key must be rank-2" }
+    require key_shape.get(1) coalesce 0 ≡ K ↦ int throw variant ShapeMismatch { message = "cache key width must equal num_kv_heads * head dim" }
+    reject (value_shape.length() ≢ 2 or value_shape.get(1) coalesce 0 ≢ K ↦ int) throw variant ShapeMismatch { message = "cache value width must equal num_kv_heads * head dim" }
+    require key_shape.get(0) coalesce 0 ≡ prefix throw variant ShapeMismatch { message = "cache key rows must equal the prefix length" }
+    require value_shape.get(0) coalesce 0 ≡ prefix throw variant ShapeMismatch { message = "cache value rows must equal the prefix length" }
+    require (C ↦ int) ≡ prefix + rows throw variant Incompatible { message = "context extent must equal the cache prefix plus the new rows" }
+    for range 0 ‥ rows let i {
+        require positions.get(i) coalesce -1 ≡ prefix + i throw variant InvalidPosition { message = "position must be the absolute prefix row" }
+    }
+
+    # --- input RMSNorm + QKV region (always-add bias; zeros at load time) --
     let tensor<f32, [T, D]> ln1 ← nn.rmsnorm(x, layer.ln1, epsilon)
-    let tensor<f32, [Q]> bq ← bias_or_zero(layer.has_bq, layer.bq, qwidth)
-    let tensor<f32, [K]> bk ← bias_or_zero(layer.has_bk, layer.bk, kwidth)
-    let tensor<f32, [K]> bv ← bias_or_zero(layer.has_bv, layer.bv, kwidth)
-    let tuple<tensor<f32, [T, Q]>, tensor<f32, [T, K]>, tensor<f32, [T, K]>> qkv ← dense_qkv(ln1, layer.wq, bq, layer.wk, bk, layer.wv, bv)
+    let tuple<tensor<f32, [T, Q]>, tensor<f32, [T, K]>, tensor<f32, [T, K]>> qkv ← dense_qkv(ln1, layer.wq, layer.bq, layer.wk, layer.bk, layer.wv, layer.bv)
     let tensor<f32, [T, Q]> qb ← qkv[0]
     let tensor<f32, [T, K]> kb ← qkv[1]
     let tensor<f32, [T, K]> vb ← qkv[2]
 
-    # --- cached multi-head attention + context pin ------------------------
-    let gqa.CachedAttention step ← multi_attention_cached(to_block(qb, rows, qwidth), to_block(kb, rows, kwidth), to_block(vb, rows, kwidth), to_block(layer.wo, qwidth, hidden), cache, attention_config.num_heads, attention_config.num_kv_heads, attention_config.scale, positions, attention_config.rope_dim, attention_config.rope_config, tokens)
-    let tensor<f32, [T, D]> ctx ← from_block(step.context)
+    # --- RoPE at the absolute row positions --------------------------------
+    let tensor<i32, [T]> pos ← pin_positions<size T>(positions)
+    mut tensor<f32, [T, Q]> qr ← tf32[T, Q] {}
+    mut tensor<f32, [T, K]> kr ← tf32[T, K] {}
+    dense_rope(qb, pos, mut qr, head_width, attention_config.rope_dim, policy, ln_theta, attention_config.rope_config.scale)
+    dense_rope(kb, pos, mut kr, head_width, attention_config.rope_dim, policy, ln_theta, attention_config.rope_config.scale)
 
-    # --- residual 1 + post-attn RMSNorm -----------------------------------
-    let tensor<f32, [T, D]> r1 ← math.add(x, ctx)
-    let tensor<f32, [T, D]> ln2 ← nn.rmsnorm(r1, layer.ln2, epsilon)
+    # --- staged cache prefix -> typed context views (the KVCache seam
+    # stays staged until its own retirement; one concat per matrix per
+    # step, replacing the per-head concats of the host attention path) ----
+    mut list<f32> kdata ← copy cache.key.data
+    for from (kr ↦ list<f32>) let e {
+        kdata.append(e)
+    }
+    mut list<f32> vdata ← copy cache.payload.data
+    for from (vb ↦ list<f32>) let e {
+        vdata.append(e)
+    }
+    mut tensor<f32, [C, K]> k_all ← tf32[C, K] {}
+    mut tensor<f32, [C, K]> v_all ← tf32[C, K] {}
+    do {
+        k_all ← kdata ↦ tensor<f32, [C, K]>
+        v_all ← vdata ↦ tensor<f32, [C, K]>
+    }
+    catch conv {
+        throw variant ShapeMismatch { message = "attention context pin failed" }
+    }
 
-    # --- SwiGLU + residual 2 ----------------------------------------------
-    return TypedCachedBlock { output = dense_mlp(r1, ln2, layer.wg, layer.wu, layer.wd), state = step.state }
+    # --- GQA causal attention over the full context ------------------------
+    let tensor<f32, [R, C]> domain ← tf32[R, C] {}
+    mut tensor<f32, [R, C]> scores ← tf32[R, C] {}
+    mut tensor<f32, [R, C]> weights ← tf32[R, C] {}
+    dense_scores<size T, size R, size C, size Q, size K>(domain, qr, k_all, mut scores, num_heads, prefix, ratio, head_width, attention_config.scale)
+    dense_softmax<size R, size C>(scores, mut weights)
+
+    let tensor<f32, [T, Q]> qdom ← tf32[T, Q] {}
+    mut tensor<f32, [T, Q]> context ← tf32[T, Q] {}
+    dense_context<size T, size R, size C, size Q, size K>(qdom, weights, v_all, mut context, num_heads, prefix, ratio, head_width)
+    let tensor<f32, [T, D]> projected ← dense_out(context, layer.wo)
+
+    # --- cache write + fused residual/RMSNorm + SwiGLU + residual 2 --------
+    let tensor.NumericBlock staged_k ← tensor.stage_f32([rows, K ↦ int], kr ↦ list<f32>)
+    let tensor.NumericBlock staged_v ← tensor.stage_f32([rows, K ↦ int], vb ↦ list<f32>)
+    do {
+        let kv.KVCache state ← kv.extend(cache, tokens, staged_k, staged_v)
+        let tuple<tensor<f32, [T, D]>, tensor<f32, [T, D]>> post ← dense_add_norm(x, projected, layer.ln2, epsilon)
+        let tensor<f32, [T, D]> r1 ← post[0]
+        let tensor<f32, [T, D]> ln2 ← post[1]
+        return TypedCachedBlock { output = dense_mlp(r1, ln2, layer.wg, layer.wu, layer.wd), state = state }
+    }
+    catch err {
+        throw variant Incompatible { message = err.message }
+    }
 }
 
 +++ faber test
@@ -703,6 +965,8 @@ import from "gradus:tensor" tensor
 import from "gradus:dtype" dtype
 import from "gradus:math" math
 import from "gradus:attention/rope" rope
+import from "gradus:attention/gqa" gqa
+import from "gradus:cache/kv" kv
 
 
 # Absolute tolerance for f32-vs-f64 comparison (the nn.proba posture).
@@ -1176,18 +1440,20 @@ describe "dense block — forward-only, autograd-independent" {
 #
 # The rows below are the durable REGION-level oracle (they pass on the
 # pre-F1 and F1 binaries alike): fixture TypedDenseLayer records built
-# directly at this level, wrapper bias-or-zero policy through the records'
-# own has_* flags and fields, and the tuple-shaped always-add region.
+# directly at this level, the record-field bias policy (absent biases are
+# proven zeros from the load-time zeroed_biases pass, issue 72 — the step
+# path reads bq/bk/bv unconditionally), and the tuple-shaped always-add
+# region.
 # Byte-level contract: the pre-KRS-4 branched prologue (verbatim `mut qb ←
 # q0; if has_bq { qb ← q0.added_bias(layer.bq) }` control flow, executed
 # in-row through the record's flags) and the always-add region form are
 # asserted list-equal IN-RUN for q/k/v — present and absent bias — and the
 # scalar-exact pins anchor those bytes (recorded under the MMG-F1 packet
 # binary; the pre-KRS-4 tree at 8ba939a^ = 96033d4 renders the same lists).
-# Absent-bias is byte-identical to the old skip form via the proven-zero
-# fill (hazard-1 posture: host-side fill loop, never a fill kernel); a
-# nonzero bias present when has_* is true is exercised; added_bias is
-# byte-exact against the explicit row-broadcast add.
+# Absent-bias is byte-identical to the old skip form via the load-time
+# proven zeros (hazard-1 posture: host-built zero tensors, never a fill
+# kernel); a nonzero bias present when has_* is true is exercised;
+# added_bias is byte-exact against the explicit row-broadcast add.
 #
 # Remaining law (recorded, not forced): block-level rows that EXECUTE the
 # @ kernel twins (dense_block_static / dense_block_cached_static — including
@@ -1232,8 +1498,9 @@ fn close_list(list<f32> got, list<f32> want) → bool {
 }
 
 # The card's fixture twins, built directly at this level (hazard-1 posture:
-# the absent record keeps the real bias FIELDS with has_* false — a wrapper
-# that consumed them anyway would change the absent bytes).
+# the absent record's bias FIELDS are the load-time proven zeros from
+# zeroed_biases with has_* false, so the always-add region consuming them
+# byte-preserves the absent case).
 # Flat→tensor conversions of named sources are failable in proba context
 # (SEM011); these pin helpers carry the do/catch, e1-style.
 fn pin_8(list<f32> data) → tensor<f32, [8]> {
@@ -1284,8 +1551,12 @@ fn krs4_present_layer() → transformer.TypedDenseLayer<8, 8, 8, 8> {
 }
 
 fn krs4_absent_layer() → transformer.TypedDenseLayer<8, 8, 8, 8> {
+    # The load-time zero policy (issue 72): the flagged record keeps the
+    # real bias FIELDS with has_* false (hazard-1 posture), and the
+    # zeroed_biases pass replaces them with proven zeros once, at assembly
+    # time — the step path then reads bq/bk/bv unconditionally.
     let transformer.TypedDenseLayer<8, 8, 8, 8> present ← krs4_present_layer()
-    return transformer.TypedDenseLayer {
+    let transformer.TypedDenseLayer<8, 8, 8, 8> flagged ← transformer.TypedDenseLayer {
         ln1 = present.ln1,
         wq = present.wq,
         bq = present.bq,
@@ -1302,6 +1573,7 @@ fn krs4_absent_layer() → transformer.TypedDenseLayer<8, 8, 8, 8> {
         wu = present.wu,
         wd = present.wd
     }
+    return transformer.zeroed_biases<size 8, size 8, size 8, size 8>(flagged)
 }
 describe "KRS-4 — typed QKV always-add region dense_qkv (MMG-C1 oracle)" {
     test "present-bias region bytes byte-identical to the pre-KRS-4 branched prologue" {
@@ -1310,19 +1582,11 @@ describe "KRS-4 — typed QKV always-add region dense_qkv (MMG-C1 oracle)" {
         assert layer.has_bk
         assert layer.has_bv
         let tensor<f32, [2, 8]> ln1 ← pin_28(DATA_X)
-        # wrapper bias-or-zero policy, flag-true arm (the real bias)
-        mut tensor<f32, [8]> bq_used ← tf32[8] {}
-        if layer.has_bq {
-            bq_used ← layer.bq
-        }
-        mut tensor<f32, [8]> bk_used ← tf32[8] {}
-        if layer.has_bk {
-            bk_used ← layer.bk
-        }
-        mut tensor<f32, [8]> bv_used ← tf32[8] {}
-        if layer.has_bv {
-            bv_used ← layer.bv
-        }
+        # wrapper bias policy: the record field, always — the load-time
+        # zeroed_biases pass guarantees absent biases are proven zeros
+        let tensor<f32, [8]> bq_used ← layer.bq
+        let tensor<f32, [8]> bk_used ← layer.bk
+        let tensor<f32, [8]> bv_used ← layer.bv
         # the region: three matmuls, bias ALWAYS added, tuple return
         let tuple<tensor<f32, [2, 8]>, tensor<f32, [2, 8]>, tensor<f32, [2, 8]>> qkv ← tuple<tensor<f32, [2, 8]>, tensor<f32, [2, 8]>, tensor<f32, [2, 8]>> [(ln1 · layer.wq).added_bias(bq_used), (ln1 · layer.wk).added_bias(bk_used), (ln1 · layer.wv).added_bias(bv_used)]
         # the pre-KRS-4 branched prologue (verbatim control flow), byte-equal in-run
@@ -1351,19 +1615,11 @@ describe "KRS-4 — typed QKV always-add region dense_qkv (MMG-C1 oracle)" {
         assert layer.has_bk ≡ false
         assert layer.has_bv ≡ false
         let tensor<f32, [2, 8]> ln1 ← pin_28(DATA_X)
-        # wrapper bias-or-zero policy, flag-false arm (the proven zero)
-        mut tensor<f32, [8]> bq_used ← tf32[8] {}
-        if layer.has_bq {
-            bq_used ← layer.bq
-        }
-        mut tensor<f32, [8]> bk_used ← tf32[8] {}
-        if layer.has_bk {
-            bk_used ← layer.bk
-        }
-        mut tensor<f32, [8]> bv_used ← tf32[8] {}
-        if layer.has_bv {
-            bv_used ← layer.bv
-        }
+        # wrapper bias policy: the record field, always — the absent record
+        # carries the load-time proven zeros from zeroed_biases
+        let tensor<f32, [8]> bq_used ← layer.bq
+        let tensor<f32, [8]> bk_used ← layer.bk
+        let tensor<f32, [8]> bv_used ← layer.bv
         let tuple<tensor<f32, [2, 8]>, tensor<f32, [2, 8]>, tensor<f32, [2, 8]>> qkv ← tuple<tensor<f32, [2, 8]>, tensor<f32, [2, 8]>, tensor<f32, [2, 8]>> [(ln1 · layer.wq).added_bias(bq_used), (ln1 · layer.wk).added_bias(bk_used), (ln1 · layer.wv).added_bias(bv_used)]
         # the pre-KRS-4 absent arm: the branch is skipped — bare matmul
         assert (qkv[0] ↦ list<f32>) ≡ ((ln1 · layer.wq) ↦ list<f32>)
@@ -1385,5 +1641,218 @@ describe "KRS-4 — typed QKV always-add region dense_qkv (MMG-C1 oracle)" {
         let tensor<f32, [2, 8]> ln1 ← pin_28(DATA_X)
         let tensor<f32, [2, 8]> explicit ← (ln1 · layer.wq) + pin_28(KRS4_BQ2X)
         assert ((ln1 · layer.wq).added_bias(layer.bq) ↦ list<f32>) ≡ (explicit ↦ list<f32>)
+    }
+}
+
+# -------------------------------------------------------------------------
+# Issue 72 — typed attention region oracle. The static twins' attention
+# kernels (dense_rope / dense_scores / dense_softmax / dense_context /
+# dense_out) execute here against the host staged gqa multi_head_attention
+# rows on the dense-block fixture config (T=2, D=16, Q=16, K=8, H=4 query
+# heads, 2 KV heads of width 4, scale 0.5): the kernels are called
+# directly with concrete sizes (the decode_step proba pattern), so these
+# rows run on the CPU device route even while block-level twin calls stay
+# blocked. Both rope policies are covered, including a partial rotation
+# width, and the cached row proves the prefix masking, the absolute
+# positions, and the cache write ordering over two steps.
+# -------------------------------------------------------------------------
+
+# Typed pins of the dense-block fixture (the pin_8 family, [16]/[8] widths).
+fn pin_2_16(list<f32> data) → tensor<f32, [2, 16]> {
+    do {
+        return data ↦ tensor<f32, [2, 16]>
+    }
+    catch conv {
+        return tf32[2, 16] {}
+    }
+}
+
+fn pin_16_16(list<f32> data) → tensor<f32, [16, 16]> {
+    do {
+        return data ↦ tensor<f32, [16, 16]>
+    }
+    catch conv {
+        return tf32[16, 16] {}
+    }
+}
+
+fn pin_16_8(list<f32> data) → tensor<f32, [16, 8]> {
+    do {
+        return data ↦ tensor<f32, [16, 8]>
+    }
+    catch conv {
+        return tf32[16, 8] {}
+    }
+}
+
+fn typed_x() → tensor<f32, [2, 16]> {
+    return pin_2_16(DATA_X_RAW)
+}
+
+fn typed_wq() → tensor<f32, [16, 16]> {
+    return pin_16_16(wq().data)
+}
+
+fn typed_wk() → tensor<f32, [16, 8]> {
+    return pin_16_8(wk().data)
+}
+
+fn typed_wv() → tensor<f32, [16, 8]> {
+    return pin_16_8(wv().data)
+}
+
+fn typed_wo() → tensor<f32, [16, 16]> {
+    return pin_16_16(wo().data)
+}
+
+# An interleaved-pair (qwen2) rope config for the second policy row.
+fn config_i() → rope.RopeConfig {
+    return rope.construct_rope_config((10000.0 ∷ f32), (1.0 ∷ f32), rope.interleaved_policy()) ⊥ rope.default()
+}
+
+# Element-wise [2, 16] compare of a typed result against a staged oracle.
+fn close_2_16(tensor<f32, [2, 16]> got, tensor.NumericBlock want) → bool {
+    for range 0 ‥ 2 let i {
+        for range 0 ‥ 16 let j {
+            if not got[[i, j]].approx(e2(want, i, j), TOLERANCE) {
+                return false
+            }
+        }
+    }
+    return true
+}
+
+# The typed attention region over fresh rows (prefix 0), kernels called
+# directly: rope q/k, flattened scores, softmax, context, output projection.
+fn typed_region_fresh(tensor<f32, [2, 16]> q, tensor<f32, [2, 8]> k, tensor<f32, [2, 8]> v, tensor<f32, [16, 16]> w_out, list<int> positions, int rope_width, int policy, f32 ln_theta) → tensor<f32, [2, 16]> {
+    mut list<i32> converted ← empty
+    for from positions let p {
+        converted.append(p ↦ i32 ⊥ 0)
+    }
+    mut tensor<i32, [2]> pos ← tensor<i32, [2]> {}
+    do {
+        pos ← converted ↦ tensor<i32, [2]>
+    }
+    catch conv {
+    }
+    mut tensor<f32, [2, 16]> qr ← tf32[2, 16] {}
+    mut tensor<f32, [2, 8]> kr ← tf32[2, 8] {}
+    transformer.dense_rope(q, pos, mut qr, 4, rope_width, policy, ln_theta, 1.0 ∷ f32)
+    transformer.dense_rope(k, pos, mut kr, 4, rope_width, policy, ln_theta, 1.0 ∷ f32)
+    let tensor<f32, [8, 2]> domain ← tf32[8, 2] {}
+    mut tensor<f32, [8, 2]> scores ← tf32[8, 2] {}
+    mut tensor<f32, [8, 2]> weights ← tf32[8, 2] {}
+    transformer.dense_scores(domain, qr, kr, mut scores, 4, 0, 2, 4, 0.5 ∷ f32)
+    transformer.dense_softmax(scores, mut weights)
+    let tensor<f32, [2, 16]> qdom ← tf32[2, 16] {}
+    mut tensor<f32, [2, 16]> context ← tf32[2, 16] {}
+    transformer.dense_context(qdom, weights, v, mut context, 4, 0, 2, 4)
+    return transformer.dense_out(context, w_out)
+}
+
+describe "typed static attention — issue 72 kernels vs the staged gqa oracle" {
+    test "consecutive-pair rope region matches gqa.multi_head_attention @ 5e-4" {
+        let tensor<f32, [2, 16]> x ← typed_x()
+        let tensor<f32, [2, 16]> q ← x · typed_wq()
+        let tensor<f32, [2, 8]> k ← x · typed_wk()
+        let tensor<f32, [2, 8]> v ← x · typed_wv()
+        let tensor.NumericBlock oracle ← gqa.multi_head_attention(tene((q ↦ list<f32>), [2, 16]), tene((k ↦ list<f32>), [2, 8]), tene((v ↦ list<f32>), [2, 8]), wo(), 4, 2, (0.5 ∷ f32), [0, 1], 4, config_p()) ⊥ tensor.default()
+        let tensor<f32, [2, 16]> got ← typed_region_fresh(q, k, v, typed_wo(), [0, 1], 4, 0, (100000.0 ∷ f32).ln())
+        assert close_2_16(got, oracle)
+    }
+    test "interleaved-pair rope region at partial width matches the oracle @ 5e-4" {
+        let tensor<f32, [2, 16]> x ← typed_x()
+        let tensor<f32, [2, 16]> q ← x · typed_wq()
+        let tensor<f32, [2, 8]> k ← x · typed_wk()
+        let tensor<f32, [2, 8]> v ← x · typed_wv()
+        let tensor.NumericBlock oracle ← gqa.multi_head_attention(tene((q ↦ list<f32>), [2, 16]), tene((k ↦ list<f32>), [2, 8]), tene((v ↦ list<f32>), [2, 8]), wo(), 4, 2, (0.5 ∷ f32), [0, 1], 2, config_i()) ⊥ tensor.default()
+        let tensor<f32, [2, 16]> got ← typed_region_fresh(q, k, v, typed_wo(), [0, 1], 2, 1, (10000.0 ∷ f32).ln())
+        assert close_2_16(got, oracle)
+    }
+}
+
+describe "typed cached attention — prefix masking and absolute positions" {
+    test "two cached steps match gqa.multi_head_attention_cached @ 5e-4" {
+        let tensor<f32, [2, 16]> x ← typed_x()
+        let tensor<f32, [2, 16]> q ← x · typed_wq()
+        let tensor<f32, [2, 8]> k ← x · typed_wk()
+        let tensor<f32, [2, 8]> v ← x · typed_wv()
+        let kv.KVCache fresh ← kv.empty_cache("proba", "1.0.0", "causal-rope-d4", "synthetic", 1, 8) ⊥ kv.default()
+        let gqa.CachedAttention step1 ← gqa.multi_head_attention_cached(tene((q ↦ list<f32>), [2, 16]), tene((k ↦ list<f32>), [2, 8]), tene((v ↦ list<f32>), [2, 8]), wo(), fresh, 4, 2, (0.5 ∷ f32), [0, 1], 4, config_p(), [5, 9]) ⊥ gqa.default_cached()
+        let gqa.CachedAttention step2 ← gqa.multi_head_attention_cached(tene((q ↦ list<f32>), [2, 16]), tene((k ↦ list<f32>), [2, 8]), tene((v ↦ list<f32>), [2, 8]), wo(), step1.state, 4, 2, (0.5 ∷ f32), [2, 3], 4, config_p(), [1, 2]) ⊥ gqa.default_cached()
+        # typed step 1: fresh rows, prefix 0
+        let tensor<f32, [2, 16]> got1 ← typed_region_fresh(q, k, v, typed_wo(), [0, 1], 4, 0, (100000.0 ∷ f32).ln())
+        assert close_2_16(got1, step1.context)
+        # typed step 2: prefix 2, absolute positions [2, 3], staged prefix
+        # pinned into the [4, 8] context view (the cached twin's seam)
+        mut list<i32> pos2 ← empty
+        pos2.append(2)
+        pos2.append(3)
+        mut tensor<i32, [2]> pt2 ← tensor<i32, [2]> {}
+        do {
+            pt2 ← pos2 ↦ tensor<i32, [2]>
+        }
+        catch conv {
+        }
+        mut tensor<f32, [2, 16]> qr2 ← tf32[2, 16] {}
+        mut tensor<f32, [2, 8]> kr2 ← tf32[2, 8] {}
+        transformer.dense_rope(q, pt2, mut qr2, 4, 4, 0, (100000.0 ∷ f32).ln(), 1.0 ∷ f32)
+        transformer.dense_rope(k, pt2, mut kr2, 4, 4, 0, (100000.0 ∷ f32).ln(), 1.0 ∷ f32)
+        mut list<f32> kdata ← copy step1.state.key.data
+        for from (kr2 ↦ list<f32>) let e {
+            kdata.append(e)
+        }
+        mut list<f32> vdata ← copy step1.state.payload.data
+        for from (v ↦ list<f32>) let e {
+            vdata.append(e)
+        }
+        mut tensor<f32, [4, 8]> k_all ← tf32[4, 8] {}
+        mut tensor<f32, [4, 8]> v_all ← tf32[4, 8] {}
+        do {
+            k_all ← kdata ↦ tensor<f32, [4, 8]>
+            v_all ← vdata ↦ tensor<f32, [4, 8]>
+        }
+        catch conv {
+        }
+        let tensor<f32, [8, 4]> dom2 ← tf32[8, 4] {}
+        mut tensor<f32, [8, 4]> sc2 ← tf32[8, 4] {}
+        mut tensor<f32, [8, 4]> w2 ← tf32[8, 4] {}
+        transformer.dense_scores(dom2, qr2, k_all, mut sc2, 4, 2, 2, 4, 0.5 ∷ f32)
+        transformer.dense_softmax(sc2, mut w2)
+        let tensor<f32, [2, 16]> cd2 ← tf32[2, 16] {}
+        mut tensor<f32, [2, 16]> c2 ← tf32[2, 16] {}
+        transformer.dense_context(cd2, w2, v_all, mut c2, 4, 2, 2, 4)
+        let tensor<f32, [2, 16]> got2 ← transformer.dense_out(c2, typed_wo())
+        assert close_2_16(got2, step2.context)
+        assert step2.state.length() ≡ 4
+    }
+}
+
+describe "zeroed_biases — the load-time absent-bias policy" {
+    test "absent biases become proven zeros; present biases are kept byte-exact" {
+        let transformer.TypedDenseLayer<8, 8, 8, 8> present ← krs4_present_layer()
+        let transformer.TypedDenseLayer<8, 8, 8, 8> layered ← transformer.zeroed_biases<size 8, size 8, size 8, size 8>(krs4_absent_layer())
+        assert layered.has_bq ≡ false
+        assert layered.has_bk ≡ false
+        assert layered.has_bv ≡ false
+        # the absent fields are all zeros
+        for from (layered.bq ↦ list<f32>) let z {
+            assert z ≡ (0.0 ∷ f32)
+        }
+        for from (layered.bk ↦ list<f32>) let z {
+            assert z ≡ (0.0 ∷ f32)
+        }
+        for from (layered.bv ↦ list<f32>) let z {
+            assert z ≡ (0.0 ∷ f32)
+        }
+        # the other weights pass through untouched
+        assert (layered.bq ↦ list<f32>).length() ≡ 8
+        assert (layered.wq ↦ list<f32>) ≡ (present.wq ↦ list<f32>)
+        assert (layered.wo ↦ list<f32>) ≡ (present.wo ↦ list<f32>)
+        # a present-bias record is returned unchanged
+        let transformer.TypedDenseLayer<8, 8, 8, 8> kept ← transformer.zeroed_biases<size 8, size 8, size 8, size 8>(present)
+        assert (kept.bq ↦ list<f32>) ≡ (present.bq ↦ list<f32>)
+        assert (kept.bk ↦ list<f32>) ≡ (present.bk ↦ list<f32>)
+        assert (kept.bv ↦ list<f32>) ≡ (present.bv ↦ list<f32>)
     }
 }
