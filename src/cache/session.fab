@@ -444,12 +444,30 @@ fn commit_prefix<size C, size W, size KVD>(mut SessionState<size C, size W, size
         return
     }
 
+    # Validate all FullKv and RingKv bounds before mutating either arena so
+    # partial or wraparound-overflow commits fail closed atomically.
     for exclusive base.full_kv.slot_ids.length() let i {
         let int base_len ← br.base_full_lengths[i]
         let int draft_len ← br.draft.full_kv.lengths[i]
         if draft_len ≻ base_len {
             require base_len + accepted_count ≤ draft_len throw variant OutOfBoundsPosition { message = "accepted_count exceeds drafted FullKv tokens" }
+        }
+    }
 
+    for exclusive base.ring_kv.slot_ids.length() let i {
+        let int base_tw ← br.base_ring_written[i]
+        let int draft_tw ← br.draft.ring_kv.total_written[i]
+        if draft_tw ≻ base_tw {
+            require base_tw + accepted_count ≤ draft_tw throw variant OutOfBoundsPosition { message = "accepted_count exceeds drafted RingKv tokens" }
+            let int win ← base.ring_kv.window_sizes[i]
+            require draft_tw - base_tw ≤ win throw variant OutOfBoundsPosition { message = "drafted RingKv tokens (§) exceed ring window (§); wraparound overwrote accepted slots"((draft_tw - base_tw) ↦ string, win ↦ string) }
+        }
+    }
+
+    for exclusive base.full_kv.slot_ids.length() let i {
+        let int base_len ← br.base_full_lengths[i]
+        let int draft_len ← br.draft.full_kv.lengths[i]
+        if draft_len ≻ base_len {
             let tensor<f32, [C, KVD]> dk ← br.draft.full_kv.keys[i]
             let tensor<f32, [C, KVD]> dv ← br.draft.full_kv.values[i]
             mut tensor<f32, [C, KVD]> bk ← base.full_kv.keys[i]
@@ -468,8 +486,6 @@ fn commit_prefix<size C, size W, size KVD>(mut SessionState<size C, size W, size
         let int base_tw ← br.base_ring_written[i]
         let int draft_tw ← br.draft.ring_kv.total_written[i]
         if draft_tw ≻ base_tw {
-            require base_tw + accepted_count ≤ draft_tw throw variant OutOfBoundsPosition { message = "accepted_count exceeds drafted RingKv tokens" }
-
             let tensor<f32, [W, KVD]> dk ← br.draft.ring_kv.keys[i]
             let tensor<f32, [W, KVD]> dv ← br.draft.ring_kv.values[i]
             mut tensor<f32, [W, KVD]> bk ← base.ring_kv.keys[i]
@@ -727,6 +743,56 @@ test "SessionState m-of-k commit_prefix advances FullKv and wraparound RingKv" {
         assert close(committed_fk[[2, 0]], 5.0)
         assert close(committed_fk[[3, 0]], 7.0)
         assert close(committed_fk[[4, 0]], 0.0)
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "SessionState commit_prefix fails closed when ring draft exceeds window" {
+    let list<schedule.AttentionKind> attns ← [
+        variant schedule.AttentionKind.SlidingWindow { window = 4 },
+        variant schedule.AttentionKind.Full
+    ]
+    let list<schedule.RopeKind> ropes ← [
+        variant schedule.RopeKind.Standard,
+        variant schedule.RopeKind.None
+    ]
+    do {
+        let schedule.ExecutionSchedule sched ← schedule.patterned_schedule(attns, ropes, 0, [])
+        mut session.SessionState<16, 4, 4> sess ← session.from_schedule<size 16, size 4, size 4>(sched)
+
+        mut tensor<f32, [4]> k_base ← tf32[4] {}
+        mut tensor<f32, [4]> k_rej ← tf32[4] {}
+        for exclusive 4 let j {
+            k_base[[j]] ← 2.0
+            k_rej[[j]] ← 99.0
+        }
+        for exclusive 4 let p {
+            session.write_kv(mut sess, 0, k_base, k_base, p ↦ i32 ⊥ 0)
+        }
+
+        mut session.SessionBranch<16, 4, 4> br ← session.branch<size 16, size 4, size 4>(sess)
+        # Draft 5 tokens into a window-4 ring (wraps and clobbers slot 0).
+        for range 4 ‥ 9 let p {
+            session.write_kv(mut br.draft, 0, k_rej, k_rej, p ↦ i32 ⊥ 0)
+        }
+        session.write_kv(mut br.draft, 1, k_rej, k_rej, 0 ∷ i32)
+
+        mut bool threw ← false
+        do {
+            session.commit_prefix(mut sess, br, 1)
+            assert false
+        }
+        catch err {
+            threw ← true
+        }
+        assert threw
+
+        assert sess.ring_kv.total_written[0] ≡ 4
+        assert sess.full_kv.lengths[0] ≡ 0
+        let tensor<f32, [4, 4]> base_rk ← sess.ring_kv.keys[0]
+        assert close(base_rk[[0, 0]], 2.0)
     }
     catch err {
         assert false
