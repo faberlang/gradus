@@ -69,6 +69,19 @@ class RingKvArena<size W, size KVD> {
 }
 
 @ public
+class KvQuantConfig {
+    let int key_bits
+    let int value_bits
+    let int group_size
+    let bool enabled
+}
+
+@ public
+fn default_kv_quant() → KvQuantConfig {
+    return KvQuantConfig { key_bits = 0, value_bits = 0, group_size = 0, enabled = false }
+}
+
+@ public
 class SessionState<size C, size W, size KVD> {
     let schedule.ExecutionSchedule sched
     mut FullKvArena<size C, size KVD> full_kv
@@ -76,6 +89,14 @@ class SessionState<size C, size W, size KVD> {
     let list<int> slot_arena_kind
     let list<int> slot_local_index
     let list<int> slot_window_sizes
+    mut list<KvQuantConfig> slot_kv_quant
+}
+
+@ public
+class SessionBranch<size C, size W, size KVD> {
+    mut SessionState<size C, size W, size KVD> draft
+    let list<int> base_full_lengths
+    let list<int> base_ring_written
 }
 
 # -------------------------------------------------------------------------
@@ -144,11 +165,14 @@ fn from_schedule<size C, size W, size KVD>(schedule.ExecutionSchedule sched) →
     mut list<int> slot_arena_kind ← empty
     mut list<int> slot_local_index ← empty
     mut list<int> slot_window_sizes ← empty
+    mut list<KvQuantConfig> slot_kv_quant ← empty
 
     for exclusive sched.slots.length() let expected_slot {
         let schedule.SlotSpec sp ← sched.slots[expected_slot]
 
         require sp.slot_id ≡ expected_slot throw variant InvalidSchedule { message = "schedule slots must be contiguous from 0 (expected §, got §)"(expected_slot ↦ string, sp.slot_id ↦ string) }
+
+        slot_kv_quant.append(default_kv_quant())
 
         match sp.arena {
             case schedule.ArenaKind.FullKv {
@@ -193,7 +217,7 @@ fn from_schedule<size C, size W, size KVD>(schedule.ExecutionSchedule sched) →
 
     let FullKvArena<size C, size KVD> full_arena ← FullKvArena { capacity = C, kv_dim = KVD, slot_ids = full_slot_ids, keys = full_keys, values = full_values, lengths = full_lengths }
     let RingKvArena<size W, size KVD> ring_arena ← RingKvArena { max_window = W, kv_dim = KVD, slot_ids = ring_slot_ids, window_sizes = ring_windows, keys = ring_keys, values = ring_values, total_written = ring_written }
-    return SessionState { sched = sched, full_kv = full_arena, ring_kv = ring_arena, slot_arena_kind = slot_arena_kind, slot_local_index = slot_local_index, slot_window_sizes = slot_window_sizes }
+    return SessionState { sched = sched, full_kv = full_arena, ring_kv = ring_arena, slot_arena_kind = slot_arena_kind, slot_local_index = slot_local_index, slot_window_sizes = slot_window_sizes, slot_kv_quant = slot_kv_quant }
 }
 
 @ public
@@ -321,6 +345,154 @@ fn softmax_full<size H, size C>(tensor<f32, [H, C]> sc, mut tensor<f32, [H, C]> 
 @ public
 fn softmax_ring<size H, size W>(tensor<f32, [H, W]> sc, mut tensor<f32, [H, W]> probs) → void {
     ds.row_softmax(sc, mut probs)
+}
+
+# -------------------------------------------------------------------------
+# Per-slot KV-quant policy metadata & transactional branch/commit/rollback
+# -------------------------------------------------------------------------
+
+@ public
+fn set_slot_kv_quant<size C, size W, size KVD>(mut SessionState<size C, size W, size KVD> sess, int slot_id, KvQuantConfig cfg) → void ⇥ SessionError {
+    check_slot(sess, slot_id)
+    require cfg.key_bits ≥ 0 and cfg.value_bits ≥ 0 and cfg.group_size ≥ 0 throw variant InvalidCapacity { message = "KvQuantConfig fields must be non-negative" }
+    sess.slot_kv_quant[slot_id] ← cfg
+}
+
+@ public
+kernel copy_mat<size R, size C>(tensor<f32, [R, C]> src, mut tensor<f32, [R, C]> dst) → void {
+    for from dst at [r, c] thread lane let e {
+        dst[[r, c]] ← src[[r, c]]
+    }
+}
+
+@ public
+kernel copy_row_range<size R, size C>(tensor<f32, [R, C]> src, mut tensor<f32, [R, C]> dst, i32 start_row, i32 count) → void {
+    for from dst at [r, c] thread lane let e {
+        let i32 ri ← (r ↦ i32) ∧ 65535
+        if ri ≥ start_row and ri ≺ start_row + count {
+            dst[[r, c]] ← src[[r, c]]
+        }
+    }
+}
+
+@ public
+kernel copy_ring_range<size W, size KVD>(tensor<f32, [W, KVD]> src, mut tensor<f32, [W, KVD]> dst, i32 start_pos, i32 count, i32 win) → void {
+    for from dst at [r, c] thread lane let e {
+        let i32 ri ← (r ↦ i32) ∧ 65535
+        if win ≥ 1 and win ≤ 4096 and count ≥ 0 and count ≤ 4096 {
+            mut i32 matched ← 0 ∷ i32
+            for exclusive count let step {
+                let i32 si ← (step ↦ i32 ⊥ 0) ∧ 4095
+                let i32 slot ← (start_pos + si) % win
+                if slot ≡ ri {
+                    matched ← 1 ∷ i32
+                }
+            }
+            if matched ≡ (1 ∷ i32) {
+                dst[[r, c]] ← src[[r, c]]
+            }
+        }
+    }
+}
+
+@ public
+fn branch<size C, size W, size KVD>(SessionState<size C, size W, size KVD> base) → SessionBranch<size C, size W, size KVD> ⇥ SessionError {
+    mut SessionState<size C, size W, size KVD> draft ← from_schedule<size C, size W, size KVD>(base.sched)
+    mut list<int> base_full_lengths ← empty
+    mut list<int> base_ring_written ← empty
+
+    for exclusive base.full_kv.slot_ids.length() let i {
+        let tensor<f32, [C, KVD]> sk ← base.full_kv.keys[i]
+        let tensor<f32, [C, KVD]> sv ← base.full_kv.values[i]
+        mut tensor<f32, [C, KVD]> dk ← draft.full_kv.keys[i]
+        mut tensor<f32, [C, KVD]> dv ← draft.full_kv.values[i]
+        copy_mat<size C, size KVD>(sk, mut dk)
+        copy_mat<size C, size KVD>(sv, mut dv)
+        draft.full_kv.keys[i] ← dk
+        draft.full_kv.values[i] ← dv
+        let int len ← base.full_kv.lengths[i]
+        draft.full_kv.lengths[i] ← len
+        base_full_lengths.append(len)
+    }
+
+    for exclusive base.ring_kv.slot_ids.length() let i {
+        let tensor<f32, [W, KVD]> sk ← base.ring_kv.keys[i]
+        let tensor<f32, [W, KVD]> sv ← base.ring_kv.values[i]
+        mut tensor<f32, [W, KVD]> dk ← draft.ring_kv.keys[i]
+        mut tensor<f32, [W, KVD]> dv ← draft.ring_kv.values[i]
+        copy_mat<size W, size KVD>(sk, mut dk)
+        copy_mat<size W, size KVD>(sv, mut dv)
+        draft.ring_kv.keys[i] ← dk
+        draft.ring_kv.values[i] ← dv
+        let int tw ← base.ring_kv.total_written[i]
+        draft.ring_kv.total_written[i] ← tw
+        base_ring_written.append(tw)
+    }
+
+    for exclusive base.slot_kv_quant.length() let s {
+        draft.slot_kv_quant[s] ← base.slot_kv_quant[s]
+    }
+
+    return SessionBranch { draft = draft, base_full_lengths = base_full_lengths, base_ring_written = base_ring_written }
+}
+
+@ public
+fn commit_prefix<size C, size W, size KVD>(mut SessionState<size C, size W, size KVD> base, SessionBranch<size C, size W, size KVD> br, int accepted_count) → void ⇥ SessionError {
+    require accepted_count ≥ 0 throw variant OutOfBoundsPosition { message = "accepted_count must be non-negative" }
+    if accepted_count ≡ 0 {
+        return
+    }
+
+    for exclusive base.full_kv.slot_ids.length() let i {
+        let int base_len ← br.base_full_lengths[i]
+        let int draft_len ← br.draft.full_kv.lengths[i]
+        if draft_len ≻ base_len {
+            require base_len + accepted_count ≤ draft_len throw variant OutOfBoundsPosition { message = "accepted_count exceeds drafted FullKv tokens" }
+
+            let tensor<f32, [C, KVD]> dk ← br.draft.full_kv.keys[i]
+            let tensor<f32, [C, KVD]> dv ← br.draft.full_kv.values[i]
+            mut tensor<f32, [C, KVD]> bk ← base.full_kv.keys[i]
+            mut tensor<f32, [C, KVD]> bv ← base.full_kv.values[i]
+            let i32 start_i32 ← base_len ↦ i32 ⊥ 0
+            let i32 count_i32 ← accepted_count ↦ i32 ⊥ 0
+            copy_row_range<size C, size KVD>(dk, mut bk, start_i32, count_i32)
+            copy_row_range<size C, size KVD>(dv, mut bv, start_i32, count_i32)
+            base.full_kv.keys[i] ← bk
+            base.full_kv.values[i] ← bv
+            base.full_kv.lengths[i] ← base_len + accepted_count
+        }
+    }
+
+    for exclusive base.ring_kv.slot_ids.length() let i {
+        let int base_tw ← br.base_ring_written[i]
+        let int draft_tw ← br.draft.ring_kv.total_written[i]
+        if draft_tw ≻ base_tw {
+            require base_tw + accepted_count ≤ draft_tw throw variant OutOfBoundsPosition { message = "accepted_count exceeds drafted RingKv tokens" }
+
+            let tensor<f32, [W, KVD]> dk ← br.draft.ring_kv.keys[i]
+            let tensor<f32, [W, KVD]> dv ← br.draft.ring_kv.values[i]
+            mut tensor<f32, [W, KVD]> bk ← base.ring_kv.keys[i]
+            mut tensor<f32, [W, KVD]> bv ← base.ring_kv.values[i]
+            let i32 start_i32 ← base_tw ↦ i32 ⊥ 0
+            let i32 count_i32 ← accepted_count ↦ i32 ⊥ 0
+            let i32 win_i32 ← base.ring_kv.window_sizes[i] ↦ i32 ⊥ 1
+            copy_ring_range<size W, size KVD>(dk, mut bk, start_i32, count_i32, win_i32)
+            copy_ring_range<size W, size KVD>(dv, mut bv, start_i32, count_i32, win_i32)
+            base.ring_kv.keys[i] ← bk
+            base.ring_kv.values[i] ← bv
+            base.ring_kv.total_written[i] ← base_tw + accepted_count
+        }
+    }
+}
+
+@ public
+fn rollback<size C, size W, size KVD>(mut SessionBranch<size C, size W, size KVD> br) → void {
+    for exclusive br.base_full_lengths.length() let i {
+        br.draft.full_kv.lengths[i] ← br.base_full_lengths[i]
+    }
+    for exclusive br.base_ring_written.length() let i {
+        br.draft.ring_kv.total_written[i] ← br.base_ring_written[i]
+    }
 }
 
 +++ faber test
@@ -460,6 +632,100 @@ test "SessionState hybrid FullKvArena + RingKvArena(513) wraparound and windowed
         mut tensor<f32, [4]> rctx ← tf32[4] {}
         session.context_ring(sess.ring_kv, 0, cdom, rpr, mut rctx, 513 ∷ i32, 1 ∷ i32, 4 ∷ i32)
         assert rctx[[0]] ≻ 1.7 and rctx[[0]] ≺ 1.85
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "SessionState transactional branch and rollback preserve base bit-for-bit" {
+    let schedule.ExecutionSchedule sched ← mk_hybrid_flint_sched()
+    do {
+        mut session.SessionState<16, 513, 4> sess ← session.from_schedule<size 16, size 513, size 4>(sched)
+
+        let session.KvQuantConfig kvq ← session.KvQuantConfig { key_bits = 8, value_bits = 8, group_size = 64, enabled = false }
+        session.set_slot_kv_quant(mut sess, 1, kvq)
+        assert sess.slot_kv_quant[1].key_bits ≡ 8
+        assert sess.slot_kv_quant[1].enabled ≡ false
+
+        mut tensor<f32, [4]> k_base ← tf32[4] {}
+        mut tensor<f32, [4]> v_base ← tf32[4] {}
+        for exclusive 4 let j {
+            k_base[[j]] ← 1.0
+            v_base[[j]] ← 2.0
+        }
+        session.write_kv(mut sess, 0, k_base, v_base, 0 ∷ i32)
+        session.write_kv(mut sess, 0, k_base, v_base, 512 ∷ i32)
+        session.write_kv(mut sess, 1, k_base, v_base, 0 ∷ i32)
+        session.write_kv(mut sess, 1, k_base, v_base, 1 ∷ i32)
+
+        mut session.SessionBranch<16, 513, 4> br1 ← session.branch<size 16, size 513, size 4>(sess)
+        mut tensor<f32, [4]> k_bad ← tf32[4] {}
+        mut tensor<f32, [4]> v_bad ← tf32[4] {}
+        for exclusive 4 let j {
+            k_bad[[j]] ← 99.0
+            v_bad[[j]] ← 88.0
+        }
+        session.write_kv(mut br1.draft, 0, k_bad, v_bad, 513 ∷ i32)
+        session.write_kv(mut br1.draft, 1, k_bad, v_bad, 2 ∷ i32)
+        session.rollback(mut br1)
+
+        assert sess.ring_kv.total_written[0] ≡ 513
+        assert sess.full_kv.lengths[0] ≡ 2
+        let tensor<f32, [513, 4]> base_rk0 ← sess.ring_kv.keys[0]
+        let tensor<f32, [16, 4]> base_fk0 ← sess.full_kv.keys[0]
+        assert close(base_rk0[[0, 0]], 1.0)
+        assert close(base_fk0[[2, 0]], 0.0)
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "SessionState m-of-k commit_prefix advances FullKv and wraparound RingKv" {
+    let schedule.ExecutionSchedule sched ← mk_hybrid_flint_sched()
+    do {
+        mut session.SessionState<16, 513, 4> sess ← session.from_schedule<size 16, size 513, size 4>(sched)
+
+        mut tensor<f32, [4]> k_base ← tf32[4] {}
+        mut tensor<f32, [4]> v_base ← tf32[4] {}
+        for exclusive 4 let j {
+            k_base[[j]] ← 1.0
+            v_base[[j]] ← 2.0
+        }
+        session.write_kv(mut sess, 0, k_base, v_base, 0 ∷ i32)
+        session.write_kv(mut sess, 0, k_base, v_base, 512 ∷ i32)
+        session.write_kv(mut sess, 1, k_base, v_base, 0 ∷ i32)
+        session.write_kv(mut sess, 1, k_base, v_base, 1 ∷ i32)
+
+        mut session.SessionBranch<16, 513, 4> br2 ← session.branch<size 16, size 513, size 4>(sess)
+        mut tensor<f32, [4]> k_acc1 ← tf32[4] {}
+        mut tensor<f32, [4]> k_acc2 ← tf32[4] {}
+        mut tensor<f32, [4]> k_rej3 ← tf32[4] {}
+        for exclusive 4 let j {
+            k_acc1[[j]] ← 5.0
+            k_acc2[[j]] ← 7.0
+            k_rej3[[j]] ← 77.0
+        }
+        session.write_kv(mut br2.draft, 0, k_acc1, k_acc1, 513 ∷ i32)
+        session.write_kv(mut br2.draft, 0, k_acc2, k_acc2, 514 ∷ i32)
+        session.write_kv(mut br2.draft, 0, k_rej3, k_rej3, 515 ∷ i32)
+        session.write_kv(mut br2.draft, 1, k_acc1, k_acc1, 2 ∷ i32)
+        session.write_kv(mut br2.draft, 1, k_acc2, k_acc2, 3 ∷ i32)
+        session.write_kv(mut br2.draft, 1, k_rej3, k_rej3, 4 ∷ i32)
+
+        session.commit_prefix(mut sess, br2, 2)
+
+        assert sess.ring_kv.total_written[0] ≡ 515
+        assert sess.full_kv.lengths[0] ≡ 4
+        let tensor<f32, [513, 4]> committed_rk ← sess.ring_kv.keys[0]
+        let tensor<f32, [16, 4]> committed_fk ← sess.full_kv.keys[0]
+        assert close(committed_rk[[0, 0]], 5.0)
+        assert close(committed_rk[[1, 0]], 7.0)
+        assert close(committed_rk[[2, 0]], 0.0)
+        assert close(committed_fk[[2, 0]], 5.0)
+        assert close(committed_fk[[3, 0]], 7.0)
+        assert close(committed_fk[[4, 0]], 0.0)
     }
     catch err {
         assert false
