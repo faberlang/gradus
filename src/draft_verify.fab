@@ -257,12 +257,15 @@ fn verify_generate<size C, size W, size KVD>(config.GenerationConfig g, list<int
     }
 
     # position = the count of consumed tokens = the index the next
-    # consumed token occupies.
+    # consumed token occupies. The loop gate mirrors the baseline's
+    # cursor (`prompt + emitted < context`): a token at the final context
+    # slot is emitted but never consumed, exactly as decoder.generate
+    # stops before decoding it.
     mut int position ← prompt_ids.length()
     mut int emitted ← 0
     mut bool finished ← false
 
-    while emitted ≺ g.max_tokens and position ≺ g.context and not finished {
+    while emitted ≺ g.max_tokens and prompt_ids.length() + emitted ≺ g.context and not finished {
         let int depth ← speculative.next_depth(ctx.adaptive_budget)
         let speculative.ProviderResult result ← draft_round(prompt_ids, ctx.token_history, depth, g)
 
@@ -280,7 +283,7 @@ fn verify_generate<size C, size W, size KVD>(config.GenerationConfig g, list<int
             if decoder.is_eog(g, token) {
                 finished ← true
             }
-            elif emitted ≺ g.max_tokens and position ≺ g.context {
+            elif emitted ≺ g.max_tokens and position + 1 ≺ g.context {
                 last ← step_logits(token, position, m)
                 write_plain_all<size C, size W, size KVD>(mut sess, token, position)
                 position ← position + 1
@@ -315,7 +318,11 @@ fn verify_generate<size C, size W, size KVD>(config.GenerationConfig g, list<int
                     break
                 }
 
-                if frontier_base + accepted_ids.length() ≥ g.context {
+                # The baseline consumes a token at position q only when
+                # q + 1 < context, so a candidate at the final context
+                # slot is emitted (by the decision) but never accepted
+                # (never consumed).
+                if frontier_base + accepted_ids.length() ≥ g.context - 1 {
                     break
                 }
 
@@ -394,8 +401,10 @@ fn verify_generate<size C, size W, size KVD>(config.GenerationConfig g, list<int
 
             # Eagerly consume the last kept token when the loop
             # continues, so the next round decides from the post-token
-            # state (baseline parity) and the session takes its row.
-            if not finished and emitted ≺ g.max_tokens and position ≺ g.context {
+            # state (baseline parity) and the session takes its row. The
+            # final context slot's token stays unconsumed, as in the
+            # baseline.
+            if not finished and emitted ≺ g.max_tokens and position + 1 ≺ g.context {
                 let int tail ← kept.get(kept.length() - 1) coalesce 0
                 last ← step_logits(tail, position, m)
                 write_plain_all<size C, size W, size KVD>(mut sess, tail, position)
@@ -634,6 +643,38 @@ describe "SD6-U3 — draft-and-verify coordinator" {
             assert sess.txn_depth ≡ 0
         }
         match trap_result_3 {
+            case returned let ? { }
+            case thrown let ? { assert false }
+        }
+    }
+    test "a context-limited run (prompt + max_tokens beyond the context) keeps both parity contracts" {
+        let _ trap_result_ctx ← trap {
+            # Admitted config: only max_prompt ≤ context and max_tokens ≤
+            # context are checked, so the stream is cut by the context at
+            # prompt 8 + 8 emitted, and the final slot's token is emitted
+            # but never consumed — on the all-divergence prompt and the
+            # full-acceptance prompt alike.
+            let config.GenerationConfig base ← baseline_generation(empty, 16)
+            let config.GenerationConfig accel ← verify_generation(empty, 16)
+            let list<int> prompt_d ← [1, 2, 1, 2, 1, 2, 1, 2]
+            let list<int> prompt_f ← [0, 0, 0, 0, 0, 0, 0, 0]
+            let list<int> baseline_d ← decoder.generate(base, prompt_d, target_p()) ⊥ empty
+            let list<int> baseline_f ← decoder.generate(base, prompt_f, target_p()) ⊥ empty
+            assert baseline_d.length() ≡ 8
+            assert baseline_f.length() ≡ 8
+
+            mut session.SessionState<16, 1, 4> sess_d ← sess_p()
+            let draft_verify.VerifyRun run_d ← draft_verify.verify_generate<size 16, size 1, size 4>(accel, prompt_d, target_p(), mut sess_d) ⊥ draft_verify.default_run()
+            assert run_d.tokens ≡ baseline_d
+            assert sessions_agree(sess_d, replay_reference(consumed_of(prompt_d, run_d.tokens)))
+
+            mut session.SessionState<16, 1, 4> sess_f ← sess_p()
+            let draft_verify.VerifyRun run_f ← draft_verify.verify_generate<size 16, size 1, size 4>(accel, prompt_f, target_p(), mut sess_f) ⊥ draft_verify.default_run()
+            assert run_f.tokens ≡ baseline_f
+            assert sessions_agree(sess_f, replay_reference(consumed_of(prompt_f, run_f.tokens)))
+            assert sess_f.txn_depth ≡ 0
+        }
+        match trap_result_ctx {
             case returned let ? { }
             case thrown let ? { assert false }
         }
