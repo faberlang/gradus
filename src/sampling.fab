@@ -197,7 +197,20 @@ fn sample(list<f32> logits, Config c, list<int> history, random.Seed seed) → S
 
     if c.temperature ≤ 0.0 then return Sampler { token_id = logits.argmax() coalesce 0, seed = seed }
 
-    return draw(filtered(logits, c, history), seed)
+    let list<f32> penalized ← repetition_penalty(logits, history, c.repetition_penalty)
+    let list<f32> scaled ← temperature_scale(penalized, c.temperature)
+
+    if c.top_k ≻ 0 and c.top_k ≺ scaled.length() {
+        let CompactTopK k_limited ← top_k_compact(scaled, c.top_k)
+        let list<f32> probs ← softmax_dense(k_limited.values)
+        let list<f32> p_limited ← top_p(probs, c.top_p)
+        let Sampler drawn ← draw(min_p(p_limited, c.min_p), seed)
+        return Sampler { token_id = k_limited.ids.get(drawn.token_id) coalesce 0, seed = drawn.seed }
+    }
+
+    let list<f32> probs ← softmax_dense(scaled)
+    let list<f32> p_limited ← top_p(probs, c.top_p)
+    return draw(min_p(p_limited, c.min_p), seed)
 }
 
 # -------------------------------------------------------------------------
@@ -228,18 +241,29 @@ fn sample_candidates(list<f32> values, list<int> ids, Config c, list<int> histor
 
     mut list<int> positions ← empty
 
-    for from history let t {
-        let int at ← candidate_position(ids, t)
+    if c.repetition_penalty ≇ (1.0 ∷ f32) and history.length() ≻ 0 {
+        for from history let t {
+            let int at ← candidate_position(ids, t)
 
-        if at ≥ 0 {
-            positions.append(at)
+            if at ≥ 0 {
+                positions.append(at)
+            }
         }
     }
 
     let list<f32> penalized ← repetition_penalty(values, positions, c.repetition_penalty)
     let list<f32> scaled ← temperature_scale(penalized, c.temperature)
-    let TopKResult k_limited ← top_k(scaled, c.top_k)
-    let list<f32> probs ← softmax(k_limited.values, k_limited.keep)
+
+    if c.top_k ≻ 0 and c.top_k ≺ scaled.length() {
+        let CompactTopK k_limited ← top_k_compact(scaled, c.top_k)
+        let list<f32> probs ← softmax_dense(k_limited.values)
+        let list<f32> p_limited ← top_p(probs, c.top_p)
+        let Sampler drawn ← draw(min_p(p_limited, c.min_p), seed)
+        let int picked ← k_limited.ids.get(drawn.token_id) coalesce 0
+        return Sampler { token_id = ids.get(picked) coalesce 0, seed = drawn.seed }
+    }
+
+    let list<f32> probs ← softmax_dense(scaled)
     let list<f32> p_limited ← top_p(probs, c.top_p)
     let Sampler drawn ← draw(min_p(p_limited, c.min_p), seed)
     return Sampler { token_id = ids.get(drawn.token_id) coalesce 0, seed = drawn.seed }
@@ -304,17 +328,36 @@ fn filtered(list<f32> logits, Config c, list<int> history) → list<f32> {
         # Keep: constant fill of a fresh list; no covering fill construct.
         mut list<f32> degenerate ← empty
 
-        for range 0 ‥ logits.length() let i {
+        for range 0 ‥ logits.length() {
             degenerate.append(0.0)
         }
 
-        return replace_at(degenerate, logits.argmax() coalesce 0, 1.0)
+        degenerate[logits.argmax() coalesce 0] ← 1.0
+        return degenerate
     }
 
     let list<f32> penalized ← repetition_penalty(logits, history, c.repetition_penalty)
     let list<f32> scaled ← temperature_scale(penalized, c.temperature)
-    let TopKResult k_limited ← top_k(scaled, c.top_k)
-    let list<f32> probs ← softmax(k_limited.values, k_limited.keep)
+
+    if c.top_k ≻ 0 and c.top_k ≺ scaled.length() {
+        let CompactTopK k_limited ← top_k_compact(scaled, c.top_k)
+        let list<f32> probs ← softmax_dense(k_limited.values)
+        let list<f32> p_limited ← top_p(probs, c.top_p)
+        let list<f32> kept ← min_p(p_limited, c.min_p)
+        mut list<f32> out ← empty
+
+        for range 0 ‥ scaled.length() {
+            out.append(0.0)
+        }
+
+        for range 0 ‥ k_limited.ids.length() let j {
+            out[k_limited.ids.get(j) coalesce 0] ← kept.get(j) coalesce 0.0 ∷ f32
+        }
+
+        return out
+    }
+
+    let list<f32> probs ← softmax_dense(scaled)
     let list<f32> p_limited ← top_p(probs, c.top_p)
     return min_p(p_limited, c.min_p)
 }
@@ -422,40 +465,13 @@ fn mask_false(int n) → list<bool> {
     return m
 }
 
-# A true mask of length n.
-fn mask_true(int n) → list<bool> {
-    # Keep: constant fill; no covering fill construct.
-    mut list<bool> m ← empty
-
-    for range 0 ‥ n {
-        m.append(true)
-    }
-
-    return m
-}
-
-# The list with position i replaced by v (pure rebuild).
-fn replace_at(list<f32> xs, int i, f32 v) → list<f32> {
-    # Keep: indexed rebuild; no index-carrying map form exists.
-    mut list<f32> out ← empty
-
-    for range 0 ‥ xs.length() let j {
-        if j ≡ i {
-            out.append(v)
-        }
-        else {
-            out.append(xs.get(j) coalesce 0.0 ∷ f32)
-        }
-    }
-
-    return out
-}
-
 # Step 1 — repetition penalty over the history tokens (llama.cpp rule:
 # positive logits divide by penalty, non-positive multiply by penalty).
 # One vocab copy, then one in-place apply per history token (O(V + history);
 # a token listed twice is penalized twice, matching the nested-scan rule).
 fn repetition_penalty(list<f32> logits, list<int> history, f32 penalty) → list<f32> {
+    if penalty ≡ (1.0 ∷ f32) or history.length() ≡ 0 then return logits
+
     # Keep: identity carrier copy (no clone intrinsic) feeding an in-place
     # scatter over history indices; no covering copy/scatter construct.
     mut list<f32> out ← empty
@@ -480,95 +496,102 @@ fn repetition_penalty(list<f32> logits, list<int> history, f32 penalty) → list
 
 # Step 2 — temperature scaling (pure per-element division).
 fn temperature_scale(list<f32> logits, f32 τ) → list<f32> {
+    if τ ≡ (1.0 ∷ f32) then return logits
+
     return logits.map(f32 v ∴ v / τ)
 }
 
-# Top-k result keeps the original vocabulary positions while carrying an
-# explicit participation mask. Dropped logits are absent from the softmax
-# reduction rather than replaced by a value that can retain probability mass.
-class TopKResult {
+# Compact top-k selection: keeps only the k selected entries sorted in
+# ascending vocabulary-id order so downstream softmax, top-p, min-p, and draw
+# run in O(k) while preserving exact full-list summation and tie-break order.
+class CompactTopK {
+    mut list<int> ids
     mut list<f32> values
-    mut list<bool> keep
+}
+
+fn sift_down_max_int(mut list<int> xs, int i, int size) → void {
+    mut int cur ← i
+
+    while true {
+        let int child ← 2 * cur + 1
+
+        if child ≥ size {
+            return
+        }
+
+        mut int pick ← child
+        let int other ← child + 1
+
+        if other ≺ size {
+            if (xs.get(other) coalesce 0) ≻ (xs.get(pick) coalesce 0) {
+                pick ← other
+            }
+        }
+
+        if (xs.get(pick) coalesce 0) ≻ (xs.get(cur) coalesce 0) {
+            let int tmp ← xs.get(cur) coalesce 0
+            xs[cur] ← xs.get(pick) coalesce 0
+            xs[pick] ← tmp
+            cur ← pick
+        }
+        else {
+            return
+        }
+    }
+}
+
+fn sort_ids_ascending(mut list<int> xs) → void {
+    let int n ← xs.length()
+    mut int start ← n / 2
+
+    while start ≻ 0 {
+        start ← start - 1
+        sift_down_max_int(mut xs, start, n)
+    }
+
+    mut int end ← n
+
+    while end ≻ 1 {
+        end ← end - 1
+        let int top ← xs.get(0) coalesce 0
+        xs[0] ← xs.get(end) coalesce 0
+        xs[end] ← top
+        sift_down_max_int(mut xs, 0, end)
+    }
 }
 
 # Step 3 — top-k: keep the k largest logits (first-index ties, k <= 0 off).
-# Partial selection: heapify once, extract k (O(V + k log V)); no full sort.
-fn top_k(list<f32> xs, int k) → TopKResult {
+# Partial selection: heapify once, extract k, sort selected ids ascending
+# (O(V + k log V + k log k)); no full sort.
+fn top_k_compact(list<f32> xs, int k) → CompactTopK {
     let int n ← xs.length()
-
-    if k ≤ 0 or k ≥ n {
-        # Keep: identity carrier copy (no clone intrinsic).
-        mut list<f32> values ← empty
-
-        for from xs let v {
-            values.append(v)
-        }
-
-        return TopKResult { values = values, keep = mask_true(n) }
-    }
-
-    mut list<bool> keep ← mask_false(n)
     mut list<int> heap ← index_heap(xs)
+    mut list<int> chosen ← empty
     mut int extent ← n
     mut int count ← 0
 
     while count ≺ k and extent ≻ 0 {
         let int best ← heap_pop(mut heap, xs, extent)
         extent ← extent - 1
-        keep[best] ← true
+        chosen.append(best)
         count ← count + 1
     }
 
-    # Keep: identity carrier copy (no clone intrinsic).
-    mut list<f32> values ← empty
+    sort_ids_ascending(mut chosen)
+    mut list<f32> vals ← empty
 
-    for from xs let v {
-        values.append(v)
+    for from chosen let idx {
+        vals.append(xs.get(idx) coalesce 0.0 ∷ f32)
     }
 
-    return TopKResult { values = values, keep = keep }
+    return CompactTopK { ids = chosen, values = vals }
 }
 
-# Step 4 — stabilized softmax (max-subtracted, base-e). Only positions in
-# keep participate in the max and sum reductions; dropped positions scatter
-# back as exact zeroes after the kept logits are normalized.
-# W0 stay: this is a participation-masked max; no masked-argmax twin is
-# admitted, so the found-flag scan remains the W1 seam.
-fn softmax(list<f32> xs, list<bool> keep) → list<f32> {
-    let int n ← xs.length()
-    mut int best ← 0
-    mut bool found ← false
-    mut f32 best_value ← 0.0
-
-    for range 0 ‥ n let i {
-        if keep.get(i) coalesce false {
-            let f32 v ← xs.get(i) coalesce 0.0 ∷ f32
-
-            if not found or v ≻ best_value {
-                best ← i
-                best_value ← v
-                found ← true
-            }
-        }
-    }
-
+# Step 4 — stabilized softmax (max-subtracted, base-e) over compact candidates.
+fn softmax_dense(list<f32> xs) → list<f32> {
+    let int best ← xs.argmax() coalesce 0
     let f32 m ← xs.get(best) coalesce 0.0 ∷ f32
-    # Keep: participation-masked exponent build needs the index into keep;
-    # no index-carrying map form exists. Dropped positions carry exact 0.0,
-    # so the flat reducer below reproduces the masked sum byte-exactly
-    # (adding +0.0 is an exact identity for the non-negative accumulator).
-    mut list<f32> es ← empty
-
-    for range 0 ‥ n let i {
-        if keep.get(i) coalesce false {
-            let f32 e ← (xs.get(i) coalesce 0.0 ∷ f32 - m).exp()
-            es.append(e)
-        }
-        else {
-            es.append(0.0)
-        }
-    }
-
+    let list<f32> es ← xs.map(f32 v ∴ (v - m).exp())
     let f32 sum ← es.reduce((f32 acc, f32 e) ∴ acc + e, 0.0)
     return es.map(f32 e ∴ e / sum)
 }
