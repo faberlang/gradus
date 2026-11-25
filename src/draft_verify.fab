@@ -1,0 +1,738 @@
++++ toml
+locale = "en"
+
++++ faber
+# Draft-and-verify coordinator — SD6-U3 (issue #53, seam 6).
+#
+# Public import: import from "gradus:draft_verify" draft_verify
+# Depends on: gradus:generation/config, gradus:generation/decoder,
+#   gradus:decode, gradus:sampling, gradus:random, gradus:speculative,
+#   gradus:context_lookup, gradus:cache/session.
+#
+# One accelerated generate loop over a transactional SessionState:
+#   drafter (the weightless PLD context_lookup provider, at the adaptive
+#   depth) → SessionState.branch() → verify the drafted block against the
+#   target's greedy decisions → commit_prefix(accepted) / rollback() →
+#   rolling-acceptance depth update. A no-draft round is the zero-tax
+#   degeneracy: one plain target step, exactly the Disabled baseline.
+#
+# Target decisions come from the admitted decode.Decoder through the same
+# sampling route the Disabled baseline generate uses, so greedy exactness
+# is token-for-token equality with decoder.generate on the same model and
+# config. The per-slot arena KV written on both the plain and the
+# transactional path is the deterministic projection of (token, position);
+# the model-fused arena write arrives with the Slice A record-typed driver
+# (issue #52). This module proves the coordinator and transaction
+# semantics — branch isolation, exact-prefix commit, rollback restoration
+# — independently of the KV's provenance.
+#
+# Only the ContextLookup (PLD) mode runs today; FeatureTapped,
+# StandaloneDraft, and the composite PldThenMtp admit in policy but reject
+# here with a typed not-runnable error until their seams land.
+
+import from "gradus:generation/config"
+
+import from "gradus:generation/decoder"
+
+import from "gradus:decode"
+
+import from "gradus:tensor"
+
+import from "gradus:sampling"
+
+import from "gradus:random"
+
+import from "gradus:speculative"
+
+import from "gradus:context_lookup"
+
+import from "gradus:cache/session"
+
+# -------------------------------------------------------------------------
+# VerifyError — typed vocabulary of the coordinator.
+# Every variant carries a text message (render via message).
+# -------------------------------------------------------------------------
+
+@ public
+union VerifyError {
+    @ shared
+    string message
+
+    InvalidConfig,
+    ModeNotImplemented,
+    DecodeFailure,
+    DraftFailure,
+    SessionFailure
+}
+
+# Error-channel conversions: a failable step on any dependency's channel
+# propagates through the coordinator's channel with its message kept.
+
+@ conversion
+fn from_generation_error(config.GenerationError err) → VerifyError {
+    return variant InvalidConfig { message = err.message }
+}
+
+@ conversion
+fn from_decode_error(decode.DecodeError err) → VerifyError {
+    return variant DecodeFailure { message = err.message }
+}
+
+@ conversion
+fn from_speculative_error(speculative.SpeculativeError err) → VerifyError {
+    return variant DraftFailure { message = err.message }
+}
+
+@ conversion
+fn from_session_error(session.SessionError err) → VerifyError {
+    return variant SessionFailure { message = err.message }
+}
+
+@ conversion
+fn from_sampling_error(sampling.SamplingError err) → VerifyError {
+    return variant DecodeFailure { message = err.message }
+}
+
+# -------------------------------------------------------------------------
+# VerifyStats / VerifyRun — the run's evidence record.
+# -------------------------------------------------------------------------
+
+@ public
+class VerifyStats {
+    mut int verify_rounds
+    mut int drafted_total
+    mut int accepted_total
+    mut int plain_steps
+}
+
+@ public
+fn default_stats() → VerifyStats {
+    return VerifyStats { verify_rounds = 0, drafted_total = 0, accepted_total = 0, plain_steps = 0 }
+}
+
+@ public
+class VerifyRun {
+    mut list<int> tokens
+    mut VerifyStats stats
+}
+
+@ public
+fn default_run() → VerifyRun {
+    return VerifyRun { tokens = empty, stats = default_stats() }
+}
+
+# -------------------------------------------------------------------------
+# Deterministic arena KV projection.
+# -------------------------------------------------------------------------
+
+# The arena row for one consumed token at one position: the key encodes
+# the position, the value encodes the token (each lane-distinct, exact in
+# f32 for realistic vocabularies and capacities). Deterministic in
+# (token, position, lane) on every route — plain writes, transactional
+# writes, and the reference replay all produce identical bytes.
+fn project_kv<size KVD>(int token, int pos, mut tensor<f32, [KVD]> k, mut tensor<f32, [KVD]> v) → void ⇥ VerifyError {
+    require token ≥ 0 throw variant InvalidConfig { message = "projected token id must be non-negative" }
+
+    require pos ≥ 0 throw variant InvalidConfig { message = "projected position must be non-negative" }
+
+    for exclusive KVD let j {
+        k[[j]] ← (pos * 16 + j + 1) ↦ f32
+        v[[j]] ← (token * 16 + j + 1) ↦ f32
+    }
+}
+
+# Plain (non-transactional) write of one token's rows into every KV arena
+# slot of the session, at the token's consumed position.
+fn write_plain_all<size C, size W, size KVD>(mut session.SessionState<size C, size W, size KVD> sess, int token, int pos) → void ⇥ VerifyError {
+    for from sess.full_kv.slot_ids let slot {
+        mut tensor<f32, [KVD]> k ← tf32[KVD] {}
+        mut tensor<f32, [KVD]> v ← tf32[KVD] {}
+        project_kv<size KVD>(token, pos, mut k, mut v)
+        session.write_kv(mut sess, slot, k, v, pos ↦ i32 ⊥ 0)
+    }
+
+    for from sess.ring_kv.slot_ids let slot {
+        mut tensor<f32, [KVD]> k ← tf32[KVD] {}
+        mut tensor<f32, [KVD]> v ← tf32[KVD] {}
+        project_kv<size KVD>(token, pos, mut k, mut v)
+        session.write_kv(mut sess, slot, k, v, pos ↦ i32 ⊥ 0)
+    }
+}
+
+# Transactional write of one candidate token's rows into every KV arena
+# slot, at the candidate's verify position.
+fn write_txn_all<size C, size W, size KVD>(mut session.SessionState<size C, size W, size KVD> sess, mut session.SessionTxn<size C, size W, size KVD> txn, int token, int pos) → void ⇥ VerifyError {
+    for from sess.full_kv.slot_ids let slot {
+        mut tensor<f32, [KVD]> k ← tf32[KVD] {}
+        mut tensor<f32, [KVD]> v ← tf32[KVD] {}
+        project_kv<size KVD>(token, pos, mut k, mut v)
+        session.txn_write_kv(mut sess, mut txn, slot, k, v, pos ↦ i32 ⊥ 0)
+    }
+
+    for from sess.ring_kv.slot_ids let slot {
+        mut tensor<f32, [KVD]> k ← tf32[KVD] {}
+        mut tensor<f32, [KVD]> v ← tf32[KVD] {}
+        project_kv<size KVD>(token, pos, mut k, mut v)
+        session.txn_write_kv(mut sess, mut txn, slot, k, v, pos ↦ i32 ⊥ 0)
+    }
+}
+
+# One consumed token's target logits: feed the token at its position and
+# keep the last row (the decision distribution at the new frontier).
+fn step_logits(int token, int position, decode.Decoder m) → list<f32> ⇥ VerifyError {
+    let tensor.NumericBlock step ← decode.decode_data(token, position, m)
+    return decoder.last_logits(step, m.vocabulary)
+}
+
+# List concatenation helper (repetition-penalty history assembly).
+fn concat_history(list<int> base, list<int> extra) → list<int> {
+    mut list<int> out ← empty
+
+    for from base let t {
+        out.append(t)
+    }
+
+    for from extra let t {
+        out.append(t)
+    }
+
+    return out
+}
+
+# -------------------------------------------------------------------------
+# The coordinator loop.
+# -------------------------------------------------------------------------
+
+# Run one accelerated greedy generation over a transactional session.
+#
+# Parity contract with decoder.generate (Eog stop): the emitted stream is
+# token-for-token the Disabled baseline's stream on the same model and
+# config, and the session's committed KV rows are exactly the rows a
+# sequential Disabled replay of the same stream would write. The stop
+# policy is Eog (the baseline default); a token past the first EOG id is
+# never emitted, and an EOG token's own row is never written (the baseline
+# stops before consuming it).
+@ public
+fn verify_generate<size C, size W, size KVD>(config.GenerationConfig g, list<int> prompt_ids, decode.Decoder m, mut session.SessionState<size C, size W, size KVD> sess) → VerifyRun ⇥ VerifyError {
+    let string mode ← config.acceleration_mode_name(g.acceleration.mode)
+
+    if mode ≡ "disabled" {
+        throw variant InvalidConfig { message = "the verify route needs an enabled acceleration policy; the Disabled baseline is decoder.generate" }
+    }
+
+    if mode ≢ "context_lookup" {
+        throw variant ModeNotImplemented { message = "the § acceleration mode is not runnable on the verify route yet"(mode) }
+    }
+
+    # Greedy admission: rejects a sampled config (or a mismatched policy)
+    # through the conversion before any model, provider, or session call.
+    let speculative.AdmissionResult ? ← speculative.admit_greedy(g.acceleration, g)
+
+    require prompt_ids.length() ≥ 1 throw variant InvalidConfig { message = "needs at least one prompt token" }
+
+    require prompt_ids.length() ≤ g.max_prompt throw variant InvalidConfig { message = "prompt length exceeds max_prompt" }
+
+    require prompt_ids.length() ≺ g.context throw variant InvalidConfig { message = "prompt length does not fit context" }
+
+    require prompt_ids.length() ≤ m.context throw variant InvalidConfig { message = "prompt length does not fit context" }
+
+    require g.context ≤ C throw variant InvalidConfig { message = "session capacity must cover the generation context" }
+
+    let sampling.Config drawn ← config.config(g)
+    mut random.Seed rng ← config.seed(g)
+
+    mut speculative.DrafterContext ctx ← speculative.construct_pld_context(empty, speculative.budget_from_policy(g.acceleration))
+
+    mut VerifyStats stats ← default_stats()
+    mut list<int> tokens ← empty
+    mut list<int> history ← empty
+
+    # Prefill: the target consumes the prompt; the session takes the
+    # prompt's plain rows at positions 0 .. prompt_len - 1.
+    let tensor.NumericBlock pref ← decode.prefill(prompt_ids, m)
+    mut list<f32> last ← decoder.last_logits(pref, m.vocabulary)
+
+    for exclusive prompt_ids.length() let i {
+        write_plain_all<size C, size W, size KVD>(mut sess, prompt_ids[i] coalesce 0, i)
+    }
+
+    # position = the count of consumed tokens = the index the next
+    # consumed token occupies. The loop gate mirrors the baseline's
+    # cursor (`prompt + emitted < context`): a token at the final context
+    # slot is emitted but never consumed, exactly as decoder.generate
+    # stops before decoding it.
+    mut int position ← prompt_ids.length()
+    mut int emitted ← 0
+    mut bool finished ← false
+
+    while emitted ≺ g.max_tokens and prompt_ids.length() + emitted ≺ g.context and not finished {
+        let int depth ← speculative.next_depth(ctx.adaptive_budget)
+        let speculative.ProviderResult result ← draft_round(prompt_ids, ctx.token_history, depth, g)
+
+        if speculative.is_no_draft(result) {
+            # Zero-tax degeneracy: one plain target step, exactly the
+            # Disabled baseline round.
+            let sampling.Sampler outcome ← sampling.sample(last, drawn, history, rng)
+            let int token ← outcome.token_id
+            tokens.append(token)
+            history.append(token)
+            rng ← outcome.seed
+            emitted ← emitted + 1
+            stats.plain_steps ← stats.plain_steps + 1
+
+            if decoder.is_eog(g, token) {
+                finished ← true
+            }
+            elif emitted ≺ g.max_tokens and position + 1 ≺ g.context {
+                last ← step_logits(token, position, m)
+                write_plain_all<size C, size W, size KVD>(mut sess, token, position)
+                position ← position + 1
+            }
+            else {
+                finished ← true
+            }
+        }
+        else {
+            # Verify path: branch, accept the matching candidate prefix,
+            # commit exactly the consumed prefix, roll back on divergence.
+            let list<int> candidates ← speculative.candidate_ids(result)
+            let int room ← g.max_tokens - emitted
+            let int frontier_base ← position
+            mut session.SessionTxn<size C, size W, size KVD> txn ← session.branch(mut sess)
+            mut list<int> accepted_ids ← empty
+            mut list<f32> verify_last ← last
+            mut sampling.Sampler decision ← sampling.sample(verify_last, drawn, history, rng)
+            mut bool diverged ← false
+
+            while accepted_ids.length() ≺ candidates.length() {
+                let int candidate ← candidates.get(accepted_ids.length()) coalesce 0
+
+                if decision.token_id ≢ candidate {
+                    diverged ← true
+                    break
+                }
+
+                # Room for exactly one more emitted token: stop accepting
+                # and let the current decision supply that token.
+                if accepted_ids.length() ≡ room - 1 {
+                    break
+                }
+
+                # The baseline consumes a token at position q only when
+                # q + 1 < context, so a candidate at the final context
+                # slot is emitted (by the decision) but never accepted
+                # (never consumed).
+                if frontier_base + accepted_ids.length() ≥ g.context - 1 {
+                    break
+                }
+
+                accepted_ids.append(candidate)
+                write_txn_all<size C, size W, size KVD>(mut sess, mut txn, candidate, frontier_base + accepted_ids.length() - 1)
+                verify_last ← step_logits(candidate, frontier_base + accepted_ids.length() - 1, m)
+                rng ← decision.seed
+                decision ← sampling.sample(verify_last, drawn, concat_history(history, accepted_ids), rng)
+            }
+
+            # The emitted block: the accepted prefix plus one target
+            # decision — the corrective token on divergence, or when
+            # acceptance stopped early; the bonus token when the whole
+            # block was accepted.
+            mut list<int> block ← empty
+
+            for from accepted_ids let t {
+                block.append(t)
+            }
+
+            if diverged or accepted_ids.length() ≺ candidates.length() {
+                block.append(decision.token_id)
+                rng ← decision.seed
+            }
+            else {
+                let sampling.Sampler bonus ← sampling.sample(verify_last, drawn, concat_history(history, accepted_ids), rng)
+                block.append(bonus.token_id)
+                rng ← bonus.seed
+            }
+
+            # A first EOG inside the accepted prefix truncates the block
+            # and the commit: the baseline stops at the EOG token and
+            # never consumes it (or anything past it).
+            mut int eogi ← 0 - 1
+
+            for exclusive accepted_ids.length() let i {
+                if eogi ≡ (0 - 1) and decoder.is_eog(g, accepted_ids[i] coalesce 0) {
+                    eogi ← i
+                }
+            }
+
+            mut list<int> kept ← empty
+
+            for from block let t {
+                if not finished {
+                    kept.append(t)
+                    tokens.append(t)
+                    history.append(t)
+                    emitted ← emitted + 1
+
+                    if decoder.is_eog(g, t) {
+                        finished ← true
+                    }
+                }
+            }
+
+            # Commit exactly the consumed prefix: rows for accepted tokens
+            # before a first EOG; all accepted rows when no EOG cut the
+            # block. A zero commit is a full rollback.
+            let int commit_count ← eogi ≥ 0 ✓ eogi ✗ accepted_ids.length()
+
+            if commit_count ≻ 0 {
+                session.commit_prefix(mut sess, mut txn, commit_count)
+            }
+            else {
+                session.rollback(mut sess, mut txn)
+            }
+
+            position ← frontier_base + commit_count
+            stats.verify_rounds ← stats.verify_rounds + 1
+            stats.drafted_total ← stats.drafted_total + candidates.length()
+            stats.accepted_total ← stats.accepted_total + accepted_ids.length()
+
+            let speculative.AdaptiveBudget advanced ← speculative.observe_block(ctx.adaptive_budget, candidates.length(), accepted_ids.length())
+            ctx ← speculative.construct_pld_context(history, advanced)
+
+            # Eagerly consume the last kept token when the loop
+            # continues, so the next round decides from the post-token
+            # state (baseline parity) and the session takes its row. The
+            # final context slot's token stays unconsumed, as in the
+            # baseline.
+            if not finished and emitted ≺ g.max_tokens and position + 1 ≺ g.context {
+                let int tail ← kept.get(kept.length() - 1) coalesce 0
+                last ← step_logits(tail, position, m)
+                write_plain_all<size C, size W, size KVD>(mut sess, tail, position)
+                position ← position + 1
+            }
+        }
+    }
+
+    return VerifyRun { tokens = tokens, stats = stats }
+}
+
+# One drafter round: the PLD proposal for the current accepted history at
+# the requested depth.
+fn draft_round(list<int> prompt_ids, list<int> history, int depth, config.GenerationConfig g) → speculative.ProviderResult ⇥ VerifyError {
+    let speculative.ProviderRequest req ← speculative.construct_request(prompt_ids, history, depth, g.acceleration.min_block, g.acceleration.max_block)
+    return context_lookup.propose(req)
+}
+
++++ faber test
+# Co-located package test for draft_verify.fab (SD6-U3 coordinator).
+#
+# Proves, at the executed-test level:
+#   * greedy exactness — the coordinator's emitted stream is
+#     token-for-token the Disabled baseline decoder.generate stream on
+#     the same fixture model and config, on drafting and no-drafting
+#     prompts alike, with and without EOG stops.
+#   * session parity — after a run, every FullKv slot's committed valid
+#     span and rows equal a sequential Disabled replay's, bit for bit
+#     (branch isolation, exact-prefix commit, rollback restoration).
+#   * the zero-tax degeneracy — a context with no usable suffix drafts
+#     nothing: every round is a plain step and the stream still equals
+#     the baseline.
+#   * the mode gate — only ContextLookup runs; Disabled and the
+#     not-yet-landed modes reject through typed VerifyError.
+#
+# The fixture model is the tiny dense decoder (vocabulary 3, context 16,
+# dimension 4) with identity attention weights; its greedy stream is what
+# the equality oracles consume, pinned per prompt.
+
+import from "gradus:draft_verify" draft_verify
+import from "gradus:generation/config" config
+import from "gradus:generation/decoder" decoder
+import from "gradus:decode" decode
+import from "gradus:tensor" tensor
+import from "gradus:model/schedule" schedule
+import from "gradus:cache/session" session
+
+# ---- fixtures
+
+fn hold(list<f32> data, list<int> shape) → tensor.NumericBlock {
+    return tensor.construct(data, shape) ⊥ tensor.default()
+}
+
+fn weights_p() → decode.Weights {
+    let tensor.NumericBlock ones ← hold([1.0, 1.0, 1.0, 1.0], [4])
+    let tensor.NumericBlock zero ← hold([0.0, 0.0, 0.0, 0.0], [4])
+    let tensor.NumericBlock ident ← hold([1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0], [4, 4])
+    return decode.construct_weights(ones, zero, ident, zero, ident, zero, ident, zero, ident, zero, ones, zero, ident, zero, ident, zero, ones, zero)
+}
+
+# The tiny dense target: vocabulary 3, context 16, dimension 4.
+fn target_p() → decode.Decoder {
+    let tensor.NumericBlock table ← hold([1.0, 0.5, 0.2, (0.0 - 0.5) ↦ f32, 0.0, 1.0, 0.5, (0.0 - 0.5) ↦ f32, (0.0 - 0.5) ↦ f32, 0.0, 1.0, 0.5], [3, 4])
+    let tensor.NumericBlock proj ← hold([1.0, 0.0, (0.0 - 1.0) ↦ f32, 0.0, 1.0, 1.0, 1.0, (0.0 - 1.0) ↦ f32, 0.0, 0.0, 0.0, 1.0], [4, 3])
+    let tensor.NumericBlock pb ← hold([0.0, 0.0, 0.0], [3])
+    return decode.construct_decoder(table, weights_p(), proj, pb, 0.5 ∷ f32, 3, 16, 4) ⊥ decode.default()
+}
+
+fn sched_p() → schedule.ExecutionSchedule {
+    return schedule.dense_schedule(2, variant schedule.RopeKind.Standard, variant schedule.FfnKind.Dense, []) ⊥ schedule.ExecutionSchedule { layers = [], segments = [], steps = [], slots = [], residual = variant schedule.ResidualKind.Standard, taps = [] }
+}
+
+fn sess_p() → session.SessionState<16, 1, 4> {
+    return session.from_dense_schedule<size 16, size 4>(sched_p()) ⊥ session.SessionState { sched = sched_p(), full_kv = session.FullKvArena { capacity = 0, kv_dim = 0, slot_ids = empty, keys = empty, values = empty, lengths = empty }, ring_kv = session.RingKvArena { max_window = 0, kv_dim = 0, slot_ids = empty, window_sizes = empty, keys = empty, values = empty, total_written = empty }, slot_arena_kind = empty, slot_local_index = empty, slot_window_sizes = empty, slot_kv_quant = empty, txn_depth = 0 }
+}
+
+# The Disabled baseline config and its ContextLookup twin: identical
+# sampling fields (greedy), seed, and EOG; only the acceleration differs.
+fn baseline_generation(list<int> eog_ids, int max_tokens) → config.GenerationConfig {
+    return config.construct_generation(16, 8, max_tokens, 7, 0.0 ∷ f32, 0, 1.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32, eog_ids) ⊥ config.default()
+}
+
+fn verify_generation(list<int> eog_ids, int max_tokens) → config.GenerationConfig {
+    let config.AccelerationPolicy policy ← config.construct_acceleration("1.1.0", config.acceleration_context_lookup(), 1, 8, 1, 8) ⊥ config.default_acceleration()
+    return config.construct_generation_with_policy(16, 8, max_tokens, 7, 0.0 ∷ f32, 0, 1.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32, eog_ids, policy) ⊥ config.default()
+}
+
+# Renders a coordinator run as its stream (on success) or its typed
+# rejection text.
+fn run_tokens(config.GenerationConfig g, list<int> prompt) → list<int> {
+    mut session.SessionState<16, 1, 4> sess ← sess_p()
+    let draft_verify.VerifyRun run ← draft_verify.verify_generate<size 16, size 1, size 4>(g, prompt, target_p(), mut sess) ⊥ draft_verify.default_run()
+    return run.tokens
+}
+
+fn run_detail(config.GenerationConfig g, list<int> prompt) → string {
+    mut session.SessionState<16, 1, 4> sess ← sess_p()
+    let _ outcome ← trap {
+        let draft_verify.VerifyRun ? ← draft_verify.verify_generate<size 16, size 1, size 4>(g, prompt, target_p(), mut sess)
+        return "ok"
+    }
+    match outcome {
+        case returned let ? {
+            return "ok"
+        }
+        case thrown let err {
+            return err.message
+        }
+    }
+}
+
+# The sequential Disabled replay of one consumed stream (prompt plus every
+# consumed generated token) through the same deterministic projection.
+fn replay_reference(list<int> consumed) → session.SessionState<16, 1, 4> {
+    mut session.SessionState<16, 1, 4> ref ← sess_p()
+    mut list<int> stream ← empty
+
+    for from consumed let t {
+        stream.append(t)
+    }
+
+    do {
+        for exclusive stream.length() let i {
+            let int token ← stream[i] coalesce 0
+            for from ref.full_kv.slot_ids let slot {
+                mut tensor<f32, [4]> k ← tf32[4] {}
+                mut tensor<f32, [4]> v ← tf32[4] {}
+                for exclusive 4 let j {
+                    k[[j]] ← (i * 16 + j + 1) ↦ f32
+                    v[[j]] ← (token * 16 + j + 1) ↦ f32
+                }
+                session.write_kv(mut ref, slot, k, v, i ↦ i32 ⊥ 0)
+            }
+        }
+        return ref
+    }
+    catch err {
+        return ref
+    }
+}
+
+# Bit-for-bit full-KV comparison over every slot's valid span.
+fn sessions_agree(session.SessionState<16, 1, 4> a, session.SessionState<16, 1, 4> b) → bool {
+    if a.full_kv.slot_ids.length() ≢ b.full_kv.slot_ids.length() then return false
+
+    for exclusive a.full_kv.lengths.length() let i {
+        if a.full_kv.lengths[i] ≢ b.full_kv.lengths[i] then return false
+
+        let int len ← a.full_kv.lengths[i]
+        for exclusive len let r {
+            for exclusive 4 let j {
+                if a.full_kv.keys[i][[r, j]] ≢ b.full_kv.keys[i][[r, j]] then return false
+
+                if a.full_kv.values[i][[r, j]] ≢ b.full_kv.values[i][[r, j]] then return false
+            }
+        }
+    }
+
+    return true
+}
+
+# The consumed stream parity: the baseline consumes the prompt and every
+# generated token except the final one (the loop stops before consuming
+# the token it stops on).
+fn consumed_of(list<int> prompt, list<int> tokens) → list<int> {
+    mut list<int> consumed ← empty
+
+    for from prompt let t {
+        consumed.append(t)
+    }
+
+    if tokens.length() ≻ 1 {
+        for exclusive tokens.length() - 1 let i {
+            consumed.append(tokens[i] coalesce 0)
+        }
+    }
+
+    return consumed
+}
+
+describe "SD6-U3 — draft-and-verify coordinator" {
+    test "the coordinator stream is greedy-exact against the Disabled baseline" {
+        let _ trap_result_1 ← trap {
+            let list<int> prompt_a ← [1, 2]
+            let list<int> prompt_b ← [1, 2, 1, 2]
+            let list<int> prompt_c ← [0, 0, 0, 0]
+            let config.GenerationConfig base ← baseline_generation(empty, 6)
+            let config.GenerationConfig accel ← verify_generation(empty, 6)
+            let list<int> baseline_a ← decoder.generate(base, prompt_a, target_p()) ⊥ empty
+            let list<int> baseline_b ← decoder.generate(base, prompt_b, target_p()) ⊥ empty
+            let list<int> baseline_c ← decoder.generate(base, prompt_c, target_p()) ⊥ empty
+            assert run_tokens(accel, prompt_a) ≡ baseline_a
+            assert run_tokens(accel, prompt_b) ≡ baseline_b
+            assert run_tokens(accel, prompt_c) ≡ baseline_c
+        }
+        match trap_result_1 {
+            case returned let ? { }
+            case thrown let ? { assert false }
+        }
+    }
+    test "verify rounds commit and roll back transactionally while staying greedy-exact" {
+        let _ trap_result_2 ← trap {
+            # The pinned fixture behavior: [1, 2, 1, 2] drafts at depth 1
+            # every round and always diverges (six rollbacks, six plain
+            # streams worth of corrective tokens); [0, 0, 0, 0] fully
+            # accepts at depths 1 and 2 (bonus-token path), then rolls
+            # back the room-capped third round.
+            mut session.SessionState<16, 1, 4> sess_b ← sess_p()
+            let draft_verify.VerifyRun run_b ← draft_verify.verify_generate<size 16, size 1, size 4>(verify_generation(empty, 6), [1, 2, 1, 2], target_p(), mut sess_b) ⊥ draft_verify.default_run()
+            assert run_b.tokens ≡ ([2, 2, 2, 2, 2, 2] ↦ list<int>)
+            assert run_b.stats.verify_rounds ≡ 6
+            assert run_b.stats.drafted_total ≡ 6
+            assert run_b.stats.accepted_total ≡ 0
+            assert run_b.stats.plain_steps ≡ 0
+
+            mut session.SessionState<16, 1, 4> sess_c ← sess_p()
+            let draft_verify.VerifyRun run_c ← draft_verify.verify_generate<size 16, size 1, size 4>(verify_generation(empty, 6), [0, 0, 0, 0], target_p(), mut sess_c) ⊥ draft_verify.default_run()
+            assert run_c.tokens ≡ ([0, 0, 0, 0, 0, 0] ↦ list<int>)
+            assert run_c.stats.verify_rounds ≡ 3
+            assert run_c.stats.drafted_total ≡ 6
+            assert run_c.stats.accepted_total ≡ 3
+            assert run_c.stats.plain_steps ≡ 0
+        }
+        match trap_result_2 {
+            case returned let ? { }
+            case thrown let ? { assert false }
+        }
+    }
+    test "the session's committed rows equal a sequential Disabled replay" {
+        let _ trap_result_3 ← trap {
+            let list<int> prompt ← [0, 0, 0, 0]
+            mut session.SessionState<16, 1, 4> sess ← sess_p()
+            let draft_verify.VerifyRun run ← draft_verify.verify_generate<size 16, size 1, size 4>(verify_generation(empty, 6), prompt, target_p(), mut sess) ⊥ draft_verify.default_run()
+            let session.SessionState<16, 1, 4> ref ← replay_reference(consumed_of(prompt, run.tokens))
+            assert sessions_agree(sess, ref)
+            assert sess.txn_depth ≡ 0
+        }
+        match trap_result_3 {
+            case returned let ? { }
+            case thrown let ? { assert false }
+        }
+    }
+    test "a context-limited run (prompt + max_tokens beyond the context) keeps both parity contracts" {
+        let _ trap_result_ctx ← trap {
+            # Admitted config: only max_prompt ≤ context and max_tokens ≤
+            # context are checked, so the stream is cut by the context at
+            # prompt 8 + 8 emitted, and the final slot's token is emitted
+            # but never consumed — on the all-divergence prompt and the
+            # full-acceptance prompt alike.
+            let config.GenerationConfig base ← baseline_generation(empty, 16)
+            let config.GenerationConfig accel ← verify_generation(empty, 16)
+            let list<int> prompt_d ← [1, 2, 1, 2, 1, 2, 1, 2]
+            let list<int> prompt_f ← [0, 0, 0, 0, 0, 0, 0, 0]
+            let list<int> baseline_d ← decoder.generate(base, prompt_d, target_p()) ⊥ empty
+            let list<int> baseline_f ← decoder.generate(base, prompt_f, target_p()) ⊥ empty
+            assert baseline_d.length() ≡ 8
+            assert baseline_f.length() ≡ 8
+
+            mut session.SessionState<16, 1, 4> sess_d ← sess_p()
+            let draft_verify.VerifyRun run_d ← draft_verify.verify_generate<size 16, size 1, size 4>(accel, prompt_d, target_p(), mut sess_d) ⊥ draft_verify.default_run()
+            assert run_d.tokens ≡ baseline_d
+            assert sessions_agree(sess_d, replay_reference(consumed_of(prompt_d, run_d.tokens)))
+
+            mut session.SessionState<16, 1, 4> sess_f ← sess_p()
+            let draft_verify.VerifyRun run_f ← draft_verify.verify_generate<size 16, size 1, size 4>(accel, prompt_f, target_p(), mut sess_f) ⊥ draft_verify.default_run()
+            assert run_f.tokens ≡ baseline_f
+            assert sessions_agree(sess_f, replay_reference(consumed_of(prompt_f, run_f.tokens)))
+            assert sess_f.txn_depth ≡ 0
+        }
+        match trap_result_ctx {
+            case returned let ? { }
+            case thrown let ? { assert false }
+        }
+    }
+    test "a one-token budget over a distinct-token prompt drafts nothing and still matches the baseline" {
+        let _ trap_result_4 ← trap {
+            # [0, 1, 2] has no repeated suffix, so the PLD drafter finds
+            # no match and the single round is a plain target step.
+            let list<int> prompt ← [0, 1, 2]
+            let config.GenerationConfig base ← baseline_generation(empty, 1)
+            let list<int> baseline ← decoder.generate(base, prompt, target_p()) ⊥ empty
+            mut session.SessionState<16, 1, 4> sess ← sess_p()
+            let draft_verify.VerifyRun run ← draft_verify.verify_generate<size 16, size 1, size 4>(verify_generation(empty, 1), prompt, target_p(), mut sess) ⊥ draft_verify.default_run()
+            assert run.tokens ≡ baseline
+            assert run.stats.plain_steps ≡ 1
+            assert run.stats.verify_rounds ≡ 0
+            assert run.stats.drafted_total ≡ 0
+            assert run.stats.accepted_total ≡ 0
+        }
+        match trap_result_4 {
+            case returned let ? { }
+            case thrown let ? { assert false }
+        }
+    }
+    test "EOG stops both routes at the same token and never writes the EOG row" {
+        let _ trap_result_5 ← trap {
+            let list<int> prompt ← [1, 2]
+            let config.GenerationConfig base ← baseline_generation([0, 2], 6)
+            let list<int> baseline ← decoder.generate(base, prompt, target_p()) ⊥ empty
+            mut session.SessionState<16, 1, 4> sess ← sess_p()
+            let draft_verify.VerifyRun run ← draft_verify.verify_generate<size 16, size 1, size 4>(verify_generation([0, 2], 6), prompt, target_p(), mut sess) ⊥ draft_verify.default_run()
+            assert run.tokens ≡ baseline
+            let session.SessionState<16, 1, 4> ref ← replay_reference(consumed_of(prompt, run.tokens))
+            assert sessions_agree(sess, ref)
+        }
+        match trap_result_5 {
+            case returned let ? { }
+            case thrown let ? { assert false }
+        }
+    }
+    test "only ContextLookup runs: Disabled and unlanded modes reject typed" {
+        assert run_detail(baseline_generation(empty, 4), [1, 2]) ≡ "the verify route needs an enabled acceleration policy; the Disabled baseline is decoder.generate"
+
+        let config.AccelerationPolicy tapped ← config.construct_acceleration("1.1.0", config.acceleration_feature_tapped(), 1, 8, 1, 8) ⊥ config.default_acceleration()
+        let config.GenerationConfig tapped_cfg ← config.construct_generation_with_policy(16, 8, 4, 7, 0.0 ∷ f32, 0, 1.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32, empty, tapped) ⊥ config.default()
+        assert run_detail(tapped_cfg, [1, 2]) ≡ "the feature_tapped acceleration mode is not runnable on the verify route yet"
+
+        let config.AccelerationPolicy composite ← config.construct_acceleration("1.1.0", config.acceleration_pld_then_mtp(), 1, 8, 1, 8) ⊥ config.default_acceleration()
+        let config.GenerationConfig composite_cfg ← config.construct_generation_with_policy(16, 8, 4, 7, 0.0 ∷ f32, 0, 1.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32, empty, composite) ⊥ config.default()
+        assert run_detail(composite_cfg, [1, 2]) ≡ "the pld_then_mtp acceleration mode is not runnable on the verify route yet"
+
+        let config.AccelerationPolicy standalone ← config.construct_acceleration("1.1.0", config.acceleration_standalone_draft(), 1, 8, 1, 8) ⊥ config.default_acceleration()
+        let config.GenerationConfig standalone_cfg ← config.construct_generation_with_policy(16, 8, 4, 7, 0.0 ∷ f32, 0, 1.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32, empty, standalone) ⊥ config.default()
+        assert run_detail(standalone_cfg, [1, 2]) ≡ "the standalone_draft acceleration mode is not runnable on the verify route yet"
+    }
+    test "a sampled config rejects on the coordinator channel" {
+        let config.AccelerationPolicy policy ← config.construct_acceleration("1.1.0", config.acceleration_context_lookup(), 1, 8, 1, 8) ⊥ config.default_acceleration()
+        let config.GenerationConfig sampled ← config.construct_generation_with_policy(16, 8, 4, 7, 0.8 ∷ f32, 0, 1.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32, empty, policy) ⊥ config.default()
+        assert run_detail(sampled, [1, 2]) ≡ "sampled acceleration is not supported"
+    }
+}
