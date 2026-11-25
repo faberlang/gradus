@@ -36,7 +36,11 @@ union SessionError {
     InvalidCapacity,
     InvalidSlot,
     SlotArenaMismatch,
-    OutOfBoundsPosition
+    OutOfBoundsPosition,
+    TxnOpen,
+    NoOpenTxn,
+    InvalidCommitCount,
+    InvalidBranchWrite
 }
 
 @ public
@@ -76,6 +80,36 @@ class SessionState<size C, size W, size KVD> {
     let list<int> slot_arena_kind
     let list<int> slot_local_index
     let list<int> slot_window_sizes
+    # 0 = no transaction open; 1 = a `branch` is active. Plain writes
+    # fail-closed while a branch is open (issue #51).
+    mut int txn_depth
+}
+
+# One-shot speculative transaction over one `SessionState` (issue #51 pass 1).
+# `branch` snapshots every ring buffer (bounded by the ring's own window
+# design) and the full-KV cursors; branch writes go through `txn_write_kv`
+# and are journaled; `commit_prefix(accepted_count)` restores the snapshot
+# and replays the accepted prefix through the same kernels, and `rollback`
+# restores without replaying. Full-KV branch writes are extension-only, so
+# the large full-KV buffers are never copied — restoring the cursor makes
+# rejected rows unreachable through the span-bounded read paths.
+@ public
+class SessionTxn<size C, size W, size KVD> {
+    # Full-KV slot length at branch time (arena-local order).
+    let list<int> base_full_lengths
+    # Ring slot total_written at branch time (arena-local order).
+    let list<int> base_ring_written
+    # Ring buffer snapshots, deep copies taken by `branch`.
+    let list<tensor<f32, [W, KVD]>> base_ring_keys
+    let list<tensor<f32, [W, KVD]>> base_ring_values
+    # Journal of branched writes in order: arena kind (ARENA_*), arena-local
+    # index, absolute position, and copied key/value rows.
+    let list<int> journal_kind
+    let list<int> journal_local_idx
+    let list<i32> journal_pos
+    let list<tensor<f32, [KVD]>> journal_k
+    let list<tensor<f32, [KVD]>> journal_v
+    mut bool open
 }
 
 # -------------------------------------------------------------------------
@@ -193,7 +227,7 @@ fn from_schedule<size C, size W, size KVD>(schedule.ExecutionSchedule sched) →
 
     let FullKvArena<size C, size KVD> full_arena ← FullKvArena { capacity = C, kv_dim = KVD, slot_ids = full_slot_ids, keys = full_keys, values = full_values, lengths = full_lengths }
     let RingKvArena<size W, size KVD> ring_arena ← RingKvArena { max_window = W, kv_dim = KVD, slot_ids = ring_slot_ids, window_sizes = ring_windows, keys = ring_keys, values = ring_values, total_written = ring_written }
-    return SessionState { sched = sched, full_kv = full_arena, ring_kv = ring_arena, slot_arena_kind = slot_arena_kind, slot_local_index = slot_local_index, slot_window_sizes = slot_window_sizes }
+    return SessionState { sched = sched, full_kv = full_arena, ring_kv = ring_arena, slot_arena_kind = slot_arena_kind, slot_local_index = slot_local_index, slot_window_sizes = slot_window_sizes, txn_depth = 0 }
 }
 
 @ public
@@ -237,6 +271,7 @@ fn slot_valid_span<size C, size W, size KVD>(SessionState<size C, size W, size K
 
 @ public
 fn write_kv<size C, size W, size KVD>(mut SessionState<size C, size W, size KVD> sess, int slot_id, tensor<f32, [KVD]> k, tensor<f32, [KVD]> v, i32 pos) → void ⇥ SessionError {
+    require sess.txn_depth ≡ 0 throw variant TxnOpen { message = "plain write_kv refuses to touch a shared cache while a branch is open" }
     check_slot(sess, slot_id)
     let int kind ← sess.slot_arena_kind[slot_id]
     let int idx ← sess.slot_local_index[slot_id]
@@ -273,6 +308,194 @@ fn write_kv<size C, size W, size KVD>(mut SessionState<size C, size W, size KVD>
     }
 
     throw variant SlotArenaMismatch { message = "slot § is not a KV arena"(slot_id ↦ string) }
+}
+
+# -------------------------------------------------------------------------
+# Speculative transactions (issue #51 pass 1)
+# -------------------------------------------------------------------------
+
+@ public
+fn branch<size C, size W, size KVD>(mut SessionState<size C, size W, size KVD> sess) → SessionTxn<size C, size W, size KVD> ⇥ SessionError {
+    require sess.txn_depth ≡ 0 throw variant TxnOpen { message = "nested branches are not supported; commit or roll back the open transaction first" }
+
+    mut list<int> base_lengths ← empty
+    mut list<int> base_written ← empty
+    mut list<tensor<f32, [W, KVD]>> base_keys ← empty
+    mut list<tensor<f32, [W, KVD]>> base_values ← empty
+    mut list<int> jkind ← empty
+    mut list<int> jidx ← empty
+    mut list<i32> jpos ← empty
+    mut list<tensor<f32, [KVD]>> jk ← empty
+    mut list<tensor<f32, [KVD]>> jv ← empty
+
+    for exclusive sess.full_kv.lengths.length() let i {
+        base_lengths.append(sess.full_kv.lengths[i])
+    }
+    for exclusive sess.ring_kv.total_written.length() let i {
+        base_written.append(sess.ring_kv.total_written[i])
+        mut tensor<f32, [W, KVD]> bk ← copy sess.ring_kv.keys[i]
+        mut tensor<f32, [W, KVD]> bv ← copy sess.ring_kv.values[i]
+        base_keys.append(bk)
+        base_values.append(bv)
+    }
+
+    sess.txn_depth ← 1
+    return SessionTxn { base_full_lengths = base_lengths, base_ring_written = base_written, base_ring_keys = base_keys, base_ring_values = base_values, journal_kind = jkind, journal_local_idx = jidx, journal_pos = jpos, journal_k = jk, journal_v = jv, open = true }
+}
+
+# Transactional write during an open branch. Full-KV slots accept extension
+# writes only (a position below the slot's current length is a typed reject —
+# that contract is what makes cursor-only full-KV rollback sound); ring slots
+# accept any non-negative position (the snapshot covers wraparound clobbers).
+@ public
+fn txn_write_kv<size C, size W, size KVD>(mut SessionState<size C, size W, size KVD> sess, mut SessionTxn<size C, size W, size KVD> txn, int slot_id, tensor<f32, [KVD]> k, tensor<f32, [KVD]> v, i32 pos) → void ⇥ SessionError {
+    require txn.open throw variant NoOpenTxn { message = "txn_write_kv requires an open transaction" }
+    require sess.txn_depth ≡ 1 throw variant NoOpenTxn { message = "session has no open transaction" }
+    check_slot(sess, slot_id)
+    let int kind ← sess.slot_arena_kind[slot_id]
+    let int idx ← sess.slot_local_index[slot_id]
+    let int p ← pos ↦ int
+
+    if kind ≡ ARENA_FULL_KV {
+        require p ≥ 0 and p ≺ C throw variant OutOfBoundsPosition { message = "FullKv position § out of capacity §"(p ↦ string, C ↦ string) }
+        require p ≥ sess.full_kv.lengths[idx] throw variant InvalidBranchWrite { message = "full-KV branch write at position § rewrites a live row (length §)"(p ↦ string, sess.full_kv.lengths[idx] ↦ string) }
+
+        mut tensor<f32, [C, KVD]> kc ← sess.full_kv.keys[idx]
+        mut tensor<f32, [C, KVD]> vc ← sess.full_kv.values[idx]
+        ds.kv_write_row(k, mut kc, pos)
+        ds.kv_write_row(v, mut vc, pos)
+        sess.full_kv.keys[idx] ← kc
+        sess.full_kv.values[idx] ← vc
+        if p + 1 ≻ sess.full_kv.lengths[idx] {
+            sess.full_kv.lengths[idx] ← p + 1
+        }
+        mut tensor<f32, [KVD]> jk ← copy k
+        mut tensor<f32, [KVD]> jv ← copy v
+        txn.journal_kind.append(ARENA_FULL_KV)
+        txn.journal_local_idx.append(idx)
+        txn.journal_pos.append(pos)
+        txn.journal_k.append(jk)
+        txn.journal_v.append(jv)
+        return
+    }
+    elif kind ≡ ARENA_RING_KV {
+        require p ≥ 0 throw variant OutOfBoundsPosition { message = "RingKv position § must be non-negative"(p ↦ string) }
+
+        let i32 win ← sess.slot_window_sizes[slot_id] ↦ i32 ⊥ 0
+        mut tensor<f32, [W, KVD]> kc ← sess.ring_kv.keys[idx]
+        mut tensor<f32, [W, KVD]> vc ← sess.ring_kv.values[idx]
+        ds.kv_ring_write_row(k, mut kc, pos, win)
+        ds.kv_ring_write_row(v, mut vc, pos, win)
+        sess.ring_kv.keys[idx] ← kc
+        sess.ring_kv.values[idx] ← vc
+        if p + 1 ≻ sess.ring_kv.total_written[idx] {
+            sess.ring_kv.total_written[idx] ← p + 1
+        }
+        mut tensor<f32, [KVD]> jk ← copy k
+        mut tensor<f32, [KVD]> jv ← copy v
+        txn.journal_kind.append(ARENA_RING_KV)
+        txn.journal_local_idx.append(idx)
+        txn.journal_pos.append(pos)
+        txn.journal_k.append(jk)
+        txn.journal_v.append(jv)
+        return
+    }
+
+    throw variant SlotArenaMismatch { message = "slot § is not a KV arena"(slot_id ↦ string) }
+}
+
+# Number of journal entries recorded for one arena-local slot of one kind.
+fn txn_journal_count<size C, size W, size KVD>(SessionTxn<size C, size W, size KVD> txn, int kind, int idx) → int {
+    mut int n ← 0
+    for exclusive txn.journal_kind.length() let i {
+        if txn.journal_kind[i] ≡ kind and txn.journal_local_idx[i] ≡ idx {
+            n ← n + 1
+        }
+    }
+    return n
+}
+
+# Restore every ring buffer from the transaction's snapshot.
+fn txn_restore_ring<size C, size W, size KVD>(mut SessionState<size C, size W, size KVD> sess, SessionTxn<size C, size W, size KVD> txn) → void {
+    for exclusive sess.ring_kv.keys.length() let i {
+        mut tensor<f32, [W, KVD]> kc ← copy txn.base_ring_keys[i]
+        mut tensor<f32, [W, KVD]> vc ← copy txn.base_ring_values[i]
+        sess.ring_kv.keys[i] ← kc
+        sess.ring_kv.values[i] ← vc
+    }
+}
+
+@ public
+fn commit_prefix<size C, size W, size KVD>(mut SessionState<size C, size W, size KVD> sess, mut SessionTxn<size C, size W, size KVD> txn, int accepted_count) → void ⇥ SessionError {
+    require txn.open throw variant NoOpenTxn { message = "commit_prefix requires an open transaction" }
+    require sess.txn_depth ≡ 1 throw variant NoOpenTxn { message = "session has no open transaction" }
+    require accepted_count ≥ 0 throw variant InvalidCommitCount { message = "accepted count must be non-negative" }
+
+    # Every touched stateful slot must have at least `accepted_count`
+    # journal entries: the count is global across the verify round, and each
+    # accepted step writes every stateful slot.
+    for exclusive txn.journal_kind.length() let i {
+        let int n ← txn_journal_count(txn, txn.journal_kind[i], txn.journal_local_idx[i])
+        require accepted_count ≤ n throw variant InvalidCommitCount { message = "accepted count § exceeds the § branched writes recorded for a touched slot"(accepted_count ↦ string, n ↦ string) }
+    }
+
+    # Restore every ring buffer to its exact pre-branch bits, then replay the
+    # accepted prefix of each ring slot's journal through the same kernel —
+    # same rows, same kernel, so the bits match what the branch wrote.
+    txn_restore_ring(mut sess, txn)
+    mut list<int> replayed ← empty
+    for exclusive sess.ring_kv.keys.length() let i {
+        replayed.append(0)
+    }
+    for exclusive txn.journal_kind.length() let i {
+        if txn.journal_kind[i] ≡ ARENA_RING_KV {
+            let int idx ← txn.journal_local_idx[i]
+            replayed[idx] ← replayed[idx] + 1
+            if replayed[idx] ≤ accepted_count {
+                let i32 win ← sess.ring_kv.window_sizes[idx] ↦ i32 ⊥ 0
+                mut tensor<f32, [W, KVD]> kc ← sess.ring_kv.keys[idx]
+                mut tensor<f32, [W, KVD]> vc ← sess.ring_kv.values[idx]
+                ds.kv_ring_write_row(txn.journal_k[i], mut kc, txn.journal_pos[i], win)
+                ds.kv_ring_write_row(txn.journal_v[i], mut vc, txn.journal_pos[i], win)
+                sess.ring_kv.keys[idx] ← kc
+                sess.ring_kv.values[idx] ← vc
+            }
+        }
+    }
+
+    # Cursors: every touched slot advances by exactly `accepted_count` from
+    # its branch-time base; untouched slots keep their base (no journal
+    # entries means the base equals the current value anyway).
+    for exclusive sess.full_kv.lengths.length() let i {
+        if txn_journal_count(txn, ARENA_FULL_KV, i) ≻ 0 {
+            sess.full_kv.lengths[i] ← txn.base_full_lengths[i] + accepted_count
+        }
+    }
+    for exclusive sess.ring_kv.total_written.length() let i {
+        if txn_journal_count(txn, ARENA_RING_KV, i) ≻ 0 {
+            sess.ring_kv.total_written[i] ← txn.base_ring_written[i] + accepted_count
+        }
+    }
+
+    txn.open ← false
+    sess.txn_depth ← 0
+}
+
+@ public
+fn rollback<size C, size W, size KVD>(mut SessionState<size C, size W, size KVD> sess, mut SessionTxn<size C, size W, size KVD> txn) → void ⇥ SessionError {
+    require txn.open throw variant NoOpenTxn { message = "rollback requires an open transaction" }
+    require sess.txn_depth ≡ 1 throw variant NoOpenTxn { message = "session has no open transaction" }
+
+    txn_restore_ring(mut sess, txn)
+    for exclusive sess.full_kv.lengths.length() let i {
+        sess.full_kv.lengths[i] ← txn.base_full_lengths[i]
+    }
+    for exclusive sess.ring_kv.total_written.length() let i {
+        sess.ring_kv.total_written[i] ← txn.base_ring_written[i]
+    }
+
+    txn.open ← false
+    sess.txn_depth ← 0
 }
 
 fn find_arena_slot(list<int> slot_ids, int slot_id) → int ⇥ SessionError {
@@ -460,6 +683,302 @@ test "SessionState hybrid FullKvArena + RingKvArena(513) wraparound and windowed
         mut tensor<f32, [4]> rctx ← tf32[4] {}
         session.context_ring(sess.ring_kv, 0, cdom, rpr, mut rctx, 513 ∷ i32, 1 ∷ i32, 4 ∷ i32)
         assert rctx[[0]] ≻ 1.7 and rctx[[0]] ≺ 1.85
+    }
+    catch err {
+        assert false
+    }
+}
+
+fn mk_small_ring_sched() → schedule.ExecutionSchedule {
+    # Two ring slots with a small window 8 so wraparound proofs run fast.
+    let list<schedule.AttentionKind> attns ← [
+        variant schedule.AttentionKind.SlidingWindow { window = 8 },
+        variant schedule.AttentionKind.SlidingWindow { window = 8 }
+    ]
+    let list<schedule.RopeKind> ropes ← [
+        variant schedule.RopeKind.Standard,
+        variant schedule.RopeKind.Standard
+    ]
+    do {
+        return schedule.patterned_schedule(attns, ropes, 1, [])
+    }
+    catch err {
+        assert false
+        return schedule.ExecutionSchedule { layers = [], segments = [], steps = [], slots = [], residual = variant schedule.ResidualKind.Standard, taps = [] }
+    }
+}
+
+# Row bits for base position `p`: element j holds (p * 10 + j + 1), so every
+# cached row is element-exact distinguishable by the position it came from.
+fn fill_row(mut tensor<f32, [4]> row, int p) → void {
+    for exclusive 4 let j {
+        row[[j]] ← (p * 10 + j + 1) ↦ f32
+    }
+}
+
+test "SessionState branch rollback restores wraparound RingKvArena bit-for-bit" {
+    let schedule.ExecutionSchedule sched ← mk_small_ring_sched()
+    do {
+        mut session.SessionState<4, 8, 4> sess ← session.from_schedule<size 4, size 8, size 4>(sched)
+        assert sess.ring_kv.slot_ids.length() ≡ 2
+
+        mut tensor<f32, [4]> k ← tf32[4] {}
+        mut tensor<f32, [4]> v ← tf32[4] {}
+
+        # Base fill: positions 0..5 land in ring slots 0..5 of ring slot 0;
+        # slots 6 and 7 stay at their zero fill.
+        for exclusive 6 let p {
+            fill_row(mut k, p)
+            for exclusive 4 let j {
+                v[[j]] ← ((p * 10 + j + 1) ↦ f32) * 0.5
+            }
+            session.write_kv(mut sess, 0, k, v, p ↦ i32 ⊥ 0)
+        }
+        assert sess.ring_kv.total_written[0] ≡ 6
+
+        # Branch and write four candidate positions spanning the boundary:
+        # 6, 7 land in empty slots; 8, 9 wrap and clobber live base rows
+        # (positions 0 and 1).
+        mut session.SessionTxn<4, 8, 4> txn ← session.branch(mut sess)
+        for exclusive 4 let step {
+            fill_row(mut k, 6 + step)
+            for exclusive 4 let j {
+                v[[j]] ← (((6 + step) * 10 + j + 1) ↦ f32) * 0.5
+            }
+            session.txn_write_kv(mut sess, mut txn, 0, k, v, (6 + step) ↦ i32 ⊥ 0)
+        }
+        assert sess.ring_kv.total_written[0] ≡ 10
+
+        session.rollback(mut sess, mut txn)
+
+        assert sess.ring_kv.total_written[0] ≡ 6
+        let session.ValidSpan sp ← session.slot_valid_span(sess, 0)
+        assert sp.start_pos ≡ 0
+        assert sp.valid_count ≡ 6
+        # Slots 0 and 1 held base positions 0 and 1 before the branch and
+        # must hold exactly those bits again; slots 6 and 7 return to zeros.
+        for exclusive 8 let slot {
+            for exclusive 4 let j {
+                mut f32 want ← 0.0
+                mut f32 wantv ← 0.0
+                if slot ≺ 6 {
+                    want ← ((slot * 10 + j + 1) ↦ f32)
+                    wantv ← ((slot * 10 + j + 1) ↦ f32) * 0.5
+                }
+                assert sess.ring_kv.keys[0][[slot, j]] ≡ want
+                assert sess.ring_kv.values[0][[slot, j]] ≡ wantv
+            }
+        }
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "SessionState commit_prefix advances exactly m of k across wraparound" {
+    let schedule.ExecutionSchedule sched ← mk_small_ring_sched()
+    do {
+        mut session.SessionState<4, 8, 4> sess ← session.from_schedule<size 4, size 8, size 4>(sched)
+        mut tensor<f32, [4]> k ← tf32[4] {}
+        mut tensor<f32, [4]> v ← tf32[4] {}
+
+        for exclusive 6 let p {
+            fill_row(mut k, p)
+            for exclusive 4 let j {
+                v[[j]] ← ((p * 10 + j + 1) ↦ f32) * 0.5
+            }
+            session.write_kv(mut sess, 0, k, v, p ↦ i32 ⊥ 0)
+        }
+
+        mut session.SessionTxn<4, 8, 4> txn ← session.branch(mut sess)
+        # Six candidates at positions 6..11: slots 6, 7, 0, 1, 2, 3 — slots
+        # 0 and 1 clobber live base rows (positions 0 and 1).
+        for exclusive 6 let step {
+            fill_row(mut k, 6 + step)
+            for exclusive 4 let j {
+                v[[j]] ← (((6 + step) * 10 + j + 1) ↦ f32) * 0.5
+            }
+            session.txn_write_kv(mut sess, mut txn, 0, k, v, (6 + step) ↦ i32 ⊥ 0)
+        }
+
+        session.commit_prefix(mut sess, mut txn, 3)
+
+        # Cursors advance by exactly 3; the valid span is [1, 9).
+        assert sess.ring_kv.total_written[0] ≡ 9
+        let session.ValidSpan sp ← session.slot_valid_span(sess, 0)
+        assert sp.start_pos ≡ 1
+        assert sp.valid_count ≡ 8
+
+        # Accepted rows (positions 6, 7, 8 → slots 6, 7, 0) carry candidate
+        # bits; rejected rows (positions 9, 10, 11 → slots 1, 2, 3) carry
+        # their exact pre-branch bits (position 1's row and zeros).
+        for exclusive 4 let j {
+            assert sess.ring_kv.keys[0][[6, j]] ≡ ((61 + j) ↦ f32)
+            assert sess.ring_kv.keys[0][[7, j]] ≡ ((71 + j) ↦ f32)
+            assert sess.ring_kv.keys[0][[0, j]] ≡ ((81 + j) ↦ f32)
+            assert sess.ring_kv.keys[0][[1, j]] ≡ ((10 + j + 1) ↦ f32)
+            assert sess.ring_kv.keys[0][[2, j]] ≡ ((20 + j + 1) ↦ f32)
+            assert sess.ring_kv.keys[0][[3, j]] ≡ ((30 + j + 1) ↦ f32)
+        }
+
+        # commit_prefix(0) on a fresh transaction is exactly a rollback.
+        mut session.SessionTxn<4, 8, 4> txn2 ← session.branch(mut sess)
+        fill_row(mut k, 20)
+        session.txn_write_kv(mut sess, mut txn2, 0, k, v, 9 ∷ i32)
+        session.commit_prefix(mut sess, mut txn2, 0)
+        assert sess.ring_kv.total_written[0] ≡ 9
+        assert sess.ring_kv.keys[0][[1, 0]] ≡ ((10 + 0 + 1) ↦ f32)
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "SessionState transactions are atomic across FullKvArena and RingKvArena" {
+    let schedule.ExecutionSchedule sched ← mk_hybrid_flint_sched()
+    do {
+        mut session.SessionState<16, 513, 4> sess ← session.from_schedule<size 16, size 513, size 4>(sched)
+        mut tensor<f32, [4]> k ← tf32[4] {}
+        mut tensor<f32, [4]> v ← tf32[4] {}
+        for exclusive 4 let j {
+            k[[j]] ← 1.0
+            v[[j]] ← 2.0
+        }
+
+        # Slot 1 is the FullKv arena; slots 0 and 2 are ring slots.
+        mut session.SessionTxn<16, 513, 4> txn ← session.branch(mut sess)
+        session.txn_write_kv(mut sess, mut txn, 1, k, v, 0 ∷ i32)
+        session.txn_write_kv(mut sess, mut txn, 0, k, v, 0 ∷ i32)
+        session.rollback(mut sess, mut txn)
+        assert sess.full_kv.lengths[0] ≡ 0
+        assert sess.ring_kv.total_written[0] ≡ 0
+
+        mut session.SessionTxn<16, 513, 4> txn2 ← session.branch(mut sess)
+        session.txn_write_kv(mut sess, mut txn2, 1, k, v, 0 ∷ i32)
+        session.txn_write_kv(mut sess, mut txn2, 0, k, v, 0 ∷ i32)
+        session.txn_write_kv(mut sess, mut txn2, 1, k, v, 1 ∷ i32)
+        session.txn_write_kv(mut sess, mut txn2, 0, k, v, 1 ∷ i32)
+        session.commit_prefix(mut sess, mut txn2, 2)
+        assert sess.full_kv.lengths[0] ≡ 2
+        assert sess.ring_kv.total_written[0] ≡ 2
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "SessionState rejects plain write_kv and nested branch while a txn is open" {
+    let schedule.ExecutionSchedule sched ← mk_small_ring_sched()
+    do {
+        mut session.SessionState<4, 8, 4> sess ← session.from_schedule<size 4, size 8, size 4>(sched)
+        mut tensor<f32, [4]> k ← tf32[4] {}
+        mut tensor<f32, [4]> v ← tf32[4] {}
+        for exclusive 4 let j {
+            k[[j]] ← 1.0
+            v[[j]] ← 2.0
+        }
+
+        mut session.SessionTxn<4, 8, 4> txn ← session.branch(mut sess)
+
+        do {
+            session.write_kv(mut sess, 0, k, v, 0 ∷ i32)
+            assert false
+        }
+        catch err {
+            match err {
+                case session.SessionError.TxnOpen let ? {
+                }
+                case _ {
+                    assert false
+                }
+            }
+        }
+
+        do {
+            let session.SessionTxn<4, 8, 4> nested ← session.branch(mut sess)
+            assert false
+        }
+        catch err {
+            match err {
+                case session.SessionError.TxnOpen let ? {
+                }
+                case _ {
+                    assert false
+                }
+            }
+        }
+
+        session.rollback(mut sess, mut txn)
+        # The plain path works again once the transaction is closed.
+        session.write_kv(mut sess, 0, k, v, 0 ∷ i32)
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "SessionState rejects full-KV rewrite inside a branch" {
+    let schedule.ExecutionSchedule sched ← mk_dense_sched(2)
+    do {
+        mut session.SessionState<4, 1, 4> sess ← session.from_dense_schedule<size 4, size 4>(sched)
+        mut tensor<f32, [4]> k ← tf32[4] {}
+        mut tensor<f32, [4]> v ← tf32[4] {}
+        for exclusive 4 let j {
+            k[[j]] ← 1.0
+            v[[j]] ← 2.0
+        }
+
+        session.write_kv(mut sess, 0, k, v, 0 ∷ i32)
+        mut session.SessionTxn<4, 1, 4> txn ← session.branch(mut sess)
+        do {
+            # Position 0 is below the slot's current length: extension-only.
+            session.txn_write_kv(mut sess, mut txn, 0, k, v, 0 ∷ i32)
+            assert false
+        }
+        catch err {
+            match err {
+                case session.SessionError.InvalidBranchWrite let ? {
+                }
+                case _ {
+                    assert false
+                }
+            }
+        }
+        # The extension write past the live row is admitted.
+        session.txn_write_kv(mut sess, mut txn, 0, k, v, 1 ∷ i32)
+        session.commit_prefix(mut sess, mut txn, 1)
+        assert sess.full_kv.lengths[0] ≡ 2
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "SessionState dense-only branch and commit over a ring-free schedule" {
+    let schedule.ExecutionSchedule sched ← mk_dense_sched(2)
+    do {
+        mut session.SessionState<4, 1, 4> sess ← session.from_dense_schedule<size 4, size 4>(sched)
+        assert sess.ring_kv.slot_ids.length() ≡ 0
+        mut tensor<f32, [4]> k ← tf32[4] {}
+        mut tensor<f32, [4]> v ← tf32[4] {}
+        for exclusive 4 let j {
+            k[[j]] ← 1.0
+            v[[j]] ← 2.0
+        }
+
+        mut session.SessionTxn<4, 1, 4> txn ← session.branch(mut sess)
+        session.txn_write_kv(mut sess, mut txn, 0, k, v, 0 ∷ i32)
+        session.txn_write_kv(mut sess, mut txn, 1, k, v, 0 ∷ i32)
+        session.rollback(mut sess, mut txn)
+        assert sess.full_kv.lengths[0] ≡ 0
+        assert sess.full_kv.lengths[1] ≡ 0
+
+        mut session.SessionTxn<4, 1, 4> txn2 ← session.branch(mut sess)
+        session.txn_write_kv(mut sess, mut txn2, 0, k, v, 0 ∷ i32)
+        session.txn_write_kv(mut sess, mut txn2, 1, k, v, 0 ∷ i32)
+        session.commit_prefix(mut sess, mut txn2, 1)
+        assert sess.full_kv.lengths[0] ≡ 1
+        assert sess.full_kv.lengths[1] ≡ 1
     }
     catch err {
         assert false
