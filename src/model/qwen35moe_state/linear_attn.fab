@@ -49,28 +49,35 @@ class LinearAttentionOutcome {
     mut session.RecurrentState recurrent
 }
 
-# Run one SSM layer over T input rows [T][2048]: attn_norm -> qkv/z/beta/
-# alpha/gate projections -> causal depthwise conv (state-carried) -> L2
-# norms + head repeat -> the delta recurrence per head per token -> z-gated
-# RMSNorm -> output projection -> residual add. The recurrence order (heads
-# outer, tokens inner, per head sequential) mirrors the comparator's fused
-# kernel; batching over tokens and feeding tokens one at a time produce the
-# same values (F5), and the returned states are the terminal state family.
+# Load-time-prepared SSM layer weights (issue #79): every weight window is
+# read, shape-checked, and finiteness-validated once here — never per
+# decode token. The lean prepared entry points below consume this record
+# and touch no weight source.
 @ public
-fn linear_attention(list<f32> x_rows, int layer, session.ConvState conv_in, session.RecurrentState recurrent_in, (string, int, int) → tensor.NumericBlock ⇥ schedule.Qwen35moeStateError source, qwen35moe.Qwen35moeConfig c) → LinearAttentionOutcome ⇥ schedule.Qwen35moeStateError {
-    let int tokens ← x_rows.length() / c.embedding_length
-    # --- window gates (fail closed) ---------------------------------------
-    require tokens ≥ 1 and x_rows.length() ≡ tokens * c.embedding_length throw variant BadShape {message = "linear attention input rows must be [T][embedding]"}
+class LinearAttentionWeights {
+    mut tensor.NumericBlock attn_norm
+    mut tensor.NumericBlock wqkv
+    mut tensor.NumericBlock wgate
+    mut tensor.NumericBlock conv_weight
+    mut tensor.NumericBlock dt_bias
+    mut tensor.NumericBlock a_row
+    mut tensor.NumericBlock wbeta
+    mut tensor.NumericBlock walpha
+    mut tensor.NumericBlock ssm_norm
+    mut tensor.NumericBlock wout
+}
+
+# Read and validate the whole SSM layer weight set once. The window order
+# matches the traced entry point's read order, so the first diverging
+# window fails with the same diagnostic either way.
+@ public
+fn prepare_linear_attention((string, int, int) → tensor.NumericBlock ⇥ schedule.Qwen35moeStateError source, int layer, qwen35moe.Qwen35moeConfig c) → LinearAttentionWeights ⇥ schedule.Qwen35moeStateError {
     require layer ≥ 0 throw variant BadConfig {message = "layer index must be non-negative"}
     let int embd ← c.embedding_length
     let int conv_channels ← c.inner_size + 2 * c.group_count * c.state_size
-    let int key_dim ← c.state_size
     let int value_heads ← c.gradus_temporis
-    let int value_dim ← c.state_size
     let int head_v_dim ← c.inner_size / value_heads
     let string p ← session.prefix(layer)
-
-    # --- weights (each read once per layer call) --------------------------
     let tensor.NumericBlock attn_norm ← session.window(source, p + ".attn_norm", 0, embd, [embd])
     let tensor.NumericBlock wqkv ← session.window(source, p + ".attn_qkv", 0, conv_channels * embd, [conv_channels, embd])
     let tensor.NumericBlock wgate ← session.window(source, p + ".attn_gate", 0, c.inner_size * embd, [c.inner_size, embd])
@@ -81,6 +88,39 @@ fn linear_attention(list<f32> x_rows, int layer, session.ConvState conv_in, sess
     let tensor.NumericBlock walpha ← session.window(source, p + ".ssm_alpha", 0, value_heads * embd, [value_heads, embd])
     let tensor.NumericBlock ssm_norm ← session.window(source, p + ".ssm_norm", 0, head_v_dim, [head_v_dim])
     let tensor.NumericBlock wout ← session.window(source, p + ".ssm_out", 0, embd * c.inner_size, [embd, c.inner_size])
+    return LinearAttentionWeights {attn_norm = attn_norm, wqkv = wqkv, wgate = wgate, conv_weight = conv_weight, dt_bias = dt_bias, a_row = a_row, wbeta = wbeta, walpha = walpha, ssm_norm = ssm_norm, wout = wout}
+}
+
+# Run one SSM layer over T input rows [T][2048]: attn_norm -> qkv/z/beta/
+# alpha/gate projections -> causal depthwise conv (state-carried) -> L2
+# norms + head repeat -> the delta recurrence per head per token -> z-gated
+# RMSNorm -> output projection -> residual add. The recurrence order (heads
+# outer, tokens inner, per head sequential) mirrors the comparator's fused
+# kernel; batching over tokens and feeding tokens one at a time produce the
+# same values (F5), and the returned states are the terminal state family.
+# `capture` gates only the diagnostic trace record: the compute path and
+# every float operation are identical either way (issue #79).
+fn linear_attention_core(list<f32> x_rows, session.ConvState conv_in, session.RecurrentState recurrent_in, LinearAttentionWeights weights, qwen35moe.Qwen35moeConfig c, bool capture) → LinearAttentionOutcome ⇥ schedule.Qwen35moeStateError {
+    let int tokens ← x_rows.length() / c.embedding_length
+    require tokens ≥ 1 and x_rows.length() ≡ tokens * c.embedding_length throw variant BadShape {message = "linear attention input rows must be [T][embedding]"}
+    let int embd ← c.embedding_length
+    let int conv_channels ← c.inner_size + 2 * c.group_count * c.state_size
+    let int key_dim ← c.state_size
+    let int value_heads ← c.gradus_temporis
+    let int value_dim ← c.state_size
+    let int head_v_dim ← c.inner_size / value_heads
+
+    # --- weights (validated at read: prepare once, or per traced call) ----
+    let tensor.NumericBlock attn_norm ← weights.attn_norm
+    let tensor.NumericBlock wqkv ← weights.wqkv
+    let tensor.NumericBlock wgate ← weights.wgate
+    let tensor.NumericBlock conv_weight ← weights.conv_weight
+    let tensor.NumericBlock dt_bias ← weights.dt_bias
+    let tensor.NumericBlock a_row ← weights.a_row
+    let tensor.NumericBlock wbeta ← weights.wbeta
+    let tensor.NumericBlock walpha ← weights.walpha
+    let tensor.NumericBlock ssm_norm ← weights.ssm_norm
+    let tensor.NumericBlock wout ← weights.wout
 
     mut list<f32> out_rows ← empty
 
@@ -247,12 +287,45 @@ fn linear_attention(list<f32> x_rows, int layer, session.ConvState conv_in, sess
         require dtype.finite(v) throw variant schedule.Qwen35moeStateError.NonFinite {message = "linear attention output is non-finite"}
         out_rows.append(v + (x_rows.get(i) coalesce 0.0 ∷ f32))
     }
+    if not capture {
+        # Lean decode route: no diagnostic trace buffers are allocated
+        # (issue #79); every compute intermediate above is either consumed
+        # by the next stage or dropped here without a trace copy.
+        return LinearAttentionOutcome {trace = LinearAttentionTrace {normed = empty, qkv_mixed = empty, gate_proj = empty, beta_sigmoid = empty, gate = empty, conv_input = empty, conv_output = empty, q_conv = empty, k_conv = empty, v_conv = empty, core_out = empty, final_output = empty}, out = out_rows, conv = conv_out_state, recurrent = recurrent_out}
+    }
     let LinearAttentionTrace trace ← LinearAttentionTrace {normed = normed_rows, qkv_mixed = qkv_rows, gate_proj = z_rows, beta_sigmoid = beta_sigmoid_rows, gate = gate_rows, conv_input = conv_input, conv_output = conv_out, q_conv = q_rows, k_conv = k_rows, v_conv = v_rows, core_out = core_token_major, final_output = final_rows}
     return LinearAttentionOutcome {trace = trace, out = out_rows, conv = conv_out_state, recurrent = recurrent_out}
+}
+
+# Traced form (the oracle/diagnostic route): reads and validates every
+# weight window through the source on each call, and captures the full
+# per-token trace for the per-layer first-divergence comparison. Gate
+# order matches the historical entry point: input shape, then layer index,
+# then weight windows.
+@ public
+fn linear_attention(list<f32> x_rows, int layer, session.ConvState conv_in, session.RecurrentState recurrent_in, (string, int, int) → tensor.NumericBlock ⇥ schedule.Qwen35moeStateError source, qwen35moe.Qwen35moeConfig c) → LinearAttentionOutcome ⇥ schedule.Qwen35moeStateError {
+    let int tokens ← x_rows.length() / c.embedding_length
+    require tokens ≥ 1 and x_rows.length() ≡ tokens * c.embedding_length throw variant BadShape {message = "linear attention input rows must be [T][embedding]"}
+    let LinearAttentionWeights weights ← prepare_linear_attention(source, layer, c)
+    return linear_attention_core(x_rows, conv_in, recurrent_in, weights, c, true)
 }
 
 # One-token incremental form (F5's decode side; identical math, T = 1).
 @ public
 fn linear_attention_step(list<f32> x_row, int layer, session.ConvState conv_in, session.RecurrentState recurrent_in, (string, int, int) → tensor.NumericBlock ⇥ schedule.Qwen35moeStateError source, qwen35moe.Qwen35moeConfig c) → LinearAttentionOutcome ⇥ schedule.Qwen35moeStateError {
     return linear_attention(x_row, layer, conv_in, recurrent_in, source, c)
+}
+
+# Lean prepared form (the decode route): consumes the load-time-prepared
+# weight record, re-reads no weight source, re-runs no weight validation,
+# and allocates no trace buffers.
+@ public
+fn linear_attention_prepared(list<f32> x_rows, session.ConvState conv_in, session.RecurrentState recurrent_in, LinearAttentionWeights weights, qwen35moe.Qwen35moeConfig c) → LinearAttentionOutcome ⇥ schedule.Qwen35moeStateError {
+    return linear_attention_core(x_rows, conv_in, recurrent_in, weights, c, false)
+}
+
+# One-token lean prepared form (identical math, T = 1).
+@ public
+fn linear_attention_step_prepared(list<f32> x_row, session.ConvState conv_in, session.RecurrentState recurrent_in, LinearAttentionWeights weights, qwen35moe.Qwen35moeConfig c) → LinearAttentionOutcome ⇥ schedule.Qwen35moeStateError {
+    return linear_attention_prepared(x_row, conv_in, recurrent_in, weights, c)
 }

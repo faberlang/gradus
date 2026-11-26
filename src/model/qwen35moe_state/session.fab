@@ -300,14 +300,28 @@ fn deserialize_session_identity<size C, size W, size KVD, size ConvRows, size Co
     mut int linear ← 0
     mut int full ← 0
     mut int nextn ← 0
+    mut list<int> linear_slots ← empty
+    mut list<int> full_slots ← empty
     for from kinds let kind {
         switch kind {
-            case 0 { linear ↑ }
-            case 1 { full ↑ }
-            case 2 { nextn ↑ }
+            case 0 {
+                linear_slots.append(linear)
+                full_slots.append(-1)
+                linear ↑
+            }
+            case 1 {
+                linear_slots.append(-1)
+                full_slots.append(full)
+                full ↑
+            }
+            case 2 {
+                linear_slots.append(-1)
+                full_slots.append(-1)
+                nextn ↑
+            }
         }
     }
-    let schedule.Qwen35moeSchedule s ← schedule.Qwen35moeSchedule {trunk_layers = linear + full, linear_layers = linear, full_layers = full, nextn_layers = nextn, kinds = kinds}
+    let schedule.Qwen35moeSchedule s ← schedule.Qwen35moeSchedule {trunk_layers = linear + full, linear_layers = linear, full_layers = full, nextn_layers = nextn, kinds = kinds, linear_slots = linear_slots, full_slots = full_slots}
     let _ exec_sched ← schedule.to_execution_schedule(s, [11, 11, 10, 0])
     do {
         let hybrid.HybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> arenas ← hybrid.from_schedule<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols>(exec_sched, 1, ConvRows, false)
@@ -449,28 +463,33 @@ fn gemm_rows(tensor.NumericBlock weight, list<f32> x_rows, int in_dim, int out_d
 # S4 — multi-section RoPE (F4).
 # -------------------------------------------------------------------------
 
-# RoPE over one head row. Pair j (0..pairs-1) is (element j, element j +
-# dims/2) — the comparator's half-split layout; elements at or beyond dims
-# pass through untouched. The angle series is theta_j = pos * base^(-2 *
-# j / dims). The four section lengths are carried for the multi-section
-# wire: on the qwen35moe text row every section reads the same text
-# position, so the per-section theta selection collapses to the shared
-# series (the pinned comparator computes the identical value either way).
+# The per-position RoPE angle table ([cos, sin] per pair, theta_j = pos *
+# base^(-2j/dims)). Computed once per token and shared by every head
+# rotation of that token (issue #79: the trig series was recomputed per
+# head — 18 times per token per layer — instead of once per position).
 @ public
-fn rope_head(list<f32> head, int dims, int pairs, f32 base, list<int> sections, int pos, int pass_through) → list<f32> ⇥ schedule.Qwen35moeStateError {
-    require dims ≡ pairs * 2 throw variant schedule.Qwen35moeStateError.BadShape {message = "rope dims must be twice the pair count"}
-    require sections.length() ≥ 4 throw variant schedule.Qwen35moeStateError.BadShape {message = "rope needs four section lengths"}
-    require head.length() ≥ dims throw variant schedule.Qwen35moeStateError.BadShape {message = "head row is shorter than the rope dims"}
-    require pass_through ≡ head.length() throw variant schedule.Qwen35moeStateError.BadShape {message = "pass-through width must be the head width"}
-    mut list<f32> out ← empty
-    let int half ← dims / 2
-    # Angle table first ([cos, sin] per pair), then one append-order walk.
+fn rope_table(f32 base, int dims, int pos) → list<f32> ⇥ schedule.Qwen35moeStateError {
+    require dims ≥ 2 and dims % 2 ≡ 0 throw variant schedule.Qwen35moeStateError.BadShape {message = "rope dims must be positive and even"}
     mut list<f32> table ← empty
-    for range 0‥half let j {
+    for range 0‥dims / 2 let j {
         let f32 angle ← (pos ↦ f32) * (base.power((-(2.0 * (j ↦ f32))) / (dims ↦ f32)) ⊥ 0.0)
         table.append(cos angle)
         table.append(sin angle)
     }
+    return table
+}
+
+# Apply a precomputed angle table to one head row. Pair j (0..pairs-1) is
+# (element j, element j + dims/2) — the comparator's half-split layout;
+# elements at or beyond dims pass through untouched. Identical math and
+# append order to the single-call form below.
+@ public
+fn rope_head_table(list<f32> head, list<f32> table, int dims, int pass_through) → list<f32> ⇥ schedule.Qwen35moeStateError {
+    require head.length() ≥ dims throw variant schedule.Qwen35moeStateError.BadShape {message = "head row is shorter than the rope dims"}
+    require pass_through ≡ head.length() throw variant schedule.Qwen35moeStateError.BadShape {message = "pass-through width must be the head width"}
+    require table.length() ≡ dims throw variant schedule.Qwen35moeStateError.BadShape {message = "rope table must carry the full pair series"}
+    mut list<f32> out ← empty
+    let int half ← dims / 2
     for range 0‥pass_through let i {
         if i ≺ half {
             let f32 x0 ← head.get(i) coalesce 0.0
@@ -492,6 +511,24 @@ fn rope_head(list<f32> head, int dims, int pairs, f32 base, list<int> sections, 
     return out
 }
 
+# RoPE over one head row. Pair j (0..pairs-1) is (element j, element j +
+# dims/2) — the comparator's half-split layout; elements at or beyond dims
+# pass through untouched. The angle series is theta_j = pos * base^(-2 *
+# j / dims). The four section lengths are carried for the multi-section
+# wire: on the qwen35moe text row every section reads the same text
+# position, so the per-section theta selection collapses to the shared
+# series (the pinned comparator computes the identical value either way).
+# Single-call form: builds the angle table, then applies it. Callers
+# rotating many heads at one position share rope_table + rope_head_table
+# instead.
+@ public
+fn rope_head(list<f32> head, int dims, int pairs, f32 base, list<int> sections, int pos, int pass_through) → list<f32> ⇥ schedule.Qwen35moeStateError {
+    require dims ≡ pairs * 2 throw variant schedule.Qwen35moeStateError.BadShape {message = "rope dims must be twice the pair count"}
+    require sections.length() ≥ 4 throw variant schedule.Qwen35moeStateError.BadShape {message = "rope needs four section lengths"}
+    let list<f32> table ← rope_table(base, dims, pos)
+    return rope_head_table(head, table, dims, pass_through)
+}
+
 # -------------------------------------------------------------------------
 # S2 — the Gated DeltaNet core recurrence (F2).
 # -------------------------------------------------------------------------
@@ -499,9 +536,11 @@ fn rope_head(list<f32> head, int dims, int pairs, f32 base, list<int> sections, 
 # One head, one token: decay -> delta -> outer update -> output read, in
 # the comparator's exact stage order. The head span (key_dim * value_dim
 # cells of the transposed state) is consumed as an immutable list and a new
-# span is returned with the output row. Stages never interleave: the delta
-# row reads the decayed state, the outer update writes it, and the output
-# row reads the updated state.
+# span is returned with the output row. Per-cell operations and their order
+# are unchanged from the four-pass form (issue #79 fused the delta, outer
+# update, and output read into one row walk — delta[j] is only consumed by
+# row j, so the fused cells and read-outs are bit-identical while the
+# intermediate delta list and one full state pass disappear).
 @ public
 fn delta_step(list<f32> span, list<f32> q, list<f32> k, list<f32> v, f32 decay, f32 beta, int dim) → tuple<updated: list<f32>, out: list<f32>> ⇥ schedule.Qwen35moeStateError {
     # 1. decay: every cell scaled by exp(g).
@@ -509,36 +548,27 @@ fn delta_step(list<f32> span, list<f32> q, list<f32> k, list<f32> v, f32 decay, 
     for from span let cell {
         decayed.append(cell * decay)
     }
-    # 2. delta[j] = (v[j] - dot(state row j, k)) * beta
-    mut list<f32> delta ← empty
+    # 2-4 fused per row j: delta[j] = (v[j] - dot(decayed row j, k)) * beta,
+    # updated row j = decayed row j + k * delta[j], and out[j] =
+    # dot(updated row j, q) / sqrt(dim).
+    let f32 scale ← 1.0 / (√ (dim ↦ f32))
+    mut list<f32> updated ← empty
+    mut list<f32> out ← empty
     for range 0‥dim let j {
         mut f32 sum ← 0.0
         let int row ← j * dim
         for range 0‥dim let i {
             sum ← sum + (decayed.get(row + i) coalesce 0.0) * (k.get(i) coalesce 0.0)
         }
-        delta.append(((v.get(j) coalesce 0.0) - sum) * beta)
-    }
-    # 3. outer update: state row j += k * delta[j]
-    mut list<f32> updated ← empty
-    for range 0‥dim let j {
-        let f32 d ← delta.get(j) coalesce 0.0
-        let int row ← j * dim
+        let f32 d ← ((v.get(j) coalesce 0.0) - sum) * beta
+        mut f32 read ← 0.0
         for range 0‥dim let i {
-            updated.append((decayed.get(row + i) coalesce 0.0) + (k.get(i) coalesce 0.0) * d)
+            let f32 cell ← (decayed.get(row + i) coalesce 0.0) + (k.get(i) coalesce 0.0) * d
+            updated.append(cell)
+            read ← read + cell * (q.get(i) coalesce 0.0)
         }
-    }
-    # 4. output read from the updated state, scaled by 1/sqrt(dim).
-    let f32 scale ← 1.0 / (√ (dim ↦ f32))
-    mut list<f32> out ← empty
-    for range 0‥dim let j {
-        mut f32 sum ← 0.0
-        let int row ← j * dim
-        for range 0‥dim let i {
-            sum ← sum + (updated.get(row + i) coalesce 0.0) * (q.get(i) coalesce 0.0)
-        }
-        require dtype.finite(sum) throw variant schedule.Qwen35moeStateError.NonFinite {message = "gated delta net output is non-finite"}
-        out.append(sum * scale)
+        require dtype.finite(read) throw variant schedule.Qwen35moeStateError.NonFinite {message = "gated delta net output is non-finite"}
+        out.append(read * scale)
     }
     return tuple<updated: list<f32>, out: list<f32>> [updated, out]
 }
