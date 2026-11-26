@@ -27,10 +27,6 @@ locale = "en"
 
 import from "gradus:random"
 
-import from "norma:fs"
-
-import from "norma:fault"
-
 # -------------------------------------------------------------------------
 # DataError — typed error vocabulary of the data surface. Every variant
 # carries a text message so consumers can render the failure without
@@ -566,31 +562,9 @@ fn supervised_sampler_step(SupervisedSet set, list<int> train_set, int batch_siz
     return supervised_sampler_emit(set, train_set, shuffled.payload, position, batch_size, state.corpus, state.seed, epoch, corpus_hash)
 }
 
-@ public
-fn supervised_sampler_save(string path, SupervisedSampler state) → bool {
-    do {
-        lm_cursor_write_text(path, supervised_sampler_wire(state))
-    }
-    catch err {
-        return false
-    }
-
-    return true
-}
-
-@ public
-fn supervised_sampler_load(string path) → SupervisedSampler ∪ none {
-    mut string wire ← ""
-
-    do {
-        wire ← lm_cursor_read_text(path)
-    }
-    catch err {
-        return null
-    }
-
-    return supervised_sampler_parse(wire)
-}
+# The sampler persists through the same wire boundary as the cursor: the
+# state's wire (supervised_sampler_wire) is the persisted bytes and
+# supervised_sampler_parse restores them; the host owns the file.
 
 # -------------------------------------------------------------------------
 # Language-model byte vocabulary and stable corpus identity.
@@ -990,50 +964,16 @@ fn lm_cursor_finish(LmCursor cursor) → LmCursor {
 }
 
 # -------------------------------------------------------------------------
-# Cursor persistence. A fresh process resumes from the file alone: the bytes
-# on disk are exactly the cursor wire, and the loaded cursor is the parse of
-# those bytes. A missing or unreadable file loads as none — never a guessed
-# cursor. A save reports whether the wire reached the disk: it is true only
-# when the write completed, and false when the write failed, in which case
-# the previous file (or no file) is left in place. A false save is NOT a
-# checkpoint — the persisted state is stale or absent, so a caller that keeps
-# training past it would replay windows after a restart. Check the result at
-# the acceptance boundary; a retry is the caller's decision.
+# Cursor persistence. Gradus is self-contained: it owns the wire, and the
+# host owns the file. The persisted state of a traversal is exactly the
+# cursor wire (lm_cursor_wire), and a fresh process resumes by parsing
+# those bytes (lm_cursor_parse) — whatever boundary carries them (a file,
+# a store, a message) is the caller's. A parse failure loads as none —
+# never a guessed cursor. Persist the wire at the acceptance boundary and
+# keep the previous state on a failed write; a stale or absent state means
+# a caller that keeps training past it would replay windows after a
+# restart. The retry is the caller's decision.
 # -------------------------------------------------------------------------
-
-fn lm_cursor_read_text(string path) → string ⇥ fault.IoFault {
-    return fs.read_file<string>(path)
-}
-
-fn lm_cursor_write_text(string path, string wire) → none ⇥ fault.IoFault {
-    fs.write_file(path, wire)
-}
-
-@ public
-fn lm_cursor_save(string path, LmCursor cursor) → bool {
-    do {
-        lm_cursor_write_text(path, lm_cursor_wire(cursor))
-    }
-    catch err {
-        return false
-    }
-
-    return true
-}
-
-@ public
-fn lm_cursor_load(string path) → LmCursor ∪ none {
-    mut string wire ← ""
-
-    do {
-        wire ← lm_cursor_read_text(path)
-    }
-    catch err {
-        return null
-    }
-
-    return lm_cursor_parse(wire)
-}
 
 +++ faber test
 # Co-located package test for data.fab (T2-U1 — the data/batch leaf).
@@ -1062,7 +1002,6 @@ fn lm_cursor_load(string path) → LmCursor ∪ none {
 # compile-level proof; no runtime value identity is claimed here.
 
 import from "gradus:data" data
-import from "norma:fs" fs
 
 import from "gradus:loss" loss
 
@@ -1754,45 +1693,40 @@ test "lm cursor parse rejects a malformed wire with none" {
     assert data.lm_cursor_parse("lm-cursor-v1#12;#training#0#2x") is none
 }
 
-# ---- cursor persistence: the file on disk is the only state a fresh process
-# needs. The save writes exactly the cursor wire, the load parses it back, and
-# a missing file loads as none rather than a guessed cursor.
+# ---- cursor persistence: the wire is the persisted state and the host
+# owns the file. The wire round-trip and the restored-cursor resume rows
+# above pin the traversal contract; the restored-sampler row below pins
+# the same boundary for the supervised sampler.
 
-# Remove a scratch cursor file; an absent file is already the wanted state.
-fn lm_cursor_discard(string path) → none {
-    do {
-        fs.delete(path)
+
+test "a sampler restored from its wire emits the same next step" {
+    # train_set is the row-index corpus the sampler contract shuffles (the
+    # supervised_split posture); the set rows are indexed by those ids.
+    let _ outcome_157 ← trap {
+        let list<int> train ← [0, 1, 2, 3, 4, 5, 6, 7]
+        let data.SupervisedSet set ← data.supervised_set([[10, 20], [11, 21], [12, 22], [13, 23], [14, 24], [15, 25], [16, 26], [17, 27]], [[110], [111], [112], [113], [114], [115], [116], [117]]) ⊥ data.SupervisedSet { inputs = empty, targets = empty }
+        let data.SupervisedSampler start_state ← data.supervised_sampler_start(train, seed_p(SEED_A))
+        let _ first_value ← data.supervised_sampler_step(set, train, 2, start_state)
+        assert first_value not is none
+        let data.SupervisedStep first ← first_value coalesce data.SupervisedStep { batch = data.Batch { x = tensor.default(), y = tensor.default() }, state = start_state }
+        let string wire ← data.supervised_sampler_wire(first.state)
+        let _ parsed_value ← data.supervised_sampler_parse(wire)
+        assert parsed_value not is none
+        let data.SupervisedSampler restored ← parsed_value coalesce start_state
+        let _ live_value ← data.supervised_sampler_step(set, train, 2, first.state)
+        assert live_value not is none
+        let data.SupervisedStep live ← live_value coalesce first
+        let _ resumed_value ← data.supervised_sampler_step(set, train, 2, restored)
+        assert resumed_value not is none
+        let data.SupervisedStep resumed ← resumed_value coalesce live
+        assert resumed.batch.x.shape ≡ live.batch.x.shape
+        assert resumed.batch.y.shape ≡ live.batch.y.shape
+        assert resumed.state.position ≡ live.state.position
+        assert resumed.state.epoch ≡ live.state.epoch
+        assert resumed.state.seed ≡ live.state.seed
     }
-    catch err {
+    match outcome_157 {
+        case returned let ? { }
+        case thrown let ? { assert false }
     }
-}
-
-test "a cursor saved to disk resumes at the same next window" {
-    let string path ← fs.join([fs.temp_dir(), "lm_cursor_resume.tmp"])
-    # Original-corpus documents: index 0 and 1 are training, index 2 is
-    # validation. The cursor sits at a non-zero document and a non-zero window.
-    let list<list<int>> documents ← [[10, 11, 12, 13, 14], [30, 31, 32, 33, 34, 35], [20, 21]]
-    let string identity ← data.lm_corpus_identity(documents)
-    let data.LmSplit split ← data.LmSplit { training = [[10, 11, 12, 13, 14], [30, 31, 32, 33, 34, 35]], validation = [[20, 21]] }
-    let data.LmCursor cursor ← data.LmCursor { corpus = identity, split = "training", document = 1, window = 1 }
-    data.lm_cursor_save(path, cursor)
-    let _ loaded_value ← data.lm_cursor_load(path)
-    assert loaded_value not is none
-    let data.LmCursor loaded ← loaded_value coalesce data.LmCursor { corpus = "", split = "", document = -1, window = 0 }
-    assert loaded.document ≢ -1
-    assert loaded.window ≢ 0
-    let data.LmWindow original ← data.lm_cursor_next(documents, split, cursor, 2) coalesce data.LmWindow { document = -1, start = -1, inputs = empty, targets = empty, loss_mask = empty }
-    let data.LmWindow resumed ← data.lm_cursor_next(documents, split, loaded, 2) coalesce data.LmWindow { document = -1, start = -1, inputs = empty, targets = empty, loss_mask = empty }
-    assert resumed.document ≡ original.document
-    assert resumed.start ≡ original.start
-    assert resumed.inputs ≡ original.inputs
-    assert resumed.targets ≡ original.targets
-    assert resumed.loss_mask ≡ original.loss_mask
-    lm_cursor_discard(path)
-}
-
-test "lm cursor load returns none for a missing file" {
-    let string path ← fs.join([fs.temp_dir(), "lm_cursor_absent.tmp"])
-    lm_cursor_discard(path)
-    assert data.lm_cursor_load(path) is none
 }

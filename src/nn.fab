@@ -411,25 +411,35 @@ fn layernorm_carrier(tensor.NumericBlock x, tensor.NumericBlock scale, tensor.Nu
     mut list<f32> out ← empty
 
     # legacy-L2: staged carrier — x.data, scale.data, and offset.data are flat lists; retain indexed walks until shaped carrier migration.
-    # Fused row passes (issue #80): the mean and variance walks run as one
-    # sum / sum-of-squares pass (population variance as E[x^2] - mean^2),
-    # the row base index is hoisted once per row, and the reciprocal
-    # standard deviation is hoisted per row (a multiply, not a per-element
-    # division). The oracle rows compare within the documented tolerance.
+    # Two row passes (population variance as mean((x − mean)²)): the first
+    # walk sums for the mean, the second walks the centered squares. The
+    # former one-pass form (E[x^2] − mean^2) cancels catastrophically in
+    # f32 once mean² dominates the spread — the sum-of-squares rounding
+    # noise alone exceeds the true variance, driving it negative or to
+    # zero. The row base index is hoisted once per row and the reciprocal
+    # standard deviation is hoisted per row (a multiply, not a
+    # per-element division). The oracle rows compare within the documented
+    # tolerance.
     for range 0 ‥ rows let row {
         # legacy-L4: staged carrier — row reductions wait for a shaped reduce admission.
         let int base ← row * c
         mut f32 sum ← 0.0 ∷ f32
-        mut f32 sq ← 0.0 ∷ f32
 
         for range 0 ‥ c let col {
             let f32 v ← x.data.get(base + col) coalesce 0.0 ∷ f32
             sum ← sum + v
-            sq ← sq + v * v
         }
 
         let f32 mean ← sum / (c ↦ f32)
-        let f32 var ← sq / (c ↦ f32) - mean * mean
+        mut f32 sq ← 0.0 ∷ f32
+
+        for range 0 ‥ c let col {
+            let f32 v ← x.data.get(base + col) coalesce 0.0 ∷ f32
+            let f32 d ← v - mean
+            sq ← sq + d * d
+        }
+
+        let f32 var ← sq / (c ↦ f32)
         let f32 inv_std ← 1.0 / √ (var + ε)
 
         # Normalize + per-feature affine.
@@ -1249,6 +1259,25 @@ test "layernorm keeps large variance accurate after sqrt prescaling" {
         assert e1(y, 1).approx(1.0, GELU_TOLERATIO)
     }
     match trap_result_10 {
+        case returned let ? { }
+        case thrown let ? { assert false }
+    }
+}
+
+test "layernorm keeps a small spread around a large mean accurate (no cancellation)" {
+    # x = [4096.0, 4096.5]: mean 4096.25, population variance 0.0625. In
+    # f32 the one-pass form E[x^2] - mean^2 evaluates both terms to the
+    # same rounded value, the variance collapses to zero, and the rows
+    # come out scaled by 1/sqrt(eps) (~316) instead of ~4. The two-pass
+    # centered squares stay exact. f64 reference: ±(0.25 / sqrt(0.0625 +
+    # 1e-5)) = ±0.99992.
+    let _ trap_result_157 ← trap {
+        let tensor.NumericBlock y ← nn.layernorm_carrier(hold([4096.0, 4096.5], [2]), hold([1.0, 1.0], [2]), hold([0.0, 0.0], [2]), 0.00001)
+        assert y.shape ≡ ([2] ↦ list<int>)
+        assert e1(y, 0).approx(0.0 - 0.999920, GELU_TOLERATIO)
+        assert e1(y, 1).approx(0.999920, GELU_TOLERATIO)
+    }
+    match trap_result_157 {
         case returned let ? { }
         case thrown let ? { assert false }
     }

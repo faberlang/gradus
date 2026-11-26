@@ -30,7 +30,8 @@ locale = "en"
 #   cross_entropy    = mean over rows of (logsumexp(logits_row) −
 #                      logits_row[target]); typed tensors currently use
 #                      dense one-hot f32 targets through CruxEntropia.
-#                      The carrier API accepts i32 class indices and has a
+#                      The carrier API accepts i32 or f32-carried integer
+#                      class indices and has a
 #                      masked form. logsumexp uses the numerically
 #                      stabilized max + ln(Σ_c exp(z_c − max)) form.
 #
@@ -239,14 +240,17 @@ fn cross_entropy<size N, size C>(tensor<f32, [N, C]> logits, tensor<f32, [N, C]>
 # Family: cross_entropy — mean over rows of (logsumexp(logits_row) −
 # logits_row[target]) over the staged carrier. The classification /
 # next-token path: logits are rank-2 [N, C] F32; target is rank-1 [N]
-# I32-tagged class indices (the integer domain of the dtype lattice). Row
+# class indices carried as I32 (a re-tagged literal) or F32 — the only
+# tag the tensor constructors stamp, so the value-level checks below are
+# the integer contract, not the tag. Row
 # logsumexp uses the stabilized max + ln(Σ exp(z − max)) form. Labels must
 # be exact integers in [0, C) and all inputs finite (fail closed).
 # Deterministic: fixed row-major iteration, no RNG.
 # -------------------------------------------------------------------------
 
-# Shared classification / next-token loss implementation. A supplied i32
-# mask is row-aligned with targets: 1 includes a target and 0 excludes it.
+# Shared classification / next-token loss implementation. A supplied mask
+# (the same I32/F32 carriers as the target) is row-aligned with targets:
+# 1 includes a target and 0 excludes it.
 # The mean denominator is the count of included targets, not the padded row
 # count. An all-zero mask fails closed rather than producing NaN or a bogus
 # zero loss.
@@ -257,7 +261,7 @@ fn cross_entropy_stats_impl(tensor.NumericBlock logits, tensor.NumericBlock targ
 
     dtype_f32(logits)
 
-    require dtype.name(target.dtype) ≡ "i32" throw variant DtypeMismatch { message = "cross_entropy target must be i32 class indices" }
+    require dtype.name(target.dtype) ≡ "i32" or dtype.name(target.dtype) ≡ "f32" throw variant DtypeMismatch { message = "cross_entropy target must be i32 or f32 class indices" }
 
     let int n ← fl.get(0) coalesce 1
     let int c ← fl.get(1) coalesce 1
@@ -273,7 +277,7 @@ fn cross_entropy_stats_impl(tensor.NumericBlock logits, tensor.NumericBlock targ
     require ft.get(0) coalesce 1 ≡ n throw variant ShapeMismatch { message = "target length does not match logits rows" }
 
     if use_mask {
-        require dtype.name(mask.dtype) ≡ "i32" throw variant DtypeMismatch { message = "cross_entropy mask must be i32" }
+        require dtype.name(mask.dtype) ≡ "i32" or dtype.name(mask.dtype) ≡ "f32" throw variant DtypeMismatch { message = "cross_entropy mask must be i32 or f32" }
 
         require mask.shape.length() ≡ 1 throw variant GradusMismatch { message = "cross_entropy mask must be rank-1" }
 
@@ -431,13 +435,20 @@ fn tene(list<f32> data, list<int> shape) → tensor.NumericBlock {
     return tensor.construct(data, shape) ⊥ tensor.default()
 }
 
-# Build an i32-tagged staged tensor (class-index target carrier). The tag
-# is entered through math.cast (the probe-visible name-based cast entry —
-# construct_f32 is skipped by the file-interface, WARN014). Callers pass
-# integer values only; cast normalizes and range-checks them.
+# Build an i32-tagged staged tensor (class-index target carrier) by
+# re-tagging the class literal — the consumer-side carrier the tensor
+# class layout anticipates. Callers pass integer values only; the loss
+# value checks enforce exact integrality.
 fn tene_i32(list<f32> data, list<int> shape) → tensor.NumericBlock {
     let tensor.NumericBlock f ← tene(data, shape)
     return tensor.NumericBlock {dtype = dtype.i32(), shape = f.shape, data = f.data, numel = f.numel, strides = f.strides}
+}
+
+# Build a foreign-tagged staged tensor: a tag that is neither of the two
+# class-index carriers (the i32 re-tag or the constructor-stamped f32).
+fn tene_u8(list<f32> data, list<int> shape) → tensor.NumericBlock {
+    let tensor.NumericBlock f ← tene(data, shape)
+    return tensor.NumericBlock {dtype = dtype.u8(), shape = f.shape, data = f.data, numel = f.numel, strides = f.strides}
 }
 
 # BLOCKER (U4b WALL 1 / SEM001 family): the trap F2 shape is unusable —
@@ -608,7 +619,7 @@ test "mse rejects non-finite targets" {
 }
 
 # Typed CruxEntropia route (dense f32 one-hot targets), complementary to the
-# carrier's i32 class-index surface.
+# carrier's integer class-index surface.
 
 test "typed cross_entropy computes the mean over rows for dense targets" {
     let _ logits ← [[0.0, 1.0, 2.0], [2.0, 0.0, 1.0]] ↦ tf32[2, 3]
@@ -672,8 +683,20 @@ test "cross_entropy rejects a non-f32 logits dtype" {
     assert ce_detail(tene_i32([0.0, 0.0, 0.0, 0.0], [2, 2]), tene_i32([0.0, 1.0], [2])) ≡ "unsupported dtype for loss"
 }
 
-test "cross_entropy rejects a non-i32 target (labels are class indices)" {
-    assert ce_detail(tene([0.0, 0.0, 0.0, 0.0], [2, 2]), tene([0.0, 1.0], [2])) ≡ "cross_entropy target must be i32 class indices"
+test "cross_entropy accepts an f32-carried integer target (the constructor-stamped carrier)" {
+    do {
+        # logits [[0,1],[1,0]], labels [0,1]: every row loss is
+        # ln(e^0 + e^1), so the mean is 1.3132617 (f64 reference).
+        let f32 v ← loss.cross_entropy_carrier(tene([0.0, 1.0, 1.0, 0.0], [2, 2]), tene([0.0, 1.0], [2]))
+        assert v.approx(1.3132617, LOSS_TOLERANCE)
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "cross_entropy rejects a target tagged outside the class-index carriers" {
+    assert ce_detail(tene([0.0, 0.0, 0.0, 0.0], [2, 2]), tene_u8([0.0, 1.0], [2])) ≡ "cross_entropy target must be i32 or f32 class indices"
 }
 
 test "cross_entropy rejects an empty batch" {
