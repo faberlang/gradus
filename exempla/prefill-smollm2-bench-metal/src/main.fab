@@ -1,0 +1,302 @@
++++ toml
+locale = "en"
+
++++ faber
+# prefill-smollm2-bench-metal: full-dimension SmolLM2-360M Metal prefill rung
+#   D=960, F=2560, H=15, KVH=5, HD=64 (QD=960, KVD=320, GQA group=3), 32 layers.
+#   Uses Metal-working batched `matmul_nt_dispatch` + query-tiled causal attention
+#   (`attn_scores_query_tile`, `row_softmax`, `attn_context_query_tile`).
+#
+#   faber run exempla/prefill-smollm2-bench-metal --library-home <gradus parent> --device metal
+
+import from "gradus:decode_step" let ds
+import from "norma:time" let time
+
+const int PASSES = 4
+const int D = 960
+const int F = 2560
+const int H = 15
+const int KVH = 5
+const int HD = 64
+const int QD = 960
+const int KVD = 320
+const int GQA_GROUP = 3
+const int TILE_B = 16
+const int TILE_BH = 240
+const f32 EPS = 0.00001
+const f32 ATTN_SCALE = 0.125
+const f32 LN_THETA = 9.21034
+
+@ public
+kernel kv_write_prefill<size B, size K>(tensor<f32, [B, K]> kwk, tensor<f32, [B, K]> kwv, mut tensor<f32, [B, K]> kwkc, mut tensor<f32, [B, K]> kwvc) → void {
+    for from kwk at [b, j] thread lane let vk {
+        kwkc[[b, j]] ← vk
+        kwvc[[b, j]] ← kwv[[b, j]]
+    }
+}
+
+@ public
+kernel synth_f32_mat<size R, size C>(tensor<f32, [R, C]> dom, mut tensor<f32, [R, C]> out, i32 seed, f32 amp) → void {
+    for from dom at [r, c] thread lane let ? {
+        let i32 rr ← r ↦ i32
+        let i32 cc ← c ↦ i32
+        if rr ≥ 0 and rr ≤ 65536 and cc ≥ 0 and cc ≤ 65536 and seed ≥ 0 and seed ≤ 65536 {
+            let i32 a ← (rr * 31 + cc * 17 + seed) % 65521
+            let f32 h ← ((a ↦ f32) + 0.5) * 0.7123
+            out[[r, c]] ← h.sin() * amp
+        }
+    }
+}
+
+@ public
+kernel synth_f32_vec<size N>(tensor<f32, [N]> dom, mut tensor<f32, [N]> out, i32 seed, f32 amp) → void {
+    for from dom at [i] thread lane let ? {
+        let i32 ii ← i ↦ i32
+        if ii ≥ 0 and ii ≤ 65536 and seed ≥ 0 and seed ≤ 65536 {
+            let i32 a ← (ii * 19 + seed) % 65521
+            let f32 h ← ((a ↦ f32) + 0.5) * 0.7123
+            out[[i]] ← h.sin() * amp
+        }
+    }
+}
+
+fn oracle_rmsnorm_elem<size B, size N>(tensor<f32, [B, N]> x, tensor<f32, [N]> w, int row, int col) → f32 {
+    mut f32 sq ← 0.0
+    for range 0 ‥ N let k {
+        let f32 v ← x[[row, k]]
+        sq ← sq + v * v
+    }
+    let f32 inv ← 1.0 / (√ (sq / (N ↦ f32) + EPS))
+    return x[[row, col]] * inv * w[[col]]
+}
+
+fn oracle_matmul_nt_elem<size B, size N, size K>(tensor<f32, [N, K]> w, tensor<f32, [B, K]> x, int row, int col) → f32 {
+    mut f32 acc ← 0.0
+    for range 0 ‥ K let k {
+        acc ← acc + x[[row, k]] * w[[col, k]]
+    }
+    return acc
+}
+
+fn oracle_causal_attn_elem<size B, size C>(tensor<f32, [B, 960]> qr, tensor<f32, [C, 320]> kc, tensor<f32, [C, 320]> vc, int b, int j) → f32 {
+    let int h ← j / HD
+    let int d ← j % HD
+    let int qbase ← h * HD
+    let int kvbase ← (h / GQA_GROUP) * HD
+    let int n_ctx ← b + 1
+
+    mut f32 max_s ← -3.0e38
+    mut list<f32> scores ← empty
+    for range 0 ‥ n_ctx let c {
+        mut f32 dot ← 0.0
+        for range 0 ‥ HD let kk {
+            dot ← dot + qr[[b, qbase + kk]] * kc[[c, kvbase + kk]]
+        }
+        let f32 s ← dot * ATTN_SCALE
+        scores.append(s)
+        if s ≻ max_s { max_s ← s }
+    }
+
+    mut f32 denom ← 0.0
+    for range 0 ‥ n_ctx let c {
+        denom ← denom + (scores[c] - max_s).exp()
+    }
+
+    mut f32 acc ← 0.0
+    for range 0 ‥ n_ctx let c {
+        let f32 p ← (scores[c] - max_s).exp() / denom
+        acc ← acc + p * vc[[c, kvbase + d]]
+    }
+    return acc
+}
+
+fn verify_smollm2_prefill<size B>(
+    tensor<f32, [B, 960]> hin,
+    tensor<f32, [960]> anorm,
+    tensor<f32, [960, 960]> wq,
+    tensor<f32, [960, 2560]> wd,
+    tensor<f32, [B, 960]> t_qr,
+    tensor<f32, [B, 320]> k_cache,
+    tensor<f32, [B, 320]> v_cache,
+    tensor<f32, [B, 960]> t_ctx,
+    tensor<f32, [B, 960]> t_h1,
+    tensor<f32, [B, 2560]> t_act,
+    tensor<f32, [B, 960]> hout,
+    mut tensor<f32, [B, 960]> t_xn,
+    mut tensor<f32, [B, 960]> t_q,
+    f32 sync_out
+) → void {
+    mut f32 max_attn_err ← 0.0
+    for range 0 ‥ 4 let b {
+        for range 0 ‥ 16 let j {
+            let f32 err ← (t_ctx[[b, j]] - oracle_causal_attn_elem(t_qr, k_cache, v_cache, b, j)).abs()
+            if err ≻ max_attn_err { max_attn_err ← err }
+        }
+    }
+    mut f32 max_out_err ← 0.0
+    for range 0 ‥ 2 let b {
+        for range 0 ‥ 8 let d {
+            let f32 ref_out ← t_h1[[b, d]] + oracle_matmul_nt_elem(wd, t_act, b, d)
+            let f32 err ← (hout[[b, d]] - ref_out).abs()
+            if err ≻ max_out_err { max_out_err ← err }
+        }
+    }
+    ds.rmsnorm_batch(hin, anorm, mut t_xn, EPS)
+    ds.matmul_nt_gemm(wq, t_xn, mut t_q)
+    mut f32 max_q_err ← 0.0
+    for range 0 ‥ 2 let b {
+        for range 0 ‥ 8 let d {
+            let f32 ref_xn ← oracle_rmsnorm_elem(hin, anorm, b, d)
+            let f32 xn_err ← (t_xn[[b, d]] - ref_xn).abs()
+            if xn_err ≻ max_q_err { max_q_err ← xn_err }
+            let f32 ref_q ← oracle_matmul_nt_elem(wq, t_xn, b, d)
+            let f32 q_err ← (t_q[[b, d]] - ref_q).abs()
+            if q_err ≻ max_q_err { max_q_err ← q_err }
+        }
+    }
+    print "verify_smollm2_prefill B=§0 hout0=§1 attn_max_err=§2 out_max_err=§3 q_max_err=§4"(B, sync_out, max_attn_err, max_out_err, max_q_err)
+    assert max_attn_err ≺ 0.0005
+    assert max_out_err ≺ 0.001
+    assert max_q_err ≺ 0.001
+}
+
+fn run_smollm2_prefill<size B>(
+    int calls_per_pass,
+    tensor<f32, [960]> anorm,
+    tensor<f32, [960]> fnorm,
+    tensor<f32, [960, 960]> wq,
+    tensor<f32, [320, 960]> wk,
+    tensor<f32, [320, 960]> wv,
+    tensor<f32, [960, 960]> wo,
+    tensor<f32, [2560, 960]> wg,
+    tensor<f32, [2560, 960]> wu,
+    tensor<f32, [960, 2560]> wd,
+    mut tensor<f32, [1]> sink
+) → void {
+    let int n_tiles ← B / TILE_B
+    let tensor<f32, [B, 960]> d_hin ← tf32[B, 960] {}
+    mut tensor<f32, [B, 960]> hin ← tf32[B, 960] {}
+    mut tensor<f32, [B, 960]> hout ← tf32[B, 960] {}
+    synth_f32_mat(d_hin, mut hin, 71 ∷ i32, 0.25 ∷ f32)
+    ds.prime2(hout, mut sink)
+
+    mut tensor<f32, [B, 320]> k_cache ← tf32[B, 320] {}
+    mut tensor<f32, [B, 320]> v_cache ← tf32[B, 320] {}
+    ds.prime2(k_cache, mut sink)
+    ds.prime2(v_cache, mut sink)
+
+    let tensor<f32, [240, B]> t_hcdom ← tf32[240, B] {}
+    let tensor<f32, [16, 960]> t_qdom ← tf32[16, 960] {}
+    mut tensor<f32, [B, 960]> t_xn ← tf32[B, 960] {}
+    mut tensor<f32, [B, 960]> t_q ← tf32[B, 960] {}
+    mut tensor<f32, [B, 960]> t_qr ← tf32[B, 960] {}
+    mut tensor<f32, [B, 320]> t_k ← tf32[B, 320] {}
+    mut tensor<f32, [B, 320]> t_kr ← tf32[B, 320] {}
+    mut tensor<f32, [B, 320]> t_v ← tf32[B, 320] {}
+    mut tensor<f32, [240, B]> t_sc ← tf32[240, B] {}
+    mut tensor<f32, [240, B]> t_pr ← tf32[240, B] {}
+    mut tensor<f32, [B, 960]> t_ctx ← tf32[B, 960] {}
+    mut tensor<f32, [B, 960]> t_h1 ← tf32[B, 960] {}
+    mut tensor<f32, [B, 2560]> t_gate ← tf32[B, 2560] {}
+    mut tensor<f32, [B, 2560]> t_up ← tf32[B, 2560] {}
+    mut tensor<f32, [B, 2560]> t_act ← tf32[B, 2560] {}
+
+    ds.prime2(t_xn, mut sink)
+    ds.prime2(t_q, mut sink)
+    ds.prime2(t_qr, mut sink)
+    ds.prime2(t_k, mut sink)
+    ds.prime2(t_kr, mut sink)
+    ds.prime2(t_v, mut sink)
+    ds.prime2(t_sc, mut sink)
+    ds.prime2(t_pr, mut sink)
+    ds.prime2(t_ctx, mut sink)
+    ds.prime2(t_h1, mut sink)
+    ds.prime2(t_gate, mut sink)
+    ds.prime2(t_up, mut sink)
+    ds.prime2(t_act, mut sink)
+
+    let i32 b_i32 ← B ↦ i32 ⊥ 0
+    let i32 h_i32 ← H ↦ i32 ⊥ 0
+    let i32 grp_i32 ← GQA_GROUP ↦ i32 ⊥ 0
+    let i32 hd_i32 ← HD ↦ i32 ⊥ 0
+    let i32 tb_i32 ← TILE_B ↦ i32 ⊥ 0
+
+    let int proj_flops ← 2 * B * (960 * 960 * 2 + 320 * 960 * 2 + 2560 * 960 * 3)
+    let int attn_flops ← 2 * 960 * B * (B + 1)
+    let int flops_per_layer ← proj_flops + attn_flops
+
+    for exclusive PASSES let pass_no {
+        let int started ← time.monotonic()
+        for exclusive calls_per_pass let ? {
+            ds.rmsnorm_batch(hin, anorm, mut t_xn, EPS)
+            ds.matmul_nt_gemm(wq, t_xn, mut t_q)
+            ds.matmul_nt_gemm(wk, t_xn, mut t_k)
+            ds.matmul_nt_gemm(wv, t_xn, mut t_v)
+            ds.rope_pairs_batch(t_q, mut t_qr, 0 ∷ i32, hd_i32, LN_THETA, b_i32)
+            ds.rope_pairs_batch(t_k, mut t_kr, 0 ∷ i32, hd_i32, LN_THETA, b_i32)
+            kv_write_prefill(t_kr, t_v, mut k_cache, mut v_cache)
+            for exclusive n_tiles let tile_idx {
+                let i32 qstart ← (tile_idx ↦ i32 ⊥ 0) * tb_i32
+                ds.attn_scores_query_tile(t_hcdom, t_qr, k_cache, mut t_sc, 0 ∷ i32, h_i32, grp_i32, hd_i32, ATTN_SCALE, b_i32, 1 ∷ i32, qstart, tb_i32)
+                ds.row_softmax(t_sc, mut t_pr)
+                ds.attn_context_query_tile(t_qdom, t_pr, v_cache, mut t_ctx, 0 ∷ i32, h_i32, grp_i32, hd_i32, b_i32, 1 ∷ i32, qstart, tb_i32)
+            }
+            ds.matmul_nt_gemm(wo, t_ctx, mut t_xn)
+            ds.residual_add_batch(hin, t_xn, mut t_h1, b_i32)
+            ds.rmsnorm_batch(t_h1, fnorm, mut t_xn, EPS)
+            ds.matmul_nt_gemm(wg, t_xn, mut t_gate)
+            ds.matmul_nt_gemm(wu, t_xn, mut t_up)
+            ds.swiglu_batch(t_gate, t_up, mut t_act, b_i32)
+            ds.matmul_nt_gemm(wd, t_act, mut t_xn)
+            ds.residual_add_batch(t_h1, t_xn, mut hout, b_i32)
+        }
+        let f32 sync_out ← hout[[0, 0]]
+        let int elapsed ← time.monotonic() - started
+
+        if pass_no ≡ 1 {
+            verify_smollm2_prefill<size B>(hin, anorm, wq, wd, t_qr, k_cache, v_cache, t_ctx, t_h1, t_act, hout, mut t_xn, mut t_q, sync_out)
+        }
+
+        let f64 layer_ms ← (elapsed ↦ f64) ÷ (calls_per_pass ↦ f64) ÷ 1000000.0
+        let f64 layer_tok_s ← ((B * calls_per_pass) ↦ f64) * 1000000000.0 ÷ (elapsed ↦ f64)
+        let f64 layer_tflops ← ((flops_per_layer * calls_per_pass) ↦ f64) ÷ ((elapsed ↦ f64) * 1000.0)
+        let f64 model32_ms ← layer_ms * 32.0
+        let f64 model32_tok_s ← layer_tok_s ÷ 32.0
+        let f64 model32_tflops ← layer_tflops
+        print "bench_smollm2_prefill_1layer B=§0 pass=§1 calls=§2 layer_ms=§3 tok_s=§4 tflops=§5"(B, pass_no, calls_per_pass, layer_ms, layer_tok_s, layer_tflops)
+        print "bench_smollm2_prefill_32layer B=§0 pass=§1 calls=§2 model32_ms=§3 tok_s=§4 tflops=§5"(B, pass_no, calls_per_pass, model32_ms, model32_tok_s, model32_tflops)
+    }
+}
+
+main {
+    mut tensor<f32, [1]> sink ← tf32[1] {}
+
+    let tensor<f32, [960]> d_dvec ← tf32[960] {}
+    mut tensor<f32, [960]> anorm ← tf32[960] {}
+    mut tensor<f32, [960]> fnorm ← tf32[960] {}
+    synth_f32_vec(d_dvec, mut anorm, 73 ∷ i32, 1.0 ∷ f32)
+    synth_f32_vec(d_dvec, mut fnorm, 79 ∷ i32, 1.0 ∷ f32)
+
+    let tensor<f32, [960, 960]> d_dd ← tf32[960, 960] {}
+    let tensor<f32, [320, 960]> d_kd ← tf32[320, 960] {}
+    let tensor<f32, [2560, 960]> d_fd ← tf32[2560, 960] {}
+    let tensor<f32, [960, 2560]> d_df ← tf32[960, 2560] {}
+    mut tensor<f32, [960, 960]> wq ← tf32[960, 960] {}
+    mut tensor<f32, [320, 960]> wk ← tf32[320, 960] {}
+    mut tensor<f32, [320, 960]> wv ← tf32[320, 960] {}
+    mut tensor<f32, [960, 960]> wo ← tf32[960, 960] {}
+    mut tensor<f32, [2560, 960]> wg ← tf32[2560, 960] {}
+    mut tensor<f32, [2560, 960]> wu ← tf32[2560, 960] {}
+    mut tensor<f32, [960, 2560]> wd ← tf32[960, 2560] {}
+    synth_f32_mat(d_dd, mut wq, 83 ∷ i32, 0.05 ∷ f32)
+    synth_f32_mat(d_kd, mut wk, 89 ∷ i32, 0.05 ∷ f32)
+    synth_f32_mat(d_kd, mut wv, 97 ∷ i32, 0.05 ∷ f32)
+    synth_f32_mat(d_dd, mut wo, 101 ∷ i32, 0.05 ∷ f32)
+    synth_f32_mat(d_fd, mut wg, 103 ∷ i32, 0.05 ∷ f32)
+    synth_f32_mat(d_fd, mut wu, 107 ∷ i32, 0.05 ∷ f32)
+    synth_f32_mat(d_df, mut wd, 109 ∷ i32, 0.05 ∷ f32)
+
+    run_smollm2_prefill<size 128>(8, anorm, fnorm, wq, wk, wv, wo, wg, wu, wd, mut sink)
+    run_smollm2_prefill<size 256>(8, anorm, fnorm, wq, wk, wv, wo, wg, wu, wd, mut sink)
+    run_smollm2_prefill<size 512>(4, anorm, fnorm, wq, wk, wv, wo, wg, wu, wd, mut sink)
+}

@@ -233,4 +233,65 @@ main {
         let f64 model32_tok_s ← layer_tok_s ÷ 32.0
         print "bench_quant_layer_4bit pass=§0 calls=§1 ns=§2 us_per_call=§3 gbps=§4 layer_tok_s=§5 model32_tok_s=§6"(pass_no, CALLS_PER_PASS, elapsed, us_per_call, gbps, layer_tok_s, model32_tok_s)
     }
+
+    # Fused KV + Gate+Up+SwiGLU 4-bit GroupAffine Split-K layer (20 launches vs 25)
+    mut tensor<f32, [512, 16]> p_k ← tf32[512, 16] {}
+    mut tensor<f32, [512, 16]> p_v ← tf32[512, 16] {}
+    mut tensor<f32, [5632, 16]> p_up ← tf32[5632, 16] {}
+    mut tensor<f32, [2048]> hout_fused ← tf32[2048] {}
+    ds.prime2(p_k, mut sink)
+    ds.prime2(p_v, mut sink)
+    ds.prime2(p_up, mut sink)
+    ds.prime1(hout_fused, mut sink)
+
+    for exclusive PASSES let pass_no {
+        let int started ← time.monotonic()
+        for exclusive CALLS_PER_PASS let ? {
+            ds.rmsnorm(hin, anorm, mut xn, 0.00001 ∷ f32)
+            ga.linear_matvec_4bit_u32_part(wq, sq, bq, xn, mut p2048, 64 ∷ i32)
+            ga.linear_matvec_u32_combine(p2048, mut q)
+            ga.linear_matvec_4bit_u32_kv_part(wk, sk, bk, wv, sv, bv, xn, mut p_k, mut p_v, 64 ∷ i32)
+            ga.linear_matvec_u32_kv_combine(p_k, p_v, mut k, mut v)
+            ds.rope_half(q, mut qr, 63 ∷ i32, 64 ∷ i32, 9.21034 ∷ f32)
+            ds.rope_half(k, mut kr, 63 ∷ i32, 64 ∷ i32, 9.21034 ∷ f32)
+            ds.kv_write_kv(kr, v, mut k_cache, mut v_cache, 63 ∷ i32)
+            ds.attn_scores(hcdom, qr, k_cache, mut sc, 63 ∷ i32, 4 ∷ i32, 128 ∷ i32, 0.08838835 ∷ f32)
+            ds.row_softmax(sc, mut pr)
+            ds.attn_context(qdom, pr, v_cache, mut ctx, 63 ∷ i32, 4 ∷ i32, 128 ∷ i32)
+            ga.linear_matvec_4bit_u32_part(wo, so, bo, ctx, mut p2048, 64 ∷ i32)
+            ga.linear_matvec_u32_combine(p2048, mut xo)
+            ds.residual_add(hin, xo, mut h1)
+            ds.rmsnorm(h1, fnorm, mut xn, 0.00001 ∷ f32)
+            ga.linear_matvec_4bit_u32_gate_up_part(wg, sg, bg, wu, su, bu, xn, mut p5632, mut p_up, 64 ∷ i32)
+            ga.linear_matvec_u32_gate_up_combine_swiglu(p5632, p_up, mut act)
+            ga.linear_matvec_4bit_u32_part(wd, sd, bd, act, mut p2048, 64 ∷ i32)
+            ga.linear_matvec_u32_combine(p2048, mut xo)
+            ds.residual_add(h1, xo, mut hout_fused)
+        }
+        let f32 sync_fused ← hout_fused[[0]]
+        let int elapsed ← time.monotonic() - started
+        if pass_no ≡ 1 {
+            mut f32 max_layer_err ← 0.0
+            for range 0 ‥ 16 let r {
+                let f32 err ← (hout_fused[[r]] - hout[[r]]).abs()
+                if err ≻ max_layer_err { max_layer_err ← err }
+            }
+            ds.rmsnorm(hin, anorm, mut xn, 0.00001 ∷ f32)
+            ga.linear_matvec_4bit_u32_kv_part(wk, sk, bk, wv, sv, bv, xn, mut p_k, mut p_v, 64 ∷ i32)
+            ga.linear_matvec_u32_kv_combine(p_k, p_v, mut k, mut v)
+            mut f32 max_k_err ← 0.0
+            for range 0 ‥ 4 let r {
+                let f32 err ← (k[[r]] - ref_row_u32_4bit(wk, sk, bk, xn, r, D, GROUP_SIZE)).abs()
+                if err ≻ max_k_err { max_k_err ← err }
+            }
+            print "verify_quant_layer_fused hout0=§0 layer_max_err=§1 k_max_err=§2"(sync_fused, max_layer_err, max_k_err)
+            assert max_layer_err ≺ 0.0001
+            assert max_k_err ≺ 0.005
+        }
+        let int us_per_call ← elapsed / CALLS_PER_PASS / 1000
+        let f64 gbps ← ((bytes_layer * CALLS_PER_PASS) ↦ f64) ÷ (elapsed ↦ f64)
+        let f64 layer_tok_s ← 1000000000.0 * (CALLS_PER_PASS ↦ f64) ÷ (elapsed ↦ f64)
+        let f64 model32_tok_s ← layer_tok_s ÷ 32.0
+        print "bench_quant_layer_4bit_fused pass=§0 calls=§1 ns=§2 us_per_call=§3 gbps=§4 layer_tok_s=§5 model32_tok_s=§6"(pass_no, CALLS_PER_PASS, elapsed, us_per_call, gbps, layer_tok_s, model32_tok_s)
+    }
 }
