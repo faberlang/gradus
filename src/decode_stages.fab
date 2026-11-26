@@ -62,6 +62,18 @@ fn linear_project_q8<size Out, size PD, size GD, size In>(lw.LinearWeight w_desc
     lw.dispatch_group_affine_u32<size Out, size PD, size GD, size In>(w_desc, w_w, w_s, w_b, x, mut y)
 }
 
+# GroupAffineU8 LinearWeight projection stage (Seam 2, Flint INT4).
+@ public
+fn linear_project_group_affine_u8<size Out, size PD, size GD, size In>(lw.LinearWeight w_desc, tensor<u8, [Out, PD]> w_w, tensor<f32, [Out, GD]> w_s, tensor<f32, [Out, GD]> w_b, tensor<f32, [In]> x, mut tensor<f32, [Out]> y) → void ⇥ lw.LinearWeightError {
+    lw.dispatch_group_affine_u8<size Out, size PD, size GD, size In>(w_desc, w_w, w_s, w_b, x, mut y)
+}
+
+# GGML Q4_K LinearWeight projection stage (Seam 2, Qwen3.6 Q4_K_M).
+@ public
+fn linear_project_ggml_q4_k<size Out, size Blocks, size RowBytes, size In>(lw.LinearWeight w_desc, tensor<u8, [Out, RowBytes]> raw_blocks, tensor<f32, [In]> x, mut tensor<f32, [Out]> y) → void ⇥ lw.LinearWeightError {
+    lw.dispatch_ggml_q4_k<size Out, size Blocks, size RowBytes, size In>(w_desc, raw_blocks, x, mut y)
+}
+
 # Update a 1D `StandardCarrier` (Seam 3) on device.
 @ public
 fn residual_push_1d<size D>(mut res.StandardCarrier<size 1, size D> carrier, tensor<f32, [D]> delta) → void {
@@ -158,16 +170,11 @@ fn attn_sectional_and_session<size QD, size KVD, size H, size C, size W>(tensor<
 # Stage 3: Conv / Gated DeltaNet stage over HybridArenas (Seam 4)
 # ---------------------------------------------------------------------------
 
-# Gated DeltaNet + ShortConv stage with O(dh) head norm/L2 and O(dim^2) recurrence.
-@ public
-fn deltanet_linear_attn_stage<size D, size ConvCh, size RecRows, size VH, size K, size RecCols, size ConvRows>(tensor<f32, [D]> hin, mut tensor<f32, [D]> hout, tensor<f32, [D]> anorm, tensor<f32, [ConvCh, D]> wqkv, tensor<f32, [RecRows, D]> wgate, tensor<f32, [ConvCh, K]> conv_w, tensor<f32, [VH]> dt_bias, tensor<f32, [VH]> a_row, tensor<f32, [VH, D]> wbeta, tensor<f32, [VH, D]> walpha, tensor<f32, [RecCols]> ssm_norm, tensor<f32, [D, RecRows]> wout, i32 group_heads, i32 key_dim, f32 eps, int site_idx, int history_len, mut hybrid.ConvStateArena<ConvRows, ConvCh> conv_arena, mut hybrid.RecurrentStateArena<RecRows, RecCols> rec_arena, int slot_id) → void ⇥ sess_mod.SessionError {
+fn deltanet_conv_part<size D, size ConvCh, size RecRows, size VH, size K, size ConvRows>(tensor<f32, [D]> hin, tensor<f32, [D]> anorm, tensor<f32, [ConvCh, D]> wqkv, tensor<f32, [RecRows, D]> wgate, tensor<f32, [ConvCh, K]> conv_w, tensor<f32, [VH]> dt_bias, tensor<f32, [VH]> a_row, tensor<f32, [VH, D]> wbeta, tensor<f32, [VH, D]> walpha, f32 eps, int site_idx, int history_len, mut hybrid.ConvStateArena<ConvRows, ConvCh> conv_arena, int slot_id, mut tensor<f32, [ConvCh]> conv_out, mut tensor<f32, [RecRows]> z, mut tensor<f32, [VH]> decay, mut tensor<f32, [VH]> beta) → void ⇥ sess_mod.SessionError {
     mut tensor<f32, [D]> xn ← tf32[D] {}
     mut tensor<f32, [ConvCh]> qkv_mixed ← tf32[ConvCh] {}
-    mut tensor<f32, [RecRows]> z ← tf32[RecRows] {}
     mut tensor<f32, [VH]> beta_raw ← tf32[VH] {}
     mut tensor<f32, [VH]> alpha_raw ← tf32[VH] {}
-    mut tensor<f32, [VH]> decay ← tf32[VH] {}
-    mut tensor<f32, [VH]> beta ← tf32[VH] {}
 
     do device {
         ds.rmsnorm(hin, anorm, mut xn, eps)
@@ -180,7 +187,6 @@ fn deltanet_linear_attn_stage<size D, size ConvCh, size RecRows, size VH, size K
 
     let int c_idx ← find_slot_index(conv_arena.slot_ids, slot_id)
     let tensor<f32, [ConvRows, ConvCh]> conv_buf ← conv_arena.buffers[c_idx]
-    mut tensor<f32, [ConvCh]> conv_out ← tf32[ConvCh] {}
     mut tensor<f32, [ConvRows, ConvCh]> next_conv_buf ← tf32[ConvRows, ConvCh] {}
     let i32 sidx32 ← site_idx ↦ i32 ⊥ 0
     let i32 hlen32 ← history_len ↦ i32 ⊥ 1
@@ -191,7 +197,9 @@ fn deltanet_linear_attn_stage<size D, size ConvCh, size RecRows, size VH, size K
     }
     conv_arena.buffers[c_idx] ← next_conv_buf
     conv_arena.steps_written[c_idx] ← conv_arena.steps_written[c_idx] + 1
+}
 
+fn deltanet_rec_part<size D, size ConvCh, size RecRows, size VH, size RecCols>(tensor<f32, [D]> hin, mut tensor<f32, [D]> hout, tensor<f32, [ConvCh]> conv_out, tensor<f32, [RecRows]> z, tensor<f32, [VH]> decay, tensor<f32, [VH]> beta, tensor<f32, [RecCols]> ssm_norm, tensor<f32, [D, RecRows]> wout, i32 group_heads, i32 key_dim, f32 eps, mut hybrid.RecurrentStateArena<RecRows, RecCols> rec_arena, int slot_id) → void ⇥ sess_mod.SessionError {
     mut tensor<f32, [RecRows]> q_rep ← tf32[RecRows] {}
     mut tensor<f32, [RecRows]> k_rep ← tf32[RecRows] {}
     mut tensor<f32, [RecRows]> v_rep ← tf32[RecRows] {}
@@ -230,6 +238,28 @@ fn deltanet_linear_attn_stage<size D, size ConvCh, size RecRows, size VH, size K
     }
 }
 
+# Gated DeltaNet + ShortConv stage with O(dh) head norm/L2 and O(dim^2) recurrence.
+@ public
+fn deltanet_linear_attn_stage<size D, size ConvCh, size RecRows, size VH, size K, size RecCols, size ConvRows>(tensor<f32, [D]> hin, mut tensor<f32, [D]> hout, tensor<f32, [D]> anorm, tensor<f32, [ConvCh, D]> wqkv, tensor<f32, [RecRows, D]> wgate, tensor<f32, [ConvCh, K]> conv_w, tensor<f32, [VH]> dt_bias, tensor<f32, [VH]> a_row, tensor<f32, [VH, D]> wbeta, tensor<f32, [VH, D]> walpha, tensor<f32, [RecCols]> ssm_norm, tensor<f32, [D, RecRows]> wout, i32 group_heads, i32 key_dim, f32 eps, int site_idx, int history_len, mut hybrid.ConvStateArena<ConvRows, ConvCh> conv_arena, mut hybrid.RecurrentStateArena<RecRows, RecCols> rec_arena, int slot_id) → void ⇥ sess_mod.SessionError {
+    mut tensor<f32, [ConvCh]> conv_out ← tf32[ConvCh] {}
+    mut tensor<f32, [RecRows]> z ← tf32[RecRows] {}
+    mut tensor<f32, [VH]> decay ← tf32[VH] {}
+    mut tensor<f32, [VH]> beta ← tf32[VH] {}
+    deltanet_conv_part(hin, anorm, wqkv, wgate, conv_w, dt_bias, a_row, wbeta, walpha, eps, site_idx, history_len, mut conv_arena, slot_id, mut conv_out, mut z, mut decay, mut beta)
+    deltanet_rec_part(hin, mut hout, conv_out, z, decay, beta, ssm_norm, wout, group_heads, key_dim, eps, mut rec_arena, slot_id)
+}
+
+# Gated DeltaNet + ShortConv stage directly over HybridSession (Seam 4).
+@ public
+fn deltanet_hybrid_stage<size C, size W, size KVD, size D, size ConvCh, size RecRows, size VH, size K, size RecCols, size ConvRows>(tensor<f32, [D]> hin, mut tensor<f32, [D]> hout, tensor<f32, [D]> anorm, tensor<f32, [ConvCh, D]> wqkv, tensor<f32, [RecRows, D]> wgate, tensor<f32, [ConvCh, K]> conv_w, tensor<f32, [VH]> dt_bias, tensor<f32, [VH]> a_row, tensor<f32, [VH, D]> wbeta, tensor<f32, [VH, D]> walpha, tensor<f32, [RecCols]> ssm_norm, tensor<f32, [D, RecRows]> wout, i32 group_heads, i32 key_dim, f32 eps, int site_idx, int history_len, mut hybrid.HybridSession<C, W, KVD, ConvRows, ConvCh, RecRows, RecCols> hs, int slot_id) → void ⇥ sess_mod.SessionError {
+    mut tensor<f32, [ConvCh]> conv_out ← tf32[ConvCh] {}
+    mut tensor<f32, [RecRows]> z ← tf32[RecRows] {}
+    mut tensor<f32, [VH]> decay ← tf32[VH] {}
+    mut tensor<f32, [VH]> beta ← tf32[VH] {}
+    deltanet_conv_part(hin, anorm, wqkv, wgate, conv_w, dt_bias, a_row, wbeta, walpha, eps, site_idx, history_len, mut hs.conv, slot_id, mut conv_out, mut z, mut decay, mut beta)
+    deltanet_rec_part(hin, mut hout, conv_out, z, decay, beta, ssm_norm, wout, group_heads, key_dim, eps, mut hs.recurrent, slot_id)
+}
+
 # ---------------------------------------------------------------------------
 # Stage 4: FFN / MoE stages (consuming ExpertBank Seam 2)
 # ---------------------------------------------------------------------------
@@ -254,7 +284,7 @@ fn dense_ffn_stage<size D, size F>(tensor<f32, [D]> h1, mut tensor<f32, [D]> hou
 
 # Routed + optional shared MoE FFN stage inside checked `do device` regions.
 @ public
-fn moe_ffn_stage<size D, size E, size EF, size ED, size K, size FE, size FS>(tensor<f32, [D]> h1, mut tensor<f32, [D]> hout, tensor<f32, [D]> fnorm, tensor<f32, [E, D]> router, tensor<f32, [EF, D]> wg, tensor<f32, [EF, D]> wu, tensor<f32, [ED, FE]> wd, bool has_shared, tensor<f32, [FS, D]> shared_wg, tensor<f32, [FS, D]> shared_wu, tensor<f32, [D, FS]> shared_wd, bool has_shared_gate, tensor<f32, [1, D]> shared_gate_w, mut tensor<i32, [K]> top_idx, f32 eps) → void {
+fn moe_ffn_stage<size D, size E, size EF, size ED, size K, size FE, size FS>(tensor<f32, [D]> h1, mut tensor<f32, [D]> hout, tensor<f32, [D]> fnorm, tensor<f32, [E, D]> router, tensor<f32, [EF, D]> wg, tensor<f32, [EF, D]> wu, tensor<f32, [ED, FE]> wd, bool has_shared, tensor<f32, [FS, D]> shared_wg, tensor<f32, [FS, D]> shared_wu, tensor<f32, [D, FS]> shared_wd, bool has_shared_gate, tensor<f32, [1, D]> shared_gate_w, mut tensor<i32, [K]> top_idx, f32 eps, bool use_sigmoid_routing) → void {
     mut tensor<f32, [D]> fnx ← tf32[D] {}
     mut tensor<f32, [E]> r_logits ← tf32[E] {}
     mut tensor<f32, [K]> top_vals ← tf32[K] {}
@@ -266,7 +296,12 @@ fn moe_ffn_stage<size D, size E, size EF, size ED, size K, size FE, size FS>(ten
         ds.rmsnorm(h1, fnorm, mut fnx, eps)
         ds.gemv(router, fnx, mut r_logits)
         dhk.moe_topk_indices(r_logits, mut top_idx, mut top_vals)
-        dhk.moe_renorm_weights(top_vals, mut top_weights)
+        if use_sigmoid_routing {
+            dhk.moe_sigmoid_renorm_weights(top_vals, mut top_weights)
+        }
+        else {
+            dhk.moe_renorm_weights(top_vals, mut top_weights)
+        }
         dhk.moe_experts_gate_up_swiglu(wg, wu, fnx, top_idx, mut expert_act)
         dhk.moe_experts_down_accum(wd, expert_act, top_idx, top_weights, mut moe_out)
     }
@@ -304,21 +339,132 @@ fn moe_ffn_stage<size D, size E, size EF, size ED, size K, size FE, size FS>(ten
 
 # ExpertBank-validated MoE FFN stage (Seam 2 + Seam 5).
 @ public
-fn moe_expert_bank_ffn_stage<size D, size E, size EF, size ED, size K, size FE, size FS>(eb.ExpertBank bank, tensor<f32, [D]> h1, mut tensor<f32, [D]> hout, tensor<f32, [D]> fnorm, tensor<f32, [E, D]> router, tensor<f32, [EF, D]> wg, tensor<f32, [EF, D]> wu, tensor<f32, [ED, FE]> wd, bool has_shared, tensor<f32, [FS, D]> shared_wg, tensor<f32, [FS, D]> shared_wu, tensor<f32, [D, FS]> shared_wd, bool has_shared_gate, tensor<f32, [1, D]> shared_gate_w, mut tensor<i32, [K]> top_idx, f32 eps) → void ⇥ eb.ExpertBankError {
+fn moe_expert_bank_ffn_stage<size D, size E, size EF, size ED, size K, size FE, size FS>(eb.ExpertBank bank, tensor<f32, [D]> h1, mut tensor<f32, [D]> hout, tensor<f32, [D]> fnorm, tensor<f32, [E, D]> router, tensor<f32, [EF, D]> wg, tensor<f32, [EF, D]> wu, tensor<f32, [ED, FE]> wd, bool has_shared, tensor<f32, [FS, D]> shared_wg, tensor<f32, [FS, D]> shared_wu, tensor<f32, [D, FS]> shared_wd, bool has_shared_gate, tensor<f32, [1, D]> shared_gate_w, mut tensor<i32, [K]> top_idx, f32 eps, bool use_sigmoid_routing) → void ⇥ eb.ExpertBankError {
     require bank.expert_count ≡ E and bank.hidden_size ≡ D and bank.intermediate_size ≡ FE throw variant eb.ExpertBankError.BadShape { message = "ExpertBank extents do not match MoE stage dimensions" }
-    moe_ffn_stage(h1, mut hout, fnorm, router, wg, wu, wd, has_shared, shared_wg, shared_wu, shared_wd, has_shared_gate, shared_gate_w, mut top_idx, eps)
+    moe_ffn_stage(h1, mut hout, fnorm, router, wg, wu, wd, has_shared, shared_wg, shared_wu, shared_wd, has_shared_gate, shared_gate_w, mut top_idx, eps, use_sigmoid_routing)
+}
+
+# Quantized GroupAffineU8 ExpertBank MoE FFN stage (Seam 2 + Seam 5, Flint INT4).
+@ public
+fn moe_expert_bank_ga_u8_ffn_stage<size D, size E, size K, size FE, size PD, size GD, size PFE, size GFE>(eb.ExpertBank bank, eb.BankedMatrixSpec gate_spec, eb.BankedMatrixSpec up_spec, eb.BankedMatrixSpec down_spec, tensor<f32, [D]> h1, mut tensor<f32, [D]> hout, tensor<f32, [D]> fnorm, tensor<f32, [E, D]> router, tensor<u8, [E, FE, PD]> wg_w, tensor<f32, [E, FE, GD]> wg_s, tensor<f32, [E, FE, GD]> wg_b, tensor<u8, [E, FE, PD]> wu_w, tensor<f32, [E, FE, GD]> wu_s, tensor<f32, [E, FE, GD]> wu_b, tensor<u8, [E, D, PFE]> wd_w, tensor<f32, [E, D, GFE]> wd_s, tensor<f32, [E, D, GFE]> wd_b, mut tensor<i32, [K]> top_idx, f32 eps, bool use_sigmoid_routing) → void ⇥ eb.ExpertBankError {
+    require bank.expert_count ≡ E and bank.hidden_size ≡ D and bank.intermediate_size ≡ FE throw variant eb.ExpertBankError.BadShape { message = "ExpertBank extents do not match GroupAffineU8 MoE stage dimensions" }
+    mut tensor<f32, [D]> fnx ← tf32[D] {}
+    mut tensor<f32, [E]> r_logits ← tf32[E] {}
+    mut tensor<f32, [K]> top_vals ← tf32[K] {}
+    mut tensor<f32, [K]> top_weights ← tf32[K] {}
+    mut tensor<f32, [FE]> e_gate ← tf32[FE] {}
+    mut tensor<f32, [FE]> e_up ← tf32[FE] {}
+    mut tensor<f32, [FE]> e_act ← tf32[FE] {}
+    mut tensor<f32, [D]> e_down ← tf32[D] {}
+    mut tensor<f32, [D]> moe_out ← tf32[D] {}
+
+    do device {
+        ds.rmsnorm(h1, fnorm, mut fnx, eps)
+        ds.gemv(router, fnx, mut r_logits)
+        dhk.moe_topk_indices(r_logits, mut top_idx, mut top_vals)
+        if use_sigmoid_routing {
+            dhk.moe_sigmoid_renorm_weights(top_vals, mut top_weights)
+        }
+        else {
+            dhk.moe_renorm_weights(top_vals, mut top_weights)
+        }
+    }
+
+    for exclusive K let k {
+        let int e_idx ← top_idx[[k]] ↦ int
+        let f32 w_k ← top_weights[[k]]
+        eb.dispatch_routed_matvec_ga_u8(gate_spec, wg_w, wg_s, wg_b, fnx, mut e_gate, e_idx)
+        eb.dispatch_routed_matvec_ga_u8(up_spec, wu_w, wu_s, wu_b, fnx, mut e_up, e_idx)
+        do device {
+            ds.swiglu(e_gate, e_up, mut e_act)
+        }
+        eb.dispatch_routed_matvec_ga_u8(down_spec, wd_w, wd_s, wd_b, e_act, mut e_down, e_idx)
+        do device {
+            dhk.weighted_add(mut moe_out, e_down, w_k)
+        }
+    }
+
+    do device {
+        ds.residual_add(h1, moe_out, mut hout)
+    }
+}
+
+# Quantized GGML Q4_K ExpertBank MoE FFN stage (Seam 2 + Seam 5, Qwen3.6 Q4_K_M).
+@ public
+fn moe_expert_bank_ggml_q4_k_ffn_stage<size D, size E, size K, size FE, size BlocksD, size RowBytesD, size BlocksFE, size RowBytesFE>(eb.ExpertBank bank, eb.BankedMatrixSpec gate_spec, eb.BankedMatrixSpec up_spec, eb.BankedMatrixSpec down_spec, tensor<f32, [D]> h1, mut tensor<f32, [D]> hout, tensor<f32, [D]> fnorm, tensor<f32, [E, D]> router, tensor<u8, [E, FE, RowBytesD]> wg_blocks, tensor<u8, [E, FE, RowBytesD]> wu_blocks, tensor<u8, [E, D, RowBytesFE]> wd_blocks, mut tensor<i32, [K]> top_idx, f32 eps, bool use_sigmoid_routing) → void ⇥ eb.ExpertBankError {
+    require bank.expert_count ≡ E and bank.hidden_size ≡ D and bank.intermediate_size ≡ FE throw variant eb.ExpertBankError.BadShape { message = "ExpertBank extents do not match Q4_K MoE stage dimensions" }
+    mut tensor<f32, [D]> fnx ← tf32[D] {}
+    mut tensor<f32, [E]> r_logits ← tf32[E] {}
+    mut tensor<f32, [K]> top_vals ← tf32[K] {}
+    mut tensor<f32, [K]> top_weights ← tf32[K] {}
+    mut tensor<f32, [FE]> e_gate ← tf32[FE] {}
+    mut tensor<f32, [FE]> e_up ← tf32[FE] {}
+    mut tensor<f32, [FE]> e_act ← tf32[FE] {}
+    mut tensor<f32, [D]> e_down ← tf32[D] {}
+    mut tensor<f32, [D]> moe_out ← tf32[D] {}
+
+    do device {
+        ds.rmsnorm(h1, fnorm, mut fnx, eps)
+        ds.gemv(router, fnx, mut r_logits)
+        dhk.moe_topk_indices(r_logits, mut top_idx, mut top_vals)
+        if use_sigmoid_routing {
+            dhk.moe_sigmoid_renorm_weights(top_vals, mut top_weights)
+        }
+        else {
+            dhk.moe_renorm_weights(top_vals, mut top_weights)
+        }
+    }
+
+    for exclusive K let k {
+        let int e_idx ← top_idx[[k]] ↦ int
+        let f32 w_k ← top_weights[[k]]
+        eb.dispatch_routed_matvec_ggml_q4_k<size E, size FE, size BlocksD, size RowBytesD, size D>(gate_spec, wg_blocks, fnx, mut e_gate, e_idx)
+        eb.dispatch_routed_matvec_ggml_q4_k<size E, size FE, size BlocksD, size RowBytesD, size D>(up_spec, wu_blocks, fnx, mut e_up, e_idx)
+        do device {
+            ds.swiglu(e_gate, e_up, mut e_act)
+        }
+        eb.dispatch_routed_matvec_ggml_q4_k<size E, size D, size BlocksFE, size RowBytesFE, size FE>(down_spec, wd_blocks, e_act, mut e_down, e_idx)
+        do device {
+            dhk.weighted_add(mut moe_out, e_down, w_k)
+        }
+    }
+
+    do device {
+        ds.residual_add(h1, moe_out, mut hout)
+    }
 }
 
 +++ faber test
 import from "gradus:decode_stages" let stages
 import from "gradus:decode_token" let dt
 import from "gradus:cache/session" let sess_mod
+import from "gradus:cache/hybrid_arenas" let hybrid
+import from "gradus:model/config" let cfg
 import from "gradus:model/schedule" let model_schedule
+import from "gradus:model/linear_weight" let lw_mod
 import from "gradus:model/expert_bank" let eb
 import from "gradus:model/residual" let res
 
 fn close(f32 a, f32 b) → bool {
     return (a - b).abs() ≺ 0.0001
+}
+
+fn must_schedule_from_json(string json) → model_schedule.ExecutionSchedule {
+    mut list<cfg.ModelConfig> mcs ← empty
+    do {
+        mcs.append(cfg.parse_json(json))
+    }
+    catch err {
+        assert false
+    }
+    assert mcs.length() ≡ 1
+    do {
+        return model_schedule.from_model_config(mcs[0], empty)
+    }
+    catch err {
+        assert false
+    }
+    return model_schedule.ExecutionSchedule { layers = [], segments = [], steps = [], slots = [], residual = variant model_schedule.ResidualKind.Standard, taps = [] }
 }
 
 test "decode_stages norm_qk_heads and residual_push_1d execute on device" {
@@ -411,9 +557,144 @@ test "decode_stages dense_ffn_stage and moe_expert_bank_ffn_stage execute over E
     mut tensor<i32, [1]> top_idx ← tensor<i32, [1]> {}
     mut tensor<f32, [2]> mhout ← tf32[2] {}
     do {
-        stages.moe_expert_bank_ffn_stage(bank, h1, mut mhout, fnorm, router, mwg, mwu, mwd, false, wg, wu, wd, false, sgw, mut top_idx, 0.00001)
+        stages.moe_expert_bank_ffn_stage(bank, h1, mut mhout, fnorm, router, mwg, mwu, mwd, false, wg, wu, wd, false, sgw, mut top_idx, 0.00001, true)
         assert close(mhout[[0]], 1.0)
         assert close(mhout[[1]], 1.0)
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "decode_stages end-to-end Slice B0 Flint ModelConfig + ExecutionSchedule + RingKv(513) + GroupAffineU8" {
+    let string flint_json ← «{"model_type": "flint", "hidden_size": 4, "num_hidden_layers": 2, "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 2, "intermediate_size": 4, "moe_intermediate_size": 4, "vocab_size": 32, "sliding_window": 513, "layer_types": ["sliding_attention", "full_attention"], "leading_dense_block_count": 1, "num_local_experts": 2, "num_experts_per_tok": 2}»
+    let model_schedule.ExecutionSchedule sched ← must_schedule_from_json(flint_json)
+    assert sched.slots.length() ≡ 2
+
+    do {
+        mut sess_mod.SessionState<8, 513, 2> sess ← sess_mod.from_schedule<size 8, size 513, size 2>(sched)
+        assert sess.ring_kv.slot_ids.length() ≡ 1
+        assert sess.full_kv.slot_ids.length() ≡ 1
+    }
+    catch err {
+        assert false
+    }
+
+    let lw_mod.LinearWeight w_desc ← lw_mod.LinearWeight {
+        kind = variant lw_mod.LinearWeightKind.GroupAffineU8,
+        out_features = 4,
+        in_features = 4,
+        bits = 4,
+        group_size = 4,
+        packed_cols = 2,
+        group_cols = 1,
+        has_bias = false
+    }
+    mut tensor<u8, [4, 2]> w_u8 ← tu8[4, 2] {}
+    w_u8[[0, 0]] ← 0x11 ∷ u8
+    w_u8[[0, 1]] ← 0x11 ∷ u8
+    mut tensor<f32, [4, 1]> w_s ← tf32[4, 1] {}
+    w_s[[0, 0]] ← 1.0
+    mut tensor<f32, [4, 1]> w_b ← tf32[4, 1] {}
+    mut tensor<f32, [4]> x ← tf32[4] {}
+    for range 0‥4 let i {
+        x[[i]] ← 1.0
+    }
+    mut tensor<f32, [4]> y ← tf32[4] {}
+    do {
+        stages.linear_project_group_affine_u8(w_desc, w_u8, w_s, w_b, x, mut y)
+        assert close(y[[0]], 4.0)
+    }
+    catch err {
+        assert false
+    }
+
+    let eb.BankedMatrixSpec sp_in ← eb.BankedMatrixSpec {
+        kind = variant eb.ExpertWeightKind.GroupAffineU8,
+        expert_count = 2, out_features = 4, in_features = 4,
+        bits = 4, group_size = 4, packed_cols = 2, group_cols = 1
+    }
+    let eb.ExpertBank bank ← eb.ExpertBank {
+        expert_count = 2, hidden_size = 4, intermediate_size = 4,
+        layout = variant eb.ExpertBankLayout.SplitGateUp { gate = sp_in, up = sp_in, down = sp_in },
+        has_router_bias = false, shared_expert_count = 0
+    }
+    mut tensor<f32, [4]> ones4 ← tf32[4] {}
+    for range 0‥4 let i {
+        ones4[[i]] ← 1.0
+    }
+    mut tensor<f32, [2, 4]> router ← tf32[2, 4] {}
+    router[[0, 0]] ← 1.0
+    mut tensor<u8, [2, 4, 2]> ew ← tu8[2, 4, 2] {}
+    ew[[0, 0, 0]] ← 0x11 ∷ u8
+    ew[[1, 0, 0]] ← 0x11 ∷ u8
+    mut tensor<f32, [2, 4, 1]> es ← tf32[2, 4, 1] {}
+    es[[0, 0, 0]] ← 1.0
+    es[[1, 0, 0]] ← 1.0
+    mut tensor<f32, [2, 4, 1]> eb_b ← tf32[2, 4, 1] {}
+    mut tensor<i32, [2]> top_idx ← ti32[2] {}
+    mut tensor<f32, [4]> moe_out ← tf32[4] {}
+    do {
+        stages.moe_expert_bank_ga_u8_ffn_stage(bank, sp_in, sp_in, sp_in, x, mut moe_out, ones4, router, ew, es, eb_b, ew, es, eb_b, ew, es, eb_b, mut top_idx, 0.0, true)
+        assert moe_out[[0]] ≻ 1.0
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "decode_stages end-to-end Slice B Qwen3.6 ModelConfig + ExecutionSchedule + HybridSession + Q4_K" {
+    let string q36_json ← «{"model_type": "qwen35moe", "hidden_size": 2, "num_hidden_layers": 4, "num_attention_heads": 1, "num_key_value_heads": 1, "head_dim": 2, "intermediate_size": 4, "moe_intermediate_size": 4, "vocab_size": 32, "full_attention_interval": 4, "rope_dimension_sections": [1, 0, 0, 0], "num_local_experts": 2, "num_experts_per_tok": 2}»
+    let model_schedule.ExecutionSchedule sched ← must_schedule_from_json(q36_json)
+    assert sched.slots.length() ≡ 4
+
+    do {
+        mut hybrid.HybridSession<8, 1, 2, 3, 6, 2, 2> hs ← hybrid.from_schedule<size 8, size 1, size 2, size 3, size 6, size 2, size 2>(sched, 1, 3, false)
+        assert hs.kv.full_kv.slot_ids.length() ≡ 1
+        assert hs.conv.slot_ids.length() ≡ 3
+        assert hs.recurrent.slot_ids.length() ≡ 3
+
+        mut tensor<f32, [2]> hin ← tf32[2] {}
+        hin[[0]] ← 1.0
+        hin[[1]] ← 1.0
+        mut tensor<f32, [2]> ones2 ← tf32[2] {}
+        ones2[[0]] ← 1.0
+        ones2[[1]] ← 1.0
+        mut tensor<f32, [6, 2]> wqkv ← tf32[6, 2] {}
+        wqkv[[0, 0]] ← 1.0
+        wqkv[[2, 0]] ← 1.0
+        wqkv[[4, 0]] ← 1.0
+        mut tensor<f32, [2, 2]> eye2 ← tf32[2, 2] {}
+        eye2[[0, 0]] ← 1.0
+        eye2[[1, 1]] ← 1.0
+        mut tensor<f32, [6, 4]> conv_w ← tf32[6, 4] {}
+        conv_w[[0, 3]] ← 1.0
+        conv_w[[2, 3]] ← 1.0
+        conv_w[[4, 3]] ← 1.0
+        mut tensor<f32, [1]> dt_bias ← tf32[1] {}
+        mut tensor<f32, [1]> a_row ← tf32[1] {}
+        a_row[[0]] ← -1.0
+        mut tensor<f32, [1, 2]> wba ← tf32[1, 2] {}
+        mut tensor<f32, [2]> h1 ← tf32[2] {}
+        stages.deltanet_hybrid_stage(hin, mut h1, ones2, wqkv, eye2, conv_w, dt_bias, a_row, wba, wba, ones2, eye2, 1, 2, 0.00001, 0, 3, mut hs, 0)
+        assert hs.conv.steps_written[0] ≡ 1
+        assert hs.recurrent.steps_written[0] ≡ 1
+
+        mut tensor<f32, [2]> qr ← tf32[2] {}
+        mut tensor<f32, [2]> kr ← tf32[2] {}
+        mut tensor<f32, [2]> h2 ← tf32[2] {}
+        mut tensor<i32, [4]> sections ← tensor<i32, [4]> {}
+        sections[[0]] ← 1
+        stages.attn_sectional_and_session<size 2, size 2, size 1, size 8, size 1>(h1, h1, h1, mut qr, mut kr, 0, 2, sections, 0.0, 1, 0.70710677, mut hs.kv, 3, mut h2)
+        assert hs.kv.full_kv.lengths[0] ≡ 1
+        assert h2[[0]] ≻ 1.0
+
+        let eb.BankedMatrixSpec sp_q4k ← eb.BankedMatrixSpec {
+            kind = variant eb.ExpertWeightKind.GgmlBlockQ4_K,
+            expert_count = 2, out_features = 256, in_features = 256,
+            bits = 4, group_size = 32, packed_cols = 0, group_cols = 0
+        }
+        assert sp_q4k.out_features ≡ 256
     }
     catch err {
         assert false
