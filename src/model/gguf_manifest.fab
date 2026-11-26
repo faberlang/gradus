@@ -10,7 +10,9 @@ locale = "en"
 #
 # `parse` consumes a bounded header/metadata/tensor-table corpus. `inspect`
 # obtains that same table incrementally from a caller-owned range function and
-# never retains the function or source bytes. `read_fragment` obtains only a
+# never retains the function or source bytes; its reads go through a buffered
+# read-ahead window so a table walk costs one source callback per window
+# instead of one per 4/8-byte field. `read_fragment` obtains only a
 # checked tensor subrange. Neither operation retains a path, URL, reader, file
 # handle, mapping, device object, or payload. `payload_wire` is the exact encoded
 # GGUF value payload, beginning at the value's first byte and ending after its
@@ -109,8 +111,9 @@ const int MAGIC_2 = 85
 const int MAGIC_3 = 70
 
 # Bounds protect the parser from count/length-driven allocation or loops.
-# Duplicate-key/name and known-range validation are intentionally bounded
-# quadratic scans in this A1 implementation. The 4,096-entry ceilings keep
+# Duplicate-key/name validation uses set<string> membership and the
+# known-range overlap check sorts and sweeps, so no validation step is
+# quadratic in the entry count. The 4,096-entry ceilings keep
 # that work finite while admitting every inventoried local model (55 metadata
 # entries and at most 753 tensors). The 64 MiB corpus ceiling bounds the
 # retained header/table copy; the full model payload is never supplied here.
@@ -127,6 +130,10 @@ const int TEXT_LIMIT = 1048576
 const int ARRAY_LIMIT = 1048576
 
 const int RANK_LIMIT = 64
+
+# Read-ahead window size for `inspect` (issue #83): one source callback covers
+# this many table bytes before the next refill, inside the 64 KiB–1 MiB band.
+const int READ_AHEAD = 262144
 
 const int MAX_NUMBER = 9223372036854775807
 
@@ -200,6 +207,12 @@ class GgufManifest {
     mut int artifact_length
     mut list<GgufMetadata> metadata
     mut list<GgufTensorDescriptor> tensors
+    # Derived lookup state (issue #83), never serialized: key/name → list
+    # position, built by `construct`. Defaulted so hand-built records that
+    # omit them keep working; the accessors fall back to a scan when the
+    # index does not answer.
+    mut map<string, int> metadata_index = empty
+    mut map<string, int> tensor_index = empty
 }
 
 # -------------------------------------------------------------------------
@@ -265,6 +278,98 @@ fn read_source((int, int) → list<b8> ⇥ GgufManifestError source, int total, 
     require chunk.length() ≡ length throw variant BadSource { message = "range source returned an unexpected byte length" }
 
     return chunk
+}
+
+# Buffered read-ahead window over a caller-owned range source (issue #83).
+# `inspect` walks the header/metadata/tensor table through this window instead
+# of issuing one source callback per 4/8-byte field: a request already inside
+# the buffered bytes is a slice, and a miss installs one read-ahead chunk
+# anchored at the request (bounded by READ_AHEAD and by the artifact). A
+# source that refuses a read-ahead beyond its own range — a header-prefix
+# adapter — is probed with halved asks until it answers, so the window keeps
+# that source's real range limit; if even the exact request fails, its outcome
+# is the pre-window behavior and wins. The window is operation-scoped and
+# never retained by the returned manifest.
+class SourceWindow {
+    mut (int, int) → list<b8> ⇥ GgufManifestError source
+    mut int total
+    mut list<b8> bytes
+    mut int origin
+    mut int limit
+    mut int ceiling
+}
+
+# Serve one exact byte range through the window. Bounds and byte equality are
+# unchanged from the direct read path: every installed chunk passed
+# `read_source`, so a served slice lies inside the artifact, and a request a
+# source cannot answer fails exactly as the equivalent direct read would.
+fn window_read(mut SourceWindow w, int start, int length) → list<b8> ⇥ GgufManifestError {
+    reject start ≺ 0 or length ≺ 0 throw variant BadSource { message = "range source received an invalid range" }
+
+    if start ≥ w.origin and start + length ≤ w.limit then return w.bytes[start - w.origin ‥ start - w.origin + length]
+
+    mut int fill ← length
+
+    if length ≺ w.ceiling {
+        let int room ← w.total - start
+
+        if room ≻ w.ceiling then fill ← w.ceiling
+        else {
+            if room ≻ length then fill ← room
+        }
+    }
+
+    if fill ≡ length {
+        let list<b8> chunk ← read_source(w.source, w.total, start, length)
+
+        w.bytes ← copy chunk
+        w.origin ← start
+        w.limit ← start + length
+        return chunk
+    }
+
+    do {
+        let list<b8> chunk ← read_source(w.source, w.total, start, fill)
+
+        w.bytes ← copy chunk
+        w.origin ← start
+        w.limit ← start + fill
+        return chunk[0 ‥ length]
+    }
+    catch err {
+        # The read-ahead was refused. Halve the ask until the source answers
+        # (a range-limited adapter serves up to its own end, so the halving
+        # converges on that limit and keeps the window useful); if even the
+        # exact request fails, its outcome is what the direct path would have
+        # produced, so it wins.
+        mut int ask ← fill
+
+        while ask ≻ length {
+            ask ← ask / 2
+
+            if ask ≺ length then ask ← length
+
+            do {
+                let list<b8> part ← read_source(w.source, w.total, start, ask)
+
+                w.bytes ← copy part
+                w.origin ← start
+                w.limit ← start + ask
+                w.ceiling ← ask
+                return part[0 ‥ length]
+            }
+            catch probe {
+            }
+        }
+
+        let list<b8> chunk ← read_source(w.source, w.total, start, length)
+
+        w.bytes ← copy chunk
+        w.origin ← start
+        w.limit ← start + length
+        w.ceiling ← length
+        return chunk
+    }
 }
 
 # Fixed-width little-endian reads. Each checks its range, then unpacks one
@@ -345,10 +450,11 @@ fn dtype_valid(int kind) → bool {
     return kind ≥ GGUF_UINT8 and kind ≤ GGUF_FLOAT64
 }
 
-# Read one metadata value from its absolute wire offset. The result contains
-# exactly that value's wire bytes. Arrays recurse over their declared element
-# type, but no cumulative header/table prefix is copied or retained.
-fn source_value((int, int) → list<b8> ⇥ GgufManifestError source, int total, int off, int kind, int depth) → list<b8> ⇥ GgufManifestError {
+# Read one metadata value from its absolute wire offset, through the buffered
+# window. The result contains exactly that value's wire bytes. Arrays recurse
+# over their declared element type, but no cumulative header/table prefix is
+# copied or retained.
+fn source_value(mut SourceWindow w, int off, int kind, int depth) → list<b8> ⇥ GgufManifestError {
     # --- bounds + kind (fail closed) --------------------------------------
     require depth ≤ 64 throw variant BadBounds { message = "metadata array nesting exceeds the bounded depth" }
 
@@ -357,29 +463,29 @@ fn source_value((int, int) → list<b8> ⇥ GgufManifestError source, int total,
     let int scalar ← scalar_size(kind)
 
     if scalar ≻ 0 {
-        # --- scalar wire (exact read) -------------------------------------
-        let list<b8> wire ← read_source(source, total, off, scalar)
+        # --- scalar wire (windowed read) ---------------------------------
+        let list<b8> wire ← window_read(mut w, off, scalar)
         size_value(byte_list(wire), 0, kind, depth)
         return wire
     }
 
     if kind ≡ GGUF_STRING {
         # --- string wire (length header + corpus) -------------------------
-        let list<b8> header ← read_source(source, total, off, 8)
+        let list<b8> header ← window_read(mut w, off, 8)
         let int len ← u64_wire(header)
 
         require len ≤ TEXT_LIMIT throw variant BadBounds { message = "GGUF string exceeds the bounded text limit" }
 
         # The language has no bulk `bytes` concatenation, so the whole value
         # (length header + body) is one exact read instead of two reads joined.
-        let list<b8> wire ← read_source(source, total, off, add(8, len))
+        let list<b8> wire ← window_read(mut w, off, add(8, len))
         text_wire(wire[8 ‥ add(8, len)])
         return wire
     }
 
     if kind ≡ GGUF_ARRAY {
         # --- array wire (element kind + count) ----------------------------
-        let list<b8> header ← read_source(source, total, off, 12)
+        let list<b8> header ← window_read(mut w, off, 12)
         let list<u8> header_list ← byte_list(header)
         let int element_kind ← u32(header_list, 0)
 
@@ -394,17 +500,20 @@ fn source_value((int, int) → list<b8> ⇥ GgufManifestError source, int total,
         if element_scalar ≻ 0 {
             # --- scalar element array (bulk read) -------------------------
             let int length ← mul(n, element_scalar)
-            let list<b8> out ← read_source(source, total, off, add(12, length))
+            let list<b8> out ← window_read(mut w, off, add(12, length))
             size_value(byte_list(out), 0, kind, depth)
             return out
         }
 
         if element_kind ≡ GGUF_STRING {
             # --- string element array (scan → exact read) -----------------
+            # Each 8-byte length header is a window slice: the scan walks the
+            # array with no source callback per element, then the whole value
+            # is one exact read.
             mut int cursor ← add(off, 12)
 
             for range 0 ‥ n let i {
-                let list<b8> item_head ← read_source(source, total, cursor, 8)
+                let list<b8> item_head ← window_read(mut w, cursor, 8)
                 let int len ← u64_wire(item_head)
 
                 require len ≤ TEXT_LIMIT throw variant BadBounds { message = "GGUF string exceeds the bounded text limit" }
@@ -416,7 +525,7 @@ fn source_value((int, int) → list<b8> ⇥ GgufManifestError source, int total,
             # One exact source read preserves the full tokenizer array without
             # copying each growing element through Faber. The bounded scanner
             # above establishes its exact end before this read is issued.
-            let list<b8> wire ← read_source(source, total, off, total_wire)
+            let list<b8> wire ← window_read(mut w, off, total_wire)
             size_value(byte_list(wire), 0, kind, depth)
             return wire
         }
@@ -426,7 +535,7 @@ fn source_value((int, int) → list<b8> ⇥ GgufManifestError source, int total,
         mut int cursor ← add(off, 12)
 
         for range 0 ‥ n let i {
-            let list<b8> item ← source_value(source, total, cursor, element_kind, depth + 1)
+            let list<b8> item ← source_value(mut w, cursor, element_kind, depth + 1)
 
             # Append in place. Passing the growing accumulator through the
             # helper would copy it once per element and turn large tokenizer
@@ -765,6 +874,18 @@ fn block_metadata(GgmlLayout value) → storage.BlockMetadata {
 
 @ public
 fn metadata(GgufManifest m, string key) → GgufMetadata ⇥ GgufManifestError {
+    # Derived index first (issue #83): one map lookup answers a constructed
+    # manifest. A record without the index (or one whose lists were rebuilt
+    # by hand) falls back to the scan, so the answer never depends on how the
+    # manifest was produced.
+    let int ix ← m.metadata_index.get(key) coalesce -1
+
+    if ix ≥ 0 and ix ≺ m.metadata.length() {
+        let GgufMetadata hit ← m.metadata[ix]
+
+        if hit.key ≡ key then return hit
+    }
+
     let GgufMetadata ∪ none found ← find_metadata(m.metadata, key)
 
     if found not is none then return found coalesce GgufMetadata { key = "", dtype = -1, payload_wire = || }
@@ -930,6 +1051,18 @@ fn list_length(GgufManifest m, string key) → int ⇥ GgufManifestError {
 
 @ public
 fn find_tensor(GgufManifest m, string name) → GgufTensorDescriptor ⇥ GgufManifestError {
+    # Derived index first (issue #83): one map lookup answers a constructed
+    # manifest. A record without the index (or one whose lists were rebuilt by
+    # hand) falls back to the scan, so the answer never depends on how the
+    # manifest was produced.
+    let int ix ← m.tensor_index.get(name) coalesce -1
+
+    if ix ≥ 0 and ix ≺ m.tensors.length() {
+        let GgufTensorDescriptor hit ← m.tensors[ix]
+
+        if hit.name ≡ name then return hit
+    }
+
     for from m.tensors let t {
         if t.name ≡ name then return t
     }
@@ -980,6 +1113,15 @@ fn power_two(int value) → bool {
     return x ≡ 1
 }
 
+# One known-layout tensor's absolute byte range, carried through the
+# sort-and-sweep overlap check (issue #83). Every span is non-empty, so
+# sorting by start makes any overlapping pair force an adjacent overlap and
+# the running-maximum sweep below is exact.
+class TensorSpan {
+    mut int start
+    mut int end
+}
+
 fn construct(artifact.ContentIdentity identity, int total, int version, int alignment, int table_end, int corpus_length, list<GgufMetadata> metadata, list<GgufTensorDescriptor> tensors) → GgufManifest ⇥ GgufManifestError {
     # --- data region start + corpus boundary (fail closed) ----------------
     let int data_start ← align(table_end, alignment)
@@ -989,8 +1131,7 @@ fn construct(artifact.ContentIdentity identity, int total, int version, int alig
     require corpus_length ≤ data_start throw variant Surplus { message = "bounded GGUF corpus contains bytes from the data region" }
 
     # --- tensor absolute ranges (within the artifact) ---------------------
-    mut list<int> abs_starts ← empty
-    mut list<int> abs_ends ← empty
+    mut list<TensorSpan> spans ← empty
 
     for from tensors let tensor {
         let int raw_start ← add(data_start, tensor.relative_offset)
@@ -1003,36 +1144,41 @@ fn construct(artifact.ContentIdentity identity, int total, int version, int alig
 
                 require finish ≤ total throw variant BadOffset { message = "known GGML tensor range exceeds the artifact" }
 
-                abs_starts.append(raw_start)
-                abs_ends.append(finish)
+                spans.append(TensorSpan { start = raw_start, end = finish })
             }
             case Unknown let kind {
             }
         }
     }
 
-    # --- range overlap scan (fail closed) ---------------------------------
-    mut int a ← 0
+    # --- range overlap check (sort-and-sweep, fail closed) ----------------
+    let list<TensorSpan> sorted_spans ← sort via asc from spans let span {
+        return span.start
+    }
 
-    while a ≺ abs_starts.length() {
-        mut int z ← a + 1
+    mut int sweep_end ← -1
 
-        while z ≺ abs_starts.length() {
-            let int ai ← abs_starts.get(a) coalesce 0
-            let int bi ← abs_ends.get(a) coalesce 0
-            let int aj ← abs_starts.get(z) coalesce 0
-            let int bj ← abs_ends.get(z) coalesce 0
+    for from sorted_spans let span {
+        reject span.start ≺ sweep_end throw variant BadOffset { message = "known GGML tensor ranges overlap" }
 
-            reject bi ≻ aj and bj ≻ ai throw variant BadOffset { message = "known GGML tensor ranges overlap" }
+        if span.end ≻ sweep_end then sweep_end ← span.end
+    }
 
-            z ↑
-        }
+    # --- derived lookup indexes (issue #83) --------------------------------
+    mut map<string, int> metadata_index ← empty
 
-        a ↑
+    for exclusive metadata.length() let i {
+        metadata_index.put(metadata[i].key, i)
+    }
+
+    mut map<string, int> tensor_index ← empty
+
+    for exclusive tensors.length() let i {
+        tensor_index.put(tensors[i].name, i)
     }
 
     # --- manifest construct -----------------------------------------------
-    return GgufManifest { identity = identity, version = version, alignment = alignment, data_start = data_start, artifact_length = total, metadata = metadata, tensors = tensors }
+    return GgufManifest { identity = identity, version = version, alignment = alignment, data_start = data_start, artifact_length = total, metadata = metadata, tensors = tensors, metadata_index = metadata_index, tensor_index = tensor_index }
 }
 
 @ public
@@ -1070,7 +1216,7 @@ fn parse(GgufCorpus corpus) → GgufManifest ⇥ GgufManifestError {
     # --- metadata table (keys + wire values) ------------------------------
     mut int cursor ← 24
     mut list<GgufMetadata> metadata ← empty
-    mut list<string> keys ← empty
+    mut set<string> keys ← empty
 
     for range 0 ‥ kv_num let i {
         # --- key (length + duplicate check) -------------------------------
@@ -1082,7 +1228,7 @@ fn parse(GgufCorpus corpus) → GgufManifest ⇥ GgufManifestError {
 
         reject key ∈ keys throw variant DuplicateKey { message = "duplicate GGUF metadata key: §"(key) }
 
-        keys.append(key)
+        keys.add(key)
         cursor ← add(cursor, 8 + key_len)
 
         # --- value kind (fail closed) -------------------------------------
@@ -1116,7 +1262,7 @@ fn parse(GgufCorpus corpus) → GgufManifest ⇥ GgufManifestError {
 
     # --- tensor table (names + shapes + layouts) --------------------------
     mut list<GgufTensorDescriptor> tensors ← empty
-    mut list<string> names ← empty
+    mut set<string> names ← empty
     mut int t ← 0
 
     while t ≺ tensor_count {
@@ -1131,7 +1277,7 @@ fn parse(GgufCorpus corpus) → GgufManifest ⇥ GgufManifestError {
 
         reject name ∈ names throw variant DuplicateTensor { message = "duplicate GGUF tensor name: §"(name) }
 
-        names.append(name)
+        names.add(name)
         cursor ← add(cursor, 8 + name_len)
 
         # --- rank + shape dims (bounded) ----------------------------------
@@ -1172,15 +1318,20 @@ fn parse(GgufCorpus corpus) → GgufManifest ⇥ GgufManifestError {
     return construct(corpus.identity, total, version, alignment, cursor, b.length(), metadata, tensors)
 }
 
-# Incrementally inspect a real GGUF header and directory. Every source request
-# is an exact range established by the wire cursor; inspection stops at the end
-# of the tensor table and never asks for a tensor payload byte.
+# Incrementally inspect a real GGUF header and directory. All table reads go
+# through one buffered read-ahead window over the caller-owned source, so a
+# table walk costs one source callback per window instead of one per 4/8-byte
+# field; a range-limited source keeps its exact-read behavior through the
+# window's exact-length fallback. Inspection stops at the end of the tensor
+# table and never consumes a tensor payload byte.
 @ public
 fn inspect((int, int) → list<b8> ⇥ GgufManifestError source, int artifact_length, artifact.ContentIdentity identity) → GgufManifest ⇥ GgufManifestError {
     # --- identity + header (fail closed) ----------------------------------
     reject artifact_length ≤ 0 or not identity_valid(identity, artifact_length) throw variant BadIdentity { message = "content identity does not match the supplied artifact length" }
 
-    let list<b8> header_wire ← read_source(source, artifact_length, 0, 24)
+    mut SourceWindow window ← SourceWindow { source = source, total = artifact_length, bytes = ||, origin = 0, limit = 0, ceiling = READ_AHEAD }
+
+    let list<b8> header_wire ← window_read(mut window, 0, 24)
     let list<u8> header ← byte_list(header_wire)
 
     reject u8_value(header, 0) ≢ MAGIC_0 or u8_value(header, 1) ≢ MAGIC_1 or u8_value(header, 2) ≢ MAGIC_2 or u8_value(header, 3) ≢ MAGIC_3 throw variant BadFormat { message = "not a GGUF file — bad magic" }
@@ -1194,35 +1345,35 @@ fn inspect((int, int) → list<b8> ⇥ GgufManifestError source, int artifact_le
 
     reject tensor_count ≻ TENSOR_LIMIT or kv_num ≻ KV_LIMIT throw variant BadBounds { message = "GGUF count exceeds the bounded limit" }
 
-    # --- metadata table (ranged reads) ------------------------------------
+    # --- metadata table (windowed reads) ----------------------------------
     mut int cursor ← 24
     mut list<GgufMetadata> metadata ← empty
-    mut list<string> keys ← empty
+    mut set<string> keys ← empty
 
     for range 0 ‥ kv_num let i {
         # --- key (length + duplicate check) -------------------------------
-        let list<b8> key_head_wire ← read_source(source, artifact_length, cursor, 8)
+        let list<b8> key_head_wire ← window_read(mut window, cursor, 8)
         let int key_len ← u64_wire(key_head_wire)
 
         require key_len ≤ NAME_LIMIT throw variant BadBounds { message = "metadata key exceeds the bounded length" }
 
         cursor ← add(cursor, 8)
-        let list<b8> key_body_wire ← read_source(source, artifact_length, cursor, key_len)
+        let list<b8> key_body_wire ← window_read(mut window, cursor, key_len)
         let string key ← text_wire(key_body_wire)
 
         reject key ∈ keys throw variant DuplicateKey { message = "duplicate GGUF metadata key: §"(key) }
 
-        keys.append(key)
+        keys.add(key)
         cursor ← add(cursor, key_len)
 
         # --- value kind + wire read ---------------------------------------
-        let list<b8> type_wire ← read_source(source, artifact_length, cursor, 4)
+        let list<b8> type_wire ← window_read(mut window, cursor, 4)
         let int kind ← u32_wire(type_wire)
 
         require dtype_valid(kind) throw variant BadWire { message = "unknown GGUF metadata value type" }
 
         cursor ← add(cursor, 4)
-        let list<b8> value_wire ← source_value(source, artifact_length, cursor, kind, 0)
+        let list<b8> value_wire ← source_value(mut window, cursor, kind, 0)
 
         # --- append metadata record ---------------------------------------
         metadata.append(GgufMetadata { key = key, dtype = kind, payload_wire = value_wire })
@@ -1245,31 +1396,31 @@ fn inspect((int, int) → list<b8> ⇥ GgufManifestError source, int artifact_le
         alignment ← file_alignment
     }
 
-    # --- tensor table (ranged reads) --------------------------------------
+    # --- tensor table (windowed reads) ------------------------------------
     mut list<GgufTensorDescriptor> tensors ← empty
-    mut list<string> names ← empty
+    mut set<string> names ← empty
     mut int t ← 0
 
     while t ≺ tensor_count {
         # --- name (length + duplicate check) ------------------------------
-        let list<b8> name_head_wire ← read_source(source, artifact_length, cursor, 8)
+        let list<b8> name_head_wire ← window_read(mut window, cursor, 8)
         let int name_len ← u64_wire(name_head_wire)
 
         require name_len ≤ NAME_LIMIT throw variant BadBounds { message = "tensor name exceeds the bounded length" }
 
         cursor ← add(cursor, 8)
-        let list<b8> name_body_wire ← read_source(source, artifact_length, cursor, name_len)
+        let list<b8> name_body_wire ← window_read(mut window, cursor, name_len)
         let string name ← text_wire(name_body_wire)
 
         require name.length() ≢ 0 throw variant BadWire { message = "empty tensor name" }
 
         reject name ∈ names throw variant DuplicateTensor { message = "duplicate GGUF tensor name: §"(name) }
 
-        names.append(name)
+        names.add(name)
         cursor ← add(cursor, name_len)
 
         # --- rank + shape dims (bounded) ----------------------------------
-        let list<b8> rank_wire ← read_source(source, artifact_length, cursor, 4)
+        let list<b8> rank_wire ← window_read(mut window, cursor, 4)
         let int rank ← u32_wire(rank_wire)
         cursor ← add(cursor, 4)
 
@@ -1281,7 +1432,7 @@ fn inspect((int, int) → list<b8> ⇥ GgufManifestError source, int artifact_le
         mut int d ← 0
 
         while d ≺ rank {
-            let list<b8> dim_wire ← read_source(source, artifact_length, cursor, 8)
+            let list<b8> dim_wire ← window_read(mut window, cursor, 8)
             let int dim ← u64_wire(dim_wire)
 
             reject dim ≤ 0 throw variant BadBounds { message = "tensor dimension must be positive" }
@@ -1292,10 +1443,10 @@ fn inspect((int, int) → list<b8> ⇥ GgufManifestError source, int artifact_le
         }
 
         # --- dtype + offset + layout --------------------------------------
-        let list<b8> ggml_wire ← read_source(source, artifact_length, cursor, 4)
+        let list<b8> ggml_wire ← window_read(mut window, cursor, 4)
         let int ggml_dtype ← u32_wire(ggml_wire)
         cursor ← add(cursor, 4)
-        let list<b8> offset_wire ← read_source(source, artifact_length, cursor, 8)
+        let list<b8> offset_wire ← window_read(mut window, cursor, 8)
         let int offset ← u64_wire(offset_wire)
         cursor ← add(cursor, 8)
         let int elements ← element_count(shape)

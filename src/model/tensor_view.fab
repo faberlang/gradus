@@ -21,13 +21,14 @@ locale = "en"
 # source function.
 #
 # `materialize_slice` decodes one element-aligned window of a bound
-# view through the operation-scoped source, one block per read, in GGUF
-# block order. It fails closed on: negative / out-of-tensor / over-cap
-# windows (BadBounds), block-misaligned windows (BadOrder), unsupported
-# decoder representation (UnsupportedRepresentation), unknown block
-# geometry (UnknownLayout), source failures (BadRange), and malformed block
-# bytes (BadRange). Each sub-window is exactly one block (≤ CORPUS_LIMIT);
-# no whole-tensor or whole-model read path exists.
+# view through the operation-scoped source in contiguous multi-MiB chunk
+# reads (a whole number of blocks per call), decoded in place at their
+# offsets in GGUF block order. It fails closed on: negative /
+# out-of-tensor / over-cap windows (BadBounds), block-misaligned windows
+# (BadOrder), unsupported decoder representation
+# (UnsupportedRepresentation), unknown block geometry (UnknownLayout),
+# source failures (BadRange), and malformed block bytes (BadRange). No
+# whole-tensor or whole-model read path exists.
 #
 # `materialize_block` is the single-block probe: it decodes exactly
 # one block of a bound view by block index. It fails closed on an
@@ -99,21 +100,20 @@ fn description(gguf_manifest.GgufManifest m, string name) → gguf_manifest.Gguf
     }
 }
 
-# Manifest range seam for a known-layout tensor. Inside the bind this runs
-# only after name and layout checks, so its only reachable failure is a
-# manifest-range overflow; it still fails closed as BadBounds.
-fn limit_of(gguf_manifest.GgufManifest m, string name) → tuple<int, int> ⇥ ViewError {
-    do {
-        return gguf_manifest.payload_limit(m, name)
-    }
-    catch err {
-        match err {
-            case gguf_manifest.NotFound let message {
-                throw variant UnknownName { message = message }
-            }
-            case _ {
-                throw variant BadBounds { message = "manifest tensor range facts are invalid" }
-            }
+# Manifest range seam for a known-layout tensor, taken from the descriptor
+# the bind already fetched (issue #83): the absolute start is the manifest's
+# data start plus the descriptor's relative offset, guarded by the same
+# carrier bound `payload_limit` checks, so a second find_tensor scan per bind
+# is not issued.
+fn limit_of(gguf_manifest.GgufManifest m, gguf_manifest.GgufTensorDescriptor t) → tuple<int, int> ⇥ ViewError {
+    reject m.data_start ≺ 0 or t.relative_offset ≺ 0 or m.data_start ≻ 9223372036854775807 - t.relative_offset throw variant BadBounds { message = "manifest tensor range facts are invalid" }
+
+    match t.layout {
+        case gguf_manifest.Known let elements_per_block, bytes_per_block, byte_length {
+            return tuple<int, int> [m.data_start + t.relative_offset, byte_length]
+        }
+        case gguf_manifest.Unknown let kind {
+            throw variant BadBounds { message = "manifest tensor range facts are invalid" }
         }
     }
 }
@@ -159,7 +159,7 @@ fn links(gguf_manifest.GgufManifest m, tensor_payload.TensorPayload p) → Tenso
         }
         case gguf_manifest.Known let elements_per_block, bytes_per_block, byte_length {
             # --- payload range match + construct --------------------------
-            let tuple<int, int> limit ← limit_of(m, p.name)
+            let tuple<int, int> limit ← limit_of(m, t)
 
             require p.absolute_start ≡ limit[0] throw variant BadRange { message = "payload start does not match the manifest tensor range" }
 
@@ -178,11 +178,17 @@ fn links(gguf_manifest.GgufManifest m, tensor_payload.TensorPayload p) → Tenso
 @ public
 const int MAXIMUM_SLICE_ELEMENTS = 16777216
 
-# One operation-scoped block read through the caller's source. The source is
+# Contiguous read chunk for materialize_slice: one source call carries at
+# most this many bytes (rounded down to a whole number of blocks), well
+# inside the CORPUS_LIMIT range-source ceiling, so a window is read in a
+# small number of multi-MiB reads instead of one read per block.
+const int READ_CHUNK_BYTES = 4194304
+
+# One operation-scoped range read through the caller's source. The source is
 # a function value supplied anew per operation and is never retained by any
-# view. Every request is exactly one block (bytes_per_block bytes, ≤
-# CORPUS_LIMIT by construction for the admitted block types); a failed or
-# short read fails closed as BadRange.
+# view. materialize_slice requests contiguous multi-MiB chunks (a whole
+# number of blocks) and materialize_block requests exactly one block; a
+# failed or short read fails closed as BadRange.
 fn read_source((int, int) → list<b8> ⇥ gguf_manifest.GgufManifestError source, int start, int length) → list<b8> ⇥ ViewError {
     require start ≥ 0 throw variant BadRange { message = "block sub-window range is negative" }
 
@@ -229,12 +235,37 @@ fn decode_chunk(storage.Representation representation, list<b8> chunk) → list<
     throw variant BadRange { message = "block decode failed" }
 }
 
-# Decode one element-aligned window of a bound view, one block per
-# source read, in GGUF block order. The window [element_start,
-# element_start + element_length) must be within the tensor and
-# block-aligned; the layout must be known; the source must answer each
-# one-block request; each block must decode. No whole-tensor or whole-model
-# read path exists.
+# Decode a contiguous chunk (a whole number of blocks) into the shared
+# output buffer through the offset-aware row decode, mapping the dequant
+# error vocabulary onto the view errors (the same mapping as the
+# single-block decode).
+fn decode_window(storage.Representation representation, list<b8> chunk, int blocks, mut list<f32> y) ⇥ ViewError {
+    do {
+        dequant.decode_order_into(representation, chunk, 0, blocks, mut y)
+    }
+    catch err {
+        match err {
+            case dequant.BadPayload let message {
+                throw variant BadRange { message = "block value decode failed: §"(message) }
+            }
+            case dequant.DequantError.UnsupportedRepresentation let message {
+                throw variant UnsupportedRepresentation { message = message }
+            }
+            case _ {
+                throw variant BadRange { message = "block decode failed" }
+            }
+        }
+    }
+}
+
+# Decode one element-aligned window of a bound view in GGUF block order.
+# The window [element_start, element_start + element_length) must be within
+# the tensor and block-aligned; the layout must be known; the source must
+# answer each contiguous chunk request; each block must decode. Reads are
+# contiguous multi-MiB chunks (a whole number of blocks per call, at most
+# READ_CHUNK_BYTES) instead of one call per block, and every chunk decodes
+# in place at its offsets onto the single output buffer. No whole-tensor or
+# whole-model read path exists.
 @ public
 fn materialize_slice(TensorView v, int element_start, int element_length, (int, int) → list<b8> ⇥ gguf_manifest.GgufManifestError source) → list<f32> ⇥ ViewError {
     # --- layout + window bounds (fail closed) -----------------------------
@@ -256,17 +287,31 @@ fn materialize_slice(TensorView v, int element_start, int element_length, (int, 
 
     require element_length % elements_per_block ≡ 0 throw variant BadOrder { message = "element window is not aligned to the tensor block boundary" }
 
-    # --- block read + decode loop -----------------------------------------
+    # --- contiguous chunked read + in-place decode loop --------------------
     let int first_block ← element_start / elements_per_block
     let int block_count ← element_length / elements_per_block
+
+    # One source call per chunk: a chunk is a whole number of blocks, at
+    # most READ_CHUNK_BYTES (rounded down to a whole block), and the last
+    # chunk takes only the window remainder.
+    mut int chunk_blocks ← READ_CHUNK_BYTES / bytes_per_block
+    if chunk_blocks ≺ 1 {
+        chunk_blocks ← 1
+    }
+
     mut list<f32> y ← empty
+    mut int done ← 0
 
-    for range 0 ‥ block_count let i {
-        let list<f32> g ← decode_chunk(v.representation, read_block(v, bytes_per_block, first_block + i, source))
-
-        for from g let x {
-            y.append(x)
+    while done ≺ block_count {
+        mut int take ← chunk_blocks
+        if block_count - done ≺ take {
+            take ← block_count - done
         }
+
+        let int chunk_start ← v.absolute_start + (first_block + done) * bytes_per_block
+        let list<b8> chunk ← read_source(source, chunk_start, take * bytes_per_block)
+        decode_window(v.representation, chunk, take, mut y)
+        done ← done + take
     }
 
     return y
@@ -434,6 +479,19 @@ fn corpus_q8() → gguf_manifest.GgufCorpus {
     return with_padding(table, 32, 164)
 }
 
+# Wide F32 corpus for the chunked-read probe: token_embd.weight [1572864]
+# kind 0 (F32, 1 element/block, 4 bytes/block) -> 6291456 payload bytes,
+# with a second row padding the table (its own 16-byte payload follows the
+# wide tensor); the table ends at 127 bytes so the data section starts at
+# 128 (DEFAULT_ALIGNMENT 32), artifact total 128 + 6291456 + 16. The
+# window spans two READ_CHUNK_BYTES chunk reads (1048576 + 524288 blocks).
+fn corpus_f32_wide() → gguf_manifest.GgufCorpus {
+    mut list<u8> table ← header(2, 0)
+    table ← join(table, tensor_row("token_embd.weight", [1572864], 0, 0))
+    table ← join(table, tensor_row("blk.0.attn_norm.weight", [8], 1, 6291456))
+    return with_padding(table, 32, 128 + 6291456 + 16)
+}
+
 # Render one bind attempt as "name/kind/elements/start/length" or the
 # typed ViewError render.
 fn view(gguf_manifest.GgufCorpus corpus, string name, int start, int length) → string {
@@ -482,6 +540,32 @@ fn source_zero(int start, int length) → list<b8> ⇥ gguf_manifest.GgufManifes
     mut list<b8> out ← ||
     for range 0‥length let i {
         out.append(0x00 ∷ b8)
+    }
+    return out
+}
+
+# F32 ramp source over the wide corpus's absolute data window (data section
+# at 128): byte at absolute address a carries element k = (a - 128) / 4 of
+# the little-endian f32 whose value is exactly k, so element order across
+# chunk boundaries is observable in the decoded output values.
+fn source_f32_ramp(int start, int length) → list<b8> ⇥ gguf_manifest.GgufManifestError {
+    mut list<b8> out ← ||
+    for exclusive length let i {
+        let int addr ← start + i - 128
+        let int k ← addr / 4
+        let int byte_in ← addr % 4
+        let int bits ← ((k ↦ f32) ↦ b32) ↦ u32 ↦ int
+        mut int byte_value ← bits % 256
+        if byte_in ≡ 1 {
+            byte_value ← (bits ⇒ 8) % 256
+        }
+        if byte_in ≡ 2 {
+            byte_value ← (bits ⇒ 16) % 256
+        }
+        if byte_in ≡ 3 {
+            byte_value ← (bits ⇒ 24) % 256
+        }
+        out.append((byte_value ↦ u8 ⊥ 0) ↦ b8)
     }
     return out
 }
@@ -606,6 +690,30 @@ test "positive window reads whole blocks in GGUF block order" {
     assert slice(corpus_q8(), "token_embd.weight", 96, 68, 0, 32, source_zero) ≡ "ok:32"
     assert slice(corpus_q8(), "token_embd.weight", 96, 68, 32, 32, source_zero) ≡ "ok:32"
     assert slice(corpus_q8(), "token_embd.weight", 96, 68, 0, 64, source_zero) ≡ "ok:64"
+}
+
+test "a window spanning several chunk reads materializes in element order" {
+    do {
+        let gguf_manifest.GgufManifest m ← gguf_manifest.parse(corpus_f32_wide())
+        do {
+            let tensor_payload.TensorPayload p ← tensor_payload.TensorPayload {name = "token_embd.weight", absolute_start = 128, length = 6291456, bytes = ||}
+            let tensor_view.TensorView v ← tensor_view.links(m, p)
+            # The window is 1572864 F32 blocks over two READ_CHUNK_BYTES
+            # chunk reads; element 1048575 ends the first chunk and element
+            # 1048576 opens the second, each decoding to its own index.
+            let list<f32> out ← tensor_view.materialize_slice(v, 0, 1572864, source_f32_ramp)
+            assert (out.get(0) coalesce (-1.0) ∷ f32) ≡ 0.0 ∷ f32
+            assert (out.get(1048575) coalesce (-1.0) ∷ f32) ≡ 1048575.0 ∷ f32
+            assert (out.get(1048576) coalesce (-1.0) ∷ f32) ≡ 1048576.0 ∷ f32
+            assert (out.get(1572863) coalesce (-1.0) ∷ f32) ≡ 1572863.0 ∷ f32
+        }
+        catch err {
+            assert false
+        }
+    }
+    catch err {
+        assert false
+    }
 }
 
 test "window bounds failure fails closed as BadBounds" {

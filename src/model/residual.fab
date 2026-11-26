@@ -1,0 +1,518 @@
++++ toml
+locale = "en"
+
++++ faber
+# ResidualCarrier (Standard / AttnResBank) and runtime TapBuffer capture
+# (issue #102, Seam 3).
+#
+# Public import: import from "gradus:model/residual" let residual
+
+import from "gradus:model/schedule" let schedule
+
+@ public
+union ResidualError {
+    @ shared
+    string message
+
+    InvalidConfig,
+    ShapeMismatch,
+    InvalidPass,
+    EmptyBank,
+    TapNotFound,
+    TapAlreadyCaptured,
+    TapNotCaptured
+}
+
+# -------------------------------------------------------------------------
+# Standard single-stream carrier
+# -------------------------------------------------------------------------
+
+@ public
+class StandardCarrier<size D> {
+    mut tensor<f32, [D]> hidden
+}
+
+@ public
+fn init_standard<size D>(tensor<f32, [D]> initial_hidden) → StandardCarrier<size D> ⇥ ResidualError {
+    require D ≥ 1 throw variant InvalidConfig { message = "carrier dimension D must be at least 1" }
+    let tensor<f32, [D]> h ← copy initial_hidden
+    return StandardCarrier<size D> { hidden = h }
+}
+
+@ public
+fn standard_push<size D>(mut StandardCarrier<size D> c, tensor<f32, [D]> delta) → void {
+    mut tensor<f32, [D]> next ← tf32[D] {}
+    for exclusive D let i {
+        next[[i]] ← c.hidden[[i]] + delta[[i]]
+    }
+    c.hidden ← next
+}
+
+# -------------------------------------------------------------------------
+# AttnResBank depthwise block-attention bank
+# -------------------------------------------------------------------------
+
+@ public
+class AttnResBank<size D> {
+    let int cadence
+    mut int layers_in_block
+    mut list<tensor<f32, [D]>> blocks
+    mut tensor<f32, [D]> cur
+    mut list<tensor<f32, [D]>> prelude_blocks
+    mut tensor<f32, [D]> prelude_cur
+    mut int prelude_layers_in_block
+    mut bool has_prelude
+    mut list<tensor<f32, [D]>> prev_pass_bank
+    mut bool has_prev_pass
+}
+
+@ public
+fn init_attn_res<size D>(int cadence, tensor<f32, [D]> initial_hidden) → AttnResBank<size D> ⇥ ResidualError {
+    require D ≥ 1 throw variant InvalidConfig { message = "AttnResBank dimension D must be at least 1" }
+    require cadence ≥ 1 throw variant InvalidConfig { message = "n_layers_per_attn_res_block must be at least 1" }
+
+    let tensor<f32, [D]> cur ← copy initial_hidden
+    let tensor<f32, [D]> p_cur ← tf32[D] {}
+    return AttnResBank<size D> { cadence = cadence, layers_in_block = 0, blocks = empty, cur = cur, prelude_blocks = empty, prelude_cur = p_cur, prelude_layers_in_block = 0, has_prelude = false, prev_pass_bank = empty, has_prev_pass = false }
+}
+
+fn copy_tensor_list<size D>(list<tensor<f32, [D]>> src) → list<tensor<f32, [D]>> {
+    mut list<tensor<f32, [D]>> out ← empty
+    for from src let t {
+        let tensor<f32, [D]> c ← copy t
+        out.append(c)
+    }
+    return out
+}
+
+fn collect_sources<size D>(AttnResBank<size D> bank) → list<tensor<f32, [D]>> {
+    mut list<tensor<f32, [D]>> sources ← copy_tensor_list<size D>(bank.blocks)
+    if bank.layers_in_block ≻ 0 or bank.blocks.length() ≡ 0 {
+        let tensor<f32, [D]> c ← copy bank.cur
+        sources.append(c)
+    }
+    return sources
+}
+
+fn attend_sources<size D>(list<tensor<f32, [D]>> sources, tensor<f32, [D]> query) → tensor<f32, [D]> ⇥ ResidualError {
+    let int k_len ← sources.length()
+    require k_len ≥ 1 throw variant EmptyBank { message = "cannot attend over empty depth bank" }
+
+    let f32 scale ← (1.0 ∷ f32) / (√(D ↦ f32))
+    mut list<f32> scores ← empty
+    mut f32 max_score ← (-1.0e30 ∷ f32)
+
+    for exclusive k_len let k {
+        let tensor<f32, [D]> src ← sources[k]
+        mut f32 dot ← (0.0 ∷ f32)
+        for exclusive D let i {
+            dot ← dot + query[[i]] * src[[i]]
+        }
+        let f32 s ← dot * scale
+        scores.append(s)
+        if k ≡ 0 or s ≻ max_score {
+            max_score ← s
+        }
+    }
+
+    mut list<f32> weights ← empty
+    mut f32 sum_w ← (0.0 ∷ f32)
+    for exclusive k_len let k {
+        let f32 w ← (scores[k] - max_score).exp()
+        weights.append(w)
+        sum_w ← sum_w + w
+    }
+
+    mut tensor<f32, [D]> out ← tf32[D] {}
+    for exclusive k_len let k {
+        let f32 prob ← weights[k] / sum_w
+        let tensor<f32, [D]> src ← sources[k]
+        for exclusive D let i {
+            out[[i]] ← out[[i]] + prob * src[[i]]
+        }
+    }
+
+    return out
+}
+
+@ public
+fn attn_res_query_1d<size D>(AttnResBank<size D> bank, tensor<f32, [D]> query) → tensor<f32, [D]> ⇥ ResidualError {
+    let list<tensor<f32, [D]>> sources ← collect_sources<size D>(bank)
+    return attend_sources<size D>(sources, query)
+}
+
+@ public
+fn attn_res_query_3d<size D>(AttnResBank<size D> bank, tensor<f32, [3, D]> queries) → tensor<f32, [3, D]> ⇥ ResidualError {
+    let list<tensor<f32, [D]>> sources ← collect_sources<size D>(bank)
+    mut tensor<f32, [3, D]> out ← tf32[3, D] {}
+
+    for exclusive 3 let r {
+        mut tensor<f32, [D]> q_row ← tf32[D] {}
+        for exclusive D let i {
+            q_row[[i]] ← queries[[r, i]]
+        }
+        let tensor<f32, [D]> attended ← attend_sources<size D>(sources, q_row)
+        for exclusive D let i {
+            out[[r, i]] ← attended[[i]]
+        }
+    }
+
+    return out
+}
+
+@ public
+fn attn_res_push<size D>(mut AttnResBank<size D> bank, tensor<f32, [D]> delta) → void {
+    mut tensor<f32, [D]> next_cur ← tf32[D] {}
+    for exclusive D let i {
+        next_cur[[i]] ← bank.cur[[i]] + delta[[i]]
+    }
+    bank.cur ← next_cur
+    bank.layers_in_block ↑
+
+    if bank.layers_in_block ≡ bank.cadence {
+        let tensor<f32, [D]> committed ← copy bank.cur
+        bank.blocks.append(committed)
+        bank.cur ← tf32[D] {}
+        bank.layers_in_block ← 0
+    }
+}
+
+@ public
+fn snapshot_prelude<size D>(mut AttnResBank<size D> bank) → void {
+    bank.prelude_blocks ← copy_tensor_list<size D>(bank.blocks)
+    bank.prelude_cur ← copy bank.cur
+    bank.prelude_layers_in_block ← bank.layers_in_block
+    bank.has_prelude ← true
+}
+
+@ public
+fn begin_next_pass<size D>(mut AttnResBank<size D> bank) → void ⇥ ResidualError {
+    require bank.has_prelude throw variant InvalidPass { message = "cannot reset_to_prelude before snapshot_prelude" }
+
+    bank.prev_pass_bank ← collect_sources<size D>(bank)
+    bank.has_prev_pass ← true
+    bank.blocks ← copy_tensor_list<size D>(bank.prelude_blocks)
+    bank.cur ← copy bank.prelude_cur
+    bank.layers_in_block ← bank.prelude_layers_in_block
+}
+
+# -------------------------------------------------------------------------
+# Cross-pass rank-R (e.g. rank-64) tanh gain/forget message controller
+# -------------------------------------------------------------------------
+
+@ public
+class CrossPassController<size D, size R> {
+    let tensor<f32, [R, D]> w_down
+    let tensor<f32, [D, R]> w_gain
+    let tensor<f32, [D, R]> w_forget
+    let tensor<f32, [D]> prev_query
+}
+
+@ public
+fn apply_cross_pass<size D, size R>(AttnResBank<size D> bank, CrossPassController<size D, R> ctrl, tensor<f32, [D]> h) → tensor<f32, [D]> ⇥ ResidualError {
+    require bank.has_prev_pass throw variant InvalidPass { message = "cross-pass controller requires prev_pass_bank" }
+    require R ≥ 1 throw variant InvalidConfig { message = "cross-pass gate rank R must be at least 1" }
+
+    let tensor<f32, [D]> m_prev ← attend_sources<size D>(bank.prev_pass_bank, ctrl.prev_query)
+
+    mut tensor<f32, [R]> z ← tf32[R] {}
+    for exclusive R let r {
+        mut f32 acc ← (0.0 ∷ f32)
+        for exclusive D let i {
+            acc ← acc + ctrl.w_down[[r, i]] * h[[i]]
+        }
+        z[[r]] ← acc.tanh()
+    }
+
+    mut tensor<f32, [D]> out ← tf32[D] {}
+    for exclusive D let i {
+        mut f32 g_logit ← (0.0 ∷ f32)
+        mut f32 f_logit ← (0.0 ∷ f32)
+        for exclusive R let r {
+            g_logit ← g_logit + ctrl.w_gain[[i, r]] * z[[r]]
+            f_logit ← f_logit + ctrl.w_forget[[i, r]] * z[[r]]
+        }
+        let f32 gain ← sigmoid g_logit
+        let f32 forget ← sigmoid f_logit
+        out[[i]] ← forget * h[[i]] + gain * m_prev[[i]]
+    }
+
+    return out
+}
+
+# -------------------------------------------------------------------------
+# Unified ResidualCarrier
+# -------------------------------------------------------------------------
+
+@ public
+class ResidualCarrier<size D> {
+    let schedule.ResidualKind kind
+    mut StandardCarrier<size D> ∪ none standard
+    mut AttnResBank<size D> ∪ none attn_res
+}
+
+@ public
+fn carrier_from_schedule<size D>(schedule.ExecutionSchedule sched, int attn_res_cadence, tensor<f32, [D]> initial_hidden) → ResidualCarrier<size D> ⇥ ResidualError {
+    match sched.residual {
+        case schedule.ResidualKind.Standard {
+            let StandardCarrier<size D> sc ← init_standard<size D>(initial_hidden)
+            return ResidualCarrier<size D> { kind = sched.residual, standard = sc, attn_res = null }
+        }
+        case schedule.ResidualKind.AttnRes {
+            let AttnResBank<size D> bank ← init_attn_res<size D>(attn_res_cadence, initial_hidden)
+            return ResidualCarrier<size D> { kind = sched.residual, standard = null, attn_res = bank }
+        }
+    }
+}
+
+@ public
+fn carrier_push<size D>(mut ResidualCarrier<size D> c, tensor<f32, [D]> delta) → void ⇥ ResidualError {
+    let StandardCarrier<size D> ∪ none maybe_sc ← c.standard
+    if maybe_sc not is none {
+        mut StandardCarrier<size D> sc ← maybe_sc
+        standard_push<size D>(mut sc, delta)
+        c.standard ← sc
+        return
+    }
+    let AttnResBank<size D> ∪ none maybe_bank ← c.attn_res
+    if maybe_bank not is none {
+        mut AttnResBank<size D> bank ← maybe_bank
+        attn_res_push<size D>(mut bank, delta)
+        c.attn_res ← bank
+        return
+    }
+    throw variant InvalidConfig { message = "ResidualCarrier has no active stream" }
+}
+
+@ public
+fn carrier_prepare_step<size D>(mut ResidualCarrier<size D> c, schedule.ExecutionStep step) → void ⇥ ResidualError {
+    if not step.resets_to_prelude {
+        return
+    }
+    let AttnResBank<size D> ∪ none maybe_bank ← c.attn_res
+    if maybe_bank not is none {
+        mut AttnResBank<size D> bank ← maybe_bank
+        begin_next_pass<size D>(mut bank)
+        c.attn_res ← bank
+    }
+}
+
+# -------------------------------------------------------------------------
+# Runtime TapBuffer capture
+# -------------------------------------------------------------------------
+
+@ public
+class TapSlot<size D> {
+    let string name
+    let int visit_id
+    mut bool captured
+    mut tensor<f32, [D]> value
+}
+
+@ public
+class TapStore<size D> {
+    mut list<TapSlot<size D>> slots
+}
+
+@ public
+fn tap_store_from_schedule<size D>(schedule.ExecutionSchedule sched) → TapStore<size D> ⇥ ResidualError {
+    require D ≥ 1 throw variant InvalidConfig { message = "TapStore dimension D must be at least 1" }
+    mut list<TapSlot<size D>> slots ← empty
+    for from sched.taps let tap {
+        require tap.name.length() ≥ 1 throw variant InvalidConfig { message = "tap name must not be empty" }
+        let tensor<f32, [D]> z ← tf32[D] {}
+        slots.append(TapSlot<size D> { name = tap.name, visit_id = tap.visit_id, captured = false, value = z })
+    }
+    return TapStore<size D> { slots = slots }
+}
+
+@ public
+fn capture_if_tapped<size D>(mut TapStore<size D> store, int visit_id, tensor<f32, [D]> hidden) → bool ⇥ ResidualError {
+    mut bool matched ← false
+    for exclusive store.slots.length() let i {
+        if store.slots[i].visit_id ≡ visit_id {
+            require not store.slots[i].captured throw variant TapAlreadyCaptured { message = "tap at visit_id § already captured"(visit_id ↦ string) }
+            store.slots[i].value ← copy hidden
+            store.slots[i].captured ← true
+            matched ← true
+        }
+    }
+    return matched
+}
+
+@ public
+fn read_tap<size D>(TapStore<size D> store, string name) → tensor<f32, [D]> ⇥ ResidualError {
+    for exclusive store.slots.length() let i {
+        if store.slots[i].name ≡ name {
+            require store.slots[i].captured throw variant TapNotCaptured { message = "tap '§' has not been captured"(name) }
+            let tensor<f32, [D]> out ← copy store.slots[i].value
+            return out
+        }
+    }
+    throw variant TapNotFound { message = "unknown tap '§'"(name) }
+}
+
+@ public
+fn read_tap_at<size D>(TapStore<size D> store, int visit_id) → tensor<f32, [D]> ⇥ ResidualError {
+    for exclusive store.slots.length() let i {
+        if store.slots[i].visit_id ≡ visit_id {
+            require store.slots[i].captured throw variant TapNotCaptured { message = "tap at visit_id § has not been captured"(visit_id ↦ string) }
+            let tensor<f32, [D]> out ← copy store.slots[i].value
+            return out
+        }
+    }
+    throw variant TapNotFound { message = "no tap registered at visit_id §"(visit_id ↦ string) }
+}
+
++++ faber test
+import from "gradus:model/residual" let res
+import from "gradus:model/schedule" let sched
+
+fn approx(f32 a, f32 b, f32 tol) → bool {
+    let f32 d ← a - b
+    return d ≥ -tol and d ≤ tol
+}
+
+fn vec4(f32 a, f32 b, f32 c, f32 d) → tensor<f32, [4]> {
+    mut tensor<f32, [4]> out ← tf32[4] {}
+    out[[0]] ← a
+    out[[1]] ← b
+    out[[2]] ← c
+    out[[3]] ← d
+    return out
+}
+
+test "Standard residual carrier accumulates deltas" {
+    do {
+        let tensor<f32, [4]> h0 ← vec4((1.0 ∷ f32), (2.0 ∷ f32), (3.0 ∷ f32), (4.0 ∷ f32))
+        mut res.StandardCarrier<size 4> sc ← res.init_standard<size 4>(h0)
+        let tensor<f32, [4]> d1 ← vec4((0.5 ∷ f32), (-1.0 ∷ f32), (2.0 ∷ f32), (0.0 ∷ f32))
+        res.standard_push<size 4>(mut sc, d1)
+        assert approx(sc.hidden[[0]], (1.5 ∷ f32), (1.0e-5 ∷ f32))
+        assert approx(sc.hidden[[1]], (1.0 ∷ f32), (1.0e-5 ∷ f32))
+        assert approx(sc.hidden[[2]], (5.0 ∷ f32), (1.0e-5 ∷ f32))
+        assert approx(sc.hidden[[3]], (4.0 ∷ f32), (1.0e-5 ∷ f32))
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "AttnResBank depthwise block-attention: 1D and 3D queries + cadence commit" {
+    do {
+        let tensor<f32, [4]> h0 ← vec4((1.0 ∷ f32), (0.0 ∷ f32), (0.0 ∷ f32), (0.0 ∷ f32))
+        mut res.AttnResBank<size 4> bank ← res.init_attn_res<size 4>(2, h0)
+
+        res.attn_res_push<size 4>(mut bank, vec4((0.0 ∷ f32), (1.0 ∷ f32), (0.0 ∷ f32), (0.0 ∷ f32)))
+        res.attn_res_push<size 4>(mut bank, vec4((0.0 ∷ f32), (0.0 ∷ f32), (0.0 ∷ f32), (0.0 ∷ f32)))
+        assert bank.blocks.length() ≡ 1
+        assert bank.layers_in_block ≡ 0
+
+        res.attn_res_push<size 4>(mut bank, vec4((0.0 ∷ f32), (0.0 ∷ f32), (2.0 ∷ f32), (0.0 ∷ f32)))
+        assert bank.layers_in_block ≡ 1
+
+        let tensor<f32, [4]> q1 ← vec4((0.0 ∷ f32), (0.0 ∷ f32), (10.0 ∷ f32), (0.0 ∷ f32))
+        let tensor<f32, [4]> out1 ← res.attn_res_query_1d<size 4>(bank, q1)
+        assert out1[[2]] ≻ (1.9 ∷ f32)
+
+        mut tensor<f32, [3, 4]> q3 ← tf32[3, 4] {}
+        q3[[0, 0]] ← (10.0 ∷ f32)
+        q3[[1, 2]] ← (10.0 ∷ f32)
+        q3[[2, 1]] ← (10.0 ∷ f32)
+        let tensor<f32, [3, 4]> out3 ← res.attn_res_query_3d<size 4>(bank, q3)
+        assert out3[[0, 0]] ≻ (0.9 ∷ f32)
+        assert out3[[1, 2]] ≻ (1.9 ∷ f32)
+        assert out3[[2, 1]] ≻ (0.9 ∷ f32)
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "AttnResBank reset_to_prelude and rank-64 cross-pass tanh gain/forget controller" {
+    do {
+        let tensor<f32, [4]> h0 ← vec4((1.0 ∷ f32), (0.0 ∷ f32), (0.0 ∷ f32), (0.0 ∷ f32))
+        mut res.AttnResBank<size 4> bank ← res.init_attn_res<size 4>(2, h0)
+        res.attn_res_push<size 4>(mut bank, vec4((0.5 ∷ f32), (0.0 ∷ f32), (0.0 ∷ f32), (0.0 ∷ f32)))
+        res.snapshot_prelude<size 4>(mut bank)
+
+        res.attn_res_push<size 4>(mut bank, vec4((0.0 ∷ f32), (3.0 ∷ f32), (0.0 ∷ f32), (0.0 ∷ f32)))
+        assert bank.blocks.length() ≡ 1
+
+        res.begin_next_pass<size 4>(mut bank)
+        assert bank.has_prev_pass
+        assert bank.prev_pass_bank.length() ≡ 1
+        assert bank.blocks.length() ≡ 0
+        assert bank.layers_in_block ≡ 1
+        assert approx(bank.cur[[0]], (1.5 ∷ f32), (1.0e-5 ∷ f32))
+        assert approx(bank.cur[[1]], (0.0 ∷ f32), (1.0e-5 ∷ f32))
+
+        mut tensor<f32, [64, 4]> w_down ← tf32[64, 4] {}
+        mut tensor<f32, [4, 64]> w_gain ← tf32[4, 64] {}
+        mut tensor<f32, [4, 64]> w_forget ← tf32[4, 64] {}
+        w_down[[0, 0]] ← (1.0 ∷ f32)
+        w_gain[[1, 0]] ← (2.0 ∷ f32)
+        w_forget[[0, 0]] ← (2.0 ∷ f32)
+        let res.CrossPassController<size 4, size 64> ctrl ← res.CrossPassController<size 4, size 64> { w_down = w_down, w_gain = w_gain, w_forget = w_forget, prev_query = vec4((0.0 ∷ f32), (1.0 ∷ f32), (0.0 ∷ f32), (0.0 ∷ f32)) }
+        let tensor<f32, [4]> mixed ← res.apply_cross_pass<size 4, size 64>(bank, ctrl, bank.cur)
+        assert mixed[[0]] ≻ (0.5 ∷ f32)
+        assert mixed[[1]] ≻ (1.0 ∷ f32)
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "Runtime TapBuffer capture stores and reads designated Inkling visit_ids fail-closed (residual)" {
+    let list<sched.TapBuffer> taps ← [
+        sched.TapBuffer { name = "prelude_end", visit_id = 5 },
+        sched.TapBuffer { name = "pass1_end", visit_id = 23 },
+        sched.TapBuffer { name = "pass2_end", visit_id = 41 },
+        sched.TapBuffer { name = "coda_end", visit_id = 47 }
+    ]
+
+    mut sched.ExecutionSchedule s ← sched.ExecutionSchedule { layers = [], segments = [], steps = [], slots = [], residual = variant sched.ResidualKind.Standard, taps = [] }
+    do {
+        s ← sched.inkling_2_mini_schedule(taps)
+    }
+    catch err {
+        assert false
+    }
+
+    do {
+        mut res.TapStore<size 4> store ← res.tap_store_from_schedule<size 4>(s)
+        let bool c0 ← res.capture_if_tapped<size 4>(mut store, 0, vec4((9.0 ∷ f32), (0.0 ∷ f32), (0.0 ∷ f32), (0.0 ∷ f32)))
+        assert not c0
+
+        let bool c5 ← res.capture_if_tapped<size 4>(mut store, 5, vec4((1.0 ∷ f32), (2.0 ∷ f32), (3.0 ∷ f32), (4.0 ∷ f32)))
+        assert c5
+        let tensor<f32, [4]> t5 ← res.read_tap<size 4>(store, "prelude_end")
+        assert approx(t5[[2]], (3.0 ∷ f32), (1.0e-5 ∷ f32))
+
+        let bool c23 ← res.capture_if_tapped<size 4>(mut store, 23, vec4((5.0 ∷ f32), (6.0 ∷ f32), (7.0 ∷ f32), (8.0 ∷ f32)))
+        assert c23
+        let tensor<f32, [4]> t23 ← res.read_tap_at<size 4>(store, 23)
+        assert approx(t23[[0]], (5.0 ∷ f32), (1.0e-5 ∷ f32))
+    }
+    catch err {
+        assert false
+    }
+
+    do {
+        let res.TapStore<size 4> store2 ← res.tap_store_from_schedule<size 4>(s)
+        let tensor<f32, [4]> ? ← res.read_tap<size 4>(store2, "prelude_end")
+        assert false
+    }
+    catch err {
+        assert true
+    }
+
+    do {
+        let res.TapStore<size 4> store3 ← res.tap_store_from_schedule<size 4>(s)
+        let tensor<f32, [4]> ? ← res.read_tap<size 4>(store3, "nonexistent")
+        assert false
+    }
+    catch err {
+        assert true
+    }
+}
