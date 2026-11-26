@@ -9,6 +9,8 @@ locale = "en"
 
 import from "gradus:model/qwen35moe_state/schedule" let schedule
 import from "gradus:model/qwen35moe" let qwen35moe
+import from "gradus:cache/session" let sess_mod
+import from "gradus:cache/hybrid_arenas" let hybrid
 import from "gradus:tensor" let tensor
 import from "gradus:dtype" let dtype
 
@@ -106,16 +108,14 @@ fn kv_equal(KeyValueState a, KeyValueState b) → bool {
     return a.values ≡ b.values
 }
 
-# Whole-trunk hybrid session: one conv + recurrent pair per SSM layer, one
-# KV value per full-attention layer, the generation counter, and the
-# identity key. The schedule is carried so state slots map to block
-# indices; dtype is the reference row ("f32").
+# Whole-trunk hybrid session backed by typed device-ready arenas
+# (`SessionState`, `ConvStateArena`, `RecurrentStateArena`, and
+# `hybrid.HybridSession`) over `ExecutionSchedule` slots, plus the
+# generation counter and identity key.
 @ public
-class HybridSession {
+class HybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> {
     mut schedule.Qwen35moeSchedule schedule
-    mut list<ConvState> conv
-    mut list<RecurrentState> recurrent
-    mut list<KeyValueState> kv
+    mut hybrid.HybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> arenas
     mut int generation
     mut string model
     mut string model_version
@@ -158,47 +158,106 @@ fn schedule_wire(schedule.Qwen35moeSchedule s) → string {
     return out
 }
 
-@ public
-fn fresh_session(qwen35moe.Qwen35moeConfig c) → HybridSession ⇥ schedule.Qwen35moeStateError {
-    let schedule.Qwen35moeSchedule s ← schedule.schedule(c)
-    mut list<ConvState> convs ← empty
-    mut list<RecurrentState> recs ← empty
-    mut list<KeyValueState> kvs ← empty
-    for range 0‥s.linear_layers {
-        convs.append(fresh_conv_state(c))
-        recs.append(fresh_recurrent_state(c))
+fn tensor_2d_equal<size R, size C>(tensor<f32, [R, C]> a, tensor<f32, [R, C]> b) → bool {
+    for exclusive R let r {
+        for exclusive C let c {
+            if a[[r, c]] ≢ b[[r, c]] then return false
+        }
     }
-    for range 0‥s.full_layers {
-        kvs.append(fresh_kv_state(c, c.context_length))
-    }
-    return HybridSession {schedule = s, conv = convs, recurrent = recs, kv = kvs, generation = 0, model = c.architecture, model_version = "file-type-§"(c.file_type ↦ string), execution_config = execution_config(c), tokenizer = "§:pre=§:tokens=§"(c.tokenizer_model, c.tokenizer_pre, c.token_count ↦ string), state_types = "conv=§x§;recurrent=§x§x§;kv=§x§"(c.conv_kernel - 1 ↦ string, (c.inner_size + 2 * c.group_count * c.state_size) ↦ string, c.gradus_temporis ↦ string, c.state_size ↦ string, c.state_size ↦ string, c.head_count_kv ↦ string, c.key_length ↦ string), dtype = "f32"}
+    return true
 }
 
-# Reset: a fresh-session construction — empty conv state, zero recurrent
-# state, empty KV, generation counter restart — with the same identity.
 @ public
-fn reset_session(HybridSession s) → HybridSession {
-    return HybridSession {schedule = s.schedule, conv = s.conv, recurrent = s.recurrent, kv = s.kv, generation = 0, model = s.model, model_version = s.model_version, execution_config = s.execution_config, tokenizer = s.tokenizer, state_types = s.state_types, dtype = s.dtype}
+fn conv_arena_equal<size ConvRows, size ConvCh>(hybrid.ConvStateArena<size ConvRows, size ConvCh> a, hybrid.ConvStateArena<size ConvRows, size ConvCh> b) → bool {
+    if a.sites_per_slot ≢ b.sites_per_slot then return false
+    if a.history_len ≢ b.history_len then return false
+    if a.channels ≢ b.channels then return false
+    if a.slot_ids ≢ b.slot_ids then return false
+    if a.steps_written ≢ b.steps_written then return false
+    if a.buffers.length() ≢ b.buffers.length() then return false
+    for exclusive a.buffers.length() let i {
+        if not tensor_2d_equal<size ConvRows, size ConvCh>(a.buffers[i], b.buffers[i]) then return false
+    }
+    return true
+}
+
+@ public
+fn recurrent_arena_equal<size RecRows, size RecCols>(hybrid.RecurrentStateArena<size RecRows, size RecCols> a, hybrid.RecurrentStateArena<size RecRows, size RecCols> b) → bool {
+    if a.rows ≢ b.rows then return false
+    if a.cols ≢ b.cols then return false
+    if a.slot_ids ≢ b.slot_ids then return false
+    if a.steps_written ≢ b.steps_written then return false
+    if a.states.length() ≢ b.states.length() then return false
+    for exclusive a.states.length() let i {
+        if not tensor_2d_equal<size RecRows, size RecCols>(a.states[i], b.states[i]) then return false
+    }
+    return true
+}
+
+@ public
+fn session_kv_equal<size C, size W, size KVD>(sess_mod.SessionState<size C, size W, size KVD> a, sess_mod.SessionState<size C, size W, size KVD> b) → bool {
+    if a.txn_depth ≢ b.txn_depth then return false
+    if a.slot_arena_kind ≢ b.slot_arena_kind then return false
+    if a.slot_local_index ≢ b.slot_local_index then return false
+    if a.slot_window_sizes ≢ b.slot_window_sizes then return false
+    if a.slot_kv_quant.length() ≢ b.slot_kv_quant.length() then return false
+    for exclusive a.slot_kv_quant.length() let i {
+        let sess_mod.KvQuantConfig qa ← a.slot_kv_quant[i]
+        let sess_mod.KvQuantConfig qb ← b.slot_kv_quant[i]
+        if qa.key_bits ≢ qb.key_bits or qa.value_bits ≢ qb.value_bits or qa.group_size ≢ qb.group_size or qa.enabled ≢ qb.enabled then return false
+    }
+    if a.full_kv.capacity ≢ b.full_kv.capacity or a.full_kv.kv_dim ≢ b.full_kv.kv_dim then return false
+    if a.full_kv.slot_ids ≢ b.full_kv.slot_ids or a.full_kv.lengths ≢ b.full_kv.lengths then return false
+    if a.full_kv.keys.length() ≢ b.full_kv.keys.length() or a.full_kv.values.length() ≢ b.full_kv.values.length() then return false
+    for exclusive a.full_kv.keys.length() let i {
+        if not tensor_2d_equal<size C, size KVD>(a.full_kv.keys[i], b.full_kv.keys[i]) then return false
+        if not tensor_2d_equal<size C, size KVD>(a.full_kv.values[i], b.full_kv.values[i]) then return false
+    }
+    if a.ring_kv.max_window ≢ b.ring_kv.max_window or a.ring_kv.kv_dim ≢ b.ring_kv.kv_dim then return false
+    if a.ring_kv.slot_ids ≢ b.ring_kv.slot_ids or a.ring_kv.window_sizes ≢ b.ring_kv.window_sizes or a.ring_kv.total_written ≢ b.ring_kv.total_written then return false
+    if a.ring_kv.keys.length() ≢ b.ring_kv.keys.length() or a.ring_kv.values.length() ≢ b.ring_kv.values.length() then return false
+    for exclusive a.ring_kv.keys.length() let i {
+        if not tensor_2d_equal<size W, size KVD>(a.ring_kv.keys[i], b.ring_kv.keys[i]) then return false
+        if not tensor_2d_equal<size W, size KVD>(a.ring_kv.values[i], b.ring_kv.values[i]) then return false
+    }
+    return true
+}
+
+@ public
+fn fresh_session<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols>(qwen35moe.Qwen35moeConfig c) → HybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> ⇥ schedule.Qwen35moeStateError {
+    require c.conv_kernel ≥ 2 throw variant schedule.Qwen35moeStateError.BadConfig {message = "conv kernel must leave a state slice"}
+    let schedule.Qwen35moeSchedule s ← schedule.schedule(c)
+    let _ exec_sched ← schedule.to_execution_schedule(s, c.rope_sections)
+    do {
+        let hybrid.HybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> arenas ← hybrid.from_schedule<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols>(exec_sched, 1, c.conv_kernel - 1, false)
+        return HybridSession {schedule = s, arenas = arenas, generation = 0, model = c.architecture, model_version = "file-type-§"(c.file_type ↦ string), execution_config = execution_config(c), tokenizer = "§:pre=§:tokens=§"(c.tokenizer_model, c.tokenizer_pre, c.token_count ↦ string), state_types = "conv=§x§;recurrent=§x§x§;kv=§x§"(c.conv_kernel - 1 ↦ string, (c.inner_size + 2 * c.group_count * c.state_size) ↦ string, c.gradus_temporis ↦ string, c.state_size ↦ string, c.state_size ↦ string, c.head_count_kv ↦ string, c.key_length ↦ string), dtype = "f32"}
+    }
+    catch err {
+        throw variant schedule.Qwen35moeStateError.BadState {message = err.message}
+    }
+}
+
+# Reset: fresh-arena construction — zeroed conv state, zeroed recurrent
+# state, zeroed KV arenas, generation counter restart — with the same identity.
+@ public
+fn reset_session<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols>(HybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> s) → HybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> ⇥ schedule.Qwen35moeStateError {
+    do {
+        let hybrid.HybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> fresh_arenas ← hybrid.from_schedule<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols>(s.arenas.kv.sched, s.arenas.conv.sites_per_slot, s.arenas.conv.history_len, false)
+        return HybridSession {schedule = s.schedule, arenas = fresh_arenas, generation = 0, model = s.model, model_version = s.model_version, execution_config = s.execution_config, tokenizer = s.tokenizer, state_types = s.state_types, dtype = s.dtype}
+    }
+    catch err {
+        throw variant schedule.Qwen35moeStateError.BadState {message = err.message}
+    }
 }
 
 # State equality across the whole trunk (identity fields are equal by the
-# wire comparison; this compares the state families and generation).
+# wire comparison; this compares the typed arena state families and generation).
 @ public
-fn session_state_equal(HybridSession a, HybridSession b) → bool {
+fn session_state_equal<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols>(HybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> a, HybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> b) → bool {
     if a.generation ≢ b.generation then return false
-    if a.conv.length() ≢ b.conv.length() then return false
-    for range 0 ‥ a.conv.length() let i {
-        if not conv_equal(a.conv[i], b.conv[i]) then return false
-    }
-    if a.recurrent.length() ≢ b.recurrent.length() then return false
-    for range 0 ‥ a.recurrent.length() let i {
-        if not recurrent_equal(a.recurrent[i], b.recurrent[i]) then return false
-    }
-    if a.kv.length() ≢ b.kv.length() then return false
-    for range 0 ‥ a.kv.length() let i {
-        if not kv_equal(a.kv[i], b.kv[i]) then return false
-    }
-    return true
+    if not conv_arena_equal<size ConvRows, size ConvCh>(a.arenas.conv, b.arenas.conv) then return false
+    if not recurrent_arena_equal<size RecRows, size RecCols>(a.arenas.recurrent, b.arenas.recurrent) then return false
+    return session_kv_equal<size C, size W, size KVD>(a.arenas.kv, b.arenas.kv)
 }
 
 # The identity key wire: schema / model / version / execution config /
@@ -206,14 +265,14 @@ fn session_state_equal(HybridSession a, HybridSession b) → bool {
 # `gradus:cache` identity-key precedent so EXEC-03 can bind two prompts to
 # one resident session without reload.
 @ public
-fn session_identity_key(HybridSession s) → string {
+fn session_identity_key<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols>(HybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> s) → string {
     return "qwen35moe-state/identity/§/§/§/§/§/§/§/§/§"(IDENTITY_SCHEMA, s.model, s.model_version, s.execution_config, s.tokenizer, schedule_wire(s.schedule), s.state_types, s.dtype, s.generation ↦ string)
 }
 
-# Parse an identity wire back into a session-shaped record. Round-trips
-# through session_identity_key.
+# Parse an identity wire back into a session-shaped record with fresh
+# typed arenas. Round-trips through session_identity_key.
 @ public
-fn deserialize_session_identity(string wire) → HybridSession ⇥ schedule.Qwen35moeStateError {
+fn deserialize_session_identity<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols>(string wire) → HybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> ⇥ schedule.Qwen35moeStateError {
     let list<string> parts ← wire.split("/")
     require parts.length() ≡ 11 throw variant BadState {message = "malformed qwen35moe state identity wire"}
     require (parts.get(0) coalesce "") ≡ "qwen35moe-state" throw variant BadState {message = "unknown identity marker"}
@@ -244,7 +303,14 @@ fn deserialize_session_identity(string wire) → HybridSession ⇥ schedule.Qwen
         }
     }
     let schedule.Qwen35moeSchedule s ← schedule.Qwen35moeSchedule {trunk_layers = linear + full, linear_layers = linear, full_layers = full, nextn_layers = nextn, kinds = kinds}
-    return HybridSession {schedule = s, conv = empty, recurrent = empty, kv = empty, generation = generation, model = parts.get(3) coalesce "", model_version = parts.get(4) coalesce "", execution_config = parts.get(5) coalesce "", tokenizer = parts.get(6) coalesce "", state_types = parts.get(8) coalesce "", dtype = parts.get(9) coalesce ""}
+    let _ exec_sched ← schedule.to_execution_schedule(s, [11, 11, 10, 0])
+    do {
+        let hybrid.HybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> arenas ← hybrid.from_schedule<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols>(exec_sched, 1, 1, false)
+        return HybridSession {schedule = s, arenas = arenas, generation = generation, model = parts.get(3) coalesce "", model_version = parts.get(4) coalesce "", execution_config = parts.get(5) coalesce "", tokenizer = parts.get(6) coalesce "", state_types = parts.get(8) coalesce "", dtype = parts.get(9) coalesce ""}
+    }
+    catch err {
+        throw variant schedule.Qwen35moeStateError.BadState {message = err.message}
+    }
 }
 # -------------------------------------------------------------------------
 # Scalar primitives (self-hosted per the nn/moe precedent).
