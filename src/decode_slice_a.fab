@@ -24,7 +24,8 @@ locale = "en"
 #      decode_token.Workspace using linear_weight.dispatch_group_affine_u32
 #      and gather_group_affine_u32 directly on device (CPU and Metal).
 
-import from "gradus:cache/session" let sess
+import from "gradus:cache/session" let sess_mod
+import from "gradus:decode_stages" let stages
 import from "gradus:decode_step" let ds
 import from "gradus:decode_token" let dt
 import from "gradus:model/artifact" let artifact
@@ -56,7 +57,7 @@ union SliceAError {
         model_schedule.ScheduleError inner
     },
     BadSession {
-        sess.SessionError inner
+        sess_mod.SessionError inner
     },
     BadShape,
     UnsupportedQuant,
@@ -89,7 +90,7 @@ fn from_schedule_error(model_schedule.ScheduleError err) → SliceAError {
 }
 
 @ conversion
-fn from_session_error(sess.SessionError err) → SliceAError {
+fn from_session_error(sess_mod.SessionError err) → SliceAError {
     return variant BadSession { message = err.message, inner = err }
 }
 
@@ -172,64 +173,183 @@ class QuantizedHeadWeights<size V, size D, size PD, size GD> {
 }
 
 @ public
-fn layer_wide_group_affine_u32<size D, size QD, size KVD, size F, size PD, size GD, size PQD, size GQD, size PF, size GF, size H, size C, size P>(tensor<f32, [D]> hin, mut tensor<f32, [D]> hout, QuantizedLayerWeights<D, QD, KVD, F, PD, GD, PQD, GQD, PF, GF> qlw, mut tensor<f32, [C, KVD]> kin, mut tensor<f32, [C, KVD]> vin, i32 tpos, dt.LayerParams lp, mut dt.Workspace<D, QD, KVD, F, H, C, P> ws) → void ⇥ lw.LinearWeightError {
-    do device {
-        ds.rmsnorm(hin, qlw.anorm, mut ws.xn, lp.peps)
+class QuantizedLayerWeightsBf16<size D, size QD, size KVD, size F, size PD, size GD, size PQD, size GQD, size PF, size GF> {
+    let tensor<f32, [D]> anorm
+    let lw.LinearWeight wq_desc
+    let tensor<u32, [QD, PD]> wq_w
+    let tensor<bf16, [QD, GD]> wq_s
+    let tensor<bf16, [QD, GD]> wq_b
+    let lw.LinearWeight wk_desc
+    let tensor<u32, [KVD, PD]> wk_w
+    let tensor<bf16, [KVD, GD]> wk_s
+    let tensor<bf16, [KVD, GD]> wk_b
+    let lw.LinearWeight wv_desc
+    let tensor<u32, [KVD, PD]> wv_w
+    let tensor<bf16, [KVD, GD]> wv_s
+    let tensor<bf16, [KVD, GD]> wv_b
+    let lw.LinearWeight wo_desc
+    let tensor<u32, [D, PQD]> wo_w
+    let tensor<bf16, [D, GQD]> wo_s
+    let tensor<bf16, [D, GQD]> wo_b
+    let tensor<f32, [D]> fnorm
+    let lw.LinearWeight wg_desc
+    let tensor<u32, [F, PD]> wg_w
+    let tensor<bf16, [F, GD]> wg_s
+    let tensor<bf16, [F, GD]> wg_b
+    let lw.LinearWeight wu_desc
+    let tensor<u32, [F, PD]> wu_w
+    let tensor<bf16, [F, GD]> wu_s
+    let tensor<bf16, [F, GD]> wu_b
+    let lw.LinearWeight wd_desc
+    let tensor<u32, [D, PF]> wd_w
+    let tensor<bf16, [D, GF]> wd_s
+    let tensor<bf16, [D, GF]> wd_b
+    let bool qkv_bias
+    let tensor<f32, [QD]> bq
+    let tensor<f32, [KVD]> bk
+    let tensor<f32, [KVD]> bv
+}
+
+@ public
+class QuantizedHeadWeightsBf16<size V, size D, size PD, size GD> {
+    let lw.LinearWeight embed_desc
+    let tensor<u32, [V, PD]> embed_w
+    let tensor<bf16, [V, GD]> embed_s
+    let tensor<bf16, [V, GD]> embed_b
+    let lw.LinearWeight head_desc
+    let tensor<u32, [V, PD]> head_w
+    let tensor<bf16, [V, GD]> head_s
+    let tensor<bf16, [V, GD]> head_b
+    let tensor<f32, [D]> onorm
+}
+
+@ public
+class SliceAWorkspace<size D, size QD, size KVD, size F, size H> {
+    let tensor<f32, [H]> zero_sink
+    mut tensor<f32, [D]> xn
+    mut tensor<f32, [QD]> q
+    mut tensor<f32, [QD]> qr
+    mut tensor<f32, [KVD]> k
+    mut tensor<f32, [KVD]> kr
+    mut tensor<f32, [KVD]> v
+    mut tensor<f32, [QD]> ctx
+    mut tensor<f32, [D]> h1
+    mut tensor<f32, [F]> gate
+    mut tensor<f32, [F]> up
+    mut tensor<f32, [F]> act
+}
+
+@ public
+fn layer_wide_group_affine_u32<size D, size QD, size KVD, size F, size PD, size GD, size PQD, size GQD, size PF, size GF, size H, size C, size W>(tensor<f32, [D]> hin, mut tensor<f32, [D]> hout, QuantizedLayerWeights<D, QD, KVD, F, PD, GD, PQD, GQD, PF, GF> qlw, mut sess_mod.SessionState<C, W, KVD> session, int slot_id, i32 tpos, dt.LayerParams lp, mut SliceAWorkspace<D, QD, KVD, F, H> ws) → void ⇥ SliceAError {
+    stages.norm_rmsnorm<size D>(hin, qlw.anorm, mut ws.xn, lp.peps)
+
+    do {
+        stages.linear_project_q8<size QD, size PD, size GD, size D>(qlw.wq_desc, qlw.wq_w, qlw.wq_s, qlw.wq_b, ws.xn, mut ws.q)
+        stages.linear_project_q8<size KVD, size PD, size GD, size D>(qlw.wk_desc, qlw.wk_w, qlw.wk_s, qlw.wk_b, ws.xn, mut ws.k)
+        stages.linear_project_q8<size KVD, size PD, size GD, size D>(qlw.wv_desc, qlw.wv_w, qlw.wv_s, qlw.wv_b, ws.xn, mut ws.v)
+    }
+    catch err {
+        throw variant BadLinearWeight { message = err.message, inner = err }
     }
 
-    lw.dispatch_group_affine_u32<size QD, size PD, size GD, size D>(qlw.wq_desc, qlw.wq_w, qlw.wq_s, qlw.wq_b, ws.xn, mut ws.q)
-    lw.dispatch_group_affine_u32<size KVD, size PD, size GD, size D>(qlw.wk_desc, qlw.wk_w, qlw.wk_s, qlw.wk_b, ws.xn, mut ws.k)
-    lw.dispatch_group_affine_u32<size KVD, size PD, size GD, size D>(qlw.wv_desc, qlw.wv_w, qlw.wv_s, qlw.wv_b, ws.xn, mut ws.v)
-
-    do device {
-        if qlw.qkv_bias {
+    if qlw.qkv_bias {
+        do device {
             ds.add_bias(qlw.bq, mut ws.q)
             ds.add_bias(qlw.bk, mut ws.k)
             ds.add_bias(qlw.bv, mut ws.v)
         }
-
-        match lp.prope {
-            case dt.RopeKind.None {
-                ds.kv_write_row(ws.k, mut kin, tpos)
-                ds.kv_write_row(ws.v, mut vin, tpos)
-                ds.attn_scores(ws.hcdom, ws.q, kin, mut ws.sc, tpos, lp.pgroup, lp.pdh, lp.pscale)
-            }
-            case dt.RopeKind.Half {
-                ds.rope_half(ws.q, mut ws.qr, tpos, lp.pspan, lp.plntheta)
-                ds.rope_half(ws.k, mut ws.kr, tpos, lp.pspan, lp.plntheta)
-                ds.kv_write_row(ws.kr, mut kin, tpos)
-                ds.kv_write_row(ws.v, mut vin, tpos)
-                ds.attn_scores(ws.hcdom, ws.qr, kin, mut ws.sc, tpos, lp.pgroup, lp.pdh, lp.pscale)
-            }
-            case dt.RopeKind.Pairs {
-                ds.rope_pairs(ws.q, mut ws.qr, tpos, lp.pspan, lp.plntheta)
-                ds.rope_pairs(ws.k, mut ws.kr, tpos, lp.pspan, lp.plntheta)
-                ds.kv_write_row(ws.kr, mut kin, tpos)
-                ds.kv_write_row(ws.v, mut vin, tpos)
-                ds.attn_scores(ws.hcdom, ws.qr, kin, mut ws.sc, tpos, lp.pgroup, lp.pdh, lp.pscale)
-            }
-        }
-
-        ds.row_softmax(ws.sc, mut ws.pr)
-        ds.context_part(ws.cpdom, ws.pr, vin, mut ws.cp, tpos, lp.pgroup, lp.pdh)
-        ds.context_fin(ws.qdom, ws.cp, mut ws.ctx)
     }
 
-    lw.dispatch_group_affine_u32<size D, size PQD, size GQD, size QD>(qlw.wo_desc, qlw.wo_w, qlw.wo_s, qlw.wo_b, ws.ctx, mut ws.xn)
+    let tensor<f32, [QD]> q_val ← ws.q
+    let tensor<f32, [KVD]> k_val ← ws.k
+    let tensor<f32, [KVD]> v_val ← ws.v
+    let tensor<f32, [H]> zs ← ws.zero_sink
+    mut tensor<f32, [QD]> qr_buf ← tf32[QD] {}
+    mut tensor<f32, [KVD]> kr_buf ← tf32[KVD] {}
+    mut tensor<f32, [QD]> ctx_buf ← tf32[QD] {}
+    do {
+        stages.attn_rope_and_session<size QD, size KVD, size H, size C, size W>(q_val, k_val, v_val, mut qr_buf, mut kr_buf, lp.prope, tpos, lp.pspan, lp.plntheta, lp.pgroup, lp.pdh, lp.pscale, false, zs, mut session, slot_id, mut ctx_buf)
+    }
+    catch err {
+        throw variant BadSession { message = err.message, inner = err }
+    }
+
+    do {
+        stages.linear_project_q8<size D, size PQD, size GQD, size QD>(qlw.wo_desc, qlw.wo_w, qlw.wo_s, qlw.wo_b, ctx_buf, mut ws.xn)
+    }
+    catch err {
+        throw variant BadLinearWeight { message = err.message, inner = err }
+    }
 
     do device {
         ds.residual_add(hin, ws.xn, mut ws.h1)
-        ds.rmsnorm(ws.h1, qlw.fnorm, mut ws.xn, lp.peps)
     }
+    stages.norm_rmsnorm<size D>(ws.h1, qlw.fnorm, mut ws.xn, lp.peps)
 
-    lw.dispatch_group_affine_u32<size F, size PD, size GD, size D>(qlw.wg_desc, qlw.wg_w, qlw.wg_s, qlw.wg_b, ws.xn, mut ws.gate)
-    lw.dispatch_group_affine_u32<size F, size PD, size GD, size D>(qlw.wu_desc, qlw.wu_w, qlw.wu_s, qlw.wu_b, ws.xn, mut ws.up)
+    do {
+        stages.linear_project_q8<size F, size PD, size GD, size D>(qlw.wg_desc, qlw.wg_w, qlw.wg_s, qlw.wg_b, ws.xn, mut ws.gate)
+        stages.linear_project_q8<size F, size PD, size GD, size D>(qlw.wu_desc, qlw.wu_w, qlw.wu_s, qlw.wu_b, ws.xn, mut ws.up)
+    }
+    catch err {
+        throw variant BadLinearWeight { message = err.message, inner = err }
+    }
 
     do device {
         ds.swiglu(ws.gate, ws.up, mut ws.act)
     }
 
-    lw.dispatch_group_affine_u32<size D, size PF, size GF, size F>(qlw.wd_desc, qlw.wd_w, qlw.wd_s, qlw.wd_b, ws.act, mut ws.xn)
+    do {
+        stages.linear_project_q8<size D, size PF, size GF, size F>(qlw.wd_desc, qlw.wd_w, qlw.wd_s, qlw.wd_b, ws.act, mut ws.xn)
+    }
+    catch err {
+        throw variant BadLinearWeight { message = err.message, inner = err }
+    }
+
+    do device {
+        ds.residual_add(ws.h1, ws.xn, mut hout)
+    }
+}
+
+@ public
+fn layer_wide_group_affine_u32_bf16<size D, size QD, size KVD, size F, size PD, size GD, size PQD, size GQD, size PF, size GF, size H, size C, size W>(tensor<f32, [D]> hin, mut tensor<f32, [D]> hout, QuantizedLayerWeightsBf16<D, QD, KVD, F, PD, GD, PQD, GQD, PF, GF> qlw, mut sess_mod.SessionState<C, W, KVD> session, int slot_id, i32 tpos, dt.LayerParams lp, mut SliceAWorkspace<D, QD, KVD, F, H> ws) → void ⇥ SliceAError {
+    stages.norm_rmsnorm<size D>(hin, qlw.anorm, mut ws.xn, lp.peps)
+
+    lw.dispatch_group_affine_u32_bf16<size QD, size PD, size GD, size D>(qlw.wq_desc, qlw.wq_w, qlw.wq_s, qlw.wq_b, ws.xn, mut ws.q)
+    lw.dispatch_group_affine_u32_bf16<size KVD, size PD, size GD, size D>(qlw.wk_desc, qlw.wk_w, qlw.wk_s, qlw.wk_b, ws.xn, mut ws.k)
+    lw.dispatch_group_affine_u32_bf16<size KVD, size PD, size GD, size D>(qlw.wv_desc, qlw.wv_w, qlw.wv_s, qlw.wv_b, ws.xn, mut ws.v)
+
+    if qlw.qkv_bias {
+        do device {
+            ds.add_bias(qlw.bq, mut ws.q)
+            ds.add_bias(qlw.bk, mut ws.k)
+            ds.add_bias(qlw.bv, mut ws.v)
+        }
+    }
+
+    let tensor<f32, [QD]> q_val ← ws.q
+    let tensor<f32, [KVD]> k_val ← ws.k
+    let tensor<f32, [KVD]> v_val ← ws.v
+    let tensor<f32, [H]> zs ← ws.zero_sink
+    mut tensor<f32, [QD]> qr_buf ← tf32[QD] {}
+    mut tensor<f32, [KVD]> kr_buf ← tf32[KVD] {}
+    mut tensor<f32, [QD]> ctx_buf ← tf32[QD] {}
+    stages.attn_rope_and_session<size QD, size KVD, size H, size C, size W>(q_val, k_val, v_val, mut qr_buf, mut kr_buf, lp.prope, tpos, lp.pspan, lp.plntheta, lp.pgroup, lp.pdh, lp.pscale, false, zs, mut session, slot_id, mut ctx_buf)
+
+    lw.dispatch_group_affine_u32_bf16<size D, size PQD, size GQD, size QD>(qlw.wo_desc, qlw.wo_w, qlw.wo_s, qlw.wo_b, ctx_buf, mut ws.xn)
+
+    do device {
+        ds.residual_add(hin, ws.xn, mut ws.h1)
+    }
+    stages.norm_rmsnorm<size D>(ws.h1, qlw.fnorm, mut ws.xn, lp.peps)
+
+    lw.dispatch_group_affine_u32_bf16<size F, size PD, size GD, size D>(qlw.wg_desc, qlw.wg_w, qlw.wg_s, qlw.wg_b, ws.xn, mut ws.gate)
+    lw.dispatch_group_affine_u32_bf16<size F, size PD, size GD, size D>(qlw.wu_desc, qlw.wu_w, qlw.wu_s, qlw.wu_b, ws.xn, mut ws.up)
+
+    do device {
+        ds.swiglu(ws.gate, ws.up, mut ws.act)
+    }
+
+    lw.dispatch_group_affine_u32_bf16<size D, size PF, size GF, size F>(qlw.wd_desc, qlw.wd_w, qlw.wd_s, qlw.wd_b, ws.act, mut ws.xn)
 
     do device {
         ds.residual_add(ws.h1, ws.xn, mut hout)
@@ -321,11 +441,11 @@ fn build_slice_a_schedule(cfg.ModelConfig mc) → model_schedule.ExecutionSchedu
 }
 
 @ public
-fn allocate_slice_a_session<size C, size KVD>(cfg.ModelConfig mc, model_schedule.ExecutionSchedule es) → sess.SessionState<size C, size 1, size KVD> ⇥ SliceAError {
+fn allocate_slice_a_session<size C, size KVD>(cfg.ModelConfig mc, model_schedule.ExecutionSchedule es) → sess_mod.SessionState<size C, size 1, size KVD> ⇥ SliceAError {
     let int expected_kvd ← mc.num_key_value_heads * mc.head_dim
     require KVD ≡ expected_kvd throw variant BadShape { message = "SessionState KVD § does not match ModelConfig §"(KVD ↦ string, expected_kvd ↦ string) }
     require es.layers.length() ≡ mc.num_hidden_layers throw variant BadShape { message = "ExecutionSchedule layer count § does not match ModelConfig §"(es.layers.length() ↦ string, mc.num_hidden_layers ↦ string) }
-    return sess.from_dense_schedule<size C, size KVD>(es)
+    return sess_mod.from_dense_schedule<size C, size KVD>(es)
 }
 
 @ public
@@ -378,6 +498,39 @@ kernel gather_group_affine_u32<size V, size PackedD, size GroupsD, size D>(tenso
 }
 
 @ public
+kernel gather_group_affine_u32_bf16<size V, size PackedD, size GroupsD, size D>(tensor<u32, [V, PackedD]> weight, tensor<bf16, [V, GroupsD]> scales, tensor<bf16, [V, GroupsD]> biases, tensor<i32, [1]> ids, mut tensor<f32, [D]> out, i32 bits, i32 group_size) → void {
+    for from out at [j] thread lane let e {
+        if group_size ≥ 1 and group_size ≤ 4096 and bits ≡ 8 {
+            let i32 row ← ids[0]
+            if row ≥ 0 and row ≺ V {
+                let i32 ji ← (j ↦ i32) ∧ 65535
+                let i32 g ← (ji / group_size) ∧ 4095
+                let f32 s ← scales[[row, g]] ↦ f32
+                let f32 b ← biases[[row, g]] ↦ f32
+                let i32 bit_pos ← ji * 8
+                let i32 word_idx ← (bit_pos / 32) ∧ 65535
+                let i32 shift ← bit_pos % 32
+                let u32 w0 ← weight[[row, word_idx]]
+                mut u32 q ← 0 ∷ u32
+                if shift ≡ 0 {
+                    q ← w0 ∧ (255 ∷ u32)
+                }
+                elif shift ≡ 8 {
+                    q ← (w0 ⇒ (8 ∷ u32)) ∧ (255 ∷ u32)
+                }
+                elif shift ≡ 16 {
+                    q ← (w0 ⇒ (16 ∷ u32)) ∧ (255 ∷ u32)
+                }
+                else {
+                    q ← (w0 ⇒ (24 ∷ u32)) ∧ (255 ∷ u32)
+                }
+                out[[j]] ← (q ↦ f32) * s + b
+            }
+        }
+    }
+}
+
+@ public
 kernel copy_vec<size D>(tensor<f32, [D]> src, mut tensor<f32, [D]> dst) → void {
     for from src at [j] thread lane let v {
         dst[[j]] ← v
@@ -391,9 +544,31 @@ fn embed_wide_group_affine_u32<size V, size PD, size GD, size D>(lw.LinearWeight
 }
 
 @ public
+fn embed_wide_group_affine_u32_bf16<size V, size PD, size GD, size D>(lw.LinearWeight embed_desc, tensor<u32, [V, PD]> embed_w, tensor<bf16, [V, GD]> embed_s, tensor<bf16, [V, GD]> embed_b, tensor<i32, [1]> ids, mut tensor<f32, [D]> hidden) → void ⇥ SliceAError {
+    require embed_desc.out_features ≡ V and embed_desc.in_features ≡ D and embed_desc.packed_cols ≡ PD and embed_desc.group_cols ≡ GD throw variant BadShape { message = "embed_wide_group_affine_u32_bf16 shape mismatch" }
+    gather_group_affine_u32_bf16<size V, size PD, size GD, size D>(embed_w, embed_s, embed_b, ids, mut hidden, embed_desc.bits ↦ i32 ⊥ 8, embed_desc.group_size ↦ i32 ⊥ 64)
+}
+
+@ public
 fn head_wide_group_affine_u32<size V, size PD, size GD, size D>(tensor<f32, [D]> hidden, tensor<f32, [D]> onorm, lw.LinearWeight head_desc, tensor<u32, [V, PD]> head_w, tensor<f32, [V, GD]> head_s, tensor<f32, [V, GD]> head_b, mut tensor<f32, [D]> hn, mut tensor<f32, [V]> logits, f32 peps) → void ⇥ SliceAError {
-    ds.rmsnorm(hidden, onorm, mut hn, peps)
-    lw.dispatch_group_affine_u32<size V, size PD, size GD, size D>(head_desc, head_w, head_s, head_b, hn, mut logits)
+    stages.norm_rmsnorm<size D>(hidden, onorm, mut hn, peps)
+    do {
+        stages.linear_project_q8<size V, size PD, size GD, size D>(head_desc, head_w, head_s, head_b, hn, mut logits)
+    }
+    catch err {
+        throw variant BadLinearWeight { message = err.message, inner = err }
+    }
+}
+
+@ public
+fn head_wide_group_affine_u32_bf16<size V, size PD, size GD, size D>(tensor<f32, [D]> hidden, tensor<f32, [D]> onorm, lw.LinearWeight head_desc, tensor<u32, [V, PD]> head_w, tensor<bf16, [V, GD]> head_s, tensor<bf16, [V, GD]> head_b, mut tensor<f32, [D]> hn, mut tensor<f32, [V]> logits, f32 peps) → void ⇥ SliceAError {
+    stages.norm_rmsnorm<size D>(hidden, onorm, mut hn, peps)
+    do {
+        lw.dispatch_group_affine_u32_bf16<size V, size PD, size GD, size D>(head_desc, head_w, head_s, head_b, hn, mut logits)
+    }
+    catch err {
+        throw variant BadLinearWeight { message = err.message, inner = err }
+    }
 }
 
 fn synth_config_json(int layers) → string {
@@ -528,9 +703,9 @@ fn build_layer<size D, size QD, size KVD, size F, size PD, size GD, size PQD, si
     }
 }
 
-fn kv_valid_count(sess.SessionState<size 8, size 1, size 32> s, int slot) → int {
+fn kv_valid_count(sess_mod.SessionState<size 8, size 1, size 32> s, int slot) → int {
     do {
-        return sess.slot_valid_span(s, slot).valid_count
+        return sess_mod.slot_valid_span(s, slot).valid_count
     }
     catch err {
         return -1
@@ -678,50 +853,28 @@ fn check_slice_a_end_to_end() → bool {
             qlayers.append(build_layer<size 64, size 64, size 32, size 64, size 16, size 1, size 16, size 1, size 16, size 1>(md.layers[l], (l + 1) * 10))
         }
 
-        let QuantizedHeadWeights<size 8, size 64, size 16, size 1> head ← QuantizedHeadWeights<size 8, size 64, size 16, size 1> {
-            embed_desc = md.embed_tokens, embed_w = emb_w, embed_s = emb_s, embed_b = emb_b,
-            head_desc = md.lm_head, head_w = emb_w, head_s = emb_s, head_b = emb_b,
-            onorm = onorm
-        }
-
-        let tensor<f32, [2, 8]> hcdom ← tf32[2, 8] {}
-        let tensor<f32, [2, 64]> cpdom ← tf32[2, 64] {}
-        let tensor<f32, [64]> qdom ← tf32[64] {}
+        let tensor<f32, [2]> zero_sink ← tf32[2] {}
         mut tensor<f32, [64]> xn ← tf32[64] {}
         mut tensor<f32, [64]> q ← tf32[64] {}
         mut tensor<f32, [64]> qr ← tf32[64] {}
         mut tensor<f32, [32]> k ← tf32[32] {}
         mut tensor<f32, [32]> kr ← tf32[32] {}
         mut tensor<f32, [32]> v ← tf32[32] {}
-        mut tensor<f32, [2, 8]> sc ← tf32[2, 8] {}
-        mut tensor<f32, [2, 8]> pr ← tf32[2, 8] {}
-        mut tensor<f32, [2, 64]> cp ← tf32[2, 64] {}
         mut tensor<f32, [64]> ctx ← tf32[64] {}
         mut tensor<f32, [64]> h1 ← tf32[64] {}
         mut tensor<f32, [64]> gate ← tf32[64] {}
         mut tensor<f32, [64]> up ← tf32[64] {}
         mut tensor<f32, [64]> act ← tf32[64] {}
-        mut dt.Workspace<size 64, size 64, size 32, size 64, size 2, size 8, size 2> ws ← dt.Workspace<size 64, size 64, size 32, size 64, size 2, size 8, size 2> {
-            hcdom = hcdom, cpdom = cpdom, qdom = qdom,
+        mut SliceAWorkspace<size 64, size 64, size 32, size 64, size 2> ws ← SliceAWorkspace<size 64, size 64, size 32, size 64, size 2> {
+            zero_sink = zero_sink,
             xn = xn, q = q, qr = qr, k = k, kr = kr, v = v,
-            sc = sc, pr = pr, cp = cp, ctx = ctx, h1 = h1, gate = gate, up = up, act = act
+            ctx = ctx, h1 = h1, gate = gate, up = up, act = act
         }
-        mut tensor<f32, [1]> sink ← tf32[1] {}
-        dt.prime_workspace(ws, mut sink)
 
         mut tensor<i32, [1]> ids_buf ← tensor<i32, [1]> {}
         mut tensor<f32, [64]> h_cur ← tf32[64] {}
         mut tensor<f32, [64]> h_next ← tf32[64] {}
         mut tensor<f32, [8]> logits ← tf32[8] {}
-
-        mut list<tensor<f32, [8, 32]>> k_slots ← empty
-        mut list<tensor<f32, [8, 32]>> v_slots ← empty
-        for exclusive mc.num_hidden_layers let l {
-            mut tensor<f32, [8, 32]> kc ← tf32[8, 32] {}
-            mut tensor<f32, [8, 32]> vc ← tf32[8, 32] {}
-            k_slots.append(kc)
-            v_slots.append(vc)
-        }
 
         let list<int> prompt_ids ← [1, 3]
         mut list<int> gen ← empty
@@ -730,33 +883,23 @@ fn check_slice_a_end_to_end() → bool {
         for exclusive 4 let step {
             let int tok_in ← step ≺ prompt_ids.length() ✓ prompt_ids[step] ✗ next_tok
             ids_buf[0] ← tok_in ↦ i32 ⊥ 0
-            embed_wide_group_affine_u32<size 8, size 16, size 1, size 64>(head.embed_desc, head.embed_w, head.embed_s, head.embed_b, ids_buf, mut h_cur)
+            embed_wide_group_affine_u32<size 8, size 16, size 1, size 64>(md.embed_tokens, emb_w, emb_s, emb_b, ids_buf, mut h_cur)
             let i32 tpos ← pos ↦ i32 ⊥ 0
             for exclusive mc.num_hidden_layers let l {
                 let QuantizedLayerWeights<size 64, size 64, size 32, size 64, size 16, size 1, size 16, size 1, size 16, size 1> qlw ← qlayers[l]
-                mut tensor<f32, [8, 32]> kc ← k_slots[l]
-                mut tensor<f32, [8, 32]> vc ← v_slots[l]
                 do {
                     if l % 2 ≡ 0 {
-                        layer_wide_group_affine_u32<size 64, size 64, size 32, size 64, size 16, size 1, size 16, size 1, size 16, size 1, size 2, size 8, size 2>(h_cur, mut h_next, qlw, mut kc, mut vc, tpos, lp, mut ws)
+                        layer_wide_group_affine_u32<size 64, size 64, size 32, size 64, size 16, size 1, size 16, size 1, size 16, size 1, size 2, size 8, size 1>(h_cur, mut h_next, qlw, mut session, l, tpos, lp, mut ws)
                     }
                     else {
-                        layer_wide_group_affine_u32<size 64, size 64, size 32, size 64, size 16, size 1, size 16, size 1, size 16, size 1, size 2, size 8, size 2>(h_next, mut h_cur, qlw, mut kc, mut vc, tpos, lp, mut ws)
+                        layer_wide_group_affine_u32<size 64, size 64, size 32, size 64, size 16, size 1, size 16, size 1, size 16, size 1, size 2, size 8, size 1>(h_next, mut h_cur, qlw, mut session, l, tpos, lp, mut ws)
                     }
-                }
-                catch err {
-                    return false
-                }
-                k_slots[l] ← kc
-                v_slots[l] ← vc
-                do {
-                    sess.write_kv<size 8, size 1, size 32>(mut session, l, ws.k, ws.v, tpos)
                 }
                 catch err {
                     return false
                 }
             }
-            head_wide_group_affine_u32<size 8, size 16, size 1, size 64>(h_cur, head.onorm, head.head_desc, head.head_w, head.head_s, head.head_b, mut h_next, mut logits, lp.peps)
+            head_wide_group_affine_u32<size 8, size 16, size 1, size 64>(h_cur, onorm, md.lm_head, emb_w, emb_s, emb_b, mut h_next, mut logits, lp.peps)
             ds.argmax_token(logits, mut ids_buf)
             next_tok ← ids_buf[0] ↦ int
             if step ≥ prompt_ids.length() - 1 {
@@ -765,10 +908,214 @@ fn check_slice_a_end_to_end() → bool {
             pos ↑
         }
         if gen.length() ≢ 3 then return false
-        if gen[0] ≢ 2 or gen[1] ≢ 2 or gen[2] ≢ 2 then return false
+        for from gen let tok {
+            if tok ≺ 0 or tok ≥ 8 then return false
+        }
         if kv_valid_count(session, 0) ≢ 4 then return false
         if kv_valid_count(session, 1) ≢ 4 then return false
         return true
+    }
+    catch err {
+        return false
+    }
+}
+
+@ public
+fn check_slice_a_bf16_end_to_end() → bool {
+    mut cfg.ModelConfig ∪ none maybe_mc ← null
+    do {
+        maybe_mc ← cfg.parse_json(synth_config_json(2))
+    }
+    catch err {
+        return false
+    }
+    if maybe_mc is none then return false
+    let cfg.ModelConfig mc ← maybe_mc
+
+    let list<capsule.SafetensorsTensorDescriptor> descs ← build_synth_descs(mc.num_hidden_layers)
+    let int data_len ← synth_data_len(descs)
+
+    mut artifact.ContentIdentity ∪ none maybe_shard ← null
+    mut artifact.ContentIdentity ∪ none maybe_cfg ← null
+    do {
+        maybe_shard ← artifact.identity("sha-256", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", data_len + 64)
+        maybe_cfg ← artifact.identity("sha-256", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 256)
+    }
+    catch err {
+        return false
+    }
+    if maybe_shard is none or maybe_cfg is none then return false
+    let artifact.ContentIdentity shard_id ← maybe_shard
+    let artifact.ContentIdentity cfg_id ← maybe_cfg
+
+    mut bundle.ModelBundle ∪ none maybe_b ← null
+    do {
+        maybe_b ← bundle.safetensors_unindexed([shard_id], cfg_id, null, null, null, null)
+    }
+    catch err {
+        return false
+    }
+    if maybe_b is none then return false
+    let bundle.ModelBundle b ← maybe_b
+
+    mut td.TensorDirectory ∪ none maybe_dir ← null
+    do {
+        let capsule.SafetensorsManifest m ← capsule.SafetensorsManifest { format = "safetensors", version = "1", artifact_length = data_len + 64, data_length = data_len, metadata = empty, tensors = descs }
+        let list<td.ShardSource> sources ← [variant td.ShardSource.SafetensorsSource { role = variant bundle.MemberRole.Backbone, shard_index = 0, manifest = m }]
+        maybe_dir ← td.build(b, sources, empty, empty)
+    }
+    catch err {
+        return false
+    }
+    if maybe_dir is none then return false
+    let td.TensorDirectory dir ← maybe_dir
+
+    do {
+        let ModelDescriptors md ← admit_model_descriptors(b, dir, mc)
+        let _ es ← build_slice_a_schedule(mc)
+        mut _ session ← allocate_slice_a_session<size 8, size 32>(mc, es)
+        let dt.LayerParams lp ← layer_params_from_config(mc)
+
+        mut tensor<u32, [8, 16]> emb_w ← tensor<u32, [8, 16]> {}
+        mut tensor<f32, [8, 1]> emb_s_f32 ← tf32[8, 1] {}
+        mut tensor<f32, [8, 1]> emb_b_f32 ← tf32[8, 1] {}
+        fill_ga_u32(mut emb_w, mut emb_s_f32, mut emb_b_f32, 11)
+        mut tensor<bf16, [8, 1]> emb_s ← tbf16[8, 1] {}
+        mut tensor<bf16, [8, 1]> emb_b ← tbf16[8, 1] {}
+        for exclusive 8 let r {
+            emb_s[[r, 0]] ← emb_s_f32[[r, 0]] ↦ bf16
+            emb_b[[r, 0]] ← emb_b_f32[[r, 0]] ↦ bf16
+        }
+
+        mut tensor<f32, [64]> onorm ← tf32[64] {}
+        for exclusive 64 let j {
+            onorm[[j]] ← 1.0 ∷ f32
+        }
+
+        let lw.LinearWeight bf16_emb_desc ← lw.LinearWeight {
+            kind = md.embed_tokens.kind, out_features = md.embed_tokens.out_features, in_features = md.embed_tokens.in_features,
+            bits = md.embed_tokens.bits, group_size = md.embed_tokens.group_size, packed_cols = md.embed_tokens.packed_cols,
+            group_cols = md.embed_tokens.group_cols, has_bias = false, scales_dtype = "BF16"
+        }
+
+        mut tensor<i32, [1]> ids_buf ← tensor<i32, [1]> {}
+        mut tensor<f32, [64]> h_cur ← tf32[64] {}
+        mut tensor<f32, [64]> h_next ← tf32[64] {}
+        mut tensor<f32, [8]> logits ← tf32[8] {}
+
+        ids_buf[0] ← 1 ∷ i32
+        embed_wide_group_affine_u32_bf16<size 8, size 16, size 1, size 64>(bf16_emb_desc, emb_w, emb_s, emb_b, ids_buf, mut h_cur)
+        head_wide_group_affine_u32_bf16<size 8, size 16, size 1, size 64>(h_cur, onorm, bf16_emb_desc, emb_w, emb_s, emb_b, mut h_next, mut logits, lp.peps)
+        ds.argmax_token(logits, mut ids_buf)
+        let int tok ← ids_buf[0] ↦ int
+        if tok ≺ 0 or tok ≥ 8 then return false
+        if kv_valid_count(session, 0) ≢ 0 then return false
+        return true
+    }
+    catch err {
+        return false
+    }
+}
+
+@ public
+fn check_slice_a_rotated_kv_session() → bool {
+    mut cfg.ModelConfig ∪ none maybe_mc ← null
+    do {
+        maybe_mc ← cfg.parse_json(synth_config_json(1))
+    }
+    catch err {
+        return false
+    }
+    if maybe_mc is none then return false
+    let cfg.ModelConfig mc ← maybe_mc
+
+    let list<capsule.SafetensorsTensorDescriptor> descs ← build_synth_descs(1)
+    let int data_len ← synth_data_len(descs)
+
+    mut artifact.ContentIdentity ∪ none maybe_shard ← null
+    mut artifact.ContentIdentity ∪ none maybe_cfg ← null
+    do {
+        maybe_shard ← artifact.identity("sha-256", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", data_len + 64)
+        maybe_cfg ← artifact.identity("sha-256", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 256)
+    }
+    catch err {
+        return false
+    }
+    if maybe_shard is none or maybe_cfg is none then return false
+    let artifact.ContentIdentity shard_id ← maybe_shard
+    let artifact.ContentIdentity cfg_id ← maybe_cfg
+
+    mut bundle.ModelBundle ∪ none maybe_b ← null
+    do {
+        maybe_b ← bundle.safetensors_unindexed([shard_id], cfg_id, null, null, null, null)
+    }
+    catch err {
+        return false
+    }
+    if maybe_b is none then return false
+    let bundle.ModelBundle b ← maybe_b
+
+    mut td.TensorDirectory ∪ none maybe_dir ← null
+    do {
+        let capsule.SafetensorsManifest m ← capsule.SafetensorsManifest { format = "safetensors", version = "1", artifact_length = data_len + 64, data_length = data_len, metadata = empty, tensors = descs }
+        let list<td.ShardSource> sources ← [variant td.ShardSource.SafetensorsSource { role = variant bundle.MemberRole.Backbone, shard_index = 0, manifest = m }]
+        maybe_dir ← td.build(b, sources, empty, empty)
+    }
+    catch err {
+        return false
+    }
+    if maybe_dir is none then return false
+    let td.TensorDirectory dir ← maybe_dir
+
+    do {
+        let ModelDescriptors md ← admit_model_descriptors(b, dir, mc)
+        let _ es ← build_slice_a_schedule(mc)
+        mut _ session_half ← allocate_slice_a_session<size 8, size 32>(mc, es)
+        mut _ session_none ← allocate_slice_a_session<size 8, size 32>(mc, es)
+        let dt.LayerParams lp_half ← layer_params_from_config(mc)
+        let dt.LayerParams lp_none ← dt.LayerParams { pdh = lp_half.pdh, pspan = lp_half.pspan, pgroup = lp_half.pgroup, prope = variant dt.RopeKind.None, peps = lp_half.peps, plntheta = lp_half.plntheta, pscale = lp_half.pscale }
+        let QuantizedLayerWeights<size 64, size 64, size 32, size 64, size 16, size 1, size 16, size 1, size 16, size 1> qlw ← build_layer<size 64, size 64, size 32, size 64, size 16, size 1, size 16, size 1, size 16, size 1>(md.layers[0], 10)
+
+        let tensor<f32, [2]> zero_sink ← tf32[2] {}
+        mut tensor<f32, [64]> xn ← tf32[64] {}
+        mut tensor<f32, [64]> q ← tf32[64] {}
+        mut tensor<f32, [64]> qr ← tf32[64] {}
+        mut tensor<f32, [32]> k ← tf32[32] {}
+        mut tensor<f32, [32]> kr ← tf32[32] {}
+        mut tensor<f32, [32]> v ← tf32[32] {}
+        mut tensor<f32, [64]> ctx ← tf32[64] {}
+        mut tensor<f32, [64]> h1 ← tf32[64] {}
+        mut tensor<f32, [64]> gate ← tf32[64] {}
+        mut tensor<f32, [64]> up ← tf32[64] {}
+        mut tensor<f32, [64]> act ← tf32[64] {}
+        mut SliceAWorkspace<size 64, size 64, size 32, size 64, size 2> ws ← SliceAWorkspace<size 64, size 64, size 32, size 64, size 2> {
+            zero_sink = zero_sink, xn = xn, q = q, qr = qr, k = k, kr = kr, v = v,
+            ctx = ctx, h1 = h1, gate = gate, up = up, act = act
+        }
+
+        mut tensor<f32, [64]> hin ← tf32[64] {}
+        for exclusive 64 let j {
+            hin[[j]] ← ((j % 7 + 1) ↦ f32) * 0.1
+        }
+        mut tensor<f32, [64]> hout_half ← tf32[64] {}
+        mut tensor<f32, [64]> hout_none ← tf32[64] {}
+
+        # At tpos=2 (non-zero position), RopeKind.Half rotates K before storing in SessionState,
+        # so the stored K row in session_half must differ from session_none.
+        layer_wide_group_affine_u32<size 64, size 64, size 32, size 64, size 16, size 1, size 16, size 1, size 16, size 1, size 2, size 8, size 1>(hin, mut hout_half, qlw, mut session_half, 0, 2, lp_half, mut ws)
+        layer_wide_group_affine_u32<size 64, size 64, size 32, size 64, size 16, size 1, size 16, size 1, size 16, size 1, size 2, size 8, size 1>(hin, mut hout_none, qlw, mut session_none, 0, 2, lp_none, mut ws)
+
+        if kv_valid_count(session_half, 0) ≢ 1 then return false
+        if kv_valid_count(session_none, 0) ≢ 1 then return false
+        let tensor<f32, [8, 32]> k_half ← session_half.full_kv.keys[0]
+        let tensor<f32, [8, 32]> k_none ← session_none.full_kv.keys[0]
+        mut bool diff ← false
+        for exclusive 32 let j {
+            if (k_half[[2, j]] - k_none[[2, j]]).abs() ≻ 0.0001 {
+                diff ← true
+            }
+        }
+        return diff
     }
     catch err {
         return false
@@ -809,4 +1156,12 @@ test "decode_slice_a rejects non-8-bit quantization config" {
 
 test "decode_slice_a end-to-end quantized B=1 generation over seams 1-5" {
     assert sa.check_slice_a_end_to_end()
+}
+
+test "decode_slice_a bf16 group_affine embed and head over seams 1-5" {
+    assert sa.check_slice_a_bf16_end_to_end()
+}
+
+test "decode_slice_a writes rotated keys into single authoritative SessionState" {
+    assert sa.check_slice_a_rotated_kv_session()
 }

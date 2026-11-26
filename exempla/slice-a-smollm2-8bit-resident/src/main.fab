@@ -2,14 +2,17 @@
 locale = "en"
 
 +++ faber
-# Resident SmolLM2-135M-Instruct-8bit admission CLI (issue #52).
+# Resident SmolLM2-135M-Instruct-8bit B=1 decode runner (issue #52).
 #
 # Admits a resident safetensors 8-bit directory
-# (default: ~/ai/models/SmolLM2-135M-Instruct-8bit) over ModelBundle,
-# TensorDirectory, ModelConfig, GroupAffine LinearWeight, and
-# ExecutionSchedule.
+# (default: /Users/ianzepp/ai/models/SmolLM2-135M-Instruct-8bit) over
+# ModelBundle, TensorDirectory, ModelConfig, GroupAffine LinearWeight,
+# ExecutionSchedule, SessionState, BPE Tokenizer, and Seam-5 decode stages.
 
+import from "gradus:cache/session" let sess_mod
 import from "gradus:decode_slice_a" let sa
+import from "gradus:decode_step" let ds
+import from "gradus:decode_token" let dt
 import from "gradus:model/artifact" let artifact
 import from "gradus:model/bundle" let bundle
 import from "gradus:model/capsule" let capsule
@@ -17,27 +20,228 @@ import from "gradus:model/config" let cfg
 import from "gradus:model/safetensors" let st
 import from "gradus:model/schedule" let model_schedule
 import from "gradus:model/tensor_directory" let td
+import from "gradus:tokenizer/bpe" let bpe
 import from "norma:fs" let fs
+import from "norma:json" let json
 import from "norma:process" let process
+import from "norma:time" let time
 
-fn admit_resident(string model_dir) → void ⇥ string {
+const size SMOL_C = 128
+const size SMOL_D = 576
+const size SMOL_QD = 576
+const size SMOL_KVD = 192
+const size SMOL_F = 1536
+const size SMOL_H = 9
+const size SMOL_V = 49152
+const size SMOL_PD = 144
+const size SMOL_GD = 9
+const size SMOL_PQD = 144
+const size SMOL_GQD = 9
+const size SMOL_PF = 384
+const size SMOL_GF = 24
+
+fn le_u16(list<b8> raw, int off) → int {
+    let int b0 ← (raw[off] ↦ u8) ↦ int
+    let int b1 ← (raw[off + 1] ↦ u8) ↦ int
+    return b0 + (b1 ⇐ 8)
+}
+
+fn le_u32(list<b8> raw, int off) → u32 {
+    let u32 b0 ← (raw[off] ↦ u8) ↦ u32 ⊥ (0 ∷ u32)
+    let u32 b1 ← (raw[off + 1] ↦ u8) ↦ u32 ⊥ (0 ∷ u32)
+    let u32 b2 ← (raw[off + 2] ↦ u8) ↦ u32 ⊥ (0 ∷ u32)
+    let u32 b3 ← (raw[off + 3] ↦ u8) ↦ u32 ⊥ (0 ∷ u32)
+    return b0 ∨ (b1 ⇐ (8 ∷ u32)) ∨ (b2 ⇐ (16 ∷ u32)) ∨ (b3 ⇐ (24 ∷ u32))
+}
+
+fn f16_bits_to_f32(int bits) → f32 {
+    let int sign ← (bits ⇒ 15) ∧ 1
+    let int expon ← (bits ⇒ 10) ∧ 31
+    let int frac ← bits ∧ 1023
+    let f32 sgn ← sign ≡ 1 ✓ (-1.0 ∷ f32) ✗ (1.0 ∷ f32)
+    if expon ≡ 0 {
+        if frac ≡ 0 then return 0.0 ∷ f32
+        return sgn * (frac ↦ f32) * (0.000000059604645 ∷ f32)
+    }
+    if expon ≡ 31 then return 0.0 ∷ f32
+    let f32 mant ← (1.0 ∷ f32) + ((frac ↦ f32) / (1024.0 ∷ f32))
+    mut f32 pow2 ← 1.0 ∷ f32
+    let int e ← expon - 15
+    if e ≻ 0 {
+        for exclusive e let ? {
+            pow2 ← pow2 * (2.0 ∷ f32)
+        }
+    }
+    elif e ≺ 0 {
+        for exclusive -e let ? {
+            pow2 ← pow2 * (0.5 ∷ f32)
+        }
+    }
+    return sgn * mant * pow2
+}
+
+fn read_entry_bytes(string st_path, int data_start, td.TensorDirectory dir, string name) → list<b8> ⇥ string {
+    mut td.DirectoryEntry ∪ none maybe_e ← null
+    do {
+        maybe_e ← td.lookup_backbone(dir, name)
+    }
+    catch err {
+        throw "slice_a_resident: failed looking up tensor §"(name)
+    }
+    if maybe_e is none then throw "slice_a_resident: missing tensor §"(name)
+    let td.DirectoryEntry e ← maybe_e
+    do {
+        return fs.read_range(st_path, data_start + e.byte_offset, e.byte_length)
+    }
+    catch err {
+        throw "slice_a_resident: failed reading tensor §"(name)
+    }
+}
+
+fn load_u32_2d<size R, size C>(string st_path, int data_start, td.TensorDirectory dir, string name) → tensor<u32, [R, C]> ⇥ string {
+    let list<b8> raw ← read_entry_bytes(st_path, data_start, dir, name)
+    mut tensor<u32, [R, C]> out ← tensor<u32, [R, C]> {}
+    for exclusive R let r {
+        for exclusive C let c {
+            let int off ← (r * C + c) * 4
+            out[[r, c]] ← le_u32(raw, off)
+        }
+    }
+    return out
+}
+
+fn load_f16_as_f32_1d<size N>(string st_path, int data_start, td.TensorDirectory dir, string name) → tensor<f32, [N]> ⇥ string {
+    let list<b8> raw ← read_entry_bytes(st_path, data_start, dir, name)
+    mut tensor<f32, [N]> out ← tf32[N] {}
+    for exclusive N let i {
+        out[[i]] ← f16_bits_to_f32(le_u16(raw, i * 2))
+    }
+    return out
+}
+
+fn load_f16_as_f32_2d<size R, size C>(string st_path, int data_start, td.TensorDirectory dir, string name) → tensor<f32, [R, C]> ⇥ string {
+    let list<b8> raw ← read_entry_bytes(st_path, data_start, dir, name)
+    mut tensor<f32, [R, C]> out ← tf32[R, C] {}
+    for exclusive R let r {
+        for exclusive C let c {
+            let int off ← (r * C + c) * 2
+            out[[r, c]] ← f16_bits_to_f32(le_u16(raw, off))
+        }
+    }
+    return out
+}
+
+fn load_bpe_tokenizer(string model_dir) → bpe.Tokenizer ⇥ string {
+    let string vocab_path ← "§/vocab.json"(model_dir)
+    let string merges_path ← "§/merges.txt"(model_dir)
+
+    mut string vocab_text ← ""
+    mut list<string> lines ← empty
+    do {
+        vocab_text ← fs.read_file<string>(vocab_path)
+        lines ← fs.read_lines(merges_path)
+    }
+    catch err {
+        throw "slice_a_resident: cannot read tokenizer files in §"(model_dir)
+    }
+
+    mut map<string, int> vocab_map ← empty
+    do {
+        let json doc ← json.parse(vocab_text)
+        vocab_map ← doc ↦ map<string, int>
+    }
+    catch err {
+        throw "slice_a_resident: failed parsing vocab.json"
+    }
+
+    mut list<int> ids ← empty
+    mut list<string> tokens ← empty
+    for from vocab_map at [tok] let id {
+        tokens.append(tok)
+        ids.append(id)
+    }
+
+    mut list<string> merges ← empty
+    for from lines let line {
+        let string trimmed ← line.trim()
+        if trimmed.length() ≻ 0 and not trimmed.starts_with("#") {
+            merges.append(trimmed)
+        }
+    }
+
+    let list<int> special_ids ← [0, 1, 2]
+
+    do {
+        return bpe.build_tables(ids, tokens, merges, special_ids)
+    }
+    catch err {
+        throw "slice_a_resident: tokenizer build failed"
+    }
+}
+
+fn load_layer_weights(string st_path, int data_start, td.TensorDirectory dir, sa.LayerDescriptors ld) → sa.QuantizedLayerWeights<size SMOL_D, size SMOL_QD, size SMOL_KVD, size SMOL_F, size SMOL_PD, size SMOL_GD, size SMOL_PQD, size SMOL_GQD, size SMOL_PF, size SMOL_GF> ⇥ string {
+    let string base ← "model.layers.§"(ld.layer_index ↦ string)
+    let tensor<f32, [SMOL_D]> anorm ← load_f16_as_f32_1d<size SMOL_D>(st_path, data_start, dir, "§.input_layernorm.weight"(base))
+    let tensor<f32, [SMOL_D]> fnorm ← load_f16_as_f32_1d<size SMOL_D>(st_path, data_start, dir, "§.post_attention_layernorm.weight"(base))
+
+    let tensor<u32, [SMOL_QD, SMOL_PD]> wq_w ← load_u32_2d<size SMOL_QD, size SMOL_PD>(st_path, data_start, dir, "§.self_attn.q_proj.weight"(base))
+    let tensor<f32, [SMOL_QD, SMOL_GD]> wq_s ← load_f16_as_f32_2d<size SMOL_QD, size SMOL_GD>(st_path, data_start, dir, "§.self_attn.q_proj.scales"(base))
+    let tensor<f32, [SMOL_QD, SMOL_GD]> wq_b ← load_f16_as_f32_2d<size SMOL_QD, size SMOL_GD>(st_path, data_start, dir, "§.self_attn.q_proj.biases"(base))
+
+    let tensor<u32, [SMOL_KVD, SMOL_PD]> wk_w ← load_u32_2d<size SMOL_KVD, size SMOL_PD>(st_path, data_start, dir, "§.self_attn.k_proj.weight"(base))
+    let tensor<f32, [SMOL_KVD, SMOL_GD]> wk_s ← load_f16_as_f32_2d<size SMOL_KVD, size SMOL_GD>(st_path, data_start, dir, "§.self_attn.k_proj.scales"(base))
+    let tensor<f32, [SMOL_KVD, SMOL_GD]> wk_b ← load_f16_as_f32_2d<size SMOL_KVD, size SMOL_GD>(st_path, data_start, dir, "§.self_attn.k_proj.biases"(base))
+
+    let tensor<u32, [SMOL_KVD, SMOL_PD]> wv_w ← load_u32_2d<size SMOL_KVD, size SMOL_PD>(st_path, data_start, dir, "§.self_attn.v_proj.weight"(base))
+    let tensor<f32, [SMOL_KVD, SMOL_GD]> wv_s ← load_f16_as_f32_2d<size SMOL_KVD, size SMOL_GD>(st_path, data_start, dir, "§.self_attn.v_proj.scales"(base))
+    let tensor<f32, [SMOL_KVD, SMOL_GD]> wv_b ← load_f16_as_f32_2d<size SMOL_KVD, size SMOL_GD>(st_path, data_start, dir, "§.self_attn.v_proj.biases"(base))
+
+    let tensor<u32, [SMOL_D, SMOL_PQD]> wo_w ← load_u32_2d<size SMOL_D, size SMOL_PQD>(st_path, data_start, dir, "§.self_attn.o_proj.weight"(base))
+    let tensor<f32, [SMOL_D, SMOL_GQD]> wo_s ← load_f16_as_f32_2d<size SMOL_D, size SMOL_GQD>(st_path, data_start, dir, "§.self_attn.o_proj.scales"(base))
+    let tensor<f32, [SMOL_D, SMOL_GQD]> wo_b ← load_f16_as_f32_2d<size SMOL_D, size SMOL_GQD>(st_path, data_start, dir, "§.self_attn.o_proj.biases"(base))
+
+    let tensor<u32, [SMOL_F, SMOL_PD]> wg_w ← load_u32_2d<size SMOL_F, size SMOL_PD>(st_path, data_start, dir, "§.mlp.gate_proj.weight"(base))
+    let tensor<f32, [SMOL_F, SMOL_GD]> wg_s ← load_f16_as_f32_2d<size SMOL_F, size SMOL_GD>(st_path, data_start, dir, "§.mlp.gate_proj.scales"(base))
+    let tensor<f32, [SMOL_F, SMOL_GD]> wg_b ← load_f16_as_f32_2d<size SMOL_F, size SMOL_GD>(st_path, data_start, dir, "§.mlp.gate_proj.biases"(base))
+
+    let tensor<u32, [SMOL_F, SMOL_PD]> wu_w ← load_u32_2d<size SMOL_F, size SMOL_PD>(st_path, data_start, dir, "§.mlp.up_proj.weight"(base))
+    let tensor<f32, [SMOL_F, SMOL_GD]> wu_s ← load_f16_as_f32_2d<size SMOL_F, size SMOL_GD>(st_path, data_start, dir, "§.mlp.up_proj.scales"(base))
+    let tensor<f32, [SMOL_F, SMOL_GD]> wu_b ← load_f16_as_f32_2d<size SMOL_F, size SMOL_GD>(st_path, data_start, dir, "§.mlp.up_proj.biases"(base))
+
+    let tensor<u32, [SMOL_D, SMOL_PF]> wd_w ← load_u32_2d<size SMOL_D, size SMOL_PF>(st_path, data_start, dir, "§.mlp.down_proj.weight"(base))
+    let tensor<f32, [SMOL_D, SMOL_GF]> wd_s ← load_f16_as_f32_2d<size SMOL_D, size SMOL_GF>(st_path, data_start, dir, "§.mlp.down_proj.scales"(base))
+    let tensor<f32, [SMOL_D, SMOL_GF]> wd_b ← load_f16_as_f32_2d<size SMOL_D, size SMOL_GF>(st_path, data_start, dir, "§.mlp.down_proj.biases"(base))
+
+    let tensor<f32, [SMOL_QD]> bq ← tf32[SMOL_QD] {}
+    let tensor<f32, [SMOL_KVD]> bk ← tf32[SMOL_KVD] {}
+    let tensor<f32, [SMOL_KVD]> bv ← tf32[SMOL_KVD] {}
+
+    return sa.QuantizedLayerWeights<size SMOL_D, size SMOL_QD, size SMOL_KVD, size SMOL_F, size SMOL_PD, size SMOL_GD, size SMOL_PQD, size SMOL_GQD, size SMOL_PF, size SMOL_GF> {
+        anorm = anorm,
+        wq_desc = ld.q_proj, wq_w = wq_w, wq_s = wq_s, wq_b = wq_b,
+        wk_desc = ld.k_proj, wk_w = wk_w, wk_s = wk_s, wk_b = wk_b,
+        wv_desc = ld.v_proj, wv_w = wv_w, wv_s = wv_s, wv_b = wv_b,
+        wo_desc = ld.o_proj, wo_w = wo_w, wo_s = wo_s, wo_b = wo_b,
+        fnorm = fnorm,
+        wg_desc = ld.gate_proj, wg_w = wg_w, wg_s = wg_s, wg_b = wg_b,
+        wu_desc = ld.up_proj, wu_w = wu_w, wu_s = wu_s, wu_b = wu_b,
+        wd_desc = ld.down_proj, wd_w = wd_w, wd_s = wd_s, wd_b = wd_b,
+        qkv_bias = false, bq = bq, bk = bk, bv = bv
+    }
+}
+
+fn run_resident(string model_dir) → void ⇥ string {
     let string cfg_path ← "§/config.json"(model_dir)
     let string st_path ← "§/model.safetensors"(model_dir)
 
     mut list<b8> cfg_bytes ← empty
-    do {
-        cfg_bytes ← fs.read_bytes(cfg_path)
-    }
-    catch err {
-        throw "slice_a_resident: cannot read §: §"(cfg_path, err.path)
-    }
-
     mut int st_len ← 0
     do {
+        cfg_bytes ← fs.read_bytes(cfg_path)
         st_len ← fs.byte_length(st_path)
     }
     catch err {
-        throw "slice_a_resident: cannot stat §: §"(st_path, err.path)
+        throw "slice_a_resident: cannot read model files in §"(model_dir)
     }
 
     mut cfg.ModelConfig ∪ none maybe_mc ← null
@@ -50,10 +254,10 @@ fn admit_resident(string model_dir) → void ⇥ string {
     if maybe_mc is none then throw "slice_a_resident: config parse failed"
     let cfg.ModelConfig mc ← maybe_mc
 
+    mut int hlen ← 0
     mut list<b8> raw_hdr ← empty
     do {
         let list<b8> prefix8 ← fs.read_range(st_path, 0, 8)
-        mut int hlen ← 0
         for exclusive 8 let i {
             let int bval ← (prefix8[i] ↦ u8) ↦ int
             hlen ← hlen + (bval ⇐ (i * 8))
@@ -63,6 +267,7 @@ fn admit_resident(string model_dir) → void ⇥ string {
     catch err {
         throw "slice_a_resident: header read failed"
     }
+    let int data_start ← 8 + hlen
 
     mut list<u8> hdr_u8 ← empty
     for from raw_hdr let b {
@@ -89,9 +294,6 @@ fn admit_resident(string model_dir) → void ⇥ string {
     catch err {
         throw "slice_a_resident: safetensors header admission failed"
     }
-    if maybe_cap is none then throw "slice_a_resident: safetensors header admission failed"
-    let capsule.Capsule cap ← maybe_cap
-
     mut bundle.ModelBundle ∪ none maybe_b ← null
     do {
         maybe_b ← bundle.safetensors_unindexed([shard_id], cfg_id, null, null, null, null)
@@ -99,7 +301,8 @@ fn admit_resident(string model_dir) → void ⇥ string {
     catch err {
         throw "slice_a_resident: bundle admission failed"
     }
-    if maybe_b is none then throw "slice_a_resident: bundle admission failed"
+    if maybe_cap is none or maybe_b is none then throw "slice_a_resident: safetensors/bundle admission failed"
+    let capsule.Capsule cap ← maybe_cap
     let bundle.ModelBundle b ← maybe_b
 
     match cap.manifest {
@@ -115,14 +318,116 @@ fn admit_resident(string model_dir) → void ⇥ string {
             if maybe_dir is none then throw "slice_a_resident: directory build failed"
             let td.TensorDirectory dir ← maybe_dir
 
+            mut sa.ModelDescriptors ∪ none maybe_md ← null
+            mut model_schedule.ExecutionSchedule ∪ none maybe_es ← null
             do {
-                let sa.ModelDescriptors md ← sa.admit_model_descriptors(b, dir, mc)
-                let model_schedule.ExecutionSchedule es ← sa.build_slice_a_schedule(mc)
-                print "slice_a_resident: model_type=§ layers=§ hidden=§ kv_heads=§ head_dim=§ vocab=§ bound_layers=§ schedule_slots=§"(mc.model_type, mc.num_hidden_layers ↦ string, mc.hidden_size ↦ string, mc.num_key_value_heads ↦ string, mc.head_dim ↦ string, mc.vocab_size ↦ string, md.layers.length() ↦ string, model_schedule.slot_count(es) ↦ string)
+                maybe_md ← sa.admit_model_descriptors(b, dir, mc)
+                maybe_es ← sa.build_slice_a_schedule(mc)
             }
             catch err {
                 throw "slice_a_resident: admission failed: §"(err.message)
             }
+            if maybe_md is none or maybe_es is none then throw "slice_a_resident: admission failed"
+            let sa.ModelDescriptors md ← maybe_md
+            let model_schedule.ExecutionSchedule es ← maybe_es
+
+            mut sess_mod.SessionState<size SMOL_C, size 1, size SMOL_KVD> ∪ none maybe_sess ← null
+            do {
+                maybe_sess ← sa.allocate_slice_a_session<size SMOL_C, size SMOL_KVD>(mc, es)
+            }
+            catch err {
+                throw "slice_a_resident: session allocation failed: §"(err.message)
+            }
+            if maybe_sess is none then throw "slice_a_resident: session allocation failed"
+            mut sess_mod.SessionState<size SMOL_C, size 1, size SMOL_KVD> session ← maybe_sess
+
+            let bpe.Tokenizer tok ← load_bpe_tokenizer(model_dir)
+            mut list<int> prompt_ids ← empty
+            do {
+                prompt_ids ← bpe.encode_prompt(tok, "The capital of France is")
+            }
+            catch err {
+                throw "slice_a_resident: tokenizer encode failed"
+            }
+
+            let tensor<u32, [SMOL_V, SMOL_PD]> emb_w ← load_u32_2d<size SMOL_V, size SMOL_PD>(st_path, data_start, dir, "model.embed_tokens.weight")
+            let tensor<f32, [SMOL_V, SMOL_GD]> emb_s ← load_f16_as_f32_2d<size SMOL_V, size SMOL_GD>(st_path, data_start, dir, "model.embed_tokens.scales")
+            let tensor<f32, [SMOL_V, SMOL_GD]> emb_b ← load_f16_as_f32_2d<size SMOL_V, size SMOL_GD>(st_path, data_start, dir, "model.embed_tokens.biases")
+            let tensor<f32, [SMOL_D]> onorm ← load_f16_as_f32_1d<size SMOL_D>(st_path, data_start, dir, "model.norm.weight")
+
+            mut list<sa.QuantizedLayerWeights<size SMOL_D, size SMOL_QD, size SMOL_KVD, size SMOL_F, size SMOL_PD, size SMOL_GD, size SMOL_PQD, size SMOL_GQD, size SMOL_PF, size SMOL_GF>> qlayers ← empty
+            for exclusive mc.num_hidden_layers let l {
+                qlayers.append(load_layer_weights(st_path, data_start, dir, md.layers[l]))
+            }
+
+            let dt.LayerParams lp ← sa.layer_params_from_config(mc)
+            let tensor<f32, [SMOL_H]> zero_sink ← tf32[SMOL_H] {}
+            mut tensor<f32, [SMOL_D]> xn ← tf32[SMOL_D] {}
+            mut tensor<f32, [SMOL_QD]> q ← tf32[SMOL_QD] {}
+            mut tensor<f32, [SMOL_QD]> qr ← tf32[SMOL_QD] {}
+            mut tensor<f32, [SMOL_KVD]> k ← tf32[SMOL_KVD] {}
+            mut tensor<f32, [SMOL_KVD]> kr ← tf32[SMOL_KVD] {}
+            mut tensor<f32, [SMOL_KVD]> v ← tf32[SMOL_KVD] {}
+            mut tensor<f32, [SMOL_QD]> ctx ← tf32[SMOL_QD] {}
+            mut tensor<f32, [SMOL_D]> h1 ← tf32[SMOL_D] {}
+            mut tensor<f32, [SMOL_F]> gate ← tf32[SMOL_F] {}
+            mut tensor<f32, [SMOL_F]> up ← tf32[SMOL_F] {}
+            mut tensor<f32, [SMOL_F]> act ← tf32[SMOL_F] {}
+            mut sa.SliceAWorkspace<size SMOL_D, size SMOL_QD, size SMOL_KVD, size SMOL_F, size SMOL_H> ws ← sa.SliceAWorkspace<size SMOL_D, size SMOL_QD, size SMOL_KVD, size SMOL_F, size SMOL_H> {
+                zero_sink = zero_sink, xn = xn, q = q, qr = qr, k = k, kr = kr, v = v,
+                ctx = ctx, h1 = h1, gate = gate, up = up, act = act
+            }
+
+            mut tensor<i32, [1]> ids_buf ← tensor<i32, [1]> {}
+            mut tensor<f32, [SMOL_D]> h_cur ← tf32[SMOL_D] {}
+            mut tensor<f32, [SMOL_D]> h_next ← tf32[SMOL_D] {}
+            mut tensor<f32, [SMOL_V]> logits ← tf32[SMOL_V] {}
+
+            let int max_gen ← 8
+            let int total_steps ← prompt_ids.length() + max_gen - 1
+            mut list<int> gen_ids ← empty
+            mut int next_tok ← 0
+
+            let int t0 ← time.monotonic()
+            for exclusive total_steps let step {
+                let int tok_in ← step ≺ prompt_ids.length() ✓ prompt_ids[step] ✗ next_tok
+                ids_buf[0] ← tok_in ↦ i32 ⊥ 0
+                do {
+                    sa.embed_wide_group_affine_u32<size SMOL_V, size SMOL_PD, size SMOL_GD, size SMOL_D>(md.embed_tokens, emb_w, emb_s, emb_b, ids_buf, mut h_cur)
+                    let i32 tpos ← step ↦ i32 ⊥ 0
+                    for exclusive mc.num_hidden_layers let l {
+                        let sa.QuantizedLayerWeights<size SMOL_D, size SMOL_QD, size SMOL_KVD, size SMOL_F, size SMOL_PD, size SMOL_GD, size SMOL_PQD, size SMOL_GQD, size SMOL_PF, size SMOL_GF> qlw ← qlayers[l]
+                        if l % 2 ≡ 0 {
+                            sa.layer_wide_group_affine_u32<size SMOL_D, size SMOL_QD, size SMOL_KVD, size SMOL_F, size SMOL_PD, size SMOL_GD, size SMOL_PQD, size SMOL_GQD, size SMOL_PF, size SMOL_GF, size SMOL_H, size SMOL_C, size 1>(h_cur, mut h_next, qlw, mut session, l, tpos, lp, mut ws)
+                        }
+                        else {
+                            sa.layer_wide_group_affine_u32<size SMOL_D, size SMOL_QD, size SMOL_KVD, size SMOL_F, size SMOL_PD, size SMOL_GD, size SMOL_PQD, size SMOL_GQD, size SMOL_PF, size SMOL_GF, size SMOL_H, size SMOL_C, size 1>(h_next, mut h_cur, qlw, mut session, l, tpos, lp, mut ws)
+                        }
+                    }
+                    sa.head_wide_group_affine_u32<size SMOL_V, size SMOL_PD, size SMOL_GD, size SMOL_D>(h_cur, onorm, md.lm_head, emb_w, emb_s, emb_b, mut h_next, mut logits, lp.peps)
+                }
+                catch err {
+                    throw "slice_a_resident: decode failed: §"(err.message)
+                }
+                ds.argmax_token(logits, mut ids_buf)
+                next_tok ← ids_buf[0] ↦ int
+                if step ≥ prompt_ids.length() - 1 {
+                    gen_ids.append(next_tok)
+                }
+            }
+            let int elapsed_ns ← time.monotonic() - t0
+            let f64 ms_per_tok ← (elapsed_ns ↦ f64) / ((total_steps ↦ f64) * 1000000.0)
+            let f64 tok_per_s ← 1000.0 / ms_per_tok
+
+            mut string decoded ← ""
+            do {
+                decoded ← bpe.decode(tok, gen_ids)
+            }
+            catch err {
+                throw "slice_a_resident: tokenizer decode failed"
+            }
+
+            print "slice_a_resident: model_type=§ layers=§ hidden=§ kv_heads=§ head_dim=§ vocab=§ steps=§ ms_per_tok=§ tok_per_s=§ text=§"(mc.model_type, mc.num_hidden_layers ↦ string, mc.hidden_size ↦ string, mc.num_key_value_heads ↦ string, mc.head_dim ↦ string, mc.vocab_size ↦ string, total_steps ↦ string, ms_per_tok ↦ string, tok_per_s ↦ string, decoded)
         }
         default {
             throw "slice_a_resident: unexpected non-safetensors manifest"
@@ -134,7 +439,7 @@ main {
     let list<string> args ← process.argv() ↦ list<string>
     let string dir ← args.length() ≥ 2 ✓ args[1] ✗ "/Users/ianzepp/ai/models/SmolLM2-135M-Instruct-8bit"
     do {
-        admit_resident(dir)
+        run_resident(dir)
     }
     catch err {
         print err
