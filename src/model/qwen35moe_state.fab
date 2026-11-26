@@ -29,12 +29,13 @@ import from "gradus:model/qwen35moe_state/full_attn"
 # weights; the real-artifact executed proof lives in
 # exempla/qwen35moe-layer-probe (per-layer oracle agreement).
 
-import from "gradus:model/qwen35moe" qwen35moe
-import from "gradus:tensor" tensor
-import from "gradus:model/qwen35moe_state/schedule" schedule
-import from "gradus:model/qwen35moe_state/session" session
-import from "gradus:model/qwen35moe_state/linear_attn" linear_attn
-import from "gradus:model/qwen35moe_state/full_attn" full_attn
+import from "gradus:model/qwen35moe" let qwen35moe
+import from "gradus:tensor" let tensor
+import from "gradus:model/qwen35moe_state/schedule" let schedule
+import from "gradus:model/qwen35moe_state/session" let session
+import from "gradus:model/qwen35moe_state/linear_attn" let linear_attn
+import from "gradus:model/qwen35moe_state/full_attn" let full_attn
+import from "gradus:model/schedule" let model_schedule
 
 # Synthetic configurations mirroring the frozen qwen35moe row (41 blocks)
 # and the two local 40-block rows (no NextN block), so schedule derivation
@@ -788,6 +789,122 @@ test "full attention prepared matches the traced path without trace buffers" {
     assert lean.trace.softmax.length() ≡ 0
     assert traced.trace.softmax.length() ≡ 2 * 4 * 2
     assert traced.trace.q_normed.length() ≡ 2 * 4 * 32
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "session_kv_equal compares active [0..length) rows only and ignores dirty tail rows" {
+    do {
+        let qwen35moe.Qwen35moeConfig c ← pinned_config()
+        mut session.HybridSession<8, 1, 4, 3, 4, 2, 2> a ← session.fresh_session<size 8, size 1, size 4, size 3, size 4, size 2, size 2>(c)
+        mut session.HybridSession<8, 1, 4, 3, 4, 2, 2> b ← session.fresh_session<size 8, size 1, size 4, size 3, size 4, size 2, size 2>(c)
+
+        for exclusive 4 let j {
+            let f32 kv ← (j + 1) ↦ f32
+            let f32 vv ← ((j + 1) * 10) ↦ f32
+            a.arenas.kv.full_kv.keys[0][[0, j]] ← kv
+            a.arenas.kv.full_kv.values[0][[0, j]] ← vv
+            b.arenas.kv.full_kv.keys[0][[0, j]] ← kv
+            b.arenas.kv.full_kv.values[0][[0, j]] ← vv
+            # Simulate dirty rolled-back tail rows [1..3) on session `a` only.
+            a.arenas.kv.full_kv.keys[0][[1, j]] ← 99.0 ∷ f32
+            a.arenas.kv.full_kv.values[0][[2, j]] ← -77.0 ∷ f32
+        }
+        a.arenas.kv.full_kv.lengths[0] ← 1
+        b.arenas.kv.full_kv.lengths[0] ← 1
+
+        # Active [0..1) equals, dirty tail [1..8) ignored.
+        assert session.session_kv_equal(a.arenas.kv, b.arenas.kv)
+        assert session.session_state_equal(a, b)
+
+        # Mutating an active row invalidates equality.
+        a.arenas.kv.full_kv.keys[0][[0, 0]] ← -1.0 ∷ f32
+        assert not session.session_kv_equal(a.arenas.kv, b.arenas.kv)
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "deserialize_session_identity reads rope_sections and conv history length from wire metadata" {
+    let qwen35moe.Qwen35moeConfig base ← mid_full_config()
+    let qwen35moe.Qwen35moeConfig custom ← qwen35moe.Qwen35moeConfig {
+        architecture = base.architecture,
+        file_type = base.file_type,
+        quantization_version = base.quantization_version,
+        block_count = base.block_count,
+        context_length = base.context_length,
+        embedding_length = base.embedding_length,
+        head_count = base.head_count,
+        head_count_kv = base.head_count_kv,
+        key_length = base.key_length,
+        value_length = base.value_length,
+        rms_norm_epsilon = base.rms_norm_epsilon,
+        freq_base = base.freq_base,
+        rope_dimension_count = base.rope_dimension_count,
+        rope_sections = [4, 4, 4, 4],
+        expert_count = base.expert_count,
+        expert_used_count = base.expert_used_count,
+        expert_ffn_length = base.expert_ffn_length,
+        shared_ffn_length = base.shared_ffn_length,
+        conv_kernel = 2,
+        state_size = base.state_size,
+        group_count = base.group_count,
+        gradus_temporis = base.gradus_temporis,
+        inner_size = base.inner_size,
+        full_attention_interval = base.full_attention_interval,
+        nextn_predict_layers = base.nextn_predict_layers,
+        tokenizer_model = base.tokenizer_model,
+        tokenizer_pre = base.tokenizer_pre,
+        token_count = base.token_count,
+        token_type_count = base.token_type_count,
+        merge_count = base.merge_count,
+        eos_token_id = base.eos_token_id,
+        padding_token_id = base.padding_token_id,
+        bos_token_id = base.bos_token_id,
+        add_bos_token = base.add_bos_token
+    }
+    do {
+        # ConvRows is 3, while conv_kernel = 2 gives conv history length 1.
+        let session.HybridSession<8, 1, 4, 3, 4, 2, 2> s ← session.fresh_session<size 8, size 1, size 4, size 3, size 4, size 2, size 2>(custom)
+        assert s.arenas.conv.history_len ≡ 1
+        let string wire ← session.session_identity_key(s)
+        let session.HybridSession<8, 1, 4, 3, 4, 2, 2> parsed ← session.deserialize_session_identity<size 8, size 1, size 4, size 3, size 4, size 2, size 2>(wire)
+        assert parsed.arenas.conv.history_len ≡ 1
+        let model_schedule.LayerSpec layer3 ← parsed.arenas.kv.sched.layers[3]
+        match layer3.rope {
+            case model_schedule.RopeKind.Sectional let secs {
+                assert secs ≡ ([4, 4, 4, 4] ↦ list<int>)
+            }
+            default {
+                assert false
+            }
+        }
+        assert session.session_identity_key(parsed) ≡ wire
+
+        # Missing rope_sections in execution_config fails closed.
+        mut bool rejected_missing_sections ← false
+        do {
+            let _ bad ← session.deserialize_session_identity<size 8, size 1, size 4, size 3, size 4, size 2, size 2>(wire.replace(":sections=4,4,4,4", ""))
+            assert false
+        }
+        catch err {
+            rejected_missing_sections ← true
+        }
+        assert rejected_missing_sections
+
+        # Conv history length exceeding ConvRows fails closed.
+        mut bool rejected_bad_conv ← false
+        do {
+            let _ bad ← session.deserialize_session_identity<size 8, size 1, size 4, size 3, size 4, size 2, size 2>(wire.replace("conv=1x", "conv=9x"))
+            assert false
+        }
+        catch err {
+            rejected_bad_conv ← true
+        }
+        assert rejected_bad_conv
     }
     catch err {
         assert false
