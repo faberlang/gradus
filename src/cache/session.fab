@@ -31,6 +31,7 @@ const int ARENA_FULL_KV = 0
 const int ARENA_RING_KV = 1
 const int ARENA_RECURRENT_SSM = 2
 const int ARENA_NO_STATE = 3
+const int SESSION_ID_MOD = 2147483647
 
 @ public
 union SessionError {
@@ -45,7 +46,9 @@ union SessionError {
     TxnOpen,
     NoOpenTxn,
     InvalidCommitCount,
-    InvalidBranchWrite
+    InvalidBranchWrite,
+    UnsupportedKvQuant,
+    SessionMismatch
 }
 
 @ public
@@ -102,6 +105,9 @@ class SessionState<size C, size W, size KVD> {
     # 0 = no transaction open; 1 = a `branch` is active. Plain writes
     # fail-closed while a branch is open.
     mut int txn_depth
+    mut int session_id = 0
+    mut int txn_seq = 0
+    mut int active_txn_id = 0
 }
 
 # One-shot speculative transaction over one `SessionState`.
@@ -124,6 +130,8 @@ class SessionTxn<size C, size W, size KVD> {
     mut list<tensor<f32, [KVD]>> ring_journal_k
     mut list<tensor<f32, [KVD]>> ring_journal_v
     mut bool open
+    let int session_id = 0
+    let int txn_id = 0
 }
 
 # -------------------------------------------------------------------------
@@ -173,6 +181,38 @@ fn full_span(int total_written, int capacity) → ValidSpan ⇥ SessionError {
 # -------------------------------------------------------------------------
 # Construction from ExecutionSchedule
 # -------------------------------------------------------------------------
+
+@ public
+fn schedule_fingerprint(model_schedule.ExecutionSchedule sched, int cap, int win, int kvd) → int {
+    mut int h ← 17
+    h ← (h * 131 + cap + 1) % SESSION_ID_MOD
+    h ← (h * 131 + win + 1) % SESSION_ID_MOD
+    h ← (h * 131 + kvd + 1) % SESSION_ID_MOD
+    h ← (h * 131 + sched.slots.length() + 1) % SESSION_ID_MOD
+    h ← (h * 131 + sched.layers.length() + 1) % SESSION_ID_MOD
+    for exclusive sched.slots.length() let i {
+        let model_schedule.SlotSpec sp ← sched.slots[i]
+        mut int tag ← 3
+        match sp.arena {
+            case model_schedule.ArenaKind.FullKv {
+                tag ← 11
+            }
+            case model_schedule.ArenaKind.RingKv let w {
+                tag ← 100 + w
+            }
+            case model_schedule.ArenaKind.RecurrentSsm {
+                tag ← 23
+            }
+            case model_schedule.ArenaKind.NoState {
+                tag ← 37
+            }
+        }
+        h ← (h * 131 + sp.slot_id + 1) % SESSION_ID_MOD
+        h ← (h * 131 + tag) % SESSION_ID_MOD
+    }
+    if h ≤ 0 then return 1
+    return h
+}
 
 @ public
 fn from_schedule<size C, size W, size KVD>(model_schedule.ExecutionSchedule sched) → SessionState<size C, size W, size KVD> ⇥ SessionError {
@@ -244,7 +284,21 @@ fn from_schedule<size C, size W, size KVD>(model_schedule.ExecutionSchedule sche
 
     let FullKvArena<size C, size KVD> full_arena ← FullKvArena { capacity = C, kv_dim = KVD, slot_ids = full_slot_ids, keys = full_keys, values = full_values, lengths = full_lengths }
     let RingKvArena<size W, size KVD> ring_arena ← RingKvArena { max_window = W, kv_dim = KVD, slot_ids = ring_slot_ids, window_sizes = ring_windows, keys = ring_keys, values = ring_values, total_written = ring_written }
-    return SessionState { sched = sched, full_kv = full_arena, ring_kv = ring_arena, slot_arena_kind = slot_arena_kind, slot_local_index = slot_local_index, slot_window_sizes = slot_window_sizes, slot_kv_quant = slot_kv_quant, txn_depth = 0 }
+    let int sid ← schedule_fingerprint(sched, C, W, KVD)
+    return SessionState { sched = sched, full_kv = full_arena, ring_kv = ring_arena, slot_arena_kind = slot_arena_kind, slot_local_index = slot_local_index, slot_window_sizes = slot_window_sizes, slot_kv_quant = slot_kv_quant, txn_depth = 0, session_id = sid, txn_seq = 0, active_txn_id = 0 }
+}
+
+@ public
+fn from_schedule_with_id<size C, size W, size KVD>(model_schedule.ExecutionSchedule sched, int session_id) → SessionState<size C, size W, size KVD> ⇥ SessionError {
+    mut SessionState<size C, size W, size KVD> sess ← from_schedule<size C, size W, size KVD>(sched)
+    sess.session_id ← session_id
+    return sess
+}
+
+@ public
+fn set_session_id<size C, size W, size KVD>(mut SessionState<size C, size W, size KVD> sess, int session_id) → void ⇥ SessionError {
+    require sess.txn_depth ≡ 0 throw variant TxnOpen { message = "cannot change session_id while a branch is open" }
+    sess.session_id ← session_id
 }
 
 @ public
@@ -256,19 +310,19 @@ fn from_dense_schedule<size C, size KVD>(model_schedule.ExecutionSchedule sched)
 # Slot inspection & per-slot KV-quant policy metadata
 # -------------------------------------------------------------------------
 
-fn check_slot<size C, size W, size KVD>(SessionState<size C, size W, size KVD> sess, int slot_id) → void ⇥ SessionError {
-    require slot_id ≥ 0 and slot_id ≺ sess.slot_arena_kind.length() throw variant InvalidSlot { message = "slot_id § out of range"(slot_id ↦ string) }
+fn check_slot_idx(int slot_count, int slot_id) → void ⇥ SessionError {
+    require slot_id ≥ 0 and slot_id ≺ slot_count throw variant InvalidSlot { message = "slot_id § out of range"(slot_id ↦ string) }
 }
 
 @ public
 fn slot_kind<size C, size W, size KVD>(SessionState<size C, size W, size KVD> sess, int slot_id) → model_schedule.ArenaKind ⇥ SessionError {
-    check_slot(sess, slot_id)
+    check_slot_idx(sess.slot_arena_kind.length(), slot_id)
     return sess.sched.slots[slot_id].arena
 }
 
 @ public
 fn slot_valid_span<size C, size W, size KVD>(SessionState<size C, size W, size KVD> sess, int slot_id) → ValidSpan ⇥ SessionError {
-    check_slot(sess, slot_id)
+    check_slot_idx(sess.slot_arena_kind.length(), slot_id)
     let int kind ← sess.slot_arena_kind[slot_id]
     let int idx ← sess.slot_local_index[slot_id]
 
@@ -282,10 +336,31 @@ fn slot_valid_span<size C, size W, size KVD>(SessionState<size C, size W, size K
     throw variant SlotArenaMismatch { message = "slot § is not a KV arena"(slot_id ↦ string) }
 }
 
+fn check_unquantized_slot(list<KvQuantConfig> quants, int slot_id) → void ⇥ SessionError {
+    if slot_id ≺ quants.length() and quants[slot_id].enabled {
+        throw variant UnsupportedKvQuant { message = "quantized KV arena is not implemented yet; slot § has KvQuantConfig.enabled = true"(slot_id ↦ string) }
+    }
+}
+
+fn check_txn_ids(bool txn_open, int txn_sid, int sess_sid, int txn_depth, int txn_id, int active_txn_id, int t_full_len, int s_full_len, int t_ring_len, int s_ring_len) → void ⇥ SessionError {
+    require txn_open throw variant NoOpenTxn { message = "transaction is closed" }
+    require txn_sid ≡ sess_sid throw variant SessionMismatch { message = "SessionTxn session_id § does not match SessionState §"(txn_sid ↦ string, sess_sid ↦ string) }
+    require txn_depth ≡ 1 throw variant NoOpenTxn { message = "session has no open transaction" }
+    require txn_id ≡ active_txn_id throw variant SessionMismatch { message = "SessionTxn txn_id § does not match active transaction §"(txn_id ↦ string, active_txn_id ↦ string) }
+    require t_full_len ≡ s_full_len throw variant SessionMismatch { message = "SessionTxn FullKv slot count mismatch" }
+    require t_ring_len ≡ s_ring_len throw variant SessionMismatch { message = "SessionTxn RingKv slot count mismatch" }
+}
+
+@ public
+fn verify_txn_session<size C, size W, size KVD>(SessionState<size C, size W, size KVD> sess, SessionTxn<size C, size W, size KVD> txn) → void ⇥ SessionError {
+    check_txn_ids(txn.open, txn.session_id, sess.session_id, sess.txn_depth, txn.txn_id, sess.active_txn_id, txn.base_full_lengths.length(), sess.full_kv.lengths.length(), txn.base_ring_written.length(), sess.ring_kv.total_written.length())
+}
+
 @ public
 fn set_slot_kv_quant<size C, size W, size KVD>(mut SessionState<size C, size W, size KVD> sess, int slot_id, KvQuantConfig cfg) → void ⇥ SessionError {
-    check_slot(sess, slot_id)
+    check_slot_idx(sess.slot_arena_kind.length(), slot_id)
     require cfg.key_bits ≥ 0 and cfg.value_bits ≥ 0 and cfg.group_size ≥ 0 throw variant InvalidCapacity { message = "KvQuantConfig fields must be non-negative" }
+    require not cfg.enabled throw variant UnsupportedKvQuant { message = "quantized KV arena is not implemented yet; KvQuantConfig.enabled = true is unsupported" }
     sess.slot_kv_quant[slot_id] ← cfg
 }
 
@@ -296,7 +371,8 @@ fn set_slot_kv_quant<size C, size W, size KVD>(mut SessionState<size C, size W, 
 @ public
 fn write_kv<size C, size W, size KVD>(mut SessionState<size C, size W, size KVD> sess, int slot_id, tensor<f32, [KVD]> k, tensor<f32, [KVD]> v, i32 pos) → void ⇥ SessionError {
     require sess.txn_depth ≡ 0 throw variant TxnOpen { message = "plain write_kv refuses to touch a shared cache while a branch is open" }
-    check_slot(sess, slot_id)
+    check_slot_idx(sess.slot_arena_kind.length(), slot_id)
+    check_unquantized_slot(sess.slot_kv_quant, slot_id)
     let int kind ← sess.slot_arena_kind[slot_id]
     let int idx ← sess.slot_local_index[slot_id]
     let int p ← pos ↦ int
@@ -341,6 +417,9 @@ fn write_kv<size C, size W, size KVD>(mut SessionState<size C, size W, size KVD>
 @ public
 fn branch<size C, size W, size KVD>(mut SessionState<size C, size W, size KVD> sess) → SessionTxn<size C, size W, size KVD> ⇥ SessionError {
     require sess.txn_depth ≡ 0 throw variant TxnOpen { message = "nested branches are not supported; commit or roll back the open transaction first" }
+    for exclusive sess.slot_kv_quant.length() let i {
+        check_unquantized_slot(sess.slot_kv_quant, i)
+    }
 
     mut list<int> base_lengths ← empty
     mut list<int> full_counts ← empty
@@ -366,8 +445,10 @@ fn branch<size C, size W, size KVD>(mut SessionState<size C, size W, size KVD> s
         base_values.append(bv)
     }
 
+    sess.txn_seq ← sess.txn_seq + 1
+    sess.active_txn_id ← sess.txn_seq
     sess.txn_depth ← 1
-    return SessionTxn { base_full_lengths = base_lengths, full_draft_counts = full_counts, base_ring_written = base_written, ring_draft_counts = ring_counts, base_ring_keys = base_keys, base_ring_values = base_values, ring_journal_local_idx = jidx, ring_journal_pos = jpos, ring_journal_k = jk, ring_journal_v = jv, open = true }
+    return SessionTxn { base_full_lengths = base_lengths, full_draft_counts = full_counts, base_ring_written = base_written, ring_draft_counts = ring_counts, base_ring_keys = base_keys, base_ring_values = base_values, ring_journal_local_idx = jidx, ring_journal_pos = jpos, ring_journal_k = jk, ring_journal_v = jv, open = true, session_id = sess.session_id, txn_id = sess.active_txn_id }
 }
 
 # Transactional write during an open branch. Both FullKv and RingKv enforce
@@ -375,9 +456,9 @@ fn branch<size C, size W, size KVD>(mut SessionState<size C, size W, size KVD> s
 # cursor arithmetic on `commit_prefix` is exact without scanning gaps.
 @ public
 fn txn_write_kv<size C, size W, size KVD>(mut SessionState<size C, size W, size KVD> sess, mut SessionTxn<size C, size W, size KVD> txn, int slot_id, tensor<f32, [KVD]> k, tensor<f32, [KVD]> v, i32 pos) → void ⇥ SessionError {
-    require txn.open throw variant NoOpenTxn { message = "txn_write_kv requires an open transaction" }
-    require sess.txn_depth ≡ 1 throw variant NoOpenTxn { message = "session has no open transaction" }
-    check_slot(sess, slot_id)
+    check_txn_ids(txn.open, txn.session_id, sess.session_id, sess.txn_depth, txn.txn_id, sess.active_txn_id, txn.base_full_lengths.length(), sess.full_kv.lengths.length(), txn.base_ring_written.length(), sess.ring_kv.total_written.length())
+    check_slot_idx(sess.slot_arena_kind.length(), slot_id)
+    check_unquantized_slot(sess.slot_kv_quant, slot_id)
     let int kind ← sess.slot_arena_kind[slot_id]
     let int idx ← sess.slot_local_index[slot_id]
     let int p ← pos ↦ int
@@ -432,8 +513,7 @@ fn txn_restore_ring<size C, size W, size KVD>(mut SessionState<size C, size W, s
 
 @ public
 fn commit_prefix<size C, size W, size KVD>(mut SessionState<size C, size W, size KVD> sess, mut SessionTxn<size C, size W, size KVD> txn, int accepted_count) → void ⇥ SessionError {
-    require txn.open throw variant NoOpenTxn { message = "commit_prefix requires an open transaction" }
-    require sess.txn_depth ≡ 1 throw variant NoOpenTxn { message = "session has no open transaction" }
+    check_txn_ids(txn.open, txn.session_id, sess.session_id, sess.txn_depth, txn.txn_id, sess.active_txn_id, txn.base_full_lengths.length(), sess.full_kv.lengths.length(), txn.base_ring_written.length(), sess.ring_kv.total_written.length())
     require accepted_count ≥ 0 throw variant InvalidCommitCount { message = "accepted count must be non-negative" }
 
     mut bool any_touched ← false
@@ -495,12 +575,12 @@ fn commit_prefix<size C, size W, size KVD>(mut SessionState<size C, size W, size
 
     txn.open ← false
     sess.txn_depth ← 0
+    sess.active_txn_id ← 0
 }
 
 @ public
 fn rollback<size C, size W, size KVD>(mut SessionState<size C, size W, size KVD> sess, mut SessionTxn<size C, size W, size KVD> txn) → void ⇥ SessionError {
-    require txn.open throw variant NoOpenTxn { message = "rollback requires an open transaction" }
-    require sess.txn_depth ≡ 1 throw variant NoOpenTxn { message = "session has no open transaction" }
+    check_txn_ids(txn.open, txn.session_id, sess.session_id, sess.txn_depth, txn.txn_id, sess.active_txn_id, txn.base_full_lengths.length(), sess.full_kv.lengths.length(), txn.base_ring_written.length(), sess.ring_kv.total_written.length())
 
     txn_restore_ring(mut sess, txn)
     for exclusive sess.full_kv.lengths.length() let i {
@@ -512,6 +592,7 @@ fn rollback<size C, size W, size KVD>(mut SessionState<size C, size W, size KVD>
 
     txn.open ← false
     sess.txn_depth ← 0
+    sess.active_txn_id ← 0
 }
 
 fn find_arena_slot(list<int> slot_ids, int slot_id) → int ⇥ SessionError {
@@ -525,6 +606,8 @@ fn find_arena_slot(list<int> slot_ids, int slot_id) → int ⇥ SessionError {
 @ public
 fn score_full<size C, size KVD, size H, size QD>(FullKvArena<size C, size KVD> arena, int slot_id, tensor<f32, [H, C]> dom, tensor<f32, [QD]> q, mut tensor<f32, [H, C]> sc, i32 pos, i32 group, i32 dh, f32 scale) → void ⇥ SessionError {
     let int idx ← find_arena_slot(arena.slot_ids, slot_id)
+    let int p ← pos ↦ int
+    require p ≥ 0 and p ≺ arena.lengths[idx] throw variant OutOfBoundsPosition { message = "score_full pos § outside active length [0..§)"(p ↦ string, arena.lengths[idx] ↦ string) }
     let tensor<f32, [C, KVD]> kc ← arena.keys[idx]
     ds.attn_scores(dom, q, kc, mut sc, pos, group, dh, scale)
 }
@@ -532,6 +615,8 @@ fn score_full<size C, size KVD, size H, size QD>(FullKvArena<size C, size KVD> a
 @ public
 fn context_full<size C, size KVD, size H, size QD>(FullKvArena<size C, size KVD> arena, int slot_id, tensor<f32, [QD]> dom, tensor<f32, [H, C]> probs, mut tensor<f32, [QD]> ctx, i32 pos, i32 group, i32 dh) → void ⇥ SessionError {
     let int idx ← find_arena_slot(arena.slot_ids, slot_id)
+    let int p ← pos ↦ int
+    require p ≥ 0 and p ≺ arena.lengths[idx] throw variant OutOfBoundsPosition { message = "context_full pos § outside active length [0..§)"(p ↦ string, arena.lengths[idx] ↦ string) }
     let tensor<f32, [C, KVD]> vc ← arena.values[idx]
     ds.attn_context(dom, probs, vc, mut ctx, pos, group, dh)
 }
@@ -539,6 +624,8 @@ fn context_full<size C, size KVD, size H, size QD>(FullKvArena<size C, size KVD>
 @ public
 fn score_ring<size W, size KVD, size H, size QD>(RingKvArena<size W, size KVD> arena, int slot_id, tensor<f32, [H, W]> dom, tensor<f32, [QD]> q, mut tensor<f32, [H, W]> sc, i32 pos, i32 group, i32 dh, f32 scale) → void ⇥ SessionError {
     let int idx ← find_arena_slot(arena.slot_ids, slot_id)
+    let int p ← pos ↦ int
+    require p ≥ 0 and p ≺ arena.total_written[idx] throw variant OutOfBoundsPosition { message = "score_ring pos § outside written length [0..§)"(p ↦ string, arena.total_written[idx] ↦ string) }
     let i32 win ← arena.window_sizes[idx] ↦ i32 ⊥ 0
     let tensor<f32, [W, KVD]> kc ← arena.keys[idx]
     ds.attn_scores_ring(dom, q, kc, mut sc, pos, win, group, dh, scale)
@@ -547,9 +634,57 @@ fn score_ring<size W, size KVD, size H, size QD>(RingKvArena<size W, size KVD> a
 @ public
 fn context_ring<size W, size KVD, size H, size QD>(RingKvArena<size W, size KVD> arena, int slot_id, tensor<f32, [QD]> dom, tensor<f32, [H, W]> probs, mut tensor<f32, [QD]> ctx, i32 pos, i32 group, i32 dh) → void ⇥ SessionError {
     let int idx ← find_arena_slot(arena.slot_ids, slot_id)
+    let int p ← pos ↦ int
+    require p ≥ 0 and p ≺ arena.total_written[idx] throw variant OutOfBoundsPosition { message = "context_ring pos § outside written length [0..§)"(p ↦ string, arena.total_written[idx] ↦ string) }
     let i32 win ← arena.window_sizes[idx] ↦ i32 ⊥ 0
     let tensor<f32, [W, KVD]> vc ← arena.values[idx]
     ds.attn_context_ring(dom, probs, vc, mut ctx, pos, win, group, dh)
+}
+
+# Active-prefix / active-span equality helper ignoring inactive tail rows
+# `[length..C)` left behind by zero-copy FullKv cursor rollback.
+@ public
+fn active_rows_equal<size C, size W, size KVD>(SessionState<size C, size W, size KVD> a, SessionState<size C, size W, size KVD> b, f32 tol) → bool ⇥ SessionError {
+    if a.full_kv.slot_ids.length() ≢ b.full_kv.slot_ids.length() then return false
+    for exclusive a.full_kv.slot_ids.length() let i {
+        if a.full_kv.slot_ids[i] ≢ b.full_kv.slot_ids[i] then return false
+        let int la ← a.full_kv.lengths[i]
+        let int lb ← b.full_kv.lengths[i]
+        if la ≢ lb then return false
+        let tensor<f32, [C, KVD]> ka ← a.full_kv.keys[i]
+        let tensor<f32, [C, KVD]> kb ← b.full_kv.keys[i]
+        let tensor<f32, [C, KVD]> va ← a.full_kv.values[i]
+        let tensor<f32, [C, KVD]> vb ← b.full_kv.values[i]
+        for exclusive la let r {
+            for exclusive KVD let c {
+                if (ka[[r, c]] - kb[[r, c]]).abs() ≻ tol then return false
+                if (va[[r, c]] - vb[[r, c]]).abs() ≻ tol then return false
+            }
+        }
+    }
+    if a.ring_kv.slot_ids.length() ≢ b.ring_kv.slot_ids.length() then return false
+    for exclusive a.ring_kv.slot_ids.length() let i {
+        if a.ring_kv.slot_ids[i] ≢ b.ring_kv.slot_ids[i] then return false
+        let int wa ← a.ring_kv.total_written[i]
+        let int wb ← b.ring_kv.total_written[i]
+        if wa ≢ wb then return false
+        let int win_a ← a.ring_kv.window_sizes[i]
+        let int win_b ← b.ring_kv.window_sizes[i]
+        if win_a ≢ win_b then return false
+        let ValidSpan sp ← ring_span(wa, win_a)
+        let tensor<f32, [W, KVD]> ka ← a.ring_kv.keys[i]
+        let tensor<f32, [W, KVD]> kb ← b.ring_kv.keys[i]
+        let tensor<f32, [W, KVD]> va ← a.ring_kv.values[i]
+        let tensor<f32, [W, KVD]> vb ← b.ring_kv.values[i]
+        for range sp.start_pos ‥ sp.end_pos let p {
+            let int slot ← ring_slot(p, win_a)
+            for exclusive KVD let c {
+                if (ka[[slot, c]] - kb[[slot, c]]).abs() ≻ tol then return false
+                if (va[[slot, c]] - vb[[slot, c]]).abs() ≻ tol then return false
+            }
+        }
+    }
+    return true
 }
 
 @ public
@@ -1045,6 +1180,191 @@ test "SessionState dense-only branch and commit over a ring-free schedule" {
         session.commit_prefix(mut sess, mut txn2, 1)
         assert sess.full_kv.lengths[0] ≡ 1
         assert sess.full_kv.lengths[1] ≡ 1
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "KvQuantConfig.enabled = true fails closed with UnsupportedKvQuant" {
+    let model_schedule.ExecutionSchedule sched ← mk_hybrid_flint_sched()
+    do {
+        mut session.SessionState<16, 513, 4> sess ← session.from_schedule<size 16, size 513, size 4>(sched)
+        let session.KvQuantConfig qcfg ← session.KvQuantConfig { key_bits = 4, value_bits = 4, group_size = 32, enabled = true }
+
+        do {
+            session.set_slot_kv_quant(mut sess, 1, qcfg)
+            assert false
+        }
+        catch err {
+            match err {
+                case session.SessionError.UnsupportedKvQuant let ? {
+                }
+                case _ {
+                    assert false
+                }
+            }
+        }
+
+        # Guarded write_kv and branch also reject a quantized slot config.
+        sess.slot_kv_quant[1] ← qcfg
+        let tensor<f32, [4]> k ← tf32[4] {}
+        let tensor<f32, [4]> v ← tf32[4] {}
+        do {
+            session.write_kv(mut sess, 1, k, v, 0 ∷ i32)
+            assert false
+        }
+        catch err {
+            match err {
+                case session.SessionError.UnsupportedKvQuant let ? {
+                }
+                case _ {
+                    assert false
+                }
+            }
+        }
+
+        do {
+            let session.SessionTxn<16, 513, 4> ? ← session.branch(mut sess)
+            assert false
+        }
+        catch err {
+            match err {
+                case session.SessionError.UnsupportedKvQuant let ? {
+                }
+                case _ {
+                    assert false
+                }
+            }
+        }
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "SessionTxn rejects mismatched SessionState with SessionMismatch" {
+    let model_schedule.ExecutionSchedule sched ← mk_hybrid_flint_sched()
+    do {
+        mut session.SessionState<16, 513, 4> sess_a ← session.from_schedule_with_id<size 16, size 513, size 4>(sched, 101)
+        mut session.SessionState<16, 513, 4> sess_b ← session.from_schedule_with_id<size 16, size 513, size 4>(sched, 202)
+
+        mut session.SessionTxn<16, 513, 4> txn_a ← session.branch(mut sess_a)
+        mut session.SessionTxn<16, 513, 4> txn_b ← session.branch(mut sess_b)
+
+        let tensor<f32, [4]> k ← tf32[4] {}
+        let tensor<f32, [4]> v ← tf32[4] {}
+
+        do {
+            session.txn_write_kv(mut sess_b, mut txn_a, 1, k, v, 0 ∷ i32)
+            assert false
+        }
+        catch err {
+            match err {
+                case session.SessionError.SessionMismatch let ? {
+                }
+                case _ {
+                    assert false
+                }
+            }
+        }
+
+        do {
+            session.commit_prefix(mut sess_b, mut txn_a, 0)
+            assert false
+        }
+        catch err {
+            match err {
+                case session.SessionError.SessionMismatch let ? {
+                }
+                case _ {
+                    assert false
+                }
+            }
+        }
+
+        do {
+            session.rollback(mut sess_a, mut txn_b)
+            assert false
+        }
+        catch err {
+            match err {
+                case session.SessionError.SessionMismatch let ? {
+                }
+                case _ {
+                    assert false
+                }
+            }
+        }
+
+        session.rollback(mut sess_a, mut txn_a)
+        session.rollback(mut sess_b, mut txn_b)
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "FullKvArena rollback compares only active [0..length) rows and masks stale draft tail" {
+    let model_schedule.ExecutionSchedule sched ← mk_dense_sched(1)
+    do {
+        mut session.SessionState<8, 1, 4> sess ← session.from_dense_schedule<size 8, size 4>(sched)
+        mut session.SessionState<8, 1, 4> baseline ← session.from_dense_schedule<size 8, size 4>(sched)
+
+        mut tensor<f32, [4]> k0 ← tf32[4] {}
+        mut tensor<f32, [4]> v0 ← tf32[4] {}
+        for exclusive 4 let j {
+            k0[[j]] ← (j + 1) ↦ f32
+            v0[[j]] ← ((j + 1) * 10) ↦ f32
+        }
+        session.write_kv(mut sess, 0, k0, v0, 0 ∷ i32)
+        session.write_kv(mut baseline, 0, k0, v0, 0 ∷ i32)
+
+        mut tensor<f32, [4]> draft_k ← tf32[4] {}
+        mut tensor<f32, [4]> draft_v ← tf32[4] {}
+        for exclusive 4 let j {
+            draft_k[[j]] ← 99.0
+            draft_v[[j]] ← -77.0
+        }
+
+        mut session.SessionTxn<8, 1, 4> txn ← session.branch(mut sess)
+        session.txn_write_kv(mut sess, mut txn, 0, draft_k, draft_v, 1 ∷ i32)
+        session.txn_write_kv(mut sess, mut txn, 0, draft_k, draft_v, 2 ∷ i32)
+        session.rollback(mut sess, mut txn)
+
+        # Zero-copy FullKv rollback leaves stale values in [1..3), so raw tensor
+        # indexing differs at row 1, while active_rows_equal compares only [0..1).
+        assert close(sess.full_kv.keys[0][[1, 0]], 99.0)
+        assert session.active_rows_equal(sess, baseline, 0.0001)
+
+        # Scoring at active pos 0 masks [1..8) despite stale draft rows, and
+        # accessing rolled-back pos 1 fails closed.
+        let tensor<f32, [1, 8]> dom ← tf32[1, 8] {}
+        mut tensor<f32, [1, 8]> sc ← tf32[1, 8] {}
+        session.score_full(sess.full_kv, 0, dom, k0, mut sc, 0 ∷ i32, 1 ∷ i32, 4 ∷ i32, 0.5 ∷ f32)
+        assert close(sc[[0, 0]], 15.0)
+        assert sc[[0, 1]] ≺ -1.0e30
+
+        mut tensor<f32, [1, 8]> pr ← tf32[1, 8] {}
+        session.softmax_full(sc, mut pr)
+        let tensor<f32, [4]> cdom ← tf32[4] {}
+        mut tensor<f32, [4]> ctx ← tf32[4] {}
+        session.context_full(sess.full_kv, 0, cdom, pr, mut ctx, 0 ∷ i32, 1 ∷ i32, 4 ∷ i32)
+        assert close(ctx[[0]], 10.0)
+
+        do {
+            session.score_full(sess.full_kv, 0, dom, k0, mut sc, 1 ∷ i32, 1 ∷ i32, 4 ∷ i32, 0.5 ∷ f32)
+            assert false
+        }
+        catch err {
+            match err {
+                case session.SessionError.OutOfBoundsPosition let ? {
+                }
+                case _ {
+                    assert false
+                }
+            }
+        }
     }
     catch err {
         assert false

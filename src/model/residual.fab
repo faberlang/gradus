@@ -2,8 +2,8 @@
 locale = "en"
 
 +++ faber
-# ResidualCarrier (Standard / AttnResBank) and runtime TapBuffer capture
-# (issue #102, Seam 3).
+# ResidualCarrier (Standard / AttnResBank), 4-message CrossPassController,
+# and runtime TapBuffer capture over [B, D] device kernels (issue #102, #137).
 #
 # Public import: import from "gradus:model/residual" let residual
 
@@ -20,188 +20,495 @@ union ResidualError {
     EmptyBank,
     TapNotFound,
     TapAlreadyCaptured,
-    TapNotCaptured
+    TapNotCaptured,
+    InvalidRole
 }
+
+@ public
+const int CROSS_PASS_Q = 0
+
+@ public
+const int CROSS_PASS_K = 1
+
+@ public
+const int CROSS_PASS_V = 2
+
+@ public
+const int CROSS_PASS_FFN = 3
+
+@ public
+const int CROSS_PASS_COUNT = 4
 
 # -------------------------------------------------------------------------
-# Standard single-stream carrier
+# [B, D] device kernels (zero host scalar loops, zero list<f32>)
 # -------------------------------------------------------------------------
 
 @ public
-class StandardCarrier<size D> {
-    mut tensor<f32, [D]> hidden
-}
-
-@ public
-fn init_standard<size D>(tensor<f32, [D]> initial_hidden) → StandardCarrier<size D> ⇥ ResidualError {
-    require D ≥ 1 throw variant InvalidConfig { message = "carrier dimension D must be at least 1" }
-    let tensor<f32, [D]> h ← copy initial_hidden
-    return StandardCarrier<size D> { hidden = h }
-}
-
-@ public
-fn standard_push<size D>(mut StandardCarrier<size D> c, tensor<f32, [D]> delta) → void {
-    mut tensor<f32, [D]> next ← tf32[D] {}
-    for exclusive D let i {
-        next[[i]] ← c.hidden[[i]] + delta[[i]]
+kernel copy_batch<size B, size D>(tensor<f32, [B, D]> src, mut tensor<f32, [B, D]> dst, i32 active_b) → void {
+    for from dst at [b, d] thread lane let ? {
+        if b ≥ 0 and b ≺ active_b {
+            dst[[b, d]] ← src[[b, d]]
+        }
     }
+}
+
+@ public
+kernel copy_2d<size R, size C>(tensor<f32, [R, C]> src, mut tensor<f32, [R, C]> dst) → void {
+    for from dst at [r, c] thread lane let ? {
+        dst[[r, c]] ← src[[r, c]]
+    }
+}
+
+@ public
+kernel zero_batch<size B, size D>(mut tensor<f32, [B, D]> dst) → void {
+    for from dst at [b, d] thread lane let ? {
+        dst[[b, d]] ← 0.0
+    }
+}
+
+@ public
+kernel add_batch<size B, size D>(tensor<f32, [B, D]> a, tensor<f32, [B, D]> b, mut tensor<f32, [B, D]> out, i32 active_b) → void {
+    for from a at [row, col] thread lane let av {
+        if row ≥ 0 and row ≺ active_b {
+            out[[row, col]] ← av + b[[row, col]]
+        }
+    }
+}
+
+@ public
+kernel write_bank_slice<size MaxRows, size B, size D>(tensor<f32, [B, D]> src, mut tensor<f32, [MaxRows, D]> bank_buf, i32 slot_idx, i32 active_b) → void {
+    let i32 b_cap ← B ↦ i32 ⊥ 1
+    let i32 start_row ← slot_idx * b_cap
+    let i32 end_row ← start_row + active_b
+    for from bank_buf at [r, d] thread lane let prev {
+        if slot_idx ∈ 0 … 4095 and b_cap ∈ 1 … 16384 and active_b ≥ 1 and active_b ≤ b_cap and r ≥ start_row and r ≺ end_row {
+            let i32 b ← r - start_row
+            bank_buf[[r, d]] ← src[[b, d]]
+        }
+        else {
+            bank_buf[[r, d]] ← prev
+        }
+    }
+}
+
+@ public
+kernel attn_res_scores_batch<size MaxRows, size B, size D, size Q, size QB, size MaxSrc>(tensor<f32, [MaxRows, D]> blocks_buf, tensor<f32, [B, D]> cur, tensor<f32, [Q, D]> queries, mut tensor<f32, [QB, MaxSrc]> scores, i32 num_blocks, i32 include_cur, i32 active_b, f32 scale) → void {
+    let i32 b_cap ← B ↦ i32 ⊥ 1
+    let i32 d_len ← D ↦ i32 ⊥ 1
+    let i32 q_len ← Q ↦ i32 ⊥ 1
+    let i32 max_r ← MaxRows ↦ i32 ⊥ 1
+    let i32 total_src ← num_blocks + include_cur
+    for from scores at [qb, k] thread lane let ? {
+        if b_cap ∈ 1 … 16384 and q_len ∈ 1 … 64 and d_len ∈ 1 … 65536 and num_blocks ∈ 0 … 4095 and qb ∈ 0 … 1048575 {
+            let i32 q_idx ← qb / b_cap
+            let i32 b ← qb % b_cap
+            if q_idx ≥ q_len or b ≥ active_b or k ≥ total_src {
+                scores[[qb, k]] ← -3.0e38
+            }
+            elif k ≺ num_blocks {
+                let i32 src_row ← k * b_cap + b
+                if src_row ≥ 0 and src_row ≺ max_r {
+                    mut f32 dot ← 0.0
+                    for range 0 ‥ d_len let j {
+                        dot ← dot + queries[[q_idx, j]] * blocks_buf[[src_row, j]]
+                    }
+                    scores[[qb, k]] ← dot * scale
+                }
+                else {
+                    scores[[qb, k]] ← -3.0e38
+                }
+            }
+            else {
+                mut f32 dot ← 0.0
+                for range 0 ‥ d_len let j {
+                    dot ← dot + queries[[q_idx, j]] * cur[[b, j]]
+                }
+                scores[[qb, k]] ← dot * scale
+            }
+        }
+        else {
+            scores[[qb, k]] ← -3.0e38
+        }
+    }
+}
+
+@ public
+kernel attn_res_softmax<size QB, size MaxSrc>(tensor<f32, [QB, MaxSrc]> scores, mut tensor<f32, [QB, MaxSrc]> probs) → void {
+    probs ⇇ scores.softmax()
+}
+
+@ public
+kernel attn_res_mix_batch<size MaxRows, size B, size D, size QB, size MaxSrc>(tensor<f32, [QB, MaxSrc]> probs, tensor<f32, [MaxRows, D]> blocks_buf, tensor<f32, [B, D]> cur, mut tensor<f32, [QB, D]> out, i32 num_blocks, i32 include_cur, i32 active_b) → void {
+    let i32 b_cap ← B ↦ i32 ⊥ 1
+    let i32 max_r ← MaxRows ↦ i32 ⊥ 1
+    let i32 max_s ← MaxSrc ↦ i32 ⊥ 1
+    for from out at [qb, d] thread lane let ? {
+        if b_cap ∈ 1 … 16384 and num_blocks ∈ 0 … 4095 and max_s ∈ 1 … 4096 and qb ∈ 0 … 1048575 {
+            let i32 b ← qb % b_cap
+            if b ≺ active_b {
+                mut f32 acc ← 0.0
+                for range 0 ‥ num_blocks let k {
+                    if k ≺ max_s {
+                        let i32 src_row ← k * b_cap + b
+                        if src_row ≥ 0 and src_row ≺ max_r {
+                            acc ← acc + probs[[qb, k]] * blocks_buf[[src_row, d]]
+                        }
+                    }
+                }
+                if include_cur ≡ 1 and num_blocks ≺ max_s {
+                    acc ← acc + probs[[qb, num_blocks]] * cur[[b, d]]
+                }
+                out[[qb, d]] ← acc
+            }
+        }
+    }
+}
+
+@ public
+kernel slice_qb_row<size QB, size B, size D>(tensor<f32, [QB, D]> src, mut tensor<f32, [B, D]> dst, i32 role_idx, i32 active_b) → void {
+    let i32 b_cap ← B ↦ i32 ⊥ 1
+    let i32 qb_max ← QB ↦ i32 ⊥ 1
+    for from dst at [b, d] thread lane let ? {
+        if role_idx ∈ 0 … 63 and b_cap ∈ 1 … 16384 and b ∈ 0 … 16383 and b ≺ active_b {
+            let i32 src_row ← role_idx * b_cap + b
+            if src_row ≥ 0 and src_row ≺ qb_max {
+                dst[[b, d]] ← src[[src_row, d]]
+            }
+        }
+    }
+}
+
+@ public
+kernel cross_pass_down_tanh<size B, size D, size R>(tensor<f32, [R, D]> w_down, tensor<f32, [B, D]> cur, mut tensor<f32, [B, R]> z, i32 active_b) → void {
+    let i32 d_len ← D ↦ i32 ⊥ 1
+    for from z at [b, r] thread lane let ? {
+        if b ≥ 0 and b ≺ active_b and d_len ∈ 1 … 65536 {
+            mut f32 acc ← 0.0
+            for range 0 ‥ d_len let i {
+                acc ← acc + w_down[[r, i]] * cur[[b, i]]
+            }
+            z[[b, r]] ← acc.tanh()
+        }
+    }
+}
+
+@ public
+kernel cross_pass_gate_mix<size B, size D, size R>(tensor<f32, [D, R]> w_gain, tensor<f32, [D, R]> w_forget, tensor<f32, [B, R]> z, tensor<f32, [B, D]> cur, tensor<f32, [B, D]> msg, mut tensor<f32, [B, D]> out, i32 active_b) → void {
+    let i32 r_len ← R ↦ i32 ⊥ 1
+    for from out at [b, d] thread lane let ? {
+        if b ≥ 0 and b ≺ active_b and r_len ∈ 1 … 4096 {
+            mut f32 g_logit ← 0.0
+            mut f32 f_logit ← 0.0
+            for range 0 ‥ r_len let r {
+                let f32 zr ← z[[b, r]]
+                g_logit ← g_logit + w_gain[[d, r]] * zr
+                f_logit ← f_logit + w_forget[[d, r]] * zr
+            }
+            let f32 gain ← g_logit.tanh()
+            let f32 forget ← f_logit.tanh()
+            out[[b, d]] ← (1.0 - forget) * cur[[b, d]] + gain * msg[[b, d]]
+        }
+    }
+}
+
+@ public
+kernel vec_to_batch1<size D>(tensor<f32, [D]> src, mut tensor<f32, [1, D]> dst) → void {
+    for from dst at [r, d] thread lane let ? {
+        if r ≡ 0 {
+            dst[[r, d]] ← src[[d]]
+        }
+    }
+}
+
+@ public
+kernel batch1_to_vec<size D>(tensor<f32, [1, D]> src, mut tensor<f32, [D]> dst) → void {
+    for from dst at [d] thread lane let ? {
+        dst[[d]] ← src[[0, d]]
+    }
+}
+
+@ public
+kernel pack_4_queries<size D>(tensor<f32, [D]> q0, tensor<f32, [D]> q1, tensor<f32, [D]> q2, tensor<f32, [D]> q3, mut tensor<f32, [4, D]> dst) → void {
+    for from dst at [r, d] thread lane let ? {
+        if r ≡ 0 {
+            dst[[r, d]] ← q0[[d]]
+        }
+        elif r ≡ 1 {
+            dst[[r, d]] ← q1[[d]]
+        }
+        elif r ≡ 2 {
+            dst[[r, d]] ← q2[[d]]
+        }
+        else {
+            dst[[r, d]] ← q3[[d]]
+        }
+    }
+}
+
+# -------------------------------------------------------------------------
+# Standard single-stream carrier over [B, D]
+# -------------------------------------------------------------------------
+
+@ public
+class StandardCarrier<size B, size D> {
+    mut tensor<f32, [B, D]> hidden
+}
+
+@ public
+fn init_standard_batch<size B, size D>(tensor<f32, [B, D]> initial_hidden) → StandardCarrier<size B, size D> ⇥ ResidualError {
+    require B ≥ 1 and D ≥ 1 throw variant InvalidConfig { message = "carrier dimensions B and D must be at least 1" }
+    mut tensor<f32, [B, D]> h ← tf32[B, D] {}
+    let i32 ab ← B ↦ i32 ⊥ 1
+    copy_batch<size B, size D>(initial_hidden, mut h, ab)
+    return StandardCarrier<size B, size D> { hidden = h }
+}
+
+@ public
+fn standard_push_delta_batch<size B, size D>(mut StandardCarrier<size B, size D> c, tensor<f32, [B, D]> delta, i32 active_b) → void {
+    mut tensor<f32, [B, D]> next ← tf32[B, D] {}
+    add_batch<size B, size D>(c.hidden, delta, mut next, active_b)
     c.hidden ← next
 }
 
+# 1D convenience wrappers for StandardCarrier (backed by [1, D] device kernels).
+@ public
+fn init_standard<size D>(tensor<f32, [D]> initial_hidden) → StandardCarrier<size 1, size D> ⇥ ResidualError {
+    require D ≥ 1 throw variant InvalidConfig { message = "carrier dimension D must be at least 1" }
+    mut tensor<f32, [1, D]> h ← tf32[1, D] {}
+    vec_to_batch1<size D>(initial_hidden, mut h)
+    return StandardCarrier<size 1, size D> { hidden = h }
+}
+
+@ public
+fn standard_push<size D>(mut StandardCarrier<size 1, size D> c, tensor<f32, [D]> delta) → void {
+    mut tensor<f32, [1, D]> db ← tf32[1, D] {}
+    vec_to_batch1<size D>(delta, mut db)
+    standard_push_delta_batch<size 1, size D>(mut c, db, 1)
+}
+
+@ public
+fn standard_hidden_1d<size D>(StandardCarrier<size 1, size D> c) → tensor<f32, [D]> {
+    mut tensor<f32, [D]> out ← tf32[D] {}
+    batch1_to_vec<size D>(c.hidden, mut out)
+    return out
+}
+
 # -------------------------------------------------------------------------
-# AttnResBank depthwise block-attention bank
+# AttnResBank depthwise block-attention bank over [B, D]
 # -------------------------------------------------------------------------
 
 @ public
-class AttnResBank<size D> {
+class AttnResBank<size B, size D, size MaxSrc, size MaxRows> {
     let int cadence
+    let int max_sources
+    mut int num_blocks
     mut int layers_in_block
-    mut list<tensor<f32, [D]>> blocks
-    mut tensor<f32, [D]> cur
-    mut list<tensor<f32, [D]>> prelude_blocks
-    mut tensor<f32, [D]> prelude_cur
+    mut tensor<f32, [MaxRows, D]> blocks_buf
+    mut tensor<f32, [B, D]> cur
+    mut tensor<f32, [MaxRows, D]> prelude_buf
+    mut tensor<f32, [B, D]> prelude_cur
+    mut int prelude_num_blocks
     mut int prelude_layers_in_block
     mut bool has_prelude
-    mut list<tensor<f32, [D]>> prev_pass_bank
+    mut tensor<f32, [MaxRows, D]> prev_pass_buf
+    mut int prev_pass_count
     mut bool has_prev_pass
 }
 
 @ public
-fn init_attn_res<size D>(int cadence, tensor<f32, [D]> initial_hidden) → AttnResBank<size D> ⇥ ResidualError {
-    require D ≥ 1 throw variant InvalidConfig { message = "AttnResBank dimension D must be at least 1" }
+fn init_attn_res_batch<size B, size D, size MaxSrc, size MaxRows>(int cadence, tensor<f32, [B, D]> initial_hidden) → AttnResBank<size B, size D, size MaxSrc, size MaxRows> ⇥ ResidualError {
+    require B ≥ 1 and D ≥ 1 and MaxSrc ≥ 1 throw variant InvalidConfig { message = "AttnResBank dimensions B, D, and MaxSrc must be at least 1" }
+    require MaxRows ≥ MaxSrc * B throw variant InvalidConfig { message = "AttnResBank MaxRows must be >= MaxSrc * B" }
     require cadence ≥ 1 throw variant InvalidConfig { message = "n_layers_per_attn_res_block must be at least 1" }
 
-    let tensor<f32, [D]> cur ← copy initial_hidden
-    let tensor<f32, [D]> p_cur ← tf32[D] {}
-    return AttnResBank<size D> { cadence = cadence, layers_in_block = 0, blocks = empty, cur = cur, prelude_blocks = empty, prelude_cur = p_cur, prelude_layers_in_block = 0, has_prelude = false, prev_pass_bank = empty, has_prev_pass = false }
+    let tensor<f32, [MaxRows, D]> blocks_buf ← tf32[MaxRows, D] {}
+    mut tensor<f32, [B, D]> cur ← tf32[B, D] {}
+    let i32 ab ← B ↦ i32 ⊥ 1
+    copy_batch<size B, size D>(initial_hidden, mut cur, ab)
+
+    let tensor<f32, [MaxRows, D]> p_buf ← tf32[MaxRows, D] {}
+    let tensor<f32, [B, D]> p_cur ← tf32[B, D] {}
+    let tensor<f32, [MaxRows, D]> prev_buf ← tf32[MaxRows, D] {}
+
+    return AttnResBank<size B, size D, size MaxSrc, size MaxRows> {
+        cadence = cadence,
+        max_sources = MaxSrc,
+        num_blocks = 0,
+        layers_in_block = 0,
+        blocks_buf = blocks_buf,
+        cur = cur,
+        prelude_buf = p_buf,
+        prelude_cur = p_cur,
+        prelude_num_blocks = 0,
+        prelude_layers_in_block = 0,
+        has_prelude = false,
+        prev_pass_buf = prev_buf,
+        prev_pass_count = 0,
+        has_prev_pass = false
+    }
 }
 
-fn copy_tensor_list<size D>(list<tensor<f32, [D]>> src) → list<tensor<f32, [D]>> {
-    mut list<tensor<f32, [D]>> out ← empty
-    for from src let t {
-        let tensor<f32, [D]> c ← copy t
-        out.append(c)
+fn active_source_count<size B, size D, size MaxSrc, size MaxRows>(AttnResBank<size B, size D, size MaxSrc, size MaxRows> bank) → int {
+    if bank.layers_in_block ≻ 0 or bank.num_blocks ≡ 0 {
+        return bank.num_blocks + 1
     }
-    return out
+    return bank.num_blocks
 }
 
-fn collect_sources<size D>(AttnResBank<size D> bank) → list<tensor<f32, [D]>> {
-    mut list<tensor<f32, [D]>> sources ← copy_tensor_list<size D>(bank.blocks)
-    if bank.layers_in_block ≻ 0 or bank.blocks.length() ≡ 0 {
-        let tensor<f32, [D]> c ← copy bank.cur
-        sources.append(c)
-    }
-    return sources
-}
+fn attend_bank_batch<size MaxRows, size B, size D, size Q, size QB, size MaxSrc>(tensor<f32, [MaxRows, D]> blocks_buf, tensor<f32, [B, D]> cur, int num_blocks, int include_cur, tensor<f32, [Q, D]> queries, mut tensor<f32, [QB, D]> out, i32 active_b) → void ⇥ ResidualError {
+    let int total_src ← num_blocks + include_cur
+    require total_src ≥ 1 throw variant EmptyBank { message = "cannot attend over empty depth bank" }
+    require total_src ≤ MaxSrc throw variant InvalidConfig { message = "depth sources § exceed MaxSrc §"(total_src ↦ string, MaxSrc ↦ string) }
+    require QB ≡ Q * B throw variant ShapeMismatch { message = "query output rows QB must equal Q * B" }
+    require active_b ≥ 1 and active_b ≤ B throw variant ShapeMismatch { message = "active_b out of bounds [1..B]" }
 
-fn attend_sources<size D>(list<tensor<f32, [D]>> sources, tensor<f32, [D]> query) → tensor<f32, [D]> ⇥ ResidualError {
-    let int k_len ← sources.length()
-    require k_len ≥ 1 throw variant EmptyBank { message = "cannot attend over empty depth bank" }
+    let f32 scale ← (1.0 ∷ f32) / (√ (D ↦ f32))
+    mut tensor<f32, [QB, MaxSrc]> scores ← tf32[QB, MaxSrc] {}
+    mut tensor<f32, [QB, MaxSrc]> probs ← tf32[QB, MaxSrc] {}
+    let i32 nb ← num_blocks ↦ i32 ⊥ 0
+    let i32 inc ← include_cur ↦ i32 ⊥ 0
 
-    let f32 scale ← (1.0 ∷ f32) / (√(D ↦ f32))
-    mut list<f32> scores ← empty
-    mut f32 max_score ← (-1.0e30 ∷ f32)
-
-    for exclusive k_len let k {
-        let tensor<f32, [D]> src ← sources[k]
-        mut f32 dot ← (0.0 ∷ f32)
-        for exclusive D let i {
-            dot ← dot + query[[i]] * src[[i]]
-        }
-        let f32 s ← dot * scale
-        scores.append(s)
-        if k ≡ 0 or s ≻ max_score {
-            max_score ← s
-        }
-    }
-
-    mut list<f32> weights ← empty
-    mut f32 sum_w ← (0.0 ∷ f32)
-    for exclusive k_len let k {
-        let f32 w ← (scores[k] - max_score).exp()
-        weights.append(w)
-        sum_w ← sum_w + w
-    }
-
-    mut tensor<f32, [D]> out ← tf32[D] {}
-    for exclusive k_len let k {
-        let f32 prob ← weights[k] / sum_w
-        let tensor<f32, [D]> src ← sources[k]
-        for exclusive D let i {
-            out[[i]] ← out[[i]] + prob * src[[i]]
-        }
-    }
-
-    return out
+    attn_res_scores_batch<size MaxRows, size B, size D, size Q, size QB, size MaxSrc>(blocks_buf, cur, queries, mut scores, nb, inc, active_b, scale)
+    attn_res_softmax<size QB, size MaxSrc>(scores, mut probs)
+    attn_res_mix_batch<size MaxRows, size B, size D, size QB, size MaxSrc>(probs, blocks_buf, cur, mut out, nb, inc, active_b)
 }
 
 @ public
-fn attn_res_query_1d<size D>(AttnResBank<size D> bank, tensor<f32, [D]> query) → tensor<f32, [D]> ⇥ ResidualError {
-    let list<tensor<f32, [D]>> sources ← collect_sources<size D>(bank)
-    return attend_sources<size D>(sources, query)
+fn attn_res_query_batch<size B, size D, size MaxSrc, size MaxRows, size Q, size QB>(AttnResBank<size B, size D, size MaxSrc, size MaxRows> bank, tensor<f32, [Q, D]> queries, mut tensor<f32, [QB, D]> out, i32 active_b) → void ⇥ ResidualError {
+    let int include_cur ← (bank.layers_in_block ≻ 0 or bank.num_blocks ≡ 0) ✓ 1 ✗ 0
+    attend_bank_batch<size MaxRows, size B, size D, size Q, size QB, size MaxSrc>(bank.blocks_buf, bank.cur, bank.num_blocks, include_cur, queries, mut out, active_b)
 }
 
 @ public
-fn attn_res_query_3d<size D>(AttnResBank<size D> bank, tensor<f32, [3, D]> queries) → tensor<f32, [3, D]> ⇥ ResidualError {
-    let list<tensor<f32, [D]>> sources ← collect_sources<size D>(bank)
-    mut tensor<f32, [3, D]> out ← tf32[3, D] {}
-
-    for exclusive 3 let r {
-        mut tensor<f32, [D]> q_row ← tf32[D] {}
-        for exclusive D let i {
-            q_row[[i]] ← queries[[r, i]]
-        }
-        let tensor<f32, [D]> attended ← attend_sources<size D>(sources, q_row)
-        for exclusive D let i {
-            out[[r, i]] ← attended[[i]]
-        }
-    }
-
-    return out
+fn attn_res_query_1_batch<size B, size D, size MaxSrc, size MaxRows>(AttnResBank<size B, size D, size MaxSrc, size MaxRows> bank, tensor<f32, [D]> query, mut tensor<f32, [B, D]> out, i32 active_b) → void ⇥ ResidualError {
+    mut tensor<f32, [1, D]> q2d ← tf32[1, D] {}
+    vec_to_batch1<size D>(query, mut q2d)
+    attn_res_query_batch<size B, size D, size MaxSrc, size MaxRows, size 1, size B>(bank, q2d, mut out, active_b)
 }
 
 @ public
-fn attn_res_push<size D>(mut AttnResBank<size D> bank, tensor<f32, [D]> delta) → void {
-    mut tensor<f32, [D]> next_cur ← tf32[D] {}
-    for exclusive D let i {
-        next_cur[[i]] ← bank.cur[[i]] + delta[[i]]
-    }
+fn attn_res_query_3_batch<size B, size D, size MaxSrc, size MaxRows, size ThreeB>(AttnResBank<size B, size D, size MaxSrc, size MaxRows> bank, tensor<f32, [3, D]> queries, mut tensor<f32, [ThreeB, D]> out_qkv, mut tensor<f32, [B, D]> out_q, mut tensor<f32, [B, D]> out_k, mut tensor<f32, [B, D]> out_v, i32 active_b) → void ⇥ ResidualError {
+    require ThreeB ≡ 3 * B throw variant ShapeMismatch { message = "ThreeB must equal 3 * B" }
+    attn_res_query_batch<size B, size D, size MaxSrc, size MaxRows, size 3, size ThreeB>(bank, queries, mut out_qkv, active_b)
+    slice_qb_row<size ThreeB, size B, size D>(out_qkv, mut out_q, 0, active_b)
+    slice_qb_row<size ThreeB, size B, size D>(out_qkv, mut out_k, 1, active_b)
+    slice_qb_row<size ThreeB, size B, size D>(out_qkv, mut out_v, 2, active_b)
+}
+
+# Sublayer delta push ONLY: accumulates delta into `bank.cur` without advancing
+# the visit cadence counter. Call `attn_res_end_visit_batch` once at visit end.
+@ public
+fn attn_res_push_delta_batch<size B, size D, size MaxSrc, size MaxRows>(mut AttnResBank<size B, size D, size MaxSrc, size MaxRows> bank, tensor<f32, [B, D]> delta, i32 active_b) → void {
+    mut tensor<f32, [B, D]> next_cur ← tf32[B, D] {}
+    add_batch<size B, size D>(bank.cur, delta, mut next_cur, active_b)
     bank.cur ← next_cur
-    bank.layers_in_block ↑
+}
 
+# Visit-end cadence commit: increments `layers_in_block` once per layer visit
+# and commits `cur` into `blocks_buf` when `layers_in_block == cadence`.
+@ public
+fn attn_res_end_visit_batch<size B, size D, size MaxSrc, size MaxRows>(mut AttnResBank<size B, size D, size MaxSrc, size MaxRows> bank, i32 active_b) → bool ⇥ ResidualError {
+    require active_b ≥ 1 and active_b ≤ B throw variant ShapeMismatch { message = "active_b out of bounds [1..B]" }
+    bank.layers_in_block ↑
     if bank.layers_in_block ≡ bank.cadence {
-        let tensor<f32, [D]> committed ← copy bank.cur
-        bank.blocks.append(committed)
-        bank.cur ← tf32[D] {}
+        require bank.num_blocks ≺ MaxSrc throw variant InvalidConfig { message = "AttnResBank exceeded MaxSrc capacity §"(MaxSrc ↦ string) }
+        let tensor<f32, [B, D]> cur_snap ← copy bank.cur
+        let i32 blk_i32 ← bank.num_blocks ↦ i32 ⊥ 0
+        mut tensor<f32, [MaxRows, D]> buf ← copy bank.blocks_buf
+        write_bank_slice<size MaxRows, size B, size D>(cur_snap, mut buf, blk_i32, active_b)
+        bank.blocks_buf ← buf
+        bank.num_blocks ↑
+        bank.cur ← tf32[B, D] {}
         bank.layers_in_block ← 0
+        return true
     }
+    return false
 }
 
 @ public
-fn snapshot_prelude<size D>(mut AttnResBank<size D> bank) → void {
-    bank.prelude_blocks ← copy_tensor_list<size D>(bank.blocks)
-    bank.prelude_cur ← copy bank.cur
+fn snapshot_prelude<size B, size D, size MaxSrc, size MaxRows>(mut AttnResBank<size B, size D, size MaxSrc, size MaxRows> bank) → void {
+    mut tensor<f32, [MaxRows, D]> pbuf ← tf32[MaxRows, D] {}
+    mut tensor<f32, [B, D]> pcur ← tf32[B, D] {}
+    copy_2d<size MaxRows, size D>(bank.blocks_buf, mut pbuf)
+    copy_2d<size B, size D>(bank.cur, mut pcur)
+    bank.prelude_buf ← pbuf
+    bank.prelude_cur ← pcur
+    bank.prelude_num_blocks ← bank.num_blocks
     bank.prelude_layers_in_block ← bank.layers_in_block
     bank.has_prelude ← true
 }
 
 @ public
-fn begin_next_pass<size D>(mut AttnResBank<size D> bank) → void ⇥ ResidualError {
+fn begin_next_pass<size B, size D, size MaxSrc, size MaxRows>(mut AttnResBank<size B, size D, size MaxSrc, size MaxRows> bank, i32 active_b) → void ⇥ ResidualError {
     require bank.has_prelude throw variant InvalidPass { message = "cannot reset_to_prelude before snapshot_prelude" }
+    require active_b ≥ 1 and active_b ≤ B throw variant ShapeMismatch { message = "active_b out of bounds [1..B]" }
 
-    bank.prev_pass_bank ← collect_sources<size D>(bank)
+    let int total_prev ← active_source_count<size B, size D, size MaxSrc, size MaxRows>(bank)
+    require total_prev ≤ MaxSrc throw variant InvalidConfig { message = "prev_pass_bank exceeded MaxSrc capacity §"(MaxSrc ↦ string) }
+
+    mut tensor<f32, [MaxRows, D]> prev_buf ← tf32[MaxRows, D] {}
+    copy_2d<size MaxRows, size D>(bank.blocks_buf, mut prev_buf)
+    if total_prev ≻ bank.num_blocks {
+        let tensor<f32, [B, D]> cur_snap ← copy bank.cur
+        let i32 blk_i32 ← bank.num_blocks ↦ i32 ⊥ 0
+        write_bank_slice<size MaxRows, size B, size D>(cur_snap, mut prev_buf, blk_i32, active_b)
+    }
+    bank.prev_pass_buf ← prev_buf
+    bank.prev_pass_count ← total_prev
     bank.has_prev_pass ← true
-    bank.blocks ← copy_tensor_list<size D>(bank.prelude_blocks)
-    bank.cur ← copy bank.prelude_cur
+
+    mut tensor<f32, [MaxRows, D]> restored_buf ← tf32[MaxRows, D] {}
+    mut tensor<f32, [B, D]> restored_cur ← tf32[B, D] {}
+    copy_2d<size MaxRows, size D>(bank.prelude_buf, mut restored_buf)
+    copy_2d<size B, size D>(bank.prelude_cur, mut restored_cur)
+    bank.blocks_buf ← restored_buf
+    bank.cur ← restored_cur
+    bank.num_blocks ← bank.prelude_num_blocks
     bank.layers_in_block ← bank.prelude_layers_in_block
 }
 
+# 1D convenience wrappers for AttnResBank (B = 1, backed by [1, D] kernels).
+@ public
+fn init_attn_res<size D, size MaxSrc>(int cadence, tensor<f32, [D]> initial_hidden) → AttnResBank<size 1, size D, size MaxSrc, size MaxSrc> ⇥ ResidualError {
+    mut tensor<f32, [1, D]> h ← tf32[1, D] {}
+    vec_to_batch1<size D>(initial_hidden, mut h)
+    return init_attn_res_batch<size 1, size D, size MaxSrc, size MaxSrc>(cadence, h)
+}
+
+@ public
+fn attn_res_push_delta<size D, size MaxSrc>(mut AttnResBank<size 1, size D, size MaxSrc, size MaxSrc> bank, tensor<f32, [D]> delta) → void {
+    mut tensor<f32, [1, D]> db ← tf32[1, D] {}
+    vec_to_batch1<size D>(delta, mut db)
+    attn_res_push_delta_batch<size 1, size D, size MaxSrc, size MaxSrc>(mut bank, db, 1)
+}
+
+@ public
+fn attn_res_end_visit<size D, size MaxSrc>(mut AttnResBank<size 1, size D, size MaxSrc, size MaxSrc> bank) → bool ⇥ ResidualError {
+    return attn_res_end_visit_batch<size 1, size D, size MaxSrc, size MaxSrc>(mut bank, 1)
+}
+
+@ public
+fn attn_res_query_1d<size D, size MaxSrc>(AttnResBank<size 1, size D, size MaxSrc, size MaxSrc> bank, tensor<f32, [D]> query) → tensor<f32, [D]> ⇥ ResidualError {
+    mut tensor<f32, [1, D]> out_b ← tf32[1, D] {}
+    attn_res_query_1_batch<size 1, size D, size MaxSrc, size MaxSrc>(bank, query, mut out_b, 1)
+    mut tensor<f32, [D]> out ← tf32[D] {}
+    batch1_to_vec<size D>(out_b, mut out)
+    return out
+}
+
+@ public
+fn attn_res_query_3d<size D, size MaxSrc>(AttnResBank<size 1, size D, size MaxSrc, size MaxSrc> bank, tensor<f32, [3, D]> queries) → tensor<f32, [3, D]> ⇥ ResidualError {
+    mut tensor<f32, [3, D]> out ← tf32[3, D] {}
+    attn_res_query_batch<size 1, size D, size MaxSrc, size MaxSrc, size 3, size 3>(bank, queries, mut out, 1)
+    return out
+}
+
 # -------------------------------------------------------------------------
-# Cross-pass rank-R (e.g. rank-64) tanh gain/forget message controller
+# 4-message (Q, K, V, FFN) CrossPassController over [B, D]
 # -------------------------------------------------------------------------
 
 @ public
-class CrossPassController<size D, size R> {
+class CrossPassGate<size D, size R> {
     let tensor<f32, [R, D]> w_down
     let tensor<f32, [D, R]> w_gain
     let tensor<f32, [D, R]> w_forget
@@ -209,109 +516,406 @@ class CrossPassController<size D, size R> {
 }
 
 @ public
-fn apply_cross_pass<size D, size R>(AttnResBank<size D> bank, CrossPassController<size D, R> ctrl, tensor<f32, [D]> h) → tensor<f32, [D]> ⇥ ResidualError {
+class CrossPassController<size D, size R> {
+    let tensor<f32, [R, D]> q_w_down
+    let tensor<f32, [D, R]> q_w_gain
+    let tensor<f32, [D, R]> q_w_forget
+    let tensor<f32, [D]> q_prev_query
+    let tensor<f32, [R, D]> k_w_down
+    let tensor<f32, [D, R]> k_w_gain
+    let tensor<f32, [D, R]> k_w_forget
+    let tensor<f32, [D]> k_prev_query
+    let tensor<f32, [R, D]> v_w_down
+    let tensor<f32, [D, R]> v_w_gain
+    let tensor<f32, [D, R]> v_w_forget
+    let tensor<f32, [D]> v_prev_query
+    let tensor<f32, [R, D]> ffn_w_down
+    let tensor<f32, [D, R]> ffn_w_gain
+    let tensor<f32, [D, R]> ffn_w_forget
+    let tensor<f32, [D]> ffn_prev_query
+}
+
+@ public
+fn init_cross_pass_gate<size D, size R>(tensor<f32, [R, D]> w_down, tensor<f32, [D, R]> w_gain, tensor<f32, [D, R]> w_forget, tensor<f32, [D]> prev_query) → CrossPassGate<size D, size R> {
+    return CrossPassGate<size D, size R> {
+        w_down = w_down,
+        w_gain = w_gain,
+        w_forget = w_forget,
+        prev_query = prev_query
+    }
+}
+
+@ public
+fn init_cross_pass_controller<size D, size R>(CrossPassGate<size D, size R> q, CrossPassGate<size D, size R> k, CrossPassGate<size D, size R> v, CrossPassGate<size D, size R> ffn) → CrossPassController<size D, size R> {
+    return CrossPassController<size D, size R> {
+        q_w_down = q.w_down,
+        q_w_gain = q.w_gain,
+        q_w_forget = q.w_forget,
+        q_prev_query = q.prev_query,
+        k_w_down = k.w_down,
+        k_w_gain = k.w_gain,
+        k_w_forget = k.w_forget,
+        k_prev_query = k.prev_query,
+        v_w_down = v.w_down,
+        v_w_gain = v.w_gain,
+        v_w_forget = v.w_forget,
+        v_prev_query = v.prev_query,
+        ffn_w_down = ffn.w_down,
+        ffn_w_gain = ffn.w_gain,
+        ffn_w_forget = ffn.w_forget,
+        ffn_prev_query = ffn.prev_query
+    }
+}
+
+fn gate_for_role<size D, size R>(CrossPassController<size D, size R> ctrl, int role) → CrossPassGate<size D, size R> ⇥ ResidualError {
+    switch role {
+        case 0 {
+            return init_cross_pass_gate<size D, size R>(ctrl.q_w_down, ctrl.q_w_gain, ctrl.q_w_forget, ctrl.q_prev_query)
+        }
+        case 1 {
+            return init_cross_pass_gate<size D, size R>(ctrl.k_w_down, ctrl.k_w_gain, ctrl.k_w_forget, ctrl.k_prev_query)
+        }
+        case 2 {
+            return init_cross_pass_gate<size D, size R>(ctrl.v_w_down, ctrl.v_w_gain, ctrl.v_w_forget, ctrl.v_prev_query)
+        }
+        case 3 {
+            return init_cross_pass_gate<size D, size R>(ctrl.ffn_w_down, ctrl.ffn_w_gain, ctrl.ffn_w_forget, ctrl.ffn_prev_query)
+        }
+        default {
+            throw variant InvalidRole { message = "cross-pass role § outside [0..4)"(role ↦ string) }
+        }
+    }
+}
+
+# Synthesize all 4 cross-pass messages (Q, K, V, FFN) from `prev_pass_buf`
+# into `msgs_out[4 * B, D]` in a single batched depth-attention launch.
+@ public
+fn synthesize_cross_pass_messages_batch<size B, size D, size R, size MaxSrc, size MaxRows, size FourB>(AttnResBank<size B, size D, size MaxSrc, size MaxRows> bank, CrossPassController<size D, size R> ctrl, mut tensor<f32, [FourB, D]> msgs_out, i32 active_b) → void ⇥ ResidualError {
     require bank.has_prev_pass throw variant InvalidPass { message = "cross-pass controller requires prev_pass_bank" }
+    require bank.prev_pass_count ≥ 1 throw variant EmptyBank { message = "prev_pass_bank is empty" }
+    require R ≥ 1 throw variant InvalidConfig { message = "cross-pass gate rank R must be at least 1" }
+    require FourB ≡ 4 * B throw variant ShapeMismatch { message = "FourB must equal 4 * B" }
+
+    mut tensor<f32, [4, D]> queries ← tf32[4, D] {}
+    pack_4_queries<size D>(ctrl.q_prev_query, ctrl.k_prev_query, ctrl.v_prev_query, ctrl.ffn_prev_query, mut queries)
+    let tensor<f32, [B, D]> dummy_cur ← tf32[B, D] {}
+    attend_bank_batch<size MaxRows, size B, size D, size 4, size FourB, size MaxSrc>(bank.prev_pass_buf, dummy_cur, bank.prev_pass_count, 0, queries, mut msgs_out, active_b)
+}
+
+# Gate one [B, D] stream with tensor weights via:
+#   out = (1 - tanh(forget)) * cur + tanh(gain) * msg
+fn apply_cross_pass_weights_batch<size B, size D, size R>(tensor<f32, [R, D]> w_down, tensor<f32, [D, R]> w_gain, tensor<f32, [D, R]> w_forget, tensor<f32, [B, D]> cur, tensor<f32, [B, D]> msg, mut tensor<f32, [B, D]> out, i32 active_b) → void ⇥ ResidualError {
+    require R ≥ 1 throw variant InvalidConfig { message = "cross-pass gate rank R must be at least 1" }
+    require active_b ≥ 1 and active_b ≤ B throw variant ShapeMismatch { message = "active_b out of bounds [1..B]" }
+
+    mut tensor<f32, [B, R]> z ← tf32[B, R] {}
+    cross_pass_down_tanh<size B, size D, size R>(w_down, cur, mut z, active_b)
+    cross_pass_gate_mix<size B, size D, size R>(w_gain, w_forget, z, cur, msg, mut out, active_b)
+}
+
+# Gate one [B, D] stream with one CrossPassGate via:
+#   out = (1 - tanh(forget)) * cur + tanh(gain) * msg
+@ public
+fn apply_cross_pass_gate_batch<size B, size D, size R>(CrossPassGate<size D, size R> gate, tensor<f32, [B, D]> cur, tensor<f32, [B, D]> msg, mut tensor<f32, [B, D]> out, i32 active_b) → void ⇥ ResidualError {
+    apply_cross_pass_weights_batch<size B, size D, size R>(gate.w_down, gate.w_gain, gate.w_forget, cur, msg, mut out, active_b)
+}
+
+# Synthesize and apply a single cross-pass role (Q, K, V, or FFN) on [B, D].
+@ public
+fn apply_cross_pass_role_batch<size B, size D, size R, size MaxSrc, size MaxRows>(AttnResBank<size B, size D, size MaxSrc, size MaxRows> bank, CrossPassController<size D, size R> ctrl, int role, tensor<f32, [B, D]> cur, mut tensor<f32, [B, D]> out, i32 active_b) → void ⇥ ResidualError {
+    require bank.has_prev_pass throw variant InvalidPass { message = "cross-pass controller requires prev_pass_bank" }
+    require bank.prev_pass_count ≥ 1 throw variant EmptyBank { message = "prev_pass_bank is empty" }
     require R ≥ 1 throw variant InvalidConfig { message = "cross-pass gate rank R must be at least 1" }
 
-    let tensor<f32, [D]> m_prev ← attend_sources<size D>(bank.prev_pass_bank, ctrl.prev_query)
+    let CrossPassGate<size D, size R> gate ← gate_for_role<size D, size R>(ctrl, role)
+    mut tensor<f32, [1, D]> q2d ← tf32[1, D] {}
+    vec_to_batch1<size D>(gate.prev_query, mut q2d)
+    let tensor<f32, [B, D]> dummy_cur ← tf32[B, D] {}
+    mut tensor<f32, [B, D]> msg ← tf32[B, D] {}
+    attend_bank_batch<size MaxRows, size B, size D, size 1, size B, size MaxSrc>(bank.prev_pass_buf, dummy_cur, bank.prev_pass_count, 0, q2d, mut msg, active_b)
+    apply_cross_pass_weights_batch<size B, size D, size R>(gate.w_down, gate.w_gain, gate.w_forget, cur, msg, mut out, active_b)
+}
 
-    mut tensor<f32, [R]> z ← tf32[R] {}
-    for exclusive R let r {
-        mut f32 acc ← (0.0 ∷ f32)
-        for exclusive D let i {
-            acc ← acc + ctrl.w_down[[r, i]] * h[[i]]
-        }
-        z[[r]] ← acc.tanh()
-    }
+# Synthesize all 4 cross-pass messages (Q, K, V, FFN) and gate all 4 streams.
+@ public
+fn apply_cross_pass_4msg_batch<size B, size D, size R, size MaxSrc, size MaxRows, size FourB>(AttnResBank<size B, size D, size MaxSrc, size MaxRows> bank, CrossPassController<size D, size R> ctrl, tensor<f32, [B, D]> cur_q, tensor<f32, [B, D]> cur_k, tensor<f32, [B, D]> cur_v, tensor<f32, [B, D]> cur_ffn, mut tensor<f32, [B, D]> out_q, mut tensor<f32, [B, D]> out_k, mut tensor<f32, [B, D]> out_v, mut tensor<f32, [B, D]> out_ffn, i32 active_b) → void ⇥ ResidualError {
+    mut tensor<f32, [FourB, D]> msgs ← tf32[FourB, D] {}
+    synthesize_cross_pass_messages_batch<size B, size D, size R, size MaxSrc, size MaxRows, size FourB>(bank, ctrl, mut msgs, active_b)
 
+    mut tensor<f32, [B, D]> msg_q ← tf32[B, D] {}
+    mut tensor<f32, [B, D]> msg_k ← tf32[B, D] {}
+    mut tensor<f32, [B, D]> msg_v ← tf32[B, D] {}
+    mut tensor<f32, [B, D]> msg_ffn ← tf32[B, D] {}
+    slice_qb_row<size FourB, size B, size D>(msgs, mut msg_q, CROSS_PASS_Q ↦ i32 ⊥ 0, active_b)
+    slice_qb_row<size FourB, size B, size D>(msgs, mut msg_k, CROSS_PASS_K ↦ i32 ⊥ 1, active_b)
+    slice_qb_row<size FourB, size B, size D>(msgs, mut msg_v, CROSS_PASS_V ↦ i32 ⊥ 2, active_b)
+    slice_qb_row<size FourB, size B, size D>(msgs, mut msg_ffn, CROSS_PASS_FFN ↦ i32 ⊥ 3, active_b)
+
+    apply_cross_pass_weights_batch<size B, size D, size R>(ctrl.q_w_down, ctrl.q_w_gain, ctrl.q_w_forget, cur_q, msg_q, mut out_q, active_b)
+    apply_cross_pass_weights_batch<size B, size D, size R>(ctrl.k_w_down, ctrl.k_w_gain, ctrl.k_w_forget, cur_k, msg_k, mut out_k, active_b)
+    apply_cross_pass_weights_batch<size B, size D, size R>(ctrl.v_w_down, ctrl.v_w_gain, ctrl.v_w_forget, cur_v, msg_v, mut out_v, active_b)
+    apply_cross_pass_weights_batch<size B, size D, size R>(ctrl.ffn_w_down, ctrl.ffn_w_gain, ctrl.ffn_w_forget, cur_ffn, msg_ffn, mut out_ffn, active_b)
+}
+
+# 1D convenience wrapper for CrossPassController (backed by [1, D] kernels).
+@ public
+fn apply_cross_pass<size D, size R, size MaxSrc>(AttnResBank<size 1, size D, size MaxSrc, size MaxSrc> bank, CrossPassController<size D, size R> ctrl, int role, tensor<f32, [D]> cur) → tensor<f32, [D]> ⇥ ResidualError {
+    mut tensor<f32, [1, D]> cur_b ← tf32[1, D] {}
+    mut tensor<f32, [1, D]> out_b ← tf32[1, D] {}
+    vec_to_batch1<size D>(cur, mut cur_b)
+    apply_cross_pass_role_batch<size 1, size D, size R, size MaxSrc, size MaxSrc>(bank, ctrl, role, cur_b, mut out_b, 1)
     mut tensor<f32, [D]> out ← tf32[D] {}
-    for exclusive D let i {
-        mut f32 g_logit ← (0.0 ∷ f32)
-        mut f32 f_logit ← (0.0 ∷ f32)
-        for exclusive R let r {
-            g_logit ← g_logit + ctrl.w_gain[[i, r]] * z[[r]]
-            f_logit ← f_logit + ctrl.w_forget[[i, r]] * z[[r]]
-        }
-        let f32 gain ← sigmoid g_logit
-        let f32 forget ← sigmoid f_logit
-        out[[i]] ← forget * h[[i]] + gain * m_prev[[i]]
-    }
-
+    batch1_to_vec<size D>(out_b, mut out)
     return out
 }
 
 # -------------------------------------------------------------------------
-# Unified ResidualCarrier
+# Unified ResidualCarrier union (unrepresentable illegal states)
 # -------------------------------------------------------------------------
 
 @ public
-class ResidualCarrier<size D> {
-    let schedule.ResidualKind kind
-    mut StandardCarrier<size D> ∪ none standard
-    mut AttnResBank<size D> ∪ none attn_res
+union ResidualCarrier<S, A> {
+    Standard {
+        S carrier
+    },
+    AttnRes {
+        A bank
+    }
 }
 
 @ public
-fn carrier_from_schedule<size D>(schedule.ExecutionSchedule sched, int attn_res_cadence, tensor<f32, [D]> initial_hidden) → ResidualCarrier<size D> ⇥ ResidualError {
+fn carrier_from_schedule_batch<size B, size D, size MaxSrc, size MaxRows>(schedule.ExecutionSchedule sched, int attn_res_cadence, tensor<f32, [B, D]> initial_hidden) → ResidualCarrier<StandardCarrier<size B, size D>, AttnResBank<size B, size D, size MaxSrc, size MaxRows>> ⇥ ResidualError {
     match sched.residual {
         case schedule.ResidualKind.Standard {
-            let StandardCarrier<size D> sc ← init_standard<size D>(initial_hidden)
-            return ResidualCarrier<size D> { kind = sched.residual, standard = sc, attn_res = null }
+            let StandardCarrier<size B, size D> sc ← init_standard_batch<size B, size D>(initial_hidden)
+            return variant Standard { carrier = sc }
         }
         case schedule.ResidualKind.AttnRes {
-            let AttnResBank<size D> bank ← init_attn_res<size D>(attn_res_cadence, initial_hidden)
-            return ResidualCarrier<size D> { kind = sched.residual, standard = null, attn_res = bank }
+            let AttnResBank<size B, size D, size MaxSrc, size MaxRows> bank ← init_attn_res_batch<size B, size D, size MaxSrc, size MaxRows>(attn_res_cadence, initial_hidden)
+            return variant AttnRes { bank = bank }
         }
     }
 }
 
 @ public
-fn carrier_push<size D>(mut ResidualCarrier<size D> c, tensor<f32, [D]> delta) → void ⇥ ResidualError {
-    let StandardCarrier<size D> ∪ none maybe_sc ← c.standard
-    if maybe_sc not is none {
-        mut StandardCarrier<size D> sc ← maybe_sc
-        standard_push<size D>(mut sc, delta)
-        c.standard ← sc
-        return
+fn carrier_push_delta_batch<size B, size D, size MaxSrc, size MaxRows>(mut ResidualCarrier<StandardCarrier<size B, size D>, AttnResBank<size B, size D, size MaxSrc, size MaxRows>> c, tensor<f32, [B, D]> delta, i32 active_b) → void ⇥ ResidualError {
+    let ResidualCarrier<StandardCarrier<size B, size D>, AttnResBank<size B, size D, size MaxSrc, size MaxRows>> cur ← c
+    match cur {
+        case Standard let sc {
+            mut StandardCarrier<size B, size D> next_sc ← sc
+            standard_push_delta_batch<size B, size D>(mut next_sc, delta, active_b)
+            c ← variant Standard { carrier = next_sc }
+        }
+        case AttnRes let bank {
+            mut AttnResBank<size B, size D, size MaxSrc, size MaxRows> next_bank ← bank
+            attn_res_push_delta_batch<size B, size D, size MaxSrc, size MaxRows>(mut next_bank, delta, active_b)
+            c ← variant AttnRes { bank = next_bank }
+        }
     }
-    let AttnResBank<size D> ∪ none maybe_bank ← c.attn_res
-    if maybe_bank not is none {
-        mut AttnResBank<size D> bank ← maybe_bank
-        attn_res_push<size D>(mut bank, delta)
-        c.attn_res ← bank
-        return
-    }
-    throw variant InvalidConfig { message = "ResidualCarrier has no active stream" }
 }
 
 @ public
-fn carrier_prepare_step<size D>(mut ResidualCarrier<size D> c, schedule.ExecutionStep step) → void ⇥ ResidualError {
-    if not step.resets_to_prelude {
-        return
-    }
-    let AttnResBank<size D> ∪ none maybe_bank ← c.attn_res
-    if maybe_bank not is none {
-        mut AttnResBank<size D> bank ← maybe_bank
-        begin_next_pass<size D>(mut bank)
-        c.attn_res ← bank
+fn carrier_end_visit_batch<size B, size D, size MaxSrc, size MaxRows>(mut ResidualCarrier<StandardCarrier<size B, size D>, AttnResBank<size B, size D, size MaxSrc, size MaxRows>> c, i32 active_b) → bool ⇥ ResidualError {
+    let ResidualCarrier<StandardCarrier<size B, size D>, AttnResBank<size B, size D, size MaxSrc, size MaxRows>> cur ← c
+    match cur {
+        case Standard let ? {
+            return false
+        }
+        case AttnRes let bank {
+            mut AttnResBank<size B, size D, size MaxSrc, size MaxRows> next_bank ← bank
+            let bool committed ← attn_res_end_visit_batch<size B, size D, size MaxSrc, size MaxRows>(mut next_bank, active_b)
+            c ← variant AttnRes { bank = next_bank }
+            return committed
+        }
     }
 }
 
+@ public
+fn carrier_prepare_step_batch<size B, size D, size MaxSrc, size MaxRows>(mut ResidualCarrier<StandardCarrier<size B, size D>, AttnResBank<size B, size D, size MaxSrc, size MaxRows>> c, schedule.ExecutionStep step, i32 active_b) → void ⇥ ResidualError {
+    if not step.snapshots_prelude and not step.resets_to_prelude {
+        return
+    }
+    let ResidualCarrier<StandardCarrier<size B, size D>, AttnResBank<size B, size D, size MaxSrc, size MaxRows>> cur ← c
+    match cur {
+        case Standard let ? {
+            return
+        }
+        case AttnRes let bank {
+            mut AttnResBank<size B, size D, size MaxSrc, size MaxRows> next_bank ← bank
+            if step.snapshots_prelude {
+                snapshot_prelude<size B, size D, size MaxSrc, size MaxRows>(mut next_bank)
+            }
+            if step.resets_to_prelude {
+                begin_next_pass<size B, size D, size MaxSrc, size MaxRows>(mut next_bank, active_b)
+            }
+            c ← variant AttnRes { bank = next_bank }
+        }
+    }
+}
+
+@ public
+fn carrier_cur_batch<size B, size D, size MaxSrc, size MaxRows>(ResidualCarrier<StandardCarrier<size B, size D>, AttnResBank<size B, size D, size MaxSrc, size MaxRows>> c) → tensor<f32, [B, D]> {
+    match c {
+        case Standard let sc {
+            return sc.hidden
+        }
+        case AttnRes let bank {
+            return bank.cur
+        }
+    }
+}
+
+@ public
+fn carrier_is_attn_res<size B, size D, size MaxSrc, size MaxRows>(ResidualCarrier<StandardCarrier<size B, size D>, AttnResBank<size B, size D, size MaxSrc, size MaxRows>> c) → bool {
+    match c {
+        case Standard let ? {
+            return false
+        }
+        case AttnRes let ? {
+            return true
+        }
+    }
+}
+
+@ public
+fn carrier_attn_res_bank<size B, size D, size MaxSrc, size MaxRows>(ResidualCarrier<StandardCarrier<size B, size D>, AttnResBank<size B, size D, size MaxSrc, size MaxRows>> c) → AttnResBank<size B, size D, size MaxSrc, size MaxRows> ⇥ ResidualError {
+    match c {
+        case Standard let ? {
+            throw variant InvalidConfig { message = "Standard ResidualCarrier has no AttnResBank" }
+        }
+        case AttnRes let bank {
+            return bank
+        }
+    }
+}
+
+# 1D convenience wrappers for ResidualCarrier (B = 1).
+@ public
+fn carrier_from_schedule<size D, size MaxSrc>(schedule.ExecutionSchedule sched, int attn_res_cadence, tensor<f32, [D]> initial_hidden) → ResidualCarrier<StandardCarrier<size 1, size D>, AttnResBank<size 1, size D, size MaxSrc, size MaxSrc>> ⇥ ResidualError {
+    mut tensor<f32, [1, D]> h ← tf32[1, D] {}
+    vec_to_batch1<size D>(initial_hidden, mut h)
+    return carrier_from_schedule_batch<size 1, size D, size MaxSrc, size MaxSrc>(sched, attn_res_cadence, h)
+}
+
+@ public
+fn carrier_push_delta<size D, size MaxSrc>(mut ResidualCarrier<StandardCarrier<size 1, size D>, AttnResBank<size 1, size D, size MaxSrc, size MaxSrc>> c, tensor<f32, [D]> delta) → void ⇥ ResidualError {
+    mut tensor<f32, [1, D]> db ← tf32[1, D] {}
+    vec_to_batch1<size D>(delta, mut db)
+    carrier_push_delta_batch<size 1, size D, size MaxSrc, size MaxSrc>(mut c, db, 1)
+}
+
+@ public
+fn carrier_end_visit<size D, size MaxSrc>(mut ResidualCarrier<StandardCarrier<size 1, size D>, AttnResBank<size 1, size D, size MaxSrc, size MaxSrc>> c) → bool ⇥ ResidualError {
+    return carrier_end_visit_batch<size 1, size D, size MaxSrc, size MaxSrc>(mut c, 1)
+}
+
+@ public
+fn carrier_prepare_step<size D, size MaxSrc>(mut ResidualCarrier<StandardCarrier<size 1, size D>, AttnResBank<size 1, size D, size MaxSrc, size MaxSrc>> c, schedule.ExecutionStep step) → void ⇥ ResidualError {
+    carrier_prepare_step_batch<size 1, size D, size MaxSrc, size MaxSrc>(mut c, step, 1)
+}
+
 # -------------------------------------------------------------------------
-# Runtime TapBuffer capture
+# Runtime TapBuffer capture over [B, D] device kernels (+ 1D compatibility)
 # -------------------------------------------------------------------------
 
+@ public
+class BatchTapSlot<size B, size D> {
+    let string name
+    let int visit_id
+    mut bool captured
+    mut tensor<f32, [B, D]> value
+}
+
+@ public
+class BatchTapStore<size B, size D> {
+    mut list<BatchTapSlot<size B, size D>> slots
+
+    fn reset() → void {
+        for exclusive self.slots.length() let i {
+            self.slots[i].captured ← false
+            mut tensor<f32, [B, D]> buf ← self.slots[i].value
+            zero_batch<size B, size D>(mut buf)
+            self.slots[i].value ← buf
+        }
+    }
+}
+
+@ public
+fn batch_tap_store_from_schedule<size B, size D>(schedule.ExecutionSchedule sched) → BatchTapStore<size B, size D> ⇥ ResidualError {
+    require B ≥ 1 and D ≥ 1 throw variant InvalidConfig { message = "BatchTapStore dimensions B and D must be at least 1" }
+    mut list<BatchTapSlot<size B, size D>> slots ← empty
+    for from sched.taps let tap {
+        require tap.name.length() ≥ 1 throw variant InvalidConfig { message = "tap name must not be empty" }
+        let tensor<f32, [B, D]> z ← tf32[B, D] {}
+        slots.append(BatchTapSlot<size B, size D> { name = tap.name, visit_id = tap.visit_id, captured = false, value = z })
+    }
+    return BatchTapStore<size B, size D> { slots = slots }
+}
+
+@ public
+fn capture_if_tapped_batch<size B, size D>(mut BatchTapStore<size B, size D> store, int visit_id, tensor<f32, [B, D]> hidden, i32 active_b) → bool ⇥ ResidualError {
+    require active_b ≥ 1 and active_b ≤ B throw variant ShapeMismatch { message = "active_b out of bounds [1..B]" }
+    mut bool matched ← false
+    for exclusive store.slots.length() let i {
+        if store.slots[i].visit_id ≡ visit_id {
+            require not store.slots[i].captured throw variant TapAlreadyCaptured { message = "tap at visit_id § already captured"(visit_id ↦ string) }
+            mut tensor<f32, [B, D]> dst ← store.slots[i].value
+            copy_batch<size B, size D>(hidden, mut dst, active_b)
+            store.slots[i].value ← dst
+            store.slots[i].captured ← true
+            matched ← true
+        }
+    }
+    return matched
+}
+
+@ public
+fn read_tap_batch<size B, size D>(BatchTapStore<size B, size D> store, string name, mut tensor<f32, [B, D]> out, i32 active_b) → void ⇥ ResidualError {
+    require active_b ≥ 1 and active_b ≤ B throw variant ShapeMismatch { message = "active_b out of bounds [1..B]" }
+    for exclusive store.slots.length() let i {
+        if store.slots[i].name ≡ name {
+            require store.slots[i].captured throw variant TapNotCaptured { message = "tap '§' has not been captured"(name) }
+            copy_batch<size B, size D>(store.slots[i].value, mut out, active_b)
+            return
+        }
+    }
+    throw variant TapNotFound { message = "unknown tap '§'"(name) }
+}
+
+@ public
+fn read_tap_batch_at<size B, size D>(BatchTapStore<size B, size D> store, int visit_id, mut tensor<f32, [B, D]> out, i32 active_b) → void ⇥ ResidualError {
+    require active_b ≥ 1 and active_b ≤ B throw variant ShapeMismatch { message = "active_b out of bounds [1..B]" }
+    for exclusive store.slots.length() let i {
+        if store.slots[i].visit_id ≡ visit_id {
+            require store.slots[i].captured throw variant TapNotCaptured { message = "tap at visit_id § has not been captured"(visit_id ↦ string) }
+            copy_batch<size B, size D>(store.slots[i].value, mut out, active_b)
+            return
+        }
+    }
+    throw variant TapNotFound { message = "no tap registered at visit_id §"(visit_id ↦ string) }
+}
+
+# 1D TapStore<size D> compatibility wrapper backed by [1, D] device kernels.
 @ public
 class TapSlot<size D> {
     let string name
     let int visit_id
     mut bool captured
-    mut tensor<f32, [D]> value
+    mut tensor<f32, [1, D]> value
 }
 
 @ public
 class TapStore<size D> {
     mut list<TapSlot<size D>> slots
+
+    fn reset() → void {
+        for exclusive self.slots.length() let i {
+            self.slots[i].captured ← false
+            mut tensor<f32, [1, D]> buf ← self.slots[i].value
+            zero_batch<size 1, size D>(mut buf)
+            self.slots[i].value ← buf
+        }
+    }
 }
 
 @ public
@@ -320,7 +924,7 @@ fn tap_store_from_schedule<size D>(schedule.ExecutionSchedule sched) → TapStor
     mut list<TapSlot<size D>> slots ← empty
     for from sched.taps let tap {
         require tap.name.length() ≥ 1 throw variant InvalidConfig { message = "tap name must not be empty" }
-        let tensor<f32, [D]> z ← tf32[D] {}
+        let tensor<f32, [1, D]> z ← tf32[1, D] {}
         slots.append(TapSlot<size D> { name = tap.name, visit_id = tap.visit_id, captured = false, value = z })
     }
     return TapStore<size D> { slots = slots }
@@ -332,7 +936,9 @@ fn capture_if_tapped<size D>(mut TapStore<size D> store, int visit_id, tensor<f3
     for exclusive store.slots.length() let i {
         if store.slots[i].visit_id ≡ visit_id {
             require not store.slots[i].captured throw variant TapAlreadyCaptured { message = "tap at visit_id § already captured"(visit_id ↦ string) }
-            store.slots[i].value ← copy hidden
+            mut tensor<f32, [1, D]> dst ← store.slots[i].value
+            vec_to_batch1<size D>(hidden, mut dst)
+            store.slots[i].value ← dst
             store.slots[i].captured ← true
             matched ← true
         }
@@ -345,7 +951,8 @@ fn read_tap<size D>(TapStore<size D> store, string name) → tensor<f32, [D]> �
     for exclusive store.slots.length() let i {
         if store.slots[i].name ≡ name {
             require store.slots[i].captured throw variant TapNotCaptured { message = "tap '§' has not been captured"(name) }
-            let tensor<f32, [D]> out ← copy store.slots[i].value
+            mut tensor<f32, [D]> out ← tf32[D] {}
+            batch1_to_vec<size D>(store.slots[i].value, mut out)
             return out
         }
     }
@@ -357,7 +964,8 @@ fn read_tap_at<size D>(TapStore<size D> store, int visit_id) → tensor<f32, [D]
     for exclusive store.slots.length() let i {
         if store.slots[i].visit_id ≡ visit_id {
             require store.slots[i].captured throw variant TapNotCaptured { message = "tap at visit_id § has not been captured"(visit_id ↦ string) }
-            let tensor<f32, [D]> out ← copy store.slots[i].value
+            mut tensor<f32, [D]> out ← tf32[D] {}
+            batch1_to_vec<size D>(store.slots[i].value, mut out)
             return out
         }
     }
@@ -382,93 +990,280 @@ fn vec4(f32 a, f32 b, f32 c, f32 d) → tensor<f32, [4]> {
     return out
 }
 
-test "Standard residual carrier accumulates deltas" {
+fn zero_gate4() → res.CrossPassGate<size 4, size 4> {
+    let tensor<f32, [4, 4]> z0 ← tf32[4, 4] {}
+    let tensor<f32, [4, 4]> z1 ← tf32[4, 4] {}
+    let tensor<f32, [4, 4]> z2 ← tf32[4, 4] {}
+    let tensor<f32, [4]> zq ← tf32[4] {}
+    return res.init_cross_pass_gate<size 4, size 4>(z0, z1, z2, zq)
+}
+
+test "Standard residual carrier accumulates [B, D] and 1D deltas" {
     do {
-        let tensor<f32, [4]> h0 ← vec4((1.0 ∷ f32), (2.0 ∷ f32), (3.0 ∷ f32), (4.0 ∷ f32))
-        mut res.StandardCarrier<size 4> sc ← res.init_standard<size 4>(h0)
-        let tensor<f32, [4]> d1 ← vec4((0.5 ∷ f32), (-1.0 ∷ f32), (2.0 ∷ f32), (0.0 ∷ f32))
-        res.standard_push<size 4>(mut sc, d1)
-        assert approx(sc.hidden[[0]], (1.5 ∷ f32), (1.0e-5 ∷ f32))
-        assert approx(sc.hidden[[1]], (1.0 ∷ f32), (1.0e-5 ∷ f32))
-        assert approx(sc.hidden[[2]], (5.0 ∷ f32), (1.0e-5 ∷ f32))
-        assert approx(sc.hidden[[3]], (4.0 ∷ f32), (1.0e-5 ∷ f32))
+        mut tensor<f32, [2, 4]> h0 ← tf32[2, 4] {}
+        h0[[0, 0]] ← 1.0 ∷ f32
+        h0[[0, 1]] ← 2.0 ∷ f32
+        h0[[1, 0]] ← -3.0 ∷ f32
+        h0[[1, 3]] ← 5.0 ∷ f32
+        mut res.StandardCarrier<size 2, size 4> sc ← res.init_standard_batch<size 2, size 4>(h0)
+        mut tensor<f32, [2, 4]> d1 ← tf32[2, 4] {}
+        d1[[0, 0]] ← 0.5 ∷ f32
+        d1[[0, 1]] ← -1.0 ∷ f32
+        d1[[1, 0]] ← 4.0 ∷ f32
+        d1[[1, 3]] ← -2.0 ∷ f32
+        res.standard_push_delta_batch<size 2, size 4>(mut sc, d1, 2)
+        assert approx(sc.hidden[[0, 0]], (1.5 ∷ f32), (1.0e-5 ∷ f32))
+        assert approx(sc.hidden[[0, 1]], (1.0 ∷ f32), (1.0e-5 ∷ f32))
+        assert approx(sc.hidden[[1, 0]], (1.0 ∷ f32), (1.0e-5 ∷ f32))
+        assert approx(sc.hidden[[1, 3]], (3.0 ∷ f32), (1.0e-5 ∷ f32))
+
+        mut res.StandardCarrier<size 1, size 4> sc1 ← res.init_standard<size 4>(vec4((1.0 ∷ f32), (2.0 ∷ f32), (3.0 ∷ f32), (4.0 ∷ f32)))
+        res.standard_push<size 4>(mut sc1, vec4((0.5 ∷ f32), (-1.0 ∷ f32), (2.0 ∷ f32), (0.0 ∷ f32)))
+        let tensor<f32, [4]> h1 ← res.standard_hidden_1d<size 4>(sc1)
+        assert approx(h1[[0]], (1.5 ∷ f32), (1.0e-5 ∷ f32))
+        assert approx(h1[[1]], (1.0 ∷ f32), (1.0e-5 ∷ f32))
+        assert approx(h1[[2]], (5.0 ∷ f32), (1.0e-5 ∷ f32))
+        assert approx(h1[[3]], (4.0 ∷ f32), (1.0e-5 ∷ f32))
     }
     catch err {
         assert false
     }
 }
 
-test "AttnResBank depthwise block-attention: 1D and 3D queries + cadence commit" {
+test "AttnResBank separates sublayer delta push from visit-end cadence commit on [B, D]" {
     do {
-        let tensor<f32, [4]> h0 ← vec4((1.0 ∷ f32), (0.0 ∷ f32), (0.0 ∷ f32), (0.0 ∷ f32))
-        mut res.AttnResBank<size 4> bank ← res.init_attn_res<size 4>(2, h0)
+        mut tensor<f32, [2, 4]> h0 ← tf32[2, 4] {}
+        h0[[0, 0]] ← 1.0 ∷ f32
+        h0[[1, 1]] ← 2.0 ∷ f32
+        mut res.AttnResBank<size 2, size 4, size 8, size 16> bank ← res.init_attn_res_batch<size 2, size 4, size 8, size 16>(2, h0)
 
-        res.attn_res_push<size 4>(mut bank, vec4((0.0 ∷ f32), (1.0 ∷ f32), (0.0 ∷ f32), (0.0 ∷ f32)))
-        res.attn_res_push<size 4>(mut bank, vec4((0.0 ∷ f32), (0.0 ∷ f32), (0.0 ∷ f32), (0.0 ∷ f32)))
-        assert bank.blocks.length() ≡ 1
+        # Visit 0: attn delta + ffn delta should NOT advance cadence until end_visit
+        mut tensor<f32, [2, 4]> d_attn0 ← tf32[2, 4] {}
+        d_attn0[[0, 1]] ← 1.0 ∷ f32
+        d_attn0[[1, 0]] ← 1.0 ∷ f32
+        mut tensor<f32, [2, 4]> d_ffn0 ← tf32[2, 4] {}
+        d_ffn0[[0, 2]] ← 3.0 ∷ f32
+        res.attn_res_push_delta_batch<size 2, size 4, size 8, size 16>(mut bank, d_attn0, 2)
+        assert bank.layers_in_block ≡ 0
+        assert bank.num_blocks ≡ 0
+        res.attn_res_push_delta_batch<size 2, size 4, size 8, size 16>(mut bank, d_ffn0, 2)
+        assert bank.layers_in_block ≡ 0
+        let bool committed0 ← res.attn_res_end_visit_batch<size 2, size 4, size 8, size 16>(mut bank, 2)
+        assert not committed0
+        assert bank.layers_in_block ≡ 1
+        assert bank.num_blocks ≡ 0
+
+        # Visit 1: commits block 0 at visit-end
+        mut tensor<f32, [2, 4]> d_zero ← tf32[2, 4] {}
+        res.attn_res_push_delta_batch<size 2, size 4, size 8, size 16>(mut bank, d_zero, 2)
+        res.attn_res_push_delta_batch<size 2, size 4, size 8, size 16>(mut bank, d_zero, 2)
+        let bool committed1 ← res.attn_res_end_visit_batch<size 2, size 4, size 8, size 16>(mut bank, 2)
+        assert committed1
+        assert bank.num_blocks ≡ 1
         assert bank.layers_in_block ≡ 0
 
-        res.attn_res_push<size 4>(mut bank, vec4((0.0 ∷ f32), (0.0 ∷ f32), (2.0 ∷ f32), (0.0 ∷ f32)))
+        # Visit 2: start next block cur
+        mut tensor<f32, [2, 4]> d2 ← tf32[2, 4] {}
+        d2[[0, 3]] ← 5.0 ∷ f32
+        d2[[1, 3]] ← 7.0 ∷ f32
+        res.attn_res_push_delta_batch<size 2, size 4, size 8, size 16>(mut bank, d2, 2)
+        assert bank.layers_in_block ≡ 0
+        let bool committed2 ← res.attn_res_end_visit_batch<size 2, size 4, size 8, size 16>(mut bank, 2)
+        assert not committed2
         assert bank.layers_in_block ≡ 1
 
-        let tensor<f32, [4]> q1 ← vec4((0.0 ∷ f32), (0.0 ∷ f32), (10.0 ∷ f32), (0.0 ∷ f32))
-        let tensor<f32, [4]> out1 ← res.attn_res_query_1d<size 4>(bank, q1)
-        assert out1[[2]] ≻ (1.9 ∷ f32)
+        # Batched 1-query and 3-query attendance over [blocks_buf, cur] per batch item
+        mut tensor<f32, [2, 4]> q1_out ← tf32[2, 4] {}
+        res.attn_res_query_1_batch<size 2, size 4, size 8, size 16>(bank, vec4((0.0 ∷ f32), (0.0 ∷ f32), (0.0 ∷ f32), (10.0 ∷ f32)), mut q1_out, 2)
+        assert q1_out[[0, 3]] ≻ (4.9 ∷ f32)
+        assert q1_out[[1, 3]] ≻ (6.9 ∷ f32)
 
         mut tensor<f32, [3, 4]> q3 ← tf32[3, 4] {}
-        q3[[0, 0]] ← (10.0 ∷ f32)
-        q3[[1, 2]] ← (10.0 ∷ f32)
-        q3[[2, 1]] ← (10.0 ∷ f32)
-        let tensor<f32, [3, 4]> out3 ← res.attn_res_query_3d<size 4>(bank, q3)
-        assert out3[[0, 0]] ≻ (0.9 ∷ f32)
-        assert out3[[1, 2]] ≻ (1.9 ∷ f32)
-        assert out3[[2, 1]] ≻ (0.9 ∷ f32)
+        q3[[0, 0]] ← 10.0 ∷ f32
+        q3[[1, 3]] ← 10.0 ∷ f32
+        q3[[2, 2]] ← 10.0 ∷ f32
+        mut tensor<f32, [6, 4]> out_qkv ← tf32[6, 4] {}
+        mut tensor<f32, [2, 4]> out_q ← tf32[2, 4] {}
+        mut tensor<f32, [2, 4]> out_k ← tf32[2, 4] {}
+        mut tensor<f32, [2, 4]> out_v ← tf32[2, 4] {}
+        res.attn_res_query_3_batch<size 2, size 4, size 8, size 16, size 6>(bank, q3, mut out_qkv, mut out_q, mut out_k, mut out_v, 2)
+        assert out_q[[0, 0]] ≻ (0.9 ∷ f32)
+        assert out_k[[0, 3]] ≻ (4.9 ∷ f32)
+        assert out_k[[1, 3]] ≻ (6.9 ∷ f32)
+        assert out_v[[0, 2]] ≻ (2.9 ∷ f32)
     }
     catch err {
         assert false
     }
 }
 
-test "AttnResBank reset_to_prelude and rank-64 cross-pass tanh gain/forget controller" {
+test "Prelude snapshot + begin_next_pass preserves prelude and prev_pass_buf" {
     do {
-        let tensor<f32, [4]> h0 ← vec4((1.0 ∷ f32), (0.0 ∷ f32), (0.0 ∷ f32), (0.0 ∷ f32))
-        mut res.AttnResBank<size 4> bank ← res.init_attn_res<size 4>(2, h0)
-        res.attn_res_push<size 4>(mut bank, vec4((0.5 ∷ f32), (0.0 ∷ f32), (0.0 ∷ f32), (0.0 ∷ f32)))
-        res.snapshot_prelude<size 4>(mut bank)
+        mut tensor<f32, [2, 4]> h0 ← tf32[2, 4] {}
+        h0[[0, 0]] ← 1.0 ∷ f32
+        h0[[1, 0]] ← 2.0 ∷ f32
+        mut res.AttnResBank<size 2, size 4, size 8, size 16> bank ← res.init_attn_res_batch<size 2, size 4, size 8, size 16>(2, h0)
+        mut tensor<f32, [2, 4]> d_pre ← tf32[2, 4] {}
+        d_pre[[0, 0]] ← 0.5 ∷ f32
+        d_pre[[1, 0]] ← 0.5 ∷ f32
+        res.attn_res_push_delta_batch<size 2, size 4, size 8, size 16>(mut bank, d_pre, 2)
+        let bool ? ← res.attn_res_end_visit_batch<size 2, size 4, size 8, size 16>(mut bank, 2)
+        res.snapshot_prelude<size 2, size 4, size 8, size 16>(mut bank)
 
-        res.attn_res_push<size 4>(mut bank, vec4((0.0 ∷ f32), (3.0 ∷ f32), (0.0 ∷ f32), (0.0 ∷ f32)))
-        assert bank.blocks.length() ≡ 1
+        mut tensor<f32, [2, 4]> d_p0 ← tf32[2, 4] {}
+        d_p0[[0, 1]] ← 4.0 ∷ f32
+        res.attn_res_push_delta_batch<size 2, size 4, size 8, size 16>(mut bank, d_p0, 2)
+        let bool ? ← res.attn_res_end_visit_batch<size 2, size 4, size 8, size 16>(mut bank, 2)
+        assert bank.num_blocks ≡ 1
 
-        res.begin_next_pass<size 4>(mut bank)
+        res.begin_next_pass<size 2, size 4, size 8, size 16>(mut bank, 2)
         assert bank.has_prev_pass
-        assert bank.prev_pass_bank.length() ≡ 1
-        assert bank.blocks.length() ≡ 0
+        assert bank.prev_pass_count ≡ 1
+        assert bank.num_blocks ≡ 0
         assert bank.layers_in_block ≡ 1
-        assert approx(bank.cur[[0]], (1.5 ∷ f32), (1.0e-5 ∷ f32))
-        assert approx(bank.cur[[1]], (0.0 ∷ f32), (1.0e-5 ∷ f32))
-
-        mut tensor<f32, [64, 4]> w_down ← tf32[64, 4] {}
-        mut tensor<f32, [4, 64]> w_gain ← tf32[4, 64] {}
-        mut tensor<f32, [4, 64]> w_forget ← tf32[4, 64] {}
-        w_down[[0, 0]] ← (1.0 ∷ f32)
-        w_gain[[1, 0]] ← (2.0 ∷ f32)
-        w_forget[[0, 0]] ← (2.0 ∷ f32)
-        let res.CrossPassController<size 4, size 64> ctrl ← res.CrossPassController<size 4, size 64> { w_down = w_down, w_gain = w_gain, w_forget = w_forget, prev_query = vec4((0.0 ∷ f32), (1.0 ∷ f32), (0.0 ∷ f32), (0.0 ∷ f32)) }
-        let tensor<f32, [4]> mixed ← res.apply_cross_pass<size 4, size 64>(bank, ctrl, bank.cur)
-        assert mixed[[0]] ≻ (0.5 ∷ f32)
-        assert mixed[[1]] ≻ (1.0 ∷ f32)
+        assert approx(bank.cur[[0, 0]], (1.5 ∷ f32), (1.0e-5 ∷ f32))
     }
     catch err {
         assert false
     }
 }
 
-test "Runtime TapBuffer capture stores and reads designated Inkling visit_ids fail-closed (residual)" {
+test "CrossPassController synthesizes 4 tanh gain/forget messages (Q, K, V, FFN) with zero-weight identity" {
+    do {
+        mut tensor<f32, [2, 4]> h0 ← tf32[2, 4] {}
+        h0[[0, 0]] ← 1.0 ∷ f32
+        h0[[1, 0]] ← 2.0 ∷ f32
+        mut res.AttnResBank<size 2, size 4, size 8, size 16> bank ← res.init_attn_res_batch<size 2, size 4, size 8, size 16>(2, h0)
+        mut tensor<f32, [2, 4]> d_pre ← tf32[2, 4] {}
+        d_pre[[0, 0]] ← 0.5 ∷ f32
+        d_pre[[1, 0]] ← 0.5 ∷ f32
+        res.attn_res_push_delta_batch<size 2, size 4, size 8, size 16>(mut bank, d_pre, 2)
+        let bool ? ← res.attn_res_end_visit_batch<size 2, size 4, size 8, size 16>(mut bank, 2)
+        res.snapshot_prelude<size 2, size 4, size 8, size 16>(mut bank)
+
+        # Pass 0 writes a distinct message state into block 0 before begin_next_pass
+        mut tensor<f32, [2, 4]> d_p0 ← tf32[2, 4] {}
+        d_p0[[0, 1]] ← 4.0 ∷ f32
+        d_p0[[0, 2]] ← 6.0 ∷ f32
+        d_p0[[0, 3]] ← 8.0 ∷ f32
+        d_p0[[1, 1]] ← 2.0 ∷ f32
+        res.attn_res_push_delta_batch<size 2, size 4, size 8, size 16>(mut bank, d_p0, 2)
+        let bool ? ← res.attn_res_end_visit_batch<size 2, size 4, size 8, size 16>(mut bank, 2)
+        assert bank.num_blocks ≡ 1
+
+        res.begin_next_pass<size 2, size 4, size 8, size 16>(mut bank, 2)
+        assert bank.has_prev_pass
+        assert bank.prev_pass_count ≡ 1
+        assert bank.num_blocks ≡ 0
+        assert bank.layers_in_block ≡ 1
+        assert approx(bank.cur[[0, 0]], (1.5 ∷ f32), (1.0e-5 ∷ f32))
+        assert approx(bank.cur[[0, 1]], (0.0 ∷ f32), (1.0e-5 ∷ f32))
+
+        # 1) Zero weights: (1 - tanh(0)) * cur + tanh(0) * msg == cur exactly (identity!)
+        let res.CrossPassController<size 4, size 4> zero_ctrl ← res.init_cross_pass_controller<size 4, size 4>(zero_gate4(), zero_gate4(), zero_gate4(), zero_gate4())
+        mut tensor<f32, [2, 4]> id_q ← tf32[2, 4] {}
+        mut tensor<f32, [2, 4]> id_k ← tf32[2, 4] {}
+        mut tensor<f32, [2, 4]> id_v ← tf32[2, 4] {}
+        mut tensor<f32, [2, 4]> id_ffn ← tf32[2, 4] {}
+        res.apply_cross_pass_4msg_batch<size 2, size 4, size 4, size 8, size 16, size 8>(bank, zero_ctrl, bank.cur, bank.cur, bank.cur, bank.cur, mut id_q, mut id_k, mut id_v, mut id_ffn, 2)
+        assert approx(id_q[[0, 0]], (1.5 ∷ f32), (1.0e-5 ∷ f32))
+        assert approx(id_q[[0, 1]], (0.0 ∷ f32), (1.0e-5 ∷ f32))
+        assert approx(id_ffn[[1, 0]], (2.5 ∷ f32), (1.0e-5 ∷ f32))
+
+        # 2) Non-zero 4-message tanh gain/forget gates for Q, K, V, FFN
+        mut tensor<f32, [4, 4]> wd ← tf32[4, 4] {}
+        wd[[0, 0]] ← 1.0 ∷ f32
+
+        mut tensor<f32, [4, 4]> wg_q ← tf32[4, 4] {}
+        mut tensor<f32, [4, 4]> wf_q ← tf32[4, 4] {}
+        wg_q[[1, 0]] ← 2.0 ∷ f32
+        wf_q[[0, 0]] ← 1.0 ∷ f32
+
+        mut tensor<f32, [4, 4]> wg_k ← tf32[4, 4] {}
+        wg_k[[2, 0]] ← 2.0 ∷ f32
+
+        mut tensor<f32, [4, 4]> wg_v ← tf32[4, 4] {}
+        wg_v[[3, 0]] ← 2.0 ∷ f32
+
+        mut tensor<f32, [4, 4]> wg_ffn ← tf32[4, 4] {}
+        mut tensor<f32, [4, 4]> wf_ffn ← tf32[4, 4] {}
+        wg_ffn[[1, 0]] ← -2.0 ∷ f32
+        wf_ffn[[0, 0]] ← 10.0 ∷ f32
+
+        let tensor<f32, [4, 4]> wf_k ← tf32[4, 4] {}
+        let tensor<f32, [4, 4]> wf_v ← tf32[4, 4] {}
+        let res.CrossPassController<size 4, size 4> ctrl ← res.init_cross_pass_controller<size 4, size 4>(
+            res.init_cross_pass_gate<size 4, size 4>(wd, wg_q, wf_q, vec4((0.0 ∷ f32), (1.0 ∷ f32), (0.0 ∷ f32), (0.0 ∷ f32))),
+            res.init_cross_pass_gate<size 4, size 4>(wd, wg_k, wf_k, vec4((0.0 ∷ f32), (0.0 ∷ f32), (1.0 ∷ f32), (0.0 ∷ f32))),
+            res.init_cross_pass_gate<size 4, size 4>(wd, wg_v, wf_v, vec4((0.0 ∷ f32), (0.0 ∷ f32), (0.0 ∷ f32), (1.0 ∷ f32))),
+            res.init_cross_pass_gate<size 4, size 4>(wd, wg_ffn, wf_ffn, vec4((0.0 ∷ f32), (1.0 ∷ f32), (0.0 ∷ f32), (0.0 ∷ f32)))
+        )
+
+        mut tensor<f32, [2, 4]> out_q ← tf32[2, 4] {}
+        mut tensor<f32, [2, 4]> out_k ← tf32[2, 4] {}
+        mut tensor<f32, [2, 4]> out_v ← tf32[2, 4] {}
+        mut tensor<f32, [2, 4]> out_ffn ← tf32[2, 4] {}
+        res.apply_cross_pass_4msg_batch<size 2, size 4, size 4, size 8, size 16, size 8>(bank, ctrl, bank.cur, bank.cur, bank.cur, bank.cur, mut out_q, mut out_k, mut out_v, mut out_ffn, 2)
+
+        # Q forgets part of dim 0 and gains msg[1] (= 4.0)
+        assert out_q[[0, 0]] ≺ (1.0 ∷ f32) and out_q[[0, 0]] ≻ (0.0 ∷ f32)
+        assert out_q[[0, 1]] ≻ (3.0 ∷ f32)
+        # K gains msg[2] (= 6.0)
+        assert out_k[[0, 2]] ≻ (4.5 ∷ f32)
+        # V gains msg[3] (= 8.0)
+        assert out_v[[0, 3]] ≻ (6.0 ∷ f32)
+        # FFN forgets dim 0 near zero (1 - tanh(9)) and subtracts msg[1]
+        assert out_ffn[[0, 0]] ≺ (0.2 ∷ f32)
+        assert out_ffn[[0, 1]] ≺ (-3.0 ∷ f32)
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "ResidualCarrier union drives prelude snapshot + reset from ExecutionStep cleanly" {
+    mut sched.ExecutionSchedule s ← sched.ExecutionSchedule { layers = [], segments = [], steps = [], slots = [], residual = variant sched.ResidualKind.Standard, taps = [] }
+    do {
+        s ← sched.inkling_schedule(2, 2, 1, 2, 4, false, 2, 4, 4, empty)
+    }
+    catch err {
+        assert false
+    }
+    do {
+        mut tensor<f32, [2, 4]> h0 ← tf32[2, 4] {}
+        h0[[0, 0]] ← 1.0 ∷ f32
+        h0[[1, 0]] ← 3.0 ∷ f32
+        mut res.ResidualCarrier<res.StandardCarrier<size 2, size 4>, res.AttnResBank<size 2, size 4, size 8, size 16>> c ← res.carrier_from_schedule_batch<size 2, size 4, size 8, size 16>(s, 2, h0)
+
+        mut tensor<f32, [2, 4]> d1 ← tf32[2, 4] {}
+        d1[[0, 1]] ← 2.0 ∷ f32
+        d1[[1, 1]] ← 4.0 ∷ f32
+
+        for exclusive s.steps.length() let vid {
+            let sched.ExecutionStep st ← s.steps[vid]
+            res.carrier_prepare_step_batch<size 2, size 4, size 8, size 16>(mut c, st, 2)
+            res.carrier_push_delta_batch<size 2, size 4, size 8, size 16>(mut c, d1, 2)
+            let bool ? ← res.carrier_end_visit_batch<size 2, size 4, size 8, size 16>(mut c, 2)
+        }
+
+        assert res.carrier_is_attn_res<size 2, size 4, size 8, size 16>(c)
+        let res.AttnResBank<size 2, size 4, size 8, size 16> bank ← res.carrier_attn_res_bank<size 2, size 4, size 8, size 16>(c)
+        assert bank.has_prelude
+        assert bank.has_prev_pass
+        assert bank.num_blocks ≡ 2
+        assert bank.layers_in_block ≡ 1
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "Runtime TapStore and BatchTapStore capture [5, 23, 41, 48] and reset cleanly" {
     let list<sched.TapBuffer> taps ← [
         sched.TapBuffer { name = "prelude_end", visit_id = 5 },
-        sched.TapBuffer { name = "pass1_end", visit_id = 23 },
-        sched.TapBuffer { name = "pass2_end", visit_id = 41 },
-        sched.TapBuffer { name = "coda_end", visit_id = 47 }
+        sched.TapBuffer { name = "pass1_mid", visit_id = 23 },
+        sched.TapBuffer { name = "loop_end", visit_id = 41 },
+        sched.TapBuffer { name = "post_coda", visit_id = 48 }
     ]
 
     mut sched.ExecutionSchedule s ← sched.ExecutionSchedule { layers = [], segments = [], steps = [], slots = [], residual = variant sched.ResidualKind.Standard, taps = [] }
@@ -480,19 +1275,48 @@ test "Runtime TapBuffer capture stores and reads designated Inkling visit_ids fa
     }
 
     do {
+        mut res.BatchTapStore<size 2, size 4> bstore ← res.batch_tap_store_from_schedule<size 2, size 4>(s)
+        mut tensor<f32, [2, 4]> v5 ← tf32[2, 4] {}
+        v5[[0, 2]] ← 3.0 ∷ f32
+        v5[[1, 2]] ← 9.0 ∷ f32
+        assert not res.capture_if_tapped_batch<size 2, size 4>(mut bstore, 0, v5, 2)
+        assert res.capture_if_tapped_batch<size 2, size 4>(mut bstore, 5, v5, 2)
+
+        mut tensor<f32, [2, 4]> v48 ← tf32[2, 4] {}
+        v48[[0, 0]] ← 7.5 ∷ f32
+        v48[[1, 1]] ← -2.5 ∷ f32
+        assert res.capture_if_tapped_batch<size 2, size 4>(mut bstore, 48, v48, 2)
+
+        mut tensor<f32, [2, 4]> out5 ← tf32[2, 4] {}
+        mut tensor<f32, [2, 4]> out48 ← tf32[2, 4] {}
+        res.read_tap_batch<size 2, size 4>(bstore, "prelude_end", mut out5, 2)
+        res.read_tap_batch_at<size 2, size 4>(bstore, 48, mut out48, 2)
+        assert approx(out5[[0, 2]], (3.0 ∷ f32), (1.0e-5 ∷ f32))
+        assert approx(out5[[1, 2]], (9.0 ∷ f32), (1.0e-5 ∷ f32))
+        assert approx(out48[[0, 0]], (7.5 ∷ f32), (1.0e-5 ∷ f32))
+        assert approx(out48[[1, 1]], (-2.5 ∷ f32), (1.0e-5 ∷ f32))
+
+        # TapStore.reset() clears captured flags and zeroes buffers so next sequence can capture cleanly
+        bstore.reset()
+        mut bool threw_uncaptured ← false
+        do {
+            res.read_tap_batch<size 2, size 4>(bstore, "prelude_end", mut out5, 2)
+        }
+        catch err {
+            threw_uncaptured ← true
+        }
+        assert threw_uncaptured
+        assert res.capture_if_tapped_batch<size 2, size 4>(mut bstore, 5, v48, 2)
+
+        # 1D TapStore<D> compatibility + reset()
         mut res.TapStore<size 4> store ← res.tap_store_from_schedule<size 4>(s)
-        let bool c0 ← res.capture_if_tapped<size 4>(mut store, 0, vec4((9.0 ∷ f32), (0.0 ∷ f32), (0.0 ∷ f32), (0.0 ∷ f32)))
-        assert not c0
-
-        let bool c5 ← res.capture_if_tapped<size 4>(mut store, 5, vec4((1.0 ∷ f32), (2.0 ∷ f32), (3.0 ∷ f32), (4.0 ∷ f32)))
-        assert c5
-        let tensor<f32, [4]> t5 ← res.read_tap<size 4>(store, "prelude_end")
-        assert approx(t5[[2]], (3.0 ∷ f32), (1.0e-5 ∷ f32))
-
-        let bool c23 ← res.capture_if_tapped<size 4>(mut store, 23, vec4((5.0 ∷ f32), (6.0 ∷ f32), (7.0 ∷ f32), (8.0 ∷ f32)))
-        assert c23
-        let tensor<f32, [4]> t23 ← res.read_tap_at<size 4>(store, 23)
-        assert approx(t23[[0]], (5.0 ∷ f32), (1.0e-5 ∷ f32))
+        assert res.capture_if_tapped<size 4>(mut store, 48, vec4((1.0 ∷ f32), (2.0 ∷ f32), (3.0 ∷ f32), (4.0 ∷ f32)))
+        let tensor<f32, [4]> t48 ← res.read_tap<size 4>(store, "post_coda")
+        assert approx(t48[[3]], (4.0 ∷ f32), (1.0e-5 ∷ f32))
+        store.reset()
+        assert res.capture_if_tapped<size 4>(mut store, 48, vec4((5.0 ∷ f32), (6.0 ∷ f32), (7.0 ∷ f32), (8.0 ∷ f32)))
+        let tensor<f32, [4]> t48_new ← res.read_tap_at<size 4>(store, 48)
+        assert approx(t48_new[[0]], (5.0 ∷ f32), (1.0e-5 ∷ f32))
     }
     catch err {
         assert false
