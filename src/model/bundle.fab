@@ -99,6 +99,11 @@ class ModelBundle {
     let BundleMember ∪ none shard_index
     let BundleMember ∪ none tokenizer
     let ShardMapping shard_map
+    # Derived lookup state (issue #83), never part of the wire identity:
+    # indexed-map tensor_name → entry position, built by `admit_bundle`.
+    # Defaulted so hand-built records that omit it keep working; resolution
+    # falls back to a scan when the index does not answer.
+    let map<string, int> entry_index = empty
 }
 
 # -------------------------------------------------------------------------
@@ -216,34 +221,45 @@ fn admit_bundle(ContainerKind primary_container, list<BundleMember> members, Sha
 
     require backbone_raw.length() ≥ 1 throw variant MissingPrimary { message = "bundle requires at least one backbone member" }
 
-    # Order and verify contiguous 0..N-1 backbone shard indices.
+    # Order and verify contiguous 0..N-1 backbone shard indices. One pass
+    # groups the members by their declared shard index (issue #83); each
+    # expected index then reads its group, so the per-index duplicate/missing
+    # checks keep their order and messages without the nested member scan.
     let int shard_total ← backbone_raw.length()
+    mut map<int, int> first_at ← empty
+    mut map<int, int> times ← empty
+
+    for exclusive backbone_raw.length() let j {
+        let int idx ← backbone_raw[j].shard_index
+        let int seen ← times.get(idx) coalesce 0
+
+        if seen ≡ 0 then first_at.put(idx, j)
+
+        times.put(idx, seen + 1)
+    }
+
     mut list<BundleMember> backbone_ordered ← empty
 
-    for range 0 ‥ shard_total let expected_idx {
-        mut int found ← -1
+    for exclusive shard_total let expected_idx {
+        let int seen ← times.get(expected_idx) coalesce 0
 
-        for range 0 ‥ backbone_raw.length() let j {
-            if backbone_raw[j].shard_index ≡ expected_idx {
-                require found ≡ -1 throw variant DuplicateRole { message = "duplicate backbone shard_index §"(expected_idx ↦ string) }
+        require seen ≤ 1 throw variant DuplicateRole { message = "duplicate backbone shard_index §"(expected_idx ↦ string) }
 
-                found ← j
-            }
-        }
+        require seen ≡ 1 throw variant BadRole { message = "missing backbone shard_index §"(expected_idx ↦ string) }
 
-        require found ≥ 0 throw variant BadRole { message = "missing backbone shard_index §"(expected_idx ↦ string) }
-
-        backbone_ordered.append(backbone_raw[found])
+        backbone_ordered.append(backbone_raw[first_at.get(expected_idx) coalesce 0])
     }
 
     # Validate shard_map consistency.
+    mut map<string, int> entry_index ← empty
+
     match shard_map {
         case Indexed let entries {
             require index_list.length() ≡ 1 throw variant BadShardMap { message = "indexed shard_map requires a shard_index member" }
 
             require entries.length() ≥ 1 throw variant BadShardMap { message = "indexed shard_map requires at least one tensor entry" }
 
-            mut list<string> seen_names ← empty
+            mut set<string> seen_names ← empty
 
             for from entries let entry {
                 require entry.tensor_name.length() ≥ 1 throw variant BadShardMap { message = "shard_map tensor_name must not be empty" }
@@ -252,7 +268,12 @@ fn admit_bundle(ContainerKind primary_container, list<BundleMember> members, Sha
 
                 require entry.tensor_name ∉ seen_names throw variant BadShardMap { message = "duplicate tensor_name in shard_map: §"(entry.tensor_name) }
 
-                seen_names.append(entry.tensor_name)
+                seen_names.add(entry.tensor_name)
+            }
+
+            # Derived shard-lookup index over the validated entries.
+            for exclusive entries.length() let i {
+                entry_index.put(entries[i].tensor_name, i)
             }
         }
         case Unindexed let count {
@@ -281,7 +302,7 @@ fn admit_bundle(ContainerKind primary_container, list<BundleMember> members, Sha
 
     if tok_list.length() ≡ 1 then tok_opt ← tok_list[0]
 
-    return ModelBundle { schema = BUNDLE_SCHEMA, primary_container = primary_container, backbone_shards = backbone_ordered, drafter = drafter_opt, vision = vision_opt, config = config_opt, quant_config = quant_opt, shard_index = index_opt, tokenizer = tok_opt, shard_map = shard_map }
+    return ModelBundle { schema = BUNDLE_SCHEMA, primary_container = primary_container, backbone_shards = backbone_ordered, drafter = drafter_opt, vision = vision_opt, config = config_opt, quant_config = quant_opt, shard_index = index_opt, tokenizer = tok_opt, shard_map = shard_map, entry_index = entry_index }
 }
 
 # -------------------------------------------------------------------------
@@ -386,6 +407,18 @@ fn member_count(ModelBundle b) → int {
 fn resolve_tensor_shard(ModelBundle b, string tensor_name) → int ⇥ BundleError {
     match b.shard_map {
         case Indexed let entries {
+            # Derived index first (issue #83): one map lookup answers an
+            # admitted bundle. A record without the index (or one whose entry
+            # list was rebuilt by hand) falls back to the scan, so the answer
+            # never depends on how the bundle was produced.
+            let int ix ← b.entry_index.get(tensor_name) coalesce -1
+
+            if ix ≥ 0 and ix ≺ entries.length() {
+                let ShardEntry hit ← entries[ix]
+
+                if hit.tensor_name ≡ tensor_name then return hit.shard_index
+            }
+
             for from entries let entry {
                 if entry.tensor_name ≡ tensor_name then return entry.shard_index
             }
