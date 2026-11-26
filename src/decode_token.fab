@@ -435,19 +435,23 @@ class BatchWorkspace<size MaxBatch, size BH, size D, size QD, size KVD, size F, 
 @ public
 fn prime_batch_workspace<size MaxBatch, size BH, size D, size QD, size KVD, size F, size H, size C>(BatchWorkspace<MaxBatch, BH, D, QD, KVD, F, H, C> ws, mut tensor<f32, [1]> sink) → void {
     assert MaxBatch ≥ 1 and MaxBatch ≤ MAX_BATCH_ROWS
-    ds.prime2(ws.xn, mut sink)
-    ds.prime2(ws.q, mut sink)
-    ds.prime2(ws.qr, mut sink)
-    ds.prime2(ws.k, mut sink)
-    ds.prime2(ws.kr, mut sink)
-    ds.prime2(ws.v, mut sink)
-    ds.prime2(ws.sc, mut sink)
-    ds.prime2(ws.pr, mut sink)
-    ds.prime2(ws.ctx, mut sink)
-    ds.prime2(ws.h1, mut sink)
-    ds.prime2(ws.gate, mut sink)
-    ds.prime2(ws.up, mut sink)
-    ds.prime2(ws.act, mut sink)
+    assert BH ≡ MaxBatch * H
+
+    do device {
+        ds.prime2(ws.xn, mut sink)
+        ds.prime2(ws.q, mut sink)
+        ds.prime2(ws.qr, mut sink)
+        ds.prime2(ws.k, mut sink)
+        ds.prime2(ws.kr, mut sink)
+        ds.prime2(ws.v, mut sink)
+        ds.prime2(ws.sc, mut sink)
+        ds.prime2(ws.pr, mut sink)
+        ds.prime2(ws.ctx, mut sink)
+        ds.prime2(ws.h1, mut sink)
+        ds.prime2(ws.gate, mut sink)
+        ds.prime2(ws.up, mut sink)
+        ds.prime2(ws.act, mut sink)
+    }
 }
 
 # One batched layer over `active_b <= MaxBatch` tokens starting at `sv.pos`.
@@ -456,6 +460,7 @@ fn prime_batch_workspace<size MaxBatch, size BH, size D, size QD, size KVD, size
 @ public
 fn layer_batch<size MaxBatch, size BH, size D, size QD, size KVD, size F, size H, size C>(tensor<f32, [MaxBatch, D]> hin, mut tensor<f32, [MaxBatch, D]> hout, LayerWeights<D, QD, KVD, F> lw, mut SlotView<C, KVD> sv, LayerParams lp, mut BatchWorkspace<MaxBatch, BH, D, QD, KVD, F, H, C> ws, i32 active_b, AttentionRegime regime) → void {
     assert MaxBatch ≥ 1 and MaxBatch ≤ MAX_BATCH_ROWS
+    assert BH ≡ MaxBatch * H
     assert (active_b ↦ int) ≥ 1 and (active_b ↦ int) ≤ MaxBatch
     let i32 tpos ← sv.pos
     let i32 heads ← H ↦ i32 ⊥ 1
@@ -473,43 +478,231 @@ fn layer_batch<size MaxBatch, size BH, size D, size QD, size KVD, size F, size H
         }
     }
 
-    ds.rmsnorm_batch(hin, lw.anorm, mut ws.xn, lp.peps)
-    ds.qkv_proj_batch(lw.wq, lw.wk, lw.wv, ws.xn, mut ws.q, mut ws.k, mut ws.v, active_b)
+    let i32 dlen ← D ↦ i32 ⊥ 1
+    let bool full_batch ← (active_b ↦ int) ≡ MaxBatch
 
-    if lw.qkv_bias {
-        ds.add_bias_batch(lw.bq, mut ws.q, active_b)
-        ds.add_bias_batch(lw.bk, mut ws.k, active_b)
-        ds.add_bias_batch(lw.bv, mut ws.v, active_b)
+    do device {
+        ds.rmsnorm_batch(hin, lw.anorm, mut ws.xn, lp.peps)
+        if full_batch {
+            ds.qkv_proj_batch_gemm(lw.wq, lw.wk, lw.wv, ws.xn, mut ws.q, mut ws.k, mut ws.v)
+        }
+        else {
+            ds.matmul_nt_batch(lw.wq, ws.xn, mut ws.q, active_b, dlen)
+            ds.matmul_nt_batch(lw.wk, ws.xn, mut ws.k, active_b, dlen)
+            ds.matmul_nt_batch(lw.wv, ws.xn, mut ws.v, active_b, dlen)
+        }
+
+        if lw.qkv_bias {
+            ds.add_bias_batch(lw.bq, mut ws.q, active_b)
+            ds.add_bias_batch(lw.bk, mut ws.k, active_b)
+            ds.add_bias_batch(lw.bv, mut ws.v, active_b)
+        }
+
+        match lp.prope {
+            case RopeKind.None {
+                ds.kv_write_kv_batch(ws.k, ws.v, mut sv.kin, mut sv.vin, tpos, active_b)
+                ds.attn_scores_batch(ws.hcdom, ws.q, sv.kin, mut ws.sc, tpos, heads, lp.pgroup, lp.pdh, lp.pscale, active_b, blk_size)
+            }
+            case RopeKind.Half {
+                ds.rope_half_batch(ws.q, mut ws.qr, tpos, lp.pspan, lp.plntheta, active_b)
+                ds.rope_half_batch(ws.k, mut ws.kr, tpos, lp.pspan, lp.plntheta, active_b)
+                ds.kv_write_kv_batch(ws.kr, ws.v, mut sv.kin, mut sv.vin, tpos, active_b)
+                ds.attn_scores_batch(ws.hcdom, ws.qr, sv.kin, mut ws.sc, tpos, heads, lp.pgroup, lp.pdh, lp.pscale, active_b, blk_size)
+            }
+            case RopeKind.Pairs {
+                ds.rope_pairs_batch(ws.q, mut ws.qr, tpos, lp.pspan, lp.plntheta, active_b)
+                ds.rope_pairs_batch(ws.k, mut ws.kr, tpos, lp.pspan, lp.plntheta, active_b)
+                ds.kv_write_kv_batch(ws.kr, ws.v, mut sv.kin, mut sv.vin, tpos, active_b)
+                ds.attn_scores_batch(ws.hcdom, ws.qr, sv.kin, mut ws.sc, tpos, heads, lp.pgroup, lp.pdh, lp.pscale, active_b, blk_size)
+            }
+        }
+
+        ds.row_softmax(ws.sc, mut ws.pr)
+        ds.attn_context_batch(ws.qdom, ws.pr, sv.vin, mut ws.ctx, tpos, heads, lp.pgroup, lp.pdh, active_b, blk_size)
+        if full_batch {
+            ds.matmul_nt_gemm(lw.wo, ws.ctx, mut ws.xn)
+        }
+        else {
+            ds.matmul_nt_batch(lw.wo, ws.ctx, mut ws.xn, active_b, QD ↦ i32 ⊥ 1)
+        }
+        ds.residual_add_batch(hin, ws.xn, mut ws.h1, active_b)
+        ds.rmsnorm_batch(ws.h1, lw.fnorm, mut ws.xn, lp.peps)
+        if full_batch {
+            ds.gate_up_proj_batch_gemm(lw.wg, lw.wu, ws.xn, mut ws.gate, mut ws.up)
+        }
+        else {
+            ds.matmul_nt_batch(lw.wg, ws.xn, mut ws.gate, active_b, dlen)
+            ds.matmul_nt_batch(lw.wu, ws.xn, mut ws.up, active_b, dlen)
+        }
+        ds.swiglu_batch(ws.gate, ws.up, mut ws.act, active_b)
+        if full_batch {
+            ds.matmul_nt_gemm(lw.wd, ws.act, mut ws.xn)
+        }
+        else {
+            ds.matmul_nt_batch(lw.wd, ws.act, mut ws.xn, active_b, F ↦ i32 ⊥ 1)
+        }
+        ds.residual_add_batch(ws.h1, ws.xn, mut hout, active_b)
+    }
+}
+
+# Query-block-tiled batched workspace: allocates O(TileB * H * C) attention
+# scratch instead of O(MaxBatch * H * C), where `TileBH = TileB * H` (e.g. TileB = 64).
+@ public
+class TiledBatchWorkspace<size MaxBatch, size TileB, size TileBH, size D, size QD, size KVD, size F, size H, size C> {
+    let tensor<f32, [TileBH, C]> hcdom
+    let tensor<f32, [TileB, QD]> qdom
+    mut tensor<f32, [MaxBatch, D]> xn
+    mut tensor<f32, [MaxBatch, QD]> q
+    mut tensor<f32, [MaxBatch, QD]> qr
+    mut tensor<f32, [MaxBatch, KVD]> k
+    mut tensor<f32, [MaxBatch, KVD]> kr
+    mut tensor<f32, [MaxBatch, KVD]> v
+    mut tensor<f32, [TileBH, C]> sc
+    mut tensor<f32, [TileBH, C]> pr
+    mut tensor<f32, [MaxBatch, QD]> ctx
+    mut tensor<f32, [MaxBatch, D]> h1
+    mut tensor<f32, [MaxBatch, F]> gate
+    mut tensor<f32, [MaxBatch, F]> up
+    mut tensor<f32, [MaxBatch, F]> act
+}
+
+# Prime every scratch tensor written by `layer_batch_tiled` inside one `do device` region.
+@ public
+fn prime_tiled_batch_workspace<size MaxBatch, size TileB, size TileBH, size D, size QD, size KVD, size F, size H, size C>(TiledBatchWorkspace<MaxBatch, TileB, TileBH, D, QD, KVD, F, H, C> ws, mut tensor<f32, [1]> sink) → void {
+    assert MaxBatch ≥ 1 and MaxBatch ≤ MAX_BATCH_ROWS
+    assert TileB ≥ 1 and TileB ≤ MaxBatch
+    assert TileBH ≡ TileB * H
+
+    do device {
+        ds.prime2(ws.xn, mut sink)
+        ds.prime2(ws.q, mut sink)
+        ds.prime2(ws.qr, mut sink)
+        ds.prime2(ws.k, mut sink)
+        ds.prime2(ws.kr, mut sink)
+        ds.prime2(ws.v, mut sink)
+        ds.prime2(ws.sc, mut sink)
+        ds.prime2(ws.pr, mut sink)
+        ds.prime2(ws.ctx, mut sink)
+        ds.prime2(ws.h1, mut sink)
+        ds.prime2(ws.gate, mut sink)
+        ds.prime2(ws.up, mut sink)
+        ds.prime2(ws.act, mut sink)
+    }
+}
+
+# Query-block-tiled batched layer over `active_b <= MaxBatch` tokens starting at `sv.pos`.
+# Uses O(TileB * H * C) attention scratch and tiled GEMM (`·`) for full-batch projections.
+@ public
+fn layer_batch_tiled<size MaxBatch, size TileB, size TileBH, size D, size QD, size KVD, size F, size H, size C>(tensor<f32, [MaxBatch, D]> hin, mut tensor<f32, [MaxBatch, D]> hout, LayerWeights<D, QD, KVD, F> lw, mut SlotView<C, KVD> sv, LayerParams lp, mut TiledBatchWorkspace<MaxBatch, TileB, TileBH, D, QD, KVD, F, H, C> ws, i32 active_b, AttentionRegime regime) → void {
+    assert MaxBatch ≥ 1 and MaxBatch ≤ MAX_BATCH_ROWS
+    assert TileB ≥ 1 and TileB ≤ MaxBatch
+    assert TileBH ≡ TileB * H
+    assert (active_b ↦ int) ≥ 1 and (active_b ↦ int) ≤ MaxBatch
+    let i32 tpos ← sv.pos
+    let i32 heads ← H ↦ i32 ⊥ 1
+    let i32 tile_b ← TileB ↦ i32 ⊥ 1
+    mut i32 blk_size ← 1
+
+    match regime {
+        case AttentionRegime.Causal {
+            blk_size ← 1
+        }
+        case AttentionRegime.BlockDiffusion let bsz {
+            blk_size ← bsz
+            if blk_size ≺ 1 {
+                blk_size ← 1
+            }
+        }
     }
 
-    match lp.prope {
-        case RopeKind.None {
-            ds.kv_write_kv_batch(ws.k, ws.v, mut sv.kin, mut sv.vin, tpos, active_b)
-            ds.attn_scores_batch(ws.hcdom, ws.q, sv.kin, mut ws.sc, tpos, heads, lp.pgroup, lp.pdh, lp.pscale, active_b, blk_size)
-        }
-        case RopeKind.Half {
-            ds.rope_half_batch(ws.q, mut ws.qr, tpos, lp.pspan, lp.plntheta, active_b)
-            ds.rope_half_batch(ws.k, mut ws.kr, tpos, lp.pspan, lp.plntheta, active_b)
-            ds.kv_write_kv_batch(ws.kr, ws.v, mut sv.kin, mut sv.vin, tpos, active_b)
-            ds.attn_scores_batch(ws.hcdom, ws.qr, sv.kin, mut ws.sc, tpos, heads, lp.pgroup, lp.pdh, lp.pscale, active_b, blk_size)
-        }
-        case RopeKind.Pairs {
-            ds.rope_pairs_batch(ws.q, mut ws.qr, tpos, lp.pspan, lp.plntheta, active_b)
-            ds.rope_pairs_batch(ws.k, mut ws.kr, tpos, lp.pspan, lp.plntheta, active_b)
-            ds.kv_write_kv_batch(ws.kr, ws.v, mut sv.kin, mut sv.vin, tpos, active_b)
-            ds.attn_scores_batch(ws.hcdom, ws.qr, sv.kin, mut ws.sc, tpos, heads, lp.pgroup, lp.pdh, lp.pscale, active_b, blk_size)
-        }
-    }
+    let i32 dlen ← D ↦ i32 ⊥ 1
+    let bool full_batch ← (active_b ↦ int) ≡ MaxBatch
+    let i32 tiles ← (active_b + tile_b - 1) / tile_b
 
-    ds.row_softmax(ws.sc, mut ws.pr)
-    ds.attn_context_batch(ws.qdom, ws.pr, sv.vin, mut ws.ctx, tpos, heads, lp.pgroup, lp.pdh, active_b, blk_size)
-    ds.matmul_nt_batch(lw.wo, ws.ctx, mut ws.xn, active_b, QD ↦ i32 ⊥ 1)
-    ds.residual_add_batch(hin, ws.xn, mut ws.h1, active_b)
-    ds.rmsnorm_batch(ws.h1, lw.fnorm, mut ws.xn, lp.peps)
-    ds.gate_up_proj_batch(lw.wg, lw.wu, ws.xn, mut ws.gate, mut ws.up, active_b)
-    ds.swiglu_batch(ws.gate, ws.up, mut ws.act, active_b)
-    ds.matmul_nt_batch(lw.wd, ws.act, mut ws.xn, active_b, F ↦ i32 ⊥ 1)
-    ds.residual_add_batch(ws.h1, ws.xn, mut hout, active_b)
+    do device {
+        ds.rmsnorm_batch(hin, lw.anorm, mut ws.xn, lp.peps)
+        if full_batch {
+            ds.qkv_proj_batch_gemm(lw.wq, lw.wk, lw.wv, ws.xn, mut ws.q, mut ws.k, mut ws.v)
+        }
+        else {
+            ds.matmul_nt_batch(lw.wq, ws.xn, mut ws.q, active_b, dlen)
+            ds.matmul_nt_batch(lw.wk, ws.xn, mut ws.k, active_b, dlen)
+            ds.matmul_nt_batch(lw.wv, ws.xn, mut ws.v, active_b, dlen)
+        }
+
+        if lw.qkv_bias {
+            ds.add_bias_batch(lw.bq, mut ws.q, active_b)
+            ds.add_bias_batch(lw.bk, mut ws.k, active_b)
+            ds.add_bias_batch(lw.bv, mut ws.v, active_b)
+        }
+
+        match lp.prope {
+            case RopeKind.None {
+                ds.kv_write_kv_batch(ws.k, ws.v, mut sv.kin, mut sv.vin, tpos, active_b)
+                for exclusive tiles let tile_idx {
+                    let i32 tid ← (tile_idx ↦ i32 ⊥ 0) ∧ 16383
+                    let i32 qstart ← tid * (tile_b ∧ 16383)
+                    let i32 rem ← active_b - qstart
+                    let i32 qcount ← rem ≻ tile_b ✓ tile_b ✗ rem
+                    ds.attn_scores_query_tile(ws.hcdom, ws.q, sv.kin, mut ws.sc, tpos, heads, lp.pgroup, lp.pdh, lp.pscale, active_b, blk_size, qstart, qcount)
+                    ds.row_softmax(ws.sc, mut ws.pr)
+                    ds.attn_context_query_tile(ws.qdom, ws.pr, sv.vin, mut ws.ctx, tpos, heads, lp.pgroup, lp.pdh, active_b, blk_size, qstart, qcount)
+                }
+            }
+            case RopeKind.Half {
+                ds.rope_half_batch(ws.q, mut ws.qr, tpos, lp.pspan, lp.plntheta, active_b)
+                ds.rope_half_batch(ws.k, mut ws.kr, tpos, lp.pspan, lp.plntheta, active_b)
+                ds.kv_write_kv_batch(ws.kr, ws.v, mut sv.kin, mut sv.vin, tpos, active_b)
+                for exclusive tiles let tile_idx {
+                    let i32 tid ← (tile_idx ↦ i32 ⊥ 0) ∧ 16383
+                    let i32 qstart ← tid * (tile_b ∧ 16383)
+                    let i32 rem ← active_b - qstart
+                    let i32 qcount ← rem ≻ tile_b ✓ tile_b ✗ rem
+                    ds.attn_scores_query_tile(ws.hcdom, ws.qr, sv.kin, mut ws.sc, tpos, heads, lp.pgroup, lp.pdh, lp.pscale, active_b, blk_size, qstart, qcount)
+                    ds.row_softmax(ws.sc, mut ws.pr)
+                    ds.attn_context_query_tile(ws.qdom, ws.pr, sv.vin, mut ws.ctx, tpos, heads, lp.pgroup, lp.pdh, active_b, blk_size, qstart, qcount)
+                }
+            }
+            case RopeKind.Pairs {
+                ds.rope_pairs_batch(ws.q, mut ws.qr, tpos, lp.pspan, lp.plntheta, active_b)
+                ds.rope_pairs_batch(ws.k, mut ws.kr, tpos, lp.pspan, lp.plntheta, active_b)
+                ds.kv_write_kv_batch(ws.kr, ws.v, mut sv.kin, mut sv.vin, tpos, active_b)
+                for exclusive tiles let tile_idx {
+                    let i32 tid ← (tile_idx ↦ i32 ⊥ 0) ∧ 16383
+                    let i32 qstart ← tid * (tile_b ∧ 16383)
+                    let i32 rem ← active_b - qstart
+                    let i32 qcount ← rem ≻ tile_b ✓ tile_b ✗ rem
+                    ds.attn_scores_query_tile(ws.hcdom, ws.qr, sv.kin, mut ws.sc, tpos, heads, lp.pgroup, lp.pdh, lp.pscale, active_b, blk_size, qstart, qcount)
+                    ds.row_softmax(ws.sc, mut ws.pr)
+                    ds.attn_context_query_tile(ws.qdom, ws.pr, sv.vin, mut ws.ctx, tpos, heads, lp.pgroup, lp.pdh, active_b, blk_size, qstart, qcount)
+                }
+            }
+        }
+
+        if full_batch {
+            ds.matmul_nt_gemm(lw.wo, ws.ctx, mut ws.xn)
+        }
+        else {
+            ds.matmul_nt_batch(lw.wo, ws.ctx, mut ws.xn, active_b, QD ↦ i32 ⊥ 1)
+        }
+        ds.residual_add_batch(hin, ws.xn, mut ws.h1, active_b)
+        ds.rmsnorm_batch(ws.h1, lw.fnorm, mut ws.xn, lp.peps)
+        if full_batch {
+            ds.gate_up_proj_batch_gemm(lw.wg, lw.wu, ws.xn, mut ws.gate, mut ws.up)
+        }
+        else {
+            ds.matmul_nt_batch(lw.wg, ws.xn, mut ws.gate, active_b, dlen)
+            ds.matmul_nt_batch(lw.wu, ws.xn, mut ws.up, active_b, dlen)
+        }
+        ds.swiglu_batch(ws.gate, ws.up, mut ws.act, active_b)
+        if full_batch {
+            ds.matmul_nt_gemm(lw.wd, ws.act, mut ws.xn)
+        }
+        else {
+            ds.matmul_nt_batch(lw.wd, ws.act, mut ws.xn, active_b, F ↦ i32 ⊥ 1)
+        }
+        ds.residual_add_batch(ws.h1, ws.xn, mut hout, active_b)
+    }
 }
 
 # Batched embedding gather: hidden[b, :] <- embed[ids[b], :] for b < active_b.
@@ -525,8 +718,17 @@ fn embed_batch<size V, size MaxBatch, size D>(tensor<f32, [V, D]> embed, tensor<
 fn head_batch<size V, size MaxBatch, size D>(tensor<f32, [MaxBatch, D]> hidden, tensor<f32, [D]> onorm, tensor<f32, [V, D]> head, mut tensor<f32, [MaxBatch, D]> hn, mut tensor<f32, [MaxBatch, V]> logits, f32 peps, i32 active_b) → void {
     assert MaxBatch ≥ 1 and MaxBatch ≤ MAX_BATCH_ROWS
     assert (active_b ↦ int) ≥ 1 and (active_b ↦ int) ≤ MaxBatch
-    ds.rmsnorm_batch(hidden, onorm, mut hn, peps)
-    ds.matmul_nt_batch(head, hn, mut logits, active_b, D ↦ i32 ⊥ 1)
+    let bool full_batch ← (active_b ↦ int) ≡ MaxBatch
+
+    do device {
+        ds.rmsnorm_batch(hidden, onorm, mut hn, peps)
+        if full_batch {
+            ds.matmul_nt_gemm(head, hn, mut logits)
+        }
+        else {
+            ds.matmul_nt_batch(head, hn, mut logits, active_b, D ↦ i32 ⊥ 1)
+        }
+    }
 }
 
 +++ faber test

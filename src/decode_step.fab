@@ -646,6 +646,13 @@ kernel rmsnorm_batch<size B, size D>(tensor<f32, [B, D]> rmx, tensor<f32, [D]> r
     rmo ⇇ rmx.norm_rms(axis 1, rmeps, rmw)
 }
 
+# Full-batch tiled GEMM with [Out, In] weights: mmy = mmx · mmwᵀ.
+@ public
+kernel matmul_nt_gemm<size B, size N, size K>(tensor<f32, [N, K]> mmw, tensor<f32, [B, K]> mmx, mut tensor<f32, [B, N]> mmy) → void {
+    let tensor<f32, [K, N]> wt ← mmwᵀ
+    mmy ⇇ mmx · wt
+}
+
 # Batched linear projection with [Out, In] weights:
 #   y[b, n] = sum_k x[b, k] * w[n, k] for b < active_b.
 @ public
@@ -665,21 +672,65 @@ kernel matmul_nt_batch<size B, size N, size K>(tensor<f32, [N, K]> mmw, tensor<f
     }
 }
 
+# Dispatch tiled GEMM (`matmul_nt_gemm`) when all B rows are active (e.g. B = C prefill),
+# falling back to `matmul_nt_batch` for partial batches (`active_b < B`).
+@ public
+fn matmul_nt_dispatch<size B, size N, size K>(tensor<f32, [N, K]> mmw, tensor<f32, [B, K]> mmx, mut tensor<f32, [B, N]> mmy, i32 mmactive, i32 mmk) → void {
+    if (mmactive ↦ int) ≡ B {
+        matmul_nt_gemm(mmw, mmx, mut mmy)
+    }
+    else {
+        matmul_nt_batch(mmw, mmx, mut mmy, mmactive, mmk)
+    }
+}
+
+# Full-batch fused Q/K/V tiled GEMM sharing input `x`:
+#   q = x · wqᵀ, k = x · wkᵀ, v = x · wvᵀ.
+@ public
+kernel qkv_proj_batch_gemm<size B, size QD, size KVD, size D>(tensor<f32, [QD, D]> wq, tensor<f32, [KVD, D]> wk, tensor<f32, [KVD, D]> wv, tensor<f32, [B, D]> x, mut tensor<f32, [B, QD]> q, mut tensor<f32, [B, KVD]> k, mut tensor<f32, [B, KVD]> v) → void {
+    let tensor<f32, [D, QD]> wqt ← wqᵀ
+    let tensor<f32, [D, KVD]> wkt ← wkᵀ
+    let tensor<f32, [D, KVD]> wvt ← wvᵀ
+    q ⇇ x · wqt
+    k ⇇ x · wkt
+    v ⇇ x · wvt
+}
+
+# Full-batch fused gate/up tiled GEMM sharing input `x`:
+#   g = x · wgᵀ, u = x · wuᵀ.
+@ public
+kernel gate_up_proj_batch_gemm<size B, size F, size D>(tensor<f32, [F, D]> wg, tensor<f32, [F, D]> wu, tensor<f32, [B, D]> x, mut tensor<f32, [B, F]> g, mut tensor<f32, [B, F]> u) → void {
+    let tensor<f32, [D, F]> wgt ← wgᵀ
+    let tensor<f32, [D, F]> wut ← wuᵀ
+    g ⇇ x · wgt
+    u ⇇ x · wut
+}
+
 # Batched Q/K/V projection sharing input `x`.
 @ public
 fn qkv_proj_batch<size B, size QD, size KVD, size D>(tensor<f32, [QD, D]> wq, tensor<f32, [KVD, D]> wk, tensor<f32, [KVD, D]> wv, tensor<f32, [B, D]> x, mut tensor<f32, [B, QD]> q, mut tensor<f32, [B, KVD]> k, mut tensor<f32, [B, KVD]> v, i32 active_b) → void {
-    let i32 dlen ← D ↦ i32 ⊥ 1
-    matmul_nt_batch(wq, x, mut q, active_b, dlen)
-    matmul_nt_batch(wk, x, mut k, active_b, dlen)
-    matmul_nt_batch(wv, x, mut v, active_b, dlen)
+    if (active_b ↦ int) ≡ B {
+        qkv_proj_batch_gemm(wq, wk, wv, x, mut q, mut k, mut v)
+    }
+    else {
+        let i32 dlen ← D ↦ i32 ⊥ 1
+        matmul_nt_batch(wq, x, mut q, active_b, dlen)
+        matmul_nt_batch(wk, x, mut k, active_b, dlen)
+        matmul_nt_batch(wv, x, mut v, active_b, dlen)
+    }
 }
 
 # Batched gate/up projection sharing input `x`.
 @ public
 fn gate_up_proj_batch<size B, size F, size D>(tensor<f32, [F, D]> wg, tensor<f32, [F, D]> wu, tensor<f32, [B, D]> x, mut tensor<f32, [B, F]> g, mut tensor<f32, [B, F]> u, i32 active_b) → void {
-    let i32 dlen ← D ↦ i32 ⊥ 1
-    matmul_nt_batch(wg, x, mut g, active_b, dlen)
-    matmul_nt_batch(wu, x, mut u, active_b, dlen)
+    if (active_b ↦ int) ≡ B {
+        gate_up_proj_batch_gemm(wg, wu, x, mut g, mut u)
+    }
+    else {
+        let i32 dlen ← D ↦ i32 ⊥ 1
+        matmul_nt_batch(wg, x, mut g, active_b, dlen)
+        matmul_nt_batch(wu, x, mut u, active_b, dlen)
+    }
 }
 
 # Batched bias add in place: into[b, j] += bias[j] for b < active_b.
@@ -891,6 +942,92 @@ kernel attn_context_batch<size B, size QD, size BH, size C, size KVD>(tensor<f32
             }
 
             acctx[[b, j]] ← acc
+        }
+    }
+}
+
+# Query-block-tiled GQA attention scores over [TileBH, C] where TileBH = TileB * H:
+# computes scores for query rows `qstart .. qstart + qcount` into `assc[qb * H + h, c]`,
+# keeping score/prob scratch O(TileB * H * C) instead of O(MaxBatch * H * C).
+@ public
+kernel attn_scores_query_tile<size B, size TileBH, size C, size QD, size KVD>(tensor<f32, [TileBH, C]> asdom, tensor<f32, [B, QD]> asq, tensor<f32, [C, KVD]> askc, mut tensor<f32, [TileBH, C]> assc, i32 aspos, i32 asheads, i32 asgroup, i32 asdh, f32 asscale, i32 asactive, i32 asblk, i32 qstart, i32 qcount) → void {
+    for from asdom at [bh, c] thread lane let ? {
+        if aspos ≺ 0 or asheads ≺ 1 or asheads ≻ 4096 or asgroup ≺ 1 or asgroup ≻ 128 or asdh ≺ 1 or asdh ≻ 960 or asblk ≺ 1 or qstart ≺ 0 or qcount ≺ 1 or bh ∉ 0 … 16777215 or c ∉ 0 … 16777215 {
+            assc[[bh, c]] ← -3.0e38
+        }
+        else {
+            let i32 bhh ← bh ∧ 16777215
+            let i32 cc ← c ∧ 16777215
+            let i32 qb ← bhh / asheads
+            let i32 hh ← bhh % asheads
+            let i32 b ← qstart + qb
+
+            if qb ≥ qcount or b ≥ asactive or b ≥ B {
+                assc[[bh, c]] ← -3.0e38
+            }
+            else {
+                let i32 blk ← b / asblk
+                mut i32 bend ← (blk + 1) * asblk
+
+                if bend ≻ asactive {
+                    bend ← asactive
+                }
+
+                if cc ≥ aspos + bend {
+                    assc[[bh, c]] ← -3.0e38
+                }
+                else {
+                    let i32 qbase ← hh * asdh
+                    let i32 kbase ← hh / asgroup * asdh
+                    mut f32 acc ← 0.0
+
+                    for range 0 ‥ asdh let kk {
+                        acc ← acc + asq[[b, qbase + kk]] * askc[[cc, kbase + kk]]
+                    }
+
+                    assc[[bh, c]] ← acc * asscale
+                }
+            }
+        }
+    }
+}
+
+# Query-block-tiled GQA attention context over [TileBH, C] probabilities:
+# writes `acctx[qstart + qb, j]` for `qb < qcount` and `qstart + qb < acactive`.
+@ public
+kernel attn_context_query_tile<size B, size TileB, size QD, size TileBH, size C, size KVD>(tensor<f32, [TileB, QD]> actiledom, tensor<f32, [TileBH, C]> acp, tensor<f32, [C, KVD]> acvc, mut tensor<f32, [B, QD]> acctx, i32 acpos, i32 acheads, i32 acgroup, i32 acdh, i32 acactive, i32 acblk, i32 qstart, i32 qcount) → void {
+    for from actiledom at [qb, j] thread lane let ? {
+        if qb ≺ qcount and qstart ≥ 0 and acpos ≥ 0 and acpos ≺ C and acheads ≥ 1 and acheads ≤ 4096 and acgroup ≥ 1 and acgroup ≤ 128 and acdh ≥ 1 and acdh ≤ 960 and acblk ≥ 1 and qb ∈ 0 … 16383 {
+            let i32 b ← qstart + qb
+            if b ≺ acactive and b ≺ B and b ∈ 0 … 16383 {
+                let i32 bb ← b ∧ 16383
+                let i32 qbb ← qb ∧ 16383
+                let i32 dh ← acdh
+                let i32 h ← j / dh
+                let i32 d ← j % dh
+                let i32 row ← qbb * acheads + h
+                let i32 vcol ← h / acgroup * dh + d
+                let i32 blk ← bb / acblk
+                mut i32 bend ← (blk + 1) * acblk
+
+                if bend ≻ acactive {
+                    bend ← acactive
+                }
+
+                mut i32 n ← acpos + bend
+
+                if n ≻ C {
+                    n ← C
+                }
+
+                mut f32 acc ← 0.0
+
+                for range 0 ‥ n let c {
+                    acc ← acc + acp[[row, c]] * acvc[[c, vcol]]
+                }
+
+                acctx[[qstart + qb, j]] ← acc
+            }
         }
     }
 }
@@ -1820,4 +1957,123 @@ test "decode_step batched table-driven RoPE twins match direct batched kernels f
     }
     assert close(table_half[[2, 0]], -9.0)
     assert close(table_pairs[[2, 7]], -9.0)
+}
+
+test "decode_step matmul_nt_dispatch tiled GEMM matches matmul_nt_batch" {
+    mut tensor<f32, [3, 4]> w ← tf32[3, 4] {}
+    mut tensor<f32, [2, 4]> x ← tf32[2, 4] {}
+    mut tensor<f32, [2, 3]> y_gemm ← tf32[2, 3] {}
+    mut tensor<f32, [2, 3]> y_ref ← tf32[2, 3] {}
+    for range 0‥3 let n {
+        for range 0‥4 let k {
+            w[[n, k]] ← ((n * 4 + k + 1) ↦ f32) * 0.25
+        }
+    }
+    for range 0‥2 let b {
+        for range 0‥4 let k {
+            x[[b, k]] ← ((b * 3 + k + 1) ↦ f32) * 0.5
+        }
+    }
+    ds.matmul_nt_dispatch(w, x, mut y_gemm, 2, 4)
+    ds.matmul_nt_batch(w, x, mut y_ref, 2, 4)
+    for range 0‥2 let b {
+        for range 0‥3 let n {
+            assert close(y_gemm[[b, n]], y_ref[[b, n]])
+        }
+    }
+}
+
+test "decode_step query-tiled attention matches full attn_scores_batch and attn_context_batch" {
+    # B=4, H=2, dh=2, QD=4, KVD=2 (group=2), C=6, TileB=2 -> TileBH=4
+    mut tensor<f32, [8, 6]> full_dom ← tf32[8, 6] {}
+    mut tensor<f32, [4, 4]> full_qdom ← tf32[4, 4] {}
+    mut tensor<f32, [4, 6]> tile_dom ← tf32[4, 6] {}
+    mut tensor<f32, [2, 4]> tile_qdom ← tf32[2, 4] {}
+    mut tensor<f32, [4, 4]> q ← tf32[4, 4] {}
+    mut tensor<f32, [6, 2]> kc ← tf32[6, 2] {}
+    mut tensor<f32, [6, 2]> vc ← tf32[6, 2] {}
+    mut tensor<f32, [8, 6]> full_sc ← tf32[8, 6] {}
+    mut tensor<f32, [8, 6]> full_pr ← tf32[8, 6] {}
+    mut tensor<f32, [4, 4]> full_ctx ← tf32[4, 4] {}
+    mut tensor<f32, [4, 6]> tile_sc ← tf32[4, 6] {}
+    mut tensor<f32, [4, 6]> tile_pr ← tf32[4, 6] {}
+    mut tensor<f32, [4, 4]> tile_ctx ← tf32[4, 4] {}
+
+    for range 0‥4 let b {
+        for range 0‥4 let j {
+            q[[b, j]] ← ((b + j + 1) ↦ f32) * 0.25
+        }
+    }
+    for range 0‥6 let c {
+        for range 0‥2 let d {
+            kc[[c, d]] ← ((c * 2 + d + 1) ↦ f32) * 0.1
+            vc[[c, d]] ← ((c + d * 3 + 1) ↦ f32) * 0.2
+        }
+    }
+
+    ds.attn_scores_batch(full_dom, q, kc, mut full_sc, 1, 2, 2, 2, 0.5, 4, 1)
+    ds.row_softmax(full_sc, mut full_pr)
+    ds.attn_context_batch(full_qdom, full_pr, vc, mut full_ctx, 1, 2, 2, 2, 4, 1)
+
+    ds.attn_scores_query_tile(tile_dom, q, kc, mut tile_sc, 1, 2, 2, 2, 0.5, 4, 1, 0, 2)
+    ds.row_softmax(tile_sc, mut tile_pr)
+    ds.attn_context_query_tile(tile_qdom, tile_pr, vc, mut tile_ctx, 1, 2, 2, 2, 4, 1, 0, 2)
+
+    ds.attn_scores_query_tile(tile_dom, q, kc, mut tile_sc, 1, 2, 2, 2, 0.5, 4, 1, 2, 2)
+    ds.row_softmax(tile_sc, mut tile_pr)
+    ds.attn_context_query_tile(tile_qdom, tile_pr, vc, mut tile_ctx, 1, 2, 2, 2, 4, 1, 2, 2)
+
+    for range 0‥4 let b {
+        for range 0‥4 let j {
+            assert close(tile_ctx[[b, j]], full_ctx[[b, j]])
+        }
+    }
+}
+
+test "decode_step query-tiled attention matches full batch on partial active_b and trailing tile" {
+    # B=4, active_b=3, H=2, dh=2, QD=4, KVD=2 (group=2), C=6, TileB=2 -> TileBH=4
+    # Tile 0 processes qstart=0, qcount=2; trailing tile 1 processes qstart=2, qcount=1 (padding qb=1).
+    mut tensor<f32, [8, 6]> full_dom ← tf32[8, 6] {}
+    mut tensor<f32, [4, 4]> full_qdom ← tf32[4, 4] {}
+    mut tensor<f32, [4, 6]> tile_dom ← tf32[4, 6] {}
+    mut tensor<f32, [2, 4]> tile_qdom ← tf32[2, 4] {}
+    mut tensor<f32, [4, 4]> q ← tf32[4, 4] {}
+    mut tensor<f32, [6, 2]> kc ← tf32[6, 2] {}
+    mut tensor<f32, [6, 2]> vc ← tf32[6, 2] {}
+    mut tensor<f32, [8, 6]> full_sc ← tf32[8, 6] {}
+    mut tensor<f32, [8, 6]> full_pr ← tf32[8, 6] {}
+    mut tensor<f32, [4, 4]> full_ctx ← tf32[4, 4] {}
+    mut tensor<f32, [4, 6]> tile_sc ← tf32[4, 6] {}
+    mut tensor<f32, [4, 6]> tile_pr ← tf32[4, 6] {}
+    mut tensor<f32, [4, 4]> tile_ctx ← tf32[4, 4] {}
+
+    for range 0‥4 let b {
+        for range 0‥4 let j {
+            q[[b, j]] ← ((b * 2 + j + 1) ↦ f32) * 0.2
+        }
+    }
+    for range 0‥6 let c {
+        for range 0‥2 let d {
+            kc[[c, d]] ← ((c * 2 + d + 1) ↦ f32) * 0.1
+            vc[[c, d]] ← ((c + d * 3 + 1) ↦ f32) * 0.15
+        }
+    }
+
+    ds.attn_scores_batch(full_dom, q, kc, mut full_sc, 1, 2, 2, 2, 0.5, 3, 2)
+    ds.row_softmax(full_sc, mut full_pr)
+    ds.attn_context_batch(full_qdom, full_pr, vc, mut full_ctx, 1, 2, 2, 2, 3, 2)
+
+    ds.attn_scores_query_tile(tile_dom, q, kc, mut tile_sc, 1, 2, 2, 2, 0.5, 3, 2, 0, 2)
+    ds.row_softmax(tile_sc, mut tile_pr)
+    ds.attn_context_query_tile(tile_qdom, tile_pr, vc, mut tile_ctx, 1, 2, 2, 2, 3, 2, 0, 2)
+
+    ds.attn_scores_query_tile(tile_dom, q, kc, mut tile_sc, 1, 2, 2, 2, 0.5, 3, 2, 2, 1)
+    ds.row_softmax(tile_sc, mut tile_pr)
+    ds.attn_context_query_tile(tile_qdom, tile_pr, vc, mut tile_ctx, 1, 2, 2, 2, 3, 2, 2, 1)
+
+    for range 0‥3 let b {
+        for range 0‥4 let j {
+            assert close(tile_ctx[[b, j]], full_ctx[[b, j]])
+        }
+    }
 }

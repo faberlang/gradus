@@ -13,18 +13,10 @@ locale = "en"
 # Zero NumericBlock / list<f32> in the device compute paths.
 
 import from "gradus:decode_step" let ds
-import from "gradus:decode_hybrid_kernels" let dhk
+import from "gradus:decode_stages" let stages
+import from "gradus:decode_token" let dt
 import from "gradus:cache/session" let sess_mod
 import from "gradus:cache/hybrid_arenas" let hybrid
-import from "gradus:model/schedule" let model_schedule
-
-# RoPE convention for Flint SWA / full-attention layers.
-@ public
-union RopeKind {
-    None,
-    Half,
-    Pairs
-}
 
 # Attention weights for Slice B0 (Flint) and Slice B (Qwen3.6) full-attention layers.
 @ public
@@ -47,7 +39,7 @@ class FlintAttnParams {
     let i32 dh
     let i32 span
     let i32 group
-    let RopeKind rope
+    let dt.RopeKind rope
     let f32 eps
     let f32 lntheta
     let f32 scale
@@ -105,157 +97,48 @@ class LinearAttnParams {
     let int history_len
 }
 
-fn find_slot_index(list<int> slot_ids, int slot_id) → int ⇥ sess_mod.SessionError {
-    for exclusive slot_ids.length() let i {
-        if slot_ids[i] ≡ slot_id then return i
-    }
-
-    throw variant sess_mod.SessionError.SlotArenaMismatch { message = "slot § is not in arena"(slot_id ↦ string) }
-}
-
 # Slice B0 attention step: RMSNorm -> QKV proj -> optional QK-norm ->
 # inverted RoPE (None on full-attn, Half/Pairs on SWA) -> SessionState KV write ->
 # RingKvArena / FullKvArena score + learnable softmax / sink -> context -> O proj + residual.
 @ public
 fn flint_attn_step<size D, size QD, size KVD, size DH, size H, size C, size W>(tensor<f32, [D]> hin, mut tensor<f32, [D]> hout, FlintAttnWeights<D, QD, KVD, DH, H> aw, FlintAttnParams ap, mut sess_mod.SessionState<C, W, KVD> sess, int slot_id, i32 pos) → void ⇥ sess_mod.SessionError {
     mut tensor<f32, [D]> xn ← tf32[D] {}
-    ds.rmsnorm(hin, aw.anorm, mut xn, ap.eps)
-
     mut tensor<f32, [QD]> q ← tf32[QD] {}
     mut tensor<f32, [KVD]> k ← tf32[KVD] {}
     mut tensor<f32, [KVD]> v ← tf32[KVD] {}
-    ds.qkv_proj(aw.wq, aw.wk, aw.wv, xn, mut q, mut k, mut v)
+    do device {
+        ds.rmsnorm(hin, aw.anorm, mut xn, ap.eps)
+        ds.qkv_proj(aw.wq, aw.wk, aw.wv, xn, mut q, mut k, mut v)
+    }
 
     mut tensor<f32, [QD]> qn ← tf32[QD] {}
     mut tensor<f32, [KVD]> kn ← tf32[KVD] {}
-    if aw.has_qk_norm {
-        dhk.rmsnorm_heads(q, aw.q_norm, mut qn, ap.eps)
-        dhk.rmsnorm_heads(k, aw.k_norm, mut kn, ap.eps)
-    }
-    else {
-        dhk.copy_slice<size QD, size QD>(q, mut qn, 0)
-        dhk.copy_slice<size KVD, size KVD>(k, mut kn, 0)
-    }
+    mut tensor<f32, [H]> q_inv ← tf32[H] {}
+    mut tensor<f32, [H]> k_inv ← tf32[H] {}
+    stages.norm_qk_heads<size H, size H, size QD, size KVD, size DH>(q, k, aw.q_norm, aw.k_norm, mut qn, mut kn, mut q_inv, mut k_inv, aw.has_qk_norm, ap.eps)
 
     mut tensor<f32, [QD]> qr ← tf32[QD] {}
     mut tensor<f32, [KVD]> kr ← tf32[KVD] {}
-    match ap.rope {
-        case RopeKind.None {
-            dhk.copy_slice<size QD, size QD>(qn, mut qr, 0)
-            dhk.copy_slice<size KVD, size KVD>(kn, mut kr, 0)
-        }
-        case RopeKind.Half {
-            ds.rope_half(qn, mut qr, pos, ap.span, ap.lntheta)
-            ds.rope_half(kn, mut kr, pos, ap.span, ap.lntheta)
-        }
-        case RopeKind.Pairs {
-            ds.rope_pairs(qn, mut qr, pos, ap.span, ap.lntheta)
-            ds.rope_pairs(kn, mut kr, pos, ap.span, ap.lntheta)
-        }
-    }
-
-    sess_mod.write_kv(mut sess, slot_id, kr, v, pos)
-
-    let tensor<f32, [QD]> qdom ← tf32[QD] {}
     mut tensor<f32, [QD]> ctx ← tf32[QD] {}
-    let model_schedule.ArenaKind kind ← sess_mod.slot_kind(sess, slot_id)
-
-    match kind {
-        case model_schedule.ArenaKind.FullKv {
-            let tensor<f32, [H, C]> dom_c ← tf32[H, C] {}
-            mut tensor<f32, [H, C]> sc_c ← tf32[H, C] {}
-            mut tensor<f32, [H, C]> pr_c ← tf32[H, C] {}
-            sess_mod.score_full(sess.full_kv, slot_id, dom_c, qr, mut sc_c, pos, ap.group, ap.dh, ap.scale)
-            if aw.has_sink {
-                dhk.row_softmax_sink(sc_c, aw.softmax_sink, mut pr_c)
-            }
-            else {
-                sess_mod.softmax_full(sc_c, mut pr_c)
-            }
-            sess_mod.context_full(sess.full_kv, slot_id, qdom, pr_c, mut ctx, pos, ap.group, ap.dh)
-        }
-        case model_schedule.ArenaKind.RingKv let ? {
-            let tensor<f32, [H, W]> dom_w ← tf32[H, W] {}
-            mut tensor<f32, [H, W]> sc_w ← tf32[H, W] {}
-            mut tensor<f32, [H, W]> pr_w ← tf32[H, W] {}
-            sess_mod.score_ring(sess.ring_kv, slot_id, dom_w, qr, mut sc_w, pos, ap.group, ap.dh, ap.scale)
-            if aw.has_sink {
-                dhk.row_softmax_sink(sc_w, aw.softmax_sink, mut pr_w)
-            }
-            else {
-                sess_mod.softmax_ring(sc_w, mut pr_w)
-            }
-            sess_mod.context_ring(sess.ring_kv, slot_id, qdom, pr_w, mut ctx, pos, ap.group, ap.dh)
-        }
-        case _ {
-            throw variant sess_mod.SessionError.SlotArenaMismatch { message = "flint_attn_step requires FullKv or RingKv slot" }
-        }
-    }
+    stages.attn_rope_and_session(qn, kn, v, mut qr, mut kr, ap.rope, pos, ap.span, ap.lntheta, ap.group, ap.dh, ap.scale, aw.has_sink, aw.softmax_sink, mut sess, slot_id, mut ctx)
 
     mut tensor<f32, [D]> ao ← tf32[D] {}
-    ds.gemv(aw.wo, ctx, mut ao)
-    ds.residual_add(hin, ao, mut hout)
+    do device {
+        ds.gemv(aw.wo, ctx, mut ao)
+        ds.residual_add(hin, ao, mut hout)
+    }
 }
 
 # Dense SwiGLU FFN step (used for Flint leading `mlp_only_layers`).
 @ public
 fn dense_ffn_step<size D, size F>(tensor<f32, [D]> h1, mut tensor<f32, [D]> hout, DenseFfnWeights<D, F> fw, f32 eps) → void {
-    mut tensor<f32, [D]> fnx ← tf32[D] {}
-    ds.rmsnorm(h1, fw.fnorm, mut fnx, eps)
-
-    mut tensor<f32, [F]> gate ← tf32[F] {}
-    mut tensor<f32, [F]> up ← tf32[F] {}
-    mut tensor<f32, [F]> act ← tf32[F] {}
-    mut tensor<f32, [D]> down ← tf32[D] {}
-    ds.gate_up_proj(fw.wg, fw.wu, fnx, mut gate, mut up)
-    ds.swiglu(gate, up, mut act)
-    ds.gemv(fw.wd, act, mut down)
-    ds.residual_add(h1, down, mut hout)
+    stages.dense_ffn_stage(h1, mut hout, fw.fnorm, fw.wg, fw.wu, fw.wd, eps)
 }
 
 # Routed + optional shared MoE FFN step.
 @ public
 fn moe_ffn_step<size D, size E, size EF, size ED, size K, size FE, size FS>(tensor<f32, [D]> h1, mut tensor<f32, [D]> hout, MoeFfnWeights<D, E, EF, ED, FE, FS> mw, mut tensor<i32, [K]> top_idx, f32 eps) → void {
-    mut tensor<f32, [D]> fnx ← tf32[D] {}
-    ds.rmsnorm(h1, mw.fnorm, mut fnx, eps)
-
-    mut tensor<f32, [E]> r_logits ← tf32[E] {}
-    ds.gemv(mw.router, fnx, mut r_logits)
-
-    mut tensor<f32, [K]> top_vals ← tf32[K] {}
-    mut tensor<f32, [K]> top_weights ← tf32[K] {}
-    dhk.moe_topk_indices(r_logits, mut top_idx, mut top_vals)
-    dhk.moe_renorm_weights(top_vals, mut top_weights)
-
-    mut tensor<f32, [K, FE]> expert_act ← tf32[K, FE] {}
-    mut tensor<f32, [D]> moe_out ← tf32[D] {}
-    dhk.moe_experts_gate_up_swiglu(mw.wg, mw.wu, fnx, top_idx, mut expert_act)
-    dhk.moe_experts_down_accum(mw.wd, expert_act, top_idx, top_weights, mut moe_out)
-
-    if mw.has_shared {
-        mut tensor<f32, [FS]> s_gate ← tf32[FS] {}
-        mut tensor<f32, [FS]> s_up ← tf32[FS] {}
-        mut tensor<f32, [FS]> s_act ← tf32[FS] {}
-        mut tensor<f32, [D]> s_out ← tf32[D] {}
-        mut tensor<f32, [D]> ffn_out ← tf32[D] {}
-        ds.gate_up_proj(mw.shared_wg, mw.shared_wu, fnx, mut s_gate, mut s_up)
-        ds.swiglu(s_gate, s_up, mut s_act)
-        ds.gemv(mw.shared_wd, s_act, mut s_out)
-
-        if mw.has_shared_gate {
-            mut tensor<f32, [1]> s_gate_logit ← tf32[1] {}
-            ds.gemv(mw.shared_gate_w, fnx, mut s_gate_logit)
-            dhk.sigmoid_gate_add(moe_out, s_out, s_gate_logit, mut ffn_out)
-        }
-        else {
-            ds.residual_add(moe_out, s_out, mut ffn_out)
-        }
-
-        ds.residual_add(h1, ffn_out, mut hout)
-    }
-    else {
-        ds.residual_add(h1, moe_out, mut hout)
-    }
+    stages.moe_ffn_stage(h1, mut hout, mw.fnorm, mw.router, mw.wg, mw.wu, mw.wd, mw.has_shared, mw.shared_wg, mw.shared_wu, mw.shared_wd, mw.has_shared_gate, mw.shared_gate_w, mut top_idx, eps)
 }
 
 # Slice B0 full layer step: attention + dense FFN (when `is_dense`) or MoE FFN.
@@ -277,44 +160,30 @@ fn flint_layer_step<size D, size QD, size KVD, size DH, size H, size C, size W, 
 @ public
 fn qwen36_full_attn_step<size D, size QD, size KVD, size DH, size H, size C, size W>(tensor<f32, [D]> hin, mut tensor<f32, [D]> hout, FlintAttnWeights<D, QD, KVD, DH, H> aw, FlintAttnParams ap, tensor<i32, [4]> sections, mut sess_mod.SessionState<C, W, KVD> sess, int slot_id, i32 pos) → void ⇥ sess_mod.SessionError {
     mut tensor<f32, [D]> xn ← tf32[D] {}
-    ds.rmsnorm(hin, aw.anorm, mut xn, ap.eps)
-
     mut tensor<f32, [QD]> q ← tf32[QD] {}
     mut tensor<f32, [KVD]> k ← tf32[KVD] {}
     mut tensor<f32, [KVD]> v ← tf32[KVD] {}
-    ds.qkv_proj(aw.wq, aw.wk, aw.wv, xn, mut q, mut k, mut v)
+    do device {
+        ds.rmsnorm(hin, aw.anorm, mut xn, ap.eps)
+        ds.qkv_proj(aw.wq, aw.wk, aw.wv, xn, mut q, mut k, mut v)
+    }
 
     mut tensor<f32, [QD]> qn ← tf32[QD] {}
     mut tensor<f32, [KVD]> kn ← tf32[KVD] {}
-    if aw.has_qk_norm {
-        dhk.rmsnorm_heads(q, aw.q_norm, mut qn, ap.eps)
-        dhk.rmsnorm_heads(k, aw.k_norm, mut kn, ap.eps)
-    }
-    else {
-        dhk.copy_slice<size QD, size QD>(q, mut qn, 0)
-        dhk.copy_slice<size KVD, size KVD>(k, mut kn, 0)
-    }
+    mut tensor<f32, [H]> q_inv ← tf32[H] {}
+    mut tensor<f32, [H]> k_inv ← tf32[H] {}
+    stages.norm_qk_heads<size H, size H, size QD, size KVD, size DH>(q, k, aw.q_norm, aw.k_norm, mut qn, mut kn, mut q_inv, mut k_inv, aw.has_qk_norm, ap.eps)
 
     mut tensor<f32, [QD]> qr ← tf32[QD] {}
     mut tensor<f32, [KVD]> kr ← tf32[KVD] {}
-    dhk.rope_sectional(qn, mut qr, pos, ap.dh, sections, ap.lntheta)
-    dhk.rope_sectional(kn, mut kr, pos, ap.dh, sections, ap.lntheta)
-
-    sess_mod.write_kv(mut sess, slot_id, kr, v, pos)
-
-    let tensor<f32, [H, C]> dom_c ← tf32[H, C] {}
-    let tensor<f32, [QD]> qdom ← tf32[QD] {}
-    mut tensor<f32, [H, C]> sc_c ← tf32[H, C] {}
-    mut tensor<f32, [H, C]> pr_c ← tf32[H, C] {}
     mut tensor<f32, [QD]> ctx ← tf32[QD] {}
-
-    sess_mod.score_full(sess.full_kv, slot_id, dom_c, qr, mut sc_c, pos, ap.group, ap.dh, ap.scale)
-    sess_mod.softmax_full(sc_c, mut pr_c)
-    sess_mod.context_full(sess.full_kv, slot_id, qdom, pr_c, mut ctx, pos, ap.group, ap.dh)
+    stages.attn_sectional_and_session<size QD, size KVD, size H, size C, size W>(qn, kn, v, mut qr, mut kr, pos, ap.dh, sections, ap.lntheta, ap.group, ap.scale, mut sess, slot_id, mut ctx)
 
     mut tensor<f32, [D]> ao ← tf32[D] {}
-    ds.gemv(aw.wo, ctx, mut ao)
-    ds.residual_add(hin, ao, mut hout)
+    do device {
+        ds.gemv(aw.wo, ctx, mut ao)
+        ds.residual_add(hin, ao, mut hout)
+    }
 }
 
 # Slice B (Qwen3.6) linear-attention step: fused attn_qkv -> causal 1D ShortConv
@@ -322,57 +191,12 @@ fn qwen36_full_attn_step<size D, size QD, size KVD, size DH, size H, size C, siz
 # RecurrentStateArena -> z-gated RMSNorm -> output proj + residual.
 @ public
 fn qwen36_linear_attn_step<size D, size ConvCh, size RecRows, size VH, size K, size RecCols, size ConvRows>(tensor<f32, [D]> hin, mut tensor<f32, [D]> hout, LinearAttnWeights<D, ConvCh, RecRows, VH, K, RecCols> lw, LinearAttnParams lp, mut hybrid.ConvStateArena<ConvRows, ConvCh> conv_arena, mut hybrid.RecurrentStateArena<RecRows, RecCols> rec_arena, int slot_id) → void ⇥ sess_mod.SessionError {
-    mut tensor<f32, [D]> xn ← tf32[D] {}
-    ds.rmsnorm(hin, lw.anorm, mut xn, lp.eps)
-
-    mut tensor<f32, [ConvCh]> qkv_mixed ← tf32[ConvCh] {}
-    mut tensor<f32, [RecRows]> z ← tf32[RecRows] {}
-    mut tensor<f32, [VH]> beta_raw ← tf32[VH] {}
-    mut tensor<f32, [VH]> alpha_raw ← tf32[VH] {}
-    ds.gemv(lw.wqkv, xn, mut qkv_mixed)
-    ds.gemv(lw.wgate, xn, mut z)
-    ds.gemv(lw.wbeta, xn, mut beta_raw)
-    ds.gemv(lw.walpha, xn, mut alpha_raw)
-
-    mut tensor<f32, [VH]> decay ← tf32[VH] {}
-    mut tensor<f32, [VH]> beta ← tf32[VH] {}
-    dhk.deltanet_gates(alpha_raw, lw.dt_bias, lw.a_row, beta_raw, mut decay, mut beta)
-
-    let int c_idx ← find_slot_index(conv_arena.slot_ids, slot_id)
-    let tensor<f32, [ConvRows, ConvCh]> conv_buf ← conv_arena.buffers[c_idx]
-    mut tensor<f32, [ConvCh]> conv_out ← tf32[ConvCh] {}
-    dhk.conv_dot_silu(conv_buf, qkv_mixed, lw.conv_w, mut conv_out, lp.site_idx ↦ i32 ⊥ 0, lp.history_len ↦ i32 ⊥ 1)
-    mut tensor<f32, [ConvRows, ConvCh]> next_conv_buf ← tf32[ConvRows, ConvCh] {}
-    dhk.conv_shift_write_row(conv_buf, mut next_conv_buf, qkv_mixed, lp.site_idx ↦ i32 ⊥ 0, lp.history_len ↦ i32 ⊥ 1)
-    conv_arena.buffers[c_idx] ← next_conv_buf
-    conv_arena.steps_written[c_idx] ← conv_arena.steps_written[c_idx] + 1
-
-    mut tensor<f32, [RecRows]> q_rep ← tf32[RecRows] {}
-    mut tensor<f32, [RecRows]> k_rep ← tf32[RecRows] {}
-    mut tensor<f32, [RecRows]> v_rep ← tf32[RecRows] {}
-    dhk.l2norm_repeat_slice(conv_out, mut q_rep, 0, lp.group_heads, lp.key_dim, lp.eps)
-    dhk.l2norm_repeat_slice(conv_out, mut k_rep, lp.group_heads * lp.key_dim, lp.group_heads, lp.key_dim, lp.eps)
-    dhk.copy_slice(conv_out, mut v_rep, 2 * lp.group_heads * lp.key_dim)
-
-    let int r_idx ← find_slot_index(rec_arena.slot_ids, slot_id)
-    let tensor<f32, [RecRows, RecCols]> prev_state ← rec_arena.states[r_idx]
-    mut tensor<f32, [RecRows, RecCols]> next_state ← tf32[RecRows, RecCols] {}
-    dhk.delta_net_update(prev_state, k_rep, v_rep, decay, beta, mut next_state)
-    hybrid.recurrent_update(mut rec_arena, slot_id, next_state)
-
-    mut tensor<f32, [RecRows]> core_out ← tf32[RecRows] {}
-    dhk.delta_net_readout(next_state, q_rep, mut core_out)
-
-    mut tensor<f32, [RecRows]> final_out ← tf32[RecRows] {}
-    dhk.z_gated_rmsnorm(core_out, z, lw.ssm_norm, mut final_out, lp.eps)
-
-    mut tensor<f32, [D]> proj_out ← tf32[D] {}
-    ds.gemv(lw.wout, final_out, mut proj_out)
-    ds.residual_add(hin, proj_out, mut hout)
+    stages.deltanet_linear_attn_stage(hin, mut hout, lw.anorm, lw.wqkv, lw.wgate, lw.conv_w, lw.dt_bias, lw.a_row, lw.wbeta, lw.walpha, lw.ssm_norm, lw.wout, lp.group_heads, lp.key_dim, lp.eps, lp.site_idx, lp.history_len, mut conv_arena, mut rec_arena, slot_id)
 }
 
 +++ faber test
 import from "gradus:decode_hybrid" let dh
+import from "gradus:decode_token" let dt
 import from "gradus:cache/session" let sess_mod
 import from "gradus:cache/hybrid_arenas" let hybrid
 import from "gradus:model/schedule" let model_schedule
@@ -488,7 +312,7 @@ test "decode_hybrid flint_attn_step dispatches RingKvArena and FullKvArena with 
             dh = 2,
             span = 1,
             group = 2,
-            rope = variant dh.RopeKind.Half,
+            rope = variant dt.RopeKind.Half,
             eps = 0.0,
             lntheta = 0.0,
             scale = 1.0
@@ -497,7 +321,7 @@ test "decode_hybrid flint_attn_step dispatches RingKvArena and FullKvArena with 
             dh = 2,
             span = 1,
             group = 2,
-            rope = variant dh.RopeKind.None,
+            rope = variant dt.RopeKind.None,
             eps = 0.0,
             lntheta = 0.0,
             scale = 1.0
@@ -550,7 +374,7 @@ test "decode_hybrid flint_layer_step supports leading dense FFN and routed+share
             has_sink = false, softmax_sink = sink
         }
         let dh.FlintAttnParams ap ← dh.FlintAttnParams {
-            dh = 2, span = 1, group = 2, rope = variant dh.RopeKind.None,
+            dh = 2, span = 1, group = 2, rope = variant dt.RopeKind.None,
             eps = 0.0, lntheta = 0.0, scale = 1.0
         }
 
@@ -674,7 +498,7 @@ test "decode_hybrid qwen36_full_attn_step applies sectional RoPE and writes Full
             has_sink = false, softmax_sink = sink
         }
         let dh.FlintAttnParams ap ← dh.FlintAttnParams {
-            dh = 4, span = 1, group = 1, rope = variant dh.RopeKind.Half,
+            dh = 4, span = 1, group = 1, rope = variant dt.RopeKind.Half,
             eps = 0.0, lntheta = 0.0, scale = 0.5
         }
         mut tensor<i32, [4]> sections ← tensor<i32, [4]> {}
