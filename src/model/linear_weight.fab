@@ -36,7 +36,6 @@ import from "gradus:model/dequant" let dequant
 import from "gradus:model/tensor_directory" let td
 import from "gradus:storage" let storage
 import from "gradus:quant/group_affine" let ga
-import from "gradus:storage" let storage
 
 @ public
 union LinearWeightError {
@@ -629,56 +628,65 @@ kernel add_bias<size Out>(tensor<f32, [Out]> bias, mut tensor<f32, [Out]> y) →
 @ public
 kernel ggml_q8_0_matvec<size Out, size Blocks, size RowBytes, size In>(tensor<u8, [Out, RowBytes]> raw_blocks, tensor<f32, [In]> x, mut tensor<f32, [Out]> y) → void {
     for from y at [row] thread lane let e {
-        let i32 rr ← (row ↦ i32) ∧ 65535
+        let i32 row_block_limit ← RowBytes / 34
+        let i32 in_block_limit ← In / 32
         mut f32 acc ← 0.0 ∷ f32
 
         for exclusive Blocks let b {
-            let i32 bi ← (b ↦ i32) ∧ 65535
-            let i32 base ← bi * 34
-            let i32 lo ← (raw_blocks[[rr, base]] ↦ i32 ⊥ 0) ∧ 255
-            let i32 hi ← (raw_blocks[[rr, base + 1]] ↦ i32 ⊥ 0) ∧ 255
-            let i32 bits ← lo + hi * 256
-            let i32 sign_bit ← (bits / 32768) ∧ 1
-            let i32 exp_bits ← (bits / 1024) ∧ 31
-            let i32 mant_bits ← bits ∧ 1023
+            if b ≥ 0 and b ≺ row_block_limit and b ≺ in_block_limit {
+                let i32 base ← b * 34
+                let i32 lo ← (raw_blocks[[row, base]] ↦ i32 ⊥ 0) ∧ 255
+                let i32 hi ← (raw_blocks[[row, base + 1]] ↦ i32 ⊥ 0) ∧ 255
+                let i32 bits ← lo + hi * 256
+                let i32 sign_bit ← (bits / 32768) ∧ 1
+                let i32 exp_bits ← (bits / 1024) ∧ 31
+                let i32 mant_bits ← bits ∧ 1023
 
-            mut f32 d ← 0.0 ∷ f32
-            if exp_bits ≡ 0 {
-                if mant_bits ≢ 0 {
-                    d ← (mant_bits ↦ f32) / (16777216.0 ∷ f32)
-                }
-            }
-            elif exp_bits ≺ 31 {
-                mut f32 mag ← (1.0 ∷ f32) + (mant_bits ↦ f32) / (1024.0 ∷ f32)
-                let i32 shift_exp ← exp_bits - 15
-                if shift_exp ≻ 0 {
-                    for exclusive shift_exp let p {
-                        mag ← mag * (2.0 ∷ f32)
+                mut f32 d ← 0.0 ∷ f32
+                if exp_bits ≡ 0 {
+                    if mant_bits ≢ 0 {
+                        d ← (mant_bits ↦ f32) / (16777216.0 ∷ f32)
                     }
                 }
-                elif shift_exp ≺ 0 {
-                    let i32 neg_exp ← 0 - shift_exp
-                    for exclusive neg_exp let p {
-                        mag ← mag / (2.0 ∷ f32)
+                elif exp_bits ≺ 31 {
+                    mut f32 mag ← (1.0 ∷ f32) + (mant_bits ↦ f32) / (1024.0 ∷ f32)
+                    let i32 shift_exp ← exp_bits - 15
+                    if shift_exp ≻ 0 {
+                        for exclusive shift_exp let p {
+                            mag ← mag * (2.0 ∷ f32)
+                        }
+                    }
+                    elif shift_exp ≺ 0 {
+                        let i32 neg_exp ← 0 - shift_exp
+                        for exclusive neg_exp let p {
+                            mag ← mag / (2.0 ∷ f32)
+                        }
+                    }
+                    d ← mag
+                }
+                else {
+                    if mant_bits ≡ 0 {
+                        d ← (1.0 ∷ f32) / (0.0 ∷ f32)
+                    }
+                    else {
+                        d ← (0.0 ∷ f32) / (0.0 ∷ f32)
                     }
                 }
-                d ← mag
-            }
 
-            if sign_bit ≢ 0 {
-                d ← (0.0 ∷ f32) - d
-            }
-
-            let i32 x_base ← bi * 32
-            for exclusive 32 let k {
-                let i32 ki ← (k ↦ i32 ⊥ 0) ∧ 31
-                let i32 q_u ← (raw_blocks[[rr, base + 2 + ki]] ↦ i32 ⊥ 0)
-                mut i32 q_s ← q_u
-                if q_u ≥ 128 {
-                    q_s ← q_u - 256
+                if sign_bit ≢ 0 {
+                    d ← -d
                 }
-                let f32 w ← (q_s ↦ f32) * d
-                acc ← acc + w * x[[x_base + ki]]
+
+                let i32 x_base ← b * 32
+                for exclusive 32 let k {
+                    let i32 q_u ← (raw_blocks[[row, base + 2 + k]] ↦ i32 ⊥ 0)
+                    mut i32 q_s ← q_u
+                    if q_u ≥ 128 {
+                        q_s ← q_u - 256
+                    }
+                    let f32 w ← (q_s ↦ f32) * d
+                    acc ← acc + w * x[[x_base + k]]
+                }
             }
         }
 
@@ -765,11 +773,9 @@ fn dispatch_ggml_q8_0<size Out, size Blocks, size RowBytes, size In>(LinearWeigh
 @ public
 kernel dense_f16_matvec<size Out, size In>(tensor<f16, [Out, In]> weight, tensor<f32, [In]> x, mut tensor<f32, [Out]> y) → void {
     for from y at [row] thread lane let e {
-        let i32 rr ← (row ↦ i32) ∧ 65535
         mut f32 acc ← 0.0 ∷ f32
         for exclusive In let j {
-            let i32 ji ← (j ↦ i32) ∧ 65535
-            acc ← acc + (weight[[rr, ji]] ↦ f32) * x[[ji]]
+            acc ← acc + (weight[[row, j]] ↦ f32) * x[[j]]
         }
         y[[row]] ← acc
     }
@@ -791,74 +797,91 @@ fn dispatch_dense_f16<size Out, size In>(LinearWeight lw, tensor<f16, [Out, In]>
 @ public
 kernel ggml_q4_1_matvec<size Out, size Blocks, size RowBytes, size In>(tensor<u8, [Out, RowBytes]> raw_blocks, tensor<f32, [In]> x, mut tensor<f32, [Out]> y) → void {
     for from y at [row] thread lane let e {
-        let i32 rr ← (row ↦ i32) ∧ 65535
+        let i32 row_block_limit ← RowBytes / 20
+        let i32 in_block_limit ← In / 32
         mut f32 acc ← 0.0 ∷ f32
 
         for exclusive Blocks let b {
-            let i32 bi ← (b ↦ i32) ∧ 65535
-            let i32 base ← bi * 20
+            if b ≥ 0 and b ≺ row_block_limit and b ≺ in_block_limit {
+                let i32 base ← b * 20
 
-            let i32 d_lo ← (raw_blocks[[rr, base]] ↦ i32 ⊥ 0) ∧ 255
-            let i32 d_hi ← (raw_blocks[[rr, base + 1]] ↦ i32 ⊥ 0) ∧ 255
-            let i32 d_bits ← d_lo + d_hi * 256
-            let i32 d_sign ← (d_bits / 32768) ∧ 1
-            let i32 d_exp ← (d_bits / 1024) ∧ 31
-            let i32 d_mant ← d_bits ∧ 1023
-            mut f32 d ← 0.0 ∷ f32
-            if d_exp ≡ 0 {
-                if d_mant ≢ 0 {
-                    d ← (d_mant ↦ f32) / (16777216.0 ∷ f32)
+                let i32 d_lo ← (raw_blocks[[row, base]] ↦ i32 ⊥ 0) ∧ 255
+                let i32 d_hi ← (raw_blocks[[row, base + 1]] ↦ i32 ⊥ 0) ∧ 255
+                let i32 d_bits ← d_lo + d_hi * 256
+                let i32 d_sign ← (d_bits / 32768) ∧ 1
+                let i32 d_exp ← (d_bits / 1024) ∧ 31
+                let i32 d_mant ← d_bits ∧ 1023
+                mut f32 d ← 0.0 ∷ f32
+                if d_exp ≡ 0 {
+                    if d_mant ≢ 0 {
+                        d ← (d_mant ↦ f32) / (16777216.0 ∷ f32)
+                    }
                 }
-            }
-            elif d_exp ≺ 31 {
-                mut f32 mag ← (1.0 ∷ f32) + (d_mant ↦ f32) / (1024.0 ∷ f32)
-                let i32 se ← d_exp - 15
-                if se ≻ 0 {
-                    for exclusive se let p { mag ← mag * (2.0 ∷ f32) }
+                elif d_exp ≺ 31 {
+                    mut f32 mag ← (1.0 ∷ f32) + (d_mant ↦ f32) / (1024.0 ∷ f32)
+                    let i32 se ← d_exp - 15
+                    if se ≻ 0 {
+                        for exclusive se let p { mag ← mag * (2.0 ∷ f32) }
+                    }
+                    elif se ≺ 0 {
+                        let i32 ne ← 0 - se
+                        for exclusive ne let p { mag ← mag / (2.0 ∷ f32) }
+                    }
+                    d ← mag
                 }
-                elif se ≺ 0 {
-                    let i32 ne ← 0 - se
-                    for exclusive ne let p { mag ← mag / (2.0 ∷ f32) }
+                else {
+                    if d_mant ≡ 0 {
+                        d ← (1.0 ∷ f32) / (0.0 ∷ f32)
+                    }
+                    else {
+                        d ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                    }
                 }
-                d ← mag
-            }
-            if d_sign ≢ 0 { d ← (0.0 ∷ f32) - d }
+                if d_sign ≢ 0 { d ← -d }
 
-            let i32 m_lo ← (raw_blocks[[rr, base + 2]] ↦ i32 ⊥ 0) ∧ 255
-            let i32 m_hi ← (raw_blocks[[rr, base + 3]] ↦ i32 ⊥ 0) ∧ 255
-            let i32 m_bits ← m_lo + m_hi * 256
-            let i32 m_sign ← (m_bits / 32768) ∧ 1
-            let i32 m_exp ← (m_bits / 1024) ∧ 31
-            let i32 m_mant ← m_bits ∧ 1023
-            mut f32 m ← 0.0 ∷ f32
-            if m_exp ≡ 0 {
-                if m_mant ≢ 0 {
-                    m ← (m_mant ↦ f32) / (16777216.0 ∷ f32)
+                let i32 m_lo ← (raw_blocks[[row, base + 2]] ↦ i32 ⊥ 0) ∧ 255
+                let i32 m_hi ← (raw_blocks[[row, base + 3]] ↦ i32 ⊥ 0) ∧ 255
+                let i32 m_bits ← m_lo + m_hi * 256
+                let i32 m_sign ← (m_bits / 32768) ∧ 1
+                let i32 m_exp ← (m_bits / 1024) ∧ 31
+                let i32 m_mant ← m_bits ∧ 1023
+                mut f32 m ← 0.0 ∷ f32
+                if m_exp ≡ 0 {
+                    if m_mant ≢ 0 {
+                        m ← (m_mant ↦ f32) / (16777216.0 ∷ f32)
+                    }
                 }
-            }
-            elif m_exp ≺ 31 {
-                mut f32 mag ← (1.0 ∷ f32) + (m_mant ↦ f32) / (1024.0 ∷ f32)
-                let i32 se ← m_exp - 15
-                if se ≻ 0 {
-                    for exclusive se let p { mag ← mag * (2.0 ∷ f32) }
+                elif m_exp ≺ 31 {
+                    mut f32 mag ← (1.0 ∷ f32) + (m_mant ↦ f32) / (1024.0 ∷ f32)
+                    let i32 se ← m_exp - 15
+                    if se ≻ 0 {
+                        for exclusive se let p { mag ← mag * (2.0 ∷ f32) }
+                    }
+                    elif se ≺ 0 {
+                        let i32 ne ← 0 - se
+                        for exclusive ne let p { mag ← mag / (2.0 ∷ f32) }
+                    }
+                    m ← mag
                 }
-                elif se ≺ 0 {
-                    let i32 ne ← 0 - se
-                    for exclusive ne let p { mag ← mag / (2.0 ∷ f32) }
+                else {
+                    if m_mant ≡ 0 {
+                        m ← (1.0 ∷ f32) / (0.0 ∷ f32)
+                    }
+                    else {
+                        m ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                    }
                 }
-                m ← mag
-            }
-            if m_sign ≢ 0 { m ← (0.0 ∷ f32) - m }
+                if m_sign ≢ 0 { m ← -m }
 
-            let i32 x_base ← bi * 32
-            for exclusive 16 let j {
-                let i32 ji ← (j ↦ i32 ⊥ 0) ∧ 15
-                let i32 qs ← (raw_blocks[[rr, base + 4 + ji]] ↦ i32 ⊥ 0) ∧ 255
-                let i32 q0 ← qs ∧ 15
-                let i32 q1 ← (qs ⇒ 4) ∧ 15
-                let f32 w0 ← (q0 ↦ f32) * d + m
-                let f32 w1 ← (q1 ↦ f32) * d + m
-                acc ← acc + w0 * x[[x_base + ji]] + w1 * x[[x_base + 16 + ji]]
+                let i32 x_base ← b * 32
+                for exclusive 16 let j {
+                    let i32 qs ← (raw_blocks[[row, base + 4 + j]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 q0 ← qs ∧ 15
+                    let i32 q1 ← (qs ⇒ 4) ∧ 15
+                    let f32 w0 ← (q0 ↦ f32) * d + m
+                    let f32 w1 ← (q1 ↦ f32) * d + m
+                    acc ← acc + w0 * x[[x_base + j]] + w1 * x[[x_base + 16 + j]]
+                }
             }
         }
 
@@ -882,83 +905,92 @@ fn dispatch_ggml_q4_1<size Out, size Blocks, size RowBytes, size In>(LinearWeigh
 @ public
 kernel ggml_q5_0_matvec<size Out, size Blocks, size RowBytes, size In>(tensor<u8, [Out, RowBytes]> raw_blocks, tensor<f32, [In]> x, mut tensor<f32, [Out]> y) → void {
     for from y at [row] thread lane let e {
-        let i32 rr ← (row ↦ i32) ∧ 65535
+        let i32 row_block_limit ← RowBytes / 22
+        let i32 in_block_limit ← In / 32
         mut f32 acc ← 0.0 ∷ f32
 
         for exclusive Blocks let b {
-            let i32 bi ← (b ↦ i32) ∧ 65535
-            let i32 base ← bi * 22
-            let i32 lo ← (raw_blocks[[rr, base]] ↦ i32 ⊥ 0) ∧ 255
-            let i32 hi ← (raw_blocks[[rr, base + 1]] ↦ i32 ⊥ 0) ∧ 255
-            let i32 bits ← lo + hi * 256
-            let i32 sign_bit ← (bits / 32768) ∧ 1
-            let i32 exp_bits ← (bits / 1024) ∧ 31
-            let i32 mant_bits ← bits ∧ 1023
+            if b ≥ 0 and b ≺ row_block_limit and b ≺ in_block_limit {
+                let i32 base ← b * 22
+                let i32 lo ← (raw_blocks[[row, base]] ↦ i32 ⊥ 0) ∧ 255
+                let i32 hi ← (raw_blocks[[row, base + 1]] ↦ i32 ⊥ 0) ∧ 255
+                let i32 bits ← lo + hi * 256
+                let i32 sign_bit ← (bits / 32768) ∧ 1
+                let i32 exp_bits ← (bits / 1024) ∧ 31
+                let i32 mant_bits ← bits ∧ 1023
 
-            mut f32 d ← 0.0 ∷ f32
-            if exp_bits ≡ 0 {
-                if mant_bits ≢ 0 {
-                    d ← (mant_bits ↦ f32) / (16777216.0 ∷ f32)
+                mut f32 d ← 0.0 ∷ f32
+                if exp_bits ≡ 0 {
+                    if mant_bits ≢ 0 {
+                        d ← (mant_bits ↦ f32) / (16777216.0 ∷ f32)
+                    }
                 }
-            }
-            elif exp_bits ≺ 31 {
-                mut f32 mag ← (1.0 ∷ f32) + (mant_bits ↦ f32) / (1024.0 ∷ f32)
-                let i32 shift_exp ← exp_bits - 15
-                if shift_exp ≻ 0 {
-                    for exclusive shift_exp let p { mag ← mag * (2.0 ∷ f32) }
+                elif exp_bits ≺ 31 {
+                    mut f32 mag ← (1.0 ∷ f32) + (mant_bits ↦ f32) / (1024.0 ∷ f32)
+                    let i32 shift_exp ← exp_bits - 15
+                    if shift_exp ≻ 0 {
+                        for exclusive shift_exp let p { mag ← mag * (2.0 ∷ f32) }
+                    }
+                    elif shift_exp ≺ 0 {
+                        let i32 neg_exp ← 0 - shift_exp
+                        for exclusive neg_exp let p { mag ← mag / (2.0 ∷ f32) }
+                    }
+                    d ← mag
                 }
-                elif shift_exp ≺ 0 {
-                    let i32 neg_exp ← 0 - shift_exp
-                    for exclusive neg_exp let p { mag ← mag / (2.0 ∷ f32) }
+                else {
+                    if mant_bits ≡ 0 {
+                        d ← (1.0 ∷ f32) / (0.0 ∷ f32)
+                    }
+                    else {
+                        d ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                    }
                 }
-                d ← mag
-            }
-            if sign_bit ≢ 0 { d ← (0.0 ∷ f32) - d }
+                if sign_bit ≢ 0 { d ← -d }
 
-            let i32 x_base ← bi * 32
-            for exclusive 16 let j {
-                let i32 ji ← (j ↦ i32 ⊥ 0) ∧ 15
-                let i32 qh_lo_b ← (raw_blocks[[rr, base + 2 + (ji / 8)]] ↦ i32 ⊥ 0) ∧ 255
-                let i32 qh_hi_b ← (raw_blocks[[rr, base + 4 + (ji / 8)]] ↦ i32 ⊥ 0) ∧ 255
-                let i32 bit_pos ← ji ∧ 7
-                mut i32 qh_lo_sh ← qh_lo_b
-                mut i32 qh_hi_sh ← qh_hi_b
-                if bit_pos ≡ 1 {
-                    qh_lo_sh ← qh_lo_b ⇒ 1
-                    qh_hi_sh ← qh_hi_b ⇒ 1
+                let i32 x_base ← b * 32
+                for exclusive 16 let j {
+                    let i32 qh_lo_b ← (raw_blocks[[row, base + 2 + (j / 8)]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 qh_hi_b ← (raw_blocks[[row, base + 4 + (j / 8)]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 bit_pos ← j % 8
+                    mut i32 qh_lo_sh ← qh_lo_b
+                    mut i32 qh_hi_sh ← qh_hi_b
+                    if bit_pos ≡ 1 {
+                        qh_lo_sh ← qh_lo_b ⇒ 1
+                        qh_hi_sh ← qh_hi_b ⇒ 1
+                    }
+                    elif bit_pos ≡ 2 {
+                        qh_lo_sh ← qh_lo_b ⇒ 2
+                        qh_hi_sh ← qh_hi_b ⇒ 2
+                    }
+                    elif bit_pos ≡ 3 {
+                        qh_lo_sh ← qh_lo_b ⇒ 3
+                        qh_hi_sh ← qh_hi_b ⇒ 3
+                    }
+                    elif bit_pos ≡ 4 {
+                        qh_lo_sh ← qh_lo_b ⇒ 4
+                        qh_hi_sh ← qh_hi_b ⇒ 4
+                    }
+                    elif bit_pos ≡ 5 {
+                        qh_lo_sh ← qh_lo_b ⇒ 5
+                        qh_hi_sh ← qh_hi_b ⇒ 5
+                    }
+                    elif bit_pos ≡ 6 {
+                        qh_lo_sh ← qh_lo_b ⇒ 6
+                        qh_hi_sh ← qh_hi_b ⇒ 6
+                    }
+                    elif bit_pos ≡ 7 {
+                        qh_lo_sh ← qh_lo_b ⇒ 7
+                        qh_hi_sh ← qh_hi_b ⇒ 7
+                    }
+                    let i32 xh_0 ← (qh_lo_sh ∧ 1) * 16
+                    let i32 xh_1 ← (qh_hi_sh ∧ 1) * 16
+                    let i32 qs ← (raw_blocks[[row, base + 6 + j]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 x0 ← ((qs ∧ 15) + xh_0) - 16
+                    let i32 x1 ← (((qs ⇒ 4) ∧ 15) + xh_1) - 16
+                    let f32 w0 ← (x0 ↦ f32) * d
+                    let f32 w1 ← (x1 ↦ f32) * d
+                    acc ← acc + w0 * x[[x_base + j]] + w1 * x[[x_base + 16 + j]]
                 }
-                elif bit_pos ≡ 2 {
-                    qh_lo_sh ← qh_lo_b ⇒ 2
-                    qh_hi_sh ← qh_hi_b ⇒ 2
-                }
-                elif bit_pos ≡ 3 {
-                    qh_lo_sh ← qh_lo_b ⇒ 3
-                    qh_hi_sh ← qh_hi_b ⇒ 3
-                }
-                elif bit_pos ≡ 4 {
-                    qh_lo_sh ← qh_lo_b ⇒ 4
-                    qh_hi_sh ← qh_hi_b ⇒ 4
-                }
-                elif bit_pos ≡ 5 {
-                    qh_lo_sh ← qh_lo_b ⇒ 5
-                    qh_hi_sh ← qh_hi_b ⇒ 5
-                }
-                elif bit_pos ≡ 6 {
-                    qh_lo_sh ← qh_lo_b ⇒ 6
-                    qh_hi_sh ← qh_hi_b ⇒ 6
-                }
-                elif bit_pos ≡ 7 {
-                    qh_lo_sh ← qh_lo_b ⇒ 7
-                    qh_hi_sh ← qh_hi_b ⇒ 7
-                }
-                let i32 xh_0 ← (qh_lo_sh ∧ 1) * 16
-                let i32 xh_1 ← (qh_hi_sh ∧ 1) * 16
-                let i32 qs ← (raw_blocks[[rr, base + 6 + ji]] ↦ i32 ⊥ 0) ∧ 255
-                let i32 x0 ← ((qs ∧ 15) + xh_0) - 16
-                let i32 x1 ← (((qs ⇒ 4) ∧ 15) + xh_1) - 16
-                let f32 w0 ← (x0 ↦ f32) * d
-                let f32 w1 ← (x1 ↦ f32) * d
-                acc ← acc + w0 * x[[x_base + ji]] + w1 * x[[x_base + 16 + ji]]
             }
         }
 
@@ -982,81 +1014,90 @@ fn dispatch_ggml_q5_0<size Out, size Blocks, size RowBytes, size In>(LinearWeigh
 @ public
 kernel ggml_iq4_nl_matvec<size Out, size Blocks, size RowBytes, size In>(tensor<u8, [Out, RowBytes]> raw_blocks, tensor<f32, [In]> x, mut tensor<f32, [Out]> y) → void {
     for from y at [row] thread lane let e {
-        let i32 rr ← (row ↦ i32) ∧ 65535
+        let i32 row_block_limit ← RowBytes / 18
+        let i32 in_block_limit ← In / 32
         mut f32 acc ← 0.0 ∷ f32
 
         for exclusive Blocks let b {
-            let i32 bi ← (b ↦ i32) ∧ 65535
-            let i32 base ← bi * 18
-            let i32 lo ← (raw_blocks[[rr, base]] ↦ i32 ⊥ 0) ∧ 255
-            let i32 hi ← (raw_blocks[[rr, base + 1]] ↦ i32 ⊥ 0) ∧ 255
-            let i32 bits ← lo + hi * 256
-            let i32 sign_bit ← (bits / 32768) ∧ 1
-            let i32 exp_bits ← (bits / 1024) ∧ 31
-            let i32 mant_bits ← bits ∧ 1023
+            if b ≥ 0 and b ≺ row_block_limit and b ≺ in_block_limit {
+                let i32 base ← b * 18
+                let i32 lo ← (raw_blocks[[row, base]] ↦ i32 ⊥ 0) ∧ 255
+                let i32 hi ← (raw_blocks[[row, base + 1]] ↦ i32 ⊥ 0) ∧ 255
+                let i32 bits ← lo + hi * 256
+                let i32 sign_bit ← (bits / 32768) ∧ 1
+                let i32 exp_bits ← (bits / 1024) ∧ 31
+                let i32 mant_bits ← bits ∧ 1023
 
-            mut f32 d ← 0.0 ∷ f32
-            if exp_bits ≡ 0 {
-                if mant_bits ≢ 0 {
-                    d ← (mant_bits ↦ f32) / (16777216.0 ∷ f32)
+                mut f32 d ← 0.0 ∷ f32
+                if exp_bits ≡ 0 {
+                    if mant_bits ≢ 0 {
+                        d ← (mant_bits ↦ f32) / (16777216.0 ∷ f32)
+                    }
                 }
-            }
-            elif exp_bits ≺ 31 {
-                mut f32 mag ← (1.0 ∷ f32) + (mant_bits ↦ f32) / (1024.0 ∷ f32)
-                let i32 shift_exp ← exp_bits - 15
-                if shift_exp ≻ 0 {
-                    for exclusive shift_exp let p { mag ← mag * (2.0 ∷ f32) }
+                elif exp_bits ≺ 31 {
+                    mut f32 mag ← (1.0 ∷ f32) + (mant_bits ↦ f32) / (1024.0 ∷ f32)
+                    let i32 shift_exp ← exp_bits - 15
+                    if shift_exp ≻ 0 {
+                        for exclusive shift_exp let p { mag ← mag * (2.0 ∷ f32) }
+                    }
+                    elif shift_exp ≺ 0 {
+                        let i32 neg_exp ← 0 - shift_exp
+                        for exclusive neg_exp let p { mag ← mag / (2.0 ∷ f32) }
+                    }
+                    d ← mag
                 }
-                elif shift_exp ≺ 0 {
-                    let i32 neg_exp ← 0 - shift_exp
-                    for exclusive neg_exp let p { mag ← mag / (2.0 ∷ f32) }
+                else {
+                    if mant_bits ≡ 0 {
+                        d ← (1.0 ∷ f32) / (0.0 ∷ f32)
+                    }
+                    else {
+                        d ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                    }
                 }
-                d ← mag
-            }
-            if sign_bit ≢ 0 { d ← (0.0 ∷ f32) - d }
+                if sign_bit ≢ 0 { d ← -d }
 
-            let i32 x_base ← bi * 32
-            for exclusive 16 let j {
-                let i32 ji ← (j ↦ i32 ⊥ 0) ∧ 15
-                let i32 qs ← (raw_blocks[[rr, base + 2 + ji]] ↦ i32 ⊥ 0) ∧ 255
-                let i32 q0 ← qs ∧ 15
-                let i32 q1 ← (qs ⇒ 4) ∧ 15
+                let i32 x_base ← b * 32
+                for exclusive 16 let j {
+                    let i32 qs ← (raw_blocks[[row, base + 2 + j]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 q0 ← qs ∧ 15
+                    let i32 q1 ← (qs ⇒ 4) ∧ 15
 
-                mut f32 kv0 ← 113.0 ∷ f32
-                if q0 ≡ 0 { kv0 ← -127.0 ∷ f32 }
-                elif q0 ≡ 1 { kv0 ← -104.0 ∷ f32 }
-                elif q0 ≡ 2 { kv0 ← -83.0 ∷ f32 }
-                elif q0 ≡ 3 { kv0 ← -65.0 ∷ f32 }
-                elif q0 ≡ 4 { kv0 ← -49.0 ∷ f32 }
-                elif q0 ≡ 5 { kv0 ← -35.0 ∷ f32 }
-                elif q0 ≡ 6 { kv0 ← -22.0 ∷ f32 }
-                elif q0 ≡ 7 { kv0 ← -10.0 ∷ f32 }
-                elif q0 ≡ 8 { kv0 ← 1.0 ∷ f32 }
-                elif q0 ≡ 9 { kv0 ← 13.0 ∷ f32 }
-                elif q0 ≡ 10 { kv0 ← 25.0 ∷ f32 }
-                elif q0 ≡ 11 { kv0 ← 38.0 ∷ f32 }
-                elif q0 ≡ 12 { kv0 ← 53.0 ∷ f32 }
-                elif q0 ≡ 13 { kv0 ← 69.0 ∷ f32 }
-                elif q0 ≡ 14 { kv0 ← 89.0 ∷ f32 }
+                    mut f32 kv0 ← 113.0 ∷ f32
+                    if q0 ≡ 0 { kv0 ← -127.0 ∷ f32 }
+                    elif q0 ≡ 1 { kv0 ← -104.0 ∷ f32 }
+                    elif q0 ≡ 2 { kv0 ← -83.0 ∷ f32 }
+                    elif q0 ≡ 3 { kv0 ← -65.0 ∷ f32 }
+                    elif q0 ≡ 4 { kv0 ← -49.0 ∷ f32 }
+                    elif q0 ≡ 5 { kv0 ← -35.0 ∷ f32 }
+                    elif q0 ≡ 6 { kv0 ← -22.0 ∷ f32 }
+                    elif q0 ≡ 7 { kv0 ← -10.0 ∷ f32 }
+                    elif q0 ≡ 8 { kv0 ← 1.0 ∷ f32 }
+                    elif q0 ≡ 9 { kv0 ← 13.0 ∷ f32 }
+                    elif q0 ≡ 10 { kv0 ← 25.0 ∷ f32 }
+                    elif q0 ≡ 11 { kv0 ← 38.0 ∷ f32 }
+                    elif q0 ≡ 12 { kv0 ← 53.0 ∷ f32 }
+                    elif q0 ≡ 13 { kv0 ← 69.0 ∷ f32 }
+                    elif q0 ≡ 14 { kv0 ← 89.0 ∷ f32 }
 
-                mut f32 kv1 ← 113.0 ∷ f32
-                if q1 ≡ 0 { kv1 ← -127.0 ∷ f32 }
-                elif q1 ≡ 1 { kv1 ← -104.0 ∷ f32 }
-                elif q1 ≡ 2 { kv1 ← -83.0 ∷ f32 }
-                elif q1 ≡ 3 { kv1 ← -65.0 ∷ f32 }
-                elif q1 ≡ 4 { kv1 ← -49.0 ∷ f32 }
-                elif q1 ≡ 5 { kv1 ← -35.0 ∷ f32 }
-                elif q1 ≡ 6 { kv1 ← -22.0 ∷ f32 }
-                elif q1 ≡ 7 { kv1 ← -10.0 ∷ f32 }
-                elif q1 ≡ 8 { kv1 ← 1.0 ∷ f32 }
-                elif q1 ≡ 9 { kv1 ← 13.0 ∷ f32 }
-                elif q1 ≡ 10 { kv1 ← 25.0 ∷ f32 }
-                elif q1 ≡ 11 { kv1 ← 38.0 ∷ f32 }
-                elif q1 ≡ 12 { kv1 ← 53.0 ∷ f32 }
-                elif q1 ≡ 13 { kv1 ← 69.0 ∷ f32 }
-                elif q1 ≡ 14 { kv1 ← 89.0 ∷ f32 }
+                    mut f32 kv1 ← 113.0 ∷ f32
+                    if q1 ≡ 0 { kv1 ← -127.0 ∷ f32 }
+                    elif q1 ≡ 1 { kv1 ← -104.0 ∷ f32 }
+                    elif q1 ≡ 2 { kv1 ← -83.0 ∷ f32 }
+                    elif q1 ≡ 3 { kv1 ← -65.0 ∷ f32 }
+                    elif q1 ≡ 4 { kv1 ← -49.0 ∷ f32 }
+                    elif q1 ≡ 5 { kv1 ← -35.0 ∷ f32 }
+                    elif q1 ≡ 6 { kv1 ← -22.0 ∷ f32 }
+                    elif q1 ≡ 7 { kv1 ← -10.0 ∷ f32 }
+                    elif q1 ≡ 8 { kv1 ← 1.0 ∷ f32 }
+                    elif q1 ≡ 9 { kv1 ← 13.0 ∷ f32 }
+                    elif q1 ≡ 10 { kv1 ← 25.0 ∷ f32 }
+                    elif q1 ≡ 11 { kv1 ← 38.0 ∷ f32 }
+                    elif q1 ≡ 12 { kv1 ← 53.0 ∷ f32 }
+                    elif q1 ≡ 13 { kv1 ← 69.0 ∷ f32 }
+                    elif q1 ≡ 14 { kv1 ← 89.0 ∷ f32 }
 
-                acc ← acc + (d * kv0) * x[[x_base + ji]] + (d * kv1) * x[[x_base + 16 + ji]]
+                    acc ← acc + (d * kv0) * x[[x_base + j]] + (d * kv1) * x[[x_base + 16 + j]]
+                }
             }
         }
 
@@ -1080,108 +1121,124 @@ fn dispatch_ggml_iq4_nl<size Out, size Blocks, size RowBytes, size In>(LinearWei
 @ public
 kernel ggml_q4_k_matvec<size Out, size Blocks, size RowBytes, size In>(tensor<u8, [Out, RowBytes]> raw_blocks, tensor<f32, [In]> x, mut tensor<f32, [Out]> y) → void {
     for from y at [row] thread lane let e {
-        let i32 rr ← (row ↦ i32) ∧ 65535
+        let i32 row_block_limit ← RowBytes / 144
+        let i32 in_block_limit ← In / 256
         mut f32 acc ← 0.0 ∷ f32
 
         for exclusive Blocks let b {
-            let i32 bi ← (b ↦ i32) ∧ 65535
-            let i32 base ← bi * 144
+            if b ≥ 0 and b ≺ row_block_limit and b ≺ in_block_limit {
+                let i32 base ← b * 144
 
-            let i32 d_lo ← (raw_blocks[[rr, base]] ↦ i32 ⊥ 0) ∧ 255
-            let i32 d_hi ← (raw_blocks[[rr, base + 1]] ↦ i32 ⊥ 0) ∧ 255
-            let i32 d_bits ← d_lo + d_hi * 256
-            let i32 d_sign ← (d_bits / 32768) ∧ 1
-            let i32 d_exp ← (d_bits / 1024) ∧ 31
-            let i32 d_mant ← d_bits ∧ 1023
-            mut f32 d ← 0.0 ∷ f32
-            if d_exp ≡ 0 {
-                if d_mant ≢ 0 { d ← (d_mant ↦ f32) / (16777216.0 ∷ f32) }
-            }
-            elif d_exp ≺ 31 {
-                mut f32 mag ← (1.0 ∷ f32) + (d_mant ↦ f32) / (1024.0 ∷ f32)
-                let i32 se ← d_exp - 15
-                if se ≻ 0 {
-                    for exclusive se let p { mag ← mag * (2.0 ∷ f32) }
+                let i32 d_lo ← (raw_blocks[[row, base]] ↦ i32 ⊥ 0) ∧ 255
+                let i32 d_hi ← (raw_blocks[[row, base + 1]] ↦ i32 ⊥ 0) ∧ 255
+                let i32 d_bits ← d_lo + d_hi * 256
+                let i32 d_sign ← (d_bits / 32768) ∧ 1
+                let i32 d_exp ← (d_bits / 1024) ∧ 31
+                let i32 d_mant ← d_bits ∧ 1023
+                mut f32 d ← 0.0 ∷ f32
+                if d_exp ≡ 0 {
+                    if d_mant ≢ 0 { d ← (d_mant ↦ f32) / (16777216.0 ∷ f32) }
                 }
-                elif se ≺ 0 {
-                    let i32 ne ← 0 - se
-                    for exclusive ne let p { mag ← mag / (2.0 ∷ f32) }
-                }
-                d ← mag
-            }
-            if d_sign ≢ 0 { d ← (0.0 ∷ f32) - d }
-
-            let i32 dm_lo ← (raw_blocks[[rr, base + 2]] ↦ i32 ⊥ 0) ∧ 255
-            let i32 dm_hi ← (raw_blocks[[rr, base + 3]] ↦ i32 ⊥ 0) ∧ 255
-            let i32 dm_bits ← dm_lo + dm_hi * 256
-            let i32 dm_sign ← (dm_bits / 32768) ∧ 1
-            let i32 dm_exp ← (dm_bits / 1024) ∧ 31
-            let i32 dm_mant ← dm_bits ∧ 1023
-            mut f32 dmin ← 0.0 ∷ f32
-            if dm_exp ≡ 0 {
-                if dm_mant ≢ 0 { dmin ← (dm_mant ↦ f32) / (16777216.0 ∷ f32) }
-            }
-            elif dm_exp ≺ 31 {
-                mut f32 mag ← (1.0 ∷ f32) + (dm_mant ↦ f32) / (1024.0 ∷ f32)
-                let i32 se ← dm_exp - 15
-                if se ≻ 0 {
-                    for exclusive se let p { mag ← mag * (2.0 ∷ f32) }
-                }
-                elif se ≺ 0 {
-                    let i32 ne ← 0 - se
-                    for exclusive ne let p { mag ← mag / (2.0 ∷ f32) }
-                }
-                dmin ← mag
-            }
-            if dm_sign ≢ 0 { dmin ← (0.0 ∷ f32) - dmin }
-
-            let i32 x_base ← bi * 256
-            for exclusive 4 let chunk {
-                let i32 ci ← (chunk ↦ i32 ⊥ 0) ∧ 3
-                let i32 idx0 ← ci * 2
-                let i32 idx1 ← idx0 + 1
-
-                mut i32 sc0 ← 0
-                mut i32 m0 ← 0
-                if idx0 ≺ 4 {
-                    sc0 ← (raw_blocks[[rr, base + 4 + idx0]] ↦ i32 ⊥ 0) ∧ 63
-                    m0 ← (raw_blocks[[rr, base + 8 + idx0]] ↦ i32 ⊥ 0) ∧ 63
+                elif d_exp ≺ 31 {
+                    mut f32 mag ← (1.0 ∷ f32) + (d_mant ↦ f32) / (1024.0 ∷ f32)
+                    let i32 se ← d_exp - 15
+                    if se ≻ 0 {
+                        for exclusive se let p { mag ← mag * (2.0 ∷ f32) }
+                    }
+                    elif se ≺ 0 {
+                        let i32 ne ← 0 - se
+                        for exclusive ne let p { mag ← mag / (2.0 ∷ f32) }
+                    }
+                    d ← mag
                 }
                 else {
-                    let i32 s_hi ← raw_blocks[[rr, base + 8 + idx0]] ↦ i32 ⊥ 0
-                    let i32 s_lo ← raw_blocks[[rr, base + idx0]] ↦ i32 ⊥ 0
-                    let i32 m_lo ← raw_blocks[[rr, base + 4 + idx0]] ↦ i32 ⊥ 0
-                    sc0 ← (s_hi ∧ 15) + (((s_lo ⇒ 6) ∧ 3) * 16)
-                    m0 ← ((s_hi ⇒ 4) ∧ 15) + (((m_lo ⇒ 6) ∧ 3) * 16)
+                    if d_mant ≡ 0 {
+                        d ← (1.0 ∷ f32) / (0.0 ∷ f32)
+                    }
+                    else {
+                        d ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                    }
                 }
+                if d_sign ≢ 0 { d ← -d }
 
-                mut i32 sc1 ← 0
-                mut i32 m1 ← 0
-                if idx1 ≺ 4 {
-                    sc1 ← (raw_blocks[[rr, base + 4 + idx1]] ↦ i32 ⊥ 0) ∧ 63
-                    m1 ← (raw_blocks[[rr, base + 8 + idx1]] ↦ i32 ⊥ 0) ∧ 63
+                let i32 dm_lo ← (raw_blocks[[row, base + 2]] ↦ i32 ⊥ 0) ∧ 255
+                let i32 dm_hi ← (raw_blocks[[row, base + 3]] ↦ i32 ⊥ 0) ∧ 255
+                let i32 dm_bits ← dm_lo + dm_hi * 256
+                let i32 dm_sign ← (dm_bits / 32768) ∧ 1
+                let i32 dm_exp ← (dm_bits / 1024) ∧ 31
+                let i32 dm_mant ← dm_bits ∧ 1023
+                mut f32 dmin ← 0.0 ∷ f32
+                if dm_exp ≡ 0 {
+                    if dm_mant ≢ 0 { dmin ← (dm_mant ↦ f32) / (16777216.0 ∷ f32) }
+                }
+                elif dm_exp ≺ 31 {
+                    mut f32 mag ← (1.0 ∷ f32) + (dm_mant ↦ f32) / (1024.0 ∷ f32)
+                    let i32 se ← dm_exp - 15
+                    if se ≻ 0 {
+                        for exclusive se let p { mag ← mag * (2.0 ∷ f32) }
+                    }
+                    elif se ≺ 0 {
+                        let i32 ne ← 0 - se
+                        for exclusive ne let p { mag ← mag / (2.0 ∷ f32) }
+                    }
+                    dmin ← mag
                 }
                 else {
-                    let i32 s_hi ← raw_blocks[[rr, base + 8 + idx1]] ↦ i32 ⊥ 0
-                    let i32 s_lo ← raw_blocks[[rr, base + idx1]] ↦ i32 ⊥ 0
-                    let i32 m_lo ← raw_blocks[[rr, base + 4 + idx1]] ↦ i32 ⊥ 0
-                    sc1 ← (s_hi ∧ 15) + (((s_lo ⇒ 6) ∧ 3) * 16)
-                    m1 ← ((s_hi ⇒ 4) ∧ 15) + (((m_lo ⇒ 6) ∧ 3) * 16)
+                    if dm_mant ≡ 0 {
+                        dmin ← (1.0 ∷ f32) / (0.0 ∷ f32)
+                    }
+                    else {
+                        dmin ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                    }
                 }
+                if dm_sign ≢ 0 { dmin ← -dmin }
 
-                let f32 d1 ← d * (sc0 ↦ f32)
-                let f32 m1f ← dmin * (m0 ↦ f32)
-                let f32 d2 ← d * (sc1 ↦ f32)
-                let f32 m2f ← dmin * (m1 ↦ f32)
-                let i32 qoff ← ci * 32
-                let i32 cx_base ← x_base + ci * 64
+                let i32 x_base ← b * 256
+                for exclusive 4 let chunk {
+                    let i32 idx0 ← chunk * 2
+                    let i32 idx1 ← idx0 + 1
 
-                for exclusive 32 let l {
-                    let i32 li ← (l ↦ i32 ⊥ 0) ∧ 31
-                    let i32 qs ← (raw_blocks[[rr, base + 16 + qoff + li]] ↦ i32 ⊥ 0) ∧ 255
-                    let f32 w0 ← d1 * ((qs ∧ 15) ↦ f32) - m1f
-                    let f32 w1 ← d2 * (((qs ⇒ 4) ∧ 15) ↦ f32) - m2f
-                    acc ← acc + w0 * x[[cx_base + li]] + w1 * x[[cx_base + 32 + li]]
+                    mut i32 sc0 ← 0
+                    mut i32 m0 ← 0
+                    if idx0 ≺ 4 {
+                        sc0 ← (raw_blocks[[row, base + 4 + idx0]] ↦ i32 ⊥ 0) ∧ 63
+                        m0 ← (raw_blocks[[row, base + 8 + idx0]] ↦ i32 ⊥ 0) ∧ 63
+                    }
+                    else {
+                        let i32 s_hi ← raw_blocks[[row, base + 8 + idx0]] ↦ i32 ⊥ 0
+                        let i32 s_lo ← raw_blocks[[row, base + idx0]] ↦ i32 ⊥ 0
+                        let i32 m_lo ← raw_blocks[[row, base + 4 + idx0]] ↦ i32 ⊥ 0
+                        sc0 ← (s_hi ∧ 15) + (((s_lo ⇒ 6) ∧ 3) * 16)
+                        m0 ← ((s_hi ⇒ 4) ∧ 15) + (((m_lo ⇒ 6) ∧ 3) * 16)
+                    }
+
+                    mut i32 sc1 ← 0
+                    mut i32 m1 ← 0
+                    if idx1 ≺ 4 {
+                        sc1 ← (raw_blocks[[row, base + 4 + idx1]] ↦ i32 ⊥ 0) ∧ 63
+                        m1 ← (raw_blocks[[row, base + 8 + idx1]] ↦ i32 ⊥ 0) ∧ 63
+                    }
+                    else {
+                        let i32 s_hi ← raw_blocks[[row, base + 8 + idx1]] ↦ i32 ⊥ 0
+                        let i32 s_lo ← raw_blocks[[row, base + idx1]] ↦ i32 ⊥ 0
+                        let i32 m_lo ← raw_blocks[[row, base + 4 + idx1]] ↦ i32 ⊥ 0
+                        sc1 ← (s_hi ∧ 15) + (((s_lo ⇒ 6) ∧ 3) * 16)
+                        m1 ← ((s_hi ⇒ 4) ∧ 15) + (((m_lo ⇒ 6) ∧ 3) * 16)
+                    }
+
+                    let f32 d1 ← d * (sc0 ↦ f32)
+                    let f32 m1f ← dmin * (m0 ↦ f32)
+                    let f32 d2 ← d * (sc1 ↦ f32)
+                    let f32 m2f ← dmin * (m1 ↦ f32)
+                    let i32 qoff ← chunk * 32
+                    let i32 cx_base ← x_base + chunk * 64
+
+                    for exclusive 32 let l {
+                        let i32 qs ← (raw_blocks[[row, base + 16 + qoff + l]] ↦ i32 ⊥ 0) ∧ 255
+                        let f32 w0 ← d1 * ((qs ∧ 15) ↦ f32) - m1f
+                        let f32 w1 ← d2 * (((qs ⇒ 4) ∧ 15) ↦ f32) - m2f
+                        acc ← acc + w0 * x[[cx_base + l]] + w1 * x[[cx_base + 32 + l]]
+                    }
                 }
             }
         }
@@ -1206,117 +1263,133 @@ fn dispatch_ggml_q4_k<size Out, size Blocks, size RowBytes, size In>(LinearWeigh
 @ public
 kernel ggml_q5_k_matvec<size Out, size Blocks, size RowBytes, size In>(tensor<u8, [Out, RowBytes]> raw_blocks, tensor<f32, [In]> x, mut tensor<f32, [Out]> y) → void {
     for from y at [row] thread lane let e {
-        let i32 rr ← (row ↦ i32) ∧ 65535
+        let i32 row_block_limit ← RowBytes / 176
+        let i32 in_block_limit ← In / 256
         mut f32 acc ← 0.0 ∷ f32
 
         for exclusive Blocks let b {
-            let i32 bi ← (b ↦ i32) ∧ 65535
-            let i32 base ← bi * 176
+            if b ≥ 0 and b ≺ row_block_limit and b ≺ in_block_limit {
+                let i32 base ← b * 176
 
-            let i32 d_lo ← (raw_blocks[[rr, base]] ↦ i32 ⊥ 0) ∧ 255
-            let i32 d_hi ← (raw_blocks[[rr, base + 1]] ↦ i32 ⊥ 0) ∧ 255
-            let i32 d_bits ← d_lo + d_hi * 256
-            let i32 d_sign ← (d_bits / 32768) ∧ 1
-            let i32 d_exp ← (d_bits / 1024) ∧ 31
-            let i32 d_mant ← d_bits ∧ 1023
-            mut f32 d ← 0.0 ∷ f32
-            if d_exp ≡ 0 {
-                if d_mant ≢ 0 { d ← (d_mant ↦ f32) / (16777216.0 ∷ f32) }
-            }
-            elif d_exp ≺ 31 {
-                mut f32 mag ← (1.0 ∷ f32) + (d_mant ↦ f32) / (1024.0 ∷ f32)
-                let i32 se ← d_exp - 15
-                if se ≻ 0 {
-                    for exclusive se let p { mag ← mag * (2.0 ∷ f32) }
+                let i32 d_lo ← (raw_blocks[[row, base]] ↦ i32 ⊥ 0) ∧ 255
+                let i32 d_hi ← (raw_blocks[[row, base + 1]] ↦ i32 ⊥ 0) ∧ 255
+                let i32 d_bits ← d_lo + d_hi * 256
+                let i32 d_sign ← (d_bits / 32768) ∧ 1
+                let i32 d_exp ← (d_bits / 1024) ∧ 31
+                let i32 d_mant ← d_bits ∧ 1023
+                mut f32 d ← 0.0 ∷ f32
+                if d_exp ≡ 0 {
+                    if d_mant ≢ 0 { d ← (d_mant ↦ f32) / (16777216.0 ∷ f32) }
                 }
-                elif se ≺ 0 {
-                    let i32 ne ← 0 - se
-                    for exclusive ne let p { mag ← mag / (2.0 ∷ f32) }
-                }
-                d ← mag
-            }
-            if d_sign ≢ 0 { d ← (0.0 ∷ f32) - d }
-
-            let i32 dm_lo ← (raw_blocks[[rr, base + 2]] ↦ i32 ⊥ 0) ∧ 255
-            let i32 dm_hi ← (raw_blocks[[rr, base + 3]] ↦ i32 ⊥ 0) ∧ 255
-            let i32 dm_bits ← dm_lo + dm_hi * 256
-            let i32 dm_sign ← (dm_bits / 32768) ∧ 1
-            let i32 dm_exp ← (dm_bits / 1024) ∧ 31
-            let i32 dm_mant ← dm_bits ∧ 1023
-            mut f32 dmin ← 0.0 ∷ f32
-            if dm_exp ≡ 0 {
-                if dm_mant ≢ 0 { dmin ← (dm_mant ↦ f32) / (16777216.0 ∷ f32) }
-            }
-            elif dm_exp ≺ 31 {
-                mut f32 mag ← (1.0 ∷ f32) + (dm_mant ↦ f32) / (1024.0 ∷ f32)
-                let i32 se ← dm_exp - 15
-                if se ≻ 0 {
-                    for exclusive se let p { mag ← mag * (2.0 ∷ f32) }
-                }
-                elif se ≺ 0 {
-                    let i32 ne ← 0 - se
-                    for exclusive ne let p { mag ← mag / (2.0 ∷ f32) }
-                }
-                dmin ← mag
-            }
-            if dm_sign ≢ 0 { dmin ← (0.0 ∷ f32) - dmin }
-
-            let i32 x_base ← bi * 256
-            for exclusive 4 let chunk {
-                let i32 ci ← (chunk ↦ i32 ⊥ 0) ∧ 3
-                let i32 idx0 ← ci * 2
-                let i32 idx1 ← idx0 + 1
-
-                mut i32 sc0 ← 0
-                mut i32 m0 ← 0
-                if idx0 ≺ 4 {
-                    sc0 ← (raw_blocks[[rr, base + 4 + idx0]] ↦ i32 ⊥ 0) ∧ 63
-                    m0 ← (raw_blocks[[rr, base + 8 + idx0]] ↦ i32 ⊥ 0) ∧ 63
+                elif d_exp ≺ 31 {
+                    mut f32 mag ← (1.0 ∷ f32) + (d_mant ↦ f32) / (1024.0 ∷ f32)
+                    let i32 se ← d_exp - 15
+                    if se ≻ 0 {
+                        for exclusive se let p { mag ← mag * (2.0 ∷ f32) }
+                    }
+                    elif se ≺ 0 {
+                        let i32 ne ← 0 - se
+                        for exclusive ne let p { mag ← mag / (2.0 ∷ f32) }
+                    }
+                    d ← mag
                 }
                 else {
-                    let i32 s_hi ← raw_blocks[[rr, base + 8 + idx0]] ↦ i32 ⊥ 0
-                    let i32 s_lo ← raw_blocks[[rr, base + idx0]] ↦ i32 ⊥ 0
-                    let i32 m_lo ← raw_blocks[[rr, base + 4 + idx0]] ↦ i32 ⊥ 0
-                    sc0 ← (s_hi ∧ 15) + (((s_lo ⇒ 6) ∧ 3) * 16)
-                    m0 ← ((s_hi ⇒ 4) ∧ 15) + (((m_lo ⇒ 6) ∧ 3) * 16)
+                    if d_mant ≡ 0 {
+                        d ← (1.0 ∷ f32) / (0.0 ∷ f32)
+                    }
+                    else {
+                        d ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                    }
                 }
+                if d_sign ≢ 0 { d ← -d }
 
-                mut i32 sc1 ← 0
-                mut i32 m1 ← 0
-                if idx1 ≺ 4 {
-                    sc1 ← (raw_blocks[[rr, base + 4 + idx1]] ↦ i32 ⊥ 0) ∧ 63
-                    m1 ← (raw_blocks[[rr, base + 8 + idx1]] ↦ i32 ⊥ 0) ∧ 63
+                let i32 dm_lo ← (raw_blocks[[row, base + 2]] ↦ i32 ⊥ 0) ∧ 255
+                let i32 dm_hi ← (raw_blocks[[row, base + 3]] ↦ i32 ⊥ 0) ∧ 255
+                let i32 dm_bits ← dm_lo + dm_hi * 256
+                let i32 dm_sign ← (dm_bits / 32768) ∧ 1
+                let i32 dm_exp ← (dm_bits / 1024) ∧ 31
+                let i32 dm_mant ← dm_bits ∧ 1023
+                mut f32 dmin ← 0.0 ∷ f32
+                if dm_exp ≡ 0 {
+                    if dm_mant ≢ 0 { dmin ← (dm_mant ↦ f32) / (16777216.0 ∷ f32) }
+                }
+                elif dm_exp ≺ 31 {
+                    mut f32 mag ← (1.0 ∷ f32) + (dm_mant ↦ f32) / (1024.0 ∷ f32)
+                    let i32 se ← dm_exp - 15
+                    if se ≻ 0 {
+                        for exclusive se let p { mag ← mag * (2.0 ∷ f32) }
+                    }
+                    elif se ≺ 0 {
+                        let i32 ne ← 0 - se
+                        for exclusive ne let p { mag ← mag / (2.0 ∷ f32) }
+                    }
+                    dmin ← mag
                 }
                 else {
-                    let i32 s_hi ← raw_blocks[[rr, base + 8 + idx1]] ↦ i32 ⊥ 0
-                    let i32 s_lo ← raw_blocks[[rr, base + idx1]] ↦ i32 ⊥ 0
-                    let i32 m_lo ← raw_blocks[[rr, base + 4 + idx1]] ↦ i32 ⊥ 0
-                    sc1 ← (s_hi ∧ 15) + (((s_lo ⇒ 6) ∧ 3) * 16)
-                    m1 ← ((s_hi ⇒ 4) ∧ 15) + (((m_lo ⇒ 6) ∧ 3) * 16)
+                    if dm_mant ≡ 0 {
+                        dmin ← (1.0 ∷ f32) / (0.0 ∷ f32)
+                    }
+                    else {
+                        dmin ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                    }
                 }
+                if dm_sign ≢ 0 { dmin ← -dmin }
 
-                let f32 d1 ← d * (sc0 ↦ f32)
-                let f32 m1f ← dmin * (m0 ↦ f32)
-                let f32 d2 ← d * (sc1 ↦ f32)
-                let f32 m2f ← dmin * (m1 ↦ f32)
-                let i32 qoff ← ci * 32
-                let i32 cx_base ← x_base + ci * 64
+                let i32 x_base ← b * 256
+                for exclusive 4 let chunk {
+                    let i32 idx0 ← chunk * 2
+                    let i32 idx1 ← idx0 + 1
 
-                for exclusive 32 let l {
-                    let i32 li ← (l ↦ i32 ⊥ 0) ∧ 31
-                    let i32 qs ← (raw_blocks[[rr, base + 48 + qoff + li]] ↦ i32 ⊥ 0) ∧ 255
-                    let i32 qh ← (raw_blocks[[rr, base + 16 + li]] ↦ i32 ⊥ 0) ∧ 255
-                    mut i32 qh_sh ← qh
-                    if ci ≡ 1 { qh_sh ← qh ⇒ 2 }
-                    elif ci ≡ 2 { qh_sh ← qh ⇒ 4 }
-                    elif ci ≡ 3 { qh_sh ← qh ⇒ 6 }
-                    let i32 hi_lo ← (qh_sh ∧ 1) * 16
-                    let i32 hi_hi ← ((qh_sh ⇒ 1) ∧ 1) * 16
-                    let i32 q_lo ← (qs ∧ 15) + hi_lo
-                    let i32 q_hi ← ((qs ⇒ 4) ∧ 15) + hi_hi
-                    let f32 w0 ← d1 * (q_lo ↦ f32) - m1f
-                    let f32 w1 ← d2 * (q_hi ↦ f32) - m2f
-                    acc ← acc + w0 * x[[cx_base + li]] + w1 * x[[cx_base + 32 + li]]
+                    mut i32 sc0 ← 0
+                    mut i32 m0 ← 0
+                    if idx0 ≺ 4 {
+                        sc0 ← (raw_blocks[[row, base + 4 + idx0]] ↦ i32 ⊥ 0) ∧ 63
+                        m0 ← (raw_blocks[[row, base + 8 + idx0]] ↦ i32 ⊥ 0) ∧ 63
+                    }
+                    else {
+                        let i32 s_hi ← raw_blocks[[row, base + 8 + idx0]] ↦ i32 ⊥ 0
+                        let i32 s_lo ← raw_blocks[[row, base + idx0]] ↦ i32 ⊥ 0
+                        let i32 m_lo ← raw_blocks[[row, base + 4 + idx0]] ↦ i32 ⊥ 0
+                        sc0 ← (s_hi ∧ 15) + (((s_lo ⇒ 6) ∧ 3) * 16)
+                        m0 ← ((s_hi ⇒ 4) ∧ 15) + (((m_lo ⇒ 6) ∧ 3) * 16)
+                    }
+
+                    mut i32 sc1 ← 0
+                    mut i32 m1 ← 0
+                    if idx1 ≺ 4 {
+                        sc1 ← (raw_blocks[[row, base + 4 + idx1]] ↦ i32 ⊥ 0) ∧ 63
+                        m1 ← (raw_blocks[[row, base + 8 + idx1]] ↦ i32 ⊥ 0) ∧ 63
+                    }
+                    else {
+                        let i32 s_hi ← raw_blocks[[row, base + 8 + idx1]] ↦ i32 ⊥ 0
+                        let i32 s_lo ← raw_blocks[[row, base + idx1]] ↦ i32 ⊥ 0
+                        let i32 m_lo ← raw_blocks[[row, base + 4 + idx1]] ↦ i32 ⊥ 0
+                        sc1 ← (s_hi ∧ 15) + (((s_lo ⇒ 6) ∧ 3) * 16)
+                        m1 ← ((s_hi ⇒ 4) ∧ 15) + (((m_lo ⇒ 6) ∧ 3) * 16)
+                    }
+
+                    let f32 d1 ← d * (sc0 ↦ f32)
+                    let f32 m1f ← dmin * (m0 ↦ f32)
+                    let f32 d2 ← d * (sc1 ↦ f32)
+                    let f32 m2f ← dmin * (m1 ↦ f32)
+                    let i32 qoff ← chunk * 32
+                    let i32 cx_base ← x_base + chunk * 64
+
+                    for exclusive 32 let l {
+                        let i32 qs ← (raw_blocks[[row, base + 48 + qoff + l]] ↦ i32 ⊥ 0) ∧ 255
+                        let i32 qh ← (raw_blocks[[row, base + 16 + l]] ↦ i32 ⊥ 0) ∧ 255
+                        mut i32 qh_sh ← qh
+                        if chunk ≡ 1 { qh_sh ← qh ⇒ 2 }
+                        elif chunk ≡ 2 { qh_sh ← qh ⇒ 4 }
+                        elif chunk ≡ 3 { qh_sh ← qh ⇒ 6 }
+                        let i32 hi_lo ← (qh_sh ∧ 1) * 16
+                        let i32 hi_hi ← ((qh_sh ⇒ 1) ∧ 1) * 16
+                        let i32 q_lo ← (qs ∧ 15) + hi_lo
+                        let i32 q_hi ← ((qs ⇒ 4) ∧ 15) + hi_hi
+                        let f32 w0 ← d1 * (q_lo ↦ f32) - m1f
+                        let f32 w1 ← d2 * (q_hi ↦ f32) - m2f
+                        acc ← acc + w0 * x[[cx_base + l]] + w1 * x[[cx_base + 32 + l]]
+                    }
                 }
             }
         }
@@ -1341,73 +1414,81 @@ fn dispatch_ggml_q5_k<size Out, size Blocks, size RowBytes, size In>(LinearWeigh
 @ public
 kernel ggml_q6_k_matvec<size Out, size Blocks, size RowBytes, size In>(tensor<u8, [Out, RowBytes]> raw_blocks, tensor<f32, [In]> x, mut tensor<f32, [Out]> y) → void {
     for from y at [row] thread lane let e {
-        let i32 rr ← (row ↦ i32) ∧ 65535
+        let i32 row_block_limit ← RowBytes / 210
+        let i32 in_block_limit ← In / 256
         mut f32 acc ← 0.0 ∷ f32
 
         for exclusive Blocks let b {
-            let i32 bi ← (b ↦ i32) ∧ 65535
-            let i32 base ← bi * 210
+            if b ≥ 0 and b ≺ row_block_limit and b ≺ in_block_limit {
+                let i32 base ← b * 210
 
-            let i32 d_lo ← (raw_blocks[[rr, base + 208]] ↦ i32 ⊥ 0) ∧ 255
-            let i32 d_hi ← (raw_blocks[[rr, base + 209]] ↦ i32 ⊥ 0) ∧ 255
-            let i32 d_bits ← d_lo + d_hi * 256
-            let i32 d_sign ← (d_bits / 32768) ∧ 1
-            let i32 d_exp ← (d_bits / 1024) ∧ 31
-            let i32 d_mant ← d_bits ∧ 1023
-            mut f32 d ← 0.0 ∷ f32
-            if d_exp ≡ 0 {
-                if d_mant ≢ 0 { d ← (d_mant ↦ f32) / (16777216.0 ∷ f32) }
-            }
-            elif d_exp ≺ 31 {
-                mut f32 mag ← (1.0 ∷ f32) + (d_mant ↦ f32) / (1024.0 ∷ f32)
-                let i32 se ← d_exp - 15
-                if se ≻ 0 {
-                    for exclusive se let p { mag ← mag * (2.0 ∷ f32) }
+                let i32 d_lo ← (raw_blocks[[row, base + 208]] ↦ i32 ⊥ 0) ∧ 255
+                let i32 d_hi ← (raw_blocks[[row, base + 209]] ↦ i32 ⊥ 0) ∧ 255
+                let i32 d_bits ← d_lo + d_hi * 256
+                let i32 d_sign ← (d_bits / 32768) ∧ 1
+                let i32 d_exp ← (d_bits / 1024) ∧ 31
+                let i32 d_mant ← d_bits ∧ 1023
+                mut f32 d ← 0.0 ∷ f32
+                if d_exp ≡ 0 {
+                    if d_mant ≢ 0 { d ← (d_mant ↦ f32) / (16777216.0 ∷ f32) }
                 }
-                elif se ≺ 0 {
-                    let i32 ne ← 0 - se
-                    for exclusive ne let p { mag ← mag / (2.0 ∷ f32) }
+                elif d_exp ≺ 31 {
+                    mut f32 mag ← (1.0 ∷ f32) + (d_mant ↦ f32) / (1024.0 ∷ f32)
+                    let i32 se ← d_exp - 15
+                    if se ≻ 0 {
+                        for exclusive se let p { mag ← mag * (2.0 ∷ f32) }
+                    }
+                    elif se ≺ 0 {
+                        let i32 ne ← 0 - se
+                        for exclusive ne let p { mag ← mag / (2.0 ∷ f32) }
+                    }
+                    d ← mag
                 }
-                d ← mag
-            }
-            if d_sign ≢ 0 { d ← (0.0 ∷ f32) - d }
+                else {
+                    if d_mant ≡ 0 {
+                        d ← (1.0 ∷ f32) / (0.0 ∷ f32)
+                    }
+                    else {
+                        d ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                    }
+                }
+                if d_sign ≢ 0 { d ← -d }
 
-            let i32 x_base ← bi * 256
-            for exclusive 2 let n {
-                let i32 ni ← (n ↦ i32 ⊥ 0) ∧ 1
-                let i32 sc_base ← ni * 8
-                let i32 ql_off ← ni * 64
-                let i32 qh_off ← ni * 32
-                let i32 y_off ← x_base + ni * 128
+                let i32 x_base ← b * 256
+                for exclusive 2 let n {
+                    let i32 sc_base ← n * 8
+                    let i32 ql_off ← n * 64
+                    let i32 qh_off ← n * 32
+                    let i32 y_off ← x_base + n * 128
 
-                for exclusive 32 let l {
-                    let i32 li ← (l ↦ i32 ⊥ 0) ∧ 31
-                    let i32 idx ← li / 16
-                    let i32 ql_lo ← (raw_blocks[[rr, base + ql_off + li]] ↦ i32 ⊥ 0) ∧ 255
-                    let i32 ql_hi ← (raw_blocks[[rr, base + ql_off + li + 32]] ↦ i32 ⊥ 0) ∧ 255
-                    let i32 qh ← (raw_blocks[[rr, base + 128 + qh_off + li]] ↦ i32 ⊥ 0) ∧ 255
+                    for exclusive 32 let l {
+                        let i32 idx ← l / 16
+                        let i32 ql_lo ← (raw_blocks[[row, base + ql_off + l]] ↦ i32 ⊥ 0) ∧ 255
+                        let i32 ql_hi ← (raw_blocks[[row, base + ql_off + l + 32]] ↦ i32 ⊥ 0) ∧ 255
+                        let i32 qh ← (raw_blocks[[row, base + 128 + qh_off + l]] ↦ i32 ⊥ 0) ∧ 255
 
-                    let i32 q1 ← ((ql_lo ∧ 15) + ((qh ∧ 3) * 16)) - 32
-                    let i32 q2 ← ((ql_hi ∧ 15) + (((qh ⇒ 2) ∧ 3) * 16)) - 32
-                    let i32 q3 ← (((ql_lo ⇒ 4) ∧ 15) + (((qh ⇒ 4) ∧ 3) * 16)) - 32
-                    let i32 q4 ← (((ql_hi ⇒ 4) ∧ 15) + (((qh ⇒ 6) ∧ 3) * 16)) - 32
+                        let i32 q1 ← ((ql_lo ∧ 15) + ((qh ∧ 3) * 16)) - 32
+                        let i32 q2 ← ((ql_hi ∧ 15) + (((qh ⇒ 2) ∧ 3) * 16)) - 32
+                        let i32 q3 ← (((ql_lo ⇒ 4) ∧ 15) + (((qh ⇒ 4) ∧ 3) * 16)) - 32
+                        let i32 q4 ← (((ql_hi ⇒ 4) ∧ 15) + (((qh ⇒ 6) ∧ 3) * 16)) - 32
 
-                    let i32 s0_u ← (raw_blocks[[rr, base + 192 + sc_base + idx]] ↦ i32 ⊥ 0) ∧ 255
-                    let i32 s2_u ← (raw_blocks[[rr, base + 192 + sc_base + idx + 2]] ↦ i32 ⊥ 0) ∧ 255
-                    let i32 s4_u ← (raw_blocks[[rr, base + 192 + sc_base + idx + 4]] ↦ i32 ⊥ 0) ∧ 255
-                    let i32 s6_u ← (raw_blocks[[rr, base + 192 + sc_base + idx + 6]] ↦ i32 ⊥ 0) ∧ 255
+                        let i32 s0_u ← (raw_blocks[[row, base + 192 + sc_base + idx]] ↦ i32 ⊥ 0) ∧ 255
+                        let i32 s2_u ← (raw_blocks[[row, base + 192 + sc_base + idx + 2]] ↦ i32 ⊥ 0) ∧ 255
+                        let i32 s4_u ← (raw_blocks[[row, base + 192 + sc_base + idx + 4]] ↦ i32 ⊥ 0) ∧ 255
+                        let i32 s6_u ← (raw_blocks[[row, base + 192 + sc_base + idx + 6]] ↦ i32 ⊥ 0) ∧ 255
 
-                    let i32 s0 ← s0_u ≥ 128 ✓ s0_u - 256 ✗ s0_u
-                    let i32 s2 ← s2_u ≥ 128 ✓ s2_u - 256 ✗ s2_u
-                    let i32 s4 ← s4_u ≥ 128 ✓ s4_u - 256 ✗ s4_u
-                    let i32 s6 ← s6_u ≥ 128 ✓ s6_u - 256 ✗ s6_u
+                        let i32 s0 ← s0_u ≥ 128 ✓ s0_u - 256 ✗ s0_u
+                        let i32 s2 ← s2_u ≥ 128 ✓ s2_u - 256 ✗ s2_u
+                        let i32 s4 ← s4_u ≥ 128 ✓ s4_u - 256 ✗ s4_u
+                        let i32 s6 ← s6_u ≥ 128 ✓ s6_u - 256 ✗ s6_u
 
-                    let f32 w1 ← d * (s0 ↦ f32) * (q1 ↦ f32)
-                    let f32 w2 ← d * (s2 ↦ f32) * (q2 ↦ f32)
-                    let f32 w3 ← d * (s4 ↦ f32) * (q3 ↦ f32)
-                    let f32 w4 ← d * (s6 ↦ f32) * (q4 ↦ f32)
+                        let f32 w1 ← d * (s0 ↦ f32) * (q1 ↦ f32)
+                        let f32 w2 ← d * (s2 ↦ f32) * (q2 ↦ f32)
+                        let f32 w3 ← d * (s4 ↦ f32) * (q3 ↦ f32)
+                        let f32 w4 ← d * (s6 ↦ f32) * (q4 ↦ f32)
 
-                    acc ← acc + w1 * x[[y_off + li]] + w2 * x[[y_off + li + 32]] + w3 * x[[y_off + li + 64]] + w4 * x[[y_off + li + 96]]
+                        acc ← acc + w1 * x[[y_off + l]] + w2 * x[[y_off + l + 32]] + w3 * x[[y_off + l + 64]] + w4 * x[[y_off + l + 96]]
+                    }
                 }
             }
         }
@@ -1450,12 +1531,9 @@ fn dispatch_add_bias_matmul<size B, size Out>(LinearWeight lw, tensor<f32, [Out]
 @ public
 kernel dense_f32_matmul<size B, size Out, size In>(tensor<f32, [Out, In]> weight, tensor<f32, [B, In]> x, mut tensor<f32, [B, Out]> y) → void {
     for from y at [b_idx, row] thread lane let e {
-        let i32 b_i ← (b_idx ↦ i32) ∧ 65535
-        let i32 rr ← (row ↦ i32) ∧ 65535
         mut f32 acc ← 0.0 ∷ f32
         for exclusive In let j {
-            let i32 ji ← (j ↦ i32) ∧ 65535
-            acc ← acc + weight[[rr, ji]] * x[[b_i, ji]]
+            acc ← acc + weight[[row, j]] * x[[b_idx, j]]
         }
         y[[b_idx, row]] ← acc
     }
@@ -1477,12 +1555,9 @@ fn dispatch_dense_f32_matmul<size B, size Out, size In>(LinearWeight lw, tensor<
 @ public
 kernel dense_bf16_matmul<size B, size Out, size In>(tensor<bf16, [Out, In]> weight, tensor<f32, [B, In]> x, mut tensor<f32, [B, Out]> y) → void {
     for from y at [b_idx, row] thread lane let e {
-        let i32 b_i ← (b_idx ↦ i32) ∧ 65535
-        let i32 rr ← (row ↦ i32) ∧ 65535
         mut f32 acc ← 0.0 ∷ f32
         for exclusive In let j {
-            let i32 ji ← (j ↦ i32) ∧ 65535
-            acc ← acc + (weight[[rr, ji]] ↦ f32) * x[[b_i, ji]]
+            acc ← acc + (weight[[row, j]] ↦ f32) * x[[b_idx, j]]
         }
         y[[b_idx, row]] ← acc
     }
@@ -1504,12 +1579,9 @@ fn dispatch_dense_bf16_matmul<size B, size Out, size In>(LinearWeight lw, tensor
 @ public
 kernel dense_f16_matmul<size B, size Out, size In>(tensor<f16, [Out, In]> weight, tensor<f32, [B, In]> x, mut tensor<f32, [B, Out]> y) → void {
     for from y at [b_idx, row] thread lane let e {
-        let i32 b_i ← (b_idx ↦ i32) ∧ 65535
-        let i32 rr ← (row ↦ i32) ∧ 65535
         mut f32 acc ← 0.0 ∷ f32
         for exclusive In let j {
-            let i32 ji ← (j ↦ i32) ∧ 65535
-            acc ← acc + (weight[[rr, ji]] ↦ f32) * x[[b_i, ji]]
+            acc ← acc + (weight[[row, j]] ↦ f32) * x[[b_idx, j]]
         }
         y[[b_idx, row]] ← acc
     }
@@ -1561,57 +1633,65 @@ fn dispatch_group_affine_u8_matmul<size B, size Out, size PackedIn, size Groups,
 @ public
 kernel ggml_q8_0_matmul<size B, size Out, size Blocks, size RowBytes, size In>(tensor<u8, [Out, RowBytes]> raw_blocks, tensor<f32, [B, In]> x, mut tensor<f32, [B, Out]> y) → void {
     for from y at [b_idx, row] thread lane let e {
-        let i32 b_i ← (b_idx ↦ i32) ∧ 65535
-        let i32 rr ← (row ↦ i32) ∧ 65535
+        let i32 row_block_limit ← RowBytes / 34
+        let i32 in_block_limit ← In / 32
         mut f32 acc ← 0.0 ∷ f32
 
         for exclusive Blocks let b {
-            let i32 bi ← (b ↦ i32) ∧ 65535
-            let i32 base ← bi * 34
-            let i32 lo ← (raw_blocks[[rr, base]] ↦ i32 ⊥ 0) ∧ 255
-            let i32 hi ← (raw_blocks[[rr, base + 1]] ↦ i32 ⊥ 0) ∧ 255
-            let i32 bits ← lo + hi * 256
-            let i32 sign_bit ← (bits / 32768) ∧ 1
-            let i32 exp_bits ← (bits / 1024) ∧ 31
-            let i32 mant_bits ← bits ∧ 1023
+            if b ≥ 0 and b ≺ row_block_limit and b ≺ in_block_limit {
+                let i32 base ← b * 34
+                let i32 lo ← (raw_blocks[[row, base]] ↦ i32 ⊥ 0) ∧ 255
+                let i32 hi ← (raw_blocks[[row, base + 1]] ↦ i32 ⊥ 0) ∧ 255
+                let i32 bits ← lo + hi * 256
+                let i32 sign_bit ← (bits / 32768) ∧ 1
+                let i32 exp_bits ← (bits / 1024) ∧ 31
+                let i32 mant_bits ← bits ∧ 1023
 
-            mut f32 d ← 0.0 ∷ f32
-            if exp_bits ≡ 0 {
-                if mant_bits ≢ 0 {
-                    d ← (mant_bits ↦ f32) / (16777216.0 ∷ f32)
-                }
-            }
-            elif exp_bits ≺ 31 {
-                mut f32 mag ← (1.0 ∷ f32) + (mant_bits ↦ f32) / (1024.0 ∷ f32)
-                let i32 shift_exp ← exp_bits - 15
-                if shift_exp ≻ 0 {
-                    for exclusive shift_exp let p {
-                        mag ← mag * (2.0 ∷ f32)
+                mut f32 d ← 0.0 ∷ f32
+                if exp_bits ≡ 0 {
+                    if mant_bits ≢ 0 {
+                        d ← (mant_bits ↦ f32) / (16777216.0 ∷ f32)
                     }
                 }
-                elif shift_exp ≺ 0 {
-                    let i32 neg_exp ← 0 - shift_exp
-                    for exclusive neg_exp let p {
-                        mag ← mag / (2.0 ∷ f32)
+                elif exp_bits ≺ 31 {
+                    mut f32 mag ← (1.0 ∷ f32) + (mant_bits ↦ f32) / (1024.0 ∷ f32)
+                    let i32 shift_exp ← exp_bits - 15
+                    if shift_exp ≻ 0 {
+                        for exclusive shift_exp let p {
+                            mag ← mag * (2.0 ∷ f32)
+                        }
+                    }
+                    elif shift_exp ≺ 0 {
+                        let i32 neg_exp ← 0 - shift_exp
+                        for exclusive neg_exp let p {
+                            mag ← mag / (2.0 ∷ f32)
+                        }
+                    }
+                    d ← mag
+                }
+                else {
+                    if mant_bits ≡ 0 {
+                        d ← (1.0 ∷ f32) / (0.0 ∷ f32)
+                    }
+                    else {
+                        d ← (0.0 ∷ f32) / (0.0 ∷ f32)
                     }
                 }
-                d ← mag
-            }
 
-            if sign_bit ≢ 0 {
-                d ← (0.0 ∷ f32) - d
-            }
-
-            let i32 x_base ← bi * 32
-            for exclusive 32 let k {
-                let i32 ki ← (k ↦ i32 ⊥ 0) ∧ 31
-                let i32 q_u ← (raw_blocks[[rr, base + 2 + ki]] ↦ i32 ⊥ 0)
-                mut i32 q_s ← q_u
-                if q_u ≥ 128 {
-                    q_s ← q_u - 256
+                if sign_bit ≢ 0 {
+                    d ← -d
                 }
-                let f32 w ← (q_s ↦ f32) * d
-                acc ← acc + w * x[[b_i, x_base + ki]]
+
+                let i32 x_base ← b * 32
+                for exclusive 32 let k {
+                    let i32 q_u ← (raw_blocks[[row, base + 2 + k]] ↦ i32 ⊥ 0)
+                    mut i32 q_s ← q_u
+                    if q_u ≥ 128 {
+                        q_s ← q_u - 256
+                    }
+                    let f32 w ← (q_s ↦ f32) * d
+                    acc ← acc + w * x[[b_idx, x_base + k]]
+                }
             }
         }
 
@@ -1635,71 +1715,87 @@ fn dispatch_ggml_q8_0_matmul<size B, size Out, size Blocks, size RowBytes, size 
 @ public
 kernel ggml_q4_1_matmul<size B, size Out, size Blocks, size RowBytes, size In>(tensor<u8, [Out, RowBytes]> raw_blocks, tensor<f32, [B, In]> x, mut tensor<f32, [B, Out]> y) → void {
     for from y at [b_idx, row] thread lane let e {
-        let i32 b_i ← (b_idx ↦ i32) ∧ 65535
-        let i32 rr ← (row ↦ i32) ∧ 65535
+        let i32 row_block_limit ← RowBytes / 20
+        let i32 in_block_limit ← In / 32
         mut f32 acc ← 0.0 ∷ f32
 
         for exclusive Blocks let b {
-            let i32 bi ← (b ↦ i32) ∧ 65535
-            let i32 base ← bi * 20
+            if b ≥ 0 and b ≺ row_block_limit and b ≺ in_block_limit {
+                let i32 base ← b * 20
 
-            let i32 d_lo ← (raw_blocks[[rr, base]] ↦ i32 ⊥ 0) ∧ 255
-            let i32 d_hi ← (raw_blocks[[rr, base + 1]] ↦ i32 ⊥ 0) ∧ 255
-            let i32 d_bits ← d_lo + d_hi * 256
-            let i32 d_sign ← (d_bits / 32768) ∧ 1
-            let i32 d_exp ← (d_bits / 1024) ∧ 31
-            let i32 d_mant ← d_bits ∧ 1023
-            mut f32 d ← 0.0 ∷ f32
-            if d_exp ≡ 0 {
-                if d_mant ≢ 0 { d ← (d_mant ↦ f32) / (16777216.0 ∷ f32) }
-            }
-            elif d_exp ≺ 31 {
-                mut f32 mag ← (1.0 ∷ f32) + (d_mant ↦ f32) / (1024.0 ∷ f32)
-                let i32 se ← d_exp - 15
-                if se ≻ 0 {
-                    for exclusive se let p { mag ← mag * (2.0 ∷ f32) }
+                let i32 d_lo ← (raw_blocks[[row, base]] ↦ i32 ⊥ 0) ∧ 255
+                let i32 d_hi ← (raw_blocks[[row, base + 1]] ↦ i32 ⊥ 0) ∧ 255
+                let i32 d_bits ← d_lo + d_hi * 256
+                let i32 d_sign ← (d_bits / 32768) ∧ 1
+                let i32 d_exp ← (d_bits / 1024) ∧ 31
+                let i32 d_mant ← d_bits ∧ 1023
+                mut f32 d ← 0.0 ∷ f32
+                if d_exp ≡ 0 {
+                    if d_mant ≢ 0 { d ← (d_mant ↦ f32) / (16777216.0 ∷ f32) }
                 }
-                elif se ≺ 0 {
-                    let i32 ne ← 0 - se
-                    for exclusive ne let p { mag ← mag / (2.0 ∷ f32) }
+                elif d_exp ≺ 31 {
+                    mut f32 mag ← (1.0 ∷ f32) + (d_mant ↦ f32) / (1024.0 ∷ f32)
+                    let i32 se ← d_exp - 15
+                    if se ≻ 0 {
+                        for exclusive se let p { mag ← mag * (2.0 ∷ f32) }
+                    }
+                    elif se ≺ 0 {
+                        let i32 ne ← 0 - se
+                        for exclusive ne let p { mag ← mag / (2.0 ∷ f32) }
+                    }
+                    d ← mag
                 }
-                d ← mag
-            }
-            if d_sign ≢ 0 { d ← (0.0 ∷ f32) - d }
+                else {
+                    if d_mant ≡ 0 {
+                        d ← (1.0 ∷ f32) / (0.0 ∷ f32)
+                    }
+                    else {
+                        d ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                    }
+                }
+                if d_sign ≢ 0 { d ← -d }
 
-            let i32 m_lo ← (raw_blocks[[rr, base + 2]] ↦ i32 ⊥ 0) ∧ 255
-            let i32 m_hi ← (raw_blocks[[rr, base + 3]] ↦ i32 ⊥ 0) ∧ 255
-            let i32 m_bits ← m_lo + m_hi * 256
-            let i32 m_sign ← (m_bits / 32768) ∧ 1
-            let i32 m_exp ← (m_bits / 1024) ∧ 31
-            let i32 m_mant ← m_bits ∧ 1023
-            mut f32 m ← 0.0 ∷ f32
-            if m_exp ≡ 0 {
-                if m_mant ≢ 0 { m ← (m_mant ↦ f32) / (16777216.0 ∷ f32) }
-            }
-            elif m_exp ≺ 31 {
-                mut f32 mag ← (1.0 ∷ f32) + (m_mant ↦ f32) / (1024.0 ∷ f32)
-                let i32 se ← m_exp - 15
-                if se ≻ 0 {
-                    for exclusive se let p { mag ← mag * (2.0 ∷ f32) }
+                let i32 m_lo ← (raw_blocks[[row, base + 2]] ↦ i32 ⊥ 0) ∧ 255
+                let i32 m_hi ← (raw_blocks[[row, base + 3]] ↦ i32 ⊥ 0) ∧ 255
+                let i32 m_bits ← m_lo + m_hi * 256
+                let i32 m_sign ← (m_bits / 32768) ∧ 1
+                let i32 m_exp ← (m_bits / 1024) ∧ 31
+                let i32 m_mant ← m_bits ∧ 1023
+                mut f32 m ← 0.0 ∷ f32
+                if m_exp ≡ 0 {
+                    if m_mant ≢ 0 { m ← (m_mant ↦ f32) / (16777216.0 ∷ f32) }
                 }
-                elif se ≺ 0 {
-                    let i32 ne ← 0 - se
-                    for exclusive ne let p { mag ← mag / (2.0 ∷ f32) }
+                elif m_exp ≺ 31 {
+                    mut f32 mag ← (1.0 ∷ f32) + (m_mant ↦ f32) / (1024.0 ∷ f32)
+                    let i32 se ← m_exp - 15
+                    if se ≻ 0 {
+                        for exclusive se let p { mag ← mag * (2.0 ∷ f32) }
+                    }
+                    elif se ≺ 0 {
+                        let i32 ne ← 0 - se
+                        for exclusive ne let p { mag ← mag / (2.0 ∷ f32) }
+                    }
+                    m ← mag
                 }
-                m ← mag
-            }
-            if m_sign ≢ 0 { m ← (0.0 ∷ f32) - m }
+                else {
+                    if m_mant ≡ 0 {
+                        m ← (1.0 ∷ f32) / (0.0 ∷ f32)
+                    }
+                    else {
+                        m ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                    }
+                }
+                if m_sign ≢ 0 { m ← -m }
 
-            let i32 x_base ← bi * 32
-            for exclusive 16 let j {
-                let i32 ji ← (j ↦ i32 ⊥ 0) ∧ 15
-                let i32 qs ← (raw_blocks[[rr, base + 4 + ji]] ↦ i32 ⊥ 0) ∧ 255
-                let i32 q0 ← qs ∧ 15
-                let i32 q1 ← (qs ⇒ 4) ∧ 15
-                let f32 w0 ← (q0 ↦ f32) * d + m
-                let f32 w1 ← (q1 ↦ f32) * d + m
-                acc ← acc + w0 * x[[b_i, x_base + ji]] + w1 * x[[b_i, x_base + 16 + ji]]
+                let i32 x_base ← b * 32
+                for exclusive 16 let j {
+                    let i32 qs ← (raw_blocks[[row, base + 4 + j]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 q0 ← qs ∧ 15
+                    let i32 q1 ← (qs ⇒ 4) ∧ 15
+                    let f32 w0 ← (q0 ↦ f32) * d + m
+                    let f32 w1 ← (q1 ↦ f32) * d + m
+                    acc ← acc + w0 * x[[b_idx, x_base + j]] + w1 * x[[b_idx, x_base + 16 + j]]
+                }
             }
         }
 
@@ -1723,82 +1819,90 @@ fn dispatch_ggml_q4_1_matmul<size B, size Out, size Blocks, size RowBytes, size 
 @ public
 kernel ggml_q5_0_matmul<size B, size Out, size Blocks, size RowBytes, size In>(tensor<u8, [Out, RowBytes]> raw_blocks, tensor<f32, [B, In]> x, mut tensor<f32, [B, Out]> y) → void {
     for from y at [b_idx, row] thread lane let e {
-        let i32 b_i ← (b_idx ↦ i32) ∧ 65535
-        let i32 rr ← (row ↦ i32) ∧ 65535
+        let i32 row_block_limit ← RowBytes / 22
+        let i32 in_block_limit ← In / 32
         mut f32 acc ← 0.0 ∷ f32
 
         for exclusive Blocks let b {
-            let i32 bi ← (b ↦ i32) ∧ 65535
-            let i32 base ← bi * 22
-            let i32 lo ← (raw_blocks[[rr, base]] ↦ i32 ⊥ 0) ∧ 255
-            let i32 hi ← (raw_blocks[[rr, base + 1]] ↦ i32 ⊥ 0) ∧ 255
-            let i32 bits ← lo + hi * 256
-            let i32 sign_bit ← (bits / 32768) ∧ 1
-            let i32 exp_bits ← (bits / 1024) ∧ 31
-            let i32 mant_bits ← bits ∧ 1023
+            if b ≥ 0 and b ≺ row_block_limit and b ≺ in_block_limit {
+                let i32 base ← b * 22
+                let i32 lo ← (raw_blocks[[row, base]] ↦ i32 ⊥ 0) ∧ 255
+                let i32 hi ← (raw_blocks[[row, base + 1]] ↦ i32 ⊥ 0) ∧ 255
+                let i32 bits ← lo + hi * 256
+                let i32 sign_bit ← (bits / 32768) ∧ 1
+                let i32 exp_bits ← (bits / 1024) ∧ 31
+                let i32 mant_bits ← bits ∧ 1023
 
-            mut f32 d ← 0.0 ∷ f32
-            if exp_bits ≡ 0 {
-                if mant_bits ≢ 0 { d ← (mant_bits ↦ f32) / (16777216.0 ∷ f32) }
-            }
-            elif exp_bits ≺ 31 {
-                mut f32 mag ← (1.0 ∷ f32) + (mant_bits ↦ f32) / (1024.0 ∷ f32)
-                let i32 shift_exp ← exp_bits - 15
-                if shift_exp ≻ 0 {
-                    for exclusive shift_exp let p { mag ← mag * (2.0 ∷ f32) }
+                mut f32 d ← 0.0 ∷ f32
+                if exp_bits ≡ 0 {
+                    if mant_bits ≢ 0 { d ← (mant_bits ↦ f32) / (16777216.0 ∷ f32) }
                 }
-                elif shift_exp ≺ 0 {
-                    let i32 neg_exp ← 0 - shift_exp
-                    for exclusive neg_exp let p { mag ← mag / (2.0 ∷ f32) }
+                elif exp_bits ≺ 31 {
+                    mut f32 mag ← (1.0 ∷ f32) + (mant_bits ↦ f32) / (1024.0 ∷ f32)
+                    let i32 shift_exp ← exp_bits - 15
+                    if shift_exp ≻ 0 {
+                        for exclusive shift_exp let p { mag ← mag * (2.0 ∷ f32) }
+                    }
+                    elif shift_exp ≺ 0 {
+                        let i32 neg_exp ← 0 - shift_exp
+                        for exclusive neg_exp let p { mag ← mag / (2.0 ∷ f32) }
+                    }
+                    d ← mag
                 }
-                d ← mag
-            }
-            if sign_bit ≢ 0 { d ← (0.0 ∷ f32) - d }
+                else {
+                    if mant_bits ≡ 0 {
+                        d ← (1.0 ∷ f32) / (0.0 ∷ f32)
+                    }
+                    else {
+                        d ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                    }
+                }
+                if sign_bit ≢ 0 { d ← -d }
 
-            let i32 x_base ← bi * 32
-            for exclusive 16 let j {
-                let i32 ji ← (j ↦ i32 ⊥ 0) ∧ 15
-                let i32 qh_lo_b ← (raw_blocks[[rr, base + 2 + (ji / 8)]] ↦ i32 ⊥ 0) ∧ 255
-                let i32 qh_hi_b ← (raw_blocks[[rr, base + 4 + (ji / 8)]] ↦ i32 ⊥ 0) ∧ 255
-                let i32 bit_pos ← ji ∧ 7
-                mut i32 qh_lo_sh ← qh_lo_b
-                mut i32 qh_hi_sh ← qh_hi_b
-                if bit_pos ≡ 1 {
-                    qh_lo_sh ← qh_lo_b ⇒ 1
-                    qh_hi_sh ← qh_hi_b ⇒ 1
+                let i32 x_base ← b * 32
+                for exclusive 16 let j {
+                    let i32 qh_lo_b ← (raw_blocks[[row, base + 2 + (j / 8)]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 qh_hi_b ← (raw_blocks[[row, base + 4 + (j / 8)]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 bit_pos ← j % 8
+                    mut i32 qh_lo_sh ← qh_lo_b
+                    mut i32 qh_hi_sh ← qh_hi_b
+                    if bit_pos ≡ 1 {
+                        qh_lo_sh ← qh_lo_b ⇒ 1
+                        qh_hi_sh ← qh_hi_b ⇒ 1
+                    }
+                    elif bit_pos ≡ 2 {
+                        qh_lo_sh ← qh_lo_b ⇒ 2
+                        qh_hi_sh ← qh_hi_b ⇒ 2
+                    }
+                    elif bit_pos ≡ 3 {
+                        qh_lo_sh ← qh_lo_b ⇒ 3
+                        qh_hi_sh ← qh_hi_b ⇒ 3
+                    }
+                    elif bit_pos ≡ 4 {
+                        qh_lo_sh ← qh_lo_b ⇒ 4
+                        qh_hi_sh ← qh_hi_b ⇒ 4
+                    }
+                    elif bit_pos ≡ 5 {
+                        qh_lo_sh ← qh_lo_b ⇒ 5
+                        qh_hi_sh ← qh_hi_b ⇒ 5
+                    }
+                    elif bit_pos ≡ 6 {
+                        qh_lo_sh ← qh_lo_b ⇒ 6
+                        qh_hi_sh ← qh_hi_b ⇒ 6
+                    }
+                    elif bit_pos ≡ 7 {
+                        qh_lo_sh ← qh_lo_b ⇒ 7
+                        qh_hi_sh ← qh_hi_b ⇒ 7
+                    }
+                    let i32 xh_0 ← (qh_lo_sh ∧ 1) * 16
+                    let i32 xh_1 ← (qh_hi_sh ∧ 1) * 16
+                    let i32 qs ← (raw_blocks[[row, base + 6 + j]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 x0 ← ((qs ∧ 15) + xh_0) - 16
+                    let i32 x1 ← (((qs ⇒ 4) ∧ 15) + xh_1) - 16
+                    let f32 w0 ← (x0 ↦ f32) * d
+                    let f32 w1 ← (x1 ↦ f32) * d
+                    acc ← acc + w0 * x[[b_idx, x_base + j]] + w1 * x[[b_idx, x_base + 16 + j]]
                 }
-                elif bit_pos ≡ 2 {
-                    qh_lo_sh ← qh_lo_b ⇒ 2
-                    qh_hi_sh ← qh_hi_b ⇒ 2
-                }
-                elif bit_pos ≡ 3 {
-                    qh_lo_sh ← qh_lo_b ⇒ 3
-                    qh_hi_sh ← qh_hi_b ⇒ 3
-                }
-                elif bit_pos ≡ 4 {
-                    qh_lo_sh ← qh_lo_b ⇒ 4
-                    qh_hi_sh ← qh_hi_b ⇒ 4
-                }
-                elif bit_pos ≡ 5 {
-                    qh_lo_sh ← qh_lo_b ⇒ 5
-                    qh_hi_sh ← qh_hi_b ⇒ 5
-                }
-                elif bit_pos ≡ 6 {
-                    qh_lo_sh ← qh_lo_b ⇒ 6
-                    qh_hi_sh ← qh_hi_b ⇒ 6
-                }
-                elif bit_pos ≡ 7 {
-                    qh_lo_sh ← qh_lo_b ⇒ 7
-                    qh_hi_sh ← qh_hi_b ⇒ 7
-                }
-                let i32 xh_0 ← (qh_lo_sh ∧ 1) * 16
-                let i32 xh_1 ← (qh_hi_sh ∧ 1) * 16
-                let i32 qs ← (raw_blocks[[rr, base + 6 + ji]] ↦ i32 ⊥ 0) ∧ 255
-                let i32 x0 ← ((qs ∧ 15) + xh_0) - 16
-                let i32 x1 ← (((qs ⇒ 4) ∧ 15) + xh_1) - 16
-                let f32 w0 ← (x0 ↦ f32) * d
-                let f32 w1 ← (x1 ↦ f32) * d
-                acc ← acc + w0 * x[[b_i, x_base + ji]] + w1 * x[[b_i, x_base + 16 + ji]]
             }
         }
 
@@ -1822,80 +1926,88 @@ fn dispatch_ggml_q5_0_matmul<size B, size Out, size Blocks, size RowBytes, size 
 @ public
 kernel ggml_iq4_nl_matmul<size B, size Out, size Blocks, size RowBytes, size In>(tensor<u8, [Out, RowBytes]> raw_blocks, tensor<f32, [B, In]> x, mut tensor<f32, [B, Out]> y) → void {
     for from y at [b_idx, row] thread lane let e {
-        let i32 b_i ← (b_idx ↦ i32) ∧ 65535
-        let i32 rr ← (row ↦ i32) ∧ 65535
+        let i32 row_block_limit ← RowBytes / 18
+        let i32 in_block_limit ← In / 32
         mut f32 acc ← 0.0 ∷ f32
 
         for exclusive Blocks let b {
-            let i32 bi ← (b ↦ i32) ∧ 65535
-            let i32 base ← bi * 18
-            let i32 lo ← (raw_blocks[[rr, base]] ↦ i32 ⊥ 0) ∧ 255
-            let i32 hi ← (raw_blocks[[rr, base + 1]] ↦ i32 ⊥ 0) ∧ 255
-            let i32 bits ← lo + hi * 256
-            let i32 sign_bit ← (bits / 32768) ∧ 1
-            let i32 exp_bits ← (bits / 1024) ∧ 31
-            let i32 mant_bits ← bits ∧ 1023
+            if b ≥ 0 and b ≺ row_block_limit and b ≺ in_block_limit {
+                let i32 base ← b * 18
+                let i32 lo ← (raw_blocks[[row, base]] ↦ i32 ⊥ 0) ∧ 255
+                let i32 hi ← (raw_blocks[[row, base + 1]] ↦ i32 ⊥ 0) ∧ 255
+                let i32 bits ← lo + hi * 256
+                let i32 sign_bit ← (bits / 32768) ∧ 1
+                let i32 exp_bits ← (bits / 1024) ∧ 31
+                let i32 mant_bits ← bits ∧ 1023
 
-            mut f32 d ← 0.0 ∷ f32
-            if exp_bits ≡ 0 {
-                if mant_bits ≢ 0 { d ← (mant_bits ↦ f32) / (16777216.0 ∷ f32) }
-            }
-            elif exp_bits ≺ 31 {
-                mut f32 mag ← (1.0 ∷ f32) + (mant_bits ↦ f32) / (1024.0 ∷ f32)
-                let i32 shift_exp ← exp_bits - 15
-                if shift_exp ≻ 0 {
-                    for exclusive shift_exp let p { mag ← mag * (2.0 ∷ f32) }
+                mut f32 d ← 0.0 ∷ f32
+                if exp_bits ≡ 0 {
+                    if mant_bits ≢ 0 { d ← (mant_bits ↦ f32) / (16777216.0 ∷ f32) }
                 }
-                elif shift_exp ≺ 0 {
-                    let i32 neg_exp ← 0 - shift_exp
-                    for exclusive neg_exp let p { mag ← mag / (2.0 ∷ f32) }
+                elif exp_bits ≺ 31 {
+                    mut f32 mag ← (1.0 ∷ f32) + (mant_bits ↦ f32) / (1024.0 ∷ f32)
+                    let i32 shift_exp ← exp_bits - 15
+                    if shift_exp ≻ 0 {
+                        for exclusive shift_exp let p { mag ← mag * (2.0 ∷ f32) }
+                    }
+                    elif shift_exp ≺ 0 {
+                        let i32 neg_exp ← 0 - shift_exp
+                        for exclusive neg_exp let p { mag ← mag / (2.0 ∷ f32) }
+                    }
+                    d ← mag
                 }
-                d ← mag
-            }
-            if sign_bit ≢ 0 { d ← (0.0 ∷ f32) - d }
+                else {
+                    if mant_bits ≡ 0 {
+                        d ← (1.0 ∷ f32) / (0.0 ∷ f32)
+                    }
+                    else {
+                        d ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                    }
+                }
+                if sign_bit ≢ 0 { d ← -d }
 
-            let i32 x_base ← bi * 32
-            for exclusive 16 let j {
-                let i32 ji ← (j ↦ i32 ⊥ 0) ∧ 15
-                let i32 qs ← (raw_blocks[[rr, base + 2 + ji]] ↦ i32 ⊥ 0) ∧ 255
-                let i32 q0 ← qs ∧ 15
-                let i32 q1 ← (qs ⇒ 4) ∧ 15
+                let i32 x_base ← b * 32
+                for exclusive 16 let j {
+                    let i32 qs ← (raw_blocks[[row, base + 2 + j]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 q0 ← qs ∧ 15
+                    let i32 q1 ← (qs ⇒ 4) ∧ 15
 
-                mut f32 kv0 ← 113.0 ∷ f32
-                if q0 ≡ 0 { kv0 ← -127.0 ∷ f32 }
-                elif q0 ≡ 1 { kv0 ← -104.0 ∷ f32 }
-                elif q0 ≡ 2 { kv0 ← -83.0 ∷ f32 }
-                elif q0 ≡ 3 { kv0 ← -65.0 ∷ f32 }
-                elif q0 ≡ 4 { kv0 ← -49.0 ∷ f32 }
-                elif q0 ≡ 5 { kv0 ← -35.0 ∷ f32 }
-                elif q0 ≡ 6 { kv0 ← -22.0 ∷ f32 }
-                elif q0 ≡ 7 { kv0 ← -10.0 ∷ f32 }
-                elif q0 ≡ 8 { kv0 ← 1.0 ∷ f32 }
-                elif q0 ≡ 9 { kv0 ← 13.0 ∷ f32 }
-                elif q0 ≡ 10 { kv0 ← 25.0 ∷ f32 }
-                elif q0 ≡ 11 { kv0 ← 38.0 ∷ f32 }
-                elif q0 ≡ 12 { kv0 ← 53.0 ∷ f32 }
-                elif q0 ≡ 13 { kv0 ← 69.0 ∷ f32 }
-                elif q0 ≡ 14 { kv0 ← 89.0 ∷ f32 }
+                    mut f32 kv0 ← 113.0 ∷ f32
+                    if q0 ≡ 0 { kv0 ← -127.0 ∷ f32 }
+                    elif q0 ≡ 1 { kv0 ← -104.0 ∷ f32 }
+                    elif q0 ≡ 2 { kv0 ← -83.0 ∷ f32 }
+                    elif q0 ≡ 3 { kv0 ← -65.0 ∷ f32 }
+                    elif q0 ≡ 4 { kv0 ← -49.0 ∷ f32 }
+                    elif q0 ≡ 5 { kv0 ← -35.0 ∷ f32 }
+                    elif q0 ≡ 6 { kv0 ← -22.0 ∷ f32 }
+                    elif q0 ≡ 7 { kv0 ← -10.0 ∷ f32 }
+                    elif q0 ≡ 8 { kv0 ← 1.0 ∷ f32 }
+                    elif q0 ≡ 9 { kv0 ← 13.0 ∷ f32 }
+                    elif q0 ≡ 10 { kv0 ← 25.0 ∷ f32 }
+                    elif q0 ≡ 11 { kv0 ← 38.0 ∷ f32 }
+                    elif q0 ≡ 12 { kv0 ← 53.0 ∷ f32 }
+                    elif q0 ≡ 13 { kv0 ← 69.0 ∷ f32 }
+                    elif q0 ≡ 14 { kv0 ← 89.0 ∷ f32 }
 
-                mut f32 kv1 ← 113.0 ∷ f32
-                if q1 ≡ 0 { kv1 ← -127.0 ∷ f32 }
-                elif q1 ≡ 1 { kv1 ← -104.0 ∷ f32 }
-                elif q1 ≡ 2 { kv1 ← -83.0 ∷ f32 }
-                elif q1 ≡ 3 { kv1 ← -65.0 ∷ f32 }
-                elif q1 ≡ 4 { kv1 ← -49.0 ∷ f32 }
-                elif q1 ≡ 5 { kv1 ← -35.0 ∷ f32 }
-                elif q1 ≡ 6 { kv1 ← -22.0 ∷ f32 }
-                elif q1 ≡ 7 { kv1 ← -10.0 ∷ f32 }
-                elif q1 ≡ 8 { kv1 ← 1.0 ∷ f32 }
-                elif q1 ≡ 9 { kv1 ← 13.0 ∷ f32 }
-                elif q1 ≡ 10 { kv1 ← 25.0 ∷ f32 }
-                elif q1 ≡ 11 { kv1 ← 38.0 ∷ f32 }
-                elif q1 ≡ 12 { kv1 ← 53.0 ∷ f32 }
-                elif q1 ≡ 13 { kv1 ← 69.0 ∷ f32 }
-                elif q1 ≡ 14 { kv1 ← 89.0 ∷ f32 }
+                    mut f32 kv1 ← 113.0 ∷ f32
+                    if q1 ≡ 0 { kv1 ← -127.0 ∷ f32 }
+                    elif q1 ≡ 1 { kv1 ← -104.0 ∷ f32 }
+                    elif q1 ≡ 2 { kv1 ← -83.0 ∷ f32 }
+                    elif q1 ≡ 3 { kv1 ← -65.0 ∷ f32 }
+                    elif q1 ≡ 4 { kv1 ← -49.0 ∷ f32 }
+                    elif q1 ≡ 5 { kv1 ← -35.0 ∷ f32 }
+                    elif q1 ≡ 6 { kv1 ← -22.0 ∷ f32 }
+                    elif q1 ≡ 7 { kv1 ← -10.0 ∷ f32 }
+                    elif q1 ≡ 8 { kv1 ← 1.0 ∷ f32 }
+                    elif q1 ≡ 9 { kv1 ← 13.0 ∷ f32 }
+                    elif q1 ≡ 10 { kv1 ← 25.0 ∷ f32 }
+                    elif q1 ≡ 11 { kv1 ← 38.0 ∷ f32 }
+                    elif q1 ≡ 12 { kv1 ← 53.0 ∷ f32 }
+                    elif q1 ≡ 13 { kv1 ← 69.0 ∷ f32 }
+                    elif q1 ≡ 14 { kv1 ← 89.0 ∷ f32 }
 
-                acc ← acc + (d * kv0) * x[[b_i, x_base + ji]] + (d * kv1) * x[[b_i, x_base + 16 + ji]]
+                    acc ← acc + (d * kv0) * x[[b_idx, x_base + j]] + (d * kv1) * x[[b_idx, x_base + 16 + j]]
+                }
             }
         }
 
@@ -1919,109 +2031,124 @@ fn dispatch_ggml_iq4_nl_matmul<size B, size Out, size Blocks, size RowBytes, siz
 @ public
 kernel ggml_q4_k_matmul<size B, size Out, size Blocks, size RowBytes, size In>(tensor<u8, [Out, RowBytes]> raw_blocks, tensor<f32, [B, In]> x, mut tensor<f32, [B, Out]> y) → void {
     for from y at [b_idx, row] thread lane let e {
-        let i32 b_i ← (b_idx ↦ i32) ∧ 65535
-        let i32 rr ← (row ↦ i32) ∧ 65535
+        let i32 row_block_limit ← RowBytes / 144
+        let i32 in_block_limit ← In / 256
         mut f32 acc ← 0.0 ∷ f32
 
         for exclusive Blocks let b {
-            let i32 bi ← (b ↦ i32) ∧ 65535
-            let i32 base ← bi * 144
+            if b ≥ 0 and b ≺ row_block_limit and b ≺ in_block_limit {
+                let i32 base ← b * 144
 
-            let i32 d_lo ← (raw_blocks[[rr, base]] ↦ i32 ⊥ 0) ∧ 255
-            let i32 d_hi ← (raw_blocks[[rr, base + 1]] ↦ i32 ⊥ 0) ∧ 255
-            let i32 d_bits ← d_lo + d_hi * 256
-            let i32 d_sign ← (d_bits / 32768) ∧ 1
-            let i32 d_exp ← (d_bits / 1024) ∧ 31
-            let i32 d_mant ← d_bits ∧ 1023
-            mut f32 d ← 0.0 ∷ f32
-            if d_exp ≡ 0 {
-                if d_mant ≢ 0 { d ← (d_mant ↦ f32) / (16777216.0 ∷ f32) }
-            }
-            elif d_exp ≺ 31 {
-                mut f32 mag ← (1.0 ∷ f32) + (d_mant ↦ f32) / (1024.0 ∷ f32)
-                let i32 se ← d_exp - 15
-                if se ≻ 0 {
-                    for exclusive se let p { mag ← mag * (2.0 ∷ f32) }
+                let i32 d_lo ← (raw_blocks[[row, base]] ↦ i32 ⊥ 0) ∧ 255
+                let i32 d_hi ← (raw_blocks[[row, base + 1]] ↦ i32 ⊥ 0) ∧ 255
+                let i32 d_bits ← d_lo + d_hi * 256
+                let i32 d_sign ← (d_bits / 32768) ∧ 1
+                let i32 d_exp ← (d_bits / 1024) ∧ 31
+                let i32 d_mant ← d_bits ∧ 1023
+                mut f32 d ← 0.0 ∷ f32
+                if d_exp ≡ 0 {
+                    if d_mant ≢ 0 { d ← (d_mant ↦ f32) / (16777216.0 ∷ f32) }
                 }
-                elif se ≺ 0 {
-                    let i32 ne ← 0 - se
-                    for exclusive ne let p { mag ← mag / (2.0 ∷ f32) }
-                }
-                d ← mag
-            }
-            if d_sign ≢ 0 { d ← (0.0 ∷ f32) - d }
-
-            let i32 dm_lo ← (raw_blocks[[rr, base + 2]] ↦ i32 ⊥ 0) ∧ 255
-            let i32 dm_hi ← (raw_blocks[[rr, base + 3]] ↦ i32 ⊥ 0) ∧ 255
-            let i32 dm_bits ← dm_lo + dm_hi * 256
-            let i32 dm_sign ← (dm_bits / 32768) ∧ 1
-            let i32 dm_exp ← (dm_bits / 1024) ∧ 31
-            let i32 dm_mant ← dm_bits ∧ 1023
-            mut f32 dmin ← 0.0 ∷ f32
-            if dm_exp ≡ 0 {
-                if dm_mant ≢ 0 { dmin ← (dm_mant ↦ f32) / (16777216.0 ∷ f32) }
-            }
-            elif dm_exp ≺ 31 {
-                mut f32 mag ← (1.0 ∷ f32) + (dm_mant ↦ f32) / (1024.0 ∷ f32)
-                let i32 se ← dm_exp - 15
-                if se ≻ 0 {
-                    for exclusive se let p { mag ← mag * (2.0 ∷ f32) }
-                }
-                elif se ≺ 0 {
-                    let i32 ne ← 0 - se
-                    for exclusive ne let p { mag ← mag / (2.0 ∷ f32) }
-                }
-                dmin ← mag
-            }
-            if dm_sign ≢ 0 { dmin ← (0.0 ∷ f32) - dmin }
-
-            let i32 x_base ← bi * 256
-            for exclusive 4 let chunk {
-                let i32 ci ← (chunk ↦ i32 ⊥ 0) ∧ 3
-                let i32 idx0 ← ci * 2
-                let i32 idx1 ← idx0 + 1
-
-                mut i32 sc0 ← 0
-                mut i32 m0 ← 0
-                if idx0 ≺ 4 {
-                    sc0 ← (raw_blocks[[rr, base + 4 + idx0]] ↦ i32 ⊥ 0) ∧ 63
-                    m0 ← (raw_blocks[[rr, base + 8 + idx0]] ↦ i32 ⊥ 0) ∧ 63
+                elif d_exp ≺ 31 {
+                    mut f32 mag ← (1.0 ∷ f32) + (d_mant ↦ f32) / (1024.0 ∷ f32)
+                    let i32 se ← d_exp - 15
+                    if se ≻ 0 {
+                        for exclusive se let p { mag ← mag * (2.0 ∷ f32) }
+                    }
+                    elif se ≺ 0 {
+                        let i32 ne ← 0 - se
+                        for exclusive ne let p { mag ← mag / (2.0 ∷ f32) }
+                    }
+                    d ← mag
                 }
                 else {
-                    let i32 s_hi ← raw_blocks[[rr, base + 8 + idx0]] ↦ i32 ⊥ 0
-                    let i32 s_lo ← raw_blocks[[rr, base + idx0]] ↦ i32 ⊥ 0
-                    let i32 m_lo ← raw_blocks[[rr, base + 4 + idx0]] ↦ i32 ⊥ 0
-                    sc0 ← (s_hi ∧ 15) + (((s_lo ⇒ 6) ∧ 3) * 16)
-                    m0 ← ((s_hi ⇒ 4) ∧ 15) + (((m_lo ⇒ 6) ∧ 3) * 16)
+                    if d_mant ≡ 0 {
+                        d ← (1.0 ∷ f32) / (0.0 ∷ f32)
+                    }
+                    else {
+                        d ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                    }
                 }
+                if d_sign ≢ 0 { d ← -d }
 
-                mut i32 sc1 ← 0
-                mut i32 m1 ← 0
-                if idx1 ≺ 4 {
-                    sc1 ← (raw_blocks[[rr, base + 4 + idx1]] ↦ i32 ⊥ 0) ∧ 63
-                    m1 ← (raw_blocks[[rr, base + 8 + idx1]] ↦ i32 ⊥ 0) ∧ 63
+                let i32 dm_lo ← (raw_blocks[[row, base + 2]] ↦ i32 ⊥ 0) ∧ 255
+                let i32 dm_hi ← (raw_blocks[[row, base + 3]] ↦ i32 ⊥ 0) ∧ 255
+                let i32 dm_bits ← dm_lo + dm_hi * 256
+                let i32 dm_sign ← (dm_bits / 32768) ∧ 1
+                let i32 dm_exp ← (dm_bits / 1024) ∧ 31
+                let i32 dm_mant ← dm_bits ∧ 1023
+                mut f32 dmin ← 0.0 ∷ f32
+                if dm_exp ≡ 0 {
+                    if dm_mant ≢ 0 { dmin ← (dm_mant ↦ f32) / (16777216.0 ∷ f32) }
+                }
+                elif dm_exp ≺ 31 {
+                    mut f32 mag ← (1.0 ∷ f32) + (dm_mant ↦ f32) / (1024.0 ∷ f32)
+                    let i32 se ← dm_exp - 15
+                    if se ≻ 0 {
+                        for exclusive se let p { mag ← mag * (2.0 ∷ f32) }
+                    }
+                    elif se ≺ 0 {
+                        let i32 ne ← 0 - se
+                        for exclusive ne let p { mag ← mag / (2.0 ∷ f32) }
+                    }
+                    dmin ← mag
                 }
                 else {
-                    let i32 s_hi ← raw_blocks[[rr, base + 8 + idx1]] ↦ i32 ⊥ 0
-                    let i32 s_lo ← raw_blocks[[rr, base + idx1]] ↦ i32 ⊥ 0
-                    let i32 m_lo ← raw_blocks[[rr, base + 4 + idx1]] ↦ i32 ⊥ 0
-                    sc1 ← (s_hi ∧ 15) + (((s_lo ⇒ 6) ∧ 3) * 16)
-                    m1 ← ((s_hi ⇒ 4) ∧ 15) + (((m_lo ⇒ 6) ∧ 3) * 16)
+                    if dm_mant ≡ 0 {
+                        dmin ← (1.0 ∷ f32) / (0.0 ∷ f32)
+                    }
+                    else {
+                        dmin ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                    }
                 }
+                if dm_sign ≢ 0 { dmin ← -dmin }
 
-                let f32 d1 ← d * (sc0 ↦ f32)
-                let f32 m1f ← dmin * (m0 ↦ f32)
-                let f32 d2 ← d * (sc1 ↦ f32)
-                let f32 m2f ← dmin * (m1 ↦ f32)
-                let i32 qoff ← ci * 32
-                let i32 cx_base ← x_base + ci * 64
+                let i32 x_base ← b * 256
+                for exclusive 4 let chunk {
+                    let i32 idx0 ← chunk * 2
+                    let i32 idx1 ← idx0 + 1
 
-                for exclusive 32 let l {
-                    let i32 li ← (l ↦ i32 ⊥ 0) ∧ 31
-                    let i32 qs ← (raw_blocks[[rr, base + 16 + qoff + li]] ↦ i32 ⊥ 0) ∧ 255
-                    let f32 w0 ← d1 * ((qs ∧ 15) ↦ f32) - m1f
-                    let f32 w1 ← d2 * (((qs ⇒ 4) ∧ 15) ↦ f32) - m2f
-                    acc ← acc + w0 * x[[b_i, cx_base + li]] + w1 * x[[b_i, cx_base + 32 + li]]
+                    mut i32 sc0 ← 0
+                    mut i32 m0 ← 0
+                    if idx0 ≺ 4 {
+                        sc0 ← (raw_blocks[[row, base + 4 + idx0]] ↦ i32 ⊥ 0) ∧ 63
+                        m0 ← (raw_blocks[[row, base + 8 + idx0]] ↦ i32 ⊥ 0) ∧ 63
+                    }
+                    else {
+                        let i32 s_hi ← raw_blocks[[row, base + 8 + idx0]] ↦ i32 ⊥ 0
+                        let i32 s_lo ← raw_blocks[[row, base + idx0]] ↦ i32 ⊥ 0
+                        let i32 m_lo ← raw_blocks[[row, base + 4 + idx0]] ↦ i32 ⊥ 0
+                        sc0 ← (s_hi ∧ 15) + (((s_lo ⇒ 6) ∧ 3) * 16)
+                        m0 ← ((s_hi ⇒ 4) ∧ 15) + (((m_lo ⇒ 6) ∧ 3) * 16)
+                    }
+
+                    mut i32 sc1 ← 0
+                    mut i32 m1 ← 0
+                    if idx1 ≺ 4 {
+                        sc1 ← (raw_blocks[[row, base + 4 + idx1]] ↦ i32 ⊥ 0) ∧ 63
+                        m1 ← (raw_blocks[[row, base + 8 + idx1]] ↦ i32 ⊥ 0) ∧ 63
+                    }
+                    else {
+                        let i32 s_hi ← raw_blocks[[row, base + 8 + idx1]] ↦ i32 ⊥ 0
+                        let i32 s_lo ← raw_blocks[[row, base + idx1]] ↦ i32 ⊥ 0
+                        let i32 m_lo ← raw_blocks[[row, base + 4 + idx1]] ↦ i32 ⊥ 0
+                        sc1 ← (s_hi ∧ 15) + (((s_lo ⇒ 6) ∧ 3) * 16)
+                        m1 ← ((s_hi ⇒ 4) ∧ 15) + (((m_lo ⇒ 6) ∧ 3) * 16)
+                    }
+
+                    let f32 d1 ← d * (sc0 ↦ f32)
+                    let f32 m1f ← dmin * (m0 ↦ f32)
+                    let f32 d2 ← d * (sc1 ↦ f32)
+                    let f32 m2f ← dmin * (m1 ↦ f32)
+                    let i32 qoff ← chunk * 32
+                    let i32 cx_base ← x_base + chunk * 64
+
+                    for exclusive 32 let l {
+                        let i32 qs ← (raw_blocks[[row, base + 16 + qoff + l]] ↦ i32 ⊥ 0) ∧ 255
+                        let f32 w0 ← d1 * ((qs ∧ 15) ↦ f32) - m1f
+                        let f32 w1 ← d2 * (((qs ⇒ 4) ∧ 15) ↦ f32) - m2f
+                        acc ← acc + w0 * x[[b_idx, cx_base + l]] + w1 * x[[b_idx, cx_base + 32 + l]]
+                    }
                 }
             }
         }
@@ -2046,118 +2173,133 @@ fn dispatch_ggml_q4_k_matmul<size B, size Out, size Blocks, size RowBytes, size 
 @ public
 kernel ggml_q5_k_matmul<size B, size Out, size Blocks, size RowBytes, size In>(tensor<u8, [Out, RowBytes]> raw_blocks, tensor<f32, [B, In]> x, mut tensor<f32, [B, Out]> y) → void {
     for from y at [b_idx, row] thread lane let e {
-        let i32 b_i ← (b_idx ↦ i32) ∧ 65535
-        let i32 rr ← (row ↦ i32) ∧ 65535
+        let i32 row_block_limit ← RowBytes / 176
+        let i32 in_block_limit ← In / 256
         mut f32 acc ← 0.0 ∷ f32
 
         for exclusive Blocks let b {
-            let i32 bi ← (b ↦ i32) ∧ 65535
-            let i32 base ← bi * 176
+            if b ≥ 0 and b ≺ row_block_limit and b ≺ in_block_limit {
+                let i32 base ← b * 176
 
-            let i32 d_lo ← (raw_blocks[[rr, base]] ↦ i32 ⊥ 0) ∧ 255
-            let i32 d_hi ← (raw_blocks[[rr, base + 1]] ↦ i32 ⊥ 0) ∧ 255
-            let i32 d_bits ← d_lo + d_hi * 256
-            let i32 d_sign ← (d_bits / 32768) ∧ 1
-            let i32 d_exp ← (d_bits / 1024) ∧ 31
-            let i32 d_mant ← d_bits ∧ 1023
-            mut f32 d ← 0.0 ∷ f32
-            if d_exp ≡ 0 {
-                if d_mant ≢ 0 { d ← (d_mant ↦ f32) / (16777216.0 ∷ f32) }
-            }
-            elif d_exp ≺ 31 {
-                mut f32 mag ← (1.0 ∷ f32) + (d_mant ↦ f32) / (1024.0 ∷ f32)
-                let i32 se ← d_exp - 15
-                if se ≻ 0 {
-                    for exclusive se let p { mag ← mag * (2.0 ∷ f32) }
+                let i32 d_lo ← (raw_blocks[[row, base]] ↦ i32 ⊥ 0) ∧ 255
+                let i32 d_hi ← (raw_blocks[[row, base + 1]] ↦ i32 ⊥ 0) ∧ 255
+                let i32 d_bits ← d_lo + d_hi * 256
+                let i32 d_sign ← (d_bits / 32768) ∧ 1
+                let i32 d_exp ← (d_bits / 1024) ∧ 31
+                let i32 d_mant ← d_bits ∧ 1023
+                mut f32 d ← 0.0 ∷ f32
+                if d_exp ≡ 0 {
+                    if d_mant ≢ 0 { d ← (d_mant ↦ f32) / (16777216.0 ∷ f32) }
                 }
-                elif se ≺ 0 {
-                    let i32 ne ← 0 - se
-                    for exclusive ne let p { mag ← mag / (2.0 ∷ f32) }
-                }
-                d ← mag
-            }
-            if d_sign ≢ 0 { d ← (0.0 ∷ f32) - d }
-
-            let i32 dm_lo ← (raw_blocks[[rr, base + 2]] ↦ i32 ⊥ 0) ∧ 255
-            let i32 dm_hi ← (raw_blocks[[rr, base + 3]] ↦ i32 ⊥ 0) ∧ 255
-            let i32 dm_bits ← dm_lo + dm_hi * 256
-            let i32 dm_sign ← (dm_bits / 32768) ∧ 1
-            let i32 dm_exp ← (dm_bits / 1024) ∧ 31
-            let i32 dm_mant ← dm_bits ∧ 1023
-            mut f32 dmin ← 0.0 ∷ f32
-            if dm_exp ≡ 0 {
-                if dm_mant ≢ 0 { dmin ← (dm_mant ↦ f32) / (16777216.0 ∷ f32) }
-            }
-            elif dm_exp ≺ 31 {
-                mut f32 mag ← (1.0 ∷ f32) + (dm_mant ↦ f32) / (1024.0 ∷ f32)
-                let i32 se ← dm_exp - 15
-                if se ≻ 0 {
-                    for exclusive se let p { mag ← mag * (2.0 ∷ f32) }
-                }
-                elif se ≺ 0 {
-                    let i32 ne ← 0 - se
-                    for exclusive ne let p { mag ← mag / (2.0 ∷ f32) }
-                }
-                dmin ← mag
-            }
-            if dm_sign ≢ 0 { dmin ← (0.0 ∷ f32) - dmin }
-
-            let i32 x_base ← bi * 256
-            for exclusive 4 let chunk {
-                let i32 ci ← (chunk ↦ i32 ⊥ 0) ∧ 3
-                let i32 idx0 ← ci * 2
-                let i32 idx1 ← idx0 + 1
-
-                mut i32 sc0 ← 0
-                mut i32 m0 ← 0
-                if idx0 ≺ 4 {
-                    sc0 ← (raw_blocks[[rr, base + 4 + idx0]] ↦ i32 ⊥ 0) ∧ 63
-                    m0 ← (raw_blocks[[rr, base + 8 + idx0]] ↦ i32 ⊥ 0) ∧ 63
+                elif d_exp ≺ 31 {
+                    mut f32 mag ← (1.0 ∷ f32) + (d_mant ↦ f32) / (1024.0 ∷ f32)
+                    let i32 se ← d_exp - 15
+                    if se ≻ 0 {
+                        for exclusive se let p { mag ← mag * (2.0 ∷ f32) }
+                    }
+                    elif se ≺ 0 {
+                        let i32 ne ← 0 - se
+                        for exclusive ne let p { mag ← mag / (2.0 ∷ f32) }
+                    }
+                    d ← mag
                 }
                 else {
-                    let i32 s_hi ← raw_blocks[[rr, base + 8 + idx0]] ↦ i32 ⊥ 0
-                    let i32 s_lo ← raw_blocks[[rr, base + idx0]] ↦ i32 ⊥ 0
-                    let i32 m_lo ← raw_blocks[[rr, base + 4 + idx0]] ↦ i32 ⊥ 0
-                    sc0 ← (s_hi ∧ 15) + (((s_lo ⇒ 6) ∧ 3) * 16)
-                    m0 ← ((s_hi ⇒ 4) ∧ 15) + (((m_lo ⇒ 6) ∧ 3) * 16)
+                    if d_mant ≡ 0 {
+                        d ← (1.0 ∷ f32) / (0.0 ∷ f32)
+                    }
+                    else {
+                        d ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                    }
                 }
+                if d_sign ≢ 0 { d ← -d }
 
-                mut i32 sc1 ← 0
-                mut i32 m1 ← 0
-                if idx1 ≺ 4 {
-                    sc1 ← (raw_blocks[[rr, base + 4 + idx1]] ↦ i32 ⊥ 0) ∧ 63
-                    m1 ← (raw_blocks[[rr, base + 8 + idx1]] ↦ i32 ⊥ 0) ∧ 63
+                let i32 dm_lo ← (raw_blocks[[row, base + 2]] ↦ i32 ⊥ 0) ∧ 255
+                let i32 dm_hi ← (raw_blocks[[row, base + 3]] ↦ i32 ⊥ 0) ∧ 255
+                let i32 dm_bits ← dm_lo + dm_hi * 256
+                let i32 dm_sign ← (dm_bits / 32768) ∧ 1
+                let i32 dm_exp ← (dm_bits / 1024) ∧ 31
+                let i32 dm_mant ← dm_bits ∧ 1023
+                mut f32 dmin ← 0.0 ∷ f32
+                if dm_exp ≡ 0 {
+                    if dm_mant ≢ 0 { dmin ← (dm_mant ↦ f32) / (16777216.0 ∷ f32) }
+                }
+                elif dm_exp ≺ 31 {
+                    mut f32 mag ← (1.0 ∷ f32) + (dm_mant ↦ f32) / (1024.0 ∷ f32)
+                    let i32 se ← dm_exp - 15
+                    if se ≻ 0 {
+                        for exclusive se let p { mag ← mag * (2.0 ∷ f32) }
+                    }
+                    elif se ≺ 0 {
+                        let i32 ne ← 0 - se
+                        for exclusive ne let p { mag ← mag / (2.0 ∷ f32) }
+                    }
+                    dmin ← mag
                 }
                 else {
-                    let i32 s_hi ← raw_blocks[[rr, base + 8 + idx1]] ↦ i32 ⊥ 0
-                    let i32 s_lo ← raw_blocks[[rr, base + idx1]] ↦ i32 ⊥ 0
-                    let i32 m_lo ← raw_blocks[[rr, base + 4 + idx1]] ↦ i32 ⊥ 0
-                    sc1 ← (s_hi ∧ 15) + (((s_lo ⇒ 6) ∧ 3) * 16)
-                    m1 ← ((s_hi ⇒ 4) ∧ 15) + (((m_lo ⇒ 6) ∧ 3) * 16)
+                    if dm_mant ≡ 0 {
+                        dmin ← (1.0 ∷ f32) / (0.0 ∷ f32)
+                    }
+                    else {
+                        dmin ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                    }
                 }
+                if dm_sign ≢ 0 { dmin ← -dmin }
 
-                let f32 d1 ← d * (sc0 ↦ f32)
-                let f32 m1f ← dmin * (m0 ↦ f32)
-                let f32 d2 ← d * (sc1 ↦ f32)
-                let f32 m2f ← dmin * (m1 ↦ f32)
-                let i32 qoff ← ci * 32
-                let i32 cx_base ← x_base + ci * 64
+                let i32 x_base ← b * 256
+                for exclusive 4 let chunk {
+                    let i32 idx0 ← chunk * 2
+                    let i32 idx1 ← idx0 + 1
 
-                for exclusive 32 let l {
-                    let i32 li ← (l ↦ i32 ⊥ 0) ∧ 31
-                    let i32 qs ← (raw_blocks[[rr, base + 48 + qoff + li]] ↦ i32 ⊥ 0) ∧ 255
-                    let i32 qh ← (raw_blocks[[rr, base + 16 + li]] ↦ i32 ⊥ 0) ∧ 255
-                    mut i32 qh_sh ← qh
-                    if ci ≡ 1 { qh_sh ← qh ⇒ 2 }
-                    elif ci ≡ 2 { qh_sh ← qh ⇒ 4 }
-                    elif ci ≡ 3 { qh_sh ← qh ⇒ 6 }
-                    let i32 hi_lo ← (qh_sh ∧ 1) * 16
-                    let i32 hi_hi ← ((qh_sh ⇒ 1) ∧ 1) * 16
-                    let i32 q_lo ← (qs ∧ 15) + hi_lo
-                    let i32 q_hi ← ((qs ⇒ 4) ∧ 15) + hi_hi
-                    let f32 w0 ← d1 * (q_lo ↦ f32) - m1f
-                    let f32 w1 ← d2 * (q_hi ↦ f32) - m2f
-                    acc ← acc + w0 * x[[b_i, cx_base + li]] + w1 * x[[b_i, cx_base + 32 + li]]
+                    mut i32 sc0 ← 0
+                    mut i32 m0 ← 0
+                    if idx0 ≺ 4 {
+                        sc0 ← (raw_blocks[[row, base + 4 + idx0]] ↦ i32 ⊥ 0) ∧ 63
+                        m0 ← (raw_blocks[[row, base + 8 + idx0]] ↦ i32 ⊥ 0) ∧ 63
+                    }
+                    else {
+                        let i32 s_hi ← raw_blocks[[row, base + 8 + idx0]] ↦ i32 ⊥ 0
+                        let i32 s_lo ← raw_blocks[[row, base + idx0]] ↦ i32 ⊥ 0
+                        let i32 m_lo ← raw_blocks[[row, base + 4 + idx0]] ↦ i32 ⊥ 0
+                        sc0 ← (s_hi ∧ 15) + (((s_lo ⇒ 6) ∧ 3) * 16)
+                        m0 ← ((s_hi ⇒ 4) ∧ 15) + (((m_lo ⇒ 6) ∧ 3) * 16)
+                    }
+
+                    mut i32 sc1 ← 0
+                    mut i32 m1 ← 0
+                    if idx1 ≺ 4 {
+                        sc1 ← (raw_blocks[[row, base + 4 + idx1]] ↦ i32 ⊥ 0) ∧ 63
+                        m1 ← (raw_blocks[[row, base + 8 + idx1]] ↦ i32 ⊥ 0) ∧ 63
+                    }
+                    else {
+                        let i32 s_hi ← raw_blocks[[row, base + 8 + idx1]] ↦ i32 ⊥ 0
+                        let i32 s_lo ← raw_blocks[[row, base + idx1]] ↦ i32 ⊥ 0
+                        let i32 m_lo ← raw_blocks[[row, base + 4 + idx1]] ↦ i32 ⊥ 0
+                        sc1 ← (s_hi ∧ 15) + (((s_lo ⇒ 6) ∧ 3) * 16)
+                        m1 ← ((s_hi ⇒ 4) ∧ 15) + (((m_lo ⇒ 6) ∧ 3) * 16)
+                    }
+
+                    let f32 d1 ← d * (sc0 ↦ f32)
+                    let f32 m1f ← dmin * (m0 ↦ f32)
+                    let f32 d2 ← d * (sc1 ↦ f32)
+                    let f32 m2f ← dmin * (m1 ↦ f32)
+                    let i32 qoff ← chunk * 32
+                    let i32 cx_base ← x_base + chunk * 64
+
+                    for exclusive 32 let l {
+                        let i32 qs ← (raw_blocks[[row, base + 48 + qoff + l]] ↦ i32 ⊥ 0) ∧ 255
+                        let i32 qh ← (raw_blocks[[row, base + 16 + l]] ↦ i32 ⊥ 0) ∧ 255
+                        mut i32 qh_sh ← qh
+                        if chunk ≡ 1 { qh_sh ← qh ⇒ 2 }
+                        elif chunk ≡ 2 { qh_sh ← qh ⇒ 4 }
+                        elif chunk ≡ 3 { qh_sh ← qh ⇒ 6 }
+                        let i32 hi_lo ← (qh_sh ∧ 1) * 16
+                        let i32 hi_hi ← ((qh_sh ⇒ 1) ∧ 1) * 16
+                        let i32 q_lo ← (qs ∧ 15) + hi_lo
+                        let i32 q_hi ← ((qs ⇒ 4) ∧ 15) + hi_hi
+                        let f32 w0 ← d1 * (q_lo ↦ f32) - m1f
+                        let f32 w1 ← d2 * (q_hi ↦ f32) - m2f
+                        acc ← acc + w0 * x[[b_idx, cx_base + l]] + w1 * x[[b_idx, cx_base + 32 + l]]
+                    }
                 }
             }
         }
@@ -2182,74 +2324,81 @@ fn dispatch_ggml_q5_k_matmul<size B, size Out, size Blocks, size RowBytes, size 
 @ public
 kernel ggml_q6_k_matmul<size B, size Out, size Blocks, size RowBytes, size In>(tensor<u8, [Out, RowBytes]> raw_blocks, tensor<f32, [B, In]> x, mut tensor<f32, [B, Out]> y) → void {
     for from y at [b_idx, row] thread lane let e {
-        let i32 b_i ← (b_idx ↦ i32) ∧ 65535
-        let i32 rr ← (row ↦ i32) ∧ 65535
+        let i32 row_block_limit ← RowBytes / 210
+        let i32 in_block_limit ← In / 256
         mut f32 acc ← 0.0 ∷ f32
 
         for exclusive Blocks let b {
-            let i32 bi ← (b ↦ i32) ∧ 65535
-            let i32 base ← bi * 210
+            if b ≥ 0 and b ≺ row_block_limit and b ≺ in_block_limit {
+                let i32 base ← b * 210
 
-            let i32 d_lo ← (raw_blocks[[rr, base + 208]] ↦ i32 ⊥ 0) ∧ 255
-            let i32 d_hi ← (raw_blocks[[rr, base + 209]] ↦ i32 ⊥ 0) ∧ 255
-            let i32 d_bits ← d_lo + d_hi * 256
-            let i32 d_sign ← (d_bits / 32768) ∧ 1
-            let i32 d_exp ← (d_bits / 1024) ∧ 31
-            let i32 d_mant ← d_bits ∧ 1023
-            mut f32 d ← 0.0 ∷ f32
-            if d_exp ≡ 0 {
-                if d_mant ≢ 0 { d ← (d_mant ↦ f32) / (16777216.0 ∷ f32) }
-            }
-            elif d_exp ≺ 31 {
-                mut f32 mag ← (1.0 ∷ f32) + (d_mant ↦ f32) / (1024.0 ∷ f32)
-                let i32 se ← d_exp - 15
-                if se ≻ 0 {
-                    for exclusive se let p { mag ← mag * (2.0 ∷ f32) }
+                let i32 d_lo ← (raw_blocks[[row, base + 208]] ↦ i32 ⊥ 0) ∧ 255
+                let i32 d_hi ← (raw_blocks[[row, base + 209]] ↦ i32 ⊥ 0) ∧ 255
+                let i32 d_bits ← d_lo + d_hi * 256
+                let i32 d_sign ← (d_bits / 32768) ∧ 1
+                let i32 d_exp ← (d_bits / 1024) ∧ 31
+                let i32 d_mant ← d_bits ∧ 1023
+                mut f32 d ← 0.0 ∷ f32
+                if d_exp ≡ 0 {
+                    if d_mant ≢ 0 { d ← (d_mant ↦ f32) / (16777216.0 ∷ f32) }
                 }
-                elif se ≺ 0 {
-                    let i32 ne ← 0 - se
-                    for exclusive ne let p { mag ← mag / (2.0 ∷ f32) }
+                elif d_exp ≺ 31 {
+                    mut f32 mag ← (1.0 ∷ f32) + (d_mant ↦ f32) / (1024.0 ∷ f32)
+                    let i32 se ← d_exp - 15
+                    if se ≻ 0 {
+                        for exclusive se let p { mag ← mag * (2.0 ∷ f32) }
+                    }
+                    elif se ≺ 0 {
+                        let i32 ne ← 0 - se
+                        for exclusive ne let p { mag ← mag / (2.0 ∷ f32) }
+                    }
+                    d ← mag
                 }
-                d ← mag
-            }
-            if d_sign ≢ 0 { d ← (0.0 ∷ f32) - d }
+                else {
+                    if d_mant ≡ 0 {
+                        d ← (1.0 ∷ f32) / (0.0 ∷ f32)
+                    }
+                    else {
+                        d ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                    }
+                }
+                if d_sign ≢ 0 { d ← -d }
 
-            let i32 x_base ← bi * 256
-            for exclusive 2 let n {
-                let i32 ni ← (n ↦ i32 ⊥ 0) ∧ 1
-                let i32 sc_base ← ni * 8
-                let i32 ql_off ← ni * 64
-                let i32 qh_off ← ni * 32
-                let i32 y_off ← x_base + ni * 128
+                let i32 x_base ← b * 256
+                for exclusive 2 let n {
+                    let i32 sc_base ← n * 8
+                    let i32 ql_off ← n * 64
+                    let i32 qh_off ← n * 32
+                    let i32 y_off ← x_base + n * 128
 
-                for exclusive 32 let l {
-                    let i32 li ← (l ↦ i32 ⊥ 0) ∧ 31
-                    let i32 idx ← li / 16
-                    let i32 ql_lo ← (raw_blocks[[rr, base + ql_off + li]] ↦ i32 ⊥ 0) ∧ 255
-                    let i32 ql_hi ← (raw_blocks[[rr, base + ql_off + li + 32]] ↦ i32 ⊥ 0) ∧ 255
-                    let i32 qh ← (raw_blocks[[rr, base + 128 + qh_off + li]] ↦ i32 ⊥ 0) ∧ 255
+                    for exclusive 32 let l {
+                        let i32 idx ← l / 16
+                        let i32 ql_lo ← (raw_blocks[[row, base + ql_off + l]] ↦ i32 ⊥ 0) ∧ 255
+                        let i32 ql_hi ← (raw_blocks[[row, base + ql_off + l + 32]] ↦ i32 ⊥ 0) ∧ 255
+                        let i32 qh ← (raw_blocks[[row, base + 128 + qh_off + l]] ↦ i32 ⊥ 0) ∧ 255
 
-                    let i32 q1 ← ((ql_lo ∧ 15) + ((qh ∧ 3) * 16)) - 32
-                    let i32 q2 ← ((ql_hi ∧ 15) + (((qh ⇒ 2) ∧ 3) * 16)) - 32
-                    let i32 q3 ← (((ql_lo ⇒ 4) ∧ 15) + (((qh ⇒ 4) ∧ 3) * 16)) - 32
-                    let i32 q4 ← (((ql_hi ⇒ 4) ∧ 15) + (((qh ⇒ 6) ∧ 3) * 16)) - 32
+                        let i32 q1 ← ((ql_lo ∧ 15) + ((qh ∧ 3) * 16)) - 32
+                        let i32 q2 ← ((ql_hi ∧ 15) + (((qh ⇒ 2) ∧ 3) * 16)) - 32
+                        let i32 q3 ← (((ql_lo ⇒ 4) ∧ 15) + (((qh ⇒ 4) ∧ 3) * 16)) - 32
+                        let i32 q4 ← (((ql_hi ⇒ 4) ∧ 15) + (((qh ⇒ 6) ∧ 3) * 16)) - 32
 
-                    let i32 s0_u ← (raw_blocks[[rr, base + 192 + sc_base + idx]] ↦ i32 ⊥ 0) ∧ 255
-                    let i32 s2_u ← (raw_blocks[[rr, base + 192 + sc_base + idx + 2]] ↦ i32 ⊥ 0) ∧ 255
-                    let i32 s4_u ← (raw_blocks[[rr, base + 192 + sc_base + idx + 4]] ↦ i32 ⊥ 0) ∧ 255
-                    let i32 s6_u ← (raw_blocks[[rr, base + 192 + sc_base + idx + 6]] ↦ i32 ⊥ 0) ∧ 255
+                        let i32 s0_u ← (raw_blocks[[row, base + 192 + sc_base + idx]] ↦ i32 ⊥ 0) ∧ 255
+                        let i32 s2_u ← (raw_blocks[[row, base + 192 + sc_base + idx + 2]] ↦ i32 ⊥ 0) ∧ 255
+                        let i32 s4_u ← (raw_blocks[[row, base + 192 + sc_base + idx + 4]] ↦ i32 ⊥ 0) ∧ 255
+                        let i32 s6_u ← (raw_blocks[[row, base + 192 + sc_base + idx + 6]] ↦ i32 ⊥ 0) ∧ 255
 
-                    let i32 s0 ← s0_u ≥ 128 ✓ s0_u - 256 ✗ s0_u
-                    let i32 s2 ← s2_u ≥ 128 ✓ s2_u - 256 ✗ s2_u
-                    let i32 s4 ← s4_u ≥ 128 ✓ s4_u - 256 ✗ s4_u
-                    let i32 s6 ← s6_u ≥ 128 ✓ s6_u - 256 ✗ s6_u
+                        let i32 s0 ← s0_u ≥ 128 ✓ s0_u - 256 ✗ s0_u
+                        let i32 s2 ← s2_u ≥ 128 ✓ s2_u - 256 ✗ s2_u
+                        let i32 s4 ← s4_u ≥ 128 ✓ s4_u - 256 ✗ s4_u
+                        let i32 s6 ← s6_u ≥ 128 ✓ s6_u - 256 ✗ s6_u
 
-                    let f32 w1 ← d * (s0 ↦ f32) * (q1 ↦ f32)
-                    let f32 w2 ← d * (s2 ↦ f32) * (q2 ↦ f32)
-                    let f32 w3 ← d * (s4 ↦ f32) * (q3 ↦ f32)
-                    let f32 w4 ← d * (s6 ↦ f32) * (q4 ↦ f32)
+                        let f32 w1 ← d * (s0 ↦ f32) * (q1 ↦ f32)
+                        let f32 w2 ← d * (s2 ↦ f32) * (q2 ↦ f32)
+                        let f32 w3 ← d * (s4 ↦ f32) * (q3 ↦ f32)
+                        let f32 w4 ← d * (s6 ↦ f32) * (q4 ↦ f32)
 
-                    acc ← acc + w1 * x[[b_i, y_off + li]] + w2 * x[[b_i, y_off + li + 32]] + w3 * x[[b_i, y_off + li + 64]] + w4 * x[[b_i, y_off + li + 96]]
+                        acc ← acc + w1 * x[[b_idx, y_off + l]] + w2 * x[[b_idx, y_off + l + 32]] + w3 * x[[b_idx, y_off + l + 64]] + w4 * x[[b_idx, y_off + l + 96]]
+                    }
                 }
             }
         }
@@ -2893,4 +3042,392 @@ test "LinearWeight Q4_K, Q5_K, and Q6_K matvec + matmul match host reference" {
     catch err {
         assert false
     }
+}
+
+fn is_pos_inf(f32 x) → bool {
+    return x ≡ x and x ≻ (1.0e30 ∷ f32)
+}
+
+fn is_neg_inf(f32 x) → bool {
+    return x ≡ x and x ≺ (-1.0e30 ∷ f32)
+}
+
+fn is_nan_f32(f32 x) → bool {
+    return x ≢ x
+}
+
+test "LinearWeight GGML device kernels decode IEEE-754 f16 Inf and NaN scales" {
+    # Row 0: +Inf (0x00, 0x7c), Row 1: -Inf (0x00, 0xfc), Row 2: quiet NaN (0x00, 0x7e),
+    # Row 3: signaling-like NaN mant=1 (0x01, 0x7c), Row 4: -0.0 (0x00, 0x80).
+    mut tensor<f32, [32]> x32_1 ← tf32[32] {}
+    mut tensor<f32, [1, 32]> x32_m ← tf32[1, 32] {}
+    for exclusive 32 let j {
+        x32_1[[j]] ← 1.0 ∷ f32
+        x32_m[[0, j]] ← 1.0 ∷ f32
+    }
+
+    mut tensor<f32, [256]> x256_1 ← tf32[256] {}
+    mut tensor<f32, [1, 256]> x256_m ← tf32[1, 256] {}
+    for exclusive 256 let j {
+        x256_1[[j]] ← 1.0 ∷ f32
+        x256_m[[0, j]] ← 1.0 ∷ f32
+    }
+
+    # Q8_0 (5 rows inside Out=65540 to share kernel monomorphization)
+    mut tensor<u8, [65540, 34]> q8 ← tu8[65540, 34] {}
+    for exclusive 5 let r {
+        for exclusive 32 let k { q8[[r, 2 + k]] ← 1 ∷ u8 }
+    }
+    q8[[0, 0]] ← 0x00 ∷ u8
+    q8[[0, 1]] ← 0x7c ∷ u8
+    q8[[1, 0]] ← 0x00 ∷ u8
+    q8[[1, 1]] ← 0xfc ∷ u8
+    q8[[2, 0]] ← 0x00 ∷ u8
+    q8[[2, 1]] ← 0x7e ∷ u8
+    q8[[3, 0]] ← 0x01 ∷ u8
+    q8[[3, 1]] ← 0x7c ∷ u8
+    q8[[4, 0]] ← 0x00 ∷ u8
+    q8[[4, 1]] ← 0x80 ∷ u8
+    mut tensor<f32, [65540]> y5 ← tf32[65540] {}
+    mut tensor<f32, [1, 65540]> ym5 ← tf32[1, 65540] {}
+    lw.ggml_q8_0_matvec<size 65540, size 1, size 34, size 32>(q8, x32_1, mut y5)
+    lw.ggml_q8_0_matmul<size 1, size 65540, size 1, size 34, size 32>(q8, x32_m, mut ym5)
+    assert is_pos_inf(y5[[0]]) and is_pos_inf(ym5[[0, 0]])
+    assert is_neg_inf(y5[[1]]) and is_neg_inf(ym5[[0, 1]])
+    assert is_nan_f32(y5[[2]]) and is_nan_f32(ym5[[0, 2]])
+    assert is_nan_f32(y5[[3]]) and is_nan_f32(ym5[[0, 3]])
+    assert y5[[4]] ≡ (0.0 ∷ f32) and ym5[[0, 4]] ≡ (0.0 ∷ f32)
+
+    # Q4_1 (6 rows: test both d and m Inf/NaN)
+    mut tensor<u8, [65540, 20]> q41 ← tu8[65540, 20] {}
+    for exclusive 6 let r {
+        q41[[r, 0]] ← 0x00 ∷ u8
+        q41[[r, 1]] ← 0x3c ∷ u8
+        q41[[r, 2]] ← 0x00 ∷ u8
+        q41[[r, 3]] ← 0x00 ∷ u8
+        for exclusive 16 let j { q41[[r, 4 + j]] ← 0x11 ∷ u8 }
+    }
+    q41[[0, 0]] ← 0x00 ∷ u8
+    q41[[0, 1]] ← 0x7c ∷ u8
+    q41[[1, 0]] ← 0x00 ∷ u8
+    q41[[1, 1]] ← 0xfc ∷ u8
+    q41[[2, 0]] ← 0x00 ∷ u8
+    q41[[2, 1]] ← 0x7e ∷ u8
+    q41[[3, 2]] ← 0x00 ∷ u8
+    q41[[3, 3]] ← 0x7c ∷ u8
+    q41[[4, 2]] ← 0x00 ∷ u8
+    q41[[4, 3]] ← 0xfc ∷ u8
+    q41[[5, 2]] ← 0x01 ∷ u8
+    q41[[5, 3]] ← 0x7c ∷ u8
+    mut tensor<f32, [65540]> y6 ← tf32[65540] {}
+    mut tensor<f32, [1, 65540]> ym6 ← tf32[1, 65540] {}
+    lw.ggml_q4_1_matvec<size 65540, size 1, size 20, size 32>(q41, x32_1, mut y6)
+    lw.ggml_q4_1_matmul<size 1, size 65540, size 1, size 20, size 32>(q41, x32_m, mut ym6)
+    assert is_pos_inf(y6[[0]]) and is_pos_inf(ym6[[0, 0]])
+    assert is_neg_inf(y6[[1]]) and is_neg_inf(ym6[[0, 1]])
+    assert is_nan_f32(y6[[2]]) and is_nan_f32(ym6[[0, 2]])
+    assert is_pos_inf(y6[[3]]) and is_pos_inf(ym6[[0, 3]])
+    assert is_neg_inf(y6[[4]]) and is_neg_inf(ym6[[0, 4]])
+    assert is_nan_f32(y6[[5]]) and is_nan_f32(ym6[[0, 5]])
+
+    # Q5_0 (4 rows)
+    mut tensor<u8, [65540, 22]> q50 ← tu8[65540, 22] {}
+    for exclusive 4 let r {
+        for exclusive 4 let h { q50[[r, 2 + h]] ← 0xff ∷ u8 }
+        for exclusive 16 let j { q50[[r, 6 + j]] ← 0x11 ∷ u8 }
+    }
+    q50[[0, 0]] ← 0x00 ∷ u8
+    q50[[0, 1]] ← 0x7c ∷ u8
+    q50[[1, 0]] ← 0x00 ∷ u8
+    q50[[1, 1]] ← 0xfc ∷ u8
+    q50[[2, 0]] ← 0x00 ∷ u8
+    q50[[2, 1]] ← 0x7e ∷ u8
+    q50[[3, 0]] ← 0x01 ∷ u8
+    q50[[3, 1]] ← 0x7c ∷ u8
+    mut tensor<f32, [65540]> y4 ← tf32[65540] {}
+    mut tensor<f32, [1, 65540]> ym4 ← tf32[1, 65540] {}
+    lw.ggml_q5_0_matvec<size 65540, size 1, size 22, size 32>(q50, x32_1, mut y4)
+    lw.ggml_q5_0_matmul<size 1, size 65540, size 1, size 22, size 32>(q50, x32_m, mut ym4)
+    assert is_pos_inf(y4[[0]]) and is_pos_inf(ym4[[0, 0]])
+    assert is_neg_inf(y4[[1]]) and is_neg_inf(ym4[[0, 1]])
+    assert is_nan_f32(y4[[2]]) and is_nan_f32(ym4[[0, 2]])
+    assert is_nan_f32(y4[[3]]) and is_nan_f32(ym4[[0, 3]])
+
+    # IQ4_NL (4 rows)
+    mut tensor<u8, [65540, 18]> iq4 ← tu8[65540, 18] {}
+    for exclusive 4 let r {
+        for exclusive 16 let j { iq4[[r, 2 + j]] ← 0x88 ∷ u8 }
+    }
+    iq4[[0, 0]] ← 0x00 ∷ u8
+    iq4[[0, 1]] ← 0x7c ∷ u8
+    iq4[[1, 0]] ← 0x00 ∷ u8
+    iq4[[1, 1]] ← 0xfc ∷ u8
+    iq4[[2, 0]] ← 0x00 ∷ u8
+    iq4[[2, 1]] ← 0x7e ∷ u8
+    iq4[[3, 0]] ← 0x01 ∷ u8
+    iq4[[3, 1]] ← 0x7c ∷ u8
+    lw.ggml_iq4_nl_matvec<size 65540, size 1, size 18, size 32>(iq4, x32_1, mut y4)
+    lw.ggml_iq4_nl_matmul<size 1, size 65540, size 1, size 18, size 32>(iq4, x32_m, mut ym4)
+    assert is_pos_inf(y4[[0]]) and is_pos_inf(ym4[[0, 0]])
+    assert is_neg_inf(y4[[1]]) and is_neg_inf(ym4[[0, 1]])
+    assert is_nan_f32(y4[[2]]) and is_nan_f32(ym4[[0, 2]])
+    assert is_nan_f32(y4[[3]]) and is_nan_f32(ym4[[0, 3]])
+
+    # Q4_K (6 rows: test both d and dmin Inf/NaN)
+    mut tensor<u8, [65540, 144]> q4k ← tu8[65540, 144] {}
+    for exclusive 6 let r {
+        q4k[[r, 0]] ← 0x00 ∷ u8
+        q4k[[r, 1]] ← 0x3c ∷ u8
+        q4k[[r, 2]] ← 0x00 ∷ u8
+        q4k[[r, 3]] ← 0x00 ∷ u8
+        for exclusive 12 let s { q4k[[r, 4 + s]] ← 0x11 ∷ u8 }
+        for exclusive 128 let q { q4k[[r, 16 + q]] ← 0x11 ∷ u8 }
+    }
+    q4k[[0, 0]] ← 0x00 ∷ u8
+    q4k[[0, 1]] ← 0x7c ∷ u8
+    q4k[[1, 0]] ← 0x00 ∷ u8
+    q4k[[1, 1]] ← 0xfc ∷ u8
+    q4k[[2, 0]] ← 0x00 ∷ u8
+    q4k[[2, 1]] ← 0x7e ∷ u8
+    q4k[[3, 2]] ← 0x00 ∷ u8
+    q4k[[3, 3]] ← 0x7c ∷ u8
+    q4k[[4, 2]] ← 0x00 ∷ u8
+    q4k[[4, 3]] ← 0xfc ∷ u8
+    q4k[[5, 2]] ← 0x01 ∷ u8
+    q4k[[5, 3]] ← 0x7c ∷ u8
+    lw.ggml_q4_k_matvec<size 65540, size 1, size 144, size 256>(q4k, x256_1, mut y6)
+    lw.ggml_q4_k_matmul<size 1, size 65540, size 1, size 144, size 256>(q4k, x256_m, mut ym6)
+    assert is_pos_inf(y6[[0]]) and is_pos_inf(ym6[[0, 0]])
+    assert is_neg_inf(y6[[1]]) and is_neg_inf(ym6[[0, 1]])
+    assert is_nan_f32(y6[[2]]) and is_nan_f32(ym6[[0, 2]])
+    assert is_neg_inf(y6[[3]]) and is_neg_inf(ym6[[0, 3]])
+    assert is_pos_inf(y6[[4]]) and is_pos_inf(ym6[[0, 4]])
+    assert is_nan_f32(y6[[5]]) and is_nan_f32(ym6[[0, 5]])
+
+    # Q5_K (6 rows: test both d and dmin Inf/NaN)
+    mut tensor<u8, [65540, 176]> q5k ← tu8[65540, 176] {}
+    for exclusive 6 let r {
+        q5k[[r, 0]] ← 0x00 ∷ u8
+        q5k[[r, 1]] ← 0x3c ∷ u8
+        q5k[[r, 2]] ← 0x00 ∷ u8
+        q5k[[r, 3]] ← 0x00 ∷ u8
+        for exclusive 12 let s { q5k[[r, 4 + s]] ← 0x11 ∷ u8 }
+        for exclusive 128 let q { q5k[[r, 48 + q]] ← 0x11 ∷ u8 }
+    }
+    q5k[[0, 0]] ← 0x00 ∷ u8
+    q5k[[0, 1]] ← 0x7c ∷ u8
+    q5k[[1, 0]] ← 0x00 ∷ u8
+    q5k[[1, 1]] ← 0xfc ∷ u8
+    q5k[[2, 0]] ← 0x00 ∷ u8
+    q5k[[2, 1]] ← 0x7e ∷ u8
+    q5k[[3, 2]] ← 0x00 ∷ u8
+    q5k[[3, 3]] ← 0x7c ∷ u8
+    q5k[[4, 2]] ← 0x00 ∷ u8
+    q5k[[4, 3]] ← 0xfc ∷ u8
+    q5k[[5, 2]] ← 0x01 ∷ u8
+    q5k[[5, 3]] ← 0x7c ∷ u8
+    lw.ggml_q5_k_matvec<size 65540, size 1, size 176, size 256>(q5k, x256_1, mut y6)
+    lw.ggml_q5_k_matmul<size 1, size 65540, size 1, size 176, size 256>(q5k, x256_m, mut ym6)
+    assert is_pos_inf(y6[[0]]) and is_pos_inf(ym6[[0, 0]])
+    assert is_neg_inf(y6[[1]]) and is_neg_inf(ym6[[0, 1]])
+    assert is_nan_f32(y6[[2]]) and is_nan_f32(ym6[[0, 2]])
+    assert is_neg_inf(y6[[3]]) and is_neg_inf(ym6[[0, 3]])
+    assert is_pos_inf(y6[[4]]) and is_pos_inf(ym6[[0, 4]])
+    assert is_nan_f32(y6[[5]]) and is_nan_f32(ym6[[0, 5]])
+
+    # Q6_K (4 rows)
+    mut tensor<u8, [65540, 210]> q6k ← tu8[65540, 210] {}
+    for exclusive 4 let r {
+        for exclusive 128 let q { q6k[[r, q]] ← 0x11 ∷ u8 }
+        for exclusive 64 let h { q6k[[r, 128 + h]] ← 0xff ∷ u8 }
+        for exclusive 16 let s { q6k[[r, 192 + s]] ← 1 ∷ u8 }
+    }
+    q6k[[0, 208]] ← 0x00 ∷ u8
+    q6k[[0, 209]] ← 0x7c ∷ u8
+    q6k[[1, 208]] ← 0x00 ∷ u8
+    q6k[[1, 209]] ← 0xfc ∷ u8
+    q6k[[2, 208]] ← 0x00 ∷ u8
+    q6k[[2, 209]] ← 0x7e ∷ u8
+    q6k[[3, 208]] ← 0x01 ∷ u8
+    q6k[[3, 209]] ← 0x7c ∷ u8
+    lw.ggml_q6_k_matvec<size 65540, size 1, size 210, size 256>(q6k, x256_1, mut y4)
+    lw.ggml_q6_k_matmul<size 1, size 65540, size 1, size 210, size 256>(q6k, x256_m, mut ym4)
+    assert is_pos_inf(y4[[0]]) and is_pos_inf(ym4[[0, 0]])
+    assert is_neg_inf(y4[[1]]) and is_neg_inf(ym4[[0, 1]])
+    assert is_nan_f32(y4[[2]]) and is_nan_f32(ym4[[0, 2]])
+    assert is_nan_f32(y4[[3]]) and is_nan_f32(ym4[[0, 3]])
+}
+
+test "LinearWeight dense and GGML device kernels handle rows above 65536 without aliasing" {
+    # Dense F32 / BF16 / F16 with Out=65540, In=4 -> row 65537 must not wrap onto row 1.
+    mut tensor<f32, [65540, 4]> dw_f32 ← tf32[65540, 4] {}
+    mut tensor<bf16, [65540, 4]> dw_bf16 ← tbf16[65540, 4] {}
+    mut tensor<f16, [65540, 4]> dw_f16 ← tf16[65540, 4] {}
+    for exclusive 4 let c {
+        dw_f32[[1, c]] ← 1.0 ∷ f32
+        dw_f32[[65537, c]] ← 3.0 ∷ f32
+        dw_bf16[[1, c]] ← (1.0 ∷ f32) ↦ bf16
+        dw_bf16[[65537, c]] ← (3.0 ∷ f32) ↦ bf16
+        dw_f16[[1, c]] ← (1.0 ∷ f32) ↦ f16
+        dw_f16[[65537, c]] ← (3.0 ∷ f32) ↦ f16
+    }
+
+    mut tensor<f32, [4]> dx_1 ← tf32[4] {}
+    mut tensor<f32, [2, 4]> dx_2 ← tf32[2, 4] {}
+    for exclusive 4 let c {
+        dx_1[[c]] ← 1.0 ∷ f32
+        dx_2[[0, c]] ← 1.0 ∷ f32
+        dx_2[[1, c]] ← 2.0 ∷ f32
+    }
+
+    mut tensor<f32, [65540]> dy_vec ← tf32[65540] {}
+    mut tensor<f32, [2, 65540]> dy_mat ← tf32[2, 65540] {}
+
+    lw.dense_f16_matvec<size 65540, size 4>(dw_f16, dx_1, mut dy_vec)
+    assert close(dy_vec[[0]], 0.0 ∷ f32)
+    assert close(dy_vec[[1]], 4.0 ∷ f32)
+    assert close(dy_vec[[65537]], 12.0 ∷ f32)
+
+    lw.dense_f32_matmul<size 2, size 65540, size 4>(dw_f32, dx_2, mut dy_mat)
+    assert close(dy_mat[[0, 1]], 4.0 ∷ f32)
+    assert close(dy_mat[[0, 65537]], 12.0 ∷ f32)
+    assert close(dy_mat[[1, 1]], 8.0 ∷ f32)
+    assert close(dy_mat[[1, 65537]], 24.0 ∷ f32)
+
+    lw.dense_bf16_matmul<size 2, size 65540, size 4>(dw_bf16, dx_2, mut dy_mat)
+    assert close(dy_mat[[0, 1]], 4.0 ∷ f32)
+    assert close(dy_mat[[0, 65537]], 12.0 ∷ f32)
+    assert close(dy_mat[[1, 65537]], 24.0 ∷ f32)
+
+    lw.dense_f16_matmul<size 2, size 65540, size 4>(dw_f16, dx_2, mut dy_mat)
+    assert close(dy_mat[[0, 1]], 4.0 ∷ f32)
+    assert close(dy_mat[[0, 65537]], 12.0 ∷ f32)
+    assert close(dy_mat[[1, 65537]], 24.0 ∷ f32)
+
+    # GGML 32-col kernels (Q8_0, Q4_1, Q5_0, IQ4_NL) with Out=65540
+    mut tensor<f32, [32]> x32_v ← tf32[32] {}
+    mut tensor<f32, [1, 32]> x32_m ← tf32[1, 32] {}
+    for exclusive 32 let c {
+        x32_v[[c]] ← 1.0 ∷ f32
+        x32_m[[0, c]] ← 1.0 ∷ f32
+    }
+    mut tensor<f32, [1, 65540]> gy_mat ← tf32[1, 65540] {}
+
+    mut tensor<u8, [65540, 34]> g_q8 ← tu8[65540, 34] {}
+    g_q8[[1, 0]] ← 0x00 ∷ u8
+    g_q8[[1, 1]] ← 0x3c ∷ u8
+    g_q8[[1, 2]] ← 1 ∷ u8
+    g_q8[[65537, 0]] ← 0x00 ∷ u8
+    g_q8[[65537, 1]] ← 0x40 ∷ u8
+    for exclusive 32 let k { g_q8[[65537, 2 + k]] ← 1 ∷ u8 }
+    lw.ggml_q8_0_matvec<size 65540, size 1, size 34, size 32>(g_q8, x32_v, mut dy_vec)
+    lw.ggml_q8_0_matmul<size 1, size 65540, size 1, size 34, size 32>(g_q8, x32_m, mut gy_mat)
+    assert close(dy_vec[[1]], 1.0 ∷ f32) and close(dy_vec[[65537]], 64.0 ∷ f32)
+    assert close(gy_mat[[0, 1]], 1.0 ∷ f32) and close(gy_mat[[0, 65537]], 64.0 ∷ f32)
+
+    mut tensor<u8, [65540, 20]> g_q41 ← tu8[65540, 20] {}
+    g_q41[[1, 0]] ← 0x00 ∷ u8
+    g_q41[[1, 1]] ← 0x3c ∷ u8
+    g_q41[[1, 4]] ← 0x01 ∷ u8
+    g_q41[[65537, 0]] ← 0x00 ∷ u8
+    g_q41[[65537, 1]] ← 0x40 ∷ u8
+    g_q41[[65537, 2]] ← 0x00 ∷ u8
+    g_q41[[65537, 3]] ← 0x3c ∷ u8
+    for exclusive 16 let k { g_q41[[65537, 4 + k]] ← 0x11 ∷ u8 }
+    lw.ggml_q4_1_matvec<size 65540, size 1, size 20, size 32>(g_q41, x32_v, mut dy_vec)
+    lw.ggml_q4_1_matmul<size 1, size 65540, size 1, size 20, size 32>(g_q41, x32_m, mut gy_mat)
+    assert close(dy_vec[[1]], 1.0 ∷ f32) and close(dy_vec[[65537]], 96.0 ∷ f32)
+    assert close(gy_mat[[0, 1]], 1.0 ∷ f32) and close(gy_mat[[0, 65537]], 96.0 ∷ f32)
+
+    mut tensor<u8, [65540, 22]> g_q50 ← tu8[65540, 22] {}
+    g_q50[[1, 0]] ← 0x00 ∷ u8
+    g_q50[[1, 1]] ← 0x3c ∷ u8
+    for exclusive 4 let h { g_q50[[1, 2 + h]] ← 0xff ∷ u8 }
+    g_q50[[1, 6]] ← 0x01 ∷ u8
+    g_q50[[65537, 0]] ← 0x00 ∷ u8
+    g_q50[[65537, 1]] ← 0x40 ∷ u8
+    for exclusive 4 let h { g_q50[[65537, 2 + h]] ← 0xff ∷ u8 }
+    for exclusive 16 let k { g_q50[[65537, 6 + k]] ← 0x11 ∷ u8 }
+    lw.ggml_q5_0_matvec<size 65540, size 1, size 22, size 32>(g_q50, x32_v, mut dy_vec)
+    lw.ggml_q5_0_matmul<size 1, size 65540, size 1, size 22, size 32>(g_q50, x32_m, mut gy_mat)
+    assert close(dy_vec[[1]], 1.0 ∷ f32) and close(dy_vec[[65537]], 64.0 ∷ f32)
+    assert close(gy_mat[[0, 1]], 1.0 ∷ f32) and close(gy_mat[[0, 65537]], 64.0 ∷ f32)
+
+    mut tensor<u8, [65540, 18]> g_iq4 ← tu8[65540, 18] {}
+    g_iq4[[1, 0]] ← 0x00 ∷ u8
+    g_iq4[[1, 1]] ← 0x3c ∷ u8
+    for exclusive 16 let k { g_iq4[[1, 2 + k]] ← 0x88 ∷ u8 }
+    g_iq4[[65537, 0]] ← 0x00 ∷ u8
+    g_iq4[[65537, 1]] ← 0x40 ∷ u8
+    for exclusive 16 let k { g_iq4[[65537, 2 + k]] ← 0x88 ∷ u8 }
+    lw.ggml_iq4_nl_matvec<size 65540, size 1, size 18, size 32>(g_iq4, x32_v, mut dy_vec)
+    lw.ggml_iq4_nl_matmul<size 1, size 65540, size 1, size 18, size 32>(g_iq4, x32_m, mut gy_mat)
+    assert close(dy_vec[[1]], 32.0 ∷ f32) and close(dy_vec[[65537]], 64.0 ∷ f32)
+    assert close(gy_mat[[0, 1]], 32.0 ∷ f32) and close(gy_mat[[0, 65537]], 64.0 ∷ f32)
+
+    # GGML 256-col K-quant kernels (Q4_K, Q5_K, Q6_K) with Out=65540
+    mut tensor<f32, [256]> x256_v ← tf32[256] {}
+    mut tensor<f32, [1, 256]> x256_m ← tf32[1, 256] {}
+    for exclusive 256 let c {
+        x256_v[[c]] ← 1.0 ∷ f32
+        x256_m[[0, c]] ← 1.0 ∷ f32
+    }
+
+    mut tensor<u8, [65540, 144]> g_q4k ← tu8[65540, 144] {}
+    g_q4k[[1, 0]] ← 0x00 ∷ u8
+    g_q4k[[1, 1]] ← 0x3c ∷ u8
+    g_q4k[[65537, 0]] ← 0x00 ∷ u8
+    g_q4k[[65537, 1]] ← 0x40 ∷ u8
+    for exclusive 12 let s {
+        g_q4k[[1, 4 + s]] ← 0x11 ∷ u8
+        g_q4k[[65537, 4 + s]] ← 0x11 ∷ u8
+    }
+    for exclusive 128 let q {
+        g_q4k[[1, 16 + q]] ← 0x11 ∷ u8
+        g_q4k[[65537, 16 + q]] ← 0x11 ∷ u8
+    }
+    lw.ggml_q4_k_matvec<size 65540, size 1, size 144, size 256>(g_q4k, x256_v, mut dy_vec)
+    lw.ggml_q4_k_matmul<size 1, size 65540, size 1, size 144, size 256>(g_q4k, x256_m, mut gy_mat)
+    assert dy_vec[[1]] ≻ (0.0 ∷ f32) and close(dy_vec[[65537]], dy_vec[[1]] * (2.0 ∷ f32))
+    assert gy_mat[[0, 1]] ≻ (0.0 ∷ f32) and close(gy_mat[[0, 65537]], gy_mat[[0, 1]] * (2.0 ∷ f32))
+
+    mut tensor<u8, [65540, 176]> g_q5k ← tu8[65540, 176] {}
+    g_q5k[[1, 0]] ← 0x00 ∷ u8
+    g_q5k[[1, 1]] ← 0x3c ∷ u8
+    g_q5k[[65537, 0]] ← 0x00 ∷ u8
+    g_q5k[[65537, 1]] ← 0x40 ∷ u8
+    for exclusive 12 let s {
+        g_q5k[[1, 4 + s]] ← 0x11 ∷ u8
+        g_q5k[[65537, 4 + s]] ← 0x11 ∷ u8
+    }
+    for exclusive 128 let q {
+        g_q5k[[1, 48 + q]] ← 0x11 ∷ u8
+        g_q5k[[65537, 48 + q]] ← 0x11 ∷ u8
+    }
+    lw.ggml_q5_k_matvec<size 65540, size 1, size 176, size 256>(g_q5k, x256_v, mut dy_vec)
+    lw.ggml_q5_k_matmul<size 1, size 65540, size 1, size 176, size 256>(g_q5k, x256_m, mut gy_mat)
+    assert dy_vec[[1]] ≻ (0.0 ∷ f32) and close(dy_vec[[65537]], dy_vec[[1]] * (2.0 ∷ f32))
+    assert gy_mat[[0, 1]] ≻ (0.0 ∷ f32) and close(gy_mat[[0, 65537]], gy_mat[[0, 1]] * (2.0 ∷ f32))
+
+    mut tensor<u8, [65540, 210]> g_q6k ← tu8[65540, 210] {}
+    g_q6k[[1, 208]] ← 0x00 ∷ u8
+    g_q6k[[1, 209]] ← 0x3c ∷ u8
+    g_q6k[[65537, 208]] ← 0x00 ∷ u8
+    g_q6k[[65537, 209]] ← 0x40 ∷ u8
+    for exclusive 128 let q {
+        g_q6k[[1, q]] ← 0x11 ∷ u8
+        g_q6k[[65537, q]] ← 0x11 ∷ u8
+    }
+    for exclusive 64 let h {
+        g_q6k[[1, 128 + h]] ← 0xff ∷ u8
+        g_q6k[[65537, 128 + h]] ← 0xff ∷ u8
+    }
+    for exclusive 16 let s {
+        g_q6k[[1, 192 + s]] ← 1 ∷ u8
+        g_q6k[[65537, 192 + s]] ← 1 ∷ u8
+    }
+    lw.ggml_q6_k_matvec<size 65540, size 1, size 210, size 256>(g_q6k, x256_v, mut dy_vec)
+    lw.ggml_q6_k_matmul<size 1, size 65540, size 1, size 210, size 256>(g_q6k, x256_m, mut gy_mat)
+    assert close(dy_vec[[1]], 4352.0 ∷ f32) and close(dy_vec[[65537]], 8704.0 ∷ f32)
+    assert close(gy_mat[[0, 1]], 4352.0 ∷ f32) and close(gy_mat[[0, 65537]], 8704.0 ∷ f32)
 }
