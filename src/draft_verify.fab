@@ -48,6 +48,8 @@ import from "gradus:context_lookup"
 
 import from "gradus:cache/session"
 
+import from "gradus:decode_token" let dt
+
 # -------------------------------------------------------------------------
 # VerifyError — typed vocabulary of the coordinator.
 # Every variant carries a text message (render via message).
@@ -423,6 +425,467 @@ fn draft_round(list<int> prompt_ids, list<int> history, int depth, config.Genera
     return context_lookup.propose(req)
 }
 
+# -------------------------------------------------------------------------
+# B=k batched speculative verify over record-typed decode_token target.
+# -------------------------------------------------------------------------
+
+# Record-typed target model for batched speculative verification.
+@ public
+class BatchTarget<size V, size D, size QD, size KVD, size F> {
+    let tensor<f32, [V, D]> embed
+    let list<dt.LayerWeights<D, QD, KVD, F>> layers
+    let list<dt.LayerParams> params
+    let tensor<f32, [D]> onorm
+    let tensor<f32, [V, D]> head
+    let f32 peps
+}
+
+fn argmax_batch_row<size V, size MaxBatch>(tensor<f32, [MaxBatch, V]> logits, int row) → int {
+    mut int best ← 0
+    mut f32 top ← logits[[row, 0]]
+
+    for range 1 ‥ V let i {
+        if logits[[row, i]] ≻ top {
+            top ← logits[[row, i]]
+            best ← i
+        }
+    }
+
+    return best
+}
+
+fn copy_hidden_rows<size MaxBatch, size D>(tensor<f32, [MaxBatch, D]> src, mut tensor<f32, [MaxBatch, D]> dst, int active_b) → void {
+    for exclusive active_b let b {
+        for exclusive D let j {
+            dst[[b, j]] ← src[[b, j]]
+        }
+    }
+}
+
+fn forward_batch_views<size V, size D, size QD, size KVD, size F, size H, size C, size W, size MaxBatch, size BH>(BatchTarget<V, D, QD, KVD, F> target, session.SessionState<size C, size W, size KVD> sess, mut dt.BatchWorkspace<MaxBatch, BH, D, QD, KVD, F, H, C> bws, tensor<i32, [MaxBatch]> ids, int tpos, int active_b, mut tensor<f32, [MaxBatch, V]> logits, mut list<tensor<f32, [C, KVD]>> out_k, mut list<tensor<f32, [C, KVD]>> out_v) → void {
+    mut tensor<f32, [MaxBatch, D]> h_in ← tf32[MaxBatch, D] {}
+    mut tensor<f32, [MaxBatch, D]> h_out ← tf32[MaxBatch, D] {}
+    mut tensor<f32, [MaxBatch, D]> hn ← tf32[MaxBatch, D] {}
+    let i32 ab ← active_b ↦ i32 ⊥ 1
+    let i32 tp ← tpos ↦ i32 ⊥ 0
+    dt.embed_batch(target.embed, ids, mut h_in, ab)
+
+    for exclusive target.layers.length() let l {
+        let tensor<f32, [C, KVD]> sv_k ← copy sess.full_kv.keys[l]
+        let tensor<f32, [C, KVD]> sv_v ← copy sess.full_kv.values[l]
+        mut dt.SlotView<C, KVD> sv ← dt.SlotView<C, KVD> { kin = sv_k, vin = sv_v, pos = tp }
+        dt.layer_batch(h_in, mut h_out, target.layers[l], mut sv, target.params[l], mut bws, ab, variant dt.AttentionRegime.Causal)
+        out_k.append(sv.kin)
+        out_v.append(sv.vin)
+        copy_hidden_rows<size MaxBatch, size D>(h_out, mut h_in, active_b)
+    }
+
+    dt.head_batch(h_in, target.onorm, target.head, mut hn, mut logits, target.peps, ab)
+}
+
+fn step_batch_plain<size V, size D, size QD, size KVD, size F, size H, size C, size W, size MaxBatch, size BH>(BatchTarget<V, D, QD, KVD, F> target, mut session.SessionState<size C, size W, size KVD> sess, mut dt.BatchWorkspace<MaxBatch, BH, D, QD, KVD, F, H, C> bws, int token, int pos) → int ⇥ VerifyError {
+    mut tensor<i32, [MaxBatch]> ids ← tensor<i32, [MaxBatch]> {}
+    ids[[0]] ← token ↦ i32 ⊥ 0
+    mut tensor<f32, [MaxBatch, V]> logits ← tf32[MaxBatch, V] {}
+    mut list<tensor<f32, [C, KVD]>> out_k ← empty
+    mut list<tensor<f32, [C, KVD]>> out_v ← empty
+    forward_batch_views<size V, size D, size QD, size KVD, size F, size H, size C, size W, size MaxBatch, size BH>(target, sess, mut bws, ids, pos, 1, mut logits, mut out_k, mut out_v)
+
+    for exclusive out_k.length() let l {
+        let int slot_id ← sess.full_kv.slot_ids[l]
+        mut tensor<f32, [KVD]> k_row ← tf32[KVD] {}
+        mut tensor<f32, [KVD]> v_row ← tf32[KVD] {}
+
+        for exclusive KVD let j {
+            k_row[[j]] ← out_k[l][[pos, j]]
+            v_row[[j]] ← out_v[l][[pos, j]]
+        }
+
+        session.write_kv(mut sess, slot_id, k_row, v_row, pos ↦ i32 ⊥ 0)
+    }
+
+    return argmax_batch_row<size V, size MaxBatch>(logits, 0)
+}
+
+fn prefill_batch<size V, size D, size QD, size KVD, size F, size H, size C, size W, size MaxBatch, size BH>(BatchTarget<V, D, QD, KVD, F> target, mut session.SessionState<size C, size W, size KVD> sess, mut dt.BatchWorkspace<MaxBatch, BH, D, QD, KVD, F, H, C> bws, list<int> prompt_ids) → int ⇥ VerifyError {
+    mut int pos ← 0
+    mut int next_token ← 0
+
+    while pos ≺ prompt_ids.length() {
+        mut int chunk ← prompt_ids.length() - pos
+        if chunk ≻ MaxBatch {
+            chunk ← MaxBatch
+        }
+
+        mut tensor<i32, [MaxBatch]> ids ← tensor<i32, [MaxBatch]> {}
+        for exclusive chunk let b {
+            ids[[b]] ← (prompt_ids[pos + b] coalesce 0) ↦ i32 ⊥ 0
+        }
+
+        mut tensor<f32, [MaxBatch, V]> logits ← tf32[MaxBatch, V] {}
+        mut list<tensor<f32, [C, KVD]>> out_k ← empty
+        mut list<tensor<f32, [C, KVD]>> out_v ← empty
+        forward_batch_views<size V, size D, size QD, size KVD, size F, size H, size C, size W, size MaxBatch, size BH>(target, sess, mut bws, ids, pos, chunk, mut logits, mut out_k, mut out_v)
+
+        for exclusive out_k.length() let l {
+            let int slot_id ← sess.full_kv.slot_ids[l]
+
+            for exclusive chunk let b {
+                mut tensor<f32, [KVD]> k_row ← tf32[KVD] {}
+                mut tensor<f32, [KVD]> v_row ← tf32[KVD] {}
+
+                for exclusive KVD let j {
+                    k_row[[j]] ← out_k[l][[pos + b, j]]
+                    v_row[[j]] ← out_v[l][[pos + b, j]]
+                }
+
+                session.write_kv(mut sess, slot_id, k_row, v_row, (pos + b) ↦ i32 ⊥ 0)
+            }
+        }
+
+        next_token ← argmax_batch_row<size V, size MaxBatch>(logits, chunk - 1)
+        pos ← pos + chunk
+    }
+
+    return next_token
+}
+
+# Run one B=k batched greedy speculative generation over a transactional
+# SessionState using decode_token.layer_batch(..., AttentionRegime.Causal).
+@ public
+fn verify_generate_batch<size V, size D, size QD, size KVD, size F, size H, size C, size W, size MaxBatch, size BH>(config.GenerationConfig g, list<int> prompt_ids, BatchTarget<V, D, QD, KVD, F> target, mut session.SessionState<size C, size W, size KVD> sess) → VerifyRun ⇥ VerifyError {
+    let string mode ← config.acceleration_mode_name(g.acceleration.mode)
+
+    if mode ≡ "disabled" {
+        throw variant InvalidConfig { message = "the verify route needs an enabled acceleration policy; the Disabled baseline is decoder.generate" }
+    }
+
+    if mode ≢ "context_lookup" {
+        throw variant ModeNotImplemented { message = "the § acceleration mode is not runnable on the verify route yet"(mode) }
+    }
+
+    let speculative.AdmissionResult ? ← speculative.admit_greedy(g.acceleration, g)
+
+    require g.repetition_penalty ≡ 1.0 ∷ f32 throw variant InvalidConfig { message = "batched verify requires repetition_penalty == 1.0" }
+    require prompt_ids.length() ≥ 1 throw variant InvalidConfig { message = "needs at least one prompt token" }
+    require prompt_ids.length() ≤ g.max_prompt throw variant InvalidConfig { message = "prompt length exceeds max_prompt" }
+    require prompt_ids.length() ≺ g.context throw variant InvalidConfig { message = "prompt length does not fit context" }
+    require g.context ≤ C throw variant InvalidConfig { message = "session capacity must cover the generation context" }
+    require target.layers.length() ≥ 1 throw variant InvalidConfig { message = "batch target needs at least one layer" }
+    require target.layers.length() ≡ target.params.length() throw variant InvalidConfig { message = "batch target layer/param count mismatch" }
+    require sess.full_kv.slot_ids.length() ≡ target.layers.length() throw variant InvalidConfig { message = "session FullKv slot count must match target layers" }
+    require MaxBatch ≥ 1 and MaxBatch ≤ dt.MAX_BATCH_ROWS throw variant InvalidConfig { message = "invalid MaxBatch capacity" }
+    require BH ≡ MaxBatch * H throw variant InvalidConfig { message = "BH must equal MaxBatch * H" }
+
+    let tensor<f32, [BH, C]> hcdom ← tf32[BH, C] {}
+    let tensor<f32, [MaxBatch, QD]> qdom ← tf32[MaxBatch, QD] {}
+    let tensor<f32, [MaxBatch, D]> ws_xn ← tf32[MaxBatch, D] {}
+    let tensor<f32, [MaxBatch, QD]> ws_q ← tf32[MaxBatch, QD] {}
+    let tensor<f32, [MaxBatch, QD]> ws_qr ← tf32[MaxBatch, QD] {}
+    let tensor<f32, [MaxBatch, KVD]> ws_k ← tf32[MaxBatch, KVD] {}
+    let tensor<f32, [MaxBatch, KVD]> ws_kr ← tf32[MaxBatch, KVD] {}
+    let tensor<f32, [MaxBatch, KVD]> ws_v ← tf32[MaxBatch, KVD] {}
+    let tensor<f32, [BH, C]> ws_sc ← tf32[BH, C] {}
+    let tensor<f32, [BH, C]> ws_pr ← tf32[BH, C] {}
+    let tensor<f32, [MaxBatch, QD]> ws_ctx ← tf32[MaxBatch, QD] {}
+    let tensor<f32, [MaxBatch, D]> ws_h1 ← tf32[MaxBatch, D] {}
+    let tensor<f32, [MaxBatch, F]> ws_gate ← tf32[MaxBatch, F] {}
+    let tensor<f32, [MaxBatch, F]> ws_up ← tf32[MaxBatch, F] {}
+    let tensor<f32, [MaxBatch, F]> ws_act ← tf32[MaxBatch, F] {}
+    mut tensor<f32, [1]> sink ← tf32[1] {}
+    mut dt.BatchWorkspace<MaxBatch, BH, D, QD, KVD, F, H, C> bws ← dt.BatchWorkspace<MaxBatch, BH, D, QD, KVD, F, H, C> { hcdom = hcdom, qdom = qdom, xn = ws_xn, q = ws_q, qr = ws_qr, k = ws_k, kr = ws_kr, v = ws_v, sc = ws_sc, pr = ws_pr, ctx = ws_ctx, h1 = ws_h1, gate = ws_gate, up = ws_up, act = ws_act }
+    dt.prime_batch_workspace(bws, mut sink)
+    mut speculative.DrafterContext ctx ← speculative.construct_pld_context(empty, speculative.budget_from_policy(g.acceleration))
+    mut VerifyStats stats ← default_stats()
+    mut list<int> tokens ← empty
+    mut list<int> history ← empty
+
+    mut int pending_token ← 0
+    mut int pre_pos ← 0
+    while pre_pos ≺ prompt_ids.length() {
+        mut int chunk ← prompt_ids.length() - pre_pos
+        if chunk ≻ MaxBatch {
+            chunk ← MaxBatch
+        }
+
+        mut tensor<i32, [MaxBatch]> pre_ids ← tensor<i32, [MaxBatch]> {}
+        for exclusive chunk let b {
+            pre_ids[[b]] ← (prompt_ids[pre_pos + b] coalesce 0) ↦ i32 ⊥ 0
+        }
+
+        mut tensor<f32, [MaxBatch, V]> pre_logits ← tf32[MaxBatch, V] {}
+        mut tensor<f32, [MaxBatch, D]> pre_hin ← tf32[MaxBatch, D] {}
+        mut tensor<f32, [MaxBatch, D]> pre_hout ← tf32[MaxBatch, D] {}
+        mut tensor<f32, [MaxBatch, D]> pre_hn ← tf32[MaxBatch, D] {}
+        let i32 pre_ab ← chunk ↦ i32 ⊥ 1
+        let i32 pre_tp ← pre_pos ↦ i32 ⊥ 0
+        dt.embed_batch(target.embed, pre_ids, mut pre_hin, pre_ab)
+        mut list<tensor<f32, [C, KVD]>> pre_k ← empty
+        mut list<tensor<f32, [C, KVD]>> pre_v ← empty
+
+        for exclusive target.layers.length() let l {
+            let tensor<f32, [C, KVD]> sv_k ← copy sess.full_kv.keys[l]
+            let tensor<f32, [C, KVD]> sv_v ← copy sess.full_kv.values[l]
+            mut dt.SlotView<C, KVD> sv ← dt.SlotView<C, KVD> { kin = sv_k, vin = sv_v, pos = pre_tp }
+            dt.layer_batch(pre_hin, mut pre_hout, target.layers[l], mut sv, target.params[l], mut bws, pre_ab, variant dt.AttentionRegime.Causal)
+            pre_k.append(sv.kin)
+            pre_v.append(sv.vin)
+            copy_hidden_rows<size MaxBatch, size D>(pre_hout, mut pre_hin, chunk)
+        }
+
+        dt.head_batch(pre_hin, target.onorm, target.head, mut pre_hn, mut pre_logits, target.peps, pre_ab)
+
+        for exclusive pre_k.length() let l {
+            let int slot_id ← sess.full_kv.slot_ids[l]
+
+            for exclusive chunk let b {
+                mut tensor<f32, [KVD]> k_row ← tf32[KVD] {}
+                mut tensor<f32, [KVD]> v_row ← tf32[KVD] {}
+
+                for exclusive KVD let j {
+                    k_row[[j]] ← pre_k[l][[pre_pos + b, j]]
+                    v_row[[j]] ← pre_v[l][[pre_pos + b, j]]
+                }
+
+                session.write_kv(mut sess, slot_id, k_row, v_row, (pre_pos + b) ↦ i32 ⊥ 0)
+            }
+        }
+
+        pending_token ← argmax_batch_row<size V, size MaxBatch>(pre_logits, chunk - 1)
+        pre_pos ← pre_pos + chunk
+    }
+    mut int position ← prompt_ids.length()
+    mut int emitted ← 0
+    mut bool finished ← false
+
+    while emitted ≺ g.max_tokens and prompt_ids.length() + emitted ≺ g.context and not finished {
+        let int depth ← speculative.next_depth(ctx.adaptive_budget)
+        let speculative.ProviderResult result ← draft_round(prompt_ids, ctx.token_history, depth, g)
+
+        if speculative.is_no_draft(result) {
+            let int token ← pending_token
+            tokens.append(token)
+            history.append(token)
+            emitted ← emitted + 1
+            stats.plain_steps ← stats.plain_steps + 1
+
+            if decoder.is_eog(g, token) {
+                finished ← true
+            }
+            elif emitted ≺ g.max_tokens and position + 1 ≺ g.context {
+                mut tensor<i32, [MaxBatch]> s_ids ← tensor<i32, [MaxBatch]> {}
+                s_ids[[0]] ← token ↦ i32 ⊥ 0
+                mut tensor<f32, [MaxBatch, V]> s_logits ← tf32[MaxBatch, V] {}
+                mut tensor<f32, [MaxBatch, D]> s_hin ← tf32[MaxBatch, D] {}
+                mut tensor<f32, [MaxBatch, D]> s_hout ← tf32[MaxBatch, D] {}
+                mut tensor<f32, [MaxBatch, D]> s_hn ← tf32[MaxBatch, D] {}
+                let i32 s_tp ← position ↦ i32 ⊥ 0
+                dt.embed_batch(target.embed, s_ids, mut s_hin, 1)
+                mut list<tensor<f32, [C, KVD]>> s_k ← empty
+                mut list<tensor<f32, [C, KVD]>> s_v ← empty
+
+                for exclusive target.layers.length() let l {
+                    let tensor<f32, [C, KVD]> sv_k ← copy sess.full_kv.keys[l]
+                    let tensor<f32, [C, KVD]> sv_v ← copy sess.full_kv.values[l]
+                    mut dt.SlotView<C, KVD> sv ← dt.SlotView<C, KVD> { kin = sv_k, vin = sv_v, pos = s_tp }
+                    dt.layer_batch(s_hin, mut s_hout, target.layers[l], mut sv, target.params[l], mut bws, 1, variant dt.AttentionRegime.Causal)
+                    s_k.append(sv.kin)
+                    s_v.append(sv.vin)
+                    copy_hidden_rows<size MaxBatch, size D>(s_hout, mut s_hin, 1)
+                }
+
+                dt.head_batch(s_hin, target.onorm, target.head, mut s_hn, mut s_logits, target.peps, 1)
+
+                for exclusive s_k.length() let l {
+                    let int slot_id ← sess.full_kv.slot_ids[l]
+                    mut tensor<f32, [KVD]> k_row ← tf32[KVD] {}
+                    mut tensor<f32, [KVD]> v_row ← tf32[KVD] {}
+
+                    for exclusive KVD let j {
+                        k_row[[j]] ← s_k[l][[position, j]]
+                        v_row[[j]] ← s_v[l][[position, j]]
+                    }
+
+                    session.write_kv(mut sess, slot_id, k_row, v_row, position ↦ i32 ⊥ 0)
+                }
+
+                pending_token ← argmax_batch_row<size V, size MaxBatch>(s_logits, 0)
+                position ← position + 1
+            }
+            else {
+                finished ← true
+            }
+        }
+        else {
+            let list<int> candidates ← speculative.candidate_ids(result)
+            let int room ← g.max_tokens - emitted
+            let int frontier_base ← position
+
+            mut int verify_k ← candidates.length()
+            if verify_k ≻ MaxBatch {
+                verify_k ← MaxBatch
+            }
+            if verify_k ≻ g.context - frontier_base {
+                verify_k ← g.context - frontier_base
+            }
+
+            mut tensor<i32, [MaxBatch]> cand_ids ← tensor<i32, [MaxBatch]> {}
+            for exclusive verify_k let b {
+                cand_ids[[b]] ← (candidates[b] coalesce 0) ↦ i32 ⊥ 0
+            }
+
+            mut session.SessionTxn<size C, size W, size KVD> txn ← session.branch(mut sess)
+            mut tensor<f32, [MaxBatch, V]> logits ← tf32[MaxBatch, V] {}
+            mut tensor<f32, [MaxBatch, D]> v_hin ← tf32[MaxBatch, D] {}
+            mut tensor<f32, [MaxBatch, D]> v_hout ← tf32[MaxBatch, D] {}
+            mut tensor<f32, [MaxBatch, D]> v_hn ← tf32[MaxBatch, D] {}
+            let i32 v_ab ← verify_k ↦ i32 ⊥ 1
+            let i32 v_tp ← frontier_base ↦ i32 ⊥ 0
+            dt.embed_batch(target.embed, cand_ids, mut v_hin, v_ab)
+            mut list<tensor<f32, [C, KVD]>> out_k ← empty
+            mut list<tensor<f32, [C, KVD]>> out_v ← empty
+
+            for exclusive target.layers.length() let l {
+                let tensor<f32, [C, KVD]> sv_k ← copy sess.full_kv.keys[l]
+                let tensor<f32, [C, KVD]> sv_v ← copy sess.full_kv.values[l]
+                mut dt.SlotView<C, KVD> sv ← dt.SlotView<C, KVD> { kin = sv_k, vin = sv_v, pos = v_tp }
+                dt.layer_batch(v_hin, mut v_hout, target.layers[l], mut sv, target.params[l], mut bws, v_ab, variant dt.AttentionRegime.Causal)
+                out_k.append(sv.kin)
+                out_v.append(sv.vin)
+                copy_hidden_rows<size MaxBatch, size D>(v_hout, mut v_hin, verify_k)
+            }
+
+            dt.head_batch(v_hin, target.onorm, target.head, mut v_hn, mut logits, target.peps, v_ab)
+
+            for exclusive out_k.length() let l {
+                let int slot_id ← sess.full_kv.slot_ids[l]
+
+                for exclusive verify_k let b {
+                    mut tensor<f32, [KVD]> k_row ← tf32[KVD] {}
+                    mut tensor<f32, [KVD]> v_row ← tf32[KVD] {}
+
+                    for exclusive KVD let j {
+                        k_row[[j]] ← out_k[l][[frontier_base + b, j]]
+                        v_row[[j]] ← out_v[l][[frontier_base + b, j]]
+                    }
+
+                    session.txn_write_kv(mut sess, mut txn, slot_id, k_row, v_row, (frontier_base + b) ↦ i32 ⊥ 0)
+                }
+            }
+
+            mut list<int> target_ids ← empty
+            target_ids.append(pending_token)
+            for range 0 ‥ (verify_k - 1) let b {
+                target_ids.append(argmax_batch_row<size V, size MaxBatch>(logits, b))
+            }
+
+            let speculative.GreedyAcceptance acc ← speculative.first_divergence(target_ids, candidates)
+            mut int accepted_count ← acc.accepted_prefix
+
+            if accepted_count ≻ room - 1 {
+                accepted_count ← room - 1
+            }
+            if accepted_count ≻ g.context - 1 - frontier_base {
+                accepted_count ← g.context - 1 - frontier_base
+            }
+
+            mut list<int> accepted_ids ← empty
+            for exclusive accepted_count let i {
+                accepted_ids.append(candidates[i] coalesce 0)
+            }
+
+            let int extra_token ← accepted_count ≺ verify_k ✓ (target_ids[accepted_count] coalesce 0) ✗ argmax_batch_row<size V, size MaxBatch>(logits, verify_k - 1)
+
+            mut list<int> block ← empty
+            for from accepted_ids let t {
+                block.append(t)
+            }
+            block.append(extra_token)
+
+            mut int eogi ← 0 - 1
+            for exclusive accepted_ids.length() let i {
+                if eogi ≡ (0 - 1) and decoder.is_eog(g, accepted_ids[i] coalesce 0) {
+                    eogi ← i
+                }
+            }
+
+            mut list<int> kept ← empty
+            for from block let t {
+                if not finished {
+                    kept.append(t)
+                    tokens.append(t)
+                    history.append(t)
+                    emitted ← emitted + 1
+
+                    if decoder.is_eog(g, t) {
+                        finished ← true
+                    }
+                }
+            }
+
+            let int commit_count ← eogi ≥ 0 ✓ eogi ✗ accepted_ids.length()
+            if commit_count ≻ 0 {
+                session.commit_prefix(mut sess, mut txn, commit_count)
+            }
+            else {
+                session.rollback(mut sess, mut txn)
+            }
+
+            position ← frontier_base + commit_count
+            stats.verify_rounds ← stats.verify_rounds + 1
+            stats.drafted_total ← stats.drafted_total + candidates.length()
+            stats.accepted_total ← stats.accepted_total + accepted_ids.length()
+
+            let speculative.AdaptiveBudget advanced ← speculative.observe_block(ctx.adaptive_budget, candidates.length(), accepted_ids.length())
+            ctx ← speculative.construct_pld_context(history, advanced)
+
+            if not finished and emitted ≺ g.max_tokens and position + 1 ≺ g.context {
+                let int tail ← kept.get(kept.length() - 1) coalesce 0
+                mut tensor<i32, [MaxBatch]> t_ids ← tensor<i32, [MaxBatch]> {}
+                t_ids[[0]] ← tail ↦ i32 ⊥ 0
+                mut tensor<f32, [MaxBatch, V]> t_logits ← tf32[MaxBatch, V] {}
+                mut tensor<f32, [MaxBatch, D]> t_hin ← tf32[MaxBatch, D] {}
+                mut tensor<f32, [MaxBatch, D]> t_hout ← tf32[MaxBatch, D] {}
+                mut tensor<f32, [MaxBatch, D]> t_hn ← tf32[MaxBatch, D] {}
+                let i32 t_tp ← position ↦ i32 ⊥ 0
+                dt.embed_batch(target.embed, t_ids, mut t_hin, 1)
+                mut list<tensor<f32, [C, KVD]>> t_k ← empty
+                mut list<tensor<f32, [C, KVD]>> t_v ← empty
+
+                for exclusive target.layers.length() let l {
+                    let tensor<f32, [C, KVD]> sv_k ← copy sess.full_kv.keys[l]
+                    let tensor<f32, [C, KVD]> sv_v ← copy sess.full_kv.values[l]
+                    mut dt.SlotView<C, KVD> sv ← dt.SlotView<C, KVD> { kin = sv_k, vin = sv_v, pos = t_tp }
+                    dt.layer_batch(t_hin, mut t_hout, target.layers[l], mut sv, target.params[l], mut bws, 1, variant dt.AttentionRegime.Causal)
+                    t_k.append(sv.kin)
+                    t_v.append(sv.vin)
+                    copy_hidden_rows<size MaxBatch, size D>(t_hout, mut t_hin, 1)
+                }
+
+                dt.head_batch(t_hin, target.onorm, target.head, mut t_hn, mut t_logits, target.peps, 1)
+
+                for exclusive t_k.length() let l {
+                    let int slot_id ← sess.full_kv.slot_ids[l]
+                    mut tensor<f32, [KVD]> k_row ← tf32[KVD] {}
+                    mut tensor<f32, [KVD]> v_row ← tf32[KVD] {}
+
+                    for exclusive KVD let j {
+                        k_row[[j]] ← t_k[l][[position, j]]
+                        v_row[[j]] ← t_v[l][[position, j]]
+                    }
+
+                    session.write_kv(mut sess, slot_id, k_row, v_row, position ↦ i32 ⊥ 0)
+                }
+
+                pending_token ← argmax_batch_row<size V, size MaxBatch>(t_logits, 0)
+                position ← position + 1
+            }
+        }
+    }
+
+    return VerifyRun { tokens = tokens, stats = stats }
+}
+
 +++ faber test
 # Co-located package test for draft_verify.fab (SD6-U3 coordinator).
 #
@@ -451,6 +914,7 @@ import from "gradus:decode" decode
 import from "gradus:tensor" tensor
 import from "gradus:model/schedule" schedule
 import from "gradus:cache/session" session
+import from "gradus:decode_token" let dt
 
 # ---- fixtures
 
@@ -734,5 +1198,308 @@ describe "SD6-U3 — draft-and-verify coordinator" {
         let config.AccelerationPolicy policy ← config.construct_acceleration("1.1.0", config.acceleration_context_lookup(), 1, 8, 1, 8) ⊥ config.default_acceleration()
         let config.GenerationConfig sampled ← config.construct_generation_with_policy(16, 8, 4, 7, 0.8 ∷ f32, 0, 1.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32, empty, policy) ⊥ config.default()
         assert run_detail(sampled, [1, 2]) ≡ "sampled acceleration is not supported"
+    }
+}
+
+# ---- B=k batched verify fixtures and parity proofs (issue #96)
+
+fn make_batch_lw(bool use_bias, f32 scale) → dt.LayerWeights<4, 4, 4, 6> {
+    mut tensor<f32, [4]> an ← tf32[4] {}
+    mut tensor<f32, [4]> fn2 ← tf32[4] {}
+    for exclusive 4 let j {
+        an[[j]] ← 1.0
+        fn2[[j]] ← 1.0
+    }
+    mut tensor<f32, [4, 4]> wq ← tf32[4, 4] {}
+    mut tensor<f32, [4, 4]> wk ← tf32[4, 4] {}
+    mut tensor<f32, [4, 4]> wv ← tf32[4, 4] {}
+    mut tensor<f32, [4, 4]> wo ← tf32[4, 4] {}
+    mut tensor<f32, [6, 4]> wg ← tf32[6, 4] {}
+    mut tensor<f32, [6, 4]> wu ← tf32[6, 4] {}
+    mut tensor<f32, [4, 6]> wd ← tf32[4, 6] {}
+    for exclusive 4 let r {
+        for exclusive 4 let c {
+            let f32 v ← ((r + c + 1) ↦ f32) * scale
+            wq[[r, c]] ← v
+            wk[[r, c]] ← v
+            wv[[r, c]] ← v
+            wo[[r, c]] ← (r ≡ c ✓ scale ✗ 0.0)
+        }
+    }
+    for exclusive 6 let r {
+        for exclusive 4 let c {
+            wg[[r, c]] ← scale
+            wu[[r, c]] ← scale
+            wd[[c, r]] ← scale * 0.5
+        }
+    }
+    mut tensor<f32, [4]> bq ← tf32[4] {}
+    mut tensor<f32, [4]> bk ← tf32[4] {}
+    mut tensor<f32, [4]> bv ← tf32[4] {}
+    if use_bias {
+        for exclusive 4 let j {
+            bq[[j]] ← scale
+            bk[[j]] ← scale
+            bv[[j]] ← scale
+        }
+    }
+    return dt.LayerWeights<4, 4, 4, 6> { anorm = an, wq = wq, wk = wk, wv = wv, wo = wo, fnorm = fn2, wg = wg, wu = wu, wd = wd, qkv_bias = use_bias, bq = bq, bk = bk, bv = bv }
+}
+
+fn make_cycle_target() → draft_verify.BatchTarget<4, 4, 4, 4, 6> {
+    mut tensor<f32, [4, 4]> embed ← tf32[4, 4] {}
+    mut tensor<f32, [4, 4]> head ← tf32[4, 4] {}
+    mut tensor<f32, [4]> onorm ← tf32[4] {}
+    for exclusive 4 let i {
+        embed[[i, i]] ← 1.0
+        onorm[[i]] ← 1.0
+    }
+    # Cyclic next-token head: 0 -> 1, 1 -> 2, 2 -> 0, 3 -> 3.
+    head[[1, 0]] ← 1.0
+    head[[2, 1]] ← 1.0
+    head[[0, 2]] ← 1.0
+    head[[3, 3]] ← 1.0
+
+    let dt.LayerParams lp ← dt.LayerParams { pdh = 2, pspan = 1, pgroup = 1, prope = variant dt.RopeKind.Pairs, peps = 0.00001, plntheta = 11.512925, pscale = 0.70710677 }
+    let list<dt.LayerWeights<4, 4, 4, 6>> layers ← [make_batch_lw(true, 0.02), make_batch_lw(false, 0.02)]
+    let list<dt.LayerParams> params ← [lp, lp]
+    return draft_verify.BatchTarget<4, 4, 4, 4, 6> { embed = embed, layers = layers, params = params, onorm = onorm, head = head, peps = 0.00001 }
+}
+
+fn fresh_wide_ws() → dt.Workspace<4, 4, 4, 6, 2, 16, 2> {
+    let tensor<f32, [2, 16]> hcdom ← tf32[2, 16] {}
+    let tensor<f32, [2, 4]> cpdom ← tf32[2, 4] {}
+    let tensor<f32, [4]> qdom ← tf32[4] {}
+    let tensor<f32, [4]> xn ← tf32[4] {}
+    let tensor<f32, [4]> q ← tf32[4] {}
+    let tensor<f32, [4]> qr ← tf32[4] {}
+    let tensor<f32, [4]> k ← tf32[4] {}
+    let tensor<f32, [4]> kr ← tf32[4] {}
+    let tensor<f32, [4]> v ← tf32[4] {}
+    let tensor<f32, [2, 16]> sc ← tf32[2, 16] {}
+    let tensor<f32, [2, 16]> pr ← tf32[2, 16] {}
+    let tensor<f32, [2, 4]> cp ← tf32[2, 4] {}
+    let tensor<f32, [4]> ctx ← tf32[4] {}
+    let tensor<f32, [4]> h1 ← tf32[4] {}
+    let tensor<f32, [6]> gate ← tf32[6] {}
+    let tensor<f32, [6]> up ← tf32[6] {}
+    let tensor<f32, [6]> act ← tf32[6] {}
+    mut tensor<f32, [1]> sink ← tf32[1] {}
+    let dt.Workspace<4, 4, 4, 6, 2, 16, 2> ws ← dt.Workspace<4, 4, 4, 6, 2, 16, 2> { hcdom = hcdom, cpdom = cpdom, qdom = qdom, xn = xn, q = q, qr = qr, k = k, kr = kr, v = v, sc = sc, pr = pr, cp = cp, ctx = ctx, h1 = h1, gate = gate, up = up, act = act }
+    dt.prime_workspace(ws, mut sink)
+    return ws
+}
+
+fn wide_step(draft_verify.BatchTarget<4, 4, 4, 4, 6> target, mut session.SessionState<16, 1, 4> sess, mut dt.Workspace<4, 4, 4, 6, 2, 16, 2> ws, int token, int pos) → int {
+    mut tensor<i32, [1]> id1 ← tensor<i32, [1]> {}
+    id1[[0]] ← token ↦ i32 ⊥ 0
+    mut tensor<f32, [4]> h_in ← tf32[4] {}
+    mut tensor<f32, [4]> h_out ← tf32[4] {}
+    mut tensor<f32, [4]> hn ← tf32[4] {}
+    mut tensor<f32, [4]> logits ← tf32[4] {}
+    dt.embed_wide(target.embed, id1, mut h_in)
+
+    do {
+        for exclusive target.layers.length() let l {
+            let int slot_id ← sess.full_kv.slot_ids[l]
+            let tensor<f32, [16, 4]> sv_k ← copy sess.full_kv.keys[l]
+            let tensor<f32, [16, 4]> sv_v ← copy sess.full_kv.values[l]
+            mut dt.SlotView<16, 4> sv ← dt.SlotView<16, 4> { kin = sv_k, vin = sv_v, pos = pos ↦ i32 ⊥ 0 }
+            dt.layer_wide(h_in, mut h_out, target.layers[l], mut sv, target.params[l], mut ws)
+
+            mut tensor<f32, [4]> k_row ← tf32[4] {}
+            mut tensor<f32, [4]> v_row ← tf32[4] {}
+            for exclusive 4 let j {
+                k_row[[j]] ← sv.kin[[pos, j]]
+                v_row[[j]] ← sv.vin[[pos, j]]
+            }
+            session.write_kv(mut sess, slot_id, k_row, v_row, pos ↦ i32 ⊥ 0)
+
+            for exclusive 4 let j {
+                h_in[[j]] ← h_out[[j]]
+            }
+        }
+    }
+    catch err {
+        assert false
+    }
+
+    dt.head_wide(h_in, target.onorm, target.head, mut hn, mut logits, target.peps)
+    return dt.argmax_host(logits)
+}
+
+fn baseline_wide_generate(config.GenerationConfig g, list<int> prompt_ids, draft_verify.BatchTarget<4, 4, 4, 4, 6> target, mut session.SessionState<16, 1, 4> sess) → list<int> {
+    mut dt.Workspace<4, 4, 4, 6, 2, 16, 2> ws ← fresh_wide_ws()
+    mut int next_token ← 0
+    for exclusive prompt_ids.length() let i {
+        next_token ← wide_step(target, mut sess, mut ws, prompt_ids[i] coalesce 0, i)
+    }
+
+    mut list<int> tokens ← empty
+    mut int position ← prompt_ids.length()
+    mut int emitted ← 0
+    mut bool finished ← false
+
+    while emitted ≺ g.max_tokens and prompt_ids.length() + emitted ≺ g.context and not finished {
+        tokens.append(next_token)
+        emitted ← emitted + 1
+        if decoder.is_eog(g, next_token) {
+            finished ← true
+        }
+        elif emitted ≺ g.max_tokens and position + 1 ≺ g.context {
+            next_token ← wide_step(target, mut sess, mut ws, next_token, position)
+            position ← position + 1
+        }
+        else {
+            finished ← true
+        }
+    }
+    return tokens
+}
+
+fn batch_cfg(int ctx, int max_tokens, list<int> eog_ids) → config.GenerationConfig {
+    let config.AccelerationPolicy policy ← config.construct_acceleration("1.1.0", config.acceleration_context_lookup(), 1, 4, 1, 4) ⊥ config.default_acceleration()
+    return config.construct_generation_with_policy(ctx, ctx, max_tokens, 7, 0.0 ∷ f32, 0, 1.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32, eog_ids, policy) ⊥ config.default()
+}
+
+fn close_tol_kv(f32 got, f32 ref) → bool {
+    let f32 diff ← (got - ref).abs()
+    let f32 lim ← 0.00001 + 0.0001 * ref.abs()
+    return diff ≤ lim
+}
+
+fn sessions_close(session.SessionState<16, 1, 4> a, session.SessionState<16, 1, 4> b) → bool {
+    if a.full_kv.slot_ids.length() ≢ b.full_kv.slot_ids.length() then return false
+
+    for exclusive a.full_kv.lengths.length() let i {
+        if a.full_kv.lengths[i] ≢ b.full_kv.lengths[i] then return false
+
+        let int len ← a.full_kv.lengths[i]
+        for exclusive len let r {
+            for exclusive 4 let j {
+                if not close_tol_kv(a.full_kv.keys[i][[r, j]], b.full_kv.keys[i][[r, j]]) then return false
+                if not close_tol_kv(a.full_kv.values[i][[r, j]], b.full_kv.values[i][[r, j]]) then return false
+            }
+        }
+    }
+
+    return true
+}
+
+describe "issue #96 — B=k parallel speculative verify over SessionTxn" {
+    test "full acceptance (+ bonus token) matches B=1 baseline and FullKv parity" {
+        let _ trap_res ← trap {
+            let draft_verify.BatchTarget<4, 4, 4, 4, 6> target ← make_cycle_target()
+            let list<int> prompt ← [3, 3, 3, 3]
+            let config.GenerationConfig g ← batch_cfg(16, 6, empty)
+
+            mut session.SessionState<16, 1, 4> base_sess ← sess_p()
+            let list<int> base_tokens ← baseline_wide_generate(g, prompt, target, mut base_sess)
+
+            mut session.SessionState<16, 1, 4> batch_sess ← sess_p()
+            let draft_verify.VerifyRun run ← draft_verify.verify_generate_batch<size 4, size 4, size 4, size 4, size 6, size 2, size 16, size 1, size 4, size 8>(g, prompt, target, mut batch_sess)
+
+            assert run.tokens ≡ base_tokens
+            assert run.stats.verify_rounds ≻ 0
+            assert run.stats.accepted_total ≻ 0
+            assert batch_sess.txn_depth ≡ 0
+            assert sessions_close(batch_sess, base_sess)
+        }
+        match trap_res {
+            case returned let ? { }
+            case thrown let ? { assert false }
+        }
+    }
+    test "partial acceptance (+ corrective token) matches B=1 baseline and FullKv parity" {
+        let _ trap_res ← trap {
+            let draft_verify.BatchTarget<4, 4, 4, 4, 6> target ← make_cycle_target()
+            let list<int> prompt ← [0, 1, 2, 0, 1, 0, 0, 1]
+            let config.GenerationConfig g ← batch_cfg(16, 6, empty)
+
+            mut session.SessionState<16, 1, 4> base_sess ← sess_p()
+            let list<int> base_tokens ← baseline_wide_generate(g, prompt, target, mut base_sess)
+
+            mut session.SessionState<16, 1, 4> batch_sess ← sess_p()
+            let draft_verify.VerifyRun run ← draft_verify.verify_generate_batch<size 4, size 4, size 4, size 4, size 6, size 2, size 16, size 1, size 4, size 8>(g, prompt, target, mut batch_sess)
+
+            assert run.tokens ≡ base_tokens
+            assert run.stats.accepted_total ≻ 0
+            assert run.stats.accepted_total ≺ run.stats.drafted_total
+            assert batch_sess.txn_depth ≡ 0
+            assert sessions_close(batch_sess, base_sess)
+        }
+        match trap_res {
+            case returned let ? { }
+            case thrown let ? { assert false }
+        }
+    }
+    test "zero acceptance (rollback) matches B=1 baseline and FullKv parity" {
+        let _ trap_res ← trap {
+            let draft_verify.BatchTarget<4, 4, 4, 4, 6> target ← make_cycle_target()
+            let list<int> prompt ← [0, 2, 2, 0, 2]
+            let config.GenerationConfig g ← batch_cfg(16, 4, empty)
+
+            mut session.SessionState<16, 1, 4> base_sess ← sess_p()
+            let list<int> base_tokens ← baseline_wide_generate(g, prompt, target, mut base_sess)
+
+            mut session.SessionState<16, 1, 4> batch_sess ← sess_p()
+            let draft_verify.VerifyRun run ← draft_verify.verify_generate_batch<size 4, size 4, size 4, size 4, size 6, size 2, size 16, size 1, size 4, size 8>(g, prompt, target, mut batch_sess)
+
+            assert run.tokens ≡ base_tokens
+            assert run.stats.verify_rounds ≻ 0
+            assert run.stats.accepted_total ≡ 0
+            assert batch_sess.txn_depth ≡ 0
+            assert sessions_close(batch_sess, base_sess)
+        }
+        match trap_res {
+            case returned let ? { }
+            case thrown let ? { assert false }
+        }
+    }
+    test "EOG inside accepted prefix truncates commit and writes no EOG row" {
+        let _ trap_res ← trap {
+            let draft_verify.BatchTarget<4, 4, 4, 4, 6> target ← make_cycle_target()
+            let list<int> prompt ← [0, 1, 2, 0, 1, 2, 0, 1]
+            let config.GenerationConfig g ← batch_cfg(16, 6, [1])
+
+            mut session.SessionState<16, 1, 4> base_sess ← sess_p()
+            let list<int> base_tokens ← baseline_wide_generate(g, prompt, target, mut base_sess)
+
+            mut session.SessionState<16, 1, 4> batch_sess ← sess_p()
+            let draft_verify.VerifyRun run ← draft_verify.verify_generate_batch<size 4, size 4, size 4, size 4, size 6, size 2, size 16, size 1, size 4, size 8>(g, prompt, target, mut batch_sess)
+
+            assert run.tokens ≡ base_tokens
+            assert batch_sess.txn_depth ≡ 0
+            assert sessions_close(batch_sess, base_sess)
+            # Final EOG token is emitted but never consumed into KV.
+            assert batch_sess.full_kv.lengths[0] ≡ prompt.length() + run.tokens.length() - 1
+        }
+        match trap_res {
+            case returned let ? { }
+            case thrown let ? { assert false }
+        }
+    }
+    test "context-boundary run matches B=1 baseline and FullKv parity" {
+        let _ trap_res ← trap {
+            let draft_verify.BatchTarget<4, 4, 4, 4, 6> target ← make_cycle_target()
+            let list<int> prompt ← [3, 3, 3, 3, 3, 3]
+            let config.GenerationConfig g ← batch_cfg(10, 10, empty)
+
+            mut session.SessionState<16, 1, 4> base_sess ← sess_p()
+            let list<int> base_tokens ← baseline_wide_generate(g, prompt, target, mut base_sess)
+
+            mut session.SessionState<16, 1, 4> batch_sess ← sess_p()
+            let draft_verify.VerifyRun run ← draft_verify.verify_generate_batch<size 4, size 4, size 4, size 4, size 6, size 2, size 16, size 1, size 4, size 8>(g, prompt, target, mut batch_sess)
+
+            assert run.tokens ≡ base_tokens
+            assert run.tokens.length() ≡ 4
+            assert batch_sess.txn_depth ≡ 0
+            assert sessions_close(batch_sess, base_sess)
+            assert batch_sess.full_kv.lengths[0] ≡ 9
+        }
+        match trap_res {
+            case returned let ? { }
+            case thrown let ? { assert false }
+        }
     }
 }
