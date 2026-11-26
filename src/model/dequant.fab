@@ -155,10 +155,6 @@ union DequantError {
 # already validated the enclosing payload).
 # -------------------------------------------------------------------------
 
-fn byte_at(list<u8> b, int off) → int {
-    return b.get(off) coalesce 0 ∷ u8 ↦ int
-}
-
 # Unsigned byte -> signed i8 value.
 fn i8(int v) → int {
     if v ≥ 128 then return v - 256
@@ -166,23 +162,9 @@ fn i8(int v) → int {
     return v
 }
 
-# Compute 2^n via repeated multiplication/division. n range: [-127, 128]
-# — matches the IEEE-754 exponent spans this module needs.
-fn power_two(int n) → float {
-    mut float result ← 1.0
-
-    if n ≥ 0 {
-        for range 0 ‥ n let i {
-            result ← result * 2.0
-        }
-    }
-    else {
-        for range n ‥ 0 let i {
-            result ← result / 2.0
-        }
-    }
-
-    return result
+# Bounds-checked byte read at an offset of a shared encoded buffer.
+fn byte_at(list<b8> b, int off) → int {
+    return (b.get(off) coalesce 0x00 ∷ b8) ↦ u8 ↦ int
 }
 
 # -------------------------------------------------------------------------
@@ -194,9 +176,8 @@ fn power_two(int n) → float {
 # (`value ≢ value` never fires there) — a NaN half is malformed data.
 # -------------------------------------------------------------------------
 
-fn half(list<u8> b, int off) → f32 ⇥ DequantError {
-    let list<b8> buf ↤ b
-    let int bits ← (buf[off ‥ off + 2] ↦ u16 via Le) ↦ int
+fn half(list<b8> b, int off) → f32 ⇥ DequantError {
+    let int bits ← (b[off ‥ off + 2] ↦ u16 via Le) ↦ int
 
     if (bits ⇒ 10) % 32 ≡ 31 {
         if bits % 1024 ≢ 0 {
@@ -204,49 +185,28 @@ fn half(list<u8> b, int off) → f32 ⇥ DequantError {
         }
     }
 
-    return (((buf[off ‥ off + 2] ↦ u16 via Le) ↦ b16) ↦ f16) ↦ f32
+    return (((b[off ‥ off + 2] ↦ u16 via Le) ↦ b16) ↦ f16) ↦ f32
 }
 
 # GGML bf16 -> exact f32 VALUE. bf16 is sign(1) / exponent(8, bias 127) /
-# mantissa(7): value-arithmetic decode through the `power_two` seam
-# (bit-exact for every finite bf16, which is exactly representable in f32). ±inf via f64 overflow narrowing; NaN fails closed.
-fn bfloat16(list<u8> b, int off) → f32 ⇥ DequantError {
-    let list<b8> buf ↤ b
-    let int bits ← (buf[off ‥ off + 2] ↦ u16 via Le) ↦ int
-    let int sign ← (bits ⇒ 15) % 2
+# mantissa(7): every finite bf16 is exactly representable in f32, so the
+# decode is the exact bit-shift widening — the 16 pattern bits into the top
+# half of an f32 (`bits ⇐ 16` reinterpreted through `u32 -> b32 -> f32`) —
+# which reproduces the old value-arithmetic form bit for bit for every
+# non-NaN pattern (normals, subnormals, ±0, ±inf). NaN fails closed before
+# the conversion.
+fn bfloat16(list<b8> b, int off) → f32 ⇥ DequantError {
+    let int bits ← (b[off ‥ off + 2] ↦ u16 via Le) ↦ int
     let int exponent ← (bits ⇒ 7) % 256
     let int frac ← bits % 128
-    mut float sign_factor ← 1.0
-
-    if sign ≢ 0 {
-        sign_factor ← -1.0
-    }
-
-    if exponent ≡ 0 {
-        if frac ≡ 0 {
-            # ±0 (subnormal zero)
-            return sign_factor * 0.0 ↦ f32
-        }
-
-        # Subnormal: ±frac × 2^-126 × 2^-7
-        let float power ← power_two(-126)
-        return sign_factor * power * ((frac ↦ float) / 128.0) ↦ f32
-    }
 
     if exponent ≡ 255 {
-        if frac ≡ 0 {
-            # ±inf via f64 overflow -> f32 narrowing.
-            let float power ← power_two(128)
-            return sign_factor * power * 2.0 ↦ f32
+        if frac ≢ 0 {
+            throw variant BadPayload { message = "NaN bf16 value in dequant block" }
         }
-
-        throw variant BadPayload { message = "NaN bf16 value in dequant block" }
     }
 
-    # Normal: ±2^(exponent-127) × (1 + frac/128)
-    let float power ← power_two(exponent - 127)
-    let float frac_ratio ← (frac ↦ float) / 128.0
-    return sign_factor * power * (1.0 + frac_ratio) ↦ f32
+    return (((bits ⇐ 16) ↦ u32 ⊥ 0) ↦ b32) ↦ f32
 }
 
 # -------------------------------------------------------------------------
@@ -254,109 +214,77 @@ fn bfloat16(list<u8> b, int off) → f32 ⇥ DequantError {
 # order; all arithmetic in f32).
 # -------------------------------------------------------------------------
 
-# `block_q8_0`: d (half) + qs[32] int8 -> y[j] = qs[j] * d.
-fn dequant_q8_0(list<u8> b) → list<f32> ⇥ DequantError {
-    let f32 d ← half(b, 0)
-    mut list<f32> y ← empty
+# `block_q8_0`: d (half) + qs[32] int8 -> y[j] = qs[j] * d. The kernel
+# reads its block bytes at base_off of the shared encoded buffer and
+# appends the 32 decoded values onto the caller's output buffer.
+fn dequant_q8_0(list<b8> b, int base_off, mut list<f32> y) ⇥ DequantError {
+    let f32 d ← half(b, base_off)
 
     for range 0 ‥ 32 let j {
-        y.append((i8(byte_at(b, 2 + j)) ↦ f32) * d)
+        y.append((i8(byte_at(b, base_off + 2 + j)) ↦ f32) * d)
     }
-
-    return y
 }
 
 # `block_q4_1`: d (half) + m (half) + qs[16] nibbles. Output order matches
 # llama.cpp: y[0..16] from low nibbles, y[16..32] from high nibbles.
-fn dequant_q4_1(list<u8> b) → list<f32> ⇥ DequantError {
-    let f32 d ← half(b, 0)
-    let f32 m ← half(b, 2)
-    mut list<f32> low ← empty
-    mut list<f32> high ← empty
+fn dequant_q4_1(list<b8> b, int base_off, mut list<f32> y) ⇥ DequantError {
+    let f32 d ← half(b, base_off)
+    let f32 m ← half(b, base_off + 2)
 
     for range 0 ‥ 16 let j {
-        let int qs ← byte_at(b, 4 + j)
+        let int qs ← byte_at(b, base_off + 4 + j)
         let int x0 ← qs % 16
+        y.append((x0 ↦ f32) * d + m)
+    }
+
+    for range 0 ‥ 16 let j {
+        let int qs ← byte_at(b, base_off + 4 + j)
         let int x1 ← (qs ⇒ 4) % 16
-        low.append((x0 ↦ f32) * d + m)
-        high.append((x1 ↦ f32) * d + m)
+        y.append((x1 ↦ f32) * d + m)
     }
-
-    mut list<f32> y ← empty
-
-    for from low let v {
-        y.append(v)
-    }
-
-    for from high let v {
-        y.append(v)
-    }
-
-    return y
 }
 
 const list<int> KVALUES_IQ4NL = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113]
 
 # `block_iq4_nl`: d (half) + qs[16] nibbles into `kvalues_iq4nl`. Output
 # order matches llama.cpp: y[0..16] from low nibbles, y[16..32] from high.
-fn dequant_iq4_nl(list<u8> b) → list<f32> ⇥ DequantError {
-    let f32 d ← half(b, 0)
-    mut list<f32> low ← empty
-    mut list<f32> high ← empty
+fn dequant_iq4_nl(list<b8> b, int base_off, mut list<f32> y) ⇥ DequantError {
+    let f32 d ← half(b, base_off)
 
     for range 0 ‥ 16 let j {
-        let int qs ← byte_at(b, 2 + j)
+        let int qs ← byte_at(b, base_off + 2 + j)
         let int k0 ← KVALUES_IQ4NL[qs % 16]
+        y.append(d * (k0 ↦ f32))
+    }
+
+    for range 0 ‥ 16 let j {
+        let int qs ← byte_at(b, base_off + 2 + j)
         let int k1 ← KVALUES_IQ4NL[(qs ⇒ 4) % 16]
-        low.append(d * (k0 ↦ f32))
-        high.append(d * (k1 ↦ f32))
+        y.append(d * (k1 ↦ f32))
     }
-
-    mut list<f32> y ← empty
-
-    for from low let v {
-        y.append(v)
-    }
-
-    for from high let v {
-        y.append(v)
-    }
-
-    return y
 }
 
 # `block_q5_0`: d (half) + qh[4] bitmask + qs[16] nibbles. Output order
 # matches llama.cpp: y[0..16] from the low nibbles, y[16..32] from the
 # high nibbles (two 16-elem runs, appended in that order).
-fn dequant_q5_0(list<u8> b) → list<f32> ⇥ DequantError {
-    let f32 d ← half(b, 0)
-    let list<b8> buf ↤ b
-    let int qh ← (buf[2 ‥ 6] ↦ u32 via Le) ↦ int
-    mut list<f32> low ← empty
-    mut list<f32> high ← empty
+fn dequant_q5_0(list<b8> b, int base_off, mut list<f32> y) ⇥ DequantError {
+    let f32 d ← half(b, base_off)
+    let int qh ← (b[base_off + 2 ‥ base_off + 6] ↦ u32 via Le) ↦ int
 
     for range 0 ‥ 16 let j {
         # xh_0 = ((qh >> j) << 4) & 0x10 ; xh_1 = (qh >> (j+12)) & 0x10
         let int xh_0 ← (qh ⇒ j) % 2 * 16
-        let int xh_1 ← (qh ⇒ j + 16) % 2 * 16
-        let int qs ← byte_at(b, 6 + j)
+        let int qs ← byte_at(b, base_off + 6 + j)
         let int x0 ← (qs % 16 ∨ xh_0) - 16
+        y.append((x0 ↦ f32) * d)
+    }
+
+    for range 0 ‥ 16 let j {
+        let int xh_1 ← (qh ⇒ j + 16) % 2 * 16
+        let int qs ← byte_at(b, base_off + 6 + j)
         let int x1 ← ((qs ⇒ 4) % 16 ∨ xh_1) - 16
-        low.append((x0 ↦ f32) * d)
-        high.append((x1 ↦ f32) * d)
+        y.append((x1 ↦ f32) * d)
     }
-
-    mut list<f32> y ← empty
-
-    for from low let v {
-        y.append(v)
-    }
-
-    for from high let v {
-        y.append(v)
-    }
-
-    return y
 }
 
 # `get_scale_min_k4` (llama.cpp ggml-quants.c): 6-bit scale + 6-bit min
@@ -375,7 +303,7 @@ class MinScale {
     mut int m
 }
 
-fn min_scale_k4(int index, list<u8> b) → MinScale {
+fn min_scale_k4(int index, list<b8> b) → MinScale {
     if index ≺ 4 then return MinScale { sc = byte_at(b, 4 + index) % 64, m = byte_at(b, 8 + index) % 64 }
 
     let int sc ← byte_at(b, 8 + index) % 16 ∨ (byte_at(b, index) ⇒ 6) % 4 * 16
@@ -388,11 +316,10 @@ fn min_scale_k4(int index, list<u8> b) → MinScale {
 # m2 = dmin·m(is+1); y = d1·(qs&0xF) − m1 for 32 elements, then
 # y = d2·(qs>>4) − m2 for 32. Output per chunk is one 64-elem run:
 # first the 32 low-nibble values, then the 32 high-nibble values.
-fn dequant_q4_k(list<u8> b) → list<f32> ⇥ DequantError {
+fn dequant_q4_k(list<b8> b, int base_off, mut list<f32> y) ⇥ DequantError {
     # --- block header (d/dmin halves) -------------------------------------
-    let f32 d ← half(b, 0)
-    let f32 dmin ← half(b, 2)
-    mut list<f32> y ← empty
+    let f32 d ← half(b, base_off)
+    let f32 dmin ← half(b, base_off + 2)
     mut int idx ← 0
     mut int qoff ← 0
 
@@ -404,29 +331,21 @@ fn dequant_q4_k(list<u8> b) → list<f32> ⇥ DequantError {
         let MinScale sm1 ← min_scale_k4(idx + 1, b)
         let f32 d2 ← d * (sm1.sc ↦ f32)
         let f32 m2 ← dmin * (sm1.m ↦ f32)
-        mut list<f32> low ← empty
-        mut list<f32> high ← empty
 
-        # --- 32-elem low + high nibble decode -----------------------------
+        # --- 32-elem low + high nibble decode (two appended runs) ---------
         for range 0 ‥ 32 let l {
-            let int qs ← byte_at(b, 16 + qoff + l)
-            low.append(d1 * (qs % 16 ↦ f32) - m1)
-            high.append(d2 * ((qs ⇒ 4) % 16 ↦ f32) - m2)
+            let int qs ← byte_at(b, base_off + 16 + qoff + l)
+            y.append(d1 * (qs % 16 ↦ f32) - m1)
         }
 
-        for from low let v {
-            y.append(v)
-        }
-
-        for from high let v {
-            y.append(v)
+        for range 0 ‥ 32 let l {
+            let int qs ← byte_at(b, base_off + 16 + qoff + l)
+            y.append(d2 * ((qs ⇒ 4) % 16 ↦ f32) - m2)
         }
 
         qoff ← qoff + 32
         idx ← idx + 2
     }
-
-    return y
 }
 
 # `block_q5_K`: d, dmin (halves), scales[12], qh[32] high bits, qs[128]
@@ -436,11 +355,10 @@ fn dequant_q4_k(list<u8> b) → list<f32> ⇥ DequantError {
 # nibble, c = chunk index). y = d1·qs16 − m1 for 32 elements, then
 # y = d2·qs16 − m2 for 32 — same output order as llama.cpp's
 # `dequantize_row_q5_K` (two 32-elem runs per chunk, low then high).
-fn dequant_q5_k(list<u8> b) → list<f32> ⇥ DequantError {
+fn dequant_q5_k(list<b8> b, int base_off, mut list<f32> y) ⇥ DequantError {
     # --- block header (d/dmin halves) -------------------------------------
-    let f32 d ← half(b, 0)
-    let f32 dmin ← half(b, 2)
-    mut list<f32> y ← empty
+    let f32 d ← half(b, base_off)
+    let f32 dmin ← half(b, base_off + 2)
     mut int idx ← 0
     mut int qoff ← 0
 
@@ -452,123 +370,103 @@ fn dequant_q5_k(list<u8> b) → list<f32> ⇥ DequantError {
         let MinScale sm1 ← min_scale_k4(idx + 1, b)
         let f32 d2 ← d * (sm1.sc ↦ f32)
         let f32 m2 ← dmin * (sm1.m ↦ f32)
-        mut list<f32> low ← empty
-        mut list<f32> high ← empty
 
-        # --- 32-elem low + high nibble decode -----------------------------
+        # --- 32-elem low + high nibble decode (two appended runs) ---------
         for range 0 ‥ 32 let l {
-            let int qs ← byte_at(b, 48 + qoff + l)
-            let int qh ← byte_at(b, 16 + l)
+            let int qs ← byte_at(b, base_off + 48 + qoff + l)
+            let int qh ← byte_at(b, base_off + 16 + l)
             # 5th bits: bit 2c (low nibble) / bit 2c+1 (high nibble).
             let int hi_lo ← (qh ⇒ 2 * chunk) % 2 * 16
-            let int hi_hi ← (qh ⇒ 2 * chunk + 1) % 2 * 16
             let int qs16_lo ← qs % 16 ∨ hi_lo
+            y.append(d1 * (qs16_lo ↦ f32) - m1)
+        }
+
+        for range 0 ‥ 32 let l {
+            let int qs ← byte_at(b, base_off + 48 + qoff + l)
+            let int qh ← byte_at(b, base_off + 16 + l)
+            let int hi_hi ← (qh ⇒ 2 * chunk + 1) % 2 * 16
             let int qs16_hi ← (qs ⇒ 4) % 16 ∨ hi_hi
-            low.append(d1 * (qs16_lo ↦ f32) - m1)
-            high.append(d2 * (qs16_hi ↦ f32) - m2)
-        }
-
-        for from low let v {
-            y.append(v)
-        }
-
-        for from high let v {
-            y.append(v)
+            y.append(d2 * (qs16_hi ↦ f32) - m2)
         }
 
         qoff ← qoff + 32
         idx ← idx + 2
     }
-
-    return y
 }
 
 # `block_q6_K`: ql[128] low nibbles, qh[64] high bits, scales[16] int8,
 # d (half) at byte offset 208. Output order matches llama.cpp: within
 # each 128-element group the four quants are written at strides 0/32/64/96
 # over l — one 32-elem run per stride, appended in stride order.
-fn dequant_q6_k(list<u8> b) → list<f32> ⇥ DequantError {
+fn dequant_q6_k(list<b8> b, int base_off, mut list<f32> y) ⇥ DequantError {
     # --- block scale d (byte 208) -----------------------------------------
-    let f32 d ← half(b, 208)
-    mut list<f32> y ← empty
+    let f32 d ← half(b, base_off + 208)
 
-    # --- per-128 group (offsets + quants q1..q4) --------------------------
+    # --- per-128 group (offsets + quants q1..q4, four appended runs) ------
     for range 0 ‥ 2 let n {
         let int sc_base ← n * 8
         let int ql_off ← n * 64
         let int qh_off ← n * 32
-        mut list<f32> q1s ← empty
-        mut list<f32> q2s ← empty
-        mut list<f32> q3s ← empty
-        mut list<f32> q4s ← empty
 
         # --- 32-elem quants q1..q4 (scales + -32) -------------------------
         for range 0 ‥ 32 let l {
             let int idx ← l / 16
-            let int ql_lo ← byte_at(b, ql_off + l)
-            let int ql_hi ← byte_at(b, ql_off + l + 32)
-            let int qh ← byte_at(b, 128 + qh_off + l)
+            let int ql_lo ← byte_at(b, base_off + ql_off + l)
+            let int qh ← byte_at(b, base_off + 128 + qh_off + l)
             # q1..q4: low/high nibbles + 2-bit high groups, then -32.
             let int q1 ← (ql_lo % 16 ∨ qh % 4 * 16) - 32
-            let int q2 ← (ql_hi % 16 ∨ (qh ⇒ 2) % 4 * 16) - 32
-            let int q3 ← ((ql_lo ⇒ 4) % 16 ∨ (qh ⇒ 4) % 4 * 16) - 32
-            let int q4 ← ((ql_hi ⇒ 4) % 16 ∨ (qh ⇒ 6) % 4 * 16) - 32
-            let f32 sc0 ← i8(byte_at(b, 192 + sc_base + idx + 0)) ↦ f32
-            let f32 sc2 ← i8(byte_at(b, 192 + sc_base + idx + 2)) ↦ f32
-            let f32 sc4 ← i8(byte_at(b, 192 + sc_base + idx + 4)) ↦ f32
-            let f32 sc6 ← i8(byte_at(b, 192 + sc_base + idx + 6)) ↦ f32
+            let f32 sc0 ← i8(byte_at(b, base_off + 192 + sc_base + idx + 0)) ↦ f32
             # Same left-associative f32 multiplication order as the C
             # kernels ((d * sc) * q), so outputs are bit-exact.
-            q1s.append(d * sc0 * (q1 ↦ f32))
-            q2s.append(d * sc2 * (q2 ↦ f32))
-            q3s.append(d * sc4 * (q3 ↦ f32))
-            q4s.append(d * sc6 * (q4 ↦ f32))
+            y.append(d * sc0 * (q1 ↦ f32))
         }
 
-        for from q1s let v {
-            y.append(v)
+        for range 0 ‥ 32 let l {
+            let int idx ← l / 16
+            let int ql_hi ← byte_at(b, base_off + ql_off + l + 32)
+            let int qh ← byte_at(b, base_off + 128 + qh_off + l)
+            let int q2 ← (ql_hi % 16 ∨ (qh ⇒ 2) % 4 * 16) - 32
+            let f32 sc2 ← i8(byte_at(b, base_off + 192 + sc_base + idx + 2)) ↦ f32
+            y.append(d * sc2 * (q2 ↦ f32))
         }
 
-        for from q2s let v {
-            y.append(v)
+        for range 0 ‥ 32 let l {
+            let int idx ← l / 16
+            let int ql_lo ← byte_at(b, base_off + ql_off + l)
+            let int qh ← byte_at(b, base_off + 128 + qh_off + l)
+            let int q3 ← ((ql_lo ⇒ 4) % 16 ∨ (qh ⇒ 4) % 4 * 16) - 32
+            let f32 sc4 ← i8(byte_at(b, base_off + 192 + sc_base + idx + 4)) ↦ f32
+            y.append(d * sc4 * (q3 ↦ f32))
         }
 
-        for from q3s let v {
-            y.append(v)
-        }
-
-        for from q4s let v {
-            y.append(v)
+        for range 0 ‥ 32 let l {
+            let int idx ← l / 16
+            let int ql_hi ← byte_at(b, base_off + ql_off + l + 32)
+            let int qh ← byte_at(b, base_off + 128 + qh_off + l)
+            let int q4 ← ((ql_hi ⇒ 4) % 16 ∨ (qh ⇒ 6) % 4 * 16) - 32
+            let f32 sc6 ← i8(byte_at(b, base_off + 192 + sc_base + idx + 6)) ↦ f32
+            y.append(d * sc6 * (q4 ↦ f32))
         }
     }
-
-    return y
 }
 
 # F32 scalar block: bit-exact passthrough of the 4 little-endian bytes via
 # the language endian-read form (bit-identical for every pattern, NaN
 # payloads included).
-fn dequant_f32(list<u8> b) → list<f32> ⇥ DequantError {
-    let list<b8> buf ↤ b
-    mut list<f32> y ← empty
-    y.append(buf[0 ‥ 4] ↦ f32 via Le)
-    return y
+fn dequant_f32(list<b8> b, int base_off, mut list<f32> y) ⇥ DequantError {
+    y.append(b[base_off ‥ base_off + 4] ↦ f32 via Le)
 }
 
 # F16 scalar block: one IEEE binary16 value (2 LE bytes) -> exact f32
 # value. Reuses `half` — the same NativeF16Convert decode the Q-block
 # scales already use (bit-exact for every finite half).
-fn dequant_f16(list<u8> b) → list<f32> ⇥ DequantError {
-    mut list<f32> y ← empty
-    y.append(half(b, 0))
-    return y
+fn dequant_f16(list<b8> b, int base_off, mut list<f32> y) ⇥ DequantError {
+    y.append(half(b, base_off))
 }
 
 # BF16 scalar block: one bf16 value (2 LE bytes) -> exact f32 value.
-fn dequant_bf16(list<u8> b) → list<f32> ⇥ DequantError {
-    mut list<f32> y ← empty
-    y.append(bfloat16(b, 0))
-    return y
+fn dequant_bf16(list<b8> b, int base_off, mut list<f32> y) ⇥ DequantError {
+    y.append(bfloat16(b, base_off))
 }
 
 # -------------------------------------------------------------------------
@@ -630,10 +528,7 @@ fn decode_kind(storage.Representation representation) → DecodeKind ⇥ Dequant
 # decision, while unknown representations remain preservable in storage.
 # -------------------------------------------------------------------------
 
-@ public
-fn block_elements(storage.Representation representation) → int ⇥ DequantError {
-    let DecodeKind kind ← decode_kind(representation)
-
+fn block_elements_kind(DecodeKind kind) → int {
     match kind {
         case DecodeKind.F32 {
             return F32_ELEMENTS
@@ -666,6 +561,12 @@ fn block_elements(storage.Representation representation) → int ⇥ DequantErro
             return IQ4_NL_ELEMENTS
         }
     }
+}
+
+@ public
+fn block_elements(storage.Representation representation) → int ⇥ DequantError {
+    let DecodeKind kind ← decode_kind(representation)
+    return block_elements_kind(kind)
 }
 
 @ public
@@ -710,112 +611,131 @@ fn block_bytes_kind(DecodeKind kind) → int {
 }
 
 # -------------------------------------------------------------------------
-# decode_block — decode ONE supported GGML block to explicitly decoded F32
-# logical elements. Representation admission has already happened; only the
-# block byte-length gate remains at this seam.
+# decode_block — decode ONE supported GGML block (read at base_off of the
+# shared encoded buffer) and append its explicitly decoded F32 logical
+# elements onto the caller's output buffer. Representation admission has
+# already happened; the block byte-range gate remains at this seam.
 # -------------------------------------------------------------------------
 
-fn decode_block(DecodeKind kind, list<u8> blocks) → list<f32> ⇥ DequantError {
+fn decode_block(DecodeKind kind, list<b8> blocks, int base_off, mut list<f32> y) ⇥ DequantError {
     let int nbytes ← block_bytes_kind(kind)
 
-    require blocks.length() ≡ nbytes throw variant BadBlock { message = "block byte length mismatch" }
+    require base_off ≥ 0 and base_off + nbytes ≤ blocks.length() throw variant BadBlock { message = "block byte length mismatch" }
 
     match kind {
         case DecodeKind.F32 {
-            return dequant_f32(blocks)
+            dequant_f32(blocks, base_off, mut y)
         }
         case DecodeKind.F16 {
-            return dequant_f16(blocks)
+            dequant_f16(blocks, base_off, mut y)
         }
         case DecodeKind.BF16 {
-            return dequant_bf16(blocks)
+            dequant_bf16(blocks, base_off, mut y)
         }
         case DecodeKind.Q4_1 {
-            return dequant_q4_1(blocks)
+            dequant_q4_1(blocks, base_off, mut y)
         }
         case DecodeKind.Q5_0 {
-            return dequant_q5_0(blocks)
+            dequant_q5_0(blocks, base_off, mut y)
         }
         case DecodeKind.Q8_0 {
-            return dequant_q8_0(blocks)
+            dequant_q8_0(blocks, base_off, mut y)
         }
         case DecodeKind.Q4_K {
-            return dequant_q4_k(blocks)
+            dequant_q4_k(blocks, base_off, mut y)
         }
         case DecodeKind.Q5_K {
-            return dequant_q5_k(blocks)
+            dequant_q5_k(blocks, base_off, mut y)
         }
         case DecodeKind.Q6_K {
-            return dequant_q6_k(blocks)
+            dequant_q6_k(blocks, base_off, mut y)
         }
         case DecodeKind.IQ4_NL {
-            return dequant_iq4_nl(blocks)
+            dequant_iq4_nl(blocks, base_off, mut y)
         }
     }
 }
 
-# Convert the opaque byte carrier only at the arithmetic decoder boundary.
-# Storage callers retain their original `bytes`; this list is an internal
-# transient for the existing scalar decoder implementation.
-fn byte_list(list<b8> input) → list<u8> {
-    return input ↦ list<u8>
-}
-
 # -------------------------------------------------------------------------
-# Byte conversion is intentionally only encoded-bytes → byte-list for the
-# decoder's arithmetic. The storage boundary itself remains `bytes`.
+# Single-block decode entry points. The byte-length equality gate keeps the
+# pinned "block byte length mismatch" failure for a carrier that is not
+# exactly one block; the decode itself reads the buffer at offset 0 and
+# builds one output list.
 # -------------------------------------------------------------------------
 
 @ public
 fn decode_block_u8(storage.Representation representation, list<u8> block) → list<f32> ⇥ DequantError {
     let DecodeKind kind ← decode_kind(representation)
-    return decode_block(kind, block)
+    let int nbytes ← block_bytes_kind(kind)
+
+    require block.length() ≡ nbytes throw variant BadBlock { message = "block byte length mismatch" }
+
+    let list<b8> buf ↤ block
+    mut list<f32> y ← empty
+    decode_block(kind, buf, 0, mut y)
+    return y
 }
 
 @ public
 fn decode_block_f32(storage.Representation representation, list<b8> block) → list<f32> ⇥ DequantError {
     let DecodeKind kind ← decode_kind(representation)
-    let list<u8> encoded ← byte_list(block)
-    return decode_block(kind, encoded)
+    let int nbytes ← block_bytes_kind(kind)
+
+    require block.length() ≡ nbytes throw variant BadBlock { message = "block byte length mismatch" }
+
+    mut list<f32> y ← empty
+    decode_block(kind, block, 0, mut y)
+    return y
 }
 
 # -------------------------------------------------------------------------
 # decode_order_f32 — decode a packed row (blocks × block_bytes, the GGUF
 # data-region payload of one supported tensor) to explicitly decoded F32
-# logical elements, in GGUF block order. Unknown representations remain
-# available to storage callers but fail closed here.
+# logical elements, in GGUF block order. The decode reads every block
+# directly from the encoded buffer at its base offset and appends onto ONE
+# output buffer — no per-block byte copies and no temporary per-block
+# lists. Unknown representations remain available to storage callers but
+# fail closed here.
 # -------------------------------------------------------------------------
 
 @ public
 fn decode_order_f32(storage.Representation representation, list<b8> payload) → list<f32> ⇥ DequantError {
     let DecodeKind kind ← decode_kind(representation)
-    let list<u8> encoded ← byte_list(payload)
     # --- row alignment gate (fail closed) ---------------------------------
-    let int nbytes ← block_bytes(representation)
+    let int nbytes ← block_bytes_kind(kind)
 
-    require encoded.length() % nbytes ≡ 0 throw variant BadOrder { message = "row byte length not a multiple of block_bytes" }
+    require payload.length() % nbytes ≡ 0 throw variant BadOrder { message = "row byte length not a multiple of block_bytes" }
 
-    # --- per-block decode (GGUF block order) ------------------------------
     mut list<f32> y ← empty
-    mut int off ← 0
+    decode_order_into(representation, payload, 0, payload.length() / nbytes, mut y)
+    return y
+}
 
-    while off ≺ encoded.length() {
-        mut list<u8> blocks ← empty
+# Decode exactly block_count blocks of a packed row starting at base_off of
+# the shared encoded buffer, appending the decoded F32 elements onto the
+# caller's ONE output buffer in GGUF block order. Returns the number of
+# decoded elements (block_count × block elements). Fails closed on a
+# negative or out-of-buffer block range.
+@ public
+fn decode_order_into(storage.Representation representation, list<b8> buf, int base_off, int block_count, mut list<f32> y) → int ⇥ DequantError {
+    let DecodeKind kind ← decode_kind(representation)
+    let int nbytes ← block_bytes_kind(kind)
 
-        for range 0 ‥ nbytes let i {
-            blocks.append(encoded.get(off + i) coalesce 0 ∷ u8)
-        }
+    require base_off ≥ 0 throw variant BadOrder { message = "row base offset is negative" }
 
-        let list<f32> g ← decode_block(kind, blocks)
+    require block_count ≥ 0 throw variant BadOrder { message = "row block count is negative" }
 
-        for from g let v {
-            y.append(v)
-        }
+    require base_off + block_count * nbytes ≤ buf.length() throw variant BadOrder { message = "row block range exceeds the buffer" }
 
+    let int end ← base_off + block_count * nbytes
+    mut int off ← base_off
+
+    while off ≺ end {
+        decode_block(kind, buf, off, mut y)
         off ← off + nbytes
     }
 
-    return y
+    return block_count * block_elements_kind(kind)
 }
 
 +++ faber test
@@ -870,6 +790,12 @@ const list<u8> F16_MAX_BLOCK = comptime { return bytes_of([255, 123]) }
 const list<u8> BF16_ONE_BLOCK = comptime { return bytes_of([128, 63]) }
 
 const list<u8> BF16_MAX_BLOCK = comptime { return bytes_of([127, 127]) }
+
+# Q4_1 probe block (d = 1.0, m = -2.0 halves + nibble ramp), 20 bytes.
+const list<u8> Q4_1_BLOCK = comptime { return bytes_of([0, 60, 0, 192, 240, 225, 210, 195, 180, 165, 150, 135, 120, 105, 90, 75, 60, 45, 30, 15]) }
+
+# IQ4_NL probe block (d = 1.0 half + nibble ramp), 18 bytes.
+const list<u8> IQ4_NL_BLOCK = comptime { return bytes_of([0, 60, 240, 225, 210, 195, 180, 165, 150, 135, 120, 105, 90, 75, 60, 45, 30, 15]) }
 
 # Q5_0 blk.0.attn_q.weight block 0 (22 bytes).
 const list<u8> Q5_0_BLOCK = comptime { return bytes_of([8, 43, 119, 109, 62, 184, 32, 0, 33, 111, 51, 16, 208, 254, 228, 14, 240, 50, 28, 17, 242, 10]) }
@@ -973,6 +899,19 @@ fn order_result(storage.Representation kind, list<u8> bytes) → string {
     }
 }
 
+# decode_order_into outcome as text ("ok:<elements>" or the typed error's
+# message).
+fn order_into_result(storage.Representation kind, list<u8> bytes, int base_off, int blocks) → string {
+    do {
+        mut list<f32> y ← empty
+        let int written ← dequant.decode_order_into(kind, bytes ↦ list<b8>, base_off, blocks, mut y)
+        return "ok:§"(written ↦ string)
+    }
+    catch err {
+        return err.message
+    }
+}
+
 # Element count of a successful F32 block decode (0 on error).
 fn block_elements(storage.Representation kind, list<u8> blocks) → int {
     do {
@@ -981,6 +920,20 @@ fn block_elements(storage.Representation kind, list<u8> blocks) → int {
     }
     catch err {
         return 0
+    }
+}
+
+# IEEE-754 bit pattern of one decoded value, read as an unsigned integer
+# (-1 on error). Bit patterns pin the decoded VALUES bit-exactly without
+# depending on float rendering.
+fn decoded_bits(list<u8> blocks, storage.Representation kind, int index) → int {
+    do {
+        let list<f32> out ← dequant.decode_block_f32(kind, blocks ↦ list<b8>)
+        let f32 v ← out.get(index) coalesce 0.0 ∷ f32
+        return ((v ↦ b32) ↦ u32) ↦ int
+    }
+    catch err {
+        return -1
     }
 }
 
@@ -1078,9 +1031,19 @@ test "BF16 block yields one f32 element matching the bf16 oracle" {
     assert block_payload(representation(30), bf16_neg) ≡ -1.0 ∷ f32
 }
 
+test "BF16 subnormal decodes exactly" {
+    # 0x0001 = frac 1, exponent 0 -> the value frac × 2^-133, computed here
+    # by exact f64 halvings and compared at the f32 store.
+    mut float power ← 1.0
+    for exclusive 133 let i {
+        power ← power / 2.0
+    }
+    let list<u8> bf16_sub ← bytes_of([1, 0])
+    assert block_payload(representation(30), bf16_sub) ≡ (power ↦ f32)
+}
+
 test "Q4_1 block yields 32 f32 elements" {
-    let list<u8> q4_1_blk ← bytes_of([0, 60, 0, 192, 240, 225, 210, 195, 180, 165, 150, 135, 120, 105, 90, 75, 60, 45, 30, 15])
-    assert block_elements(representation(3), q4_1_blk) ≡ 32
+    assert block_elements(representation(3), Q4_1_BLOCK) ≡ 32
 }
 
 test "Q5_0 block yields 32 f32 elements" {
@@ -1092,8 +1055,7 @@ test "Q8_0 block yields 32 f32 elements" {
 }
 
 test "IQ4_NL block yields 32 f32 elements" {
-    let list<u8> iq4_nl_blk ← bytes_of([0, 60, 240, 225, 210, 195, 180, 165, 150, 135, 120, 105, 90, 75, 60, 45, 30, 15])
-    assert block_elements(representation(20), iq4_nl_blk) ≡ 32
+    assert block_elements(representation(20), IQ4_NL_BLOCK) ≡ 32
 }
 
 test "Q4_K block yields 256 f32 elements" {
@@ -1107,6 +1069,36 @@ test "Q5_K block yields 256 f32 elements" {
 
 test "Q6_K block yields 256 f32 elements" {
     assert block_elements(representation(14), Q6_K_BLOCK) ≡ 256
+}
+
+# -- value pins against the independent reference (first / middle / last
+#    decoded value of each pinned block, read as IEEE-754 bit patterns) ----
+
+test "Q-block decodes match the independent reference bit patterns" {
+    assert decoded_bits(Q8_0_BLOCK, representation(8), 0) ≡ 3180473472
+    assert decoded_bits(Q8_0_BLOCK, representation(8), 16) ≡ 1005576192
+    assert decoded_bits(Q8_0_BLOCK, representation(8), 31) ≡ 3181701632
+    assert decoded_bits(Q4_1_BLOCK, representation(3), 0) ≡ 3221225472
+    assert decoded_bits(Q4_1_BLOCK, representation(3), 16) ≡ 1095761920
+    assert decoded_bits(Q4_1_BLOCK, representation(3), 31) ≡ 3221225472
+    assert decoded_bits(IQ4_NL_BLOCK, representation(20), 0) ≡ 3271426048
+    assert decoded_bits(IQ4_NL_BLOCK, representation(20), 16) ≡ 1122107392
+    assert decoded_bits(IQ4_NL_BLOCK, representation(20), 31) ≡ 3271426048
+    assert decoded_bits(Q5_0_BLOCK, representation(6), 0) ≡ 0
+    assert decoded_bits(Q5_0_BLOCK, representation(6), 16) ≡ 3208962048
+    assert decoded_bits(Q5_0_BLOCK, representation(6), 31) ≡ 0
+    assert decoded_bits(Q4_K_BLOCK, representation(12), 0) ≡ 3190142656
+    assert decoded_bits(Q4_K_BLOCK, representation(12), 128) ≡ 3179664384
+    assert decoded_bits(Q4_K_BLOCK, representation(12), 255) ≡ 3201249536
+    assert decoded_bits(Q5_K_MAX_BLOCK, representation(13), 0) ≡ 1291059580
+    assert decoded_bits(Q5_K_MAX_BLOCK, representation(13), 128) ≡ 1273520880
+    assert decoded_bits(Q5_K_MAX_BLOCK, representation(13), 255) ≡ 1273520880
+    assert decoded_bits(Q5_K_HIGH_BLOCK, representation(13), 0) ≡ 3297083392
+    assert decoded_bits(Q5_K_HIGH_BLOCK, representation(13), 128) ≡ 3296509952
+    assert decoded_bits(Q5_K_HIGH_BLOCK, representation(13), 255) ≡ 2147483648
+    assert decoded_bits(Q6_K_BLOCK, representation(14), 0) ≡ 3186614744
+    assert decoded_bits(Q6_K_BLOCK, representation(14), 128) ≡ 3165577568
+    assert decoded_bits(Q6_K_BLOCK, representation(14), 255) ≡ 1020822720
 }
 
 # -- fail-closed gates ----------------------------------------------------
@@ -1174,6 +1166,35 @@ test "row element count equals blocks × block elements" {
     assert element_order(representation(14), row) ≡ 3 * geometry_elements(representation(14))
     let list<u8> row_q5k ← add(Q5_K_MAX_BLOCK, Q5_K_HIGH_BLOCK)
     assert element_order(representation(13), row_q5k) ≡ 2 * geometry_elements(representation(13))
+}
+
+# -- offset decode (decode_order_into) --------------------------------------
+
+test "decode_order_into decodes a block range at an offset into one buffer" {
+    let list<u8> row ← add(Q8_0_BLOCK, Q8_0_BLOCK)
+    # Second block: base_off = 34 (one Q8_0 block), one block, 32 elements.
+    assert order_into_result(representation(8), row, 34, 1) ≡ "ok:32"
+    do {
+        mut list<f32> y ← empty
+        let int written ← dequant.decode_order_into(representation(8), row ↦ list<b8>, 34, 1, mut y)
+        assert written ≡ 32
+        assert y.length() ≡ 32
+        # The offset decode matches the second half of the whole-row decode.
+        let list<f32> whole ← dequant.decode_order_f32(representation(8), row ↦ list<b8>)
+        for exclusive 32 let j {
+            assert (y.get(j) coalesce 0.0 ∷ f32) ≡ (whole.get(32 + j) coalesce 0.0 ∷ f32)
+        }
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "decode_order_into range gates fail closed" {
+    let list<u8> row ← add(Q8_0_BLOCK, Q8_0_BLOCK)
+    assert order_into_result(representation(8), row, 34, 2) ≡ "row block range exceeds the buffer"
+    assert order_into_result(representation(8), row, -1, 1) ≡ "row base offset is negative"
+    assert order_into_result(representation(8), row, 0, -1) ≡ "row block count is negative"
 }
 
 # Sub-list helper for the trimmed-block probe.
