@@ -239,6 +239,21 @@ kernel moe_renorm_weights<size K>(tensor<f32, [K]> val_in, mut tensor<f32, [K]> 
     }
 }
 
+# Sigmoid + top-K renormalization over the selected top-K expert logits (Flint MoE routing).
+@ public
+kernel moe_sigmoid_renorm_weights<size K>(tensor<f32, [K]> val_in, mut tensor<f32, [K]> weight_out) → void {
+    for from weight_out at [k] thread lane let ? {
+        mut f32 denom ← 0.0
+
+        for range 0 ‥ K let r {
+            denom ← denom + 1.0 / (1.0 + (-val_in[[r]]).exp())
+        }
+
+        let f32 sk ← 1.0 / (1.0 + (-val_in[[k]]).exp())
+        weight_out[[k]] ← sk / denom
+    }
+}
+
 # MoE routed expert gate+up projection + SwiGLU activation for selected experts.
 # `wg` and `wu` are packed 2D `[E * F, D]` so indexing stays 2D and i64-free.
 @ public
@@ -385,6 +400,42 @@ fn split_qkv<size QKV, size QD, size KD, size VD>(tensor<f32, [QKV]> qkv, mut te
     copy_slice<size QKV, size QD>(qkv, mut q, 0)
     copy_slice<size QKV, size KD>(qkv, mut k, qd)
     copy_slice<size QKV, size VD>(qkv, mut v, qd + kd)
+}
+
+# Split interleaved per-head Q + gate projection `[H * 2 * DH]` into `q_out[H * DH]`
+# and `gate_out[H * DH]` (Qwen3.6 full-attention `attn_q` gate).
+@ public
+kernel split_q_gate_interleaved<size TwoQD, size QD>(tensor<f32, [TwoQD]> q_full, mut tensor<f32, [QD]> q_out, mut tensor<f32, [QD]> gate_out, i32 head_dim) → void {
+    for from q_out at [j] thread lane let ? {
+        if head_dim ≥ 1 and head_dim ≤ 960 and j ∈ 0 … 16777215 {
+            let i32 jj ← j ∧ 16777215
+            let i32 h ← jj / head_dim
+            let i32 d ← jj % head_dim
+            let i32 src_q ← h * (2 * head_dim) + d
+            let i32 src_g ← src_q + head_dim
+            if src_g ≺ TwoQD {
+                q_out[[j]] ← q_full[[src_q]]
+                gate_out[[j]] ← q_full[[src_g]]
+            }
+        }
+    }
+}
+
+# Elementwise sigmoid output gate: `out[j] = x[j] * sigmoid(gate[j])`.
+@ public
+kernel sigmoid_mul<size N>(tensor<f32, [N]> x, tensor<f32, [N]> gate, mut tensor<f32, [N]> out) → void {
+    for from x at [j] thread lane let xv {
+        let f32 gv ← gate[[j]]
+        out[[j]] ← xv * (1.0 / (1.0 + (-gv).exp()))
+    }
+}
+
+# Weighted accumulation: `acc[d] = acc[d] + weight * delta[d]`.
+@ public
+kernel weighted_add<size D>(mut tensor<f32, [D]> acc, tensor<f32, [D]> delta, f32 weight) → void {
+    for from acc at [d] thread lane let av {
+        acc[[d]] ← av + weight * delta[[d]]
+    }
 }
 
 # Portable rolling conv-state shift+write over ConvStateArena buffer [ConvRows, ConvCh].
@@ -913,4 +964,47 @@ test "decode_hybrid_kernels Split-C row_softmax_sink matches single-pass row_sof
     dhk.row_softmax_sink_apply(rsi_b, row_m_b, row_inv_d_b, mut rso_b_split)
     assert close(rso_b_split[[0, 0]], rso_b_ref[[0, 0]])
     assert close(rso_b_split[[0, 1]], rso_b_ref[[0, 1]])
+}
+
+test "decode_hybrid_kernels moe_sigmoid_renorm_weights and split_q_gate_interleaved + sigmoid_mul" {
+    # Sigmoid renormalization over top-2 logits [0.0, 2.0]:
+    # sig(0) = 0.5, sig(2) = 1/(1+exp(-2)) ~ 0.8807971
+    mut tensor<f32, [2]> top_vals ← tf32[2] {}
+    mut tensor<f32, [2]> sig_w ← tf32[2] {}
+    top_vals[[0]] ← 0.0
+    top_vals[[1]] ← 2.0
+    dhk.moe_sigmoid_renorm_weights(top_vals, mut sig_w)
+    let f32 s0 ← 0.5 ∷ f32
+    let f32 s1 ← (1.0 ∷ f32) / ((1.0 ∷ f32) + (-2.0 ∷ f32).exp())
+    assert close(sig_w[[0]], s0 / (s0 + s1))
+    assert close(sig_w[[1]], s1 / (s0 + s1))
+
+    # Interleaved 2*QD split (2 heads, head_dim=2 -> TwoQD=8, QD=4) + sigmoid_mul
+    mut tensor<f32, [8]> q_full ← tf32[8] {}
+    q_full[[0]] ← 1.0
+    q_full[[1]] ← 2.0
+    q_full[[2]] ← 0.0
+    q_full[[3]] ← 2.0
+    q_full[[4]] ← 3.0
+    q_full[[5]] ← 4.0
+    q_full[[6]] ← -2.0
+    q_full[[7]] ← 0.0
+    mut tensor<f32, [4]> q_out ← tf32[4] {}
+    mut tensor<f32, [4]> q_gate ← tf32[4] {}
+    mut tensor<f32, [4]> gated ← tf32[4] {}
+    dhk.split_q_gate_interleaved(q_full, mut q_out, mut q_gate, 2)
+    assert close(q_out[[0]], 1.0)
+    assert close(q_out[[1]], 2.0)
+    assert close(q_out[[2]], 3.0)
+    assert close(q_out[[3]], 4.0)
+    assert close(q_gate[[0]], 0.0)
+    assert close(q_gate[[1]], 2.0)
+    assert close(q_gate[[2]], -2.0)
+    assert close(q_gate[[3]], 0.0)
+
+    dhk.sigmoid_mul(q_out, q_gate, mut gated)
+    assert close(gated[[0]], 0.5)
+    assert close(gated[[1]], 2.0 ∷ f32 * s1)
+    assert close(gated[[2]], 3.0 ∷ f32 * ((1.0 ∷ f32) / ((1.0 ∷ f32) + (2.0 ∷ f32).exp())))
+    assert close(gated[[3]], 2.0)
 }
