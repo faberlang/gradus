@@ -1013,7 +1013,45 @@ fn draft_round_mode_batch<size V, size D, size QD, size KVD, size F, size H, siz
     throw variant ModeNotImplemented { message = "the § acceleration mode is not runnable on the verify route yet"(mode) }
 }
 
-fn run_verify_hybrid_coordinator<size V, size D, size QD, size KVD, size F, size H, size C, size W, size ConvRows, size ConvCh, size RecRows, size RecCols, size MaxBatch, size BH>(BatchTarget<V, D, QD, KVD, F> target, mut hybrid.HybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> hs, BatchTarget<V, D, QD, KVD, F> drafter, bool has_drafter, config.GenerationConfig g, list<int> prompt_ids, speculative.DrafterContext initial_ctx) → VerifyRun ⇥ VerifyError {
+fn draft_round_mode_dspark_batch<size V, size D, size QD, size KVD, size F, size H, size C, size W, size MaxBatch, size BH>(BatchTarget<V, D, QD, KVD, F> drafter, mut session.SessionState<C, W, KVD> dr_sess, mut dt.BatchWorkspace<MaxBatch, BH, D, QD, KVD, F, H, C> bws, string mode, list<int> prompt_ids, speculative.DrafterContext ctx, config.GenerationConfig g, bool has_drafter, bool use_dspark_block, int mask_token_id) → speculative.ProviderResult ⇥ VerifyError {
+    if not use_dspark_block {
+        return draft_round_mode_batch<size V, size D, size QD, size KVD, size F, size H, size C, size MaxBatch, size BH>(drafter, mut bws, mode, prompt_ids, ctx, g, has_drafter)
+    }
+
+    let int eff_min ← speculative.effective_min_suffix_length(ctx, mode)
+    if mode ≡ "context_lookup" {
+        let int depth ← speculative.next_depth(ctx.adaptive_budget)
+        let speculative.ProviderRequest req ← speculative.construct_request(prompt_ids, ctx.token_history, depth, g.acceleration.min_block, g.acceleration.max_block)
+        return context_lookup.propose_with_min_suffix(req, eff_min)
+    }
+
+    if mode ≡ "feature_tapped" or mode ≡ "standalone_draft" {
+        require has_drafter throw variant InvalidConfig { message = "mode § requires a drafter model"(mode) }
+        let int depth ← speculative.next_depth(ctx.mtp_budget)
+        let speculative.ProviderRequest req ← speculative.construct_request(prompt_ids, ctx.token_history, depth, g.acceleration.min_block, g.acceleration.max_block)
+        let string src ← (mode ≡ "feature_tapped") ✓ speculative.feature_tapped_source() ✗ speculative.standalone_draft_source()
+        return draft_dspark_block_batch<size V, size D, size QD, size KVD, size F, size H, size C, size W, size MaxBatch, size BH>(drafter, mut dr_sess, mut bws, req, prompt_ids, ctx, src, mask_token_id)
+    }
+
+    if mode ≡ "pld_then_mtp" {
+        let int pld_depth ← speculative.next_depth(ctx.adaptive_budget)
+        let speculative.ProviderRequest pld_req ← speculative.construct_request(prompt_ids, ctx.token_history, pld_depth, g.acceleration.min_block, g.acceleration.max_block)
+        let speculative.ProviderResult pld_res ← context_lookup.propose_with_min_suffix(pld_req, eff_min)
+        if not speculative.is_no_draft(pld_res) {
+            return pld_res
+        }
+
+        require has_drafter throw variant InvalidConfig { message = "pld_then_mtp fallback requires a drafter model" }
+        let int mtp_depth ← speculative.next_depth(ctx.mtp_budget)
+        let speculative.ProviderRequest mtp_req ← speculative.construct_request(prompt_ids, ctx.token_history, mtp_depth, g.acceleration.min_block, g.acceleration.max_block)
+        let string fallback_src ← has_feature_tapped_inputs(ctx) ✓ speculative.feature_tapped_source() ✗ speculative.standalone_draft_source()
+        return draft_dspark_block_batch<size V, size D, size QD, size KVD, size F, size H, size C, size W, size MaxBatch, size BH>(drafter, mut dr_sess, mut bws, mtp_req, prompt_ids, ctx, fallback_src, mask_token_id)
+    }
+
+    throw variant ModeNotImplemented { message = "the § acceleration mode is not runnable on the verify route yet"(mode) }
+}
+
+fn run_verify_hybrid_coordinator_impl<size V, size D, size QD, size KVD, size F, size H, size C, size W, size ConvRows, size ConvCh, size RecRows, size RecCols, size MaxBatch, size BH>(BatchTarget<V, D, QD, KVD, F> target, mut hybrid.HybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> hs, BatchTarget<V, D, QD, KVD, F> drafter, mut session.SessionState<C, W, KVD> dr_sess, bool has_drafter, bool use_dspark_block, int mask_token_id, config.GenerationConfig g, list<int> prompt_ids, speculative.DrafterContext initial_ctx) → VerifyRun ⇥ VerifyError {
     let string mode ← config.acceleration_mode_name(g.acceleration.mode)
 
     if mode ≢ "disabled" {
@@ -1150,7 +1188,7 @@ fn run_verify_hybrid_coordinator<size V, size D, size QD, size KVD, size F, size
         mut speculative.ProviderResult result ← speculative.no_draft()
 
         if not take_plain {
-            result ← draft_round_mode_batch<size V, size D, size QD, size KVD, size F, size H, size C, size MaxBatch, size BH>(drafter, mut bws, mode, prompt_ids, ctx, g, has_drafter)
+            result ← draft_round_mode_dspark_batch<size V, size D, size QD, size KVD, size F, size H, size C, size W, size MaxBatch, size BH>(drafter, mut dr_sess, mut bws, mode, prompt_ids, ctx, g, has_drafter, use_dspark_block, mask_token_id)
 
             if speculative.is_no_draft(result) {
                 take_plain ← true
@@ -1405,12 +1443,24 @@ fn run_verify_hybrid_coordinator<size V, size D, size QD, size KVD, size F, size
     return VerifyRun { tokens = tokens, stats = stats }
 }
 
+fn run_verify_hybrid_coordinator<size V, size D, size QD, size KVD, size F, size H, size C, size W, size ConvRows, size ConvCh, size RecRows, size RecCols, size MaxBatch, size BH>(BatchTarget<V, D, QD, KVD, F> target, mut hybrid.HybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> hs, BatchTarget<V, D, QD, KVD, F> drafter, bool has_drafter, config.GenerationConfig g, list<int> prompt_ids, speculative.DrafterContext initial_ctx) → VerifyRun ⇥ VerifyError {
+    mut session.SessionState<C, W, KVD> dummy_dr ← hs.kv
+    return run_verify_hybrid_coordinator_impl<size V, size D, size QD, size KVD, size F, size H, size C, size W, size ConvRows, size ConvCh, size RecRows, size RecCols, size MaxBatch, size BH>(target, mut hs, drafter, mut dummy_dr, has_drafter, false, 0, g, prompt_ids, initial_ctx)
+}
+
 # Unified B=k verify coordinator over HybridTxn (supporting Disabled,
 # ContextLookup, FeatureTapped, StandaloneDraft, and PldThenMtp in greedy-only
 # Phase 1; SessionTxn is the KV-only degeneracy).
 @ public
 fn verify_generate_hybrid<size V, size D, size QD, size KVD, size F, size H, size C, size W, size ConvRows, size ConvCh, size RecRows, size RecCols, size MaxBatch, size BH>(config.GenerationConfig g, list<int> prompt_ids, BatchTarget<V, D, QD, KVD, F> target, BatchTarget<V, D, QD, KVD, F> drafter, bool has_drafter, speculative.DrafterContext initial_ctx, mut hybrid.HybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> hs) → VerifyRun ⇥ VerifyError {
     return run_verify_hybrid_coordinator<size V, size D, size QD, size KVD, size F, size H, size C, size W, size ConvRows, size ConvCh, size RecRows, size RecCols, size MaxBatch, size BH>(target, mut hs, drafter, has_drafter, g, prompt_ids, initial_ctx)
+}
+
+# DSpark BlockDiffusion (`block_size = 8`) B=k verify coordinator over HybridTxn,
+# wiring `draft_dspark_block_batch` into StandaloneDraft / FeatureTapped / PldThenMtp.
+@ public
+fn verify_generate_dspark_hybrid<size V, size D, size QD, size KVD, size F, size H, size C, size W, size ConvRows, size ConvCh, size RecRows, size RecCols, size MaxBatch, size BH>(config.GenerationConfig g, list<int> prompt_ids, BatchTarget<V, D, QD, KVD, F> target, BatchTarget<V, D, QD, KVD, F> drafter, mut session.SessionState<C, W, KVD> dr_sess, int mask_token_id, speculative.DrafterContext initial_ctx, mut hybrid.HybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> hs) → VerifyRun ⇥ VerifyError {
+    return run_verify_hybrid_coordinator_impl<size V, size D, size QD, size KVD, size F, size H, size C, size W, size ConvRows, size ConvCh, size RecRows, size RecCols, size MaxBatch, size BH>(target, mut hs, drafter, mut dr_sess, true, true, mask_token_id, g, prompt_ids, initial_ctx)
 }
 
 # Backwards-compatible KV-only coupled wrapper (SessionTxn degeneracy of HybridTxn).
@@ -2430,9 +2480,10 @@ describe "issue #139 — NoDraft recovery, frontier skip, and MaxBatch accountin
             mut session.SessionState<16, 1, 4> base_sess ← sess_p()
             let list<int> base_tokens ← baseline_wide_generate(sd_cfg, [1, 2], target, mut base_sess)
 
-            mut hybrid.HybridSession<16, 1, 4, 4, 4, 2, 2> hs ← hybrid.from_schedule<size 16, size 1, size 4, size 4, size 4, size 2, size 2>(t_sched, 1, 3, true)
-            let draft_verify.VerifyRun run ← draft_verify.verify_generate_hybrid<size 4, size 4, size 4, size 4, size 6, size 2, size 16, size 1, size 4, size 4, size 2, size 2, size 4, size 8>(sd_cfg, [1, 2], target, target, true, ctx, mut hs)
+            mut hybrid.HybridSession<16, 16, 4, 4, 4, 2, 2> hs ← hybrid.from_schedule<size 16, size 16, size 4, size 4, size 4, size 2, size 2>(t_sched, 1, 3, true)
+            let draft_verify.VerifyRun run ← draft_verify.verify_generate_dspark_hybrid<size 4, size 4, size 4, size 4, size 6, size 2, size 16, size 16, size 4, size 4, size 2, size 2, size 8, size 16>(sd_cfg, [1, 2], target, target, mut dr_sess, 0, ctx, mut hs)
             assert run.tokens ≡ base_tokens
+            assert run.stats.verify_rounds ≥ 1
         }
         match trap_res {
             case returned let ? { }
