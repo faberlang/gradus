@@ -1,0 +1,637 @@
++++ toml
+locale = "en"
+
++++ faber
+# DualScaledFp4 (NVFP4) — dual-scaled 4-bit E2M1 with FP8 E4M3FN group scales
+# and f32 global scale (issue #105).
+#
+# Public import: import from "gradus:quant/dual_scaled_fp4" let dual_scaled_fp4
+#
+# --- Contract ------------------------------------------------------------
+#
+# Rule-17 pure-Faber representation (zero compiler format tables):
+#   * Raw ModelOpt encoding:
+#       - `weight`: packed E2M1 (`u8` `[Out, In / 2]`, low nibble = even, high = odd)
+#       - `scales`: `fp8_e4m3` group-16 `_scale` (`u8` `[Out, In / G]`)
+#       - `amax`: `f32` `_amax`
+#       - `outer_scale_denominator`: `f32` `_outer_scale_denominator`
+#       - `global_scale = amax / outer_scale_denominator`
+#   * MLX-converted encoding (Inkling L0-19):
+#       - `weight`: `u32` packed 8x E2M1 nibbles (`[Out, In / 8]`)
+#       - `scales`: `fp8_e4m3` group scales (`u8` `[Out, In / G]`)
+#       - `global_scale`: `f32`
+#   * Dequantize: `w[r, j] = e2m1(q[r, j]) * fp8_e4m3(scales[r, j / G]) * global_scale`
+
+import from "gradus:quant/fp_primitives" let fp
+
+@ public
+union DualScaledFp4Error {
+    @ shared
+    string message
+
+    BadConfig,
+    BadShape,
+    BadPack,
+    BadScale
+}
+
+@ public
+union PackKind {
+    PackU8,
+    PackU32
+}
+
+@ public
+class DualScaledFp4Spec {
+    let int out_features
+    let int in_features
+    let int group_size
+    let PackKind pack
+    let int packed_cols
+    let int group_cols
+}
+
+@ public
+fn admit_spec(int out_features, int in_features, int group_size, PackKind pack) → DualScaledFp4Spec ⇥ DualScaledFp4Error {
+    require out_features ≥ 1 throw variant BadShape { message = "out_features must be at least 1" }
+    require in_features ≥ 1 throw variant BadShape { message = "in_features must be at least 1" }
+    require group_size ≥ 1 throw variant BadConfig { message = "group_size must be at least 1" }
+    require in_features % group_size ≡ 0 throw variant BadShape { message = "in_features must be divisible by group_size" }
+
+    mut int packed_cols ← 0
+
+    match pack {
+        case PackU8 {
+            require in_features % 2 ≡ 0 throw variant BadShape { message = "in_features must be divisible by 2 for u8 E2M1 packing" }
+            packed_cols ← in_features / 2
+        }
+        case PackU32 {
+            require in_features % 8 ≡ 0 throw variant BadShape { message = "in_features must be divisible by 8 for u32 E2M1 packing" }
+            packed_cols ← in_features / 8
+        }
+    }
+
+    let int group_cols ← in_features / group_size
+    return DualScaledFp4Spec {
+        out_features = out_features,
+        in_features = in_features,
+        group_size = group_size,
+        pack = pack,
+        packed_cols = packed_cols,
+        group_cols = group_cols
+    }
+}
+
+@ public
+fn admit_nvfp4_spec(int out_features, int in_features, PackKind pack) → DualScaledFp4Spec ⇥ DualScaledFp4Error {
+    return admit_spec(out_features, in_features, 16, pack)
+}
+
+@ public
+fn admit_modelopt_global_scale(f32 amax, f32 outer_scale_denominator) → f32 ⇥ DualScaledFp4Error {
+    require amax ≡ amax and amax ≥ (0.0 ∷ f32) throw variant BadScale { message = "amax must be finite and non-negative" }
+    require outer_scale_denominator ≡ outer_scale_denominator and outer_scale_denominator ≻ (0.0 ∷ f32) throw variant BadScale { message = "outer_scale_denominator must be finite and positive" }
+    return amax / outer_scale_denominator
+}
+
+# -------------------------------------------------------------------------
+# Typed host reference decode and GEMV
+# -------------------------------------------------------------------------
+
+@ public
+fn ref_dequantize_u8(DualScaledFp4Spec spec, list<u8> weight, list<u8> scales, f32 global_scale) → list<f32> ⇥ DualScaledFp4Error {
+    match spec.pack {
+        case PackU8 {
+            pass
+        }
+        default {
+            throw variant BadPack { message = "expected PackU8 spec" }
+        }
+    }
+
+    require weight.length() ≡ spec.out_features * spec.packed_cols throw variant BadShape { message = "weight length mismatch" }
+    require scales.length() ≡ spec.out_features * spec.group_cols throw variant BadShape { message = "scales length mismatch" }
+
+    mut list<f32> out ← empty
+
+    for exclusive spec.out_features let r {
+        let int w_base ← r * spec.packed_cols
+        let int s_base ← r * spec.group_cols
+
+        for exclusive spec.in_features let j {
+            let u8 packed ← weight[w_base + (j / 2)]
+            let f32 q ← (j % 2 ≡ 0) ✓ fp.e2m1x2_lo(packed) ✗ fp.e2m1x2_hi(packed)
+            let f32 local_s ← fp.fp8_e4m3(scales[s_base + (j / spec.group_size)])
+            out.append(q * local_s * global_scale)
+        }
+    }
+
+    return out
+}
+
+@ public
+fn ref_dequantize_modelopt_u8(DualScaledFp4Spec spec, list<u8> weight, list<u8> scales, f32 amax, f32 outer_scale_denominator) → list<f32> ⇥ DualScaledFp4Error {
+    let f32 global_scale ← admit_modelopt_global_scale(amax, outer_scale_denominator)
+    return ref_dequantize_u8(spec, weight, scales, global_scale)
+}
+
+@ public
+fn ref_dequantize_u32(DualScaledFp4Spec spec, list<u32> weight, list<u8> scales, f32 global_scale) → list<f32> ⇥ DualScaledFp4Error {
+    match spec.pack {
+        case PackU32 {
+            pass
+        }
+        default {
+            throw variant BadPack { message = "expected PackU32 spec" }
+        }
+    }
+
+    require weight.length() ≡ spec.out_features * spec.packed_cols throw variant BadShape { message = "weight length mismatch" }
+    require scales.length() ≡ spec.out_features * spec.group_cols throw variant BadShape { message = "scales length mismatch" }
+
+    mut list<f32> out ← empty
+
+    for exclusive spec.out_features let r {
+        let int w_base ← r * spec.packed_cols
+        let int s_base ← r * spec.group_cols
+
+        for exclusive spec.in_features let j {
+            let int word_idx ← j / 8
+            let int shift ← (j % 8) * 4
+            let int word ← weight[w_base + word_idx] ↦ int
+            let u8 nib ← ((word ⇒ shift) ∧ 15) ↦ wrapping<u8>
+            let f32 q ← fp.e2m1(nib)
+            let f32 local_s ← fp.fp8_e4m3(scales[s_base + (j / spec.group_size)])
+            out.append(q * local_s * global_scale)
+        }
+    }
+
+    return out
+}
+
+@ public
+fn ref_matvec(int out_features, int in_features, list<f32> w_dense, list<f32> x) → list<f32> ⇥ DualScaledFp4Error {
+    require w_dense.length() ≡ out_features * in_features throw variant BadShape { message = "dense weight length mismatch" }
+    require x.length() ≡ in_features throw variant BadShape { message = "input vector length mismatch" }
+
+    mut list<f32> y ← empty
+
+    for exclusive out_features let r {
+        mut f32 acc ← 0.0 ∷ f32
+        let int base ← r * in_features
+
+        for exclusive in_features let j {
+            acc ← acc + w_dense[base + j] * x[j]
+        }
+
+        y.append(acc)
+    }
+
+    return y
+}
+
+# -------------------------------------------------------------------------
+# Shape-generic @ kernel packed GEMV contractions (CPU + Metal)
+# -------------------------------------------------------------------------
+
+@ public
+kernel linear_matvec_u8<size Out, size PackedIn, size Groups, size In>(tensor<u8, [Out, PackedIn]> weight, tensor<u8, [Out, Groups]> scales, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, f32 global_scale, i32 group_size) → void {
+    for from y at [row] thread lane let e {
+        if group_size ≥ 1 and group_size ≤ 4096 {
+            let i32 rr ← (row ↦ i32) ∧ 65535
+            mut f32 acc ← 0.0 ∷ f32
+
+            for exclusive In let j {
+                let i32 ji ← (j ↦ i32) ∧ 65535
+                let i32 g ← (ji / group_size) ∧ 4095
+                let u8 packed ← weight[[rr, (ji / 2) ∧ 65535]]
+                mut i32 nib ← 0
+
+                if ji % 2 ≡ 0 {
+                    nib ← (packed ↦ i32) ∧ 15
+                }
+                else {
+                    nib ← ((packed ↦ i32) ⇒ 4) ∧ 15
+                }
+
+                let i32 q_sign ← (nib ⇒ 3) ∧ 1
+                let i32 q_mag_bits ← nib ∧ 7
+                mut f32 q ← 0.0 ∷ f32
+
+                if q_mag_bits ≡ 0 {
+                    q ← 0.0 ∷ f32
+                }
+                elif q_mag_bits ≡ 1 {
+                    q ← 0.5 ∷ f32
+                }
+                elif q_mag_bits ≡ 2 {
+                    q ← 1.0 ∷ f32
+                }
+                elif q_mag_bits ≡ 3 {
+                    q ← 1.5 ∷ f32
+                }
+                elif q_mag_bits ≡ 4 {
+                    q ← 2.0 ∷ f32
+                }
+                elif q_mag_bits ≡ 5 {
+                    q ← 3.0 ∷ f32
+                }
+                elif q_mag_bits ≡ 6 {
+                    q ← 4.0 ∷ f32
+                }
+                else {
+                    q ← 6.0 ∷ f32
+                }
+
+                if q_sign ≡ 1 {
+                    q ← -q
+                }
+
+                let i32 sb ← scales[[rr, g]] ↦ i32
+                let i32 s_sign ← (sb ⇒ 7) ∧ 1
+                let i32 s_exp ← (sb ⇒ 3) ∧ 15
+                let i32 s_mant ← sb ∧ 7
+                mut f32 local_s ← 0.0 ∷ f32
+
+                if s_exp ≡ 15 and s_mant ≡ 7 {
+                    local_s ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                }
+                else {
+                    if s_exp ≡ 0 {
+                        local_s ← (s_mant ↦ f32) * (0.001953125 ∷ f32)
+                    }
+                    else {
+                        mut f32 pow2 ← 0.0078125 ∷ f32
+                        if (s_exp ∧ 1) ≢ 0 {
+                            pow2 ← pow2 * (2.0 ∷ f32)
+                        }
+                        if (s_exp ∧ 2) ≢ 0 {
+                            pow2 ← pow2 * (4.0 ∷ f32)
+                        }
+                        if (s_exp ∧ 4) ≢ 0 {
+                            pow2 ← pow2 * (16.0 ∷ f32)
+                        }
+                        if (s_exp ∧ 8) ≢ 0 {
+                            pow2 ← pow2 * (256.0 ∷ f32)
+                        }
+                        let f32 frac ← (1.0 ∷ f32) + (s_mant ↦ f32) * (0.125 ∷ f32)
+                        local_s ← pow2 * frac
+                    }
+
+                    if s_sign ≡ 1 {
+                        local_s ← -local_s
+                    }
+                }
+
+                let f32 w ← q * local_s * global_scale
+                acc ← acc + w * x[[ji]]
+            }
+
+            y[[row]] ← acc
+        }
+    }
+}
+
+@ public
+kernel linear_matvec_modelopt_u8<size Out, size PackedIn, size Groups, size In>(tensor<u8, [Out, PackedIn]> weight, tensor<u8, [Out, Groups]> scales, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, f32 amax, f32 outer_scale_denominator, i32 group_size) → void {
+    let f32 global_scale ← amax / outer_scale_denominator
+
+    for from y at [row] thread lane let e {
+        if group_size ≥ 1 and group_size ≤ 4096 {
+            let i32 rr ← (row ↦ i32) ∧ 65535
+            mut f32 acc ← 0.0 ∷ f32
+
+            for exclusive In let j {
+                let i32 ji ← (j ↦ i32) ∧ 65535
+                let i32 g ← (ji / group_size) ∧ 4095
+                let u8 packed ← weight[[rr, (ji / 2) ∧ 65535]]
+                mut i32 nib ← 0
+
+                if ji % 2 ≡ 0 {
+                    nib ← (packed ↦ i32) ∧ 15
+                }
+                else {
+                    nib ← ((packed ↦ i32) ⇒ 4) ∧ 15
+                }
+
+                let i32 q_sign ← (nib ⇒ 3) ∧ 1
+                let i32 q_mag_bits ← nib ∧ 7
+                mut f32 q ← 0.0 ∷ f32
+
+                if q_mag_bits ≡ 0 {
+                    q ← 0.0 ∷ f32
+                }
+                elif q_mag_bits ≡ 1 {
+                    q ← 0.5 ∷ f32
+                }
+                elif q_mag_bits ≡ 2 {
+                    q ← 1.0 ∷ f32
+                }
+                elif q_mag_bits ≡ 3 {
+                    q ← 1.5 ∷ f32
+                }
+                elif q_mag_bits ≡ 4 {
+                    q ← 2.0 ∷ f32
+                }
+                elif q_mag_bits ≡ 5 {
+                    q ← 3.0 ∷ f32
+                }
+                elif q_mag_bits ≡ 6 {
+                    q ← 4.0 ∷ f32
+                }
+                else {
+                    q ← 6.0 ∷ f32
+                }
+
+                if q_sign ≡ 1 {
+                    q ← -q
+                }
+
+                let i32 sb ← scales[[rr, g]] ↦ i32
+                let i32 s_sign ← (sb ⇒ 7) ∧ 1
+                let i32 s_exp ← (sb ⇒ 3) ∧ 15
+                let i32 s_mant ← sb ∧ 7
+                mut f32 local_s ← 0.0 ∷ f32
+
+                if s_exp ≡ 15 and s_mant ≡ 7 {
+                    local_s ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                }
+                else {
+                    if s_exp ≡ 0 {
+                        local_s ← (s_mant ↦ f32) * (0.001953125 ∷ f32)
+                    }
+                    else {
+                        mut f32 pow2 ← 0.0078125 ∷ f32
+                        if (s_exp ∧ 1) ≢ 0 {
+                            pow2 ← pow2 * (2.0 ∷ f32)
+                        }
+                        if (s_exp ∧ 2) ≢ 0 {
+                            pow2 ← pow2 * (4.0 ∷ f32)
+                        }
+                        if (s_exp ∧ 4) ≢ 0 {
+                            pow2 ← pow2 * (16.0 ∷ f32)
+                        }
+                        if (s_exp ∧ 8) ≢ 0 {
+                            pow2 ← pow2 * (256.0 ∷ f32)
+                        }
+                        let f32 frac ← (1.0 ∷ f32) + (s_mant ↦ f32) * (0.125 ∷ f32)
+                        local_s ← pow2 * frac
+                    }
+
+                    if s_sign ≡ 1 {
+                        local_s ← -local_s
+                    }
+                }
+
+                let f32 w ← q * local_s * global_scale
+                acc ← acc + w * x[[ji]]
+            }
+
+            y[[row]] ← acc
+        }
+    }
+}
+
+@ public
+kernel linear_matvec_u32<size Out, size PackedIn, size Groups, size In>(tensor<u32, [Out, PackedIn]> weight, tensor<u8, [Out, Groups]> scales, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, f32 global_scale, i32 group_size) → void {
+    for from y at [row] thread lane let e {
+        if group_size ≥ 1 and group_size ≤ 4096 {
+            let i32 rr ← (row ↦ i32) ∧ 65535
+            mut f32 acc ← 0.0 ∷ f32
+
+            for exclusive In let j {
+                let i32 ji ← (j ↦ i32) ∧ 65535
+                let i32 g ← (ji / group_size) ∧ 4095
+                let i32 word_idx ← (ji / 8) ∧ 65535
+                let i32 nib_lane ← ji % 8
+                let u32 w0 ← weight[[rr, word_idx]]
+                mut u32 nib_u32 ← 0 ∷ u32
+
+                if nib_lane ≡ 0 {
+                    nib_u32 ← w0 ∧ (15 ∷ u32)
+                }
+                elif nib_lane ≡ 1 {
+                    nib_u32 ← (w0 ⇒ (4 ∷ u32)) ∧ (15 ∷ u32)
+                }
+                elif nib_lane ≡ 2 {
+                    nib_u32 ← (w0 ⇒ (8 ∷ u32)) ∧ (15 ∷ u32)
+                }
+                elif nib_lane ≡ 3 {
+                    nib_u32 ← (w0 ⇒ (12 ∷ u32)) ∧ (15 ∷ u32)
+                }
+                elif nib_lane ≡ 4 {
+                    nib_u32 ← (w0 ⇒ (16 ∷ u32)) ∧ (15 ∷ u32)
+                }
+                elif nib_lane ≡ 5 {
+                    nib_u32 ← (w0 ⇒ (20 ∷ u32)) ∧ (15 ∷ u32)
+                }
+                elif nib_lane ≡ 6 {
+                    nib_u32 ← (w0 ⇒ (24 ∷ u32)) ∧ (15 ∷ u32)
+                }
+                else {
+                    nib_u32 ← (w0 ⇒ (28 ∷ u32)) ∧ (15 ∷ u32)
+                }
+
+                let i32 nib ← nib_u32 ↦ wrapping<i32>
+                let i32 q_sign ← (nib ⇒ 3) ∧ 1
+                let i32 q_mag_bits ← nib ∧ 7
+                mut f32 q ← 0.0 ∷ f32
+
+                if q_mag_bits ≡ 0 {
+                    q ← 0.0 ∷ f32
+                }
+                elif q_mag_bits ≡ 1 {
+                    q ← 0.5 ∷ f32
+                }
+                elif q_mag_bits ≡ 2 {
+                    q ← 1.0 ∷ f32
+                }
+                elif q_mag_bits ≡ 3 {
+                    q ← 1.5 ∷ f32
+                }
+                elif q_mag_bits ≡ 4 {
+                    q ← 2.0 ∷ f32
+                }
+                elif q_mag_bits ≡ 5 {
+                    q ← 3.0 ∷ f32
+                }
+                elif q_mag_bits ≡ 6 {
+                    q ← 4.0 ∷ f32
+                }
+                else {
+                    q ← 6.0 ∷ f32
+                }
+
+                if q_sign ≡ 1 {
+                    q ← -q
+                }
+
+                let i32 sb ← scales[[rr, g]] ↦ i32
+                let i32 s_sign ← (sb ⇒ 7) ∧ 1
+                let i32 s_exp ← (sb ⇒ 3) ∧ 15
+                let i32 s_mant ← sb ∧ 7
+                mut f32 local_s ← 0.0 ∷ f32
+
+                if s_exp ≡ 15 and s_mant ≡ 7 {
+                    local_s ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                }
+                else {
+                    if s_exp ≡ 0 {
+                        local_s ← (s_mant ↦ f32) * (0.001953125 ∷ f32)
+                    }
+                    else {
+                        mut f32 pow2 ← 0.0078125 ∷ f32
+                        if (s_exp ∧ 1) ≢ 0 {
+                            pow2 ← pow2 * (2.0 ∷ f32)
+                        }
+                        if (s_exp ∧ 2) ≢ 0 {
+                            pow2 ← pow2 * (4.0 ∷ f32)
+                        }
+                        if (s_exp ∧ 4) ≢ 0 {
+                            pow2 ← pow2 * (16.0 ∷ f32)
+                        }
+                        if (s_exp ∧ 8) ≢ 0 {
+                            pow2 ← pow2 * (256.0 ∷ f32)
+                        }
+                        let f32 frac ← (1.0 ∷ f32) + (s_mant ↦ f32) * (0.125 ∷ f32)
+                        local_s ← pow2 * frac
+                    }
+
+                    if s_sign ≡ 1 {
+                        local_s ← -local_s
+                    }
+                }
+
+                let f32 w ← q * local_s * global_scale
+                acc ← acc + w * x[[ji]]
+            }
+
+            y[[row]] ← acc
+        }
+    }
+}
+
++++ faber test
+import from "gradus:quant/dual_scaled_fp4" let fp4
+
+fn close(f32 a, f32 b) → bool {
+    let f32 diff ← (a - b).abs()
+    let f32 tol ← (1.0e-5 ∷ f32) + (1.0e-4 ∷ f32) * b.abs()
+    return diff ≤ tol
+}
+
+fn spec_result(int o, int i, int g, fp4.PackKind p) → string {
+    do {
+        fp4.admit_spec(o, i, g, p)
+        return "ok"
+    }
+    catch err {
+        return err.message
+    }
+}
+
+test "DualScaledFp4 spec validates shape, group, and pack divisibility fail-closed" {
+    assert spec_result(4, 16, 16, variant fp4.PackKind.PackU8) ≡ "ok"
+    assert spec_result(4, 16, 16, variant fp4.PackKind.PackU32) ≡ "ok"
+    assert spec_result(4, 15, 15, variant fp4.PackKind.PackU8) ≡ "in_features must be divisible by 2 for u8 E2M1 packing"
+    assert spec_result(4, 12, 4, variant fp4.PackKind.PackU32) ≡ "in_features must be divisible by 8 for u32 E2M1 packing"
+    assert spec_result(4, 16, 6, variant fp4.PackKind.PackU8) ≡ "in_features must be divisible by group_size"
+}
+
+test "DualScaledFp4 raw ModelOpt u8 (group-16) ref decode and kernel matvec match" {
+    # Out=2, In=16, group_size=16 -> PackedIn=8 u8s, Groups=1
+    # amax=134.4, outer_scale_denominator=2688.0 -> global_scale = 0.05
+    # Row 0: scale=0x38 (1.0), nibbles: [0,1,2,3, 4,5,6,7, 8,9,10,11, 12,13,14,15]
+    #   packed bytes: 0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe
+    # Row 1: scale=0xC0 (-2.0), nibbles: [7,6,5,4, 3,2,1,0, 15,14,13,12, 11,10,9,8]
+    #   packed bytes: 0x67, 0x45, 0x23, 0x01, 0xef, 0xcd, 0xab, 0x89
+    let list<u8> w_list ← [
+        0x10 ∷ u8, 0x32 ∷ u8, 0x54 ∷ u8, 0x76 ∷ u8, 0x98 ∷ u8, 0xba ∷ u8, 0xdc ∷ u8, 0xfe ∷ u8,
+        0x67 ∷ u8, 0x45 ∷ u8, 0x23 ∷ u8, 0x01 ∷ u8, 0xef ∷ u8, 0xcd ∷ u8, 0xab ∷ u8, 0x89 ∷ u8
+    ]
+    let list<u8> s_list ← [0x38 ∷ u8, 0xc0 ∷ u8]
+    let f32 amax ← 134.4 ∷ f32
+    let f32 denom ← 2688.0 ∷ f32
+    mut list<f32> x_list ← empty
+    for exclusive 16 let j {
+        x_list.append(((j ↦ f32) - 7.5 ∷ f32) * (0.25 ∷ f32))
+    }
+
+    do {
+        let fp4.DualScaledFp4Spec spec ← fp4.admit_nvfp4_spec(2, 16, variant fp4.PackKind.PackU8)
+        let list<f32> w_dense ← fp4.ref_dequantize_modelopt_u8(spec, w_list, s_list, amax, denom)
+        let list<f32> y_ref ← fp4.ref_matvec(2, 16, w_dense, x_list)
+
+        mut tensor<u8, [2, 8]> w_t ← tu8[2, 8] {}
+        for exclusive 2 let r {
+            for exclusive 8 let c {
+                w_t[[r, c]] ← w_list[r * 8 + c]
+            }
+        }
+        mut tensor<u8, [2, 1]> s_t ← tu8[2, 1] {}
+        s_t[[0, 0]] ← 0x38 ∷ u8
+        s_t[[1, 0]] ← 0xc0 ∷ u8
+        mut tensor<f32, [16]> x_t ← tf32[16] {}
+        for exclusive 16 let j {
+            x_t[[j]] ← x_list[j]
+        }
+        mut tensor<f32, [2]> y_k ← tf32[2] {}
+
+        fp4.linear_matvec_modelopt_u8(w_t, s_t, x_t, mut y_k, amax, denom, 16)
+        assert close(y_k[[0]], y_ref[0])
+        assert close(y_k[[1]], y_ref[1])
+
+        mut tensor<f32, [2]> y_k2 ← tf32[2] {}
+        let f32 gs ← fp4.admit_modelopt_global_scale(amax, denom)
+        fp4.linear_matvec_u8(w_t, s_t, x_t, mut y_k2, gs, 16)
+        assert close(y_k2[[0]], y_ref[0])
+        assert close(y_k2[[1]], y_ref[1])
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "DualScaledFp4 MLX-converted u32 (Inkling L0-19) ref decode and kernel matvec match" {
+    # Out=2, In=16, group_size=8 -> PackedIn=2 u32s, Groups=2
+    let u32 r0w0 ← 0x76543210 ∷ u32
+    let u32 r0w1 ← 0xfedcba98 ∷ u32
+    let u32 r1w0 ← 0x01234567 ∷ u32
+    let u32 r1w1 ← 0x89abcdef ∷ u32
+    let list<u32> w_list ← [r0w0, r0w1, r1w0, r1w1]
+    let list<u8> s_list ← [0x38 ∷ u8, 0x3c ∷ u8, 0xb8 ∷ u8, 0x40 ∷ u8]
+    let f32 global_scale ← 0.125 ∷ f32
+    mut list<f32> x_list ← empty
+    for exclusive 16 let j {
+        x_list.append(((j ↦ f32) - 5.0 ∷ f32) * (0.5 ∷ f32))
+    }
+
+    do {
+        let fp4.DualScaledFp4Spec spec ← fp4.admit_spec(2, 16, 8, variant fp4.PackKind.PackU32)
+        let list<f32> w_dense ← fp4.ref_dequantize_u32(spec, w_list, s_list, global_scale)
+        let list<f32> y_ref ← fp4.ref_matvec(2, 16, w_dense, x_list)
+
+        mut tensor<u32, [2, 2]> w_t ← tu32[2, 2] {}
+        w_t[[0, 0]] ← r0w0
+        w_t[[0, 1]] ← r0w1
+        w_t[[1, 0]] ← r1w0
+        w_t[[1, 1]] ← r1w1
+        mut tensor<u8, [2, 2]> s_t ← tu8[2, 2] {}
+        s_t[[0, 0]] ← 0x38 ∷ u8
+        s_t[[0, 1]] ← 0x3c ∷ u8
+        s_t[[1, 0]] ← 0xb8 ∷ u8
+        s_t[[1, 1]] ← 0x40 ∷ u8
+        mut tensor<f32, [16]> x_t ← tf32[16] {}
+        for exclusive 16 let j {
+            x_t[[j]] ← x_list[j]
+        }
+        mut tensor<f32, [2]> y_k ← tf32[2] {}
+
+        fp4.linear_matvec_u32(w_t, s_t, x_t, mut y_k, global_scale, 8)
+        assert close(y_k[[0]], y_ref[0])
+        assert close(y_k[[1]], y_ref[1])
+    }
+    catch err {
+        assert false
+    }
+}
