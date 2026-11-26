@@ -57,10 +57,12 @@ locale = "en"
 #                valid() is the non-failable consistency predicate.
 # element access — get(indices) with rank / negative / bounds checks and
 #                row-major flat offset computation.
-# stride cache  — W0 perf rider: the row-major stride vector and the element
-#                count are computed ONCE at construction and cached on the
-#                block; get()/numel() read the cache instead of re-walking
-#                the shape per call.
+# stride cache  — W0 perf rider, superseded by the issue #80 lazy-strides
+#                posture: the element count stays cached on the block, but
+#                the stride VECTOR is never materialized — get() derives
+#                each per-position stride inline (the same running-quotient
+#                arithmetic), so intermediate ops that never call get()
+#                allocate nothing.
 #
 # Materialization: a validated NumericBlock is turned into a typed compiler tensor
 # by the consumer, which pins the static shape:
@@ -156,9 +158,13 @@ class NumericBlock {
     mut list<int> shape
     mut list<f32> data
     # Element count (product of dimension sizes; [] → 1). Cached at
-    # construction (W0 stride-cache rider) — the shape walk runs once per
-    # block, not once per call.
+    # construction (W0 rider) — the shape walk runs once per block, not
+    # once per call.
     mut int numel
+    # Stride-vector slot, kept for class-layout stability. Always staged
+    # empty (issue #80 lazy-strides rider): get() derives each stride
+    # inline, so no construction allocates a stride list. Re-tag literals
+    # in consumer modules copy this field through unchanged.
     mut list<int> strides
 
     # Rank (number of dimensions).
@@ -180,15 +186,19 @@ class NumericBlock {
 
     # Element access — validated, typed errors. Rank must match the shape;
     # each index must be non-negative and strictly inside its dimension.
-    # Flat offset is the row-major dot of indices with the cached stride
-    # vector (W0): identical arithmetic to the former per-call stride walk,
-    # without re-deriving strides from the shape on every get.
+    # Flat offset is the row-major dot of indices with per-position strides
+    # derived on the fly (issue #80 lazy-strides rider): the running
+    # quotient numel / prod(dims[0..=i]) IS strides[i], so get() computes
+    # identical arithmetic to the former stride-vector read without any
+    # materialized stride list. Construction stages no stride vector at
+    # all — intermediate ops that never call get() allocate nothing.
     fn get(list<int> indices) → f32 ⇥ TensorError {
         require self.numel ≢ 0 throw variant IndexOutOfBounds { message = "empty tensor" }
 
         require indices.length() ≡ self.shape.length() throw variant IndexOutOfBounds { message = "index rank mismatch" }
 
         mut int flat ← 0
+        mut int stride ← self.numel
         mut int i ← 0
 
         for from indices let idx {
@@ -200,7 +210,14 @@ class NumericBlock {
 
             require idx ≺ dim throw variant IndexOutOfBounds { message = "index out of bounds" }
 
-            flat ← flat + idx * self.strides.get(i) coalesce 1
+            if dim ≻ 0 {
+                stride ← stride / dim
+            }
+            else {
+                stride ← 0
+            }
+
+            flat ← flat + idx * stride
             i ← i + 1
         }
 
@@ -220,26 +237,10 @@ class NumericBlock {
 
 # Row-major stride vector for a shape given its element product:
 # strides[i] = product of dimensions strictly after i (rank-0 → []).
-# A zero dimension zeroes the remaining strides; such blocks have
-# element count 0, so get() fails closed on them before any stride is
-# read (division by zero never runs).
-fn strides(list<int> shape, int product) → list<int> {
-    mut list<int> strides ← empty
-    mut int stride ← product
-
-    for from shape let dim {
-        if dim ≻ 0 {
-            stride ← stride / dim
-        }
-        else {
-            stride ← 0
-        }
-
-        strides.append(stride)
-    }
-
-    return strides
-}
+# RETIRED as a materialized cache (issue #80 lazy-strides rider): every
+# construction used to allocate this list even though intermediate ops
+# never read it — get() now derives each stride inline (same running
+# quotient arithmetic), and all constructors stage `strides = empty`.
 
 # Zero-shape Default for `var NumericBlock` bindings (varia on structs).
 # Empty rank-0 carrier: F32 tag, [] shape, empty data. Not a validated
@@ -267,7 +268,7 @@ fn construct_f32(list<f32> data, list<int> shape) → NumericBlock ⇥ TensorErr
 
     require data.length() ≡ product throw variant ElementMismatch { message = "element count mismatch" }
 
-    return NumericBlock { dtype = dtype.f32(), shape = shape, data = data, numel = product, strides = strides(shape, product) }
+    return NumericBlock { dtype = dtype.f32(), shape = shape, data = data, numel = product, strides = empty }
 }
 
 # Build a NumericBlock filled with one value over a runtime shape.
@@ -281,16 +282,18 @@ fn fill(list<int> shape, f32 payload) → NumericBlock ⇥ TensorError {
         data.append(payload)
     }
 
-    return NumericBlock { dtype = dtype.f32(), shape = shape, data = data, numel = product, strides = strides(shape, product) }
+    return NumericBlock { dtype = dtype.f32(), shape = shape, data = data, numel = product, strides = empty }
 }
 
 # Stage an explicitly decoded F32 NumericBlock from TRUSTED parts (W0
 # carrier/admissions ruling):
 # a producer that has just built `data` to match `shape` (internal math/
-# nn/attention/moe output sites). Computes the stride/count cache; performs
-# NO validation — the producer's shape arithmetic is the admission. This
-# is the library-internal staging seam, not an entry point for external
-# data: external data enters only through construct/construct_f32/fill.
+# nn/attention/moe output sites). Computes the count cache only — strides
+# stay lazy (issue #80: no stride-list allocation on intermediate ops);
+# performs NO validation — the producer's shape arithmetic is the
+# admission. This is the library-internal staging seam, not an entry
+# point for external data: external data enters only through
+# construct/construct_f32/fill.
 @ public
 fn stage_f32(list<int> shape, list<f32> data) → NumericBlock {
     mut int product ← 1
@@ -304,7 +307,7 @@ fn stage_f32(list<int> shape, list<f32> data) → NumericBlock {
         }
     }
 
-    return NumericBlock { dtype = dtype.f32(), shape = shape, data = data, numel = product, strides = strides(shape, product) }
+    return NumericBlock { dtype = dtype.f32(), shape = shape, data = data, numel = product, strides = empty }
 }
 
 +++ faber test

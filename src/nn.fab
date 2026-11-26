@@ -50,9 +50,10 @@ locale = "en"
 #                      (llama.cpp LLM_NORM_RMS; ε explicit, llama default
 #                      1e-5).
 #   gather(table,ids) = rows of table [V, D] at the token ids → [T, D].
-#                      Production row is the typed gather<T,V,D> (MMG-C2);
-#                      gather_carrier stays the staged runtime-shape
-#                      residual. Not @ kernel (list loop + pin).
+#                      Production row is the typed gather<T,V,D> (MMG-C2),
+#                      lowered through the gather_rows @ kernel since
+#                      issue #80; gather_carrier stays the staged
+#                      runtime-shape residual.
 #   transpose(t)      = bag stand-in for `.transpose()` / `ᵀ`. Runtime
 #                      [rows, cols] cannot pin (SEM014). Production name
 #                      is transpose_carrier.
@@ -74,14 +75,13 @@ locale = "en"
 #     shape-size substitutions). The typed
 #     `gather<size T, size V, size D>(tensor<f32, [V, D]>, list<int>)
 #     → tensor<f32, [T, D]> ⇥ NnError` twin is LANDED below in the U9
-#     branch (a) form: the body walks ids with the carrier index math on
-#     typed storage (`.get([tok, j])`) and pins the output through the
-#     `_pin_same` do/catch edge. Checks green; nn.proba rows call the
-#     twin and run green on the F1 binary — the U9 package-wide
-#     monomorphization block (3→5 blocked) did NOT recur. The SEM016
-#     note above is superseded: the typed twin is the production row;
-#     gather_carrier stays the staged runtime-shape residual. Still not
-#     @ kernel (list loop + pin).
+#     branch (a) form; checks green, nn.proba rows call the twin and run
+#     green on the F1 binary — the U9 package-wide monomorphization
+#     block (3→5 blocked) did NOT recur. The SEM016 note above is
+#     superseded: the typed twin is the production row; gather_carrier
+#     stays the staged runtime-shape residual. Since issue #80 the body
+#     validates ids on the host, widens them to u32 id words, and lowers
+#     the row copy through the gather_rows @ kernel (table.gather).
 
 import from "gradus:dtype"
 
@@ -411,35 +411,33 @@ fn layernorm_carrier(tensor.NumericBlock x, tensor.NumericBlock scale, tensor.Nu
     mut list<f32> out ← empty
 
     # legacy-L2: staged carrier — x.data, scale.data, and offset.data are flat lists; retain indexed walks until shaped carrier migration.
+    # Fused row passes (issue #80): the mean and variance walks run as one
+    # sum / sum-of-squares pass (population variance as E[x^2] - mean^2),
+    # the row base index is hoisted once per row, and the reciprocal
+    # standard deviation is hoisted per row (a multiply, not a per-element
+    # division). The oracle rows compare within the documented tolerance.
     for range 0 ‥ rows let row {
         # legacy-L4: staged carrier — row reductions wait for a shaped reduce admission.
-        # Row mean over the feature axis.
+        let int base ← row * c
         mut f32 sum ← 0.0 ∷ f32
+        mut f32 sq ← 0.0 ∷ f32
 
         for range 0 ‥ c let col {
-            let f32 v ← x.data.get(row * c + col) coalesce 0.0 ∷ f32
+            let f32 v ← x.data.get(base + col) coalesce 0.0 ∷ f32
             sum ← sum + v
+            sq ← sq + v * v
         }
 
         let f32 mean ← sum / (c ↦ f32)
-        # Row variance (population, over the feature axis).
-        mut f32 sq ← 0.0 ∷ f32
-
-        for range 0 ‥ c let col2 {
-            let f32 v ← x.data.get(row * c + col2) coalesce 0.0 ∷ f32
-            let f32 d ← v - mean
-            sq ← sq + d * d
-        }
-
-        let f32 var ← sq / (c ↦ f32)
-        let f32 std ← √ (var + ε)
+        let f32 var ← sq / (c ↦ f32) - mean * mean
+        let f32 inv_std ← 1.0 / √ (var + ε)
 
         # Normalize + per-feature affine.
-        for range 0 ‥ c let col3 {
-            let f32 v ← x.data.get(row * c + col3) coalesce 0.0 ∷ f32
-            let f32 s ← scale.data.get(col3) coalesce 0.0 ∷ f32
-            let f32 o ← offset.data.get(col3) coalesce 0.0 ∷ f32
-            out.append((v - mean) / std * s + o)
+        for range 0 ‥ c let col2 {
+            let f32 v ← x.data.get(base + col2) coalesce 0.0 ∷ f32
+            let f32 s ← scale.data.get(col2) coalesce 0.0 ∷ f32
+            let f32 o ← offset.data.get(col2) coalesce 0.0 ∷ f32
+            out.append((v - mean) * inv_std * s + o)
         }
     }
 
@@ -464,9 +462,10 @@ kernel swiglu_hidden<size T, size F>(tensor<f32, [T, F]> gate, tensor<f32, [T, F
 
 # -------------------------------------------------------------------------
 # Family: gather — embedding row lookup. table [V, D] and T token ids
-# produce [T, D]. Not @ kernel (list loop + pin). gather<T,V,D> below is
-# the typed production row (MMG-C2; SEM016 superseded); the carrier stays
-# for runtime-shape callers.
+# produce [T, D]. The typed row lowers through the gather_rows @ kernel
+# (issue #80): one table.gather launch over the id words replaces the
+# former per-element [tok, j] host walk. gather_carrier stays the staged
+# runtime-shape residual for NumericBlock callers.
 # -------------------------------------------------------------------------
 
 @ public
@@ -490,30 +489,36 @@ fn gather_carrier(tensor.NumericBlock table, list<int> ids) → tensor.NumericBl
     return tensor.stage_f32([ids.length(), d], out)
 }
 
-# gather<T,V,D> — the typed production row (MMG-C2, U9 branch (a) form).
-# Walks ids with the carrier index math on typed storage; T binds from
-# the destination/explicit type arguments (the ids list carries no
-# shape). V/D stay type witnesses — the walk reads its bounds from the
-# table's own shape (size params are not values). The output pins
-# through the `_pin_same` do/catch edge (dense.fab pattern) so a
-# row-count mismatch is a typed NnError.
+# gather_rows — the device row (issue #80): the compact id words read the
+# selected rows of the resident table in one gather launch (the
+# kernel.fab embedding_gather form, generalized to T ids).
+@ public
+kernel gather_rows<size T, size V, size D>(tensor<f32, [V, D]> table, tensor<u32, [T]> ids) → tensor<f32, [T, D]> {
+    return table.gather(ids)
+}
+
+# gather<T,V,D> — the typed production row (MMG-C2, U9 branch (a) form),
+# kernel-lowered since issue #80: ids are validated in order on the host,
+# widened to id words, and the row copy runs as the gather_rows kernel
+# (table.gather). T binds from the destination/explicit type arguments
+# (the ids list carries no shape); the words-to-tensor conversion is the
+# `_pin_same` do/catch edge (dense.fab pattern) so a row-count mismatch
+# is a typed NnError.
 @ public
 fn gather<size T, size V, size D>(tensor<f32, [V, D]> table, list<int> ids) → tensor<f32, [T, D]> ⇥ NnError {
     let list<int, size 2> dims ← table.shape()
     let int v ← dims.get(0) coalesce 1
-    let int d ← dims.get(1) coalesce 1
-    mut list<f32> out ← empty
+    mut list<u32> words ← empty
 
     for from ids let tok {
         reject tok ≺ 0 or tok ≥ v throw variant IndexOutOfBounds { message = "token id out of range for the embedding" }
 
-        for range 0 ‥ d let j {
-            out.append(table.get([tok, j]) ⊥ 0.0)
-        }
+        words.append(tok ↦ u32 ⊥ 0)
     }
 
     do {
-        return out ↦ tensor<f32, [T, D]>
+        let tensor<u32, [T]> id_words ← words ↦ tensor<u32, [T]>
+        return gather_rows<size T, size V, size D>(table, id_words)
     }
     catch conv {
         throw variant ShapeMismatch { message = "gather row count does not pin the output shape" }
@@ -649,6 +654,10 @@ fn swiglu<size T, size F, size N>(tensor<f32, [T, F]> gate, tensor<f32, [T, F]> 
 
 # swiglu_carrier — load-edge staged residual. Same carrier ladder as the
 # former production swiglu; not the production name (SEM005).
+# Fused hidden pass (issue #80): h = silu(gate) ⊙ up is built in ONE
+# element walk with the same per-element arithmetic order (silu(v), then
+# the up multiply) — the former route staged silu_carrier and
+# mul_carrier as two full traversals plus two intermediate blocks.
 @ public
 fn swiglu_carrier(tensor.NumericBlock gate, tensor.NumericBlock up, tensor.NumericBlock down_weight, tensor.NumericBlock down_bias) → tensor.NumericBlock ⇥ NnError {
     dtype_f32(gate)
@@ -662,8 +671,16 @@ fn swiglu_carrier(tensor.NumericBlock gate, tensor.NumericBlock up, tensor.Numer
 
     require fg ≡ fu throw variant ShapeMismatch { message = "gate and up must share the same shape" }
 
-    let tensor.NumericBlock g ← silu_carrier(gate)
-    let tensor.NumericBlock h ← math.mul_carrier(g, up)
+    let int total ← numel_valid(fg)
+    mut list<f32> hidden ← empty
+
+    for range 0 ‥ total let i {
+        let f32 v ← gate.data.get(i) coalesce 0.0 ∷ f32
+        let f32 u ← up.data.get(i) coalesce 0.0 ∷ f32
+        hidden.append(scalar_silu(v) * u)
+    }
+
+    let tensor.NumericBlock h ← tensor.stage_f32(fg, hidden)
     return linear_carrier(h, down_weight, down_bias)
 }
 

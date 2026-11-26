@@ -37,8 +37,13 @@ locale = "en"
 #   * Registry.replace(owner, name, payload, expected_version) resolves the
 #     registered slot (including aliases), rejects stale versions, then calls
 #     guarded mutate; frozen parameters are rejected by mutate.
+#   * Registry.replace_all(updated) batch-swaps mutate-produced parameters in
+#     one registry rebuild (issue #80): per entry it resolves the slot,
+#     rejects frozen slots and non-successor versions; it changes payload
+#     bytes only through values mutate already produced.
 #   * add registers an existing payload, rejecting duplicate (owner,name); it
-#     does not change payload bytes.
+#     does not change payload bytes. from_parameters registers a whole list
+#     in one pass (same duplicate rule, no ties).
 #   * tie removes an independent slot and redirects its path; it checks distinct
 #     registered identities and matching dtype, shape, and trainability, but
 #     does not change payload bytes. These are all public payload-related paths.
@@ -403,6 +408,52 @@ fn retarget_ties(list<list<string>> ties, Parameter old_target, Parameter new_ta
     return next
 }
 
+# Alias-pass rebuilds (issue #80): append each existing slot/row into a
+# fresh list instead of `copy`-ing the whole collection. Slots are
+# value-stable (every public mutation path returns fresh Parameter
+# values; nothing writes a slot in place), so sharing them between the
+# old and new registry is the parameters_without/retarget_ties posture —
+# a single-slot update no longer deep-copies every registered payload.
+fn slots_aliased(list<Parameter> parameters) → list<Parameter> {
+    mut list<Parameter> next ← empty
+
+    for from parameters let p {
+        next.append(p)
+    }
+
+    return next
+}
+
+fn ties_aliased(list<list<string>> ties) → list<list<string>> {
+    mut list<list<string>> next ← empty
+
+    for from ties let alias {
+        next.append(alias)
+    }
+
+    return next
+}
+
+# Identity membership over a raw slot list (the from_parameters batch
+# admission below; the Registry.contains method needs a Registry).
+fn slots_contain(list<Parameter> parameters, string owner, string name) → bool {
+    for from parameters let p {
+        if p.owner() ≡ owner and p.name() ≡ name then return true
+    }
+
+    return false
+}
+
+# Identity membership over parallel owner/name lists (the replace_all
+# batch admission — canonical identities already stripped off slots).
+fn slots_contain_named(list<string> owners, list<string> names, string owner, string name) → bool {
+    for range 0 ‥ owners.length() let i {
+        if owners.get(i) coalesce "" ≡ owner and names.get(i) coalesce "" ≡ name then return true
+    }
+
+    return false
+}
+
 # -------------------------------------------------------------------------
 # Registrum — parameter collection. Enforces (owner, name) uniqueness
 # and owns the traversal order contract: trainable first, then frozen,
@@ -516,8 +567,8 @@ class Registry {
         reject current.version() ≢ expected_version throw variant StaleVersion { message = "stale parameter version" }
 
         let Parameter updated ← mutate(current, payload, current.version())
-        let list<list<string>> next_ties ← copy self.ties
-        mut list<Parameter> next ← copy self.parameters
+        let list<list<string>> next_ties ← ties_aliased(self.ties)
+        mut list<Parameter> next ← slots_aliased(self.parameters)
 
         for range 0 ‥ next.length() let i {
             let Parameter candidate ← next.get(i) coalesce default()
@@ -530,6 +581,54 @@ class Registry {
 
         throw variant UnknownName { message = "no parameter with that identity" }
     }
+
+    # Batch replace (issue #80): swap in a list of already-updated
+    # parameters (as produced by mutate / optimize.step) in ONE registry
+    # rebuild — repeated replace calls rebuilt the slot list per update,
+    # making a training step O(P^2) in deep payload copies. Each entry
+    # must resolve to a registered slot (a tied alias addresses its
+    # canonical slot), must not be frozen, must carry exactly the
+    # successor version of the current slot (the mutate contract), and
+    # the batch itself must not repeat an identity. Ties pass through
+    # unchanged.
+    fn replace_all(list<Parameter> updated) → Registry ⇥ ParameterError {
+        # Canonical identity per batch entry (a tied alias resolves to its
+        # canonical slot — the single replace rule); the same list is the
+        # duplicate admission and the slot-swap key.
+        mut list<string> batch_owners ← empty
+        mut list<string> batch_names ← empty
+
+        for from updated let u {
+            let Parameter current ← self.find(u.owner(), u.name())
+
+            reject slots_contain_named(batch_owners, batch_names, current.owner(), current.name()) throw variant DuplicateName { message = "duplicate parameter identity in batch replace" }
+
+            reject is_frozen(current) throw variant FrozenMutation { message = "frozen parameter cannot be mutated" }
+
+            reject u.version() ≢ current.version() + 1 throw variant StaleVersion { message = "stale parameter version" }
+
+            batch_owners.append(current.owner())
+            batch_names.append(current.name())
+        }
+
+        mut list<Parameter> next ← slots_aliased(self.parameters)
+
+        for range 0 ‥ batch_owners.length() let k {
+            let string owner ← batch_owners.get(k) coalesce ""
+            let string name ← batch_names.get(k) coalesce ""
+            let Parameter u ← updated.get(k) coalesce default()
+
+            for range 0 ‥ next.length() let i {
+                let Parameter candidate ← next.get(i) coalesce default()
+
+                if candidate.owner() ≡ owner and candidate.name() ≡ name {
+                    next[i] ← u
+                }
+            }
+        }
+
+        return Registry { parameters = next, ties = ties_aliased(self.ties) }
+    }
 }
 
 # Empty registry.
@@ -540,14 +639,33 @@ fn empty_registry() → Registry {
 
 # Register a parameter. Rejects a duplicate (owner, name) identity
 # (DuplicateName) — identity must resolve uniquely within an owner.
+# The slot list rebuild is the alias pass (issue #80): registration no
+# longer deep-copies every registered payload.
 @ public
 fn add(Registry r, Parameter p) → Registry ⇥ ParameterError {
     reject r.contains(p.owner(), p.name()) throw variant DuplicateName { message = "parameter identity already registered" }
 
-    mut list<Parameter> next ← copy r.parameters
+    mut list<Parameter> next ← slots_aliased(r.parameters)
     next.append(p)
-    let list<list<string>> next_ties ← copy r.ties
+    let list<list<string>> next_ties ← ties_aliased(r.ties)
     return Registry { parameters = next, ties = next_ties }
+}
+
+# Build a registry from a parameter list in one pass (issue #80): the
+# repeated add route rebuilt (and deep-copied) the accumulating slot list
+# per entry — O(P^2) over model assembly. Duplicate identities reject
+# exactly as add does; the result carries no ties.
+@ public
+fn from_parameters(list<Parameter> parameters) → Registry ⇥ ParameterError {
+    mut list<Parameter> slots ← empty
+
+    for from parameters let p {
+        reject slots_contain(slots, p.owner(), p.name()) throw variant DuplicateName { message = "parameter identity already registered" }
+
+        slots.append(p)
+    }
+
+    return Registry { parameters = slots, ties = empty }
 }
 
 # -------------------------------------------------------------------------
@@ -729,6 +847,26 @@ fn find_result(parameter.Registry r, string owner, string name) → string {
 fn replace_result(parameter.Registry r, string owner, string name, list<f32> data, int version) → string {
     do {
         let _ updated ← r.replace(owner, name, data, version)
+        return "ok"
+    }
+    catch err {
+        return err.message
+    }
+}
+
+fn replace_all_result(parameter.Registry r, list<parameter.Parameter> updated) → string {
+    do {
+        let _ next ← r.replace_all(updated)
+        return "ok"
+    }
+    catch err {
+        return err.message
+    }
+}
+
+fn from_parameters_result(list<parameter.Parameter> parameters) → string {
+    do {
+        let _ r ← parameter.from_parameters(parameters)
         return "ok"
     }
     catch err {
@@ -1206,6 +1344,73 @@ test "replace rejects frozen parameters" {
         assert replace_result(registered, "model", "weight", [2.0], 1) ≡ "frozen parameter cannot be mutated"
     }
     match trap_result_replace_frozen {
+        case returned let ? { }
+        case thrown let ? { assert false }
+    }
+}
+
+test "replace_all swaps a mutate-produced batch in one rebuild" {
+    let _ trap_result_replace_all ← trap {
+        let parameter.Parameter w ← parameter.construct("weight", "model", "f32", [2], [1.0, 2.0])
+        let parameter.Parameter b ← parameter.construct("bias", "model", "f32", [1], [0.5])
+        let parameter.Registry r ← parameter.from_parameters([w, b])
+        assert r.count() ≡ 2
+        let parameter.Parameter w2 ← parameter.mutate(w, [3.0, 4.0], w.version())
+        let parameter.Parameter b2 ← parameter.mutate(b, [1.5], b.version())
+        let parameter.Registry updated ← r.replace_all([w2, b2])
+        assert updated.count() ≡ 2
+        let parameter.Parameter w_after ← updated.find("model", "weight")
+        let parameter.Parameter b_after ← updated.find("model", "bias")
+        assert w_after.version() ≡ 2
+        assert get_f32(w_after, 0) ≡ 3.0 ∷ f32
+        assert b_after.version() ≡ 2
+        assert get_f32(b_after, 0) ≡ 1.5 ∷ f32
+        # The source registry is untouched (value semantics).
+        let parameter.Parameter w_before ← r.find("model", "weight")
+        assert w_before.version() ≡ 1
+    }
+    match trap_result_replace_all {
+        case returned let ? { }
+        case thrown let ? { assert false }
+    }
+}
+
+test "replace_all rejects non-successor versions, frozen slots, and batch duplicates" {
+    let _ trap_result_replace_all_rejects ← trap {
+        let parameter.Parameter w ← parameter.construct("weight", "model", "f32", [2], [1.0, 2.0])
+        let parameter.Parameter f ← parameter.construct_frozen("frozen", "model", "f32", [1], [1.0])
+        let parameter.Registry r ← parameter.from_parameters([w, f])
+        let parameter.Parameter w2 ← parameter.mutate(w, [3.0, 4.0], w.version())
+        # A stale entry (two mutates ahead of the registered slot).
+        let parameter.Parameter w3 ← parameter.mutate(w2, [5.0, 6.0], w2.version())
+        assert replace_all_result(r, [w3]) ≡ "stale parameter version"
+        # A frozen registered slot rejects any same-identity entry (the
+        # frozen admission precedes the version check).
+        let parameter.Parameter f_entry ← parameter.construct("frozen", "model", "f32", [1], [2.0])
+        assert replace_all_result(r, [f_entry]) ≡ "frozen parameter cannot be mutated"
+        # The same identity twice in one batch rejects.
+        assert replace_all_result(r, [w2, w2]) ≡ "duplicate parameter identity in batch replace"
+    }
+    match trap_result_replace_all_rejects {
+        case returned let ? { }
+        case thrown let ? { assert false }
+    }
+}
+
+test "from_parameters builds a registry in one pass and rejects duplicates" {
+    let _ trap_result_from_parameters ← trap {
+        let parameter.Parameter w ← parameter.construct("weight", "model", "f32", [2], [1.0, 2.0])
+        let parameter.Parameter b ← parameter.construct("bias", "model", "f32", [1], [0.5])
+        let parameter.Registry r ← parameter.from_parameters([w, b])
+        assert r.count() ≡ 2
+        assert r.contains("model", "weight")
+        assert r.contains("model", "bias")
+        let parameter.Parameter dup ← parameter.construct("weight", "model", "f32", [2], [9.0, 9.0])
+        assert from_parameters_result([w, b, dup]) ≡ "parameter identity already registered"
+        let parameter.Registry empty_case ← parameter.from_parameters([])
+        assert empty_case.count() ≡ 0
+    }
+    match trap_result_from_parameters {
         case returned let ? { }
         case thrown let ? { assert false }
     }
