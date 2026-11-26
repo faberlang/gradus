@@ -451,6 +451,58 @@ fn optional_bias((string, int) → tensor.NumericBlock ⇥ DenseError source, st
     return BiasBag { value = b, present = hit }
 }
 
+# One layer's resolved stored weights: the nine canonical tensors a
+# resolver-based pass consumes, shape-checked against the config. The
+# shape contract lives in resolve_layer so the four entry points share
+# one body (and one output-projection shape row).
+class ResolvedLayer {
+    mut tensor.NumericBlock ln1_s
+    mut tensor.NumericBlock wq
+    mut tensor.NumericBlock wk
+    mut tensor.NumericBlock wv
+    mut tensor.NumericBlock wo
+    mut tensor.NumericBlock ln2_s
+    mut tensor.NumericBlock wg
+    mut tensor.NumericBlock wu
+    mut tensor.NumericBlock wd
+}
+
+# Resolve one layer's stored weights and validate every shape against the
+# config: the shared body of forward / decode_step / decode_block /
+# prefill_cached. The output projection maps the query width back to the
+# hidden dim ([qwidth, cfg.hidden_dim] — the same row `load` pins).
+fn resolve_layer(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ DenseError source, int layer, int qwidth, int kwidth) → ResolvedLayer ⇥ DenseError {
+    let string prefix ← "model.layers.§"(layer ↦ string)
+
+    # --- resolve stored weights ---------------------------------------
+    let tensor.NumericBlock ln1_s ← source(prefix + ".input_layernorm", layer)
+    let tensor.NumericBlock wq ← source(prefix + ".self_attn.q_proj", layer)
+    let tensor.NumericBlock wk ← source(prefix + ".self_attn.k_proj", layer)
+    let tensor.NumericBlock wv ← source(prefix + ".self_attn.v_proj", layer)
+    let tensor.NumericBlock wo ← source(prefix + ".self_attn.o_proj", layer)
+    let tensor.NumericBlock ln2_s ← source(prefix + ".post_attention_layernorm", layer)
+    let tensor.NumericBlock wg ← source(prefix + ".mlp.gate_proj", layer)
+    let tensor.NumericBlock wu ← source(prefix + ".mlp.up_proj", layer)
+    let tensor.NumericBlock wd ← source(prefix + ".mlp.down_proj", layer)
+
+    # --- shape contract against cfg -----------------------------------
+    shape(ln1_s, prefix + ".input_layernorm", [cfg.hidden_dim])
+    shape(wq, prefix + ".self_attn.q_proj", [cfg.hidden_dim, qwidth])
+    shape(wk, prefix + ".self_attn.k_proj", [cfg.hidden_dim, kwidth])
+    shape(wv, prefix + ".self_attn.v_proj", [cfg.hidden_dim, kwidth])
+    shape(wo, prefix + ".self_attn.o_proj", [qwidth, cfg.hidden_dim])
+    shape(ln2_s, prefix + ".post_attention_layernorm", [cfg.hidden_dim])
+    let list<int> fwg ← wg.shape
+
+    require fwg.length() ≡ 2 throw variant BadShape { message = "canonical tensor §.mlp.gate_proj must be rank 2"(prefix) }
+
+    let int f ← fwg.get(1) coalesce 1
+    shape(wu, prefix + ".mlp.up_proj", [cfg.hidden_dim, f])
+    shape(wd, prefix + ".mlp.down_proj", [f, cfg.hidden_dim])
+
+    return ResolvedLayer { ln1_s = ln1_s, wq = wq, wk = wk, wv = wv, wo = wo, ln2_s = ln2_s, wg = wg, wu = wu, wd = wd }
+}
+
 # load — resolver → pinned DenseModel. Layer pins stay in this function so
 # D/Q/K/F unify (size params cannot be forwarded as explicit generic
 # arguments).
@@ -570,45 +622,22 @@ fn forward(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ DenseError
     for range 0 ‥ cfg.layers let layer {
         let string prefix ← "model.layers.§"(layer ↦ string)
 
-        # --- resolve stored weights ---------------------------------------
-        let tensor.NumericBlock ln1_s ← source(prefix + ".input_layernorm", layer)
-        let tensor.NumericBlock wq ← source(prefix + ".self_attn.q_proj", layer)
-        let tensor.NumericBlock wk ← source(prefix + ".self_attn.k_proj", layer)
-        let tensor.NumericBlock wv ← source(prefix + ".self_attn.v_proj", layer)
-        let tensor.NumericBlock wo ← source(prefix + ".self_attn.o_proj", layer)
-        let tensor.NumericBlock ln2_s ← source(prefix + ".post_attention_layernorm", layer)
-        let tensor.NumericBlock wg ← source(prefix + ".mlp.gate_proj", layer)
-        let tensor.NumericBlock wu ← source(prefix + ".mlp.up_proj", layer)
-        let tensor.NumericBlock wd ← source(prefix + ".mlp.down_proj", layer)
-
-        # --- shape contract against cfg -----------------------------------
-        shape(ln1_s, prefix + ".input_layernorm", [cfg.hidden_dim])
-        shape(wq, prefix + ".self_attn.q_proj", [cfg.hidden_dim, qwidth])
-        shape(wk, prefix + ".self_attn.k_proj", [cfg.hidden_dim, kwidth])
-        shape(wv, prefix + ".self_attn.v_proj", [cfg.hidden_dim, kwidth])
-        shape(wo, prefix + ".self_attn.o_proj", [qwidth, qwidth])
-        shape(ln2_s, prefix + ".post_attention_layernorm", [cfg.hidden_dim])
-        let list<int> fwg ← wg.shape
-
-        require fwg.length() ≡ 2 throw variant BadShape { message = "canonical tensor §.mlp.gate_proj must be rank 2"(prefix) }
-
-        let int f ← fwg.get(1) coalesce 1
-        shape(wu, prefix + ".mlp.up_proj", [cfg.hidden_dim, f])
-        shape(wd, prefix + ".mlp.down_proj", [f, cfg.hidden_dim])
+        # --- resolve stored weights + shape contract (shared helper) ------
+        let ResolvedLayer w ← resolve_layer(cfg, source, layer, qwidth, kwidth)
 
         # --- optional Q/K/V bias (MLP / output stay absent) ---------------
-        let tensor.NumericBlock bq ← attn_bias(source, prefix + ".self_attn.q_proj.bias", layer, h, wq)
-        let tensor.NumericBlock bk ← attn_bias(source, prefix + ".self_attn.k_proj.bias", layer, h, wk)
-        let tensor.NumericBlock bv ← attn_bias(source, prefix + ".self_attn.v_proj.bias", layer, h, wv)
+        let tensor.NumericBlock bq ← attn_bias(source, prefix + ".self_attn.q_proj.bias", layer, h, w.wq)
+        let tensor.NumericBlock bk ← attn_bias(source, prefix + ".self_attn.k_proj.bias", layer, h, w.wk)
+        let tensor.NumericBlock bv ← attn_bias(source, prefix + ".self_attn.v_proj.bias", layer, h, w.wv)
         let tensor.NumericBlock bg ← no_bias()
         let tensor.NumericBlock bu ← no_bias()
         let tensor.NumericBlock bd ← no_bias()
 
         # --- pack and apply the block -------------------------------------
-        let transformer.DenseAttentionWeights attention_weights ← transformer.DenseAttentionWeights { wq = wq, bq = bq, wk = wk, bk = bk, wv = wv, bv = bv, wo = wo }
+        let transformer.DenseAttentionWeights attention_weights ← transformer.DenseAttentionWeights { wq = w.wq, bq = bq, wk = w.wk, bk = bk, wv = w.wv, bv = bv, wo = w.wo }
         let transformer.DenseAttentionConfig attention_config ← transformer.DenseAttentionConfig { num_heads = cfg.heads, num_kv_heads = cfg.kv_heads, scale = scale, rope_dim = rope_dim, rope_config = rope_cfg }
-        let transformer.DenseMlpWeights mlp_weights ← transformer.DenseMlpWeights { wg = wg, bg = bg, wu = wu, bu = bu, wd = wd, bd = bd }
-        let transformer.DenseNormConfig norm_config ← transformer.DenseNormConfig { ln1_s = ln1_s, ln2_s = ln2_s, epsilon = epsilon }
+        let transformer.DenseMlpWeights mlp_weights ← transformer.DenseMlpWeights { wg = w.wg, bg = bg, wu = w.wu, bu = bu, wd = w.wd, bd = bd }
+        let transformer.DenseNormConfig norm_config ← transformer.DenseNormConfig { ln1_s = w.ln1_s, ln2_s = w.ln2_s, epsilon = epsilon }
         h ← block(h, positions, attention_weights, attention_config, mlp_weights, norm_config)
     }
 
@@ -688,46 +717,23 @@ fn decode_step(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ DenseE
     for range 0 ‥ cfg.layers let layer {
         let string prefix ← "model.layers.§"(layer ↦ string)
 
-        # --- resolve stored weights ---------------------------------------
-        let tensor.NumericBlock ln1_s ← source(prefix + ".input_layernorm", layer)
-        let tensor.NumericBlock wq ← source(prefix + ".self_attn.q_proj", layer)
-        let tensor.NumericBlock wk ← source(prefix + ".self_attn.k_proj", layer)
-        let tensor.NumericBlock wv ← source(prefix + ".self_attn.v_proj", layer)
-        let tensor.NumericBlock wo ← source(prefix + ".self_attn.o_proj", layer)
-        let tensor.NumericBlock ln2_s ← source(prefix + ".post_attention_layernorm", layer)
-        let tensor.NumericBlock wg ← source(prefix + ".mlp.gate_proj", layer)
-        let tensor.NumericBlock wu ← source(prefix + ".mlp.up_proj", layer)
-        let tensor.NumericBlock wd ← source(prefix + ".mlp.down_proj", layer)
-
-        # --- shape contract against cfg -----------------------------------
-        shape(ln1_s, prefix + ".input_layernorm", [cfg.hidden_dim])
-        shape(wq, prefix + ".self_attn.q_proj", [cfg.hidden_dim, qwidth])
-        shape(wk, prefix + ".self_attn.k_proj", [cfg.hidden_dim, kwidth])
-        shape(wv, prefix + ".self_attn.v_proj", [cfg.hidden_dim, kwidth])
-        shape(wo, prefix + ".self_attn.o_proj", [qwidth, qwidth])
-        shape(ln2_s, prefix + ".post_attention_layernorm", [cfg.hidden_dim])
-        let list<int> fwg ← wg.shape
-
-        require fwg.length() ≡ 2 throw variant BadShape { message = "canonical tensor §.mlp.gate_proj must be rank 2"(prefix) }
-
-        let int f ← fwg.get(1) coalesce 1
-        shape(wu, prefix + ".mlp.up_proj", [cfg.hidden_dim, f])
-        shape(wd, prefix + ".mlp.down_proj", [f, cfg.hidden_dim])
+        # --- resolve stored weights + shape contract (shared helper) ------
+        let ResolvedLayer w ← resolve_layer(cfg, source, layer, qwidth, kwidth)
 
         # --- optional Q/K/V bias (MLP / output stay absent) ---------------
-        let tensor.NumericBlock bq ← attn_bias(source, prefix + ".self_attn.q_proj.bias", layer, h, wq)
-        let tensor.NumericBlock bk ← attn_bias(source, prefix + ".self_attn.k_proj.bias", layer, h, wk)
-        let tensor.NumericBlock bv ← attn_bias(source, prefix + ".self_attn.v_proj.bias", layer, h, wv)
+        let tensor.NumericBlock bq ← attn_bias(source, prefix + ".self_attn.q_proj.bias", layer, h, w.wq)
+        let tensor.NumericBlock bk ← attn_bias(source, prefix + ".self_attn.k_proj.bias", layer, h, w.wk)
+        let tensor.NumericBlock bv ← attn_bias(source, prefix + ".self_attn.v_proj.bias", layer, h, w.wv)
         let tensor.NumericBlock bg ← no_bias()
         let tensor.NumericBlock bu ← no_bias()
         let tensor.NumericBlock bd ← no_bias()
 
         # --- pack and apply the cached block ------------------------------
         mut kv.KVCache cache ← layers.get(layer) coalesce kv.default()
-        let transformer.DenseAttentionWeights attention_weights ← transformer.DenseAttentionWeights { wq = wq, bq = bq, wk = wk, bk = bk, wv = wv, bv = bv, wo = wo }
+        let transformer.DenseAttentionWeights attention_weights ← transformer.DenseAttentionWeights { wq = w.wq, bq = bq, wk = w.wk, bk = bk, wv = w.wv, bv = bv, wo = w.wo }
         let transformer.DenseAttentionConfig attention_config ← transformer.DenseAttentionConfig { num_heads = cfg.heads, num_kv_heads = cfg.kv_heads, scale = scale, rope_dim = rope_dim, rope_config = rope_cfg }
-        let transformer.DenseMlpWeights mlp_weights ← transformer.DenseMlpWeights { wg = wg, bg = bg, wu = wu, bu = bu, wd = wd, bd = bd }
-        let transformer.DenseNormConfig norm_config ← transformer.DenseNormConfig { ln1_s = ln1_s, ln2_s = ln2_s, epsilon = epsilon }
+        let transformer.DenseMlpWeights mlp_weights ← transformer.DenseMlpWeights { wg = w.wg, bg = bg, wu = w.wu, bu = bu, wd = w.wd, bd = bd }
+        let transformer.DenseNormConfig norm_config ← transformer.DenseNormConfig { ln1_s = w.ln1_s, ln2_s = w.ln2_s, epsilon = epsilon }
         let transformer.CachedBlock block ← block_cached(h, positions, mut cache, tokens, attention_weights, attention_config, mlp_weights, norm_config)
         h ← block.output
         next.append(block.state)
@@ -799,46 +805,23 @@ fn decode_block(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ Dense
     for range 0 ‥ cfg.layers let layer {
         let string prefix ← "model.layers.§"(layer ↦ string)
 
-        # --- resolve stored weights ---------------------------------------
-        let tensor.NumericBlock ln1_s ← source(prefix + ".input_layernorm", layer)
-        let tensor.NumericBlock wq ← source(prefix + ".self_attn.q_proj", layer)
-        let tensor.NumericBlock wk ← source(prefix + ".self_attn.k_proj", layer)
-        let tensor.NumericBlock wv ← source(prefix + ".self_attn.v_proj", layer)
-        let tensor.NumericBlock wo ← source(prefix + ".self_attn.o_proj", layer)
-        let tensor.NumericBlock ln2_s ← source(prefix + ".post_attention_layernorm", layer)
-        let tensor.NumericBlock wg ← source(prefix + ".mlp.gate_proj", layer)
-        let tensor.NumericBlock wu ← source(prefix + ".mlp.up_proj", layer)
-        let tensor.NumericBlock wd ← source(prefix + ".mlp.down_proj", layer)
-
-        # --- shape contract against cfg -----------------------------------
-        shape(ln1_s, prefix + ".input_layernorm", [cfg.hidden_dim])
-        shape(wq, prefix + ".self_attn.q_proj", [cfg.hidden_dim, qwidth])
-        shape(wk, prefix + ".self_attn.k_proj", [cfg.hidden_dim, kwidth])
-        shape(wv, prefix + ".self_attn.v_proj", [cfg.hidden_dim, kwidth])
-        shape(wo, prefix + ".self_attn.o_proj", [qwidth, qwidth])
-        shape(ln2_s, prefix + ".post_attention_layernorm", [cfg.hidden_dim])
-        let list<int> fwg ← wg.shape
-
-        require fwg.length() ≡ 2 throw variant BadShape { message = "canonical tensor §.mlp.gate_proj must be rank 2"(prefix) }
-
-        let int f ← fwg.get(1) coalesce 1
-        shape(wu, prefix + ".mlp.up_proj", [cfg.hidden_dim, f])
-        shape(wd, prefix + ".mlp.down_proj", [f, cfg.hidden_dim])
+        # --- resolve stored weights + shape contract (shared helper) ------
+        let ResolvedLayer w ← resolve_layer(cfg, source, layer, qwidth, kwidth)
 
         # --- optional Q/K/V bias (MLP / output stay absent) ---------------
-        let tensor.NumericBlock bq ← attn_bias(source, prefix + ".self_attn.q_proj.bias", layer, h, wq)
-        let tensor.NumericBlock bk ← attn_bias(source, prefix + ".self_attn.k_proj.bias", layer, h, wk)
-        let tensor.NumericBlock bv ← attn_bias(source, prefix + ".self_attn.v_proj.bias", layer, h, wv)
+        let tensor.NumericBlock bq ← attn_bias(source, prefix + ".self_attn.q_proj.bias", layer, h, w.wq)
+        let tensor.NumericBlock bk ← attn_bias(source, prefix + ".self_attn.k_proj.bias", layer, h, w.wk)
+        let tensor.NumericBlock bv ← attn_bias(source, prefix + ".self_attn.v_proj.bias", layer, h, w.wv)
         let tensor.NumericBlock bg ← no_bias()
         let tensor.NumericBlock bu ← no_bias()
         let tensor.NumericBlock bd ← no_bias()
 
         # --- pack and apply the cached block ------------------------------
         mut kv.KVCache cache ← layers.get(layer) coalesce kv.default()
-        let transformer.DenseAttentionWeights attention_weights ← transformer.DenseAttentionWeights { wq = wq, bq = bq, wk = wk, bk = bk, wv = wv, bv = bv, wo = wo }
+        let transformer.DenseAttentionWeights attention_weights ← transformer.DenseAttentionWeights { wq = w.wq, bq = bq, wk = w.wk, bk = bk, wv = w.wv, bv = bv, wo = w.wo }
         let transformer.DenseAttentionConfig attention_config ← transformer.DenseAttentionConfig { num_heads = cfg.heads, num_kv_heads = cfg.kv_heads, scale = scale, rope_dim = rope_dim, rope_config = rope_cfg }
-        let transformer.DenseMlpWeights mlp_weights ← transformer.DenseMlpWeights { wg = wg, bg = bg, wu = wu, bu = bu, wd = wd, bd = bd }
-        let transformer.DenseNormConfig norm_config ← transformer.DenseNormConfig { ln1_s = ln1_s, ln2_s = ln2_s, epsilon = epsilon }
+        let transformer.DenseMlpWeights mlp_weights ← transformer.DenseMlpWeights { wg = w.wg, bg = bg, wu = w.wu, bu = bu, wd = w.wd, bd = bd }
+        let transformer.DenseNormConfig norm_config ← transformer.DenseNormConfig { ln1_s = w.ln1_s, ln2_s = w.ln2_s, epsilon = epsilon }
         let transformer.CachedBlock block ← block_cached(h, positions, mut cache, tokens, attention_weights, attention_config, mlp_weights, norm_config)
         h ← block.output
         next.append(block.state)
@@ -909,46 +892,23 @@ fn prefill_cached(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ Den
     for range 0 ‥ cfg.layers let layer {
         let string prefix ← "model.layers.§"(layer ↦ string)
 
-        # --- resolve stored weights ---------------------------------------
-        let tensor.NumericBlock ln1_s ← source(prefix + ".input_layernorm", layer)
-        let tensor.NumericBlock wq ← source(prefix + ".self_attn.q_proj", layer)
-        let tensor.NumericBlock wk ← source(prefix + ".self_attn.k_proj", layer)
-        let tensor.NumericBlock wv ← source(prefix + ".self_attn.v_proj", layer)
-        let tensor.NumericBlock wo ← source(prefix + ".self_attn.o_proj", layer)
-        let tensor.NumericBlock ln2_s ← source(prefix + ".post_attention_layernorm", layer)
-        let tensor.NumericBlock wg ← source(prefix + ".mlp.gate_proj", layer)
-        let tensor.NumericBlock wu ← source(prefix + ".mlp.up_proj", layer)
-        let tensor.NumericBlock wd ← source(prefix + ".mlp.down_proj", layer)
-
-        # --- shape contract against cfg -----------------------------------
-        shape(ln1_s, prefix + ".input_layernorm", [cfg.hidden_dim])
-        shape(wq, prefix + ".self_attn.q_proj", [cfg.hidden_dim, qwidth])
-        shape(wk, prefix + ".self_attn.k_proj", [cfg.hidden_dim, kwidth])
-        shape(wv, prefix + ".self_attn.v_proj", [cfg.hidden_dim, kwidth])
-        shape(wo, prefix + ".self_attn.o_proj", [qwidth, qwidth])
-        shape(ln2_s, prefix + ".post_attention_layernorm", [cfg.hidden_dim])
-        let list<int> fwg ← wg.shape
-
-        require fwg.length() ≡ 2 throw variant BadShape { message = "canonical tensor §.mlp.gate_proj must be rank 2"(prefix) }
-
-        let int f ← fwg.get(1) coalesce 1
-        shape(wu, prefix + ".mlp.up_proj", [cfg.hidden_dim, f])
-        shape(wd, prefix + ".mlp.down_proj", [f, cfg.hidden_dim])
+        # --- resolve stored weights + shape contract (shared helper) ------
+        let ResolvedLayer w ← resolve_layer(cfg, source, layer, qwidth, kwidth)
 
         # --- optional Q/K/V bias (MLP / output stay absent) ---------------
-        let tensor.NumericBlock bq ← attn_bias(source, prefix + ".self_attn.q_proj.bias", layer, h, wq)
-        let tensor.NumericBlock bk ← attn_bias(source, prefix + ".self_attn.k_proj.bias", layer, h, wk)
-        let tensor.NumericBlock bv ← attn_bias(source, prefix + ".self_attn.v_proj.bias", layer, h, wv)
+        let tensor.NumericBlock bq ← attn_bias(source, prefix + ".self_attn.q_proj.bias", layer, h, w.wq)
+        let tensor.NumericBlock bk ← attn_bias(source, prefix + ".self_attn.k_proj.bias", layer, h, w.wk)
+        let tensor.NumericBlock bv ← attn_bias(source, prefix + ".self_attn.v_proj.bias", layer, h, w.wv)
         let tensor.NumericBlock bg ← no_bias()
         let tensor.NumericBlock bu ← no_bias()
         let tensor.NumericBlock bd ← no_bias()
 
         # --- pack and apply the cached block ------------------------------
         mut kv.KVCache cache ← layers.get(layer) coalesce kv.default()
-        let transformer.DenseAttentionWeights attention_weights ← transformer.DenseAttentionWeights { wq = wq, bq = bq, wk = wk, bk = bk, wv = wv, bv = bv, wo = wo }
+        let transformer.DenseAttentionWeights attention_weights ← transformer.DenseAttentionWeights { wq = w.wq, bq = bq, wk = w.wk, bk = bk, wv = w.wv, bv = bv, wo = w.wo }
         let transformer.DenseAttentionConfig attention_config ← transformer.DenseAttentionConfig { num_heads = cfg.heads, num_kv_heads = cfg.kv_heads, scale = scale, rope_dim = rope_dim, rope_config = rope_cfg }
-        let transformer.DenseMlpWeights mlp_weights ← transformer.DenseMlpWeights { wg = wg, bg = bg, wu = wu, bu = bu, wd = wd, bd = bd }
-        let transformer.DenseNormConfig norm_config ← transformer.DenseNormConfig { ln1_s = ln1_s, ln2_s = ln2_s, epsilon = epsilon }
+        let transformer.DenseMlpWeights mlp_weights ← transformer.DenseMlpWeights { wg = w.wg, bg = bg, wu = w.wu, bu = bu, wd = w.wd, bd = bd }
+        let transformer.DenseNormConfig norm_config ← transformer.DenseNormConfig { ln1_s = w.ln1_s, ln2_s = w.ln2_s, epsilon = epsilon }
         let transformer.CachedBlock block ← block_cached(h, positions, mut cache, tokens, attention_weights, attention_config, mlp_weights, norm_config)
         h ← block.output
         next.append(block.state)
@@ -1820,5 +1780,140 @@ describe "P71 — pre-loaded model decode keeps the fail-closed cache contract" 
         catch err {
             assert false
         }
+    }
+}
+
+# ---- G1: the non-square output projection. The synthetic fixtures above
+# are square (qwidth == hidden_dim), so they cannot distinguish the old
+# [qwidth, qwidth] output-projection row from the correct one. This tiny
+# GQA-shaped fixture (hidden 8, heads 2, head_dim 2 -> qwidth 4, kv_heads
+# 1 -> kwidth 2) can: the output projection must be [4, 8].
+
+fn gq_embed() → tensor.NumericBlock {
+    return ggml_embed(tene([0.04, 0.03, 0.02, 0.01, 0.05, 0.04, 0.03, 0.02, 0.02, 0.03, 0.04, 0.05, 0.01, 0.02, 0.03, 0.04, 0.03, 0.01, 0.04, 0.02, 0.05, 0.03, 0.01, 0.02, 0.02, 0.04, 0.01, 0.03, 0.04, 0.05, 0.02, 0.01], [8, 4]))
+}
+
+fn gq_norm() → tensor.NumericBlock {
+    return tene([1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65], [8])
+}
+
+fn gq_ln1() → tensor.NumericBlock {
+    return tene([1.1, 1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4], [8])
+}
+
+fn gq_ln2() → tensor.NumericBlock {
+    return tene([0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1], [8])
+}
+
+fn gq_wq() → tensor.NumericBlock {
+    return tene([0.11, 0.12, 0.13, 0.14, 0.15, 0.16, 0.17, 0.18, 0.21, 0.22, 0.23, 0.24, 0.25, 0.26, 0.27, 0.28, 0.31, 0.32, 0.33, 0.34, 0.35, 0.36, 0.37, 0.38, 0.41, 0.42, 0.43, 0.44, 0.45, 0.46, 0.47, 0.48], [8, 4])
+}
+
+fn gq_wk() → tensor.NumericBlock {
+    return tene([0.12, 0.14, 0.16, 0.18, 0.22, 0.24, 0.26, 0.28, 0.32, 0.34, 0.36, 0.38, 0.42, 0.44, 0.46, 0.48], [8, 2])
+}
+
+fn gq_wv() → tensor.NumericBlock {
+    return tene([0.13, 0.16, 0.19, 0.22, 0.25, 0.28, 0.31, 0.34, 0.37, 0.40, 0.43, 0.46, 0.49, 0.52, 0.55, 0.58], [8, 2])
+}
+
+fn gq_wo() → tensor.NumericBlock {
+    return tene([0.14, 0.15, 0.16, 0.17, 0.18, 0.19, 0.20, 0.21, 0.22, 0.23, 0.24, 0.25, 0.26, 0.27, 0.28, 0.29, 0.30, 0.31, 0.32, 0.33, 0.34, 0.35, 0.36, 0.37, 0.38, 0.39, 0.40, 0.41, 0.42, 0.43, 0.44, 0.45], [4, 8])
+}
+
+fn gq_wg() → tensor.NumericBlock {
+    return tene([0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00, 0.06, 0.12, 0.18, 0.24, 0.30, 0.36, 0.42, 0.48, 0.54, 0.60, 0.66, 0.72, 0.78, 0.84, 0.90, 0.96, 0.07, 0.14, 0.21, 0.28, 0.35, 0.42, 0.49, 0.56, 0.63, 0.70, 0.77, 0.84, 0.91, 0.98, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70], [8, 8])
+}
+
+fn gq_wu() → tensor.NumericBlock {
+    return tene([0.06, 0.11, 0.16, 0.21, 0.26, 0.31, 0.36, 0.41, 0.46, 0.51, 0.56, 0.61, 0.66, 0.71, 0.76, 0.81, 0.86, 0.91, 0.96, 0.07, 0.13, 0.19, 0.25, 0.31, 0.37, 0.43, 0.49, 0.55, 0.61, 0.67, 0.73, 0.79, 0.85, 0.91, 0.97, 0.08, 0.15, 0.22, 0.29, 0.36, 0.43, 0.50, 0.57, 0.64, 0.71, 0.78, 0.85, 0.92, 0.99, 0.06, 0.11, 0.16, 0.21, 0.26, 0.31, 0.36, 0.41, 0.46, 0.51, 0.56, 0.61, 0.66, 0.71, 0.76], [8, 8])
+}
+
+fn gq_wd() → tensor.NumericBlock {
+    return tene([0.07, 0.13, 0.19, 0.25, 0.31, 0.37, 0.43, 0.49, 0.55, 0.61, 0.67, 0.73, 0.79, 0.85, 0.91, 0.97, 0.08, 0.15, 0.22, 0.29, 0.36, 0.43, 0.50, 0.57, 0.64, 0.71, 0.78, 0.85, 0.92, 0.99, 0.06, 0.12, 0.18, 0.24, 0.30, 0.36, 0.42, 0.48, 0.54, 0.60, 0.66, 0.72, 0.78, 0.84, 0.90, 0.96, 0.05, 0.11, 0.17, 0.23, 0.29, 0.35, 0.41, 0.47, 0.53, 0.59, 0.65, 0.71, 0.77, 0.83, 0.89, 0.95, 0.04, 0.09], [8, 8])
+}
+
+# Per-layer slot order: ln1, wq, wk, wv, wo, ln2, wg, wu, wd (suffixa).
+fn gq_layer() → list<tensor.NumericBlock> {
+    return [gq_ln1(), gq_wq(), gq_wk(), gq_wv(), gq_wo(), gq_ln2(), gq_wg(), gq_wu(), gq_wd()]
+}
+
+# A square [qwidth, qwidth] output projection — the shape the old check
+# demanded and the config rejects.
+fn gq_wo_square() → tensor.NumericBlock {
+    return tene([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6], [4, 4])
+}
+
+# The tiny-GQA resolver: `square` swaps the layer-0 output projection for
+# the wrong [4, 4] table.
+fn gq_resolve(string name, int layer, bool square) → tensor.NumericBlock ⇥ dense.DenseError {
+    if name ≡ "model.embed_tokens" then return gq_embed()
+    if name ≡ "model.norm" then return gq_norm()
+    let int slot ← suffixa(suffixum(name))
+    require slot ≥ 0 throw variant MissingTensor { message = "unknown canonical tensor: §"(name) }
+    if square and slot ≡ 4 then return gq_wo_square()
+    return gq_layer().get(slot) coalesce gq_embed()
+}
+
+fn gq_cfg() → dense.DenseConfig {
+    return dense.DenseConfig { layers = 1, heads = 2, kv_heads = 1, head_dim = 2, hidden_dim = 8, vocab = 4, tied = true }
+}
+
+# One-layer KV structure with the GQA geometry (kv_heads 1, head_dim 2).
+fn gq_structure_cap(int context_length) → structure.KVStructure {
+    return test_util.or_default(() → structure.KVStructure ⇥ kv.CacheError ∴ do {
+        let structure.LayerSet set ← structure.construct_layer_set([0], structure.dense_structure(), 1, 2)
+        mut list<structure.LayerSet> sets ← empty
+        sets.append(set)
+        return structure.construct_kv_structure(sets, structure.kv_dtype_f32(), structure.kv_dtype_f32(), structure.v_layout_transposed(), structure.sharing_gqa(), structure.attention_classic(), 2, 8, context_length)
+    }, structure.default_kv_structure())
+}
+
+fn gq_caches() → list<kv.KVCache> {
+    return dense.empty_caches(gq_structure_cap(8), "tiny-gqa", "1.0.0", "causal-rope-d2", "smollm") ⊥ empty
+}
+
+fn gq_prefill_p(dense.DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ dense.DenseError source, list<int> tokens, list<kv.KVCache> layers) → dense.DenseStep {
+    return dense.prefill_cached(cfg, source, tokens, (0.00001 ∷ f32), (0.5 ∷ f32), 2, rq(), layers) ⊥ dense.default_step()
+}
+
+fn gq_prefill_text(dense.DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ dense.DenseError source, list<int> tokens, list<kv.KVCache> layers) → string {
+    do {
+        let dense.DenseStep ? ← dense.prefill_cached(cfg, source, tokens, (0.00001 ∷ f32), (0.5 ∷ f32), 2, rq(), layers)
+        return "ok"
+    }
+    catch err {
+        return err.message
+    }
+}
+
+describe "G1 — the output projection is [qwidth, hidden_dim], not [qwidth, qwidth]" {
+    test "a GQA-shaped model (qwidth != hidden_dim) runs the full forward graph" {
+        do {
+            let dense.DenseConfig cfg ← gq_cfg()
+            let (string, int) → tensor.NumericBlock ⇥ dense.DenseError source ← (string n, int s) → tensor.NumericBlock ⇥ dense.DenseError ∴ gq_resolve(n, s, false)
+            let tensor.NumericBlock y ← model_p(cfg, source, [0], (0.00001 ∷ f32), (0.5 ∷ f32), [0], 2, rq())
+            assert y.valid()
+            assert y.shape ≡ ([1, 4] ↦ list<int>)
+        }
+        catch err {
+            assert false
+        }
+    }
+    test "a GQA-shaped model (qwidth != hidden_dim) runs the cached prefill" {
+        do {
+            let dense.DenseConfig cfg ← gq_cfg()
+            let (string, int) → tensor.NumericBlock ⇥ dense.DenseError source ← (string n, int s) → tensor.NumericBlock ⇥ dense.DenseError ∴ gq_resolve(n, s, false)
+            let dense.DenseStep pref ← gq_prefill_p(cfg, source, [0, 3], gq_caches())
+            assert pref.logits.shape ≡ ([2, 4] ↦ list<int>)
+            assert layer_at(pref.layers, 0).length() ≡ 2
+        }
+        catch err {
+            assert false
+        }
+    }
+    test "a square output projection now contradicts the config on every entry point" {
+        assert model_text(gq_cfg(), (string n, int s) → tensor.NumericBlock ⇥ dense.DenseError ∴ gq_resolve(n, s, true), [0], (0.00001 ∷ f32), (0.5 ∷ f32), [0], 2, rq()) ≡ "canonical tensor model.layers.0.self_attn.o_proj has shape 4,4, expected 4,8"
+        assert gq_prefill_text(gq_cfg(), (string n, int s) → tensor.NumericBlock ⇥ dense.DenseError ∴ gq_resolve(n, s, true), [0, 3], gq_caches()) ≡ "canonical tensor model.layers.0.self_attn.o_proj has shape 4,4, expected 4,8"
     }
 }
