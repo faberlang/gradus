@@ -24,8 +24,13 @@ locale = "en"
 # device tensors compatible with Cranelift CPU and Metal KIR kernels.
 
 import from "gradus:decode_step" let ds
+import from "gradus:decode_hybrid_kernels" let dhk
+import from "gradus:decode_stages" let stages
 import from "gradus:cache/session" let sess_mod
 import from "gradus:cache/hybrid_arenas" let hybrid
+import from "gradus:model/expert_bank" let eb
+import from "gradus:model/residual" let res
+import from "gradus:model/schedule" let model_schedule
 
 @ public
 const f32 INKLING_MLP_GATE_SOFTCAP = 4.0
@@ -47,6 +52,36 @@ const int INKLING_CONV_KERNEL = 4
 
 @ public
 const int INKLING_CONV_HISTORY = 3
+
+@ public
+const int INKLING_NUM_LAYERS = 24
+
+@ public
+const int INKLING_SWA_WINDOW = 1024
+
+@ public
+const int INKLING_LOOP_START = 6
+
+@ public
+const int INKLING_LOOP_END = 18
+
+@ public
+const int INKLING_LOOP_PASSES = 3
+
+@ public
+const int INKLING_GATE_RANK = 64
+
+@ public
+const int INKLING_NUM_EXPERTS = 128
+
+@ public
+const int INKLING_TOP_K = 8
+
+@ public
+const f32 INKLING_ROUTE_SCALE = 8.0
+
+@ public
+const int INKLING_ATTN_RES_CADENCE = 6
 
 # ---------------------------------------------------------------------------
 # Relative-position bias kernels
@@ -398,6 +433,9 @@ kernel vocab_slice<size PADDED_V, size UNPADDED_V>(tensor<f32, [PADDED_V]> logit
 @ public
 class InklingLayerWeights<size D, size QD, size KVD, size F, size H, size HD_REL, size D_REL, size REL_EXTENT, size H_TAPS> {
     let tensor<f32, [D]> anorm
+    let tensor<f32, [D]> q_anorm
+    let tensor<f32, [D]> k_anorm
+    let tensor<f32, [D]> v_anorm
     let tensor<f32, [QD, D]> wq
     let tensor<f32, [KVD, D]> wk
     let tensor<f32, [KVD, D]> wv
@@ -406,6 +444,8 @@ class InklingLayerWeights<size D, size QD, size KVD, size F, size H, size HD_REL
     let tensor<f32, [H, D]> w_sink
     let tensor<f32, [HD_REL, D]> wr
     let tensor<f32, [D_REL, REL_EXTENT]> w_rel
+    let tensor<f32, [4, KVD]> k_sconv_w
+    let tensor<f32, [4, KVD]> v_sconv_w
     let tensor<f32, [H_TAPS, KVD]> k_sconv_weight_proj
     let tensor<f32, [H_TAPS, KVD]> v_sconv_weight_proj
     let tensor<f32, [4, D]> post_attn_conv_w
@@ -426,53 +466,85 @@ class InklingLayerParams {
     let f32 r_max_norm
     let f32 inv_ln_base
     let bool is_full_attn
+    let bool use_split_qkv_norms
     let bool use_sink
     let bool use_rel_bias
     let bool use_qkv_gate
+    let bool use_static_kv_conv
     let bool use_dynamic_kv_conv
     let bool use_post_conv
     let MlpActivation mlp_act
 }
 
-# Inkling attention sub-block: RMSNorm -> QKV (+ R, sink, gate) -> log-pos tau
-# (full) -> L2 norm clip -> parameterless V RMSNorm -> K/V ShortConv -> KV write ->
-# attention scores (+ rel bias) -> sink/standard softmax -> context -> sigmoid gate ->
-# Wo -> post_attn ShortConv -> residual.
+# Inkling attention sub-block: RMSNorm (single on SWA, 3 separate Q/K/V norms
+# on full-attention) -> QKV (+ R, sink, gate) -> log-pos tau (full) -> L2 norm
+# clip -> parameterless V RMSNorm -> K/V ShortConv (static on SWA, dynamic
+# per-head on full) -> KV write -> attention scores (+ rel bias) -> sink/standard
+# softmax -> context -> sigmoid gate -> Wo -> post_attn ShortConv -> residual.
 @ public
 fn inkling_attn_step<size D, size QD, size KVD, size F, size H, size HD_REL, size D_REL, size REL_EXTENT, size H_TAPS, size C, size W, size ConvRows>(tensor<f32, [D]> hin, mut tensor<f32, [D]> h1, InklingLayerWeights<D, QD, KVD, F, H, HD_REL, D_REL, REL_EXTENT, H_TAPS> lw, InklingLayerParams lp, mut sess_mod.SessionState<C, W, KVD> sess, mut hybrid.ConvStateArena<ConvRows, KVD> kv_conv, mut hybrid.ConvStateArena<ConvRows, D> post_conv, int slot_id, i32 pos) → void ⇥ sess_mod.SessionError {
-    mut tensor<f32, [D]> xn ← tf32[D] {}
-    ds.rmsnorm(hin, lw.anorm, mut xn, lp.peps)
+    mut tensor<f32, [D]> xn_q ← tf32[D] {}
+    mut tensor<f32, [D]> xn_k ← tf32[D] {}
+    mut tensor<f32, [D]> xn_v ← tf32[D] {}
+
+    if lp.use_split_qkv_norms {
+        stages.norm_rmsnorm(hin, lw.q_anorm, mut xn_q, lp.peps)
+        stages.norm_rmsnorm(hin, lw.k_anorm, mut xn_k, lp.peps)
+        stages.norm_rmsnorm(hin, lw.v_anorm, mut xn_v, lp.peps)
+    }
+    else {
+        stages.norm_rmsnorm(hin, lw.anorm, mut xn_q, lp.peps)
+        do device {
+            dhk.copy_slice<size D, size D>(xn_q, mut xn_k, 0)
+            dhk.copy_slice<size D, size D>(xn_q, mut xn_v, 0)
+        }
+    }
 
     mut tensor<f32, [QD]> q_raw ← tf32[QD] {}
     mut tensor<f32, [KVD]> k_raw ← tf32[KVD] {}
     mut tensor<f32, [KVD]> v_raw ← tf32[KVD] {}
-    ds.qkv_proj(lw.wq, lw.wk, lw.wv, xn, mut q_raw, mut k_raw, mut v_raw)
-
     mut tensor<f32, [QD]> q_scaled ← tf32[QD] {}
-    if lp.is_full_attn and lp.inv_ln_base ≻ 0.0 {
-        log_pos_scale(q_raw, mut q_scaled, pos, lp.inv_ln_base)
-    }
-    else {
-        q_scaled ⇇ q_raw
-    }
-
     mut tensor<f32, [QD]> q ← tf32[QD] {}
     mut tensor<f32, [KVD]> k_clip ← tf32[KVD] {}
-    l2_norm_clip(q_scaled, mut q, lp.pdh, lp.qk_max_norm, lp.peps)
-    l2_norm_clip(k_raw, mut k_clip, lp.pdh, lp.qk_max_norm, lp.peps)
-
     mut tensor<f32, [KVD]> v_normed ← tf32[KVD] {}
-    rmsnorm_unit(v_raw, mut v_normed, lp.pdh, lp.peps)
+
+    do device {
+        if lp.use_split_qkv_norms {
+            ds.gemv(lw.wq, xn_q, mut q_raw)
+            ds.gemv(lw.wk, xn_k, mut k_raw)
+            ds.gemv(lw.wv, xn_v, mut v_raw)
+        }
+        else {
+            ds.qkv_proj(lw.wq, lw.wk, lw.wv, xn_q, mut q_raw, mut k_raw, mut v_raw)
+        }
+
+        if lp.is_full_attn and lp.inv_ln_base ≻ 0.0 {
+            log_pos_scale(q_raw, mut q_scaled, pos, lp.inv_ln_base)
+        }
+        else {
+            q_scaled ⇇ q_raw
+        }
+
+        l2_norm_clip(q_scaled, mut q, lp.pdh, lp.qk_max_norm, lp.peps)
+        l2_norm_clip(k_raw, mut k_clip, lp.pdh, lp.qk_max_norm, lp.peps)
+        rmsnorm_unit(v_raw, mut v_normed, lp.pdh, lp.peps)
+    }
 
     mut tensor<f32, [KVD]> k_final ← tf32[KVD] {}
     mut tensor<f32, [KVD]> v_final ← tf32[KVD] {}
     if lp.use_dynamic_kv_conv {
         mut tensor<f32, [H_TAPS]> k_taps ← tf32[H_TAPS] {}
         mut tensor<f32, [H_TAPS]> v_taps ← tf32[H_TAPS] {}
-        ds.gemv(lw.k_sconv_weight_proj, k_clip, mut k_taps)
-        ds.gemv(lw.v_sconv_weight_proj, v_normed, mut v_taps)
+        do device {
+            ds.gemv(lw.k_sconv_weight_proj, k_clip, mut k_taps)
+            ds.gemv(lw.v_sconv_weight_proj, v_normed, mut v_taps)
+        }
         shortconv4_dynamic_step(mut kv_conv, slot_id, hybrid.SITE_CONV_K, k_taps, k_clip, mut k_final, lp.pdh)
         shortconv4_dynamic_step(mut kv_conv, slot_id, hybrid.SITE_CONV_V, v_taps, v_normed, mut v_final, lp.pdh)
+    }
+    elif lp.use_static_kv_conv {
+        shortconv4_step(mut kv_conv, slot_id, hybrid.SITE_CONV_K, lw.k_sconv_w, k_clip, mut k_final)
+        shortconv4_step(mut kv_conv, slot_id, hybrid.SITE_CONV_V, lw.v_sconv_w, v_normed, mut v_final)
     }
     else {
         k_final ⇇ k_clip
@@ -484,22 +556,26 @@ fn inkling_attn_step<size D, size QD, size KVD, size F, size H, size HD_REL, siz
     mut tensor<f32, [H, REL_EXTENT]> rel_logits ← tf32[H, REL_EXTENT] {}
     if lp.use_rel_bias {
         mut tensor<f32, [HD_REL]> r_raw ← tf32[HD_REL] {}
-        ds.gemv(lw.wr, xn, mut r_raw)
         mut tensor<f32, [HD_REL]> r_scaled ← tf32[HD_REL] {}
-        if lp.is_full_attn and lp.inv_ln_base ≻ 0.0 {
-            log_pos_scale(r_raw, mut r_scaled, pos, lp.inv_ln_base)
-        }
-        else {
-            r_scaled ⇇ r_raw
-        }
         mut tensor<f32, [HD_REL]> r_clip ← tf32[HD_REL] {}
-        l2_norm_clip(r_scaled, mut r_clip, D_REL ↦ i32 ⊥ 1, lp.r_max_norm, lp.peps)
-        rel_bias_project(r_clip, lw.w_rel, mut rel_logits)
+        do device {
+            ds.gemv(lw.wr, xn_q, mut r_raw)
+            if lp.is_full_attn and lp.inv_ln_base ≻ 0.0 {
+                log_pos_scale(r_raw, mut r_scaled, pos, lp.inv_ln_base)
+            }
+            else {
+                r_scaled ⇇ r_raw
+            }
+            l2_norm_clip(r_scaled, mut r_clip, D_REL ↦ i32 ⊥ 1, lp.r_max_norm, lp.peps)
+            rel_bias_project(r_clip, lw.w_rel, mut rel_logits)
+        }
     }
 
     mut tensor<f32, [H]> sink_logits ← tf32[H] {}
     if lp.use_sink {
-        ds.gemv(lw.w_sink, xn, mut sink_logits)
+        do device {
+            ds.gemv(lw.w_sink, xn_q, mut sink_logits)
+        }
     }
 
     mut tensor<f32, [QD]> ctx ← tf32[QD] {}
@@ -511,10 +587,14 @@ fn inkling_attn_step<size D, size QD, size KVD, size F, size H, size HD_REL, siz
         mut tensor<f32, [H, C]> pr ← tf32[H, C] {}
         sess_mod.score_full(sess.full_kv, slot_id, hcdom, q, mut sc, pos, lp.pgroup, lp.pdh, lp.pscale)
         if lp.use_rel_bias {
-            rel_bias_gather_add(rel_logits, mut sc, pos)
+            do device {
+                rel_bias_gather_add(rel_logits, mut sc, pos)
+            }
         }
         if lp.use_sink {
-            row_softmax_with_sink(sc, sink_logits, mut pr, pos + 1)
+            do device {
+                row_softmax_with_sink(sc, sink_logits, mut pr, pos + 1)
+            }
         }
         else {
             sess_mod.softmax_full(sc, mut pr)
@@ -528,7 +608,9 @@ fn inkling_attn_step<size D, size QD, size KVD, size F, size H, size HD_REL, siz
         sess_mod.score_ring(sess.ring_kv, slot_id, hwdom, q, mut sc_r, pos, lp.pgroup, lp.pdh, lp.pscale)
         let int win ← sess.slot_window_sizes[slot_id]
         if lp.use_rel_bias {
-            rel_bias_gather_add_ring(rel_logits, mut sc_r, pos, win ↦ i32 ⊥ 1)
+            do device {
+                rel_bias_gather_add_ring(rel_logits, mut sc_r, pos, win ↦ i32 ⊥ 1)
+            }
         }
         if lp.use_sink {
             mut i32 valid ← pos + 1
@@ -536,7 +618,9 @@ fn inkling_attn_step<size D, size QD, size KVD, size F, size H, size HD_REL, siz
             if valid ≻ win_i32 {
                 valid ← win_i32
             }
-            row_softmax_with_sink(sc_r, sink_logits, mut pr_r, valid)
+            do device {
+                row_softmax_with_sink(sc_r, sink_logits, mut pr_r, valid)
+            }
         }
         else {
             sess_mod.softmax_ring(sc_r, mut pr_r)
@@ -544,18 +628,19 @@ fn inkling_attn_step<size D, size QD, size KVD, size F, size H, size HD_REL, siz
         sess_mod.context_ring(sess.ring_kv, slot_id, qdom, pr_r, mut ctx, pos, lp.pgroup, lp.pdh)
     }
 
+    mut tensor<f32, [QD]> g_logits ← tf32[QD] {}
     mut tensor<f32, [QD]> gated_ctx ← tf32[QD] {}
-    if lp.use_qkv_gate {
-        mut tensor<f32, [QD]> g_logits ← tf32[QD] {}
-        ds.gemv(lw.wqkv_gate, xn, mut g_logits)
-        sigmoid_gate(ctx, g_logits, mut gated_ctx)
-    }
-    else {
-        gated_ctx ⇇ ctx
-    }
-
     mut tensor<f32, [D]> proj ← tf32[D] {}
-    ds.gemv(lw.wo, gated_ctx, mut proj)
+    do device {
+        if lp.use_qkv_gate {
+            ds.gemv(lw.wqkv_gate, xn_q, mut g_logits)
+            sigmoid_gate(ctx, g_logits, mut gated_ctx)
+        }
+        else {
+            gated_ctx ⇇ ctx
+        }
+        ds.gemv(lw.wo, gated_ctx, mut proj)
+    }
 
     mut tensor<f32, [D]> attn_branch ← tf32[D] {}
     if lp.use_post_conv {
@@ -565,7 +650,9 @@ fn inkling_attn_step<size D, size QD, size KVD, size F, size H, size HD_REL, siz
         attn_branch ⇇ proj
     }
 
-    ds.residual_add(hin, attn_branch, mut h1)
+    do device {
+        ds.residual_add(hin, attn_branch, mut h1)
+    }
 }
 
 # Inkling FFN sub-block: FFN RMSNorm -> gate/up -> SITU/GELU/SwiGLU -> Wd ->
@@ -634,12 +721,300 @@ fn inkling_head_step<size D, size PADDED_V, size UNPADDED_V>(tensor<f32, [D]> hi
     }
 }
 
+# ---------------------------------------------------------------------------
+# Inkling 128-expert ExpertBank MoE + SITU + LoopedSegment / ResidualCarrier
+# ---------------------------------------------------------------------------
+
+@ public
+kernel zero_vec<size D>(mut tensor<f32, [D]> out) → void {
+    for from out at [j] thread lane let ? {
+        out[[j]] ← 0.0
+    }
+}
+
+@ public
+kernel vec_sub<size D>(tensor<f32, [D]> a, tensor<f32, [D]> b, mut tensor<f32, [D]> out) → void {
+    for from out at [j] thread lane let ? {
+        out[[j]] ← a[[j]] - b[[j]]
+    }
+}
+
+@ public
+kernel dspark_extract_b0<size B, size D>(tensor<f32, [B, D]> src, mut tensor<f32, [D]> dst) → void {
+    for from dst at [d] thread lane let ? {
+        dst[[d]] ← src[[0, d]]
+    }
+}
+
+@ public
+kernel dspark_insert_b0<size B, size D>(tensor<f32, [D]> src, mut tensor<f32, [B, D]> dst) → void {
+    for from src at [d] thread lane let v {
+        dst[[0, d]] ← v
+    }
+}
+
+@ public
+kernel accum_scaled<size D>(tensor<f32, [D]> src, f32 weight, mut tensor<f32, [D]> acc) → void {
+    for from acc at [j] thread lane let cur {
+        acc[[j]] ← cur + weight * src[[j]]
+    }
+}
+
+# Inkling sigmoid router scoring with optional `e_score_correction_bias`.
+@ public
+kernel router_sigmoid_bias<size E>(tensor<f32, [E]> logits, tensor<f32, [E]> bias, mut tensor<f32, [E]> probs, mut tensor<f32, [E]> sel_scores, bool use_bias) → void {
+    for from logits at [e] thread lane let l {
+        let f32 p ← 1.0 / (1.0 + (-l).exp())
+        probs[[e]] ← p
+        sel_scores[[e]] ← use_bias ✓ (p + bias[[e]]) ✗ p
+    }
+}
+
+# Gather sigmoid probabilities for selected top-K experts and normalize by
+# `route_scale / sum(probs[idx])`.
+@ public
+kernel moe_gather_scale_weights<size E, size K>(tensor<f32, [E]> probs, tensor<i32, [K]> idx, mut tensor<f32, [K]> weights_out, f32 route_scale) → void {
+    for from weights_out at [k] thread lane let ? {
+        mut f32 wsum ← 0.0
+        mut f32 wk ← 0.0
+        for range 0 ‥ K let r {
+            let i32 ei ← idx[[r]]
+            if ei ≥ 0 and ei ≺ E {
+                let f32 p ← probs[[ei]]
+                wsum ← wsum + p
+                if r ≡ k {
+                    wk ← p
+                }
+            }
+        }
+        weights_out[[k]] ← wsum ≻ 0.0 ✓ (wk * (route_scale / wsum)) ✗ 0.0
+    }
+}
+
+@ public
+class InklingMoeFfnWeights<size D, size E, size F> {
+    let eb.ExpertBank bank
+    let tensor<f32, [D]> fnorm
+    let tensor<f32, [E, D]> router_w
+    let tensor<f32, [E]> router_bias
+    let bool use_router_bias
+    let f32 route_scale
+    let tensor<f32, [E, F, D]> expert_gate_w
+    let tensor<f32, [E, F, D]> expert_up_w
+    let tensor<f32, [E, D, F]> expert_down_w
+    let tensor<f32, [4, D]> post_ffn_conv_w
+}
+
+# Inkling MoE FFN sub-block over `ExpertBank` + `ExpertActivation.Situ`
+# (`gate_cap = 4.0`, `up_cap = 25.0`), followed by `post_ffn` ShortConv.
+@ public
+fn inkling_moe_ffn_step<size D, size E, size F, size K, size ConvRows>(tensor<f32, [D]> h1, mut tensor<f32, [D]> hout, InklingMoeFfnWeights<D, E, F> mw, InklingLayerParams lp, mut hybrid.ConvStateArena<ConvRows, D> post_conv, int slot_id) → void ⇥ sess_mod.SessionError {
+    require mw.bank.expert_count ≡ E and mw.bank.hidden_size ≡ D and mw.bank.intermediate_size ≡ F throw variant sess_mod.SessionError.InvalidCapacity { message = "ExpertBank dimensions do not match Inkling MoE weights" }
+
+    mut eb.BankedMatrixSpec gate_spec ← eb.BankedMatrixSpec { kind = variant eb.ExpertWeightKind.DenseF32, expert_count = E, out_features = F, in_features = D, bits = 0, group_size = 0, packed_cols = 0, group_cols = 0 }
+    mut eb.BankedMatrixSpec up_spec ← gate_spec
+    mut eb.BankedMatrixSpec down_spec ← eb.BankedMatrixSpec { kind = variant eb.ExpertWeightKind.DenseF32, expert_count = E, out_features = D, in_features = F, bits = 0, group_size = 0, packed_cols = 0, group_cols = 0 }
+
+    match mw.bank.layout {
+        case eb.ExpertBankLayout.SplitGateUp let gate, up, down {
+            gate_spec ← gate
+            up_spec ← up
+            down_spec ← down
+        }
+        case _ {
+            throw variant sess_mod.SessionError.InvalidCapacity { message = "inkling_moe_ffn_step requires SplitGateUp ExpertBank layout" }
+        }
+    }
+
+    mut tensor<f32, [D]> fn_in ← tf32[D] {}
+    stages.norm_rmsnorm(h1, mw.fnorm, mut fn_in, lp.peps)
+
+    mut tensor<f32, [E]> r_logits ← tf32[E] {}
+    mut tensor<f32, [E]> r_probs ← tf32[E] {}
+    mut tensor<f32, [E]> r_sel ← tf32[E] {}
+    mut tensor<i32, [K]> top_idx ← tensor<i32, [K]> {}
+    mut tensor<f32, [K]> top_raw ← tf32[K] {}
+    mut tensor<f32, [K]> top_weights ← tf32[K] {}
+    mut tensor<f32, [D]> moe_out ← tf32[D] {}
+
+    do device {
+        ds.gemv(mw.router_w, fn_in, mut r_logits)
+        router_sigmoid_bias<size E>(r_logits, mw.router_bias, mut r_probs, mut r_sel, mw.use_router_bias)
+        dhk.moe_topk_indices<size E, size K>(r_sel, mut top_idx, mut top_raw)
+        moe_gather_scale_weights<size E, size K>(r_probs, top_idx, mut top_weights, mw.route_scale)
+        zero_vec<size D>(mut moe_out)
+    }
+
+    let eb.ExpertActivation act_kind ← eb.bank_activation(mw.bank)
+    mut tensor<f32, [F]> g_k ← tf32[F] {}
+    mut tensor<f32, [F]> u_k ← tf32[F] {}
+    mut tensor<f32, [F]> a_k ← tf32[F] {}
+    mut tensor<f32, [D]> d_k ← tf32[D] {}
+
+    for range 0 ‥ K let ki {
+        let int eidx ← top_idx[[ki]] ↦ int
+        let f32 ew ← top_weights[[ki]]
+
+        do {
+            eb.dispatch_routed_matvec_dense<size E, size F, size D>(gate_spec, mw.expert_gate_w, fn_in, mut g_k, eidx)
+            eb.dispatch_routed_matvec_dense<size E, size F, size D>(up_spec, mw.expert_up_w, fn_in, mut u_k, eidx)
+        }
+        catch err {
+            throw variant sess_mod.SessionError.InvalidCapacity { message = err.message }
+        }
+
+        do device {
+            match act_kind {
+                case eb.ExpertActivation.Situ let gate_cap, up_cap {
+                    situ(g_k, u_k, mut a_k, gate_cap, up_cap)
+                }
+                case eb.ExpertActivation.Swiglu {
+                    ds.swiglu(g_k, u_k, mut a_k)
+                }
+                case _ {
+                    geglu_tanh(g_k, u_k, mut a_k)
+                }
+            }
+        }
+
+        do {
+            eb.dispatch_routed_matvec_dense<size E, size D, size F>(down_spec, mw.expert_down_w, a_k, mut d_k, eidx)
+        }
+        catch err {
+            throw variant sess_mod.SessionError.InvalidCapacity { message = err.message }
+        }
+
+        do device {
+            accum_scaled<size D>(d_k, ew, mut moe_out)
+        }
+    }
+
+    mut tensor<f32, [D]> ffn_branch ← tf32[D] {}
+    if lp.use_post_conv {
+        shortconv4_step(mut post_conv, slot_id, hybrid.SITE_CONV_POST_FFN, mw.post_ffn_conv_w, moe_out, mut ffn_branch)
+    }
+    else {
+        ffn_branch ⇇ moe_out
+    }
+
+    do device {
+        ds.residual_add(h1, ffn_branch, mut hout)
+    }
+}
+
+# Build the canonical Inkling-2-Mini `ExecutionSchedule` with `RingKvArena(1024)`
+# on SWA layers, `FullKv` every 6th layer, `LoopedSegment(loop_start..loop_end)`,
+# and `ResidualKind.AttnRes`.
+@ public
+fn inkling_backbone_schedule(int num_layers, int swa_window, int loop_start, int loop_end, int loop_passes, int gate_rank, list<model_schedule.TapBuffer> taps) → model_schedule.ExecutionSchedule ⇥ model_schedule.ScheduleError {
+    require num_layers ≥ 1 throw variant model_schedule.ScheduleError.InvalidLayer { message = "num_layers must be >= 1" }
+    require loop_start ≥ 0 and loop_end ≻ loop_start and loop_end ≤ num_layers throw variant model_schedule.ScheduleError.InvalidSegment { message = "invalid LoopedSegment bounds for Inkling schedule" }
+
+    mut list<model_schedule.LayerSpec> layers ← empty
+    for exclusive num_layers let l {
+        let bool is_full ← (l % 6) ≡ 5
+        let model_schedule.AttentionKind attn ← is_full ✓ variant model_schedule.AttentionKind.Full ✗ variant model_schedule.AttentionKind.SlidingWindow { window = swa_window }
+        layers.append(model_schedule.LayerSpec {
+            physical_layer_id = l,
+            attention = attn,
+            rope = variant model_schedule.RopeKind.RelativeBias,
+            ffn = variant model_schedule.FfnKind.MoE
+        })
+    }
+
+    mut list<model_schedule.ScheduleSegment> segs ← empty
+    if loop_start ≻ 0 {
+        segs.append(variant model_schedule.ScheduleSegment.Linear {
+            seg = model_schedule.LinearSegment { start_layer = 0, end_layer = loop_start }
+        })
+    }
+    segs.append(variant model_schedule.ScheduleSegment.Looped {
+        seg = model_schedule.LoopedSegment {
+            start_layer = loop_start,
+            end_layer = loop_end,
+            pass_count = loop_passes,
+            reset_to_prelude = true,
+            gate_rank = gate_rank,
+            is_varloop = false,
+            max_passes = loop_passes
+        }
+    })
+    if loop_end ≺ num_layers {
+        segs.append(variant model_schedule.ScheduleSegment.Linear {
+            seg = model_schedule.LinearSegment { start_layer = loop_end, end_layer = num_layers }
+        })
+    }
+
+    return model_schedule.build_schedule(layers, segs, variant model_schedule.ResidualKind.AttnRes, taps)
+}
+
+# Execute one scheduled Inkling `ExecutionStep` integrating `AttnResBank<B, D, ...>`,
+# 4-message `tanh` `CrossPassController` on looped passes, `inkling_attn_step` +
+# `inkling_moe_ffn_step`, and `BatchTapStore`.
+@ public
+fn inkling_looped_visit_step<size B, size D, size QD, size KVD, size E, size F, size K, size H, size HD_REL, size D_REL, size REL_EXTENT, size H_TAPS, size C, size W, size ConvRows, size MaxSrc, size MaxRows, size R>(model_schedule.ExecutionStep step, InklingLayerWeights<D, QD, KVD, F, H, HD_REL, D_REL, REL_EXTENT, H_TAPS> lw, InklingMoeFfnWeights<D, E, F> mw, InklingLayerParams lp, res.CrossPassController<D, R> ctrl, mut res.AttnResBank<B, D, MaxSrc, MaxRows> bank, mut sess_mod.SessionState<C, W, KVD> sess, mut hybrid.ConvStateArena<ConvRows, KVD> kv_conv, mut hybrid.ConvStateArena<ConvRows, D> post_conv, mut res.BatchTapStore<B, D> taps, i32 pos) → void ⇥ sess_mod.SessionError {
+    if step.snapshots_prelude {
+        res.snapshot_prelude<size B, size D, size MaxSrc, size MaxRows>(mut bank)
+    }
+    if step.resets_to_prelude {
+        do {
+            res.begin_next_pass<size B, size D, size MaxSrc, size MaxRows>(mut bank, 1)
+        }
+        catch err {
+            throw variant sess_mod.SessionError.InvalidCapacity { message = err.message }
+        }
+    }
+
+    mut tensor<f32, [D]> hin ← tf32[D] {}
+    do device {
+        dspark_extract_b0<size B, size D>(bank.cur, mut hin)
+    }
+
+    if step.pass_index ≻ 0 and bank.has_prev_pass and bank.prev_pass_count ≥ 1 {
+        do {
+            mut tensor<f32, [B, D]> cur_out ← tf32[B, D] {}
+            res.apply_cross_pass_role_batch<size B, size D, size R, size MaxSrc, size MaxRows>(bank, ctrl, res.CROSS_PASS_Q, bank.cur, mut cur_out, 1)
+            do device {
+                dspark_extract_b0<size B, size D>(cur_out, mut hin)
+            }
+        }
+        catch err {
+            throw variant sess_mod.SessionError.InvalidCapacity { message = err.message }
+        }
+    }
+
+    mut tensor<f32, [D]> h1 ← tf32[D] {}
+    mut tensor<f32, [D]> hout ← tf32[D] {}
+    inkling_attn_step(hin, mut h1, lw, lp, mut sess, mut kv_conv, mut post_conv, step.slot_id, pos)
+    inkling_moe_ffn_step<size D, size E, size F, size K, size ConvRows>(h1, mut hout, mw, lp, mut post_conv, step.slot_id)
+
+    mut tensor<f32, [D]> delta ← tf32[D] {}
+    mut tensor<f32, [B, D]> delta_b ← tf32[B, D] {}
+    mut tensor<f32, [B, D]> post_b ← tf32[B, D] {}
+    do device {
+        vec_sub<size D>(hout, hin, mut delta)
+        dspark_insert_b0<size B, size D>(delta, mut delta_b)
+        dspark_insert_b0<size B, size D>(hout, mut post_b)
+    }
+
+    res.attn_res_push_delta_batch<size B, size D, size MaxSrc, size MaxRows>(mut bank, delta_b, 1)
+    do {
+        let bool ? ← res.attn_res_end_visit_batch<size B, size D, size MaxSrc, size MaxRows>(mut bank, 1)
+        let bool ? ← res.capture_if_tapped_batch<size B, size D>(mut taps, step.visit_id, post_b, 1)
+    }
+    catch err {
+        throw variant sess_mod.SessionError.InvalidCapacity { message = err.message }
+    }
+}
+
 +++ faber test
 
 import from "gradus:decode_step" let ds
 import from "gradus:cache/session" let sess_mod
 import from "gradus:cache/hybrid_arenas" let hybrid
 import from "gradus:model/schedule" let model_schedule
+import from "gradus:model/expert_bank" let eb
+import from "gradus:model/residual" let res
 
 fn close(f32 a, f32 b) → bool {
     let f32 diff ← (a - b).abs()
@@ -903,4 +1278,187 @@ test "Inkling row_softmax_with_sink O(C) online masks beyond valid_cols" {
             assert close(pr[[h, c]], (sc[[h, c]] - m).exp() / z)
         }
     }
+}
+
+test "Inkling 3-norm full-attn + 4-site SWA ShortConv + 128-expert SITU ExpertBank + LoopedSegment ResidualCarrier" {
+    # 1. Verify canonical Inkling-2-Mini 24-layer schedule with RingKv(1024),
+    #    LoopedSegment(6..18, 3 passes, gate_rank=64), ResidualKind.AttnRes, and TapBuffer.
+    let list<model_schedule.TapBuffer> tap_specs ← [
+        model_schedule.TapBuffer { name = "tap_l5", visit_id = 5 }
+    ]
+    let model_schedule.ExecutionSchedule full_sched ← inkling_backbone_schedule(INKLING_NUM_LAYERS, INKLING_SWA_WINDOW, INKLING_LOOP_START, INKLING_LOOP_END, INKLING_LOOP_PASSES, INKLING_GATE_RANK, tap_specs) ⊥ model_schedule.ExecutionSchedule { layers = empty, segments = empty, steps = empty, slots = empty, residual = variant model_schedule.ResidualKind.Standard, taps = empty }
+    assert model_schedule.slot_count(full_sched) ≡ 24
+    assert model_schedule.ring_kv_slot_count(full_sched) ≡ 20
+    assert model_schedule.full_kv_slot_count(full_sched) ≡ 4
+    # 6 prelude + 12 * 3 looped + 6 tail = 48 visits
+    assert full_sched.steps.length() ≡ 48
+
+    # 2. Verify 3-norm full-attn + 4-site SWA ShortConv + 128-expert SITU ExpertBank
+    #    + LoopedSegment + 4-msg CrossPassController + AttnResBank + TapStore.
+    let model_schedule.ExecutionSchedule small_sched ← inkling_backbone_schedule(3, 1024, 1, 2, 2, 2, [model_schedule.TapBuffer { name = "tap_mid", visit_id = 1 }]) ⊥ model_schedule.ExecutionSchedule { layers = empty, segments = empty, steps = empty, slots = empty, residual = variant model_schedule.ResidualKind.Standard, taps = empty }
+    mut sess_mod.SessionState<8, 1024, 2> sess ← sess_mod.from_schedule<size 8, size 1024, size 2>(small_sched) ⊥ sess_mod.SessionState<8, 1024, 2> { sched = small_sched, full_kv = sess_mod.FullKvArena<8, 2> { capacity = 8, kv_dim = 2, slot_ids = empty, keys = empty, values = empty, lengths = empty }, ring_kv = sess_mod.RingKvArena<1024, 2> { max_window = 1024, kv_dim = 2, slot_ids = empty, window_sizes = empty, keys = empty, values = empty, total_written = empty }, slot_arena_kind = empty, slot_local_index = empty, slot_window_sizes = empty, slot_kv_quant = empty, txn_depth = 0 }
+    mut hybrid.ConvStateArena<12, 2> kv_conv ← hybrid.conv_from_schedule<size 12, size 2>(small_sched, 4, 3, true) ⊥ hybrid.ConvStateArena<12, 2> { sites_per_slot = 4, history_len = 3, channels = 2, slot_ids = empty, buffers = empty, steps_written = empty }
+    mut hybrid.ConvStateArena<12, 2> post_conv ← hybrid.conv_from_schedule<size 12, size 2>(small_sched, 4, 3, true) ⊥ hybrid.ConvStateArena<12, 2> { sites_per_slot = 4, history_len = 3, channels = 2, slot_ids = empty, buffers = empty, steps_written = empty }
+
+    mut tensor<f32, [2]> eye2 ← tf32[2] {}
+    eye2[[0]] ← 1.0
+    eye2[[1]] ← 1.0
+    mut tensor<f32, [2, 2]> id2 ← tf32[2, 2] {}
+    id2[[0, 0]] ← 1.0
+    id2[[1, 1]] ← 1.0
+    mut tensor<f32, [4, 2]> conv_id ← tf32[4, 2] {}
+    conv_id[[3, 0]] ← 1.0
+    conv_id[[3, 1]] ← 1.0
+
+    let tensor<f32, [1, 2]> z_sink ← tf32[1, 2] {}
+    let tensor<f32, [2, 2]> z_rel ← tf32[2, 2] {}
+    let tensor<f32, [4, 2]> z_taps ← tf32[4, 2] {}
+    let tensor<f32, [128]> z_rbias ← tf32[128] {}
+
+    let InklingLayerWeights<2, 2, 2, 2, 1, 2, 2, 2, 4> lw ← InklingLayerWeights<2, 2, 2, 2, 1, 2, 2, 2, 4> {
+        anorm = eye2,
+        q_anorm = eye2,
+        k_anorm = eye2,
+        v_anorm = eye2,
+        wq = id2,
+        wk = id2,
+        wv = id2,
+        wo = id2,
+        wqkv_gate = id2,
+        w_sink = z_sink,
+        wr = id2,
+        w_rel = z_rel,
+        k_sconv_w = conv_id,
+        v_sconv_w = conv_id,
+        k_sconv_weight_proj = z_taps,
+        v_sconv_weight_proj = z_taps,
+        post_attn_conv_w = conv_id,
+        post_ffn_conv_w = conv_id,
+        fnorm = eye2,
+        wg = id2,
+        wu = id2,
+        wd = id2
+    }
+
+    let InklingLayerParams lp_swa ← InklingLayerParams {
+        pdh = 2,
+        pgroup = 1,
+        peps = 1.0e-6,
+        pscale = 1.0,
+        qk_max_norm = 0.0,
+        r_max_norm = 0.0,
+        inv_ln_base = 0.0,
+        is_full_attn = false,
+        use_split_qkv_norms = false,
+        use_sink = false,
+        use_rel_bias = false,
+        use_qkv_gate = true,
+        use_static_kv_conv = true,
+        use_dynamic_kv_conv = false,
+        use_post_conv = true,
+        mlp_act = variant Gelu
+    }
+
+    let eb.BankedMatrixSpec gate_spec ← eb.BankedMatrixSpec { kind = variant eb.ExpertWeightKind.DenseF32, expert_count = 128, out_features = 2, in_features = 2, bits = 0, group_size = 0, packed_cols = 0, group_cols = 0 }
+    let eb.ExpertBank bank128 ← eb.ExpertBank {
+        expert_count = 128,
+        hidden_size = 2,
+        intermediate_size = 2,
+        layout = variant eb.ExpertBankLayout.SplitGateUp { gate = gate_spec, up = gate_spec, down = gate_spec },
+        has_router_bias = true,
+        shared_expert_count = 0,
+        activation = variant eb.ExpertActivation.Situ { gate_cap = INKLING_MLP_GATE_SOFTCAP, up_cap = INKLING_MLP_UP_SOFTCAP }
+    }
+
+    mut tensor<f32, [128, 2]> router_w ← tf32[128, 2] {}
+    router_w[[0, 0]] ← 2.0
+    router_w[[1, 1]] ← 2.0
+    mut tensor<f32, [128, 2, 2]> exp_w ← tf32[128, 2, 2] {}
+    exp_w[[0, 0, 0]] ← 1.0
+    exp_w[[0, 1, 1]] ← 1.0
+    exp_w[[1, 0, 0]] ← 1.0
+    exp_w[[1, 1, 1]] ← 1.0
+
+    let InklingMoeFfnWeights<2, 128, 2> mw ← InklingMoeFfnWeights<2, 128, 2> {
+        bank = bank128,
+        fnorm = eye2,
+        router_w = router_w,
+        router_bias = z_rbias,
+        use_router_bias = true,
+        route_scale = INKLING_ROUTE_SCALE,
+        expert_gate_w = exp_w,
+        expert_up_w = exp_w,
+        expert_down_w = exp_w,
+        post_ffn_conv_w = conv_id
+    }
+
+    let res.CrossPassGate<2, 2> g0 ← res.init_cross_pass_gate<size 2, size 2>(id2, id2, id2, eye2)
+    let res.CrossPassController<2, 2> ctrl ← res.init_cross_pass_controller<size 2, size 2>(g0, g0, g0, g0)
+
+    mut tensor<f32, [2]> init_h ← tf32[2] {}
+    init_h[[0]] ← 1.0
+    init_h[[1]] ← 0.5
+
+    mut bool ok ← true
+    do {
+        let res.ResidualCarrier<res.StandardCarrier<size 1, size 2>, res.AttnResBank<size 1, size 2, size 8, size 8>> carrier ← res.carrier_from_schedule<size 2, size 8>(small_sched, 1, init_h)
+        assert res.carrier_is_attn_res<size 1, size 2, size 8, size 8>(carrier)
+        mut res.AttnResBank<1, 2, 8, 8> bank ← res.carrier_attn_res_bank<size 1, size 2, size 8, size 8>(carrier)
+        mut res.BatchTapStore<size 1, size 2> tap_store ← res.batch_tap_store_from_schedule<size 1, size 2>(small_sched)
+
+        do {
+            for from small_sched.steps let step {
+                inkling_looped_visit_step<size 1, size 2, size 2, size 2, size 128, size 2, size 8, size 1, size 2, size 2, size 2, size 4, size 8, size 1024, size 12, size 8, size 8, size 2>(step, lw, mw, lp_swa, ctrl, mut bank, mut sess, mut kv_conv, mut post_conv, mut tap_store, 0)
+            }
+        }
+        catch err {
+            ok ← false
+        }
+
+        assert tap_store.slots[0].captured
+        assert not (bank.cur[[0, 0]] ≡ (0.0 ∷ f32))
+
+        # 3. Also exercise 3-norm full-attention path (`is_full_attn = true`,
+        #    `use_split_qkv_norms = true`, `use_dynamic_kv_conv = true`).
+        let list<model_schedule.LayerSpec> full_layers ← [
+            model_schedule.LayerSpec { physical_layer_id = 0, attention = variant model_schedule.AttentionKind.Full, rope = variant model_schedule.RopeKind.RelativeBias, ffn = variant model_schedule.FfnKind.MoE }
+        ]
+        let list<model_schedule.ScheduleSegment> full_segs ← [
+            variant model_schedule.ScheduleSegment.Linear { seg = model_schedule.LinearSegment { start_layer = 0, end_layer = 1 } }
+        ]
+        let model_schedule.ExecutionSchedule full_only_sched ← model_schedule.build_schedule(full_layers, full_segs, variant model_schedule.ResidualKind.Standard, empty) ⊥ model_schedule.ExecutionSchedule { layers = empty, segments = empty, steps = empty, slots = empty, residual = variant model_schedule.ResidualKind.Standard, taps = empty }
+        mut sess_mod.SessionState<8, 1024, 2> full_sess ← sess_mod.from_schedule<size 8, size 1024, size 2>(full_only_sched) ⊥ sess_mod.SessionState<8, 1024, 2> { sched = full_only_sched, full_kv = sess_mod.FullKvArena<8, 2> { capacity = 8, kv_dim = 2, slot_ids = empty, keys = empty, values = empty, lengths = empty }, ring_kv = sess_mod.RingKvArena<1024, 2> { max_window = 1024, kv_dim = 2, slot_ids = empty, window_sizes = empty, keys = empty, values = empty, total_written = empty }, slot_arena_kind = empty, slot_local_index = empty, slot_window_sizes = empty, slot_kv_quant = empty, txn_depth = 0 }
+        mut hybrid.ConvStateArena<12, 2> full_kv_conv ← hybrid.conv_from_schedule<size 12, size 2>(full_only_sched, 4, 3, true) ⊥ hybrid.ConvStateArena<12, 2> { sites_per_slot = 4, history_len = 3, channels = 2, slot_ids = empty, buffers = empty, steps_written = empty }
+        mut hybrid.ConvStateArena<12, 2> full_post_conv ← hybrid.conv_from_schedule<size 12, size 2>(full_only_sched, 4, 3, true) ⊥ hybrid.ConvStateArena<12, 2> { sites_per_slot = 4, history_len = 3, channels = 2, slot_ids = empty, buffers = empty, steps_written = empty }
+        let InklingLayerParams lp_full ← InklingLayerParams {
+            pdh = 2,
+            pgroup = 1,
+            peps = 1.0e-6,
+            pscale = 1.0,
+            qk_max_norm = 0.0,
+            r_max_norm = 0.0,
+            inv_ln_base = 0.0,
+            is_full_attn = true,
+            use_split_qkv_norms = true,
+            use_sink = false,
+            use_rel_bias = true,
+            use_qkv_gate = true,
+            use_static_kv_conv = false,
+            use_dynamic_kv_conv = true,
+            use_post_conv = true,
+            mlp_act = variant Gelu
+        }
+        mut tensor<f32, [2]> h1_full ← tf32[2] {}
+        do {
+            inkling_attn_step(init_h, mut h1_full, lw, lp_full, mut full_sess, mut full_kv_conv, mut full_post_conv, 0, 0)
+        }
+        catch err {
+            ok ← false
+        }
+        assert not (h1_full[[0]] ≡ (0.0 ∷ f32))
+    }
+    catch err {
+        ok ← false
+    }
+    assert ok
 }
