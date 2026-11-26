@@ -108,6 +108,84 @@ kernel row_softmax_sink<size H, size C>(tensor<f32, [H, C]> rsi, tensor<f32, [H]
     }
 }
 
+# Split-C pass 1 for sink softmax: each lane `[h, p]` computes online `(max, denom)`
+# over strided elements `c = p, p + P, ... < C` (coalesced across `P`).
+@ public
+kernel row_softmax_sink_part<size H, size C, size P>(tensor<f32, [H, C]> rsi, mut tensor<f32, [H, P]> part_m, mut tensor<f32, [H, P]> part_d) → void {
+    let i32 c_len ← C ↦ i32 ⊥ 0
+    let i32 p_len ← P ↦ i32 ⊥ 1
+
+    for from part_m at [h, p] thread lane let ? {
+        if c_len ∈ 1 … 16777215 and p_len ∈ 1 … 1024 and p ∈ 0 … 1023 {
+            let i32 cc_len ← c_len ∧ 16777215
+            let i32 pp ← p ∧ 1023
+            if pp ≺ cc_len {
+                mut f32 m ← rsi[[h, pp]]
+                mut f32 denom ← 1.0
+                mut i32 k ← pp + p_len
+
+                while k ≺ cc_len {
+                    let f32 sk ← rsi[[h, k]]
+                    if sk ≻ m {
+                        denom ← denom * (m - sk).exp() + 1.0
+                        m ← sk
+                    }
+                    else {
+                        denom ← denom + (sk - m).exp()
+                    }
+                    k ← k + p_len
+                }
+
+                part_m[[h, p]] ← m
+                part_d[[h, p]] ← denom
+            }
+            else {
+                part_m[[h, p]] ← -3.4028235e38
+                part_d[[h, p]] ← 0.0
+            }
+        }
+    }
+}
+
+# Split-C pass 2 for sink softmax: reduce `P` partials + `rsink[h]` into `row_m[h]` and `row_inv_d[h]`.
+@ public
+kernel row_softmax_sink_reduce<size H, size P>(tensor<f32, [H, P]> part_m, tensor<f32, [H, P]> part_d, tensor<f32, [H]> rsink, mut tensor<f32, [H]> row_m, mut tensor<f32, [H]> row_inv_d) → void {
+    let i32 p_len ← P ↦ i32 ⊥ 1
+
+    for from rsink at [h] thread lane let sink_logit {
+        if p_len ∈ 1 … 1024 {
+            let i32 pp_len ← p_len ∧ 1023
+            mut f32 m ← sink_logit
+            mut f32 denom ← 1.0
+
+            for range 0 ‥ pp_len let p {
+                let f32 pd ← part_d[[h, p]]
+                if pd ≻ 0.0 {
+                    let f32 pm ← part_m[[h, p]]
+                    if pm ≻ m {
+                        denom ← denom * (m - pm).exp() + pd
+                        m ← pm
+                    }
+                    else {
+                        denom ← denom + pd * (pm - m).exp()
+                    }
+                }
+            }
+
+            row_m[[h]] ← m
+            row_inv_d[[h]] ← 1.0 / denom
+        }
+    }
+}
+
+# Split-C pass 3 for sink softmax: parallel elementwise normalize over all `[H, C]`.
+@ public
+kernel row_softmax_sink_apply<size H, size C>(tensor<f32, [H, C]> rsi, tensor<f32, [H]> row_m, tensor<f32, [H]> row_inv_d, mut tensor<f32, [H, C]> rso) → void {
+    for from rso at [h, c] thread lane let ? {
+        rso[[h, c]] ← (rsi[[h, c]] - row_m[[h]]).exp() * row_inv_d[[h]]
+    }
+}
+
 # MoE top-K router selection (indices + raw top-K logits).
 # Ties break to the lowest expert index.
 @ public
@@ -787,5 +865,34 @@ test "decode_hybrid_kernels l2norm_repeat_slice and z_gated_rmsnorm O(dh) match 
     for range 0‥4 let i {
         assert close(rn_out[[i]], rn_ref[[i]])
         assert close(zg2[[i]], zg[[i]])
+    }
+}
+
+test "decode_hybrid_kernels Split-C row_softmax_sink matches single-pass row_softmax_sink" {
+    mut tensor<f32, [2, 8]> rsi ← tf32[2, 8] {}
+    mut tensor<f32, [2]> rsink ← tf32[2] {}
+    mut tensor<f32, [2, 8]> rso_ref ← tf32[2, 8] {}
+    mut tensor<f32, [2, 8]> rso_split ← tf32[2, 8] {}
+    mut tensor<f32, [2, 4]> part_m ← tf32[2, 4] {}
+    mut tensor<f32, [2, 4]> part_d ← tf32[2, 4] {}
+    mut tensor<f32, [2]> row_m ← tf32[2] {}
+    mut tensor<f32, [2]> row_inv_d ← tf32[2] {}
+
+    rsink[[0]] ← 1.25
+    rsink[[1]] ← -0.75
+    for range 0‥8 let c {
+        rsi[[0, c]] ← ((c ↦ f32) - 3.5) * 0.6
+        rsi[[1, c]] ← (3.0 - (c ↦ f32)) * 0.4
+    }
+
+    dhk.row_softmax_sink(rsi, rsink, mut rso_ref)
+    dhk.row_softmax_sink_part(rsi, mut part_m, mut part_d)
+    dhk.row_softmax_sink_reduce(part_m, part_d, rsink, mut row_m, mut row_inv_d)
+    dhk.row_softmax_sink_apply(rsi, row_m, row_inv_d, mut rso_split)
+
+    for range 0‥2 let h {
+        for range 0‥8 let c {
+            assert close(rso_split[[h, c]], rso_ref[[h, c]])
+        }
     }
 }
