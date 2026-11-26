@@ -92,8 +92,17 @@ fn admit_group_spec(int out_features, int in_features, int group_size, PackKind 
 # Typed host reference decode and GEMV
 # -------------------------------------------------------------------------
 
-@ public
-fn ref_dequantize_u8(BlockFp8Spec spec, list<u8> weight, list<u8> scales) → list<f32> ⇥ BlockFp8Error {
+fn ue8m0_list_to_f32(list<u8> scales) → list<f32> {
+    mut list<f32> out ← empty
+
+    for from scales let b {
+        out.append(fp.ue8m0(b))
+    }
+
+    return out
+}
+
+fn dequantize_u8_with_f32_scales(BlockFp8Spec spec, list<u8> weight, list<f32> scales) → list<f32> ⇥ BlockFp8Error {
     match spec.pack {
         case PackU8 {
             pass
@@ -116,7 +125,7 @@ fn ref_dequantize_u8(BlockFp8Spec spec, list<u8> weight, list<u8> scales) → li
         for exclusive spec.in_features let j {
             let int sc ← j / spec.block_cols
             let f32 w ← fp.fp8_e4m3(weight[w_base + j])
-            let f32 s ← fp.ue8m0(scales[s_base + sc])
+            let f32 s ← scales[s_base + sc]
             out.append(w * s)
         }
     }
@@ -124,8 +133,7 @@ fn ref_dequantize_u8(BlockFp8Spec spec, list<u8> weight, list<u8> scales) → li
     return out
 }
 
-@ public
-fn ref_dequantize_u32(BlockFp8Spec spec, list<u32> weight, list<u8> scales) → list<f32> ⇥ BlockFp8Error {
+fn dequantize_u32_with_f32_scales(BlockFp8Spec spec, list<u32> weight, list<f32> scales) → list<f32> ⇥ BlockFp8Error {
     match spec.pack {
         case PackU32 {
             pass
@@ -152,12 +160,39 @@ fn ref_dequantize_u32(BlockFp8Spec spec, list<u32> weight, list<u8> scales) → 
             let u8 raw_w ← ((word ⇒ shift) ∧ 255) ↦ wrapping<u8>
             let int sc ← j / spec.block_cols
             let f32 w ← fp.fp8_e4m3(raw_w)
-            let f32 s ← fp.ue8m0(scales[s_base + sc])
+            let f32 s ← scales[s_base + sc]
             out.append(w * s)
         }
     }
 
     return out
+}
+
+@ public
+fn ref_dequantize_u8(BlockFp8Spec spec, list<u8> weight, list<u8> scales) → list<f32> ⇥ BlockFp8Error {
+    return dequantize_u8_with_f32_scales(spec, weight, ue8m0_list_to_f32(scales))
+}
+
+@ public
+fn ref_dequantize_u8_f32(BlockFp8Spec spec, list<u8> weight, list<f32> scales) → list<f32> ⇥ BlockFp8Error {
+    return dequantize_u8_with_f32_scales(spec, weight, scales)
+}
+
+@ public
+fn ref_dequantize_u8_unscaled(int out_features, int in_features, list<u8> weight) → list<f32> ⇥ BlockFp8Error {
+    let BlockFp8Spec spec ← admit_spec(out_features, in_features, out_features, in_features, variant PackKind.PackU8)
+    let list<f32> unit ← [1.0 ∷ f32]
+    return dequantize_u8_with_f32_scales(spec, weight, unit)
+}
+
+@ public
+fn ref_dequantize_u32(BlockFp8Spec spec, list<u32> weight, list<u8> scales) → list<f32> ⇥ BlockFp8Error {
+    return dequantize_u32_with_f32_scales(spec, weight, ue8m0_list_to_f32(scales))
+}
+
+@ public
+fn ref_dequantize_u32_f32(BlockFp8Spec spec, list<u32> weight, list<f32> scales) → list<f32> ⇥ BlockFp8Error {
+    return dequantize_u32_with_f32_scales(spec, weight, scales)
 }
 
 @ public
@@ -176,6 +211,32 @@ fn ref_matvec(int out_features, int in_features, list<f32> w_dense, list<f32> x)
         }
 
         y.append(acc)
+    }
+
+    return y
+}
+
+@ public
+fn ref_matmul(int batch, int out_features, int in_features, list<f32> w_dense, list<f32> x) → list<f32> ⇥ BlockFp8Error {
+    require batch ≥ 1 throw variant BadShape { message = "batch must be at least 1" }
+    require w_dense.length() ≡ out_features * in_features throw variant BadShape { message = "dense weight length mismatch" }
+    require x.length() ≡ batch * in_features throw variant BadShape { message = "input batch length mismatch" }
+
+    mut list<f32> y ← empty
+
+    for exclusive batch let b {
+        let int x_base ← b * in_features
+
+        for exclusive out_features let r {
+            mut f32 acc ← 0.0 ∷ f32
+            let int w_base ← r * in_features
+
+            for exclusive in_features let j {
+                acc ← acc + w_dense[w_base + j] * x[x_base + j]
+            }
+
+            y.append(acc)
+        }
     }
 
     return y
@@ -451,6 +512,1525 @@ kernel linear_matvec_u32<size Out, size PackedIn, size ScaleRows, size ScaleCols
     }
 }
 
+@ public
+kernel linear_matmul_u8<size B, size Out, size In, size ScaleRows, size ScaleCols>(tensor<u8, [Out, In]> weight, tensor<u8, [ScaleRows, ScaleCols]> scales, tensor<f32, [B, In]> x, mut tensor<f32, [B, Out]> y, i32 block_rows, i32 block_cols) → void {
+    for from y at [b_idx, row] thread lane let e {
+        if block_rows ≥ 1 and block_rows ≤ 4096 and block_cols ≥ 1 and block_cols ≤ 4096 {
+            let i32 sr ← row / block_rows
+            mut f32 acc ← 0.0 ∷ f32
+
+            for exclusive In let j {
+                let i32 sc ← j / block_cols
+                let i32 wb ← weight[[row, j]] ↦ i32
+                let i32 w_sign ← (wb ⇒ 7) ∧ 1
+                let i32 w_exp ← (wb ⇒ 3) ∧ 15
+                let i32 w_mant ← wb ∧ 7
+                mut f32 w ← 0.0 ∷ f32
+
+                if w_exp ≡ 15 and w_mant ≡ 7 {
+                    w ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                }
+                else {
+                    if w_exp ≡ 0 {
+                        w ← (w_mant ↦ f32) * (0.001953125 ∷ f32)
+                    }
+                    else {
+                        mut f32 pow2 ← 0.0078125 ∷ f32
+                        if (w_exp ∧ 1) ≢ 0 {
+                            pow2 ← pow2 * (2.0 ∷ f32)
+                        }
+                        if (w_exp ∧ 2) ≢ 0 {
+                            pow2 ← pow2 * (4.0 ∷ f32)
+                        }
+                        if (w_exp ∧ 4) ≢ 0 {
+                            pow2 ← pow2 * (16.0 ∷ f32)
+                        }
+                        if (w_exp ∧ 8) ≢ 0 {
+                            pow2 ← pow2 * (256.0 ∷ f32)
+                        }
+                        let f32 frac ← (1.0 ∷ f32) + (w_mant ↦ f32) * (0.125 ∷ f32)
+                        w ← pow2 * frac
+                    }
+
+                    if w_sign ≡ 1 {
+                        w ← -w
+                    }
+                }
+
+                let i32 se ← scales[[sr, sc]] ↦ i32
+                mut f32 s ← 1.0 ∷ f32
+
+                if se ≡ 255 {
+                    s ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                }
+                elif se ≥ 127 {
+                    let i32 diff ← se - 127
+                    let f32 p1 ← 2.0 ∷ f32
+                    let f32 p2 ← p1 * p1
+                    let f32 p4 ← p2 * p2
+                    let f32 p8 ← p4 * p4
+                    let f32 p16 ← p8 * p8
+                    let f32 p32 ← p16 * p16
+                    let f32 p64 ← p32 * p32
+
+                    if (diff ∧ 1) ≢ 0 {
+                        s ← s * p1
+                    }
+                    if (diff ∧ 2) ≢ 0 {
+                        s ← s * p2
+                    }
+                    if (diff ∧ 4) ≢ 0 {
+                        s ← s * p4
+                    }
+                    if (diff ∧ 8) ≢ 0 {
+                        s ← s * p8
+                    }
+                    if (diff ∧ 16) ≢ 0 {
+                        s ← s * p16
+                    }
+                    if (diff ∧ 32) ≢ 0 {
+                        s ← s * p32
+                    }
+                    if (diff ∧ 64) ≢ 0 {
+                        s ← s * p64
+                    }
+                }
+                else {
+                    let i32 diff ← 127 - se
+                    let f32 n1 ← 0.5 ∷ f32
+                    let f32 n2 ← n1 * n1
+                    let f32 n4 ← n2 * n2
+                    let f32 n8 ← n4 * n4
+                    let f32 n16 ← n8 * n8
+                    let f32 n32 ← n16 * n16
+                    let f32 n64 ← n32 * n32
+
+                    if (diff ∧ 1) ≢ 0 {
+                        s ← s * n1
+                    }
+                    if (diff ∧ 2) ≢ 0 {
+                        s ← s * n2
+                    }
+                    if (diff ∧ 4) ≢ 0 {
+                        s ← s * n4
+                    }
+                    if (diff ∧ 8) ≢ 0 {
+                        s ← s * n8
+                    }
+                    if (diff ∧ 16) ≢ 0 {
+                        s ← s * n16
+                    }
+                    if (diff ∧ 32) ≢ 0 {
+                        s ← s * n32
+                    }
+                    if (diff ∧ 64) ≢ 0 {
+                        s ← s * n64
+                    }
+                }
+
+                acc ← acc + (w * s) * x[[b_idx, j]]
+            }
+
+            y[[b_idx, row]] ← acc
+        }
+    }
+}
+
+@ public
+kernel linear_matmul_u32<size B, size Out, size PackedIn, size ScaleRows, size ScaleCols, size In>(tensor<u32, [Out, PackedIn]> weight, tensor<u8, [ScaleRows, ScaleCols]> scales, tensor<f32, [B, In]> x, mut tensor<f32, [B, Out]> y, i32 block_rows, i32 block_cols) → void {
+    for from y at [b_idx, row] thread lane let e {
+        if block_rows ≥ 1 and block_rows ≤ 4096 and block_cols ≥ 1 and block_cols ≤ 4096 {
+            let i32 sr ← row / block_rows
+            mut f32 acc ← 0.0 ∷ f32
+
+            for exclusive In let j {
+                let i32 sc ← j / block_cols
+                let i32 word_idx ← j / 4
+                let i32 byte_lane ← j % 4
+                let u32 w0 ← weight[[row, word_idx]]
+                mut u32 raw_bits ← 0 ∷ u32
+
+                if byte_lane ≡ 0 {
+                    raw_bits ← w0 ∧ (255 ∷ u32)
+                }
+                elif byte_lane ≡ 1 {
+                    raw_bits ← (w0 ⇒ (8 ∷ u32)) ∧ (255 ∷ u32)
+                }
+                elif byte_lane ≡ 2 {
+                    raw_bits ← (w0 ⇒ (16 ∷ u32)) ∧ (255 ∷ u32)
+                }
+                else {
+                    raw_bits ← (w0 ⇒ (24 ∷ u32)) ∧ (255 ∷ u32)
+                }
+
+                let i32 wb ← raw_bits ↦ wrapping<i32>
+                let i32 w_sign ← (wb ⇒ 7) ∧ 1
+                let i32 w_exp ← (wb ⇒ 3) ∧ 15
+                let i32 w_mant ← wb ∧ 7
+                mut f32 w ← 0.0 ∷ f32
+
+                if w_exp ≡ 15 and w_mant ≡ 7 {
+                    w ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                }
+                else {
+                    if w_exp ≡ 0 {
+                        w ← (w_mant ↦ f32) * (0.001953125 ∷ f32)
+                    }
+                    else {
+                        mut f32 pow2 ← 0.0078125 ∷ f32
+                        if (w_exp ∧ 1) ≢ 0 {
+                            pow2 ← pow2 * (2.0 ∷ f32)
+                        }
+                        if (w_exp ∧ 2) ≢ 0 {
+                            pow2 ← pow2 * (4.0 ∷ f32)
+                        }
+                        if (w_exp ∧ 4) ≢ 0 {
+                            pow2 ← pow2 * (16.0 ∷ f32)
+                        }
+                        if (w_exp ∧ 8) ≢ 0 {
+                            pow2 ← pow2 * (256.0 ∷ f32)
+                        }
+                        let f32 frac ← (1.0 ∷ f32) + (w_mant ↦ f32) * (0.125 ∷ f32)
+                        w ← pow2 * frac
+                    }
+
+                    if w_sign ≡ 1 {
+                        w ← -w
+                    }
+                }
+
+                let i32 se ← scales[[sr, sc]] ↦ i32
+                mut f32 s ← 1.0 ∷ f32
+
+                if se ≡ 255 {
+                    s ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                }
+                elif se ≥ 127 {
+                    let i32 diff ← se - 127
+                    let f32 p1 ← 2.0 ∷ f32
+                    let f32 p2 ← p1 * p1
+                    let f32 p4 ← p2 * p2
+                    let f32 p8 ← p4 * p4
+                    let f32 p16 ← p8 * p8
+                    let f32 p32 ← p16 * p16
+                    let f32 p64 ← p32 * p32
+
+                    if (diff ∧ 1) ≢ 0 {
+                        s ← s * p1
+                    }
+                    if (diff ∧ 2) ≢ 0 {
+                        s ← s * p2
+                    }
+                    if (diff ∧ 4) ≢ 0 {
+                        s ← s * p4
+                    }
+                    if (diff ∧ 8) ≢ 0 {
+                        s ← s * p8
+                    }
+                    if (diff ∧ 16) ≢ 0 {
+                        s ← s * p16
+                    }
+                    if (diff ∧ 32) ≢ 0 {
+                        s ← s * p32
+                    }
+                    if (diff ∧ 64) ≢ 0 {
+                        s ← s * p64
+                    }
+                }
+                else {
+                    let i32 diff ← 127 - se
+                    let f32 n1 ← 0.5 ∷ f32
+                    let f32 n2 ← n1 * n1
+                    let f32 n4 ← n2 * n2
+                    let f32 n8 ← n4 * n4
+                    let f32 n16 ← n8 * n8
+                    let f32 n32 ← n16 * n16
+                    let f32 n64 ← n32 * n32
+
+                    if (diff ∧ 1) ≢ 0 {
+                        s ← s * n1
+                    }
+                    if (diff ∧ 2) ≢ 0 {
+                        s ← s * n2
+                    }
+                    if (diff ∧ 4) ≢ 0 {
+                        s ← s * n4
+                    }
+                    if (diff ∧ 8) ≢ 0 {
+                        s ← s * n8
+                    }
+                    if (diff ∧ 16) ≢ 0 {
+                        s ← s * n16
+                    }
+                    if (diff ∧ 32) ≢ 0 {
+                        s ← s * n32
+                    }
+                    if (diff ∧ 64) ≢ 0 {
+                        s ← s * n64
+                    }
+                }
+
+                acc ← acc + (w * s) * x[[b_idx, j]]
+            }
+
+            y[[b_idx, row]] ← acc
+        }
+    }
+}
+
+@ public
+kernel linear_matvec_u8_f32_scales<size Out, size In, size ScaleRows, size ScaleCols>(tensor<u8, [Out, In]> weight, tensor<f32, [ScaleRows, ScaleCols]> scales, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, i32 block_rows, i32 block_cols) → void {
+    for from y at [row] thread lane let e {
+        if block_rows ≥ 1 and block_cols ≥ 1 {
+            let i32 sr ← row / block_rows
+            mut f32 acc ← 0.0 ∷ f32
+
+            for exclusive In let j {
+                let i32 sc ← j / block_cols
+                let i32 wb ← weight[[row, j]] ↦ i32
+                let i32 w_sign ← (wb ⇒ 7) ∧ 1
+                let i32 w_exp ← (wb ⇒ 3) ∧ 15
+                let i32 w_mant ← wb ∧ 7
+                mut f32 w ← 0.0 ∷ f32
+
+                if w_exp ≡ 15 and w_mant ≡ 7 {
+                    w ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                }
+                else {
+                    if w_exp ≡ 0 {
+                        w ← (w_mant ↦ f32) * (0.001953125 ∷ f32)
+                    }
+                    else {
+                        mut f32 pow2 ← 0.0078125 ∷ f32
+                        if (w_exp ∧ 1) ≢ 0 {
+                            pow2 ← pow2 * (2.0 ∷ f32)
+                        }
+                        if (w_exp ∧ 2) ≢ 0 {
+                            pow2 ← pow2 * (4.0 ∷ f32)
+                        }
+                        if (w_exp ∧ 4) ≢ 0 {
+                            pow2 ← pow2 * (16.0 ∷ f32)
+                        }
+                        if (w_exp ∧ 8) ≢ 0 {
+                            pow2 ← pow2 * (256.0 ∷ f32)
+                        }
+                        let f32 frac ← (1.0 ∷ f32) + (w_mant ↦ f32) * (0.125 ∷ f32)
+                        w ← pow2 * frac
+                    }
+
+                    if w_sign ≡ 1 {
+                        w ← -w
+                    }
+                }
+
+                let f32 s ← scales[[sr, sc]]
+                acc ← acc + (w * s) * x[[j]]
+            }
+
+            y[[row]] ← acc
+        }
+    }
+}
+
+@ public
+kernel linear_matmul_u8_f32_scales<size B, size Out, size In, size ScaleRows, size ScaleCols>(tensor<u8, [Out, In]> weight, tensor<f32, [ScaleRows, ScaleCols]> scales, tensor<f32, [B, In]> x, mut tensor<f32, [B, Out]> y, i32 block_rows, i32 block_cols) → void {
+    for from y at [b_idx, row] thread lane let e {
+        if block_rows ≥ 1 and block_cols ≥ 1 {
+            let i32 sr ← row / block_rows
+            mut f32 acc ← 0.0 ∷ f32
+
+            for exclusive In let j {
+                let i32 sc ← j / block_cols
+                let i32 wb ← weight[[row, j]] ↦ i32
+                let i32 w_sign ← (wb ⇒ 7) ∧ 1
+                let i32 w_exp ← (wb ⇒ 3) ∧ 15
+                let i32 w_mant ← wb ∧ 7
+                mut f32 w ← 0.0 ∷ f32
+
+                if w_exp ≡ 15 and w_mant ≡ 7 {
+                    w ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                }
+                else {
+                    if w_exp ≡ 0 {
+                        w ← (w_mant ↦ f32) * (0.001953125 ∷ f32)
+                    }
+                    else {
+                        mut f32 pow2 ← 0.0078125 ∷ f32
+                        if (w_exp ∧ 1) ≢ 0 {
+                            pow2 ← pow2 * (2.0 ∷ f32)
+                        }
+                        if (w_exp ∧ 2) ≢ 0 {
+                            pow2 ← pow2 * (4.0 ∷ f32)
+                        }
+                        if (w_exp ∧ 4) ≢ 0 {
+                            pow2 ← pow2 * (16.0 ∷ f32)
+                        }
+                        if (w_exp ∧ 8) ≢ 0 {
+                            pow2 ← pow2 * (256.0 ∷ f32)
+                        }
+                        let f32 frac ← (1.0 ∷ f32) + (w_mant ↦ f32) * (0.125 ∷ f32)
+                        w ← pow2 * frac
+                    }
+
+                    if w_sign ≡ 1 {
+                        w ← -w
+                    }
+                }
+
+                let f32 s ← scales[[sr, sc]]
+                acc ← acc + (w * s) * x[[b_idx, j]]
+            }
+
+            y[[b_idx, row]] ← acc
+        }
+    }
+}
+
+@ public
+kernel linear_matvec_u8_unscaled<size Out, size In>(tensor<u8, [Out, In]> weight, tensor<f32, [In]> x, mut tensor<f32, [Out]> y) → void {
+    for from y at [row] thread lane let e {
+        mut f32 acc ← 0.0 ∷ f32
+
+        for exclusive In let j {
+            let i32 wb ← weight[[row, j]] ↦ i32
+            let i32 w_sign ← (wb ⇒ 7) ∧ 1
+            let i32 w_exp ← (wb ⇒ 3) ∧ 15
+            let i32 w_mant ← wb ∧ 7
+            mut f32 w ← 0.0 ∷ f32
+
+            if w_exp ≡ 15 and w_mant ≡ 7 {
+                w ← (0.0 ∷ f32) / (0.0 ∷ f32)
+            }
+            else {
+                if w_exp ≡ 0 {
+                    w ← (w_mant ↦ f32) * (0.001953125 ∷ f32)
+                }
+                else {
+                    mut f32 pow2 ← 0.0078125 ∷ f32
+                    if (w_exp ∧ 1) ≢ 0 {
+                        pow2 ← pow2 * (2.0 ∷ f32)
+                    }
+                    if (w_exp ∧ 2) ≢ 0 {
+                        pow2 ← pow2 * (4.0 ∷ f32)
+                    }
+                    if (w_exp ∧ 4) ≢ 0 {
+                        pow2 ← pow2 * (16.0 ∷ f32)
+                    }
+                    if (w_exp ∧ 8) ≢ 0 {
+                        pow2 ← pow2 * (256.0 ∷ f32)
+                    }
+                    let f32 frac ← (1.0 ∷ f32) + (w_mant ↦ f32) * (0.125 ∷ f32)
+                    w ← pow2 * frac
+                }
+
+                if w_sign ≡ 1 {
+                    w ← -w
+                }
+            }
+
+            acc ← acc + w * x[[j]]
+        }
+
+        y[[row]] ← acc
+    }
+}
+
+@ public
+kernel linear_matmul_u8_unscaled<size B, size Out, size In>(tensor<u8, [Out, In]> weight, tensor<f32, [B, In]> x, mut tensor<f32, [B, Out]> y) → void {
+    for from y at [b_idx, row] thread lane let e {
+        mut f32 acc ← 0.0 ∷ f32
+
+        for exclusive In let j {
+            let i32 wb ← weight[[row, j]] ↦ i32
+            let i32 w_sign ← (wb ⇒ 7) ∧ 1
+            let i32 w_exp ← (wb ⇒ 3) ∧ 15
+            let i32 w_mant ← wb ∧ 7
+            mut f32 w ← 0.0 ∷ f32
+
+            if w_exp ≡ 15 and w_mant ≡ 7 {
+                w ← (0.0 ∷ f32) / (0.0 ∷ f32)
+            }
+            else {
+                if w_exp ≡ 0 {
+                    w ← (w_mant ↦ f32) * (0.001953125 ∷ f32)
+                }
+                else {
+                    mut f32 pow2 ← 0.0078125 ∷ f32
+                    if (w_exp ∧ 1) ≢ 0 {
+                        pow2 ← pow2 * (2.0 ∷ f32)
+                    }
+                    if (w_exp ∧ 2) ≢ 0 {
+                        pow2 ← pow2 * (4.0 ∷ f32)
+                    }
+                    if (w_exp ∧ 4) ≢ 0 {
+                        pow2 ← pow2 * (16.0 ∷ f32)
+                    }
+                    if (w_exp ∧ 8) ≢ 0 {
+                        pow2 ← pow2 * (256.0 ∷ f32)
+                    }
+                    let f32 frac ← (1.0 ∷ f32) + (w_mant ↦ f32) * (0.125 ∷ f32)
+                    w ← pow2 * frac
+                }
+
+                if w_sign ≡ 1 {
+                    w ← -w
+                }
+            }
+
+            acc ← acc + w * x[[b_idx, j]]
+        }
+
+        y[[b_idx, row]] ← acc
+    }
+}
+
+# -------------------------------------------------------------------------
+# Shape-generic 3D @ kernel routed-expert contractions (CPU + Metal)
+# -------------------------------------------------------------------------
+
+@ public
+kernel routed_expert_matvec_u8<size E, size Out, size In, size ScaleRows, size ScaleCols>(tensor<u8, [E, Out, In]> weight, tensor<u8, [E, ScaleRows, ScaleCols]> scales, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, i32 expert_idx, i32 block_rows, i32 block_cols) → void {
+    for from y at [row] thread lane let e {
+        if block_rows ≥ 1 and block_rows ≤ 4096 and block_cols ≥ 1 and block_cols ≤ 4096 and expert_idx ≥ 0 and expert_idx ≺ E {
+            let i32 sr ← row / block_rows
+            mut f32 acc ← 0.0 ∷ f32
+
+            for exclusive In let j {
+                let i32 sc ← j / block_cols
+                let i32 wb ← weight[[expert_idx, row, j]] ↦ i32
+                let i32 w_sign ← (wb ⇒ 7) ∧ 1
+                let i32 w_exp ← (wb ⇒ 3) ∧ 15
+                let i32 w_mant ← wb ∧ 7
+                mut f32 w ← 0.0 ∷ f32
+
+                if w_exp ≡ 15 and w_mant ≡ 7 {
+                    w ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                }
+                else {
+                    if w_exp ≡ 0 {
+                        w ← (w_mant ↦ f32) * (0.001953125 ∷ f32)
+                    }
+                    else {
+                        mut f32 pow2 ← 0.0078125 ∷ f32
+                        if (w_exp ∧ 1) ≢ 0 {
+                            pow2 ← pow2 * (2.0 ∷ f32)
+                        }
+                        if (w_exp ∧ 2) ≢ 0 {
+                            pow2 ← pow2 * (4.0 ∷ f32)
+                        }
+                        if (w_exp ∧ 4) ≢ 0 {
+                            pow2 ← pow2 * (16.0 ∷ f32)
+                        }
+                        if (w_exp ∧ 8) ≢ 0 {
+                            pow2 ← pow2 * (256.0 ∷ f32)
+                        }
+                        let f32 frac ← (1.0 ∷ f32) + (w_mant ↦ f32) * (0.125 ∷ f32)
+                        w ← pow2 * frac
+                    }
+
+                    if w_sign ≡ 1 {
+                        w ← -w
+                    }
+                }
+
+                let i32 se ← scales[[expert_idx, sr, sc]] ↦ i32
+                mut f32 s ← 1.0 ∷ f32
+
+                if se ≡ 255 {
+                    s ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                }
+                elif se ≥ 127 {
+                    let i32 diff ← se - 127
+                    let f32 p1 ← 2.0 ∷ f32
+                    let f32 p2 ← p1 * p1
+                    let f32 p4 ← p2 * p2
+                    let f32 p8 ← p4 * p4
+                    let f32 p16 ← p8 * p8
+                    let f32 p32 ← p16 * p16
+                    let f32 p64 ← p32 * p32
+
+                    if (diff ∧ 1) ≢ 0 {
+                        s ← s * p1
+                    }
+                    if (diff ∧ 2) ≢ 0 {
+                        s ← s * p2
+                    }
+                    if (diff ∧ 4) ≢ 0 {
+                        s ← s * p4
+                    }
+                    if (diff ∧ 8) ≢ 0 {
+                        s ← s * p8
+                    }
+                    if (diff ∧ 16) ≢ 0 {
+                        s ← s * p16
+                    }
+                    if (diff ∧ 32) ≢ 0 {
+                        s ← s * p32
+                    }
+                    if (diff ∧ 64) ≢ 0 {
+                        s ← s * p64
+                    }
+                }
+                else {
+                    let i32 diff ← 127 - se
+                    let f32 n1 ← 0.5 ∷ f32
+                    let f32 n2 ← n1 * n1
+                    let f32 n4 ← n2 * n2
+                    let f32 n8 ← n4 * n4
+                    let f32 n16 ← n8 * n8
+                    let f32 n32 ← n16 * n16
+                    let f32 n64 ← n32 * n32
+
+                    if (diff ∧ 1) ≢ 0 {
+                        s ← s * n1
+                    }
+                    if (diff ∧ 2) ≢ 0 {
+                        s ← s * n2
+                    }
+                    if (diff ∧ 4) ≢ 0 {
+                        s ← s * n4
+                    }
+                    if (diff ∧ 8) ≢ 0 {
+                        s ← s * n8
+                    }
+                    if (diff ∧ 16) ≢ 0 {
+                        s ← s * n16
+                    }
+                    if (diff ∧ 32) ≢ 0 {
+                        s ← s * n32
+                    }
+                    if (diff ∧ 64) ≢ 0 {
+                        s ← s * n64
+                    }
+                }
+
+                acc ← acc + (w * s) * x[[j]]
+            }
+
+            y[[row]] ← acc
+        }
+    }
+}
+
+@ public
+kernel routed_expert_matvec_u32<size E, size Out, size PackedIn, size ScaleRows, size ScaleCols, size In>(tensor<u32, [E, Out, PackedIn]> weight, tensor<u8, [E, ScaleRows, ScaleCols]> scales, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, i32 expert_idx, i32 block_rows, i32 block_cols) → void {
+    for from y at [row] thread lane let e {
+        if block_rows ≥ 1 and block_rows ≤ 4096 and block_cols ≥ 1 and block_cols ≤ 4096 and expert_idx ≥ 0 and expert_idx ≺ E {
+            let i32 sr ← row / block_rows
+            mut f32 acc ← 0.0 ∷ f32
+
+            for exclusive In let j {
+                let i32 sc ← j / block_cols
+                let i32 word_idx ← j / 4
+                let i32 byte_lane ← j % 4
+                let u32 w0 ← weight[[expert_idx, row, word_idx]]
+                mut u32 raw_bits ← 0 ∷ u32
+
+                if byte_lane ≡ 0 {
+                    raw_bits ← w0 ∧ (255 ∷ u32)
+                }
+                elif byte_lane ≡ 1 {
+                    raw_bits ← (w0 ⇒ (8 ∷ u32)) ∧ (255 ∷ u32)
+                }
+                elif byte_lane ≡ 2 {
+                    raw_bits ← (w0 ⇒ (16 ∷ u32)) ∧ (255 ∷ u32)
+                }
+                else {
+                    raw_bits ← (w0 ⇒ (24 ∷ u32)) ∧ (255 ∷ u32)
+                }
+
+                let i32 wb ← raw_bits ↦ wrapping<i32>
+                let i32 w_sign ← (wb ⇒ 7) ∧ 1
+                let i32 w_exp ← (wb ⇒ 3) ∧ 15
+                let i32 w_mant ← wb ∧ 7
+                mut f32 w ← 0.0 ∷ f32
+
+                if w_exp ≡ 15 and w_mant ≡ 7 {
+                    w ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                }
+                else {
+                    if w_exp ≡ 0 {
+                        w ← (w_mant ↦ f32) * (0.001953125 ∷ f32)
+                    }
+                    else {
+                        mut f32 pow2 ← 0.0078125 ∷ f32
+                        if (w_exp ∧ 1) ≢ 0 {
+                            pow2 ← pow2 * (2.0 ∷ f32)
+                        }
+                        if (w_exp ∧ 2) ≢ 0 {
+                            pow2 ← pow2 * (4.0 ∷ f32)
+                        }
+                        if (w_exp ∧ 4) ≢ 0 {
+                            pow2 ← pow2 * (16.0 ∷ f32)
+                        }
+                        if (w_exp ∧ 8) ≢ 0 {
+                            pow2 ← pow2 * (256.0 ∷ f32)
+                        }
+                        let f32 frac ← (1.0 ∷ f32) + (w_mant ↦ f32) * (0.125 ∷ f32)
+                        w ← pow2 * frac
+                    }
+
+                    if w_sign ≡ 1 {
+                        w ← -w
+                    }
+                }
+
+                let i32 se ← scales[[expert_idx, sr, sc]] ↦ i32
+                mut f32 s ← 1.0 ∷ f32
+
+                if se ≡ 255 {
+                    s ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                }
+                elif se ≥ 127 {
+                    let i32 diff ← se - 127
+                    let f32 p1 ← 2.0 ∷ f32
+                    let f32 p2 ← p1 * p1
+                    let f32 p4 ← p2 * p2
+                    let f32 p8 ← p4 * p4
+                    let f32 p16 ← p8 * p8
+                    let f32 p32 ← p16 * p16
+                    let f32 p64 ← p32 * p32
+
+                    if (diff ∧ 1) ≢ 0 {
+                        s ← s * p1
+                    }
+                    if (diff ∧ 2) ≢ 0 {
+                        s ← s * p2
+                    }
+                    if (diff ∧ 4) ≢ 0 {
+                        s ← s * p4
+                    }
+                    if (diff ∧ 8) ≢ 0 {
+                        s ← s * p8
+                    }
+                    if (diff ∧ 16) ≢ 0 {
+                        s ← s * p16
+                    }
+                    if (diff ∧ 32) ≢ 0 {
+                        s ← s * p32
+                    }
+                    if (diff ∧ 64) ≢ 0 {
+                        s ← s * p64
+                    }
+                }
+                else {
+                    let i32 diff ← 127 - se
+                    let f32 n1 ← 0.5 ∷ f32
+                    let f32 n2 ← n1 * n1
+                    let f32 n4 ← n2 * n2
+                    let f32 n8 ← n4 * n4
+                    let f32 n16 ← n8 * n8
+                    let f32 n32 ← n16 * n16
+                    let f32 n64 ← n32 * n32
+
+                    if (diff ∧ 1) ≢ 0 {
+                        s ← s * n1
+                    }
+                    if (diff ∧ 2) ≢ 0 {
+                        s ← s * n2
+                    }
+                    if (diff ∧ 4) ≢ 0 {
+                        s ← s * n4
+                    }
+                    if (diff ∧ 8) ≢ 0 {
+                        s ← s * n8
+                    }
+                    if (diff ∧ 16) ≢ 0 {
+                        s ← s * n16
+                    }
+                    if (diff ∧ 32) ≢ 0 {
+                        s ← s * n32
+                    }
+                    if (diff ∧ 64) ≢ 0 {
+                        s ← s * n64
+                    }
+                }
+
+                acc ← acc + (w * s) * x[[j]]
+            }
+
+            y[[row]] ← acc
+        }
+    }
+}
+
+@ public
+kernel routed_expert_matmul_u8<size B, size E, size Out, size In, size ScaleRows, size ScaleCols>(tensor<u8, [E, Out, In]> weight, tensor<u8, [E, ScaleRows, ScaleCols]> scales, tensor<f32, [B, In]> x, tensor<i32, [B]> expert_indices, mut tensor<f32, [B, Out]> y, i32 block_rows, i32 block_cols) → void {
+    for from y at [b_idx, row] thread lane let e {
+        if block_rows ≥ 1 and block_rows ≤ 4096 and block_cols ≥ 1 and block_cols ≤ 4096 {
+            let i32 ee ← expert_indices[[b_idx]]
+            if ee ≥ 0 and ee ≺ E {
+                let i32 sr ← row / block_rows
+                mut f32 acc ← 0.0 ∷ f32
+
+                for exclusive In let j {
+                    let i32 sc ← j / block_cols
+                    let i32 wb ← weight[[ee, row, j]] ↦ i32
+                    let i32 w_sign ← (wb ⇒ 7) ∧ 1
+                    let i32 w_exp ← (wb ⇒ 3) ∧ 15
+                    let i32 w_mant ← wb ∧ 7
+                    mut f32 w ← 0.0 ∷ f32
+
+                    if w_exp ≡ 15 and w_mant ≡ 7 {
+                        w ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                    }
+                    else {
+                        if w_exp ≡ 0 {
+                            w ← (w_mant ↦ f32) * (0.001953125 ∷ f32)
+                        }
+                        else {
+                            mut f32 pow2 ← 0.0078125 ∷ f32
+                            if (w_exp ∧ 1) ≢ 0 {
+                                pow2 ← pow2 * (2.0 ∷ f32)
+                            }
+                            if (w_exp ∧ 2) ≢ 0 {
+                                pow2 ← pow2 * (4.0 ∷ f32)
+                            }
+                            if (w_exp ∧ 4) ≢ 0 {
+                                pow2 ← pow2 * (16.0 ∷ f32)
+                            }
+                            if (w_exp ∧ 8) ≢ 0 {
+                                pow2 ← pow2 * (256.0 ∷ f32)
+                            }
+                            let f32 frac ← (1.0 ∷ f32) + (w_mant ↦ f32) * (0.125 ∷ f32)
+                            w ← pow2 * frac
+                        }
+
+                        if w_sign ≡ 1 {
+                            w ← -w
+                        }
+                    }
+
+                    let i32 se ← scales[[ee, sr, sc]] ↦ i32
+                    mut f32 s ← 1.0 ∷ f32
+
+                    if se ≡ 255 {
+                        s ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                    }
+                    elif se ≥ 127 {
+                        let i32 diff ← se - 127
+                        let f32 p1 ← 2.0 ∷ f32
+                        let f32 p2 ← p1 * p1
+                        let f32 p4 ← p2 * p2
+                        let f32 p8 ← p4 * p4
+                        let f32 p16 ← p8 * p8
+                        let f32 p32 ← p16 * p16
+                        let f32 p64 ← p32 * p32
+
+                        if (diff ∧ 1) ≢ 0 {
+                            s ← s * p1
+                        }
+                        if (diff ∧ 2) ≢ 0 {
+                            s ← s * p2
+                        }
+                        if (diff ∧ 4) ≢ 0 {
+                            s ← s * p4
+                        }
+                        if (diff ∧ 8) ≢ 0 {
+                            s ← s * p8
+                        }
+                        if (diff ∧ 16) ≢ 0 {
+                            s ← s * p16
+                        }
+                        if (diff ∧ 32) ≢ 0 {
+                            s ← s * p32
+                        }
+                        if (diff ∧ 64) ≢ 0 {
+                            s ← s * p64
+                        }
+                    }
+                    else {
+                        let i32 diff ← 127 - se
+                        let f32 n1 ← 0.5 ∷ f32
+                        let f32 n2 ← n1 * n1
+                        let f32 n4 ← n2 * n2
+                        let f32 n8 ← n4 * n4
+                        let f32 n16 ← n8 * n8
+                        let f32 n32 ← n16 * n16
+                        let f32 n64 ← n32 * n32
+
+                        if (diff ∧ 1) ≢ 0 {
+                            s ← s * n1
+                        }
+                        if (diff ∧ 2) ≢ 0 {
+                            s ← s * n2
+                        }
+                        if (diff ∧ 4) ≢ 0 {
+                            s ← s * n4
+                        }
+                        if (diff ∧ 8) ≢ 0 {
+                            s ← s * n8
+                        }
+                        if (diff ∧ 16) ≢ 0 {
+                            s ← s * n16
+                        }
+                        if (diff ∧ 32) ≢ 0 {
+                            s ← s * n32
+                        }
+                        if (diff ∧ 64) ≢ 0 {
+                            s ← s * n64
+                        }
+                    }
+
+                    acc ← acc + (w * s) * x[[b_idx, j]]
+                }
+
+                y[[b_idx, row]] ← acc
+            }
+        }
+    }
+}
+
+@ public
+kernel routed_expert_matmul_u32<size B, size E, size Out, size PackedIn, size ScaleRows, size ScaleCols, size In>(tensor<u32, [E, Out, PackedIn]> weight, tensor<u8, [E, ScaleRows, ScaleCols]> scales, tensor<f32, [B, In]> x, tensor<i32, [B]> expert_indices, mut tensor<f32, [B, Out]> y, i32 block_rows, i32 block_cols) → void {
+    for from y at [b_idx, row] thread lane let e {
+        if block_rows ≥ 1 and block_rows ≤ 4096 and block_cols ≥ 1 and block_cols ≤ 4096 {
+            let i32 ee ← expert_indices[[b_idx]]
+            if ee ≥ 0 and ee ≺ E {
+                let i32 sr ← row / block_rows
+                mut f32 acc ← 0.0 ∷ f32
+
+                for exclusive In let j {
+                    let i32 sc ← j / block_cols
+                    let i32 word_idx ← j / 4
+                    let i32 byte_lane ← j % 4
+                    let u32 w0 ← weight[[ee, row, word_idx]]
+                    mut u32 raw_bits ← 0 ∷ u32
+
+                    if byte_lane ≡ 0 {
+                        raw_bits ← w0 ∧ (255 ∷ u32)
+                    }
+                    elif byte_lane ≡ 1 {
+                        raw_bits ← (w0 ⇒ (8 ∷ u32)) ∧ (255 ∷ u32)
+                    }
+                    elif byte_lane ≡ 2 {
+                        raw_bits ← (w0 ⇒ (16 ∷ u32)) ∧ (255 ∷ u32)
+                    }
+                    else {
+                        raw_bits ← (w0 ⇒ (24 ∷ u32)) ∧ (255 ∷ u32)
+                    }
+
+                    let i32 wb ← raw_bits ↦ wrapping<i32>
+                    let i32 w_sign ← (wb ⇒ 7) ∧ 1
+                    let i32 w_exp ← (wb ⇒ 3) ∧ 15
+                    let i32 w_mant ← wb ∧ 7
+                    mut f32 w ← 0.0 ∷ f32
+
+                    if w_exp ≡ 15 and w_mant ≡ 7 {
+                        w ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                    }
+                    else {
+                        if w_exp ≡ 0 {
+                            w ← (w_mant ↦ f32) * (0.001953125 ∷ f32)
+                        }
+                        else {
+                            mut f32 pow2 ← 0.0078125 ∷ f32
+                            if (w_exp ∧ 1) ≢ 0 {
+                                pow2 ← pow2 * (2.0 ∷ f32)
+                            }
+                            if (w_exp ∧ 2) ≢ 0 {
+                                pow2 ← pow2 * (4.0 ∷ f32)
+                            }
+                            if (w_exp ∧ 4) ≢ 0 {
+                                pow2 ← pow2 * (16.0 ∷ f32)
+                            }
+                            if (w_exp ∧ 8) ≢ 0 {
+                                pow2 ← pow2 * (256.0 ∷ f32)
+                            }
+                            let f32 frac ← (1.0 ∷ f32) + (w_mant ↦ f32) * (0.125 ∷ f32)
+                            w ← pow2 * frac
+                        }
+
+                        if w_sign ≡ 1 {
+                            w ← -w
+                        }
+                    }
+
+                    let i32 se ← scales[[ee, sr, sc]] ↦ i32
+                    mut f32 s ← 1.0 ∷ f32
+
+                    if se ≡ 255 {
+                        s ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                    }
+                    elif se ≥ 127 {
+                        let i32 diff ← se - 127
+                        let f32 p1 ← 2.0 ∷ f32
+                        let f32 p2 ← p1 * p1
+                        let f32 p4 ← p2 * p2
+                        let f32 p8 ← p4 * p4
+                        let f32 p16 ← p8 * p8
+                        let f32 p32 ← p16 * p16
+                        let f32 p64 ← p32 * p32
+
+                        if (diff ∧ 1) ≢ 0 {
+                            s ← s * p1
+                        }
+                        if (diff ∧ 2) ≢ 0 {
+                            s ← s * p2
+                        }
+                        if (diff ∧ 4) ≢ 0 {
+                            s ← s * p4
+                        }
+                        if (diff ∧ 8) ≢ 0 {
+                            s ← s * p8
+                        }
+                        if (diff ∧ 16) ≢ 0 {
+                            s ← s * p16
+                        }
+                        if (diff ∧ 32) ≢ 0 {
+                            s ← s * p32
+                        }
+                        if (diff ∧ 64) ≢ 0 {
+                            s ← s * p64
+                        }
+                    }
+                    else {
+                        let i32 diff ← 127 - se
+                        let f32 n1 ← 0.5 ∷ f32
+                        let f32 n2 ← n1 * n1
+                        let f32 n4 ← n2 * n2
+                        let f32 n8 ← n4 * n4
+                        let f32 n16 ← n8 * n8
+                        let f32 n32 ← n16 * n16
+                        let f32 n64 ← n32 * n32
+
+                        if (diff ∧ 1) ≢ 0 {
+                            s ← s * n1
+                        }
+                        if (diff ∧ 2) ≢ 0 {
+                            s ← s * n2
+                        }
+                        if (diff ∧ 4) ≢ 0 {
+                            s ← s * n4
+                        }
+                        if (diff ∧ 8) ≢ 0 {
+                            s ← s * n8
+                        }
+                        if (diff ∧ 16) ≢ 0 {
+                            s ← s * n16
+                        }
+                        if (diff ∧ 32) ≢ 0 {
+                            s ← s * n32
+                        }
+                        if (diff ∧ 64) ≢ 0 {
+                            s ← s * n64
+                        }
+                    }
+
+                    acc ← acc + (w * s) * x[[b_idx, j]]
+                }
+
+                y[[b_idx, row]] ← acc
+            }
+        }
+    }
+}
+
+@ public
+kernel routed_expert_matvec_u8_f32_scales<size E, size Out, size In, size ScaleRows, size ScaleCols>(tensor<u8, [E, Out, In]> weight, tensor<f32, [E, ScaleRows, ScaleCols]> scales, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, i32 expert_idx, i32 block_rows, i32 block_cols) → void {
+    for from y at [row] thread lane let e {
+        if block_rows ≥ 1 and block_cols ≥ 1 and expert_idx ≥ 0 and expert_idx ≺ E {
+            let i32 sr ← row / block_rows
+            mut f32 acc ← 0.0 ∷ f32
+
+            for exclusive In let j {
+                let i32 sc ← j / block_cols
+                let i32 wb ← weight[[expert_idx, row, j]] ↦ i32
+                let i32 w_sign ← (wb ⇒ 7) ∧ 1
+                let i32 w_exp ← (wb ⇒ 3) ∧ 15
+                let i32 w_mant ← wb ∧ 7
+                mut f32 w ← 0.0 ∷ f32
+
+                if w_exp ≡ 15 and w_mant ≡ 7 {
+                    w ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                }
+                else {
+                    if w_exp ≡ 0 {
+                        w ← (w_mant ↦ f32) * (0.001953125 ∷ f32)
+                    }
+                    else {
+                        mut f32 pow2 ← 0.0078125 ∷ f32
+                        if (w_exp ∧ 1) ≢ 0 {
+                            pow2 ← pow2 * (2.0 ∷ f32)
+                        }
+                        if (w_exp ∧ 2) ≢ 0 {
+                            pow2 ← pow2 * (4.0 ∷ f32)
+                        }
+                        if (w_exp ∧ 4) ≢ 0 {
+                            pow2 ← pow2 * (16.0 ∷ f32)
+                        }
+                        if (w_exp ∧ 8) ≢ 0 {
+                            pow2 ← pow2 * (256.0 ∷ f32)
+                        }
+                        let f32 frac ← (1.0 ∷ f32) + (w_mant ↦ f32) * (0.125 ∷ f32)
+                        w ← pow2 * frac
+                    }
+
+                    if w_sign ≡ 1 {
+                        w ← -w
+                    }
+                }
+
+                let f32 s ← scales[[expert_idx, sr, sc]]
+                acc ← acc + (w * s) * x[[j]]
+            }
+
+            y[[row]] ← acc
+        }
+    }
+}
+
+@ public
+kernel routed_expert_matmul_u8_f32_scales<size B, size E, size Out, size In, size ScaleRows, size ScaleCols>(tensor<u8, [E, Out, In]> weight, tensor<f32, [E, ScaleRows, ScaleCols]> scales, tensor<f32, [B, In]> x, tensor<i32, [B]> expert_indices, mut tensor<f32, [B, Out]> y, i32 block_rows, i32 block_cols) → void {
+    for from y at [b_idx, row] thread lane let e {
+        if block_rows ≥ 1 and block_cols ≥ 1 {
+            let i32 ee ← expert_indices[[b_idx]]
+            if ee ≥ 0 and ee ≺ E {
+                let i32 sr ← row / block_rows
+                mut f32 acc ← 0.0 ∷ f32
+
+                for exclusive In let j {
+                    let i32 sc ← j / block_cols
+                    let i32 wb ← weight[[ee, row, j]] ↦ i32
+                    let i32 w_sign ← (wb ⇒ 7) ∧ 1
+                    let i32 w_exp ← (wb ⇒ 3) ∧ 15
+                    let i32 w_mant ← wb ∧ 7
+                    mut f32 w ← 0.0 ∷ f32
+
+                    if w_exp ≡ 15 and w_mant ≡ 7 {
+                        w ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                    }
+                    else {
+                        if w_exp ≡ 0 {
+                            w ← (w_mant ↦ f32) * (0.001953125 ∷ f32)
+                        }
+                        else {
+                            mut f32 pow2 ← 0.0078125 ∷ f32
+                            if (w_exp ∧ 1) ≢ 0 {
+                                pow2 ← pow2 * (2.0 ∷ f32)
+                            }
+                            if (w_exp ∧ 2) ≢ 0 {
+                                pow2 ← pow2 * (4.0 ∷ f32)
+                            }
+                            if (w_exp ∧ 4) ≢ 0 {
+                                pow2 ← pow2 * (16.0 ∷ f32)
+                            }
+                            if (w_exp ∧ 8) ≢ 0 {
+                                pow2 ← pow2 * (256.0 ∷ f32)
+                            }
+                            let f32 frac ← (1.0 ∷ f32) + (w_mant ↦ f32) * (0.125 ∷ f32)
+                            w ← pow2 * frac
+                        }
+
+                        if w_sign ≡ 1 {
+                            w ← -w
+                        }
+                    }
+
+                    let f32 s ← scales[[ee, sr, sc]]
+                    acc ← acc + (w * s) * x[[b_idx, j]]
+                }
+
+                y[[b_idx, row]] ← acc
+            }
+        }
+    }
+}
+
+@ public
+kernel routed_expert_matvec_u8_unscaled<size E, size Out, size In>(tensor<u8, [E, Out, In]> weight, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, i32 expert_idx) → void {
+    for from y at [row] thread lane let e {
+        if expert_idx ≥ 0 and expert_idx ≺ E {
+            mut f32 acc ← 0.0 ∷ f32
+
+            for exclusive In let j {
+                let i32 wb ← weight[[expert_idx, row, j]] ↦ i32
+                let i32 w_sign ← (wb ⇒ 7) ∧ 1
+                let i32 w_exp ← (wb ⇒ 3) ∧ 15
+                let i32 w_mant ← wb ∧ 7
+                mut f32 w ← 0.0 ∷ f32
+
+                if w_exp ≡ 15 and w_mant ≡ 7 {
+                    w ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                }
+                else {
+                    if w_exp ≡ 0 {
+                        w ← (w_mant ↦ f32) * (0.001953125 ∷ f32)
+                    }
+                    else {
+                        mut f32 pow2 ← 0.0078125 ∷ f32
+                        if (w_exp ∧ 1) ≢ 0 {
+                            pow2 ← pow2 * (2.0 ∷ f32)
+                        }
+                        if (w_exp ∧ 2) ≢ 0 {
+                            pow2 ← pow2 * (4.0 ∷ f32)
+                        }
+                        if (w_exp ∧ 4) ≢ 0 {
+                            pow2 ← pow2 * (16.0 ∷ f32)
+                        }
+                        if (w_exp ∧ 8) ≢ 0 {
+                            pow2 ← pow2 * (256.0 ∷ f32)
+                        }
+                        let f32 frac ← (1.0 ∷ f32) + (w_mant ↦ f32) * (0.125 ∷ f32)
+                        w ← pow2 * frac
+                    }
+
+                    if w_sign ≡ 1 {
+                        w ← -w
+                    }
+                }
+
+                acc ← acc + w * x[[j]]
+            }
+
+            y[[row]] ← acc
+        }
+    }
+}
+
+@ public
+kernel routed_expert_matmul_u8_unscaled<size B, size E, size Out, size In>(tensor<u8, [E, Out, In]> weight, tensor<f32, [B, In]> x, tensor<i32, [B]> expert_indices, mut tensor<f32, [B, Out]> y) → void {
+    for from y at [b_idx, row] thread lane let e {
+        let i32 ee ← expert_indices[[b_idx]]
+        if ee ≥ 0 and ee ≺ E {
+            mut f32 acc ← 0.0 ∷ f32
+
+            for exclusive In let j {
+                let i32 wb ← weight[[ee, row, j]] ↦ i32
+                let i32 w_sign ← (wb ⇒ 7) ∧ 1
+                let i32 w_exp ← (wb ⇒ 3) ∧ 15
+                let i32 w_mant ← wb ∧ 7
+                mut f32 w ← 0.0 ∷ f32
+
+                if w_exp ≡ 15 and w_mant ≡ 7 {
+                    w ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                }
+                else {
+                    if w_exp ≡ 0 {
+                        w ← (w_mant ↦ f32) * (0.001953125 ∷ f32)
+                    }
+                    else {
+                        mut f32 pow2 ← 0.0078125 ∷ f32
+                        if (w_exp ∧ 1) ≢ 0 {
+                            pow2 ← pow2 * (2.0 ∷ f32)
+                        }
+                        if (w_exp ∧ 2) ≢ 0 {
+                            pow2 ← pow2 * (4.0 ∷ f32)
+                        }
+                        if (w_exp ∧ 4) ≢ 0 {
+                            pow2 ← pow2 * (16.0 ∷ f32)
+                        }
+                        if (w_exp ∧ 8) ≢ 0 {
+                            pow2 ← pow2 * (256.0 ∷ f32)
+                        }
+                        let f32 frac ← (1.0 ∷ f32) + (w_mant ↦ f32) * (0.125 ∷ f32)
+                        w ← pow2 * frac
+                    }
+
+                    if w_sign ≡ 1 {
+                        w ← -w
+                    }
+                }
+
+                acc ← acc + w * x[[b_idx, j]]
+            }
+
+            y[[b_idx, row]] ← acc
+        }
+    }
+}
+
+@ public
+kernel linear_matvec_u32_f32_scales<size Out, size PackedIn, size ScaleRows, size ScaleCols, size In>(tensor<u32, [Out, PackedIn]> weight, tensor<f32, [ScaleRows, ScaleCols]> scales, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, i32 block_rows, i32 block_cols) → void {
+    for from y at [row] thread lane let e {
+        if block_rows ≥ 1 and block_cols ≥ 1 {
+            let i32 sr ← row / block_rows
+            mut f32 acc ← 0.0 ∷ f32
+
+            for exclusive In let j {
+                let i32 sc ← j / block_cols
+                let i32 word_idx ← j / 4
+                let i32 byte_lane ← j % 4
+                let u32 w0 ← weight[[row, word_idx]]
+                mut u32 raw_bits ← 0 ∷ u32
+
+                if byte_lane ≡ 0 {
+                    raw_bits ← w0 ∧ (255 ∷ u32)
+                }
+                elif byte_lane ≡ 1 {
+                    raw_bits ← (w0 ⇒ (8 ∷ u32)) ∧ (255 ∷ u32)
+                }
+                elif byte_lane ≡ 2 {
+                    raw_bits ← (w0 ⇒ (16 ∷ u32)) ∧ (255 ∷ u32)
+                }
+                else {
+                    raw_bits ← (w0 ⇒ (24 ∷ u32)) ∧ (255 ∷ u32)
+                }
+
+                let i32 wb ← raw_bits ↦ wrapping<i32>
+                let i32 w_sign ← (wb ⇒ 7) ∧ 1
+                let i32 w_exp ← (wb ⇒ 3) ∧ 15
+                let i32 w_mant ← wb ∧ 7
+                mut f32 w ← 0.0 ∷ f32
+
+                if w_exp ≡ 15 and w_mant ≡ 7 {
+                    w ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                }
+                else {
+                    if w_exp ≡ 0 {
+                        w ← (w_mant ↦ f32) * (0.001953125 ∷ f32)
+                    }
+                    else {
+                        mut f32 pow2 ← 0.0078125 ∷ f32
+                        if (w_exp ∧ 1) ≢ 0 {
+                            pow2 ← pow2 * (2.0 ∷ f32)
+                        }
+                        if (w_exp ∧ 2) ≢ 0 {
+                            pow2 ← pow2 * (4.0 ∷ f32)
+                        }
+                        if (w_exp ∧ 4) ≢ 0 {
+                            pow2 ← pow2 * (16.0 ∷ f32)
+                        }
+                        if (w_exp ∧ 8) ≢ 0 {
+                            pow2 ← pow2 * (256.0 ∷ f32)
+                        }
+                        let f32 frac ← (1.0 ∷ f32) + (w_mant ↦ f32) * (0.125 ∷ f32)
+                        w ← pow2 * frac
+                    }
+
+                    if w_sign ≡ 1 {
+                        w ← -w
+                    }
+                }
+
+                let f32 s ← scales[[sr, sc]]
+                acc ← acc + (w * s) * x[[j]]
+            }
+
+            y[[row]] ← acc
+        }
+    }
+}
+
+@ public
+kernel linear_matmul_u32_f32_scales<size B, size Out, size PackedIn, size ScaleRows, size ScaleCols, size In>(tensor<u32, [Out, PackedIn]> weight, tensor<f32, [ScaleRows, ScaleCols]> scales, tensor<f32, [B, In]> x, mut tensor<f32, [B, Out]> y, i32 block_rows, i32 block_cols) → void {
+    for from y at [b_idx, row] thread lane let e {
+        if block_rows ≥ 1 and block_cols ≥ 1 {
+            let i32 sr ← row / block_rows
+            mut f32 acc ← 0.0 ∷ f32
+
+            for exclusive In let j {
+                let i32 sc ← j / block_cols
+                let i32 word_idx ← j / 4
+                let i32 byte_lane ← j % 4
+                let u32 w0 ← weight[[row, word_idx]]
+                mut u32 raw_bits ← 0 ∷ u32
+
+                if byte_lane ≡ 0 {
+                    raw_bits ← w0 ∧ (255 ∷ u32)
+                }
+                elif byte_lane ≡ 1 {
+                    raw_bits ← (w0 ⇒ (8 ∷ u32)) ∧ (255 ∷ u32)
+                }
+                elif byte_lane ≡ 2 {
+                    raw_bits ← (w0 ⇒ (16 ∷ u32)) ∧ (255 ∷ u32)
+                }
+                else {
+                    raw_bits ← (w0 ⇒ (24 ∷ u32)) ∧ (255 ∷ u32)
+                }
+
+                let i32 wb ← raw_bits ↦ wrapping<i32>
+                let i32 w_sign ← (wb ⇒ 7) ∧ 1
+                let i32 w_exp ← (wb ⇒ 3) ∧ 15
+                let i32 w_mant ← wb ∧ 7
+                mut f32 w ← 0.0 ∷ f32
+
+                if w_exp ≡ 15 and w_mant ≡ 7 {
+                    w ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                }
+                else {
+                    if w_exp ≡ 0 {
+                        w ← (w_mant ↦ f32) * (0.001953125 ∷ f32)
+                    }
+                    else {
+                        mut f32 pow2 ← 0.0078125 ∷ f32
+                        if (w_exp ∧ 1) ≢ 0 {
+                            pow2 ← pow2 * (2.0 ∷ f32)
+                        }
+                        if (w_exp ∧ 2) ≢ 0 {
+                            pow2 ← pow2 * (4.0 ∷ f32)
+                        }
+                        if (w_exp ∧ 4) ≢ 0 {
+                            pow2 ← pow2 * (16.0 ∷ f32)
+                        }
+                        if (w_exp ∧ 8) ≢ 0 {
+                            pow2 ← pow2 * (256.0 ∷ f32)
+                        }
+                        let f32 frac ← (1.0 ∷ f32) + (w_mant ↦ f32) * (0.125 ∷ f32)
+                        w ← pow2 * frac
+                    }
+
+                    if w_sign ≡ 1 {
+                        w ← -w
+                    }
+                }
+
+                let f32 s ← scales[[sr, sc]]
+                acc ← acc + (w * s) * x[[b_idx, j]]
+            }
+
+            y[[b_idx, row]] ← acc
+        }
+    }
+}
+
+@ public
+kernel routed_expert_matvec_u32_f32_scales<size E, size Out, size PackedIn, size ScaleRows, size ScaleCols, size In>(tensor<u32, [E, Out, PackedIn]> weight, tensor<f32, [E, ScaleRows, ScaleCols]> scales, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, i32 expert_idx, i32 block_rows, i32 block_cols) → void {
+    for from y at [row] thread lane let e {
+        if block_rows ≥ 1 and block_cols ≥ 1 and expert_idx ≥ 0 and expert_idx ≺ E {
+            let i32 sr ← row / block_rows
+            mut f32 acc ← 0.0 ∷ f32
+
+            for exclusive In let j {
+                let i32 sc ← j / block_cols
+                let i32 word_idx ← j / 4
+                let i32 byte_lane ← j % 4
+                let u32 w0 ← weight[[expert_idx, row, word_idx]]
+                mut u32 raw_bits ← 0 ∷ u32
+
+                if byte_lane ≡ 0 {
+                    raw_bits ← w0 ∧ (255 ∷ u32)
+                }
+                elif byte_lane ≡ 1 {
+                    raw_bits ← (w0 ⇒ (8 ∷ u32)) ∧ (255 ∷ u32)
+                }
+                elif byte_lane ≡ 2 {
+                    raw_bits ← (w0 ⇒ (16 ∷ u32)) ∧ (255 ∷ u32)
+                }
+                else {
+                    raw_bits ← (w0 ⇒ (24 ∷ u32)) ∧ (255 ∷ u32)
+                }
+
+                let i32 wb ← raw_bits ↦ wrapping<i32>
+                let i32 w_sign ← (wb ⇒ 7) ∧ 1
+                let i32 w_exp ← (wb ⇒ 3) ∧ 15
+                let i32 w_mant ← wb ∧ 7
+                mut f32 w ← 0.0 ∷ f32
+
+                if w_exp ≡ 15 and w_mant ≡ 7 {
+                    w ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                }
+                else {
+                    if w_exp ≡ 0 {
+                        w ← (w_mant ↦ f32) * (0.001953125 ∷ f32)
+                    }
+                    else {
+                        mut f32 pow2 ← 0.0078125 ∷ f32
+                        if (w_exp ∧ 1) ≢ 0 {
+                            pow2 ← pow2 * (2.0 ∷ f32)
+                        }
+                        if (w_exp ∧ 2) ≢ 0 {
+                            pow2 ← pow2 * (4.0 ∷ f32)
+                        }
+                        if (w_exp ∧ 4) ≢ 0 {
+                            pow2 ← pow2 * (16.0 ∷ f32)
+                        }
+                        if (w_exp ∧ 8) ≢ 0 {
+                            pow2 ← pow2 * (256.0 ∷ f32)
+                        }
+                        let f32 frac ← (1.0 ∷ f32) + (w_mant ↦ f32) * (0.125 ∷ f32)
+                        w ← pow2 * frac
+                    }
+
+                    if w_sign ≡ 1 {
+                        w ← -w
+                    }
+                }
+
+                let f32 s ← scales[[expert_idx, sr, sc]]
+                acc ← acc + (w * s) * x[[j]]
+            }
+
+            y[[row]] ← acc
+        }
+    }
+}
+
+@ public
+kernel routed_expert_matmul_u32_f32_scales<size B, size E, size Out, size PackedIn, size ScaleRows, size ScaleCols, size In>(tensor<u32, [E, Out, PackedIn]> weight, tensor<f32, [E, ScaleRows, ScaleCols]> scales, tensor<f32, [B, In]> x, tensor<i32, [B]> expert_indices, mut tensor<f32, [B, Out]> y, i32 block_rows, i32 block_cols) → void {
+    for from y at [b_idx, row] thread lane let e {
+        if block_rows ≥ 1 and block_cols ≥ 1 {
+            let i32 ee ← expert_indices[[b_idx]]
+            if ee ≥ 0 and ee ≺ E {
+                let i32 sr ← row / block_rows
+                mut f32 acc ← 0.0 ∷ f32
+
+                for exclusive In let j {
+                    let i32 sc ← j / block_cols
+                    let i32 word_idx ← j / 4
+                    let i32 byte_lane ← j % 4
+                    let u32 w0 ← weight[[ee, row, word_idx]]
+                    mut u32 raw_bits ← 0 ∷ u32
+
+                    if byte_lane ≡ 0 {
+                        raw_bits ← w0 ∧ (255 ∷ u32)
+                    }
+                    elif byte_lane ≡ 1 {
+                        raw_bits ← (w0 ⇒ (8 ∷ u32)) ∧ (255 ∷ u32)
+                    }
+                    elif byte_lane ≡ 2 {
+                        raw_bits ← (w0 ⇒ (16 ∷ u32)) ∧ (255 ∷ u32)
+                    }
+                    else {
+                        raw_bits ← (w0 ⇒ (24 ∷ u32)) ∧ (255 ∷ u32)
+                    }
+
+                    let i32 wb ← raw_bits ↦ wrapping<i32>
+                    let i32 w_sign ← (wb ⇒ 7) ∧ 1
+                    let i32 w_exp ← (wb ⇒ 3) ∧ 15
+                    let i32 w_mant ← wb ∧ 7
+                    mut f32 w ← 0.0 ∷ f32
+
+                    if w_exp ≡ 15 and w_mant ≡ 7 {
+                        w ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                    }
+                    else {
+                        if w_exp ≡ 0 {
+                            w ← (w_mant ↦ f32) * (0.001953125 ∷ f32)
+                        }
+                        else {
+                            mut f32 pow2 ← 0.0078125 ∷ f32
+                            if (w_exp ∧ 1) ≢ 0 {
+                                pow2 ← pow2 * (2.0 ∷ f32)
+                            }
+                            if (w_exp ∧ 2) ≢ 0 {
+                                pow2 ← pow2 * (4.0 ∷ f32)
+                            }
+                            if (w_exp ∧ 4) ≢ 0 {
+                                pow2 ← pow2 * (16.0 ∷ f32)
+                            }
+                            if (w_exp ∧ 8) ≢ 0 {
+                                pow2 ← pow2 * (256.0 ∷ f32)
+                            }
+                            let f32 frac ← (1.0 ∷ f32) + (w_mant ↦ f32) * (0.125 ∷ f32)
+                            w ← pow2 * frac
+                        }
+
+                        if w_sign ≡ 1 {
+                            w ← -w
+                        }
+                    }
+
+                    let f32 s ← scales[[ee, sr, sc]]
+                    acc ← acc + (w * s) * x[[b_idx, j]]
+                }
+
+                y[[b_idx, row]] ← acc
+            }
+        }
+    }
+}
+
 +++ faber test
 import from "gradus:quant/block_fp8" let bf8
 
@@ -596,4 +2176,146 @@ test "BlockFp8 u8 and u32 kernels handle rows above 65536 without aliasing" {
     assert close(y_u32[[0]], 0.0 ∷ f32)
     assert close(y_u32[[1]], 1.0 ∷ f32)
     assert close(y_u32[[65537]], 16.0 ∷ f32)
+
+    mut tensor<f32, [2, 4]> x_mat ← tf32[2, 4] {}
+    for exclusive 4 let j {
+        x_mat[[0, j]] ← 1.0 ∷ f32
+        x_mat[[1, j]] ← 2.0 ∷ f32
+    }
+
+    mut tensor<f32, [2, 65540]> y_mm_u8 ← tf32[2, 65540] {}
+    mut tensor<f32, [2, 65540]> y_mm_u32 ← tf32[2, 65540] {}
+    bf8.linear_matmul_u8(w_u8, scales, x_mat, mut y_mm_u8, 2, 4)
+    bf8.linear_matmul_u32(w_u32, scales, x_mat, mut y_mm_u32, 2, 4)
+
+    assert close(y_mm_u8[[0, 1]], 1.0 ∷ f32)
+    assert close(y_mm_u8[[1, 65537]], 32.0 ∷ f32)
+    assert close(y_mm_u32[[0, 1]], 1.0 ∷ f32)
+    assert close(y_mm_u32[[1, 65537]], 32.0 ∷ f32)
+
+    mut tensor<f32, [32770, 1]> f32_scales ← tf32[32770, 1] {}
+    f32_scales[[0, 0]] ← 1.0 ∷ f32
+    f32_scales[[32768, 0]] ← 2.0 ∷ f32
+
+    mut tensor<f32, [65540]> y_mv_u8_f32 ← tf32[65540] {}
+    mut tensor<f32, [2, 65540]> y_mm_u8_f32 ← tf32[2, 65540] {}
+    mut tensor<f32, [65540]> y_mv_u32_f32 ← tf32[65540] {}
+    mut tensor<f32, [2, 65540]> y_mm_u32_f32 ← tf32[2, 65540] {}
+    mut tensor<f32, [65540]> y_mv_unscaled ← tf32[65540] {}
+    mut tensor<f32, [2, 65540]> y_mm_unscaled ← tf32[2, 65540] {}
+
+    bf8.linear_matvec_u8_f32_scales(w_u8, f32_scales, x_t, mut y_mv_u8_f32, 2, 4)
+    bf8.linear_matmul_u8_f32_scales(w_u8, f32_scales, x_mat, mut y_mm_u8_f32, 2, 4)
+    bf8.linear_matvec_u32_f32_scales(w_u32, f32_scales, x_t, mut y_mv_u32_f32, 2, 4)
+    bf8.linear_matmul_u32_f32_scales(w_u32, f32_scales, x_mat, mut y_mm_u32_f32, 2, 4)
+    bf8.linear_matvec_u8_unscaled(w_u8, x_t, mut y_mv_unscaled)
+    bf8.linear_matmul_u8_unscaled(w_u8, x_mat, mut y_mm_unscaled)
+
+    assert close(y_mv_u8_f32[[65537]], 16.0 ∷ f32)
+    assert close(y_mm_u8_f32[[1, 65537]], 32.0 ∷ f32)
+    assert close(y_mv_u32_f32[[65537]], 16.0 ∷ f32)
+    assert close(y_mm_u32_f32[[1, 65537]], 32.0 ∷ f32)
+    assert close(y_mv_unscaled[[1]], 1.0 ∷ f32)
+    assert close(y_mm_unscaled[[1, 65537]], 16.0 ∷ f32)
+
+    mut tensor<u8, [2, 2, 4]> e_w_u8 ← tu8[2, 2, 4] {}
+    mut tensor<u32, [2, 2, 1]> e_w_u32 ← tu32[2, 2, 1] {}
+    mut tensor<u8, [2, 1, 1]> e_s_u8 ← tu8[2, 1, 1] {}
+    mut tensor<f32, [2, 1, 1]> e_s_f32 ← tf32[2, 1, 1] {}
+    e_w_u8[[1, 0, 0]] ← 0x38 ∷ u8
+    e_w_u8[[1, 1, 0]] ← 0x40 ∷ u8
+    e_w_u32[[1, 0, 0]] ← 0x00000038 ∷ u32
+    e_w_u32[[1, 1, 0]] ← 0x00000040 ∷ u32
+    e_s_u8[[0, 0, 0]] ← 127 ∷ u8
+    e_s_u8[[1, 0, 0]] ← 128 ∷ u8
+    e_s_f32[[0, 0, 0]] ← 1.0 ∷ f32
+    e_s_f32[[1, 0, 0]] ← 2.0 ∷ f32
+
+    mut tensor<i32, [2]> experts ← ti32[2] {}
+    experts[[0]] ← 0 ∷ i32
+    experts[[1]] ← 1 ∷ i32
+    mut tensor<f32, [2]> e_y_mv_u8 ← tf32[2] {}
+    mut tensor<f32, [2]> e_y_mv_u32 ← tf32[2] {}
+    mut tensor<f32, [2]> e_y_mv_u8_f32 ← tf32[2] {}
+    mut tensor<f32, [2]> e_y_mv_u32_f32 ← tf32[2] {}
+    mut tensor<f32, [2]> e_y_mv_unscaled ← tf32[2] {}
+    mut tensor<f32, [2, 2]> e_y_mm_u8 ← tf32[2, 2] {}
+    mut tensor<f32, [2, 2]> e_y_mm_u32 ← tf32[2, 2] {}
+    mut tensor<f32, [2, 2]> e_y_mm_u8_f32 ← tf32[2, 2] {}
+    mut tensor<f32, [2, 2]> e_y_mm_u32_f32 ← tf32[2, 2] {}
+    mut tensor<f32, [2, 2]> e_y_mm_unscaled ← tf32[2, 2] {}
+
+    bf8.routed_expert_matvec_u8(e_w_u8, e_s_u8, x_t, mut e_y_mv_u8, 1, 2, 4)
+    bf8.routed_expert_matvec_u32(e_w_u32, e_s_u8, x_t, mut e_y_mv_u32, 1, 2, 4)
+    bf8.routed_expert_matvec_u8_f32_scales(e_w_u8, e_s_f32, x_t, mut e_y_mv_u8_f32, 1, 2, 4)
+    bf8.routed_expert_matvec_u32_f32_scales(e_w_u32, e_s_f32, x_t, mut e_y_mv_u32_f32, 1, 2, 4)
+    bf8.routed_expert_matvec_u8_unscaled(e_w_u8, x_t, mut e_y_mv_unscaled, 1)
+    bf8.routed_expert_matmul_u8(e_w_u8, e_s_u8, x_mat, experts, mut e_y_mm_u8, 2, 4)
+    bf8.routed_expert_matmul_u32(e_w_u32, e_s_u8, x_mat, experts, mut e_y_mm_u32, 2, 4)
+    bf8.routed_expert_matmul_u8_f32_scales(e_w_u8, e_s_f32, x_mat, experts, mut e_y_mm_u8_f32, 2, 4)
+    bf8.routed_expert_matmul_u32_f32_scales(e_w_u32, e_s_f32, x_mat, experts, mut e_y_mm_u32_f32, 2, 4)
+    bf8.routed_expert_matmul_u8_unscaled(e_w_u8, x_mat, experts, mut e_y_mm_unscaled)
+
+    assert close(e_y_mv_u8[[0]], 2.0 ∷ f32)
+    assert close(e_y_mv_u8[[1]], 4.0 ∷ f32)
+    assert close(e_y_mv_u32[[0]], 2.0 ∷ f32)
+    assert close(e_y_mv_u32[[1]], 4.0 ∷ f32)
+    assert close(e_y_mv_u8_f32[[0]], 2.0 ∷ f32)
+    assert close(e_y_mv_u32_f32[[1]], 4.0 ∷ f32)
+    assert close(e_y_mv_unscaled[[0]], 1.0 ∷ f32)
+    assert close(e_y_mm_u8[[1, 0]], 4.0 ∷ f32)
+    assert close(e_y_mm_u32[[1, 1]], 8.0 ∷ f32)
+    assert close(e_y_mm_u8_f32[[1, 0]], 4.0 ∷ f32)
+    assert close(e_y_mm_u32_f32[[1, 1]], 8.0 ∷ f32)
+    assert close(e_y_mm_unscaled[[1, 1]], 4.0 ∷ f32)
+}
+
+test "BlockFp8 batched ref_matmul, f32-scale, unscaled, and 3D expert-slice decode match" {
+    let list<u8> w_u8 ← [
+        0x38 ∷ u8, 0x40 ∷ u8, 0x3c ∷ u8, 0x00 ∷ u8,
+        0xb8 ∷ u8, 0x30 ∷ u8, 0x44 ∷ u8, 0x00 ∷ u8,
+        0x38 ∷ u8, 0x38 ∷ u8, 0x00 ∷ u8, 0x00 ∷ u8,
+        0x40 ∷ u8, 0x40 ∷ u8, 0x00 ∷ u8, 0x00 ∷ u8
+    ]
+    let list<u32> w_u32 ← [
+        0x003c4038 ∷ u32,
+        0x004430b8 ∷ u32,
+        0x00003838 ∷ u32,
+        0x00004040 ∷ u32
+    ]
+    let list<u8> s_u8 ← [128 ∷ u8, 127 ∷ u8, 126 ∷ u8, 128 ∷ u8]
+    let list<f32> s_f32 ← [2.0 ∷ f32, 1.0 ∷ f32, 0.5 ∷ f32, 2.0 ∷ f32]
+    let list<f32> x_mat ← [
+        1.0, 2.0, -1.0, 3.0,
+        0.5, -1.0, 2.0, 1.0
+    ]
+
+    do {
+        let bf8.BlockFp8Spec spec_u8 ← bf8.admit_spec(4, 4, 2, 2, variant bf8.PackKind.PackU8)
+        let bf8.BlockFp8Spec spec_u32 ← bf8.admit_spec(4, 4, 2, 2, variant bf8.PackKind.PackU32)
+        let list<f32> d_u8 ← bf8.ref_dequantize_u8(spec_u8, w_u8, s_u8)
+        let list<f32> d_u8_f32 ← bf8.ref_dequantize_u8_f32(spec_u8, w_u8, s_f32)
+        let list<f32> d_u32 ← bf8.ref_dequantize_u32(spec_u32, w_u32, s_u8)
+        let list<f32> d_u32_f32 ← bf8.ref_dequantize_u32_f32(spec_u32, w_u32, s_f32)
+        for exclusive d_u8.length() let i {
+            assert close(d_u8[i], d_u8_f32[i])
+            assert close(d_u8[i], d_u32[i])
+            assert close(d_u8[i], d_u32_f32[i])
+        }
+
+        let list<f32> y_mm ← bf8.ref_matmul(2, 4, 4, d_u8, x_mat)
+        assert close(y_mm[0], 8.5)
+        assert close(y_mm[1], -3.0)
+        assert close(y_mm[2], 1.5)
+        assert close(y_mm[3], 3.0)
+        assert close(y_mm[7], -0.5)
+
+        let list<f32> d_unscaled ← bf8.ref_dequantize_u8_unscaled(4, 4, w_u8)
+        let list<f32> y_unscaled ← bf8.ref_matmul(2, 4, 4, d_unscaled, x_mat)
+        assert close(y_unscaled[0], 3.5)
+        assert close(y_unscaled[7], -1.0)
+    }
+    catch err {
+        assert false
+    }
 }

@@ -29,6 +29,8 @@ import from "gradus:dtype" let dtype
 import from "gradus:model/bundle" let bundle
 import from "gradus:model/dequant" let dequant
 import from "gradus:model/tensor_directory" let td
+import from "gradus:quant/block_fp8" let bf8
+import from "gradus:quant/dual_scaled_fp4" let fp4
 import from "gradus:quant/group_affine" let ga
 import from "gradus:storage" let storage
 
@@ -48,6 +50,12 @@ union ExpertBankError {
     GroupAffineFailure {
         ga.GroupAffineError inner
     },
+    BlockFp8Failure {
+        bf8.BlockFp8Error inner
+    },
+    DualScaledFp4Failure {
+        fp4.DualScaledFp4Error inner
+    },
     DequantFailure {
         dequant.DequantError inner
     }
@@ -61,6 +69,16 @@ fn from_directory_error(td.DirectoryError err) → ExpertBankError {
 @ conversion
 fn from_group_affine_error(ga.GroupAffineError err) → ExpertBankError {
     return variant GroupAffineFailure { message = err.message, inner = err }
+}
+
+@ conversion
+fn from_block_fp8_error(bf8.BlockFp8Error err) → ExpertBankError {
+    return variant BlockFp8Failure { message = err.message, inner = err }
+}
+
+@ conversion
+fn from_dual_scaled_fp4_error(fp4.DualScaledFp4Error err) → ExpertBankError {
+    return variant DualScaledFp4Failure { message = err.message, inner = err }
 }
 
 @ conversion
@@ -99,6 +117,22 @@ fn default_quant_hint() → ExpertQuantHint {
 }
 
 @ public
+union PackKind {
+    PackDense,
+    PackU8,
+    PackU32
+}
+
+@ public
+union ExpertActivation {
+    Swiglu,
+    Situ {
+        f32 gate_cap
+        f32 up_cap
+    }
+}
+
+@ public
 class BankedMatrixSpec {
     let ExpertWeightKind kind
     let int expert_count
@@ -108,6 +142,45 @@ class BankedMatrixSpec {
     let int group_size
     let int packed_cols
     let int group_cols
+    let int block_rows = 0
+    let int block_cols = 0
+    let PackKind ∪ none pack = null
+    let string scales_dtype = "F32"
+    let bool has_modelopt_amax = false
+}
+
+@ public
+fn spec_pack_kind(BankedMatrixSpec spec) → PackKind {
+    if spec.pack not is none {
+        return spec.pack coalesce variant PackKind.PackDense
+    }
+    match spec.kind {
+        case ExpertWeightKind.GroupAffineU32 {
+            return variant PackKind.PackU32
+        }
+        case ExpertWeightKind.GroupAffineU8 {
+            return variant PackKind.PackU8
+        }
+        case ExpertWeightKind.BlockFp8 {
+            if spec.packed_cols ≻ 0 and spec.in_features ≡ spec.packed_cols * 4 {
+                return variant PackKind.PackU32
+            }
+            return variant PackKind.PackU8
+        }
+        case ExpertWeightKind.DualScaledFp4 {
+            if spec.packed_cols ≻ 0 and spec.in_features ≡ spec.packed_cols * 8 {
+                return variant PackKind.PackU32
+            }
+            return variant PackKind.PackU8
+        }
+        case ExpertWeightKind.DenseF32 {}
+        case ExpertWeightKind.DenseBf16 {}
+        case ExpertWeightKind.DenseF16 {}
+        default {
+            return variant PackKind.PackU8
+        }
+    }
+    return variant PackKind.PackDense
 }
 
 @ public
@@ -133,6 +206,25 @@ class ExpertBank {
     let ExpertBankLayout layout
     let bool has_router_bias
     let int shared_expert_count
+    let ExpertActivation ∪ none activation = null
+}
+
+@ public
+fn bank_activation(ExpertBank bank) → ExpertActivation {
+    return bank.activation coalesce variant ExpertActivation.Swiglu
+}
+
+@ public
+fn with_activation(ExpertBank bank, ExpertActivation act) → ExpertBank {
+    return ExpertBank {
+        expert_count = bank.expert_count,
+        hidden_size = bank.hidden_size,
+        intermediate_size = bank.intermediate_size,
+        layout = bank.layout,
+        has_router_bias = bank.has_router_bias,
+        shared_expert_count = bank.shared_expert_count,
+        activation = act
+    }
 }
 
 # -------------------------------------------------------------------------
@@ -276,6 +368,65 @@ fn dense_kind_for(string raw_dtype) → ExpertWeightKind ⇥ ExpertBankError {
     }
 }
 
+class BankedAffineGeom {
+    let int group_size
+    let int bits
+}
+
+fn affine_bits_valid(int bits, bool is_u8) → bool {
+    if is_u8 {
+        return bits ≡ 4 or bits ≡ 8
+    }
+    return bits ≡ 4 or bits ≡ 6 or bits ≡ 8
+}
+
+fn hint_allows_affine(ExpertQuantHint hint) → bool {
+    if hint.mode is string {
+        let string hm ← hint.mode coalesce ""
+        return hm ≡ "affine" or hm ≡ "group_affine"
+    }
+    return true
+}
+
+fn resolve_banked_affine_geom(int bits_per_group, bool is_u8, ExpertQuantHint hint) → BankedAffineGeom ⇥ ExpertBankError {
+    if hint_allows_affine(hint) {
+        if hint.group_size is int and hint.bits is int {
+            let int hg ← hint.group_size coalesce 0
+            let int hb ← hint.bits coalesce 0
+            if hg ≥ 1 and affine_bits_valid(hb, is_u8) and hg * hb ≡ bits_per_group {
+                return BankedAffineGeom { group_size = hg, bits = hb }
+            }
+        }
+        elif hint.group_size is int {
+            let int hg ← hint.group_size coalesce 0
+            if hg ≥ 1 and bits_per_group % hg ≡ 0 {
+                let int b ← bits_per_group / hg
+                if affine_bits_valid(b, is_u8) {
+                    return BankedAffineGeom { group_size = hg, bits = b }
+                }
+            }
+        }
+        elif hint.bits is int {
+            let int hb ← hint.bits coalesce 0
+            if affine_bits_valid(hb, is_u8) and bits_per_group % hb ≡ 0 {
+                return BankedAffineGeom { group_size = bits_per_group / hb, bits = hb }
+            }
+        }
+    }
+
+    let list<int> candidates ← [64, 32, 128, 16, 256, 8, 4]
+    for from candidates let gs {
+        if bits_per_group % gs ≡ 0 {
+            let int b ← bits_per_group / gs
+            if affine_bits_valid(b, is_u8) {
+                return BankedAffineGeom { group_size = gs, bits = b }
+            }
+        }
+    }
+
+    throw variant BadShape { message = "unable to infer valid banked GroupAffine group_size and bits for bits_per_group=§"(bits_per_group ↦ string) }
+}
+
 fn bind_banked_group_affine(td.DirectoryEntry weight, td.DirectoryEntry scales, td.DirectoryEntry biases, ExpertQuantHint hint) → BankedMatrixSpec ⇥ ExpertBankError {
     let int expert_count ← weight.shape.get(0) coalesce 0
     let int out_features ← weight.shape.get(1) coalesce 0
@@ -291,84 +442,165 @@ fn bind_banked_group_affine(td.DirectoryEntry weight, td.DirectoryEntry scales, 
     let int b_cols ← biases.shape.get(2) coalesce 0
 
     require s_e ≡ expert_count and b_e ≡ expert_count and s_rows ≡ out_features and b_rows ≡ out_features and b_cols ≡ group_cols and group_cols ≥ 1 throw variant BadShape { message = "banked scales/biases shape mismatch against weight" }
+    require scales.raw_dtype ≡ biases.raw_dtype and (scales.raw_dtype ≡ "F32" or scales.raw_dtype ≡ "BF16") throw variant UnsupportedFormat { message = "banked scales/biases dtype must match and be F32 or BF16, got §/§"(scales.raw_dtype, biases.raw_dtype) }
 
-    let int group_size ← hint.group_size coalesce 64
-    require group_size ≥ 1 throw variant BadConfig { message = "group_size must be at least 1" }
-
-    let int in_features ← group_cols * group_size
     mut int pack_width ← 32
-    mut ga.PackKind pack ← variant ga.PackKind.PackU32
+    mut ga.PackKind ga_pack ← variant ga.PackKind.PackU32
+    mut PackKind bank_pack ← variant PackKind.PackU32
     mut ExpertWeightKind kind ← variant ExpertWeightKind.GroupAffineU32
+    mut bool is_u8 ← false
 
     if weight.raw_dtype ≡ "U32" {
         pack_width ← 32
-        pack ← variant ga.PackKind.PackU32
+        ga_pack ← variant ga.PackKind.PackU32
+        bank_pack ← variant PackKind.PackU32
         kind ← variant ExpertWeightKind.GroupAffineU32
+        is_u8 ← false
     }
     elif weight.raw_dtype ≡ "U8" {
         pack_width ← 8
-        pack ← variant ga.PackKind.PackU8
+        ga_pack ← variant ga.PackKind.PackU8
+        bank_pack ← variant PackKind.PackU8
         kind ← variant ExpertWeightKind.GroupAffineU8
+        is_u8 ← true
     }
     else {
         throw variant UnsupportedFormat { message = "GroupAffine banked weight dtype must be U32 or U8, got §"(weight.raw_dtype) }
     }
 
     let int total_bits ← packed_cols * pack_width
-    mut int bits ← 0
+    require total_bits % group_cols ≡ 0 throw variant BadShape { message = "packed GroupAffine banked bit width not divisible by group_cols" }
 
-    if hint.bits is int {
-        let int hb ← hint.bits coalesce 0
-        require total_bits ≡ in_features * hb throw variant BadConfig { message = "hint.bits does not match packed GroupAffine banked shape" }
-        bits ← hb
-    }
-    else {
-        require total_bits % in_features ≡ 0 throw variant BadShape { message = "packed GroupAffine banked bit width not divisible by in_features" }
-        bits ← total_bits / in_features
-    }
-
-    let ga.GroupAffineSpec spec ← ga.admit_spec(out_features, in_features, bits, group_size, pack)
-    return BankedMatrixSpec { kind = kind, expert_count = expert_count, out_features = spec.out_features, in_features = spec.in_features, bits = spec.bits, group_size = spec.group_size, packed_cols = spec.packed_cols, group_cols = spec.group_cols }
+    let int bits_per_group ← total_bits / group_cols
+    let BankedAffineGeom geom ← resolve_banked_affine_geom(bits_per_group, is_u8, hint)
+    let int in_features ← group_cols * geom.group_size
+    let ga.ScaleDtype sd ← (scales.raw_dtype ≡ "BF16") ✓ variant ga.ScaleDtype.ScaleBf16 ✗ variant ga.ScaleDtype.ScaleF32
+    let ga.GroupAffineSpec spec ← ga.admit_spec_with_scale(out_features, in_features, geom.bits, geom.group_size, ga_pack, sd)
+    return BankedMatrixSpec { kind = kind, expert_count = expert_count, out_features = spec.out_features, in_features = spec.in_features, bits = spec.bits, group_size = spec.group_size, packed_cols = spec.packed_cols, group_cols = spec.group_cols, block_rows = 1, block_cols = spec.group_size, pack = bank_pack, scales_dtype = scales.raw_dtype }
 }
 
-fn bind_banked_dual_scaled_fp4(td.DirectoryEntry weight, td.DirectoryEntry scales, td.DirectoryEntry global_scale, ExpertQuantHint hint) → BankedMatrixSpec ⇥ ExpertBankError {
+fn validate_scalar_or_per_expert(td.DirectoryEntry entry, int expert_count, string label) → bool ⇥ ExpertBankError {
+    if entry.shape.length() ≡ 0 {
+        return false
+    }
+    if entry.shape.length() ≡ 1 {
+        let int d0 ← entry.shape[0]
+        require d0 ≡ 1 or d0 ≡ expert_count throw variant BadShape { message = "§ shape length § does not match scalar or expert_count §"(label, d0 ↦ string, expert_count ↦ string) }
+        return d0 ≡ expert_count and expert_count ≻ 1
+    }
+    let int d0 ← entry.shape[0]
+    require d0 ≡ 1 or d0 ≡ expert_count throw variant BadShape { message = "§ leading dim § does not match scalar or expert_count §"(label, d0 ↦ string, expert_count ↦ string) }
+    for range 1 ‥ entry.shape.length() let idx {
+        require entry.shape[idx] ≡ 1 throw variant BadShape { message = "§ trailing dimensions must be 1"(label) }
+    }
+    return d0 ≡ expert_count and expert_count ≻ 1
+}
+
+fn bind_banked_dual_scaled_fp4(td.DirectoryEntry weight, td.DirectoryEntry scales, td.DirectoryEntry ∪ none maybe_global, td.DirectoryEntry ∪ none maybe_amax, td.DirectoryEntry ∪ none maybe_denom, ExpertQuantHint hint) → BankedMatrixSpec ⇥ ExpertBankError {
     let int expert_count ← weight.shape.get(0) coalesce 0
     let int out_features ← weight.shape.get(1) coalesce 0
     let int packed_cols ← weight.shape.get(2) coalesce 0
 
     require scales.shape.length() ≡ 3 throw variant BadShape { message = "DualScaledFp4 scales must be rank-3" }
     require (scales.shape[0] ≡ expert_count) and (scales.shape[1] ≡ out_features) throw variant BadShape { message = "DualScaledFp4 scales expert/row mismatch" }
-    require global_scale.shape.length() ≥ 1 throw variant BadShape { message = "DualScaledFp4 global_scale must be non-empty" }
+
+    mut bool has_modelopt_amax ← false
+    if maybe_global is td.DirectoryEntry {
+        validate_scalar_or_per_expert(maybe_global, expert_count, "DualScaledFp4 global_scale")
+    }
+    elif maybe_amax is td.DirectoryEntry and maybe_denom is td.DirectoryEntry {
+        validate_scalar_or_per_expert(maybe_amax, expert_count, "ModelOpt DualScaledFp4 amax")
+        validate_scalar_or_per_expert(maybe_denom, expert_count, "ModelOpt DualScaledFp4 outer_scale_denominator")
+        has_modelopt_amax ← true
+    }
+    else {
+        throw variant BadBinding { message = "DualScaledFp4 requires global_scale or ModelOpt amax + outer_scale_denominator" }
+    }
 
     let int group_cols ← scales.shape.get(2) coalesce 0
     require group_cols ≥ 1 throw variant BadShape { message = "DualScaledFp4 group_cols must be positive" }
 
-    let int group_size ← hint.group_size coalesce 16
-    require group_size ≥ 1 throw variant BadConfig { message = "group_size must be at least 1" }
+    mut PackKind bank_pack ← variant PackKind.PackU8
+    mut fp4.PackKind fp4_pack ← variant fp4.PackKind.PackU8
+    mut int in_features ← packed_cols * 2
 
-    let int in_features ← group_cols * group_size
-    return BankedMatrixSpec { kind = variant ExpertWeightKind.DualScaledFp4, expert_count = expert_count, out_features = out_features, in_features = in_features, bits = 4, group_size = group_size, packed_cols = packed_cols, group_cols = group_cols }
+    if weight.raw_dtype ≡ "U8" {
+        bank_pack ← variant PackKind.PackU8
+        fp4_pack ← variant fp4.PackKind.PackU8
+        in_features ← packed_cols * 2
+    }
+    elif weight.raw_dtype ≡ "U32" {
+        bank_pack ← variant PackKind.PackU32
+        fp4_pack ← variant fp4.PackKind.PackU32
+        in_features ← packed_cols * 8
+    }
+    else {
+        throw variant UnsupportedFormat { message = "DualScaledFp4 weight dtype must be U8 or U32, got §"(weight.raw_dtype) }
+    }
+
+    require in_features % group_cols ≡ 0 throw variant BadShape { message = "DualScaledFp4 in_features not divisible by scale group_cols" }
+    let int group_size ← in_features / group_cols
+    let fp4.DualScaledFp4Spec spec ← fp4.admit_spec(out_features, in_features, group_size, fp4_pack)
+    return BankedMatrixSpec { kind = variant ExpertWeightKind.DualScaledFp4, expert_count = expert_count, out_features = spec.out_features, in_features = spec.in_features, bits = 4, group_size = spec.group_size, packed_cols = spec.packed_cols, group_cols = spec.group_cols, block_rows = 1, block_cols = spec.group_size, pack = bank_pack, scales_dtype = scales.raw_dtype, has_modelopt_amax = has_modelopt_amax }
+}
+
+fn is_fp8_weight_dtype(string raw_dtype) → bool {
+    return raw_dtype ≡ "F8_E4M3" or raw_dtype ≡ "FP8_E4M3" or raw_dtype ≡ "E4M3"
 }
 
 fn bind_banked_block_fp8(td.DirectoryEntry weight, td.DirectoryEntry ∪ none maybe_scales, ExpertQuantHint hint) → BankedMatrixSpec ⇥ ExpertBankError {
     let int expert_count ← weight.shape.get(0) coalesce 0
     let int out_features ← weight.shape.get(1) coalesce 0
-    let int in_features ← weight.shape.get(2) coalesce 0
-    let int group_size ← hint.group_size coalesce 128
+    let int packed_cols ← weight.shape.get(2) coalesce 0
 
-    require group_size ≥ 1 throw variant BadConfig { message = "group_size must be at least 1" }
+    mut PackKind bank_pack ← variant PackKind.PackU8
+    mut bf8.PackKind bf8_pack ← variant bf8.PackKind.PackU8
+    mut int in_features ← packed_cols
 
-    mut int group_cols ← 1
-    if in_features ≥ group_size and in_features % group_size ≡ 0 {
-        group_cols ← in_features / group_size
+    if is_fp8_weight_dtype(weight.raw_dtype) or weight.raw_dtype ≡ "U8" {
+        bank_pack ← variant PackKind.PackU8
+        bf8_pack ← variant bf8.PackKind.PackU8
+        in_features ← packed_cols
+    }
+    elif weight.raw_dtype ≡ "U32" {
+        bank_pack ← variant PackKind.PackU32
+        bf8_pack ← variant bf8.PackKind.PackU32
+        in_features ← packed_cols * 4
+    }
+    else {
+        throw variant UnsupportedFormat { message = "BlockFp8 weight dtype must be F8_E4M3, U8, or U32, got §"(weight.raw_dtype) }
     }
 
     if maybe_scales is td.DirectoryEntry {
-        require maybe_scales.shape.length() ≥ 2 throw variant BadShape { message = "BlockFp8 scales must be at least rank-2" }
+        require maybe_scales.shape.length() ≡ 3 throw variant BadShape { message = "BlockFp8 banked scales must be rank-3" }
         require maybe_scales.shape[0] ≡ expert_count throw variant BadShape { message = "BlockFp8 scales expert_count mismatch" }
+        require maybe_scales.raw_dtype ≡ "U8" or maybe_scales.raw_dtype ≡ "F32" throw variant UnsupportedFormat { message = "BlockFp8 scales dtype must be U8 or F32, got §"(maybe_scales.raw_dtype) }
+
+        let int scale_rows ← maybe_scales.shape[1]
+        let int scale_cols ← maybe_scales.shape[2]
+        require scale_rows ≥ 1 and scale_cols ≥ 1 throw variant BadShape { message = "BlockFp8 scales must have positive extents" }
+        require out_features % scale_rows ≡ 0 throw variant BadShape { message = "BlockFp8 out_features not divisible by scale_rows" }
+        require in_features % scale_cols ≡ 0 throw variant BadShape { message = "BlockFp8 in_features not divisible by scale_cols" }
+
+        let int block_rows ← out_features / scale_rows
+        let int block_cols ← in_features / scale_cols
+        let bf8.BlockFp8Spec spec ← bf8.admit_spec(out_features, in_features, block_rows, block_cols, bf8_pack)
+        return BankedMatrixSpec { kind = variant ExpertWeightKind.BlockFp8, expert_count = expert_count, out_features = spec.out_features, in_features = spec.in_features, bits = 8, group_size = spec.block_cols, packed_cols = spec.packed_cols, group_cols = spec.scale_cols, block_rows = spec.block_rows, block_cols = spec.block_cols, pack = bank_pack, scales_dtype = maybe_scales.raw_dtype }
     }
 
-    return BankedMatrixSpec { kind = variant ExpertWeightKind.BlockFp8, expert_count = expert_count, out_features = out_features, in_features = in_features, bits = 8, group_size = group_size, packed_cols = in_features, group_cols = group_cols }
+    require is_fp8_weight_dtype(weight.raw_dtype) throw variant BadBinding { message = "BlockFp8 U8/U32 storage requires a scales tensor" }
+    let bf8.BlockFp8Spec spec ← bf8.admit_spec(out_features, in_features, out_features, in_features, bf8_pack)
+    return BankedMatrixSpec { kind = variant ExpertWeightKind.BlockFp8, expert_count = expert_count, out_features = spec.out_features, in_features = spec.in_features, bits = 8, group_size = spec.block_cols, packed_cols = spec.packed_cols, group_cols = spec.scale_cols, block_rows = spec.block_rows, block_cols = spec.block_cols, pack = bank_pack, scales_dtype = "NONE" }
+}
+
+fn resolve_banked_scales_sibling(td.TensorDirectory dir, bundle.MemberRole role, string module_prefix, td.DirectoryEntry ∪ none sib_scales) → td.DirectoryEntry ∪ none ⇥ ExpertBankError {
+    if sib_scales is td.DirectoryEntry {
+        return sib_scales
+    }
+    if td.has_tensor(dir, role, "§.weight_scale_inv"(module_prefix)) {
+        return td.lookup(dir, role, "§.weight_scale_inv"(module_prefix))
+    }
+    return null
 }
 
 @ public
@@ -383,13 +615,15 @@ fn bind_matrix_with_config(td.TensorDirectory dir, bundle.MemberRole role, strin
     let int dim2 ← weight.shape.get(2) coalesce 0
     require dim0 ≥ 1 and dim1 ≥ 1 and dim2 ≥ 1 throw variant BadShape { message = "banked expert weight must have positive extents" }
 
-    let td.DirectoryEntry ∪ none maybe_scales ← sib.scales
+    let td.DirectoryEntry ∪ none maybe_scales ← resolve_banked_scales_sibling(dir, role, module_prefix, sib.scales)
     let td.DirectoryEntry ∪ none maybe_biases ← sib.biases
     let td.DirectoryEntry ∪ none maybe_global ← sib.global_scale
+    let td.DirectoryEntry ∪ none maybe_amax ← sib.amax
+    let td.DirectoryEntry ∪ none maybe_denom ← sib.outer_scale_denominator
 
-    # 1. DualScaledFp4: .weight + .scales + .global_scale
-    if maybe_scales is td.DirectoryEntry and maybe_global is td.DirectoryEntry {
-        return bind_banked_dual_scaled_fp4(weight, maybe_scales, maybe_global, hint)
+    # 1. DualScaledFp4: .weight + .scales + (.global_scale | .amax + .outer_scale_denominator)
+    if maybe_scales is td.DirectoryEntry and (maybe_global is td.DirectoryEntry or (maybe_amax is td.DirectoryEntry and maybe_denom is td.DirectoryEntry)) {
+        return bind_banked_dual_scaled_fp4(weight, maybe_scales, maybe_global, maybe_amax, maybe_denom, hint)
     }
 
     # 2. GroupAffine: .weight + .scales + .biases
@@ -397,8 +631,8 @@ fn bind_matrix_with_config(td.TensorDirectory dir, bundle.MemberRole role, strin
         return bind_banked_group_affine(weight, maybe_scales, maybe_biases, hint)
     }
 
-    # 3. BlockFp8: F8_E4M3 / FP8_E4M3 / E4M3 or U8 with scales-only sibling
-    if weight.raw_dtype ≡ "F8_E4M3" or weight.raw_dtype ≡ "FP8_E4M3" or weight.raw_dtype ≡ "E4M3" or (weight.raw_dtype ≡ "U8" and maybe_scales is td.DirectoryEntry) {
+    # 3. BlockFp8: F8_E4M3 / FP8_E4M3 / E4M3 or U8 / U32 with scales-only sibling
+    if is_fp8_weight_dtype(weight.raw_dtype) or ((weight.raw_dtype ≡ "U8" or weight.raw_dtype ≡ "U32") and maybe_scales is td.DirectoryEntry) {
         return bind_banked_block_fp8(weight, maybe_scales, hint)
     }
 
@@ -421,12 +655,12 @@ fn bind_matrix_with_config(td.TensorDirectory dir, bundle.MemberRole role, strin
         let ExpertWeightKind kind ← ggml_kind_for(weight.raw_dtype)
         let int block_elems ← ggml_block_elements(kind)
         require in_features % block_elems ≡ 0 throw variant BadShape { message = "GGML banked weight in_features must be divisible by block element count" }
-        return BankedMatrixSpec { kind = kind, expert_count = expert_count, out_features = out_features, in_features = in_features, bits = 0, group_size = 0, packed_cols = 0, group_cols = 0 }
+        return BankedMatrixSpec { kind = kind, expert_count = expert_count, out_features = out_features, in_features = in_features, bits = 0, group_size = 0, packed_cols = 0, group_cols = 0, block_rows = 1, block_cols = block_elems, pack = variant PackKind.PackU8 }
     }
 
     # 5. Dense: F32 / BF16 / F16
     let ExpertWeightKind kind ← dense_kind_for(weight.raw_dtype)
-    return BankedMatrixSpec { kind = kind, expert_count = expert_count, out_features = out_features, in_features = in_features, bits = 0, group_size = 0, packed_cols = 0, group_cols = 0 }
+    return BankedMatrixSpec { kind = kind, expert_count = expert_count, out_features = out_features, in_features = in_features, bits = 0, group_size = 0, packed_cols = 0, group_cols = 0, pack = variant PackKind.PackDense }
 }
 
 @ public
@@ -446,7 +680,8 @@ fn bind_split(td.TensorDirectory dir, bundle.MemberRole role, string gate_prefix
 
 @ public
 fn bind_fused(td.TensorDirectory dir, bundle.MemberRole role, string gate_up_prefix, string down_prefix, ExpertQuantHint hint, bool has_router_bias, int shared_expert_count) → ExpertBank ⇥ ExpertBankError {
-    let td.DirectoryEntry gate_up_entry ← td.lookup(dir, role, "§.weight"(gate_up_prefix))
+    let td.SiblingSet gu_sib ← td.siblings(dir, role, gate_up_prefix)
+    let td.DirectoryEntry gate_up_entry ← gu_sib.weight
     let BankedMatrixSpec gate_up ← bind_matrix_with_config(dir, role, gate_up_prefix, hint)
     let BankedMatrixSpec down ← bind_matrix_with_config(dir, role, down_prefix, hint)
 
@@ -477,7 +712,7 @@ fn bind_fused(td.TensorDirectory dir, bundle.MemberRole role, string gate_up_pre
 
 @ public
 fn bind_auto(td.TensorDirectory dir, bundle.MemberRole role, string moe_prefix, ExpertQuantHint hint, int shared_expert_count) → ExpertBank ⇥ ExpertBankError {
-    let bool has_bias ← td.has_tensor(dir, role, "§.gate.e_score_correction_bias"(moe_prefix)) or td.has_tensor(dir, role, "§.router.e_score_correction_bias"(moe_prefix))
+    let bool has_bias ← td.has_tensor(dir, role, "§.gate.e_score_correction_bias"(moe_prefix)) or td.has_tensor(dir, role, "§.router.e_score_correction_bias"(moe_prefix)) or td.has_tensor(dir, role, "§.ffn_gate_inp.bias"(moe_prefix))
 
     let string split_gate ← "§.gate_proj"(moe_prefix)
     let string split_up ← "§.up_proj"(moe_prefix)
@@ -487,12 +722,30 @@ fn bind_auto(td.TensorDirectory dir, bundle.MemberRole role, string moe_prefix, 
         return bind_split(dir, role, split_gate, split_up, down, hint, has_bias, shared_expert_count)
     }
 
+    let string gguf_gate ← "§.ffn_gate_exps"(moe_prefix)
+    let string gguf_up ← "§.ffn_up_exps"(moe_prefix)
+    let string gguf_down ← "§.ffn_down_exps"(moe_prefix)
+    if td.has_tensor(dir, role, "§.weight"(gguf_gate)) and td.has_tensor(dir, role, "§.weight"(gguf_up)) {
+        return bind_split(dir, role, gguf_gate, gguf_up, gguf_down, hint, has_bias, shared_expert_count)
+    }
+
     let string fused_gu ← "§.gate_up_proj"(moe_prefix)
-    if td.has_tensor(dir, role, "§.weight"(fused_gu)) {
+    if td.has_tensor(dir, role, "§.weight"(fused_gu)) or td.has_tensor(dir, role, "§.w13_weight"(moe_prefix)) or td.has_tensor(dir, role, "§.w13.weight"(moe_prefix)) {
         return bind_fused(dir, role, fused_gu, down, hint, has_bias, shared_expert_count)
     }
 
-    throw variant BadBinding { message = "no split gate_proj/up_proj or fused gate_up_proj found under §"(moe_prefix) }
+    let string gguf_gu ← "§.ffn_gate_up_exps"(moe_prefix)
+    if td.has_tensor(dir, role, "§.weight"(gguf_gu)) {
+        return bind_fused(dir, role, gguf_gu, gguf_down, hint, has_bias, shared_expert_count)
+    }
+
+    throw variant BadBinding { message = "no split gate_proj/up_proj, raw HF w13_weight, GGUF ffn_*_exps, or fused gate_up_proj found under §"(moe_prefix) }
+}
+
+@ public
+fn bind_auto_with_activation(td.TensorDirectory dir, bundle.MemberRole role, string moe_prefix, ExpertQuantHint hint, int shared_expert_count, ExpertActivation act) → ExpertBank ⇥ ExpertBankError {
+    let ExpertBank base ← bind_auto(dir, role, moe_prefix, hint, shared_expert_count)
+    return with_activation(base, act)
 }
 
 # -------------------------------------------------------------------------
@@ -720,6 +973,36 @@ union BankedPayload {
         list<f32> scales
         list<f32> biases
     },
+    GroupAffineU32Bf16BankPayload {
+        list<u32> weight
+        list<bf16> scales
+        list<bf16> biases
+    },
+    GroupAffineU8Bf16BankPayload {
+        list<u8> weight
+        list<bf16> scales
+        list<bf16> biases
+    },
+    BlockFp8U8BankPayload {
+        list<u8> weight
+        list<u8> scales
+        list<f32> f32_scales
+    },
+    BlockFp8U32BankPayload {
+        list<u32> weight
+        list<u8> scales
+        list<f32> f32_scales
+    },
+    DualScaledFp4U8BankPayload {
+        list<u8> weight
+        list<u8> scales
+        list<f32> expert_global_scales
+    },
+    DualScaledFp4U32BankPayload {
+        list<u32> weight
+        list<u8> scales
+        list<f32> expert_global_scales
+    },
     GgmlBlockBankPayload {
         list<u8> raw_blocks
     }
@@ -770,6 +1053,120 @@ fn unpack_u8_at(list<u8> weight, int w_base, int j, int bits) → int {
     return (b ⇒ shift) % 16
 }
 
+fn bf16_list_to_f32(list<bf16> items) → list<f32> {
+    mut list<f32> out ← empty
+    for from items let v {
+        out.append(v ↦ f32)
+    }
+    return out
+}
+
+fn eval_ga_u32_slice(BankedMatrixSpec spec, list<u32> weight, list<f32> scales, list<f32> biases, int expert_idx, int row_offset, int row_count, list<f32> x) → list<f32> ⇥ ExpertBankError {
+    match spec.kind {
+        case GroupAffineU32 {}
+        default {
+            throw variant BadBinding { message = "BankedMatrixSpec kind does not match GroupAffineU32" }
+        }
+    }
+    require weight.length() ≡ spec.expert_count * spec.out_features * spec.packed_cols throw variant BadShape { message = "u32 banked weight length mismatch" }
+    require scales.length() ≡ spec.expert_count * spec.out_features * spec.group_cols throw variant BadShape { message = "u32 banked scales length mismatch" }
+    require biases.length() ≡ spec.expert_count * spec.out_features * spec.group_cols throw variant BadShape { message = "u32 banked biases length mismatch" }
+
+    mut list<f32> y ← empty
+    let int e_w_base ← expert_idx * spec.out_features * spec.packed_cols
+    let int e_g_base ← expert_idx * spec.out_features * spec.group_cols
+    for exclusive row_count let rr {
+        let int r ← row_offset + rr
+        let int w_base ← e_w_base + r * spec.packed_cols
+        let int g_base ← e_g_base + r * spec.group_cols
+        mut f32 acc ← 0.0 ∷ f32
+        for exclusive spec.in_features let j {
+            let int q ← unpack_u32_at(weight, w_base, j, spec.bits)
+            let int g ← j / spec.group_size
+            let f32 w ← (q ↦ f32) * scales[g_base + g] + biases[g_base + g]
+            acc ← acc + w * x[j]
+        }
+        y.append(acc)
+    }
+    return y
+}
+
+fn eval_ga_u8_slice(BankedMatrixSpec spec, list<u8> weight, list<f32> scales, list<f32> biases, int expert_idx, int row_offset, int row_count, list<f32> x) → list<f32> ⇥ ExpertBankError {
+    match spec.kind {
+        case GroupAffineU8 {}
+        default {
+            throw variant BadBinding { message = "BankedMatrixSpec kind does not match GroupAffineU8" }
+        }
+    }
+    require weight.length() ≡ spec.expert_count * spec.out_features * spec.packed_cols throw variant BadShape { message = "u8 banked weight length mismatch" }
+    require scales.length() ≡ spec.expert_count * spec.out_features * spec.group_cols throw variant BadShape { message = "u8 banked scales length mismatch" }
+    require biases.length() ≡ spec.expert_count * spec.out_features * spec.group_cols throw variant BadShape { message = "u8 banked biases length mismatch" }
+
+    mut list<f32> y ← empty
+    let int e_w_base ← expert_idx * spec.out_features * spec.packed_cols
+    let int e_g_base ← expert_idx * spec.out_features * spec.group_cols
+    for exclusive row_count let rr {
+        let int r ← row_offset + rr
+        let int w_base ← e_w_base + r * spec.packed_cols
+        let int g_base ← e_g_base + r * spec.group_cols
+        mut f32 acc ← 0.0 ∷ f32
+        for exclusive spec.in_features let j {
+            let int q ← unpack_u8_at(weight, w_base, j, spec.bits)
+            let int g ← j / spec.group_size
+            let f32 w ← (q ↦ f32) * scales[g_base + g] + biases[g_base + g]
+            acc ← acc + w * x[j]
+        }
+        y.append(acc)
+    }
+    return y
+}
+
+fn effective_block_rows(BankedMatrixSpec spec) → int {
+    return (spec.block_rows ≥ 1) ✓ spec.block_rows ✗ 1
+}
+
+fn effective_block_cols(BankedMatrixSpec spec) → int {
+    if spec.block_cols ≥ 1 {
+        return spec.block_cols
+    }
+    return (spec.group_size ≥ 1) ✓ spec.group_size ✗ spec.in_features
+}
+
+fn resolve_expert_global_scale(list<f32> gs_list, int expert_count, int expert_idx) → f32 ⇥ ExpertBankError {
+    require gs_list.length() ≡ 1 or gs_list.length() ≡ expert_count throw variant BadShape { message = "DualScaledFp4 expert_global_scales length mismatch" }
+    return (gs_list.length() ≡ 1) ✓ gs_list[0] ✗ gs_list[expert_idx]
+}
+
+fn slice_u8_rows(list<u8> src, int expert_idx, int total_rows, int cols, int row_offset, int row_count) → list<u8> {
+    mut list<u8> out ← empty
+    let int base ← (expert_idx * total_rows + row_offset) * cols
+    let int count ← row_count * cols
+    for exclusive count let i {
+        out.append(src[base + i])
+    }
+    return out
+}
+
+fn slice_u32_rows(list<u32> src, int expert_idx, int total_rows, int cols, int row_offset, int row_count) → list<u32> {
+    mut list<u32> out ← empty
+    let int base ← (expert_idx * total_rows + row_offset) * cols
+    let int count ← row_count * cols
+    for exclusive count let i {
+        out.append(src[base + i])
+    }
+    return out
+}
+
+fn slice_f32_rows(list<f32> src, int expert_idx, int total_rows, int cols, int row_offset, int row_count) → list<f32> {
+    mut list<f32> out ← empty
+    let int base ← (expert_idx * total_rows + row_offset) * cols
+    let int count ← row_count * cols
+    for exclusive count let i {
+        out.append(src[base + i])
+    }
+    return out
+}
+
 @ public
 fn ref_expert_matvec_slice(BankedMatrixSpec spec, BankedPayload payload, int expert_idx, int row_offset, int row_count, list<f32> x) → list<f32> ⇥ ExpertBankError {
     require expert_idx ≥ 0 and expert_idx ≺ spec.expert_count throw variant BadShape { message = "expert_idx out of bounds" }
@@ -802,58 +1199,114 @@ fn ref_expert_matvec_slice(BankedMatrixSpec spec, BankedPayload payload, int exp
             }
         }
         case GroupAffineU32BankPayload let weight, scales, biases {
-            match spec.kind {
-                case GroupAffineU32 {}
-                default {
-                    throw variant BadBinding { message = "BankedMatrixSpec kind does not match GroupAffineU32BankPayload" }
-                }
-            }
-            require weight.length() ≡ spec.expert_count * spec.out_features * spec.packed_cols throw variant BadShape { message = "u32 banked weight length mismatch" }
-            require scales.length() ≡ spec.expert_count * spec.out_features * spec.group_cols throw variant BadShape { message = "u32 banked scales length mismatch" }
-            require biases.length() ≡ spec.expert_count * spec.out_features * spec.group_cols throw variant BadShape { message = "u32 banked biases length mismatch" }
-
-            let int e_w_base ← expert_idx * spec.out_features * spec.packed_cols
-            let int e_g_base ← expert_idx * spec.out_features * spec.group_cols
-            for exclusive row_count let rr {
-                let int r ← row_offset + rr
-                let int w_base ← e_w_base + r * spec.packed_cols
-                let int g_base ← e_g_base + r * spec.group_cols
-                mut f32 acc ← 0.0 ∷ f32
-                for exclusive spec.in_features let j {
-                    let int q ← unpack_u32_at(weight, w_base, j, spec.bits)
-                    let int g ← j / spec.group_size
-                    let f32 w ← (q ↦ f32) * scales[g_base + g] + biases[g_base + g]
-                    acc ← acc + w * x[j]
-                }
-                y.append(acc)
-            }
+            return eval_ga_u32_slice(spec, weight, scales, biases, expert_idx, row_offset, row_count, x)
         }
         case GroupAffineU8BankPayload let weight, scales, biases {
+            return eval_ga_u8_slice(spec, weight, scales, biases, expert_idx, row_offset, row_count, x)
+        }
+        case GroupAffineU32Bf16BankPayload let weight, scales, biases {
+            return eval_ga_u32_slice(spec, weight, bf16_list_to_f32(scales), bf16_list_to_f32(biases), expert_idx, row_offset, row_count, x)
+        }
+        case GroupAffineU8Bf16BankPayload let weight, scales, biases {
+            return eval_ga_u8_slice(spec, weight, bf16_list_to_f32(scales), bf16_list_to_f32(biases), expert_idx, row_offset, row_count, x)
+        }
+        case BlockFp8U8BankPayload let weight, scales, f32_scales {
             match spec.kind {
-                case GroupAffineU8 {}
+                case BlockFp8 {}
                 default {
-                    throw variant BadBinding { message = "BankedMatrixSpec kind does not match GroupAffineU8BankPayload" }
+                    throw variant BadBinding { message = "BankedMatrixSpec kind does not match BlockFp8U8BankPayload" }
                 }
             }
-            require weight.length() ≡ spec.expert_count * spec.out_features * spec.packed_cols throw variant BadShape { message = "u8 banked weight length mismatch" }
-            require scales.length() ≡ spec.expert_count * spec.out_features * spec.group_cols throw variant BadShape { message = "u8 banked scales length mismatch" }
-            require biases.length() ≡ spec.expert_count * spec.out_features * spec.group_cols throw variant BadShape { message = "u8 banked biases length mismatch" }
-
-            let int e_w_base ← expert_idx * spec.out_features * spec.packed_cols
-            let int e_g_base ← expert_idx * spec.out_features * spec.group_cols
-            for exclusive row_count let rr {
-                let int r ← row_offset + rr
-                let int w_base ← e_w_base + r * spec.packed_cols
-                let int g_base ← e_g_base + r * spec.group_cols
-                mut f32 acc ← 0.0 ∷ f32
-                for exclusive spec.in_features let j {
-                    let int q ← unpack_u8_at(weight, w_base, j, spec.bits)
-                    let int g ← j / spec.group_size
-                    let f32 w ← (q ↦ f32) * scales[g_base + g] + biases[g_base + g]
-                    acc ← acc + w * x[j]
-                }
-                y.append(acc)
+            let int br ← effective_block_rows(spec)
+            let int bc ← effective_block_cols(spec)
+            let int scale_rows ← spec.out_features / br
+            let int scale_cols ← spec.group_cols ≥ 1 ✓ spec.group_cols ✗ (spec.in_features / bc)
+            require weight.length() ≡ spec.expert_count * spec.out_features * spec.in_features throw variant BadShape { message = "BlockFp8 U8 banked weight length mismatch" }
+            let list<u8> w_slice ← slice_u8_rows(weight, expert_idx, spec.out_features, spec.in_features, row_offset, row_count)
+            mut list<f32> w_dense ← empty
+            if spec.scales_dtype ≡ "NONE" {
+                w_dense ← bf8.ref_dequantize_u8_unscaled(row_count, spec.in_features, w_slice)
             }
+            else {
+                require row_offset % br ≡ 0 and row_count % br ≡ 0 throw variant BadShape { message = "BlockFp8 slice must align with block_rows" }
+                let int sr_off ← row_offset / br
+                let int sr_cnt ← row_count / br
+                let bf8.BlockFp8Spec bspec ← bf8.admit_spec(row_count, spec.in_features, br, bc, variant bf8.PackKind.PackU8)
+                if spec.scales_dtype ≡ "F32" {
+                    require f32_scales.length() ≡ spec.expert_count * scale_rows * scale_cols throw variant BadShape { message = "BlockFp8 F32 scales length mismatch" }
+                    let list<f32> s_slice ← slice_f32_rows(f32_scales, expert_idx, scale_rows, scale_cols, sr_off, sr_cnt)
+                    w_dense ← bf8.ref_dequantize_u8_f32(bspec, w_slice, s_slice)
+                }
+                else {
+                    require scales.length() ≡ spec.expert_count * scale_rows * scale_cols throw variant BadShape { message = "BlockFp8 U8 scales length mismatch" }
+                    let list<u8> s_slice ← slice_u8_rows(scales, expert_idx, scale_rows, scale_cols, sr_off, sr_cnt)
+                    w_dense ← bf8.ref_dequantize_u8(bspec, w_slice, s_slice)
+                }
+            }
+            return bf8.ref_matvec(row_count, spec.in_features, w_dense, x)
+        }
+        case BlockFp8U32BankPayload let weight, scales, f32_scales {
+            match spec.kind {
+                case BlockFp8 {}
+                default {
+                    throw variant BadBinding { message = "BankedMatrixSpec kind does not match BlockFp8U32BankPayload" }
+                }
+            }
+            let int br ← effective_block_rows(spec)
+            let int bc ← effective_block_cols(spec)
+            let int scale_rows ← spec.out_features / br
+            let int scale_cols ← spec.group_cols ≥ 1 ✓ spec.group_cols ✗ (spec.in_features / bc)
+            let int packed_cols ← spec.packed_cols ≥ 1 ✓ spec.packed_cols ✗ (spec.in_features / 4)
+            require weight.length() ≡ spec.expert_count * spec.out_features * packed_cols throw variant BadShape { message = "BlockFp8 U32 banked weight length mismatch" }
+            require row_offset % br ≡ 0 and row_count % br ≡ 0 throw variant BadShape { message = "BlockFp8 slice must align with block_rows" }
+            let int sr_off ← row_offset / br
+            let int sr_cnt ← row_count / br
+            let list<u32> w_slice ← slice_u32_rows(weight, expert_idx, spec.out_features, packed_cols, row_offset, row_count)
+            let bf8.BlockFp8Spec bspec ← bf8.admit_spec(row_count, spec.in_features, br, bc, variant bf8.PackKind.PackU32)
+            mut list<f32> w_dense ← empty
+            if spec.scales_dtype ≡ "F32" {
+                require f32_scales.length() ≡ spec.expert_count * scale_rows * scale_cols throw variant BadShape { message = "BlockFp8 F32 scales length mismatch" }
+                let list<f32> s_slice ← slice_f32_rows(f32_scales, expert_idx, scale_rows, scale_cols, sr_off, sr_cnt)
+                w_dense ← bf8.ref_dequantize_u32_f32(bspec, w_slice, s_slice)
+            }
+            else {
+                require scales.length() ≡ spec.expert_count * scale_rows * scale_cols throw variant BadShape { message = "BlockFp8 U8 scales length mismatch" }
+                let list<u8> s_slice ← slice_u8_rows(scales, expert_idx, scale_rows, scale_cols, sr_off, sr_cnt)
+                w_dense ← bf8.ref_dequantize_u32(bspec, w_slice, s_slice)
+            }
+            return bf8.ref_matvec(row_count, spec.in_features, w_dense, x)
+        }
+        case DualScaledFp4U8BankPayload let weight, scales, expert_global_scales {
+            match spec.kind {
+                case DualScaledFp4 {}
+                default {
+                    throw variant BadBinding { message = "BankedMatrixSpec kind does not match DualScaledFp4U8BankPayload" }
+                }
+            }
+            require weight.length() ≡ spec.expert_count * spec.out_features * spec.packed_cols throw variant BadShape { message = "DualScaledFp4 U8 banked weight length mismatch" }
+            require scales.length() ≡ spec.expert_count * spec.out_features * spec.group_cols throw variant BadShape { message = "DualScaledFp4 U8 banked scales length mismatch" }
+            let f32 gs ← resolve_expert_global_scale(expert_global_scales, spec.expert_count, expert_idx)
+            let list<u8> w_slice ← slice_u8_rows(weight, expert_idx, spec.out_features, spec.packed_cols, row_offset, row_count)
+            let list<u8> s_slice ← slice_u8_rows(scales, expert_idx, spec.out_features, spec.group_cols, row_offset, row_count)
+            let fp4.DualScaledFp4Spec fspec ← fp4.admit_spec(row_count, spec.in_features, spec.group_size, variant fp4.PackKind.PackU8)
+            let list<f32> w_dense ← fp4.ref_dequantize_u8(fspec, w_slice, s_slice, gs)
+            return fp4.ref_matvec(row_count, spec.in_features, w_dense, x)
+        }
+        case DualScaledFp4U32BankPayload let weight, scales, expert_global_scales {
+            match spec.kind {
+                case DualScaledFp4 {}
+                default {
+                    throw variant BadBinding { message = "BankedMatrixSpec kind does not match DualScaledFp4U32BankPayload" }
+                }
+            }
+            require weight.length() ≡ spec.expert_count * spec.out_features * spec.packed_cols throw variant BadShape { message = "DualScaledFp4 U32 banked weight length mismatch" }
+            require scales.length() ≡ spec.expert_count * spec.out_features * spec.group_cols throw variant BadShape { message = "DualScaledFp4 U32 banked scales length mismatch" }
+            let f32 gs ← resolve_expert_global_scale(expert_global_scales, spec.expert_count, expert_idx)
+            let list<u32> w_slice ← slice_u32_rows(weight, expert_idx, spec.out_features, spec.packed_cols, row_offset, row_count)
+            let list<u8> s_slice ← slice_u8_rows(scales, expert_idx, spec.out_features, spec.group_cols, row_offset, row_count)
+            let fp4.DualScaledFp4Spec fspec ← fp4.admit_spec(row_count, spec.in_features, spec.group_size, variant fp4.PackKind.PackU32)
+            let list<f32> w_dense ← fp4.ref_dequantize_u32(fspec, w_slice, s_slice, gs)
+            return fp4.ref_matvec(row_count, spec.in_features, w_dense, x)
         }
         case GgmlBlockBankPayload let raw_blocks {
             let int block_elems ← ggml_block_elements(spec.kind)
@@ -903,18 +1356,48 @@ fn swiglu_list(list<f32> gate, list<f32> up) → list<f32> {
     return out
 }
 
+@ public
+fn situ_list(list<f32> gate, list<f32> up, f32 gate_cap, f32 up_cap) → list<f32> {
+    mut list<f32> out ← empty
+    for exclusive gate.length() let i {
+        mut f32 g ← gate[i]
+        if gate_cap ≻ (0.0 ∷ f32) {
+            g ← gate_cap * (g / gate_cap).tanh()
+        }
+        mut f32 u ← up[i]
+        if up_cap ≻ (0.0 ∷ f32) {
+            u ← up_cap * (u / up_cap).tanh()
+        }
+        let f32 act ← g * (sigmoid g)
+        out.append(act * u)
+    }
+    return out
+}
+
+fn apply_activation_list(ExpertBank bank, list<f32> gate, list<f32> up) → list<f32> {
+    let ExpertActivation act ← bank_activation(bank)
+    match act {
+        case Swiglu {
+            return swiglu_list(gate, up)
+        }
+        case Situ let gate_cap, up_cap {
+            return situ_list(gate, up, gate_cap, up_cap)
+        }
+    }
+}
+
 fn eval_single_routed_expert(ExpertBank bank, BankedPayload gate_or_fused, BankedPayload up_or_empty, BankedPayload down, int expert_idx, list<f32> x) → list<f32> ⇥ ExpertBankError {
     match bank.layout {
         case SplitGateUp let gate_spec, up_spec, down_spec {
             let list<f32> g ← ref_expert_matvec(gate_spec, gate_or_fused, expert_idx, x)
             let list<f32> u ← ref_expert_matvec(up_spec, up_or_empty, expert_idx, x)
-            let list<f32> h ← swiglu_list(g, u)
+            let list<f32> h ← apply_activation_list(bank, g, u)
             return ref_expert_matvec(down_spec, down, expert_idx, h)
         }
         case FusedGateUp let gu_spec, gate_rows, up_rows, down_spec {
             let list<f32> g ← ref_expert_matvec_slice(gu_spec, gate_or_fused, expert_idx, 0, gate_rows, x)
             let list<f32> u ← ref_expert_matvec_slice(gu_spec, gate_or_fused, expert_idx, gate_rows, up_rows, x)
-            let list<f32> h ← swiglu_list(g, u)
+            let list<f32> h ← apply_activation_list(bank, g, u)
             return ref_expert_matvec(down_spec, down, expert_idx, h)
         }
     }
@@ -1378,6 +1861,1569 @@ kernel routed_expert_matmul_ga_u8<size B, size E, size Out, size PackedIn, size 
     }
 }
 
+@ public
+kernel routed_expert_matmul_dense_2d<size B, size E, size Out, size In>(tensor<f32, [E, Out, In]> weight, tensor<f32, [B, In]> x, tensor<i32, [B]> expert_indices, mut tensor<f32, [B, Out]> y) → void {
+    for from y at [bi, rr] thread lane let e {
+        let i32 ee ← expert_indices[[bi]]
+        if ee ≥ 0 and ee ≺ E and In ≥ 1 and In ≤ 2147483647 {
+            let i32 in_i ← In ↦ wrapping<i32>
+            mut f32 acc ← 0.0 ∷ f32
+            for exclusive in_i let j {
+                acc ← acc + weight[[ee, rr, j]] * x[[bi, j]]
+            }
+            y[[bi, rr]] ← acc
+        }
+    }
+}
+
+@ public
+kernel routed_expert_matvec_dense_bf16<size E, size Out, size In>(tensor<bf16, [E, Out, In]> weight, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, i32 expert_idx) → void {
+    for from y at [row] thread lane let e {
+        if expert_idx ≥ 0 and expert_idx ≺ E and In ≥ 1 and In ≤ 2147483647 {
+            let i32 in_i ← In ↦ wrapping<i32>
+            mut f32 acc ← 0.0 ∷ f32
+            for exclusive in_i let j {
+                acc ← acc + (weight[[expert_idx, row, j]] ↦ f32) * x[[j]]
+            }
+            y[[row]] ← acc
+        }
+    }
+}
+
+@ public
+kernel routed_expert_matmul_dense_bf16<size B, size E, size Out, size In>(tensor<bf16, [E, Out, In]> weight, tensor<f32, [B, In]> x, tensor<i32, [B]> expert_indices, mut tensor<f32, [B, Out]> y) → void {
+    for from y at [bi, rr] thread lane let e {
+        let i32 ee ← expert_indices[[bi]]
+        if ee ≥ 0 and ee ≺ E and In ≥ 1 and In ≤ 2147483647 {
+            let i32 in_i ← In ↦ wrapping<i32>
+            mut f32 acc ← 0.0 ∷ f32
+            for exclusive in_i let j {
+                acc ← acc + (weight[[ee, rr, j]] ↦ f32) * x[[bi, j]]
+            }
+            y[[bi, rr]] ← acc
+        }
+    }
+}
+
+@ public
+kernel routed_expert_matvec_ga_u32_bf16<size E, size Out, size PackedIn, size Groups, size In>(tensor<u32, [E, Out, PackedIn]> weight, tensor<bf16, [E, Out, Groups]> scales, tensor<bf16, [E, Out, Groups]> biases, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, i32 expert_idx, i32 bits, i32 group_size) → void {
+    for from y at [row] thread lane let e {
+        if group_size ≥ 1 and group_size ≤ 4096 and (bits ≡ 4 or bits ≡ 6 or bits ≡ 8) and expert_idx ≥ 0 and expert_idx ≺ E and In ≤ 200000000 {
+            let i32 n_groups ← In / group_size
+            mut f32 acc ← 0.0 ∷ f32
+
+            for exclusive n_groups let g {
+                let f32 s ← scales[[expert_idx, row, g]] ↦ f32
+                let f32 b ← biases[[expert_idx, row, g]] ↦ f32
+                let i32 j_base ← g * group_size
+
+                for exclusive group_size let k {
+                    let i32 j ← j_base + k
+                    let i32 bit_pos ← j * bits
+                    let i32 word_idx ← bit_pos / 32
+                    let i32 shift ← bit_pos % 32
+                    let u32 w0 ← weight[[expert_idx, row, word_idx]]
+                    mut u32 q ← 0 ∷ u32
+
+                    if bits ≡ 8 {
+                        if shift ≡ 0 { q ← w0 ∧ (255 ∷ u32) }
+                        elif shift ≡ 8 { q ← (w0 ⇒ (8 ∷ u32)) ∧ (255 ∷ u32) }
+                        elif shift ≡ 16 { q ← (w0 ⇒ (16 ∷ u32)) ∧ (255 ∷ u32) }
+                        else { q ← (w0 ⇒ (24 ∷ u32)) ∧ (255 ∷ u32) }
+                    }
+                    elif bits ≡ 4 {
+                        if shift ≡ 0 { q ← w0 ∧ (15 ∷ u32) }
+                        elif shift ≡ 4 { q ← (w0 ⇒ (4 ∷ u32)) ∧ (15 ∷ u32) }
+                        elif shift ≡ 8 { q ← (w0 ⇒ (8 ∷ u32)) ∧ (15 ∷ u32) }
+                        elif shift ≡ 12 { q ← (w0 ⇒ (12 ∷ u32)) ∧ (15 ∷ u32) }
+                        elif shift ≡ 16 { q ← (w0 ⇒ (16 ∷ u32)) ∧ (15 ∷ u32) }
+                        elif shift ≡ 20 { q ← (w0 ⇒ (20 ∷ u32)) ∧ (15 ∷ u32) }
+                        elif shift ≡ 24 { q ← (w0 ⇒ (24 ∷ u32)) ∧ (15 ∷ u32) }
+                        else { q ← (w0 ⇒ (28 ∷ u32)) ∧ (15 ∷ u32) }
+                    }
+                    else {
+                        if shift ≡ 0 { q ← w0 ∧ (63 ∷ u32) }
+                        elif shift ≡ 2 { q ← (w0 ⇒ (2 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 4 { q ← (w0 ⇒ (4 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 6 { q ← (w0 ⇒ (6 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 8 { q ← (w0 ⇒ (8 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 10 { q ← (w0 ⇒ (10 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 12 { q ← (w0 ⇒ (12 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 14 { q ← (w0 ⇒ (14 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 16 { q ← (w0 ⇒ (16 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 18 { q ← (w0 ⇒ (18 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 20 { q ← (w0 ⇒ (20 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 22 { q ← (w0 ⇒ (22 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 24 { q ← (w0 ⇒ (24 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 26 { q ← (w0 ⇒ (26 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 28 {
+                            let u32 w1 ← weight[[expert_idx, row, word_idx + 1]]
+                            let u32 lo ← w0 ⇒ (28 ∷ u32)
+                            let u32 hi ← (w1 ∧ (3 ∷ u32)) * (16 ∷ u32)
+                            q ← lo + hi
+                        }
+                        else {
+                            let u32 w1 ← weight[[expert_idx, row, word_idx + 1]]
+                            let u32 lo ← w0 ⇒ (30 ∷ u32)
+                            let u32 hi ← (w1 ∧ (15 ∷ u32)) * (4 ∷ u32)
+                            q ← lo + hi
+                        }
+                    }
+
+                    let f32 w ← (q ↦ f32) * s + b
+                    acc ← acc + w * x[[j]]
+                }
+            }
+
+            y[[row]] ← acc
+        }
+    }
+}
+
+@ public
+kernel routed_expert_matmul_ga_u32_bf16<size B, size E, size Out, size PackedIn, size Groups, size In>(tensor<u32, [E, Out, PackedIn]> weight, tensor<bf16, [E, Out, Groups]> scales, tensor<bf16, [E, Out, Groups]> biases, tensor<f32, [B, In]> x, tensor<i32, [B]> expert_indices, mut tensor<f32, [B, Out]> y, i32 bits, i32 group_size) → void {
+    for from y at [bi, rr] thread lane let e {
+        let i32 ee ← expert_indices[[bi]]
+        if group_size ≥ 1 and group_size ≤ 4096 and (bits ≡ 4 or bits ≡ 6 or bits ≡ 8) and ee ≥ 0 and ee ≺ E and In ≤ 200000000 {
+            let i32 n_groups ← In / group_size
+            mut f32 acc ← 0.0 ∷ f32
+
+            for exclusive n_groups let g {
+                let f32 s ← scales[[ee, rr, g]] ↦ f32
+                let f32 b ← biases[[ee, rr, g]] ↦ f32
+                let i32 j_base ← g * group_size
+
+                for exclusive group_size let k {
+                    let i32 j ← j_base + k
+                    let i32 bit_pos ← j * bits
+                    let i32 word_idx ← bit_pos / 32
+                    let i32 shift ← bit_pos % 32
+                    let u32 w0 ← weight[[ee, rr, word_idx]]
+                    mut u32 q ← 0 ∷ u32
+
+                    if bits ≡ 8 {
+                        if shift ≡ 0 { q ← w0 ∧ (255 ∷ u32) }
+                        elif shift ≡ 8 { q ← (w0 ⇒ (8 ∷ u32)) ∧ (255 ∷ u32) }
+                        elif shift ≡ 16 { q ← (w0 ⇒ (16 ∷ u32)) ∧ (255 ∷ u32) }
+                        else { q ← (w0 ⇒ (24 ∷ u32)) ∧ (255 ∷ u32) }
+                    }
+                    elif bits ≡ 4 {
+                        if shift ≡ 0 { q ← w0 ∧ (15 ∷ u32) }
+                        elif shift ≡ 4 { q ← (w0 ⇒ (4 ∷ u32)) ∧ (15 ∷ u32) }
+                        elif shift ≡ 8 { q ← (w0 ⇒ (8 ∷ u32)) ∧ (15 ∷ u32) }
+                        elif shift ≡ 12 { q ← (w0 ⇒ (12 ∷ u32)) ∧ (15 ∷ u32) }
+                        elif shift ≡ 16 { q ← (w0 ⇒ (16 ∷ u32)) ∧ (15 ∷ u32) }
+                        elif shift ≡ 20 { q ← (w0 ⇒ (20 ∷ u32)) ∧ (15 ∷ u32) }
+                        elif shift ≡ 24 { q ← (w0 ⇒ (24 ∷ u32)) ∧ (15 ∷ u32) }
+                        else { q ← (w0 ⇒ (28 ∷ u32)) ∧ (15 ∷ u32) }
+                    }
+                    else {
+                        if shift ≡ 0 { q ← w0 ∧ (63 ∷ u32) }
+                        elif shift ≡ 2 { q ← (w0 ⇒ (2 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 4 { q ← (w0 ⇒ (4 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 6 { q ← (w0 ⇒ (6 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 8 { q ← (w0 ⇒ (8 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 10 { q ← (w0 ⇒ (10 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 12 { q ← (w0 ⇒ (12 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 14 { q ← (w0 ⇒ (14 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 16 { q ← (w0 ⇒ (16 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 18 { q ← (w0 ⇒ (18 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 20 { q ← (w0 ⇒ (20 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 22 { q ← (w0 ⇒ (22 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 24 { q ← (w0 ⇒ (24 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 26 { q ← (w0 ⇒ (26 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 28 {
+                            let u32 w1 ← weight[[ee, rr, word_idx + 1]]
+                            let u32 lo ← w0 ⇒ (28 ∷ u32)
+                            let u32 hi ← (w1 ∧ (3 ∷ u32)) * (16 ∷ u32)
+                            q ← lo + hi
+                        }
+                        else {
+                            let u32 w1 ← weight[[ee, rr, word_idx + 1]]
+                            let u32 lo ← w0 ⇒ (30 ∷ u32)
+                            let u32 hi ← (w1 ∧ (15 ∷ u32)) * (4 ∷ u32)
+                            q ← lo + hi
+                        }
+                    }
+
+                    let f32 w ← (q ↦ f32) * s + b
+                    acc ← acc + w * x[[bi, j]]
+                }
+            }
+
+            y[[bi, rr]] ← acc
+        }
+    }
+}
+
+@ public
+kernel routed_expert_matvec_ga_u8_bf16<size E, size Out, size PackedIn, size Groups, size In>(tensor<u8, [E, Out, PackedIn]> weight, tensor<bf16, [E, Out, Groups]> scales, tensor<bf16, [E, Out, Groups]> biases, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, i32 expert_idx, i32 bits, i32 group_size) → void {
+    for from y at [row] thread lane let e {
+        if group_size ≥ 1 and group_size ≤ 4096 and (bits ≡ 4 or bits ≡ 8) and expert_idx ≥ 0 and expert_idx ≺ E and In ≤ 200000000 {
+            let i32 n_groups ← In / group_size
+            mut f32 acc ← 0.0 ∷ f32
+
+            for exclusive n_groups let g {
+                let f32 s ← scales[[expert_idx, row, g]] ↦ f32
+                let f32 b ← biases[[expert_idx, row, g]] ↦ f32
+                let i32 j_base ← g * group_size
+
+                for exclusive group_size let k {
+                    let i32 j ← j_base + k
+                    mut u8 q ← 0 ∷ u8
+                    if bits ≡ 8 {
+                        q ← weight[[expert_idx, row, j]]
+                    }
+                    else {
+                        let u8 packed ← weight[[expert_idx, row, j / 2]]
+                        if j % 2 ≡ 0 { q ← packed ∧ (15 ∷ u8) }
+                        else { q ← (packed ⇒ (4 ∷ u8)) ∧ (15 ∷ u8) }
+                    }
+                    let f32 w ← (q ↦ f32) * s + b
+                    acc ← acc + w * x[[j]]
+                }
+            }
+
+            y[[row]] ← acc
+        }
+    }
+}
+
+@ public
+kernel routed_expert_matmul_ga_u8_bf16<size B, size E, size Out, size PackedIn, size Groups, size In>(tensor<u8, [E, Out, PackedIn]> weight, tensor<bf16, [E, Out, Groups]> scales, tensor<bf16, [E, Out, Groups]> biases, tensor<f32, [B, In]> x, tensor<i32, [B]> expert_indices, mut tensor<f32, [B, Out]> y, i32 bits, i32 group_size) → void {
+    for from y at [bi, rr] thread lane let e {
+        let i32 ee ← expert_indices[[bi]]
+        if group_size ≥ 1 and group_size ≤ 4096 and (bits ≡ 4 or bits ≡ 8) and ee ≥ 0 and ee ≺ E and In ≤ 200000000 {
+            let i32 n_groups ← In / group_size
+            mut f32 acc ← 0.0 ∷ f32
+
+            for exclusive n_groups let g {
+                let f32 s ← scales[[ee, rr, g]] ↦ f32
+                let f32 b ← biases[[ee, rr, g]] ↦ f32
+                let i32 j_base ← g * group_size
+
+                for exclusive group_size let k {
+                    let i32 j ← j_base + k
+                    mut u8 q ← 0 ∷ u8
+                    if bits ≡ 8 {
+                        q ← weight[[ee, rr, j]]
+                    }
+                    else {
+                        let u8 packed ← weight[[ee, rr, j / 2]]
+                        if j % 2 ≡ 0 { q ← packed ∧ (15 ∷ u8) }
+                        else { q ← (packed ⇒ (4 ∷ u8)) ∧ (15 ∷ u8) }
+                    }
+                    let f32 w ← (q ↦ f32) * s + b
+                    acc ← acc + w * x[[bi, j]]
+                }
+            }
+
+            y[[bi, rr]] ← acc
+        }
+    }
+}
+
+@ public
+kernel routed_expert_situ<size F>(tensor<f32, [F]> gate, tensor<f32, [F]> up, mut tensor<f32, [F]> out, f32 gate_cap, f32 up_cap) → void {
+    for from out at [i] thread lane let e {
+        mut f32 g ← gate[[i]]
+        if gate_cap ≻ (0.0 ∷ f32) {
+            g ← gate_cap * (g / gate_cap).tanh()
+        }
+        mut f32 u ← up[[i]]
+        if up_cap ≻ (0.0 ∷ f32) {
+            u ← up_cap * (u / up_cap).tanh()
+        }
+        let f32 act ← g / ((1.0 ∷ f32) + (-g).exp())
+        out[[i]] ← act * u
+    }
+}
+
+@ public
+kernel routed_expert_situ_batch<size B, size F>(tensor<f32, [B, F]> gate, tensor<f32, [B, F]> up, mut tensor<f32, [B, F]> out, f32 gate_cap, f32 up_cap) → void {
+    for from out at [bi, i] thread lane let e {
+        mut f32 g ← gate[[bi, i]]
+        if gate_cap ≻ (0.0 ∷ f32) {
+            g ← gate_cap * (g / gate_cap).tanh()
+        }
+        mut f32 u ← up[[bi, i]]
+        if up_cap ≻ (0.0 ∷ f32) {
+            u ← up_cap * (u / up_cap).tanh()
+        }
+        let f32 act ← g / ((1.0 ∷ f32) + (-g).exp())
+        out[[bi, i]] ← act * u
+    }
+}
+
+@ public
+kernel routed_expert_matvec_ggml_q8_0<size E, size Out, size Blocks, size RowBytes, size In>(tensor<u8, [E, Out, RowBytes]> raw_blocks, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, i32 expert_idx) → void {
+    for from y at [row] thread lane let e {
+        if expert_idx ≥ 0 and expert_idx ≺ E {
+            let i32 row_block_limit ← RowBytes / 34
+            let i32 in_block_limit ← In / 32
+            mut f32 acc ← 0.0 ∷ f32
+
+            for exclusive Blocks let b {
+                if b ≥ 0 and b ≺ row_block_limit and b ≺ in_block_limit {
+                    let i32 base ← b * 34
+                    let i32 lo ← (raw_blocks[[expert_idx, row, base]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 hi ← (raw_blocks[[expert_idx, row, base + 1]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 bits ← lo + hi * 256
+                    let i32 sign_bit ← (bits / 32768) ∧ 1
+                    let i32 exp_bits ← (bits / 1024) ∧ 31
+                    let i32 mant_bits ← bits ∧ 1023
+                    mut f32 d ← 0.0 ∷ f32
+                    if exp_bits ≡ 0 {
+                        if mant_bits ≢ 0 { d ← (mant_bits ↦ f32) / (16777216.0 ∷ f32) }
+                    }
+                    elif exp_bits ≺ 31 {
+                        mut f32 mag ← (1.0 ∷ f32) + (mant_bits ↦ f32) / (1024.0 ∷ f32)
+                        let i32 shift_exp ← exp_bits - 15
+                        if shift_exp ≻ 0 {
+                            for exclusive shift_exp let p { mag ← mag * (2.0 ∷ f32) }
+                        }
+                        elif shift_exp ≺ 0 {
+                            let i32 neg_exp ← 0 - shift_exp
+                            for exclusive neg_exp let p { mag ← mag / (2.0 ∷ f32) }
+                        }
+                        d ← mag
+                    }
+                    else {
+                        if mant_bits ≡ 0 { d ← (1.0 ∷ f32) / (0.0 ∷ f32) }
+                        else { d ← (0.0 ∷ f32) / (0.0 ∷ f32) }
+                    }
+                    if sign_bit ≢ 0 { d ← -d }
+
+                    let i32 x_base ← b * 32
+                    for exclusive 32 let k {
+                        let i32 q_u ← raw_blocks[[expert_idx, row, base + 2 + k]] ↦ i32 ⊥ 0
+                        mut i32 q_s ← q_u
+                        if q_u ≥ 128 { q_s ← q_u - 256 }
+                        acc ← acc + ((q_s ↦ f32) * d) * x[[x_base + k]]
+                    }
+                }
+            }
+
+            y[[row]] ← acc
+        }
+    }
+}
+
+@ public
+kernel routed_expert_matmul_ggml_q8_0<size B, size E, size Out, size Blocks, size RowBytes, size In>(tensor<u8, [E, Out, RowBytes]> raw_blocks, tensor<f32, [B, In]> x, tensor<i32, [B]> expert_indices, mut tensor<f32, [B, Out]> y) → void {
+    for from y at [bi, row] thread lane let e {
+        let i32 ee ← expert_indices[[bi]]
+        if ee ≥ 0 and ee ≺ E {
+            let i32 row_block_limit ← RowBytes / 34
+            let i32 in_block_limit ← In / 32
+            mut f32 acc ← 0.0 ∷ f32
+
+            for exclusive Blocks let b {
+                if b ≥ 0 and b ≺ row_block_limit and b ≺ in_block_limit {
+                    let i32 base ← b * 34
+                    let i32 lo ← (raw_blocks[[ee, row, base]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 hi ← (raw_blocks[[ee, row, base + 1]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 bits ← lo + hi * 256
+                    let i32 sign_bit ← (bits / 32768) ∧ 1
+                    let i32 exp_bits ← (bits / 1024) ∧ 31
+                    let i32 mant_bits ← bits ∧ 1023
+                    mut f32 d ← 0.0 ∷ f32
+                    if exp_bits ≡ 0 {
+                        if mant_bits ≢ 0 { d ← (mant_bits ↦ f32) / (16777216.0 ∷ f32) }
+                    }
+                    elif exp_bits ≺ 31 {
+                        mut f32 mag ← (1.0 ∷ f32) + (mant_bits ↦ f32) / (1024.0 ∷ f32)
+                        let i32 shift_exp ← exp_bits - 15
+                        if shift_exp ≻ 0 {
+                            for exclusive shift_exp let p { mag ← mag * (2.0 ∷ f32) }
+                        }
+                        elif shift_exp ≺ 0 {
+                            let i32 neg_exp ← 0 - shift_exp
+                            for exclusive neg_exp let p { mag ← mag / (2.0 ∷ f32) }
+                        }
+                        d ← mag
+                    }
+                    else {
+                        if mant_bits ≡ 0 { d ← (1.0 ∷ f32) / (0.0 ∷ f32) }
+                        else { d ← (0.0 ∷ f32) / (0.0 ∷ f32) }
+                    }
+                    if sign_bit ≢ 0 { d ← -d }
+
+                    let i32 x_base ← b * 32
+                    for exclusive 32 let k {
+                        let i32 q_u ← raw_blocks[[ee, row, base + 2 + k]] ↦ i32 ⊥ 0
+                        mut i32 q_s ← q_u
+                        if q_u ≥ 128 { q_s ← q_u - 256 }
+                        acc ← acc + ((q_s ↦ f32) * d) * x[[bi, x_base + k]]
+                    }
+                }
+            }
+
+            y[[bi, row]] ← acc
+        }
+    }
+}
+
+@ public
+kernel routed_expert_matvec_ggml_q4_1<size E, size Out, size Blocks, size RowBytes, size In>(tensor<u8, [E, Out, RowBytes]> raw_blocks, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, i32 expert_idx) → void {
+    for from y at [row] thread lane let e {
+        if expert_idx ≥ 0 and expert_idx ≺ E {
+            let i32 row_block_limit ← RowBytes / 20
+            let i32 in_block_limit ← In / 32
+            mut f32 acc ← 0.0 ∷ f32
+
+            for exclusive Blocks let b {
+                if b ≥ 0 and b ≺ row_block_limit and b ≺ in_block_limit {
+                    let i32 base ← b * 20
+                    let i32 d_lo ← (raw_blocks[[expert_idx, row, base]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 d_hi ← (raw_blocks[[expert_idx, row, base + 1]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 d_bits ← d_lo + d_hi * 256
+                    let i32 d_sign ← (d_bits / 32768) ∧ 1
+                    let i32 d_exp ← (d_bits / 1024) ∧ 31
+                    let i32 d_mant ← d_bits ∧ 1023
+                    mut f32 d ← 0.0 ∷ f32
+                    if d_exp ≡ 0 {
+                        if d_mant ≢ 0 { d ← (d_mant ↦ f32) / (16777216.0 ∷ f32) }
+                    }
+                    elif d_exp ≺ 31 {
+                        mut f32 mag ← (1.0 ∷ f32) + (d_mant ↦ f32) / (1024.0 ∷ f32)
+                        let i32 se ← d_exp - 15
+                        if se ≻ 0 { for exclusive se let p { mag ← mag * (2.0 ∷ f32) } }
+                        elif se ≺ 0 {
+                            let i32 ne ← 0 - se
+                            for exclusive ne let p { mag ← mag / (2.0 ∷ f32) }
+                        }
+                        d ← mag
+                    }
+                    else {
+                        if d_mant ≡ 0 { d ← (1.0 ∷ f32) / (0.0 ∷ f32) }
+                        else { d ← (0.0 ∷ f32) / (0.0 ∷ f32) }
+                    }
+                    if d_sign ≢ 0 { d ← -d }
+
+                    let i32 m_lo ← (raw_blocks[[expert_idx, row, base + 2]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 m_hi ← (raw_blocks[[expert_idx, row, base + 3]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 m_bits ← m_lo + m_hi * 256
+                    let i32 m_sign ← (m_bits / 32768) ∧ 1
+                    let i32 m_exp ← (m_bits / 1024) ∧ 31
+                    let i32 m_mant ← m_bits ∧ 1023
+                    mut f32 m ← 0.0 ∷ f32
+                    if m_exp ≡ 0 {
+                        if m_mant ≢ 0 { m ← (m_mant ↦ f32) / (16777216.0 ∷ f32) }
+                    }
+                    elif m_exp ≺ 31 {
+                        mut f32 mag ← (1.0 ∷ f32) + (m_mant ↦ f32) / (1024.0 ∷ f32)
+                        let i32 se ← m_exp - 15
+                        if se ≻ 0 { for exclusive se let p { mag ← mag * (2.0 ∷ f32) } }
+                        elif se ≺ 0 {
+                            let i32 ne ← 0 - se
+                            for exclusive ne let p { mag ← mag / (2.0 ∷ f32) }
+                        }
+                        m ← mag
+                    }
+                    else {
+                        if m_mant ≡ 0 { m ← (1.0 ∷ f32) / (0.0 ∷ f32) }
+                        else { m ← (0.0 ∷ f32) / (0.0 ∷ f32) }
+                    }
+                    if m_sign ≢ 0 { m ← -m }
+
+                    let i32 x_base ← b * 32
+                    for exclusive 16 let j {
+                        let i32 qs ← (raw_blocks[[expert_idx, row, base + 4 + j]] ↦ i32 ⊥ 0) ∧ 255
+                        let f32 w0 ← ((qs ∧ 15) ↦ f32) * d + m
+                        let f32 w1 ← (((qs ⇒ 4) ∧ 15) ↦ f32) * d + m
+                        acc ← acc + w0 * x[[x_base + j]] + w1 * x[[x_base + 16 + j]]
+                    }
+                }
+            }
+
+            y[[row]] ← acc
+        }
+    }
+}
+
+@ public
+kernel routed_expert_matmul_ggml_q4_1<size B, size E, size Out, size Blocks, size RowBytes, size In>(tensor<u8, [E, Out, RowBytes]> raw_blocks, tensor<f32, [B, In]> x, tensor<i32, [B]> expert_indices, mut tensor<f32, [B, Out]> y) → void {
+    for from y at [bi, row] thread lane let e {
+        let i32 ee ← expert_indices[[bi]]
+        if ee ≥ 0 and ee ≺ E {
+            let i32 row_block_limit ← RowBytes / 20
+            let i32 in_block_limit ← In / 32
+            mut f32 acc ← 0.0 ∷ f32
+
+            for exclusive Blocks let b {
+                if b ≥ 0 and b ≺ row_block_limit and b ≺ in_block_limit {
+                    let i32 base ← b * 20
+                    let i32 d_lo ← (raw_blocks[[ee, row, base]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 d_hi ← (raw_blocks[[ee, row, base + 1]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 d_bits ← d_lo + d_hi * 256
+                    let i32 d_sign ← (d_bits / 32768) ∧ 1
+                    let i32 d_exp ← (d_bits / 1024) ∧ 31
+                    let i32 d_mant ← d_bits ∧ 1023
+                    mut f32 d ← 0.0 ∷ f32
+                    if d_exp ≡ 0 {
+                        if d_mant ≢ 0 { d ← (d_mant ↦ f32) / (16777216.0 ∷ f32) }
+                    }
+                    elif d_exp ≺ 31 {
+                        mut f32 mag ← (1.0 ∷ f32) + (d_mant ↦ f32) / (1024.0 ∷ f32)
+                        let i32 se ← d_exp - 15
+                        if se ≻ 0 { for exclusive se let p { mag ← mag * (2.0 ∷ f32) } }
+                        elif se ≺ 0 {
+                            let i32 ne ← 0 - se
+                            for exclusive ne let p { mag ← mag / (2.0 ∷ f32) }
+                        }
+                        d ← mag
+                    }
+                    else {
+                        if d_mant ≡ 0 { d ← (1.0 ∷ f32) / (0.0 ∷ f32) }
+                        else { d ← (0.0 ∷ f32) / (0.0 ∷ f32) }
+                    }
+                    if d_sign ≢ 0 { d ← -d }
+
+                    let i32 m_lo ← (raw_blocks[[ee, row, base + 2]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 m_hi ← (raw_blocks[[ee, row, base + 3]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 m_bits ← m_lo + m_hi * 256
+                    let i32 m_sign ← (m_bits / 32768) ∧ 1
+                    let i32 m_exp ← (m_bits / 1024) ∧ 31
+                    let i32 m_mant ← m_bits ∧ 1023
+                    mut f32 m ← 0.0 ∷ f32
+                    if m_exp ≡ 0 {
+                        if m_mant ≢ 0 { m ← (m_mant ↦ f32) / (16777216.0 ∷ f32) }
+                    }
+                    elif m_exp ≺ 31 {
+                        mut f32 mag ← (1.0 ∷ f32) + (m_mant ↦ f32) / (1024.0 ∷ f32)
+                        let i32 se ← m_exp - 15
+                        if se ≻ 0 { for exclusive se let p { mag ← mag * (2.0 ∷ f32) } }
+                        elif se ≺ 0 {
+                            let i32 ne ← 0 - se
+                            for exclusive ne let p { mag ← mag / (2.0 ∷ f32) }
+                        }
+                        m ← mag
+                    }
+                    else {
+                        if m_mant ≡ 0 { m ← (1.0 ∷ f32) / (0.0 ∷ f32) }
+                        else { m ← (0.0 ∷ f32) / (0.0 ∷ f32) }
+                    }
+                    if m_sign ≢ 0 { m ← -m }
+
+                    let i32 x_base ← b * 32
+                    for exclusive 16 let j {
+                        let i32 qs ← (raw_blocks[[ee, row, base + 4 + j]] ↦ i32 ⊥ 0) ∧ 255
+                        let f32 w0 ← ((qs ∧ 15) ↦ f32) * d + m
+                        let f32 w1 ← (((qs ⇒ 4) ∧ 15) ↦ f32) * d + m
+                        acc ← acc + w0 * x[[bi, x_base + j]] + w1 * x[[bi, x_base + 16 + j]]
+                    }
+                }
+            }
+
+            y[[bi, row]] ← acc
+        }
+    }
+}
+
+@ public
+kernel routed_expert_matvec_ggml_q5_0<size E, size Out, size Blocks, size RowBytes, size In>(tensor<u8, [E, Out, RowBytes]> raw_blocks, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, i32 expert_idx) → void {
+    for from y at [row] thread lane let e {
+        if expert_idx ≥ 0 and expert_idx ≺ E {
+            let i32 row_block_limit ← RowBytes / 22
+            let i32 in_block_limit ← In / 32
+            mut f32 acc ← 0.0 ∷ f32
+
+            for exclusive Blocks let b {
+                if b ≥ 0 and b ≺ row_block_limit and b ≺ in_block_limit {
+                    let i32 base ← b * 22
+                    let i32 lo ← (raw_blocks[[expert_idx, row, base]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 hi ← (raw_blocks[[expert_idx, row, base + 1]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 bits ← lo + hi * 256
+                    let i32 sign_bit ← (bits / 32768) ∧ 1
+                    let i32 exp_bits ← (bits / 1024) ∧ 31
+                    let i32 mant_bits ← bits ∧ 1023
+                    mut f32 d ← 0.0 ∷ f32
+                    if exp_bits ≡ 0 {
+                        if mant_bits ≢ 0 { d ← (mant_bits ↦ f32) / (16777216.0 ∷ f32) }
+                    }
+                    elif exp_bits ≺ 31 {
+                        mut f32 mag ← (1.0 ∷ f32) + (mant_bits ↦ f32) / (1024.0 ∷ f32)
+                        let i32 shift_exp ← exp_bits - 15
+                        if shift_exp ≻ 0 { for exclusive shift_exp let p { mag ← mag * (2.0 ∷ f32) } }
+                        elif shift_exp ≺ 0 {
+                            let i32 neg_exp ← 0 - shift_exp
+                            for exclusive neg_exp let p { mag ← mag / (2.0 ∷ f32) }
+                        }
+                        d ← mag
+                    }
+                    else {
+                        if mant_bits ≡ 0 { d ← (1.0 ∷ f32) / (0.0 ∷ f32) }
+                        else { d ← (0.0 ∷ f32) / (0.0 ∷ f32) }
+                    }
+                    if sign_bit ≢ 0 { d ← -d }
+
+                    let i32 x_base ← b * 32
+                    for exclusive 16 let j {
+                        let i32 qh_lo_b ← (raw_blocks[[expert_idx, row, base + 2 + (j / 8)]] ↦ i32 ⊥ 0) ∧ 255
+                        let i32 qh_hi_b ← (raw_blocks[[expert_idx, row, base + 4 + (j / 8)]] ↦ i32 ⊥ 0) ∧ 255
+                        let i32 bit_pos ← j % 8
+                        mut i32 qh_lo_sh ← qh_lo_b
+                        mut i32 qh_hi_sh ← qh_hi_b
+                        if bit_pos ≡ 1 {
+                            qh_lo_sh ← qh_lo_b ⇒ 1
+                            qh_hi_sh ← qh_hi_b ⇒ 1
+                        }
+                        elif bit_pos ≡ 2 {
+                            qh_lo_sh ← qh_lo_b ⇒ 2
+                            qh_hi_sh ← qh_hi_b ⇒ 2
+                        }
+                        elif bit_pos ≡ 3 {
+                            qh_lo_sh ← qh_lo_b ⇒ 3
+                            qh_hi_sh ← qh_hi_b ⇒ 3
+                        }
+                        elif bit_pos ≡ 4 {
+                            qh_lo_sh ← qh_lo_b ⇒ 4
+                            qh_hi_sh ← qh_hi_b ⇒ 4
+                        }
+                        elif bit_pos ≡ 5 {
+                            qh_lo_sh ← qh_lo_b ⇒ 5
+                            qh_hi_sh ← qh_hi_b ⇒ 5
+                        }
+                        elif bit_pos ≡ 6 {
+                            qh_lo_sh ← qh_lo_b ⇒ 6
+                            qh_hi_sh ← qh_hi_b ⇒ 6
+                        }
+                        elif bit_pos ≡ 7 {
+                            qh_lo_sh ← qh_lo_b ⇒ 7
+                            qh_hi_sh ← qh_hi_b ⇒ 7
+                        }
+                        let i32 xh_0 ← (qh_lo_sh ∧ 1) * 16
+                        let i32 xh_1 ← (qh_hi_sh ∧ 1) * 16
+                        let i32 qs ← (raw_blocks[[expert_idx, row, base + 6 + j]] ↦ i32 ⊥ 0) ∧ 255
+                        let i32 x0 ← ((qs ∧ 15) + xh_0) - 16
+                        let i32 x1 ← (((qs ⇒ 4) ∧ 15) + xh_1) - 16
+                        acc ← acc + ((x0 ↦ f32) * d) * x[[x_base + j]] + ((x1 ↦ f32) * d) * x[[x_base + 16 + j]]
+                    }
+                }
+            }
+
+            y[[row]] ← acc
+        }
+    }
+}
+
+@ public
+kernel routed_expert_matmul_ggml_q5_0<size B, size E, size Out, size Blocks, size RowBytes, size In>(tensor<u8, [E, Out, RowBytes]> raw_blocks, tensor<f32, [B, In]> x, tensor<i32, [B]> expert_indices, mut tensor<f32, [B, Out]> y) → void {
+    for from y at [bi, row] thread lane let e {
+        let i32 ee ← expert_indices[[bi]]
+        if ee ≥ 0 and ee ≺ E {
+            let i32 row_block_limit ← RowBytes / 22
+            let i32 in_block_limit ← In / 32
+            mut f32 acc ← 0.0 ∷ f32
+
+            for exclusive Blocks let b {
+                if b ≥ 0 and b ≺ row_block_limit and b ≺ in_block_limit {
+                    let i32 base ← b * 22
+                    let i32 lo ← (raw_blocks[[ee, row, base]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 hi ← (raw_blocks[[ee, row, base + 1]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 bits ← lo + hi * 256
+                    let i32 sign_bit ← (bits / 32768) ∧ 1
+                    let i32 exp_bits ← (bits / 1024) ∧ 31
+                    let i32 mant_bits ← bits ∧ 1023
+                    mut f32 d ← 0.0 ∷ f32
+                    if exp_bits ≡ 0 {
+                        if mant_bits ≢ 0 { d ← (mant_bits ↦ f32) / (16777216.0 ∷ f32) }
+                    }
+                    elif exp_bits ≺ 31 {
+                        mut f32 mag ← (1.0 ∷ f32) + (mant_bits ↦ f32) / (1024.0 ∷ f32)
+                        let i32 shift_exp ← exp_bits - 15
+                        if shift_exp ≻ 0 { for exclusive shift_exp let p { mag ← mag * (2.0 ∷ f32) } }
+                        elif shift_exp ≺ 0 {
+                            let i32 neg_exp ← 0 - shift_exp
+                            for exclusive neg_exp let p { mag ← mag / (2.0 ∷ f32) }
+                        }
+                        d ← mag
+                    }
+                    else {
+                        if mant_bits ≡ 0 { d ← (1.0 ∷ f32) / (0.0 ∷ f32) }
+                        else { d ← (0.0 ∷ f32) / (0.0 ∷ f32) }
+                    }
+                    if sign_bit ≢ 0 { d ← -d }
+
+                    let i32 x_base ← b * 32
+                    for exclusive 16 let j {
+                        let i32 qh_lo_b ← (raw_blocks[[ee, row, base + 2 + (j / 8)]] ↦ i32 ⊥ 0) ∧ 255
+                        let i32 qh_hi_b ← (raw_blocks[[ee, row, base + 4 + (j / 8)]] ↦ i32 ⊥ 0) ∧ 255
+                        let i32 bit_pos ← j % 8
+                        mut i32 qh_lo_sh ← qh_lo_b
+                        mut i32 qh_hi_sh ← qh_hi_b
+                        if bit_pos ≡ 1 {
+                            qh_lo_sh ← qh_lo_b ⇒ 1
+                            qh_hi_sh ← qh_hi_b ⇒ 1
+                        }
+                        elif bit_pos ≡ 2 {
+                            qh_lo_sh ← qh_lo_b ⇒ 2
+                            qh_hi_sh ← qh_hi_b ⇒ 2
+                        }
+                        elif bit_pos ≡ 3 {
+                            qh_lo_sh ← qh_lo_b ⇒ 3
+                            qh_hi_sh ← qh_hi_b ⇒ 3
+                        }
+                        elif bit_pos ≡ 4 {
+                            qh_lo_sh ← qh_lo_b ⇒ 4
+                            qh_hi_sh ← qh_hi_b ⇒ 4
+                        }
+                        elif bit_pos ≡ 5 {
+                            qh_lo_sh ← qh_lo_b ⇒ 5
+                            qh_hi_sh ← qh_hi_b ⇒ 5
+                        }
+                        elif bit_pos ≡ 6 {
+                            qh_lo_sh ← qh_lo_b ⇒ 6
+                            qh_hi_sh ← qh_hi_b ⇒ 6
+                        }
+                        elif bit_pos ≡ 7 {
+                            qh_lo_sh ← qh_lo_b ⇒ 7
+                            qh_hi_sh ← qh_hi_b ⇒ 7
+                        }
+                        let i32 xh_0 ← (qh_lo_sh ∧ 1) * 16
+                        let i32 xh_1 ← (qh_hi_sh ∧ 1) * 16
+                        let i32 qs ← (raw_blocks[[ee, row, base + 6 + j]] ↦ i32 ⊥ 0) ∧ 255
+                        let i32 x0 ← ((qs ∧ 15) + xh_0) - 16
+                        let i32 x1 ← (((qs ⇒ 4) ∧ 15) + xh_1) - 16
+                        acc ← acc + ((x0 ↦ f32) * d) * x[[bi, x_base + j]] + ((x1 ↦ f32) * d) * x[[bi, x_base + 16 + j]]
+                    }
+                }
+            }
+
+            y[[bi, row]] ← acc
+        }
+    }
+}
+
+@ public
+kernel routed_expert_matvec_ggml_iq4_nl<size E, size Out, size Blocks, size RowBytes, size In>(tensor<u8, [E, Out, RowBytes]> raw_blocks, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, i32 expert_idx) → void {
+    for from y at [row] thread lane let e {
+        if expert_idx ≥ 0 and expert_idx ≺ E {
+            let i32 row_block_limit ← RowBytes / 18
+            let i32 in_block_limit ← In / 32
+            mut f32 acc ← 0.0 ∷ f32
+
+            for exclusive Blocks let b {
+                if b ≥ 0 and b ≺ row_block_limit and b ≺ in_block_limit {
+                    let i32 base ← b * 18
+                    let i32 lo ← (raw_blocks[[expert_idx, row, base]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 hi ← (raw_blocks[[expert_idx, row, base + 1]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 bits ← lo + hi * 256
+                    let i32 sign_bit ← (bits / 32768) ∧ 1
+                    let i32 exp_bits ← (bits / 1024) ∧ 31
+                    let i32 mant_bits ← bits ∧ 1023
+                    mut f32 d ← 0.0 ∷ f32
+                    if exp_bits ≡ 0 {
+                        if mant_bits ≢ 0 { d ← (mant_bits ↦ f32) / (16777216.0 ∷ f32) }
+                    }
+                    elif exp_bits ≺ 31 {
+                        mut f32 mag ← (1.0 ∷ f32) + (mant_bits ↦ f32) / (1024.0 ∷ f32)
+                        let i32 shift_exp ← exp_bits - 15
+                        if shift_exp ≻ 0 { for exclusive shift_exp let p { mag ← mag * (2.0 ∷ f32) } }
+                        elif shift_exp ≺ 0 {
+                            let i32 neg_exp ← 0 - shift_exp
+                            for exclusive neg_exp let p { mag ← mag / (2.0 ∷ f32) }
+                        }
+                        d ← mag
+                    }
+                    else {
+                        if mant_bits ≡ 0 { d ← (1.0 ∷ f32) / (0.0 ∷ f32) }
+                        else { d ← (0.0 ∷ f32) / (0.0 ∷ f32) }
+                    }
+                    if sign_bit ≢ 0 { d ← -d }
+
+                    let i32 x_base ← b * 32
+                    for exclusive 16 let j {
+                        let i32 qs ← (raw_blocks[[expert_idx, row, base + 2 + j]] ↦ i32 ⊥ 0) ∧ 255
+                        let i32 q0 ← qs ∧ 15
+                        let i32 q1 ← (qs ⇒ 4) ∧ 15
+                        mut f32 kv0 ← 113.0 ∷ f32
+                        if q0 ≡ 0 { kv0 ← -127.0 ∷ f32 }
+                        elif q0 ≡ 1 { kv0 ← -104.0 ∷ f32 }
+                        elif q0 ≡ 2 { kv0 ← -83.0 ∷ f32 }
+                        elif q0 ≡ 3 { kv0 ← -65.0 ∷ f32 }
+                        elif q0 ≡ 4 { kv0 ← -49.0 ∷ f32 }
+                        elif q0 ≡ 5 { kv0 ← -35.0 ∷ f32 }
+                        elif q0 ≡ 6 { kv0 ← -22.0 ∷ f32 }
+                        elif q0 ≡ 7 { kv0 ← -10.0 ∷ f32 }
+                        elif q0 ≡ 8 { kv0 ← 1.0 ∷ f32 }
+                        elif q0 ≡ 9 { kv0 ← 13.0 ∷ f32 }
+                        elif q0 ≡ 10 { kv0 ← 25.0 ∷ f32 }
+                        elif q0 ≡ 11 { kv0 ← 38.0 ∷ f32 }
+                        elif q0 ≡ 12 { kv0 ← 53.0 ∷ f32 }
+                        elif q0 ≡ 13 { kv0 ← 69.0 ∷ f32 }
+                        elif q0 ≡ 14 { kv0 ← 89.0 ∷ f32 }
+
+                        mut f32 kv1 ← 113.0 ∷ f32
+                        if q1 ≡ 0 { kv1 ← -127.0 ∷ f32 }
+                        elif q1 ≡ 1 { kv1 ← -104.0 ∷ f32 }
+                        elif q1 ≡ 2 { kv1 ← -83.0 ∷ f32 }
+                        elif q1 ≡ 3 { kv1 ← -65.0 ∷ f32 }
+                        elif q1 ≡ 4 { kv1 ← -49.0 ∷ f32 }
+                        elif q1 ≡ 5 { kv1 ← -35.0 ∷ f32 }
+                        elif q1 ≡ 6 { kv1 ← -22.0 ∷ f32 }
+                        elif q1 ≡ 7 { kv1 ← -10.0 ∷ f32 }
+                        elif q1 ≡ 8 { kv1 ← 1.0 ∷ f32 }
+                        elif q1 ≡ 9 { kv1 ← 13.0 ∷ f32 }
+                        elif q1 ≡ 10 { kv1 ← 25.0 ∷ f32 }
+                        elif q1 ≡ 11 { kv1 ← 38.0 ∷ f32 }
+                        elif q1 ≡ 12 { kv1 ← 53.0 ∷ f32 }
+                        elif q1 ≡ 13 { kv1 ← 69.0 ∷ f32 }
+                        elif q1 ≡ 14 { kv1 ← 89.0 ∷ f32 }
+
+                        acc ← acc + (d * kv0) * x[[x_base + j]] + (d * kv1) * x[[x_base + 16 + j]]
+                    }
+                }
+            }
+
+            y[[row]] ← acc
+        }
+    }
+}
+
+@ public
+kernel routed_expert_matmul_ggml_iq4_nl<size B, size E, size Out, size Blocks, size RowBytes, size In>(tensor<u8, [E, Out, RowBytes]> raw_blocks, tensor<f32, [B, In]> x, tensor<i32, [B]> expert_indices, mut tensor<f32, [B, Out]> y) → void {
+    for from y at [bi, row] thread lane let e {
+        let i32 ee ← expert_indices[[bi]]
+        if ee ≥ 0 and ee ≺ E {
+            let i32 row_block_limit ← RowBytes / 18
+            let i32 in_block_limit ← In / 32
+            mut f32 acc ← 0.0 ∷ f32
+
+            for exclusive Blocks let b {
+                if b ≥ 0 and b ≺ row_block_limit and b ≺ in_block_limit {
+                    let i32 base ← b * 18
+                    let i32 lo ← (raw_blocks[[ee, row, base]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 hi ← (raw_blocks[[ee, row, base + 1]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 bits ← lo + hi * 256
+                    let i32 sign_bit ← (bits / 32768) ∧ 1
+                    let i32 exp_bits ← (bits / 1024) ∧ 31
+                    let i32 mant_bits ← bits ∧ 1023
+                    mut f32 d ← 0.0 ∷ f32
+                    if exp_bits ≡ 0 {
+                        if mant_bits ≢ 0 { d ← (mant_bits ↦ f32) / (16777216.0 ∷ f32) }
+                    }
+                    elif exp_bits ≺ 31 {
+                        mut f32 mag ← (1.0 ∷ f32) + (mant_bits ↦ f32) / (1024.0 ∷ f32)
+                        let i32 shift_exp ← exp_bits - 15
+                        if shift_exp ≻ 0 { for exclusive shift_exp let p { mag ← mag * (2.0 ∷ f32) } }
+                        elif shift_exp ≺ 0 {
+                            let i32 neg_exp ← 0 - shift_exp
+                            for exclusive neg_exp let p { mag ← mag / (2.0 ∷ f32) }
+                        }
+                        d ← mag
+                    }
+                    else {
+                        if mant_bits ≡ 0 { d ← (1.0 ∷ f32) / (0.0 ∷ f32) }
+                        else { d ← (0.0 ∷ f32) / (0.0 ∷ f32) }
+                    }
+                    if sign_bit ≢ 0 { d ← -d }
+
+                    let i32 x_base ← b * 32
+                    for exclusive 16 let j {
+                        let i32 qs ← (raw_blocks[[ee, row, base + 2 + j]] ↦ i32 ⊥ 0) ∧ 255
+                        let i32 q0 ← qs ∧ 15
+                        let i32 q1 ← (qs ⇒ 4) ∧ 15
+                        mut f32 kv0 ← 113.0 ∷ f32
+                        if q0 ≡ 0 { kv0 ← -127.0 ∷ f32 }
+                        elif q0 ≡ 1 { kv0 ← -104.0 ∷ f32 }
+                        elif q0 ≡ 2 { kv0 ← -83.0 ∷ f32 }
+                        elif q0 ≡ 3 { kv0 ← -65.0 ∷ f32 }
+                        elif q0 ≡ 4 { kv0 ← -49.0 ∷ f32 }
+                        elif q0 ≡ 5 { kv0 ← -35.0 ∷ f32 }
+                        elif q0 ≡ 6 { kv0 ← -22.0 ∷ f32 }
+                        elif q0 ≡ 7 { kv0 ← -10.0 ∷ f32 }
+                        elif q0 ≡ 8 { kv0 ← 1.0 ∷ f32 }
+                        elif q0 ≡ 9 { kv0 ← 13.0 ∷ f32 }
+                        elif q0 ≡ 10 { kv0 ← 25.0 ∷ f32 }
+                        elif q0 ≡ 11 { kv0 ← 38.0 ∷ f32 }
+                        elif q0 ≡ 12 { kv0 ← 53.0 ∷ f32 }
+                        elif q0 ≡ 13 { kv0 ← 69.0 ∷ f32 }
+                        elif q0 ≡ 14 { kv0 ← 89.0 ∷ f32 }
+
+                        mut f32 kv1 ← 113.0 ∷ f32
+                        if q1 ≡ 0 { kv1 ← -127.0 ∷ f32 }
+                        elif q1 ≡ 1 { kv1 ← -104.0 ∷ f32 }
+                        elif q1 ≡ 2 { kv1 ← -83.0 ∷ f32 }
+                        elif q1 ≡ 3 { kv1 ← -65.0 ∷ f32 }
+                        elif q1 ≡ 4 { kv1 ← -49.0 ∷ f32 }
+                        elif q1 ≡ 5 { kv1 ← -35.0 ∷ f32 }
+                        elif q1 ≡ 6 { kv1 ← -22.0 ∷ f32 }
+                        elif q1 ≡ 7 { kv1 ← -10.0 ∷ f32 }
+                        elif q1 ≡ 8 { kv1 ← 1.0 ∷ f32 }
+                        elif q1 ≡ 9 { kv1 ← 13.0 ∷ f32 }
+                        elif q1 ≡ 10 { kv1 ← 25.0 ∷ f32 }
+                        elif q1 ≡ 11 { kv1 ← 38.0 ∷ f32 }
+                        elif q1 ≡ 12 { kv1 ← 53.0 ∷ f32 }
+                        elif q1 ≡ 13 { kv1 ← 69.0 ∷ f32 }
+                        elif q1 ≡ 14 { kv1 ← 89.0 ∷ f32 }
+
+                        acc ← acc + (d * kv0) * x[[bi, x_base + j]] + (d * kv1) * x[[bi, x_base + 16 + j]]
+                    }
+                }
+            }
+
+            y[[bi, row]] ← acc
+        }
+    }
+}
+
+@ public
+kernel routed_expert_matvec_ggml_q4_k<size E, size Out, size Blocks, size RowBytes, size In>(tensor<u8, [E, Out, RowBytes]> raw_blocks, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, i32 expert_idx) → void {
+    for from y at [row] thread lane let e {
+        if expert_idx ≥ 0 and expert_idx ≺ E {
+            let i32 row_block_limit ← RowBytes / 144
+            let i32 in_block_limit ← In / 256
+            mut f32 acc ← 0.0 ∷ f32
+
+            for exclusive Blocks let b {
+                if b ≥ 0 and b ≺ row_block_limit and b ≺ in_block_limit {
+                    let i32 base ← b * 144
+                    let i32 d_lo ← (raw_blocks[[expert_idx, row, base]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 d_hi ← (raw_blocks[[expert_idx, row, base + 1]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 d_bits ← d_lo + d_hi * 256
+                    let i32 d_sign ← (d_bits / 32768) ∧ 1
+                    let i32 d_exp ← (d_bits / 1024) ∧ 31
+                    let i32 d_mant ← d_bits ∧ 1023
+                    mut f32 d ← 0.0 ∷ f32
+                    if d_exp ≡ 0 {
+                        if d_mant ≢ 0 { d ← (d_mant ↦ f32) / (16777216.0 ∷ f32) }
+                    }
+                    elif d_exp ≺ 31 {
+                        mut f32 mag ← (1.0 ∷ f32) + (d_mant ↦ f32) / (1024.0 ∷ f32)
+                        let i32 se ← d_exp - 15
+                        if se ≻ 0 { for exclusive se let p { mag ← mag * (2.0 ∷ f32) } }
+                        elif se ≺ 0 {
+                            let i32 ne ← 0 - se
+                            for exclusive ne let p { mag ← mag / (2.0 ∷ f32) }
+                        }
+                        d ← mag
+                    }
+                    else {
+                        if d_mant ≡ 0 { d ← (1.0 ∷ f32) / (0.0 ∷ f32) }
+                        else { d ← (0.0 ∷ f32) / (0.0 ∷ f32) }
+                    }
+                    if d_sign ≢ 0 { d ← -d }
+
+                    let i32 dm_lo ← (raw_blocks[[expert_idx, row, base + 2]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 dm_hi ← (raw_blocks[[expert_idx, row, base + 3]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 dm_bits ← dm_lo + dm_hi * 256
+                    let i32 dm_sign ← (dm_bits / 32768) ∧ 1
+                    let i32 dm_exp ← (dm_bits / 1024) ∧ 31
+                    let i32 dm_mant ← dm_bits ∧ 1023
+                    mut f32 dmin ← 0.0 ∷ f32
+                    if dm_exp ≡ 0 {
+                        if dm_mant ≢ 0 { dmin ← (dm_mant ↦ f32) / (16777216.0 ∷ f32) }
+                    }
+                    elif dm_exp ≺ 31 {
+                        mut f32 mag ← (1.0 ∷ f32) + (dm_mant ↦ f32) / (1024.0 ∷ f32)
+                        let i32 se ← dm_exp - 15
+                        if se ≻ 0 { for exclusive se let p { mag ← mag * (2.0 ∷ f32) } }
+                        elif se ≺ 0 {
+                            let i32 ne ← 0 - se
+                            for exclusive ne let p { mag ← mag / (2.0 ∷ f32) }
+                        }
+                        dmin ← mag
+                    }
+                    else {
+                        if dm_mant ≡ 0 { dmin ← (1.0 ∷ f32) / (0.0 ∷ f32) }
+                        else { dmin ← (0.0 ∷ f32) / (0.0 ∷ f32) }
+                    }
+                    if dm_sign ≢ 0 { dmin ← -dmin }
+
+                    let i32 x_base ← b * 256
+                    for exclusive 4 let chunk {
+                        let i32 idx0 ← chunk * 2
+                        let i32 idx1 ← idx0 + 1
+
+                        mut i32 sc0 ← 0
+                        mut i32 m0 ← 0
+                        if idx0 ≺ 4 {
+                            sc0 ← (raw_blocks[[expert_idx, row, base + 4 + idx0]] ↦ i32 ⊥ 0) ∧ 63
+                            m0 ← (raw_blocks[[expert_idx, row, base + 8 + idx0]] ↦ i32 ⊥ 0) ∧ 63
+                        }
+                        else {
+                            let i32 s_hi ← raw_blocks[[expert_idx, row, base + 8 + idx0]] ↦ i32 ⊥ 0
+                            let i32 s_lo ← raw_blocks[[expert_idx, row, base + idx0]] ↦ i32 ⊥ 0
+                            let i32 m_lo ← raw_blocks[[expert_idx, row, base + 4 + idx0]] ↦ i32 ⊥ 0
+                            sc0 ← (s_hi ∧ 15) + (((s_lo ⇒ 6) ∧ 3) * 16)
+                            m0 ← ((s_hi ⇒ 4) ∧ 15) + (((m_lo ⇒ 6) ∧ 3) * 16)
+                        }
+
+                        mut i32 sc1 ← 0
+                        mut i32 m1 ← 0
+                        if idx1 ≺ 4 {
+                            sc1 ← (raw_blocks[[expert_idx, row, base + 4 + idx1]] ↦ i32 ⊥ 0) ∧ 63
+                            m1 ← (raw_blocks[[expert_idx, row, base + 8 + idx1]] ↦ i32 ⊥ 0) ∧ 63
+                        }
+                        else {
+                            let i32 s_hi ← raw_blocks[[expert_idx, row, base + 8 + idx1]] ↦ i32 ⊥ 0
+                            let i32 s_lo ← raw_blocks[[expert_idx, row, base + idx1]] ↦ i32 ⊥ 0
+                            let i32 m_lo ← raw_blocks[[expert_idx, row, base + 4 + idx1]] ↦ i32 ⊥ 0
+                            sc1 ← (s_hi ∧ 15) + (((s_lo ⇒ 6) ∧ 3) * 16)
+                            m1 ← ((s_hi ⇒ 4) ∧ 15) + (((m_lo ⇒ 6) ∧ 3) * 16)
+                        }
+
+                        let f32 d1 ← d * (sc0 ↦ f32)
+                        let f32 m1f ← dmin * (m0 ↦ f32)
+                        let f32 d2 ← d * (sc1 ↦ f32)
+                        let f32 m2f ← dmin * (m1 ↦ f32)
+                        let i32 qoff ← chunk * 32
+                        let i32 cx_base ← x_base + chunk * 64
+
+                        for exclusive 32 let l {
+                            let i32 qs ← (raw_blocks[[expert_idx, row, base + 16 + qoff + l]] ↦ i32 ⊥ 0) ∧ 255
+                            let f32 w0 ← d1 * ((qs ∧ 15) ↦ f32) - m1f
+                            let f32 w1 ← d2 * (((qs ⇒ 4) ∧ 15) ↦ f32) - m2f
+                            acc ← acc + w0 * x[[cx_base + l]] + w1 * x[[cx_base + 32 + l]]
+                        }
+                    }
+                }
+            }
+
+            y[[row]] ← acc
+        }
+    }
+}
+
+@ public
+kernel routed_expert_matmul_ggml_q4_k<size B, size E, size Out, size Blocks, size RowBytes, size In>(tensor<u8, [E, Out, RowBytes]> raw_blocks, tensor<f32, [B, In]> x, tensor<i32, [B]> expert_indices, mut tensor<f32, [B, Out]> y) → void {
+    for from y at [bi, row] thread lane let e {
+        let i32 ee ← expert_indices[[bi]]
+        if ee ≥ 0 and ee ≺ E {
+            let i32 row_block_limit ← RowBytes / 144
+            let i32 in_block_limit ← In / 256
+            mut f32 acc ← 0.0 ∷ f32
+
+            for exclusive Blocks let b {
+                if b ≥ 0 and b ≺ row_block_limit and b ≺ in_block_limit {
+                    let i32 base ← b * 144
+                    let i32 d_lo ← (raw_blocks[[ee, row, base]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 d_hi ← (raw_blocks[[ee, row, base + 1]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 d_bits ← d_lo + d_hi * 256
+                    let i32 d_sign ← (d_bits / 32768) ∧ 1
+                    let i32 d_exp ← (d_bits / 1024) ∧ 31
+                    let i32 d_mant ← d_bits ∧ 1023
+                    mut f32 d ← 0.0 ∷ f32
+                    if d_exp ≡ 0 {
+                        if d_mant ≢ 0 { d ← (d_mant ↦ f32) / (16777216.0 ∷ f32) }
+                    }
+                    elif d_exp ≺ 31 {
+                        mut f32 mag ← (1.0 ∷ f32) + (d_mant ↦ f32) / (1024.0 ∷ f32)
+                        let i32 se ← d_exp - 15
+                        if se ≻ 0 { for exclusive se let p { mag ← mag * (2.0 ∷ f32) } }
+                        elif se ≺ 0 {
+                            let i32 ne ← 0 - se
+                            for exclusive ne let p { mag ← mag / (2.0 ∷ f32) }
+                        }
+                        d ← mag
+                    }
+                    else {
+                        if d_mant ≡ 0 { d ← (1.0 ∷ f32) / (0.0 ∷ f32) }
+                        else { d ← (0.0 ∷ f32) / (0.0 ∷ f32) }
+                    }
+                    if d_sign ≢ 0 { d ← -d }
+
+                    let i32 dm_lo ← (raw_blocks[[ee, row, base + 2]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 dm_hi ← (raw_blocks[[ee, row, base + 3]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 dm_bits ← dm_lo + dm_hi * 256
+                    let i32 dm_sign ← (dm_bits / 32768) ∧ 1
+                    let i32 dm_exp ← (dm_bits / 1024) ∧ 31
+                    let i32 dm_mant ← dm_bits ∧ 1023
+                    mut f32 dmin ← 0.0 ∷ f32
+                    if dm_exp ≡ 0 {
+                        if dm_mant ≢ 0 { dmin ← (dm_mant ↦ f32) / (16777216.0 ∷ f32) }
+                    }
+                    elif dm_exp ≺ 31 {
+                        mut f32 mag ← (1.0 ∷ f32) + (dm_mant ↦ f32) / (1024.0 ∷ f32)
+                        let i32 se ← dm_exp - 15
+                        if se ≻ 0 { for exclusive se let p { mag ← mag * (2.0 ∷ f32) } }
+                        elif se ≺ 0 {
+                            let i32 ne ← 0 - se
+                            for exclusive ne let p { mag ← mag / (2.0 ∷ f32) }
+                        }
+                        dmin ← mag
+                    }
+                    else {
+                        if dm_mant ≡ 0 { dmin ← (1.0 ∷ f32) / (0.0 ∷ f32) }
+                        else { dmin ← (0.0 ∷ f32) / (0.0 ∷ f32) }
+                    }
+                    if dm_sign ≢ 0 { dmin ← -dmin }
+
+                    let i32 x_base ← b * 256
+                    for exclusive 4 let chunk {
+                        let i32 idx0 ← chunk * 2
+                        let i32 idx1 ← idx0 + 1
+
+                        mut i32 sc0 ← 0
+                        mut i32 m0 ← 0
+                        if idx0 ≺ 4 {
+                            sc0 ← (raw_blocks[[ee, row, base + 4 + idx0]] ↦ i32 ⊥ 0) ∧ 63
+                            m0 ← (raw_blocks[[ee, row, base + 8 + idx0]] ↦ i32 ⊥ 0) ∧ 63
+                        }
+                        else {
+                            let i32 s_hi ← raw_blocks[[ee, row, base + 8 + idx0]] ↦ i32 ⊥ 0
+                            let i32 s_lo ← raw_blocks[[ee, row, base + idx0]] ↦ i32 ⊥ 0
+                            let i32 m_lo ← raw_blocks[[ee, row, base + 4 + idx0]] ↦ i32 ⊥ 0
+                            sc0 ← (s_hi ∧ 15) + (((s_lo ⇒ 6) ∧ 3) * 16)
+                            m0 ← ((s_hi ⇒ 4) ∧ 15) + (((m_lo ⇒ 6) ∧ 3) * 16)
+                        }
+
+                        mut i32 sc1 ← 0
+                        mut i32 m1 ← 0
+                        if idx1 ≺ 4 {
+                            sc1 ← (raw_blocks[[ee, row, base + 4 + idx1]] ↦ i32 ⊥ 0) ∧ 63
+                            m1 ← (raw_blocks[[ee, row, base + 8 + idx1]] ↦ i32 ⊥ 0) ∧ 63
+                        }
+                        else {
+                            let i32 s_hi ← raw_blocks[[ee, row, base + 8 + idx1]] ↦ i32 ⊥ 0
+                            let i32 s_lo ← raw_blocks[[ee, row, base + idx1]] ↦ i32 ⊥ 0
+                            let i32 m_lo ← raw_blocks[[ee, row, base + 4 + idx1]] ↦ i32 ⊥ 0
+                            sc1 ← (s_hi ∧ 15) + (((s_lo ⇒ 6) ∧ 3) * 16)
+                            m1 ← ((s_hi ⇒ 4) ∧ 15) + (((m_lo ⇒ 6) ∧ 3) * 16)
+                        }
+
+                        let f32 d1 ← d * (sc0 ↦ f32)
+                        let f32 m1f ← dmin * (m0 ↦ f32)
+                        let f32 d2 ← d * (sc1 ↦ f32)
+                        let f32 m2f ← dmin * (m1 ↦ f32)
+                        let i32 qoff ← chunk * 32
+                        let i32 cx_base ← x_base + chunk * 64
+
+                        for exclusive 32 let l {
+                            let i32 qs ← (raw_blocks[[ee, row, base + 16 + qoff + l]] ↦ i32 ⊥ 0) ∧ 255
+                            let f32 w0 ← d1 * ((qs ∧ 15) ↦ f32) - m1f
+                            let f32 w1 ← d2 * (((qs ⇒ 4) ∧ 15) ↦ f32) - m2f
+                            acc ← acc + w0 * x[[bi, cx_base + l]] + w1 * x[[bi, cx_base + 32 + l]]
+                        }
+                    }
+                }
+            }
+
+            y[[bi, row]] ← acc
+        }
+    }
+}
+
+@ public
+kernel routed_expert_matvec_ggml_q5_k<size E, size Out, size Blocks, size RowBytes, size In>(tensor<u8, [E, Out, RowBytes]> raw_blocks, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, i32 expert_idx) → void {
+    for from y at [row] thread lane let e {
+        if expert_idx ≥ 0 and expert_idx ≺ E {
+            let i32 row_block_limit ← RowBytes / 176
+            let i32 in_block_limit ← In / 256
+            mut f32 acc ← 0.0 ∷ f32
+
+            for exclusive Blocks let b {
+                if b ≥ 0 and b ≺ row_block_limit and b ≺ in_block_limit {
+                    let i32 base ← b * 176
+                    let i32 d_lo ← (raw_blocks[[expert_idx, row, base]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 d_hi ← (raw_blocks[[expert_idx, row, base + 1]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 d_bits ← d_lo + d_hi * 256
+                    let i32 d_sign ← (d_bits / 32768) ∧ 1
+                    let i32 d_exp ← (d_bits / 1024) ∧ 31
+                    let i32 d_mant ← d_bits ∧ 1023
+                    mut f32 d ← 0.0 ∷ f32
+                    if d_exp ≡ 0 {
+                        if d_mant ≢ 0 { d ← (d_mant ↦ f32) / (16777216.0 ∷ f32) }
+                    }
+                    elif d_exp ≺ 31 {
+                        mut f32 mag ← (1.0 ∷ f32) + (d_mant ↦ f32) / (1024.0 ∷ f32)
+                        let i32 se ← d_exp - 15
+                        if se ≻ 0 { for exclusive se let p { mag ← mag * (2.0 ∷ f32) } }
+                        elif se ≺ 0 {
+                            let i32 ne ← 0 - se
+                            for exclusive ne let p { mag ← mag / (2.0 ∷ f32) }
+                        }
+                        d ← mag
+                    }
+                    else {
+                        if d_mant ≡ 0 { d ← (1.0 ∷ f32) / (0.0 ∷ f32) }
+                        else { d ← (0.0 ∷ f32) / (0.0 ∷ f32) }
+                    }
+                    if d_sign ≢ 0 { d ← -d }
+
+                    let i32 dm_lo ← (raw_blocks[[expert_idx, row, base + 2]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 dm_hi ← (raw_blocks[[expert_idx, row, base + 3]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 dm_bits ← dm_lo + dm_hi * 256
+                    let i32 dm_sign ← (dm_bits / 32768) ∧ 1
+                    let i32 dm_exp ← (dm_bits / 1024) ∧ 31
+                    let i32 dm_mant ← dm_bits ∧ 1023
+                    mut f32 dmin ← 0.0 ∷ f32
+                    if dm_exp ≡ 0 {
+                        if dm_mant ≢ 0 { dmin ← (dm_mant ↦ f32) / (16777216.0 ∷ f32) }
+                    }
+                    elif dm_exp ≺ 31 {
+                        mut f32 mag ← (1.0 ∷ f32) + (dm_mant ↦ f32) / (1024.0 ∷ f32)
+                        let i32 se ← dm_exp - 15
+                        if se ≻ 0 { for exclusive se let p { mag ← mag * (2.0 ∷ f32) } }
+                        elif se ≺ 0 {
+                            let i32 ne ← 0 - se
+                            for exclusive ne let p { mag ← mag / (2.0 ∷ f32) }
+                        }
+                        dmin ← mag
+                    }
+                    else {
+                        if dm_mant ≡ 0 { dmin ← (1.0 ∷ f32) / (0.0 ∷ f32) }
+                        else { dmin ← (0.0 ∷ f32) / (0.0 ∷ f32) }
+                    }
+                    if dm_sign ≢ 0 { dmin ← -dmin }
+
+                    let i32 x_base ← b * 256
+                    for exclusive 4 let chunk {
+                        let i32 idx0 ← chunk * 2
+                        let i32 idx1 ← idx0 + 1
+
+                        mut i32 sc0 ← 0
+                        mut i32 m0 ← 0
+                        if idx0 ≺ 4 {
+                            sc0 ← (raw_blocks[[expert_idx, row, base + 4 + idx0]] ↦ i32 ⊥ 0) ∧ 63
+                            m0 ← (raw_blocks[[expert_idx, row, base + 8 + idx0]] ↦ i32 ⊥ 0) ∧ 63
+                        }
+                        else {
+                            let i32 s_hi ← raw_blocks[[expert_idx, row, base + 8 + idx0]] ↦ i32 ⊥ 0
+                            let i32 s_lo ← raw_blocks[[expert_idx, row, base + idx0]] ↦ i32 ⊥ 0
+                            let i32 m_lo ← raw_blocks[[expert_idx, row, base + 4 + idx0]] ↦ i32 ⊥ 0
+                            sc0 ← (s_hi ∧ 15) + (((s_lo ⇒ 6) ∧ 3) * 16)
+                            m0 ← ((s_hi ⇒ 4) ∧ 15) + (((m_lo ⇒ 6) ∧ 3) * 16)
+                        }
+
+                        mut i32 sc1 ← 0
+                        mut i32 m1 ← 0
+                        if idx1 ≺ 4 {
+                            sc1 ← (raw_blocks[[expert_idx, row, base + 4 + idx1]] ↦ i32 ⊥ 0) ∧ 63
+                            m1 ← (raw_blocks[[expert_idx, row, base + 8 + idx1]] ↦ i32 ⊥ 0) ∧ 63
+                        }
+                        else {
+                            let i32 s_hi ← raw_blocks[[expert_idx, row, base + 8 + idx1]] ↦ i32 ⊥ 0
+                            let i32 s_lo ← raw_blocks[[expert_idx, row, base + idx1]] ↦ i32 ⊥ 0
+                            let i32 m_lo ← raw_blocks[[expert_idx, row, base + 4 + idx1]] ↦ i32 ⊥ 0
+                            sc1 ← (s_hi ∧ 15) + (((s_lo ⇒ 6) ∧ 3) * 16)
+                            m1 ← ((s_hi ⇒ 4) ∧ 15) + (((m_lo ⇒ 6) ∧ 3) * 16)
+                        }
+
+                        let f32 d1 ← d * (sc0 ↦ f32)
+                        let f32 m1f ← dmin * (m0 ↦ f32)
+                        let f32 d2 ← d * (sc1 ↦ f32)
+                        let f32 m2f ← dmin * (m1 ↦ f32)
+                        let i32 qoff ← chunk * 32
+                        let i32 cx_base ← x_base + chunk * 64
+
+                        for exclusive 32 let l {
+                            let i32 qs ← (raw_blocks[[expert_idx, row, base + 48 + qoff + l]] ↦ i32 ⊥ 0) ∧ 255
+                            let i32 qh ← (raw_blocks[[expert_idx, row, base + 16 + l]] ↦ i32 ⊥ 0) ∧ 255
+                            mut i32 qh_sh ← qh
+                            if chunk ≡ 1 { qh_sh ← qh ⇒ 2 }
+                            elif chunk ≡ 2 { qh_sh ← qh ⇒ 4 }
+                            elif chunk ≡ 3 { qh_sh ← qh ⇒ 6 }
+                            let i32 hi_lo ← (qh_sh ∧ 1) * 16
+                            let i32 hi_hi ← ((qh_sh ⇒ 1) ∧ 1) * 16
+                            let i32 q_lo ← (qs ∧ 15) + hi_lo
+                            let i32 q_hi ← ((qs ⇒ 4) ∧ 15) + hi_hi
+                            let f32 w0 ← d1 * (q_lo ↦ f32) - m1f
+                            let f32 w1 ← d2 * (q_hi ↦ f32) - m2f
+                            acc ← acc + w0 * x[[cx_base + l]] + w1 * x[[cx_base + 32 + l]]
+                        }
+                    }
+                }
+            }
+
+            y[[row]] ← acc
+        }
+    }
+}
+
+@ public
+kernel routed_expert_matmul_ggml_q5_k<size B, size E, size Out, size Blocks, size RowBytes, size In>(tensor<u8, [E, Out, RowBytes]> raw_blocks, tensor<f32, [B, In]> x, tensor<i32, [B]> expert_indices, mut tensor<f32, [B, Out]> y) → void {
+    for from y at [bi, row] thread lane let e {
+        let i32 ee ← expert_indices[[bi]]
+        if ee ≥ 0 and ee ≺ E {
+            let i32 row_block_limit ← RowBytes / 176
+            let i32 in_block_limit ← In / 256
+            mut f32 acc ← 0.0 ∷ f32
+
+            for exclusive Blocks let b {
+                if b ≥ 0 and b ≺ row_block_limit and b ≺ in_block_limit {
+                    let i32 base ← b * 176
+                    let i32 d_lo ← (raw_blocks[[ee, row, base]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 d_hi ← (raw_blocks[[ee, row, base + 1]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 d_bits ← d_lo + d_hi * 256
+                    let i32 d_sign ← (d_bits / 32768) ∧ 1
+                    let i32 d_exp ← (d_bits / 1024) ∧ 31
+                    let i32 d_mant ← d_bits ∧ 1023
+                    mut f32 d ← 0.0 ∷ f32
+                    if d_exp ≡ 0 {
+                        if d_mant ≢ 0 { d ← (d_mant ↦ f32) / (16777216.0 ∷ f32) }
+                    }
+                    elif d_exp ≺ 31 {
+                        mut f32 mag ← (1.0 ∷ f32) + (d_mant ↦ f32) / (1024.0 ∷ f32)
+                        let i32 se ← d_exp - 15
+                        if se ≻ 0 { for exclusive se let p { mag ← mag * (2.0 ∷ f32) } }
+                        elif se ≺ 0 {
+                            let i32 ne ← 0 - se
+                            for exclusive ne let p { mag ← mag / (2.0 ∷ f32) }
+                        }
+                        d ← mag
+                    }
+                    else {
+                        if d_mant ≡ 0 { d ← (1.0 ∷ f32) / (0.0 ∷ f32) }
+                        else { d ← (0.0 ∷ f32) / (0.0 ∷ f32) }
+                    }
+                    if d_sign ≢ 0 { d ← -d }
+
+                    let i32 dm_lo ← (raw_blocks[[ee, row, base + 2]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 dm_hi ← (raw_blocks[[ee, row, base + 3]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 dm_bits ← dm_lo + dm_hi * 256
+                    let i32 dm_sign ← (dm_bits / 32768) ∧ 1
+                    let i32 dm_exp ← (dm_bits / 1024) ∧ 31
+                    let i32 dm_mant ← dm_bits ∧ 1023
+                    mut f32 dmin ← 0.0 ∷ f32
+                    if dm_exp ≡ 0 {
+                        if dm_mant ≢ 0 { dmin ← (dm_mant ↦ f32) / (16777216.0 ∷ f32) }
+                    }
+                    elif dm_exp ≺ 31 {
+                        mut f32 mag ← (1.0 ∷ f32) + (dm_mant ↦ f32) / (1024.0 ∷ f32)
+                        let i32 se ← dm_exp - 15
+                        if se ≻ 0 { for exclusive se let p { mag ← mag * (2.0 ∷ f32) } }
+                        elif se ≺ 0 {
+                            let i32 ne ← 0 - se
+                            for exclusive ne let p { mag ← mag / (2.0 ∷ f32) }
+                        }
+                        dmin ← mag
+                    }
+                    else {
+                        if dm_mant ≡ 0 { dmin ← (1.0 ∷ f32) / (0.0 ∷ f32) }
+                        else { dmin ← (0.0 ∷ f32) / (0.0 ∷ f32) }
+                    }
+                    if dm_sign ≢ 0 { dmin ← -dmin }
+
+                    let i32 x_base ← b * 256
+                    for exclusive 4 let chunk {
+                        let i32 idx0 ← chunk * 2
+                        let i32 idx1 ← idx0 + 1
+
+                        mut i32 sc0 ← 0
+                        mut i32 m0 ← 0
+                        if idx0 ≺ 4 {
+                            sc0 ← (raw_blocks[[ee, row, base + 4 + idx0]] ↦ i32 ⊥ 0) ∧ 63
+                            m0 ← (raw_blocks[[ee, row, base + 8 + idx0]] ↦ i32 ⊥ 0) ∧ 63
+                        }
+                        else {
+                            let i32 s_hi ← raw_blocks[[ee, row, base + 8 + idx0]] ↦ i32 ⊥ 0
+                            let i32 s_lo ← raw_blocks[[ee, row, base + idx0]] ↦ i32 ⊥ 0
+                            let i32 m_lo ← raw_blocks[[ee, row, base + 4 + idx0]] ↦ i32 ⊥ 0
+                            sc0 ← (s_hi ∧ 15) + (((s_lo ⇒ 6) ∧ 3) * 16)
+                            m0 ← ((s_hi ⇒ 4) ∧ 15) + (((m_lo ⇒ 6) ∧ 3) * 16)
+                        }
+
+                        mut i32 sc1 ← 0
+                        mut i32 m1 ← 0
+                        if idx1 ≺ 4 {
+                            sc1 ← (raw_blocks[[ee, row, base + 4 + idx1]] ↦ i32 ⊥ 0) ∧ 63
+                            m1 ← (raw_blocks[[ee, row, base + 8 + idx1]] ↦ i32 ⊥ 0) ∧ 63
+                        }
+                        else {
+                            let i32 s_hi ← raw_blocks[[ee, row, base + 8 + idx1]] ↦ i32 ⊥ 0
+                            let i32 s_lo ← raw_blocks[[ee, row, base + idx1]] ↦ i32 ⊥ 0
+                            let i32 m_lo ← raw_blocks[[ee, row, base + 4 + idx1]] ↦ i32 ⊥ 0
+                            sc1 ← (s_hi ∧ 15) + (((s_lo ⇒ 6) ∧ 3) * 16)
+                            m1 ← ((s_hi ⇒ 4) ∧ 15) + (((m_lo ⇒ 6) ∧ 3) * 16)
+                        }
+
+                        let f32 d1 ← d * (sc0 ↦ f32)
+                        let f32 m1f ← dmin * (m0 ↦ f32)
+                        let f32 d2 ← d * (sc1 ↦ f32)
+                        let f32 m2f ← dmin * (m1 ↦ f32)
+                        let i32 qoff ← chunk * 32
+                        let i32 cx_base ← x_base + chunk * 64
+
+                        for exclusive 32 let l {
+                            let i32 qs ← (raw_blocks[[ee, row, base + 48 + qoff + l]] ↦ i32 ⊥ 0) ∧ 255
+                            let i32 qh ← (raw_blocks[[ee, row, base + 16 + l]] ↦ i32 ⊥ 0) ∧ 255
+                            mut i32 qh_sh ← qh
+                            if chunk ≡ 1 { qh_sh ← qh ⇒ 2 }
+                            elif chunk ≡ 2 { qh_sh ← qh ⇒ 4 }
+                            elif chunk ≡ 3 { qh_sh ← qh ⇒ 6 }
+                            let i32 hi_lo ← (qh_sh ∧ 1) * 16
+                            let i32 hi_hi ← ((qh_sh ⇒ 1) ∧ 1) * 16
+                            let i32 q_lo ← (qs ∧ 15) + hi_lo
+                            let i32 q_hi ← ((qs ⇒ 4) ∧ 15) + hi_hi
+                            let f32 w0 ← d1 * (q_lo ↦ f32) - m1f
+                            let f32 w1 ← d2 * (q_hi ↦ f32) - m2f
+                            acc ← acc + w0 * x[[bi, cx_base + l]] + w1 * x[[bi, cx_base + 32 + l]]
+                        }
+                    }
+                }
+            }
+
+            y[[bi, row]] ← acc
+        }
+    }
+}
+
+@ public
+kernel routed_expert_matvec_ggml_q6_k<size E, size Out, size Blocks, size RowBytes, size In>(tensor<u8, [E, Out, RowBytes]> raw_blocks, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, i32 expert_idx) → void {
+    for from y at [row] thread lane let e {
+        if expert_idx ≥ 0 and expert_idx ≺ E {
+            let i32 row_block_limit ← RowBytes / 210
+            let i32 in_block_limit ← In / 256
+            mut f32 acc ← 0.0 ∷ f32
+
+            for exclusive Blocks let b {
+                if b ≥ 0 and b ≺ row_block_limit and b ≺ in_block_limit {
+                    let i32 base ← b * 210
+                    let i32 d_lo ← (raw_blocks[[expert_idx, row, base + 208]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 d_hi ← (raw_blocks[[expert_idx, row, base + 209]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 d_bits ← d_lo + d_hi * 256
+                    let i32 d_sign ← (d_bits / 32768) ∧ 1
+                    let i32 d_exp ← (d_bits / 1024) ∧ 31
+                    let i32 d_mant ← d_bits ∧ 1023
+                    mut f32 d ← 0.0 ∷ f32
+                    if d_exp ≡ 0 {
+                        if d_mant ≢ 0 { d ← (d_mant ↦ f32) / (16777216.0 ∷ f32) }
+                    }
+                    elif d_exp ≺ 31 {
+                        mut f32 mag ← (1.0 ∷ f32) + (d_mant ↦ f32) / (1024.0 ∷ f32)
+                        let i32 se ← d_exp - 15
+                        if se ≻ 0 { for exclusive se let p { mag ← mag * (2.0 ∷ f32) } }
+                        elif se ≺ 0 {
+                            let i32 ne ← 0 - se
+                            for exclusive ne let p { mag ← mag / (2.0 ∷ f32) }
+                        }
+                        d ← mag
+                    }
+                    else {
+                        if d_mant ≡ 0 { d ← (1.0 ∷ f32) / (0.0 ∷ f32) }
+                        else { d ← (0.0 ∷ f32) / (0.0 ∷ f32) }
+                    }
+                    if d_sign ≢ 0 { d ← -d }
+
+                    let i32 x_base ← b * 256
+                    for exclusive 2 let n {
+                        let i32 sc_base ← n * 8
+                        let i32 ql_off ← n * 64
+                        let i32 qh_off ← n * 32
+                        let i32 y_off ← x_base + n * 128
+
+                        for exclusive 32 let l {
+                            let i32 idx ← l / 16
+                            let i32 ql_lo ← (raw_blocks[[expert_idx, row, base + ql_off + l]] ↦ i32 ⊥ 0) ∧ 255
+                            let i32 ql_hi ← (raw_blocks[[expert_idx, row, base + ql_off + l + 32]] ↦ i32 ⊥ 0) ∧ 255
+                            let i32 qh ← (raw_blocks[[expert_idx, row, base + 128 + qh_off + l]] ↦ i32 ⊥ 0) ∧ 255
+
+                            let i32 q1 ← ((ql_lo ∧ 15) + ((qh ∧ 3) * 16)) - 32
+                            let i32 q2 ← ((ql_hi ∧ 15) + (((qh ⇒ 2) ∧ 3) * 16)) - 32
+                            let i32 q3 ← (((ql_lo ⇒ 4) ∧ 15) + (((qh ⇒ 4) ∧ 3) * 16)) - 32
+                            let i32 q4 ← (((ql_hi ⇒ 4) ∧ 15) + (((qh ⇒ 6) ∧ 3) * 16)) - 32
+
+                            let i32 s0_u ← (raw_blocks[[expert_idx, row, base + 192 + sc_base + idx]] ↦ i32 ⊥ 0) ∧ 255
+                            let i32 s2_u ← (raw_blocks[[expert_idx, row, base + 192 + sc_base + idx + 2]] ↦ i32 ⊥ 0) ∧ 255
+                            let i32 s4_u ← (raw_blocks[[expert_idx, row, base + 192 + sc_base + idx + 4]] ↦ i32 ⊥ 0) ∧ 255
+                            let i32 s6_u ← (raw_blocks[[expert_idx, row, base + 192 + sc_base + idx + 6]] ↦ i32 ⊥ 0) ∧ 255
+
+                            let i32 s0 ← s0_u ≥ 128 ✓ s0_u - 256 ✗ s0_u
+                            let i32 s2 ← s2_u ≥ 128 ✓ s2_u - 256 ✗ s2_u
+                            let i32 s4 ← s4_u ≥ 128 ✓ s4_u - 256 ✗ s4_u
+                            let i32 s6 ← s6_u ≥ 128 ✓ s6_u - 256 ✗ s6_u
+
+                            let f32 w1 ← d * (s0 ↦ f32) * (q1 ↦ f32)
+                            let f32 w2 ← d * (s2 ↦ f32) * (q2 ↦ f32)
+                            let f32 w3 ← d * (s4 ↦ f32) * (q3 ↦ f32)
+                            let f32 w4 ← d * (s6 ↦ f32) * (q4 ↦ f32)
+
+                            acc ← acc + w1 * x[[y_off + l]] + w2 * x[[y_off + l + 32]] + w3 * x[[y_off + l + 64]] + w4 * x[[y_off + l + 96]]
+                        }
+                    }
+                }
+            }
+
+            y[[row]] ← acc
+        }
+    }
+}
+
+@ public
+kernel routed_expert_matmul_ggml_q6_k<size B, size E, size Out, size Blocks, size RowBytes, size In>(tensor<u8, [E, Out, RowBytes]> raw_blocks, tensor<f32, [B, In]> x, tensor<i32, [B]> expert_indices, mut tensor<f32, [B, Out]> y) → void {
+    for from y at [bi, row] thread lane let e {
+        let i32 ee ← expert_indices[[bi]]
+        if ee ≥ 0 and ee ≺ E {
+            let i32 row_block_limit ← RowBytes / 210
+            let i32 in_block_limit ← In / 256
+            mut f32 acc ← 0.0 ∷ f32
+
+            for exclusive Blocks let b {
+                if b ≥ 0 and b ≺ row_block_limit and b ≺ in_block_limit {
+                    let i32 base ← b * 210
+                    let i32 d_lo ← (raw_blocks[[ee, row, base + 208]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 d_hi ← (raw_blocks[[ee, row, base + 209]] ↦ i32 ⊥ 0) ∧ 255
+                    let i32 d_bits ← d_lo + d_hi * 256
+                    let i32 d_sign ← (d_bits / 32768) ∧ 1
+                    let i32 d_exp ← (d_bits / 1024) ∧ 31
+                    let i32 d_mant ← d_bits ∧ 1023
+                    mut f32 d ← 0.0 ∷ f32
+                    if d_exp ≡ 0 {
+                        if d_mant ≢ 0 { d ← (d_mant ↦ f32) / (16777216.0 ∷ f32) }
+                    }
+                    elif d_exp ≺ 31 {
+                        mut f32 mag ← (1.0 ∷ f32) + (d_mant ↦ f32) / (1024.0 ∷ f32)
+                        let i32 se ← d_exp - 15
+                        if se ≻ 0 { for exclusive se let p { mag ← mag * (2.0 ∷ f32) } }
+                        elif se ≺ 0 {
+                            let i32 ne ← 0 - se
+                            for exclusive ne let p { mag ← mag / (2.0 ∷ f32) }
+                        }
+                        d ← mag
+                    }
+                    else {
+                        if d_mant ≡ 0 { d ← (1.0 ∷ f32) / (0.0 ∷ f32) }
+                        else { d ← (0.0 ∷ f32) / (0.0 ∷ f32) }
+                    }
+                    if d_sign ≢ 0 { d ← -d }
+
+                    let i32 x_base ← b * 256
+                    for exclusive 2 let n {
+                        let i32 sc_base ← n * 8
+                        let i32 ql_off ← n * 64
+                        let i32 qh_off ← n * 32
+                        let i32 y_off ← x_base + n * 128
+
+                        for exclusive 32 let l {
+                            let i32 idx ← l / 16
+                            let i32 ql_lo ← (raw_blocks[[ee, row, base + ql_off + l]] ↦ i32 ⊥ 0) ∧ 255
+                            let i32 ql_hi ← (raw_blocks[[ee, row, base + ql_off + l + 32]] ↦ i32 ⊥ 0) ∧ 255
+                            let i32 qh ← (raw_blocks[[ee, row, base + 128 + qh_off + l]] ↦ i32 ⊥ 0) ∧ 255
+
+                            let i32 q1 ← ((ql_lo ∧ 15) + ((qh ∧ 3) * 16)) - 32
+                            let i32 q2 ← ((ql_hi ∧ 15) + (((qh ⇒ 2) ∧ 3) * 16)) - 32
+                            let i32 q3 ← (((ql_lo ⇒ 4) ∧ 15) + (((qh ⇒ 4) ∧ 3) * 16)) - 32
+                            let i32 q4 ← (((ql_hi ⇒ 4) ∧ 15) + (((qh ⇒ 6) ∧ 3) * 16)) - 32
+
+                            let i32 s0_u ← (raw_blocks[[ee, row, base + 192 + sc_base + idx]] ↦ i32 ⊥ 0) ∧ 255
+                            let i32 s2_u ← (raw_blocks[[ee, row, base + 192 + sc_base + idx + 2]] ↦ i32 ⊥ 0) ∧ 255
+                            let i32 s4_u ← (raw_blocks[[ee, row, base + 192 + sc_base + idx + 4]] ↦ i32 ⊥ 0) ∧ 255
+                            let i32 s6_u ← (raw_blocks[[ee, row, base + 192 + sc_base + idx + 6]] ↦ i32 ⊥ 0) ∧ 255
+
+                            let i32 s0 ← s0_u ≥ 128 ✓ s0_u - 256 ✗ s0_u
+                            let i32 s2 ← s2_u ≥ 128 ✓ s2_u - 256 ✗ s2_u
+                            let i32 s4 ← s4_u ≥ 128 ✓ s4_u - 256 ✗ s4_u
+                            let i32 s6 ← s6_u ≥ 128 ✓ s6_u - 256 ✗ s6_u
+
+                            let f32 w1 ← d * (s0 ↦ f32) * (q1 ↦ f32)
+                            let f32 w2 ← d * (s2 ↦ f32) * (q2 ↦ f32)
+                            let f32 w3 ← d * (s4 ↦ f32) * (q3 ↦ f32)
+                            let f32 w4 ← d * (s6 ↦ f32) * (q4 ↦ f32)
+
+                            acc ← acc + w1 * x[[bi, y_off + l]] + w2 * x[[bi, y_off + l + 32]] + w3 * x[[bi, y_off + l + 64]] + w4 * x[[bi, y_off + l + 96]]
+                        }
+                    }
+                }
+            }
+
+            y[[bi, row]] ← acc
+        }
+    }
+}
+
 # -------------------------------------------------------------------------
 # Typed Host Dispatchers for Device Contractions
 # -------------------------------------------------------------------------
@@ -1457,12 +3503,528 @@ fn dispatch_routed_matmul_ga_u8<size B, size E, size Out, size PackedIn, size Gr
     routed_expert_matmul_ga_u8<size B, size E, size Out, size PackedIn, size Groups, size In, size BOut>(weight, scales, biases, x, expert_indices, mut y, spec.bits ↦ i32 ⊥ 4, spec.group_size ↦ i32 ⊥ 64)
 }
 
+@ public
+fn dispatch_routed_matmul_dense_2d<size B, size E, size Out, size In>(BankedMatrixSpec spec, tensor<f32, [E, Out, In]> weight, tensor<f32, [B, In]> x, tensor<i32, [B]> expert_indices, mut tensor<f32, [B, Out]> y) → void ⇥ ExpertBankError {
+    match spec.kind {
+        case DenseF32 {}
+        default {
+            throw variant BadBinding { message = "expected DenseF32 BankedMatrixSpec" }
+        }
+    }
+    require spec.expert_count ≡ E and spec.out_features ≡ Out and spec.in_features ≡ In throw variant BadShape { message = "shape mismatch in dispatch_routed_matmul_dense_2d" }
+    routed_expert_matmul_dense_2d<size B, size E, size Out, size In>(weight, x, expert_indices, mut y)
+}
+
+@ public
+fn dispatch_routed_matvec_dense_bf16<size E, size Out, size In>(BankedMatrixSpec spec, tensor<bf16, [E, Out, In]> weight, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, int expert_idx) → void ⇥ ExpertBankError {
+    match spec.kind {
+        case DenseBf16 {}
+        default {
+            throw variant BadBinding { message = "expected DenseBf16 BankedMatrixSpec" }
+        }
+    }
+    require spec.expert_count ≡ E and spec.out_features ≡ Out and spec.in_features ≡ In throw variant BadShape { message = "shape mismatch in dispatch_routed_matvec_dense_bf16" }
+    require expert_idx ≥ 0 and expert_idx ≺ E throw variant BadShape { message = "expert_idx out of bounds" }
+    routed_expert_matvec_dense_bf16<size E, size Out, size In>(weight, x, mut y, expert_idx ↦ i32 ⊥ 0)
+}
+
+@ public
+fn dispatch_routed_matmul_dense_bf16<size B, size E, size Out, size In>(BankedMatrixSpec spec, tensor<bf16, [E, Out, In]> weight, tensor<f32, [B, In]> x, tensor<i32, [B]> expert_indices, mut tensor<f32, [B, Out]> y) → void ⇥ ExpertBankError {
+    match spec.kind {
+        case DenseBf16 {}
+        default {
+            throw variant BadBinding { message = "expected DenseBf16 BankedMatrixSpec" }
+        }
+    }
+    require spec.expert_count ≡ E and spec.out_features ≡ Out and spec.in_features ≡ In throw variant BadShape { message = "shape mismatch in dispatch_routed_matmul_dense_bf16" }
+    routed_expert_matmul_dense_bf16<size B, size E, size Out, size In>(weight, x, expert_indices, mut y)
+}
+
+@ public
+fn dispatch_routed_matvec_ga_u32_bf16<size E, size Out, size PackedIn, size Groups, size In>(BankedMatrixSpec spec, tensor<u32, [E, Out, PackedIn]> weight, tensor<bf16, [E, Out, Groups]> scales, tensor<bf16, [E, Out, Groups]> biases, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, int expert_idx) → void ⇥ ExpertBankError {
+    match spec.kind {
+        case GroupAffineU32 {}
+        default {
+            throw variant BadBinding { message = "expected GroupAffineU32 BankedMatrixSpec" }
+        }
+    }
+    require spec.scales_dtype ≡ "BF16" throw variant BadBinding { message = "expected BF16 scales_dtype in dispatch_routed_matvec_ga_u32_bf16" }
+    require spec.expert_count ≡ E and spec.out_features ≡ Out and spec.in_features ≡ In and spec.packed_cols ≡ PackedIn and spec.group_cols ≡ Groups throw variant BadShape { message = "shape mismatch in dispatch_routed_matvec_ga_u32_bf16" }
+    require expert_idx ≥ 0 and expert_idx ≺ E throw variant BadShape { message = "expert_idx out of bounds" }
+    routed_expert_matvec_ga_u32_bf16<size E, size Out, size PackedIn, size Groups, size In>(weight, scales, biases, x, mut y, expert_idx ↦ i32 ⊥ 0, spec.bits ↦ i32 ⊥ 8, spec.group_size ↦ i32 ⊥ 64)
+}
+
+@ public
+fn dispatch_routed_matmul_ga_u32_bf16<size B, size E, size Out, size PackedIn, size Groups, size In>(BankedMatrixSpec spec, tensor<u32, [E, Out, PackedIn]> weight, tensor<bf16, [E, Out, Groups]> scales, tensor<bf16, [E, Out, Groups]> biases, tensor<f32, [B, In]> x, tensor<i32, [B]> expert_indices, mut tensor<f32, [B, Out]> y) → void ⇥ ExpertBankError {
+    match spec.kind {
+        case GroupAffineU32 {}
+        default {
+            throw variant BadBinding { message = "expected GroupAffineU32 BankedMatrixSpec" }
+        }
+    }
+    require spec.scales_dtype ≡ "BF16" throw variant BadBinding { message = "expected BF16 scales_dtype in dispatch_routed_matmul_ga_u32_bf16" }
+    require spec.expert_count ≡ E and spec.out_features ≡ Out and spec.in_features ≡ In and spec.packed_cols ≡ PackedIn and spec.group_cols ≡ Groups throw variant BadShape { message = "shape mismatch in dispatch_routed_matmul_ga_u32_bf16" }
+    routed_expert_matmul_ga_u32_bf16<size B, size E, size Out, size PackedIn, size Groups, size In>(weight, scales, biases, x, expert_indices, mut y, spec.bits ↦ i32 ⊥ 8, spec.group_size ↦ i32 ⊥ 64)
+}
+
+@ public
+fn dispatch_routed_matvec_ga_u8_bf16<size E, size Out, size PackedIn, size Groups, size In>(BankedMatrixSpec spec, tensor<u8, [E, Out, PackedIn]> weight, tensor<bf16, [E, Out, Groups]> scales, tensor<bf16, [E, Out, Groups]> biases, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, int expert_idx) → void ⇥ ExpertBankError {
+    match spec.kind {
+        case GroupAffineU8 {}
+        default {
+            throw variant BadBinding { message = "expected GroupAffineU8 BankedMatrixSpec" }
+        }
+    }
+    require spec.scales_dtype ≡ "BF16" throw variant BadBinding { message = "expected BF16 scales_dtype in dispatch_routed_matvec_ga_u8_bf16" }
+    require spec.expert_count ≡ E and spec.out_features ≡ Out and spec.in_features ≡ In and spec.packed_cols ≡ PackedIn and spec.group_cols ≡ Groups throw variant BadShape { message = "shape mismatch in dispatch_routed_matvec_ga_u8_bf16" }
+    require expert_idx ≥ 0 and expert_idx ≺ E throw variant BadShape { message = "expert_idx out of bounds" }
+    routed_expert_matvec_ga_u8_bf16<size E, size Out, size PackedIn, size Groups, size In>(weight, scales, biases, x, mut y, expert_idx ↦ i32 ⊥ 0, spec.bits ↦ i32 ⊥ 4, spec.group_size ↦ i32 ⊥ 64)
+}
+
+@ public
+fn dispatch_routed_matmul_ga_u8_bf16<size B, size E, size Out, size PackedIn, size Groups, size In>(BankedMatrixSpec spec, tensor<u8, [E, Out, PackedIn]> weight, tensor<bf16, [E, Out, Groups]> scales, tensor<bf16, [E, Out, Groups]> biases, tensor<f32, [B, In]> x, tensor<i32, [B]> expert_indices, mut tensor<f32, [B, Out]> y) → void ⇥ ExpertBankError {
+    match spec.kind {
+        case GroupAffineU8 {}
+        default {
+            throw variant BadBinding { message = "expected GroupAffineU8 BankedMatrixSpec" }
+        }
+    }
+    require spec.scales_dtype ≡ "BF16" throw variant BadBinding { message = "expected BF16 scales_dtype in dispatch_routed_matmul_ga_u8_bf16" }
+    require spec.expert_count ≡ E and spec.out_features ≡ Out and spec.in_features ≡ In and spec.packed_cols ≡ PackedIn and spec.group_cols ≡ Groups throw variant BadShape { message = "shape mismatch in dispatch_routed_matmul_ga_u8_bf16" }
+    routed_expert_matmul_ga_u8_bf16<size B, size E, size Out, size PackedIn, size Groups, size In>(weight, scales, biases, x, expert_indices, mut y, spec.bits ↦ i32 ⊥ 4, spec.group_size ↦ i32 ⊥ 64)
+}
+
+@ public
+fn dispatch_routed_matvec_block_fp8_u8<size E, size Out, size In, size ScaleRows, size ScaleCols>(BankedMatrixSpec spec, tensor<u8, [E, Out, In]> weight, tensor<u8, [E, ScaleRows, ScaleCols]> scales, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, int expert_idx) → void ⇥ ExpertBankError {
+    match spec.kind {
+        case BlockFp8 {}
+        default { throw variant BadBinding { message = "expected BlockFp8 BankedMatrixSpec" } }
+    }
+    let PackKind pk ← spec_pack_kind(spec)
+    match pk {
+        case PackU8 {}
+        default { throw variant BadBinding { message = "expected U8-packed BlockFp8 BankedMatrixSpec" } }
+    }
+    let int br ← effective_block_rows(spec)
+    let int bc ← effective_block_cols(spec)
+    require spec.scales_dtype ≡ "U8" throw variant BadBinding { message = "expected U8 scales_dtype for dispatch_routed_matvec_block_fp8_u8" }
+    require spec.expert_count ≡ E and spec.out_features ≡ Out and spec.in_features ≡ In and Out % br ≡ 0 and Out / br ≡ ScaleRows and In % bc ≡ 0 and In / bc ≡ ScaleCols throw variant BadShape { message = "shape mismatch in dispatch_routed_matvec_block_fp8_u8" }
+    require expert_idx ≥ 0 and expert_idx ≺ E throw variant BadShape { message = "expert_idx out of bounds" }
+    bf8.routed_expert_matvec_u8<size E, size Out, size In, size ScaleRows, size ScaleCols>(weight, scales, x, mut y, expert_idx ↦ i32 ⊥ 0, br ↦ i32 ⊥ 1, bc ↦ i32 ⊥ 32)
+}
+
+@ public
+fn dispatch_routed_matmul_block_fp8_u8<size B, size E, size Out, size In, size ScaleRows, size ScaleCols>(BankedMatrixSpec spec, tensor<u8, [E, Out, In]> weight, tensor<u8, [E, ScaleRows, ScaleCols]> scales, tensor<f32, [B, In]> x, tensor<i32, [B]> expert_indices, mut tensor<f32, [B, Out]> y) → void ⇥ ExpertBankError {
+    match spec.kind {
+        case BlockFp8 {}
+        default { throw variant BadBinding { message = "expected BlockFp8 BankedMatrixSpec" } }
+    }
+    let PackKind pk ← spec_pack_kind(spec)
+    match pk {
+        case PackU8 {}
+        default { throw variant BadBinding { message = "expected U8-packed BlockFp8 BankedMatrixSpec" } }
+    }
+    let int br ← effective_block_rows(spec)
+    let int bc ← effective_block_cols(spec)
+    require spec.scales_dtype ≡ "U8" throw variant BadBinding { message = "expected U8 scales_dtype for dispatch_routed_matmul_block_fp8_u8" }
+    require spec.expert_count ≡ E and spec.out_features ≡ Out and spec.in_features ≡ In and Out % br ≡ 0 and Out / br ≡ ScaleRows and In % bc ≡ 0 and In / bc ≡ ScaleCols throw variant BadShape { message = "shape mismatch in dispatch_routed_matmul_block_fp8_u8" }
+    bf8.routed_expert_matmul_u8<size B, size E, size Out, size In, size ScaleRows, size ScaleCols>(weight, scales, x, expert_indices, mut y, br ↦ i32 ⊥ 1, bc ↦ i32 ⊥ 32)
+}
+
+@ public
+fn dispatch_routed_matvec_block_fp8_u8_f32<size E, size Out, size In, size ScaleRows, size ScaleCols>(BankedMatrixSpec spec, tensor<u8, [E, Out, In]> weight, tensor<f32, [E, ScaleRows, ScaleCols]> scales, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, int expert_idx) → void ⇥ ExpertBankError {
+    match spec.kind {
+        case BlockFp8 {}
+        default { throw variant BadBinding { message = "expected BlockFp8 BankedMatrixSpec" } }
+    }
+    let PackKind pk ← spec_pack_kind(spec)
+    match pk {
+        case PackU8 {}
+        default { throw variant BadBinding { message = "expected U8-packed BlockFp8 BankedMatrixSpec" } }
+    }
+    let int br ← effective_block_rows(spec)
+    let int bc ← effective_block_cols(spec)
+    require spec.scales_dtype ≡ "F32" throw variant BadBinding { message = "expected F32 scales_dtype for dispatch_routed_matvec_block_fp8_u8_f32" }
+    require spec.expert_count ≡ E and spec.out_features ≡ Out and spec.in_features ≡ In and Out % br ≡ 0 and Out / br ≡ ScaleRows and In % bc ≡ 0 and In / bc ≡ ScaleCols throw variant BadShape { message = "shape mismatch in dispatch_routed_matvec_block_fp8_u8_f32" }
+    require expert_idx ≥ 0 and expert_idx ≺ E throw variant BadShape { message = "expert_idx out of bounds" }
+    bf8.routed_expert_matvec_u8_f32_scales<size E, size Out, size In, size ScaleRows, size ScaleCols>(weight, scales, x, mut y, expert_idx ↦ i32 ⊥ 0, br ↦ i32 ⊥ 1, bc ↦ i32 ⊥ 32)
+}
+
+@ public
+fn dispatch_routed_matmul_block_fp8_u8_f32<size B, size E, size Out, size In, size ScaleRows, size ScaleCols>(BankedMatrixSpec spec, tensor<u8, [E, Out, In]> weight, tensor<f32, [E, ScaleRows, ScaleCols]> scales, tensor<f32, [B, In]> x, tensor<i32, [B]> expert_indices, mut tensor<f32, [B, Out]> y) → void ⇥ ExpertBankError {
+    match spec.kind {
+        case BlockFp8 {}
+        default { throw variant BadBinding { message = "expected BlockFp8 BankedMatrixSpec" } }
+    }
+    let PackKind pk ← spec_pack_kind(spec)
+    match pk {
+        case PackU8 {}
+        default { throw variant BadBinding { message = "expected U8-packed BlockFp8 BankedMatrixSpec" } }
+    }
+    let int br ← effective_block_rows(spec)
+    let int bc ← effective_block_cols(spec)
+    require spec.scales_dtype ≡ "F32" throw variant BadBinding { message = "expected F32 scales_dtype for dispatch_routed_matmul_block_fp8_u8_f32" }
+    require spec.expert_count ≡ E and spec.out_features ≡ Out and spec.in_features ≡ In and Out % br ≡ 0 and Out / br ≡ ScaleRows and In % bc ≡ 0 and In / bc ≡ ScaleCols throw variant BadShape { message = "shape mismatch in dispatch_routed_matmul_block_fp8_u8_f32" }
+    bf8.routed_expert_matmul_u8_f32_scales<size B, size E, size Out, size In, size ScaleRows, size ScaleCols>(weight, scales, x, expert_indices, mut y, br ↦ i32 ⊥ 1, bc ↦ i32 ⊥ 32)
+}
+
+@ public
+fn dispatch_routed_matvec_block_fp8_u8_unscaled<size E, size Out, size In>(BankedMatrixSpec spec, tensor<u8, [E, Out, In]> weight, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, int expert_idx) → void ⇥ ExpertBankError {
+    match spec.kind {
+        case BlockFp8 {}
+        default { throw variant BadBinding { message = "expected BlockFp8 BankedMatrixSpec" } }
+    }
+    let PackKind pk ← spec_pack_kind(spec)
+    match pk {
+        case PackU8 {}
+        default { throw variant BadBinding { message = "expected U8-packed BlockFp8 BankedMatrixSpec" } }
+    }
+    require spec.scales_dtype ≡ "NONE" throw variant BadBinding { message = "expected unscaled BlockFp8 BankedMatrixSpec" }
+    require spec.expert_count ≡ E and spec.out_features ≡ Out and spec.in_features ≡ In throw variant BadShape { message = "shape mismatch in dispatch_routed_matvec_block_fp8_u8_unscaled" }
+    require expert_idx ≥ 0 and expert_idx ≺ E throw variant BadShape { message = "expert_idx out of bounds" }
+    bf8.routed_expert_matvec_u8_unscaled<size E, size Out, size In>(weight, x, mut y, expert_idx ↦ i32 ⊥ 0)
+}
+
+@ public
+fn dispatch_routed_matmul_block_fp8_u8_unscaled<size B, size E, size Out, size In>(BankedMatrixSpec spec, tensor<u8, [E, Out, In]> weight, tensor<f32, [B, In]> x, tensor<i32, [B]> expert_indices, mut tensor<f32, [B, Out]> y) → void ⇥ ExpertBankError {
+    match spec.kind {
+        case BlockFp8 {}
+        default { throw variant BadBinding { message = "expected BlockFp8 BankedMatrixSpec" } }
+    }
+    let PackKind pk ← spec_pack_kind(spec)
+    match pk {
+        case PackU8 {}
+        default { throw variant BadBinding { message = "expected U8-packed BlockFp8 BankedMatrixSpec" } }
+    }
+    require spec.scales_dtype ≡ "NONE" throw variant BadBinding { message = "expected unscaled BlockFp8 BankedMatrixSpec" }
+    require spec.expert_count ≡ E and spec.out_features ≡ Out and spec.in_features ≡ In throw variant BadShape { message = "shape mismatch in dispatch_routed_matmul_block_fp8_u8_unscaled" }
+    bf8.routed_expert_matmul_u8_unscaled<size B, size E, size Out, size In>(weight, x, expert_indices, mut y)
+}
+
+@ public
+fn dispatch_routed_matvec_block_fp8_u32<size E, size Out, size PackedIn, size ScaleRows, size ScaleCols, size In>(BankedMatrixSpec spec, tensor<u32, [E, Out, PackedIn]> weight, tensor<u8, [E, ScaleRows, ScaleCols]> scales, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, int expert_idx) → void ⇥ ExpertBankError {
+    match spec.kind {
+        case BlockFp8 {}
+        default { throw variant BadBinding { message = "expected BlockFp8 BankedMatrixSpec" } }
+    }
+    let PackKind pk ← spec_pack_kind(spec)
+    match pk {
+        case PackU32 {}
+        default { throw variant BadBinding { message = "expected U32-packed BlockFp8 BankedMatrixSpec" } }
+    }
+    let int br ← effective_block_rows(spec)
+    let int bc ← effective_block_cols(spec)
+    require spec.scales_dtype ≡ "U8" throw variant BadBinding { message = "expected U8 scales_dtype for dispatch_routed_matvec_block_fp8_u32" }
+    require spec.expert_count ≡ E and spec.out_features ≡ Out and spec.in_features ≡ In and spec.packed_cols ≡ PackedIn and Out % br ≡ 0 and Out / br ≡ ScaleRows and In % bc ≡ 0 and In / bc ≡ ScaleCols throw variant BadShape { message = "shape mismatch in dispatch_routed_matvec_block_fp8_u32" }
+    require expert_idx ≥ 0 and expert_idx ≺ E throw variant BadShape { message = "expert_idx out of bounds" }
+    bf8.routed_expert_matvec_u32<size E, size Out, size PackedIn, size ScaleRows, size ScaleCols, size In>(weight, scales, x, mut y, expert_idx ↦ i32 ⊥ 0, br ↦ i32 ⊥ 1, bc ↦ i32 ⊥ 32)
+}
+
+@ public
+fn dispatch_routed_matmul_block_fp8_u32<size B, size E, size Out, size PackedIn, size ScaleRows, size ScaleCols, size In>(BankedMatrixSpec spec, tensor<u32, [E, Out, PackedIn]> weight, tensor<u8, [E, ScaleRows, ScaleCols]> scales, tensor<f32, [B, In]> x, tensor<i32, [B]> expert_indices, mut tensor<f32, [B, Out]> y) → void ⇥ ExpertBankError {
+    match spec.kind {
+        case BlockFp8 {}
+        default { throw variant BadBinding { message = "expected BlockFp8 BankedMatrixSpec" } }
+    }
+    let PackKind pk ← spec_pack_kind(spec)
+    match pk {
+        case PackU32 {}
+        default { throw variant BadBinding { message = "expected U32-packed BlockFp8 BankedMatrixSpec" } }
+    }
+    let int br ← effective_block_rows(spec)
+    let int bc ← effective_block_cols(spec)
+    require spec.scales_dtype ≡ "U8" throw variant BadBinding { message = "expected U8 scales_dtype for dispatch_routed_matmul_block_fp8_u32" }
+    require spec.expert_count ≡ E and spec.out_features ≡ Out and spec.in_features ≡ In and spec.packed_cols ≡ PackedIn and Out % br ≡ 0 and Out / br ≡ ScaleRows and In % bc ≡ 0 and In / bc ≡ ScaleCols throw variant BadShape { message = "shape mismatch in dispatch_routed_matmul_block_fp8_u32" }
+    bf8.routed_expert_matmul_u32<size B, size E, size Out, size PackedIn, size ScaleRows, size ScaleCols, size In>(weight, scales, x, expert_indices, mut y, br ↦ i32 ⊥ 1, bc ↦ i32 ⊥ 32)
+}
+
+@ public
+fn dispatch_routed_matvec_block_fp8_u32_f32<size E, size Out, size PackedIn, size ScaleRows, size ScaleCols, size In>(BankedMatrixSpec spec, tensor<u32, [E, Out, PackedIn]> weight, tensor<f32, [E, ScaleRows, ScaleCols]> scales, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, int expert_idx) → void ⇥ ExpertBankError {
+    match spec.kind {
+        case BlockFp8 {}
+        default { throw variant BadBinding { message = "expected BlockFp8 BankedMatrixSpec" } }
+    }
+    let PackKind pk ← spec_pack_kind(spec)
+    match pk {
+        case PackU32 {}
+        default { throw variant BadBinding { message = "expected U32-packed BlockFp8 BankedMatrixSpec" } }
+    }
+    let int br ← effective_block_rows(spec)
+    let int bc ← effective_block_cols(spec)
+    require spec.scales_dtype ≡ "F32" throw variant BadBinding { message = "expected F32 scales_dtype for dispatch_routed_matvec_block_fp8_u32_f32" }
+    require spec.expert_count ≡ E and spec.out_features ≡ Out and spec.in_features ≡ In and spec.packed_cols ≡ PackedIn and Out % br ≡ 0 and Out / br ≡ ScaleRows and In % bc ≡ 0 and In / bc ≡ ScaleCols throw variant BadShape { message = "shape mismatch in dispatch_routed_matvec_block_fp8_u32_f32" }
+    require expert_idx ≥ 0 and expert_idx ≺ E throw variant BadShape { message = "expert_idx out of bounds" }
+    bf8.routed_expert_matvec_u32_f32_scales<size E, size Out, size PackedIn, size ScaleRows, size ScaleCols, size In>(weight, scales, x, mut y, expert_idx ↦ i32 ⊥ 0, br ↦ i32 ⊥ 1, bc ↦ i32 ⊥ 32)
+}
+
+@ public
+fn dispatch_routed_matmul_block_fp8_u32_f32<size B, size E, size Out, size PackedIn, size ScaleRows, size ScaleCols, size In>(BankedMatrixSpec spec, tensor<u32, [E, Out, PackedIn]> weight, tensor<f32, [E, ScaleRows, ScaleCols]> scales, tensor<f32, [B, In]> x, tensor<i32, [B]> expert_indices, mut tensor<f32, [B, Out]> y) → void ⇥ ExpertBankError {
+    match spec.kind {
+        case BlockFp8 {}
+        default { throw variant BadBinding { message = "expected BlockFp8 BankedMatrixSpec" } }
+    }
+    let PackKind pk ← spec_pack_kind(spec)
+    match pk {
+        case PackU32 {}
+        default { throw variant BadBinding { message = "expected U32-packed BlockFp8 BankedMatrixSpec" } }
+    }
+    let int br ← effective_block_rows(spec)
+    let int bc ← effective_block_cols(spec)
+    require spec.scales_dtype ≡ "F32" throw variant BadBinding { message = "expected F32 scales_dtype for dispatch_routed_matmul_block_fp8_u32_f32" }
+    require spec.expert_count ≡ E and spec.out_features ≡ Out and spec.in_features ≡ In and spec.packed_cols ≡ PackedIn and Out % br ≡ 0 and Out / br ≡ ScaleRows and In % bc ≡ 0 and In / bc ≡ ScaleCols throw variant BadShape { message = "shape mismatch in dispatch_routed_matmul_block_fp8_u32_f32" }
+    bf8.routed_expert_matmul_u32_f32_scales<size B, size E, size Out, size PackedIn, size ScaleRows, size ScaleCols, size In>(weight, scales, x, expert_indices, mut y, br ↦ i32 ⊥ 1, bc ↦ i32 ⊥ 32)
+}
+
+@ public
+fn dispatch_routed_matvec_dual_scaled_fp4_u8<size E, size Out, size PackedIn, size Groups, size In>(BankedMatrixSpec spec, tensor<u8, [E, Out, PackedIn]> weight, tensor<u8, [E, Out, Groups]> scales, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, int expert_idx, f32 global_scale) → void ⇥ ExpertBankError {
+    match spec.kind {
+        case DualScaledFp4 {}
+        default { throw variant BadBinding { message = "expected DualScaledFp4 BankedMatrixSpec" } }
+    }
+    let PackKind pk ← spec_pack_kind(spec)
+    match pk {
+        case PackU8 {}
+        default { throw variant BadBinding { message = "expected U8-packed DualScaledFp4 BankedMatrixSpec" } }
+    }
+    require spec.expert_count ≡ E and spec.out_features ≡ Out and spec.in_features ≡ In and spec.packed_cols ≡ PackedIn and spec.group_cols ≡ Groups throw variant BadShape { message = "shape mismatch in dispatch_routed_matvec_dual_scaled_fp4_u8" }
+    require expert_idx ≥ 0 and expert_idx ≺ E throw variant BadShape { message = "expert_idx out of bounds" }
+    fp4.routed_expert_matvec_u8<size E, size Out, size PackedIn, size Groups, size In>(weight, scales, x, mut y, expert_idx ↦ i32 ⊥ 0, global_scale, spec.group_size ↦ i32 ⊥ 16)
+}
+
+@ public
+fn dispatch_routed_matmul_dual_scaled_fp4_u8<size B, size E, size Out, size PackedIn, size Groups, size In>(BankedMatrixSpec spec, tensor<u8, [E, Out, PackedIn]> weight, tensor<u8, [E, Out, Groups]> scales, tensor<f32, [B, In]> x, tensor<i32, [B]> expert_indices, mut tensor<f32, [B, Out]> y, f32 global_scale) → void ⇥ ExpertBankError {
+    match spec.kind {
+        case DualScaledFp4 {}
+        default { throw variant BadBinding { message = "expected DualScaledFp4 BankedMatrixSpec" } }
+    }
+    let PackKind pk ← spec_pack_kind(spec)
+    match pk {
+        case PackU8 {}
+        default { throw variant BadBinding { message = "expected U8-packed DualScaledFp4 BankedMatrixSpec" } }
+    }
+    require spec.expert_count ≡ E and spec.out_features ≡ Out and spec.in_features ≡ In and spec.packed_cols ≡ PackedIn and spec.group_cols ≡ Groups throw variant BadShape { message = "shape mismatch in dispatch_routed_matmul_dual_scaled_fp4_u8" }
+    fp4.routed_expert_matmul_u8<size B, size E, size Out, size PackedIn, size Groups, size In>(weight, scales, x, expert_indices, mut y, global_scale, spec.group_size ↦ i32 ⊥ 16)
+}
+
+@ public
+fn dispatch_routed_matvec_dual_scaled_fp4_modelopt_u8<size E, size Out, size PackedIn, size Groups, size In>(BankedMatrixSpec spec, tensor<u8, [E, Out, PackedIn]> weight, tensor<u8, [E, Out, Groups]> scales, tensor<f32, [E]> amax, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, int expert_idx, f32 outer_scale_denominator) → void ⇥ ExpertBankError {
+    match spec.kind {
+        case DualScaledFp4 {}
+        default { throw variant BadBinding { message = "expected DualScaledFp4 BankedMatrixSpec" } }
+    }
+    let PackKind pk ← spec_pack_kind(spec)
+    match pk {
+        case PackU8 {}
+        default { throw variant BadBinding { message = "expected U8-packed DualScaledFp4 BankedMatrixSpec" } }
+    }
+    require outer_scale_denominator ≻ 0.0 throw variant BadConfig { message = "outer_scale_denominator must be positive" }
+    require spec.expert_count ≡ E and spec.out_features ≡ Out and spec.in_features ≡ In and spec.packed_cols ≡ PackedIn and spec.group_cols ≡ Groups throw variant BadShape { message = "shape mismatch in dispatch_routed_matvec_dual_scaled_fp4_modelopt_u8" }
+    require expert_idx ≥ 0 and expert_idx ≺ E throw variant BadShape { message = "expert_idx out of bounds" }
+    fp4.routed_expert_matvec_modelopt_u8<size E, size Out, size PackedIn, size Groups, size In>(weight, scales, amax, x, mut y, expert_idx ↦ i32 ⊥ 0, outer_scale_denominator, spec.group_size ↦ i32 ⊥ 16)
+}
+
+@ public
+fn dispatch_routed_matmul_dual_scaled_fp4_modelopt_u8<size B, size E, size Out, size PackedIn, size Groups, size In>(BankedMatrixSpec spec, tensor<u8, [E, Out, PackedIn]> weight, tensor<u8, [E, Out, Groups]> scales, tensor<f32, [E]> amax, tensor<f32, [B, In]> x, tensor<i32, [B]> expert_indices, mut tensor<f32, [B, Out]> y, f32 outer_scale_denominator) → void ⇥ ExpertBankError {
+    match spec.kind {
+        case DualScaledFp4 {}
+        default { throw variant BadBinding { message = "expected DualScaledFp4 BankedMatrixSpec" } }
+    }
+    let PackKind pk ← spec_pack_kind(spec)
+    match pk {
+        case PackU8 {}
+        default { throw variant BadBinding { message = "expected U8-packed DualScaledFp4 BankedMatrixSpec" } }
+    }
+    require outer_scale_denominator ≻ 0.0 throw variant BadConfig { message = "outer_scale_denominator must be positive" }
+    require spec.expert_count ≡ E and spec.out_features ≡ Out and spec.in_features ≡ In and spec.packed_cols ≡ PackedIn and spec.group_cols ≡ Groups throw variant BadShape { message = "shape mismatch in dispatch_routed_matmul_dual_scaled_fp4_modelopt_u8" }
+    fp4.routed_expert_matmul_modelopt_u8<size B, size E, size Out, size PackedIn, size Groups, size In>(weight, scales, amax, x, expert_indices, mut y, outer_scale_denominator, spec.group_size ↦ i32 ⊥ 16)
+}
+
+@ public
+fn dispatch_routed_matvec_dual_scaled_fp4_u32<size E, size Out, size PackedIn, size Groups, size In>(BankedMatrixSpec spec, tensor<u32, [E, Out, PackedIn]> weight, tensor<u8, [E, Out, Groups]> scales, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, int expert_idx, f32 global_scale) → void ⇥ ExpertBankError {
+    match spec.kind {
+        case DualScaledFp4 {}
+        default { throw variant BadBinding { message = "expected DualScaledFp4 BankedMatrixSpec" } }
+    }
+    let PackKind pk ← spec_pack_kind(spec)
+    match pk {
+        case PackU32 {}
+        default { throw variant BadBinding { message = "expected U32-packed DualScaledFp4 BankedMatrixSpec" } }
+    }
+    require spec.expert_count ≡ E and spec.out_features ≡ Out and spec.in_features ≡ In and spec.packed_cols ≡ PackedIn and spec.group_cols ≡ Groups throw variant BadShape { message = "shape mismatch in dispatch_routed_matvec_dual_scaled_fp4_u32" }
+    require expert_idx ≥ 0 and expert_idx ≺ E throw variant BadShape { message = "expert_idx out of bounds" }
+    fp4.routed_expert_matvec_u32<size E, size Out, size PackedIn, size Groups, size In>(weight, scales, x, mut y, expert_idx ↦ i32 ⊥ 0, global_scale, spec.group_size ↦ i32 ⊥ 16)
+}
+
+@ public
+fn dispatch_routed_matmul_dual_scaled_fp4_u32<size B, size E, size Out, size PackedIn, size Groups, size In>(BankedMatrixSpec spec, tensor<u32, [E, Out, PackedIn]> weight, tensor<u8, [E, Out, Groups]> scales, tensor<f32, [B, In]> x, tensor<i32, [B]> expert_indices, mut tensor<f32, [B, Out]> y, f32 global_scale) → void ⇥ ExpertBankError {
+    match spec.kind {
+        case DualScaledFp4 {}
+        default { throw variant BadBinding { message = "expected DualScaledFp4 BankedMatrixSpec" } }
+    }
+    let PackKind pk ← spec_pack_kind(spec)
+    match pk {
+        case PackU32 {}
+        default { throw variant BadBinding { message = "expected U32-packed DualScaledFp4 BankedMatrixSpec" } }
+    }
+    require spec.expert_count ≡ E and spec.out_features ≡ Out and spec.in_features ≡ In and spec.packed_cols ≡ PackedIn and spec.group_cols ≡ Groups throw variant BadShape { message = "shape mismatch in dispatch_routed_matmul_dual_scaled_fp4_u32" }
+    fp4.routed_expert_matmul_u32<size B, size E, size Out, size PackedIn, size Groups, size In>(weight, scales, x, expert_indices, mut y, global_scale, spec.group_size ↦ i32 ⊥ 16)
+}
+
+@ public
+fn dispatch_routed_matvec_ggml_q8_0<size E, size Out, size Blocks, size RowBytes, size In>(BankedMatrixSpec spec, tensor<u8, [E, Out, RowBytes]> raw_blocks, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, int expert_idx) → void ⇥ ExpertBankError {
+    match spec.kind {
+        case GgmlBlockQ8_0 {}
+        default { throw variant BadBinding { message = "expected GgmlBlockQ8_0 BankedMatrixSpec" } }
+    }
+    require spec.expert_count ≡ E and spec.out_features ≡ Out and spec.in_features ≡ In and In ≡ Blocks * 32 and RowBytes ≡ Blocks * 34 throw variant BadShape { message = "shape mismatch in dispatch_routed_matvec_ggml_q8_0" }
+    require expert_idx ≥ 0 and expert_idx ≺ E throw variant BadShape { message = "expert_idx out of bounds" }
+    routed_expert_matvec_ggml_q8_0<size E, size Out, size Blocks, size RowBytes, size In>(raw_blocks, x, mut y, expert_idx ↦ i32 ⊥ 0)
+}
+
+@ public
+fn dispatch_routed_matmul_ggml_q8_0<size B, size E, size Out, size Blocks, size RowBytes, size In>(BankedMatrixSpec spec, tensor<u8, [E, Out, RowBytes]> raw_blocks, tensor<f32, [B, In]> x, tensor<i32, [B]> expert_indices, mut tensor<f32, [B, Out]> y) → void ⇥ ExpertBankError {
+    match spec.kind {
+        case GgmlBlockQ8_0 {}
+        default { throw variant BadBinding { message = "expected GgmlBlockQ8_0 BankedMatrixSpec" } }
+    }
+    require spec.expert_count ≡ E and spec.out_features ≡ Out and spec.in_features ≡ In and In ≡ Blocks * 32 and RowBytes ≡ Blocks * 34 throw variant BadShape { message = "shape mismatch in dispatch_routed_matmul_ggml_q8_0" }
+    routed_expert_matmul_ggml_q8_0<size B, size E, size Out, size Blocks, size RowBytes, size In>(raw_blocks, x, expert_indices, mut y)
+}
+
+@ public
+fn dispatch_routed_matvec_ggml_q4_1<size E, size Out, size Blocks, size RowBytes, size In>(BankedMatrixSpec spec, tensor<u8, [E, Out, RowBytes]> raw_blocks, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, int expert_idx) → void ⇥ ExpertBankError {
+    match spec.kind {
+        case GgmlBlockQ4_1 {}
+        default { throw variant BadBinding { message = "expected GgmlBlockQ4_1 BankedMatrixSpec" } }
+    }
+    require spec.expert_count ≡ E and spec.out_features ≡ Out and spec.in_features ≡ In and In ≡ Blocks * 32 and RowBytes ≡ Blocks * 20 throw variant BadShape { message = "shape mismatch in dispatch_routed_matvec_ggml_q4_1" }
+    require expert_idx ≥ 0 and expert_idx ≺ E throw variant BadShape { message = "expert_idx out of bounds" }
+    routed_expert_matvec_ggml_q4_1<size E, size Out, size Blocks, size RowBytes, size In>(raw_blocks, x, mut y, expert_idx ↦ i32 ⊥ 0)
+}
+
+@ public
+fn dispatch_routed_matmul_ggml_q4_1<size B, size E, size Out, size Blocks, size RowBytes, size In>(BankedMatrixSpec spec, tensor<u8, [E, Out, RowBytes]> raw_blocks, tensor<f32, [B, In]> x, tensor<i32, [B]> expert_indices, mut tensor<f32, [B, Out]> y) → void ⇥ ExpertBankError {
+    match spec.kind {
+        case GgmlBlockQ4_1 {}
+        default { throw variant BadBinding { message = "expected GgmlBlockQ4_1 BankedMatrixSpec" } }
+    }
+    require spec.expert_count ≡ E and spec.out_features ≡ Out and spec.in_features ≡ In and In ≡ Blocks * 32 and RowBytes ≡ Blocks * 20 throw variant BadShape { message = "shape mismatch in dispatch_routed_matmul_ggml_q4_1" }
+    routed_expert_matmul_ggml_q4_1<size B, size E, size Out, size Blocks, size RowBytes, size In>(raw_blocks, x, expert_indices, mut y)
+}
+
+@ public
+fn dispatch_routed_matvec_ggml_q5_0<size E, size Out, size Blocks, size RowBytes, size In>(BankedMatrixSpec spec, tensor<u8, [E, Out, RowBytes]> raw_blocks, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, int expert_idx) → void ⇥ ExpertBankError {
+    match spec.kind {
+        case GgmlBlockQ5_0 {}
+        default { throw variant BadBinding { message = "expected GgmlBlockQ5_0 BankedMatrixSpec" } }
+    }
+    require spec.expert_count ≡ E and spec.out_features ≡ Out and spec.in_features ≡ In and In ≡ Blocks * 32 and RowBytes ≡ Blocks * 22 throw variant BadShape { message = "shape mismatch in dispatch_routed_matvec_ggml_q5_0" }
+    require expert_idx ≥ 0 and expert_idx ≺ E throw variant BadShape { message = "expert_idx out of bounds" }
+    routed_expert_matvec_ggml_q5_0<size E, size Out, size Blocks, size RowBytes, size In>(raw_blocks, x, mut y, expert_idx ↦ i32 ⊥ 0)
+}
+
+@ public
+fn dispatch_routed_matmul_ggml_q5_0<size B, size E, size Out, size Blocks, size RowBytes, size In>(BankedMatrixSpec spec, tensor<u8, [E, Out, RowBytes]> raw_blocks, tensor<f32, [B, In]> x, tensor<i32, [B]> expert_indices, mut tensor<f32, [B, Out]> y) → void ⇥ ExpertBankError {
+    match spec.kind {
+        case GgmlBlockQ5_0 {}
+        default { throw variant BadBinding { message = "expected GgmlBlockQ5_0 BankedMatrixSpec" } }
+    }
+    require spec.expert_count ≡ E and spec.out_features ≡ Out and spec.in_features ≡ In and In ≡ Blocks * 32 and RowBytes ≡ Blocks * 22 throw variant BadShape { message = "shape mismatch in dispatch_routed_matmul_ggml_q5_0" }
+    routed_expert_matmul_ggml_q5_0<size B, size E, size Out, size Blocks, size RowBytes, size In>(raw_blocks, x, expert_indices, mut y)
+}
+
+@ public
+fn dispatch_routed_matvec_ggml_iq4_nl<size E, size Out, size Blocks, size RowBytes, size In>(BankedMatrixSpec spec, tensor<u8, [E, Out, RowBytes]> raw_blocks, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, int expert_idx) → void ⇥ ExpertBankError {
+    match spec.kind {
+        case GgmlBlockIQ4_NL {}
+        default { throw variant BadBinding { message = "expected GgmlBlockIQ4_NL BankedMatrixSpec" } }
+    }
+    require spec.expert_count ≡ E and spec.out_features ≡ Out and spec.in_features ≡ In and In ≡ Blocks * 32 and RowBytes ≡ Blocks * 18 throw variant BadShape { message = "shape mismatch in dispatch_routed_matvec_ggml_iq4_nl" }
+    require expert_idx ≥ 0 and expert_idx ≺ E throw variant BadShape { message = "expert_idx out of bounds" }
+    routed_expert_matvec_ggml_iq4_nl<size E, size Out, size Blocks, size RowBytes, size In>(raw_blocks, x, mut y, expert_idx ↦ i32 ⊥ 0)
+}
+
+@ public
+fn dispatch_routed_matmul_ggml_iq4_nl<size B, size E, size Out, size Blocks, size RowBytes, size In>(BankedMatrixSpec spec, tensor<u8, [E, Out, RowBytes]> raw_blocks, tensor<f32, [B, In]> x, tensor<i32, [B]> expert_indices, mut tensor<f32, [B, Out]> y) → void ⇥ ExpertBankError {
+    match spec.kind {
+        case GgmlBlockIQ4_NL {}
+        default { throw variant BadBinding { message = "expected GgmlBlockIQ4_NL BankedMatrixSpec" } }
+    }
+    require spec.expert_count ≡ E and spec.out_features ≡ Out and spec.in_features ≡ In and In ≡ Blocks * 32 and RowBytes ≡ Blocks * 18 throw variant BadShape { message = "shape mismatch in dispatch_routed_matmul_ggml_iq4_nl" }
+    routed_expert_matmul_ggml_iq4_nl<size B, size E, size Out, size Blocks, size RowBytes, size In>(raw_blocks, x, expert_indices, mut y)
+}
+
+@ public
+fn dispatch_routed_matvec_ggml_q4_k<size E, size Out, size Blocks, size RowBytes, size In>(BankedMatrixSpec spec, tensor<u8, [E, Out, RowBytes]> raw_blocks, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, int expert_idx) → void ⇥ ExpertBankError {
+    match spec.kind {
+        case GgmlBlockQ4_K {}
+        default { throw variant BadBinding { message = "expected GgmlBlockQ4_K BankedMatrixSpec" } }
+    }
+    require spec.expert_count ≡ E and spec.out_features ≡ Out and spec.in_features ≡ In and In ≡ Blocks * 256 and RowBytes ≡ Blocks * 144 throw variant BadShape { message = "shape mismatch in dispatch_routed_matvec_ggml_q4_k" }
+    require expert_idx ≥ 0 and expert_idx ≺ E throw variant BadShape { message = "expert_idx out of bounds" }
+    routed_expert_matvec_ggml_q4_k<size E, size Out, size Blocks, size RowBytes, size In>(raw_blocks, x, mut y, expert_idx ↦ i32 ⊥ 0)
+}
+
+@ public
+fn dispatch_routed_matmul_ggml_q4_k<size B, size E, size Out, size Blocks, size RowBytes, size In>(BankedMatrixSpec spec, tensor<u8, [E, Out, RowBytes]> raw_blocks, tensor<f32, [B, In]> x, tensor<i32, [B]> expert_indices, mut tensor<f32, [B, Out]> y) → void ⇥ ExpertBankError {
+    match spec.kind {
+        case GgmlBlockQ4_K {}
+        default { throw variant BadBinding { message = "expected GgmlBlockQ4_K BankedMatrixSpec" } }
+    }
+    require spec.expert_count ≡ E and spec.out_features ≡ Out and spec.in_features ≡ In and In ≡ Blocks * 256 and RowBytes ≡ Blocks * 144 throw variant BadShape { message = "shape mismatch in dispatch_routed_matmul_ggml_q4_k" }
+    routed_expert_matmul_ggml_q4_k<size B, size E, size Out, size Blocks, size RowBytes, size In>(raw_blocks, x, expert_indices, mut y)
+}
+
+@ public
+fn dispatch_routed_matvec_ggml_q5_k<size E, size Out, size Blocks, size RowBytes, size In>(BankedMatrixSpec spec, tensor<u8, [E, Out, RowBytes]> raw_blocks, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, int expert_idx) → void ⇥ ExpertBankError {
+    match spec.kind {
+        case GgmlBlockQ5_K {}
+        default { throw variant BadBinding { message = "expected GgmlBlockQ5_K BankedMatrixSpec" } }
+    }
+    require spec.expert_count ≡ E and spec.out_features ≡ Out and spec.in_features ≡ In and In ≡ Blocks * 256 and RowBytes ≡ Blocks * 176 throw variant BadShape { message = "shape mismatch in dispatch_routed_matvec_ggml_q5_k" }
+    require expert_idx ≥ 0 and expert_idx ≺ E throw variant BadShape { message = "expert_idx out of bounds" }
+    routed_expert_matvec_ggml_q5_k<size E, size Out, size Blocks, size RowBytes, size In>(raw_blocks, x, mut y, expert_idx ↦ i32 ⊥ 0)
+}
+
+@ public
+fn dispatch_routed_matmul_ggml_q5_k<size B, size E, size Out, size Blocks, size RowBytes, size In>(BankedMatrixSpec spec, tensor<u8, [E, Out, RowBytes]> raw_blocks, tensor<f32, [B, In]> x, tensor<i32, [B]> expert_indices, mut tensor<f32, [B, Out]> y) → void ⇥ ExpertBankError {
+    match spec.kind {
+        case GgmlBlockQ5_K {}
+        default { throw variant BadBinding { message = "expected GgmlBlockQ5_K BankedMatrixSpec" } }
+    }
+    require spec.expert_count ≡ E and spec.out_features ≡ Out and spec.in_features ≡ In and In ≡ Blocks * 256 and RowBytes ≡ Blocks * 176 throw variant BadShape { message = "shape mismatch in dispatch_routed_matmul_ggml_q5_k" }
+    routed_expert_matmul_ggml_q5_k<size B, size E, size Out, size Blocks, size RowBytes, size In>(raw_blocks, x, expert_indices, mut y)
+}
+
+@ public
+fn dispatch_routed_matvec_ggml_q6_k<size E, size Out, size Blocks, size RowBytes, size In>(BankedMatrixSpec spec, tensor<u8, [E, Out, RowBytes]> raw_blocks, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, int expert_idx) → void ⇥ ExpertBankError {
+    match spec.kind {
+        case GgmlBlockQ6_K {}
+        default { throw variant BadBinding { message = "expected GgmlBlockQ6_K BankedMatrixSpec" } }
+    }
+    require spec.expert_count ≡ E and spec.out_features ≡ Out and spec.in_features ≡ In and In ≡ Blocks * 256 and RowBytes ≡ Blocks * 210 throw variant BadShape { message = "shape mismatch in dispatch_routed_matvec_ggml_q6_k" }
+    require expert_idx ≥ 0 and expert_idx ≺ E throw variant BadShape { message = "expert_idx out of bounds" }
+    routed_expert_matvec_ggml_q6_k<size E, size Out, size Blocks, size RowBytes, size In>(raw_blocks, x, mut y, expert_idx ↦ i32 ⊥ 0)
+}
+
+@ public
+fn dispatch_routed_matmul_ggml_q6_k<size B, size E, size Out, size Blocks, size RowBytes, size In>(BankedMatrixSpec spec, tensor<u8, [E, Out, RowBytes]> raw_blocks, tensor<f32, [B, In]> x, tensor<i32, [B]> expert_indices, mut tensor<f32, [B, Out]> y) → void ⇥ ExpertBankError {
+    match spec.kind {
+        case GgmlBlockQ6_K {}
+        default { throw variant BadBinding { message = "expected GgmlBlockQ6_K BankedMatrixSpec" } }
+    }
+    require spec.expert_count ≡ E and spec.out_features ≡ Out and spec.in_features ≡ In and In ≡ Blocks * 256 and RowBytes ≡ Blocks * 210 throw variant BadShape { message = "shape mismatch in dispatch_routed_matmul_ggml_q6_k" }
+    routed_expert_matmul_ggml_q6_k<size B, size E, size Out, size Blocks, size RowBytes, size In>(raw_blocks, x, expert_indices, mut y)
+}
+
 +++ faber test
 import from "gradus:model/artifact" let artifact
 import from "gradus:model/bundle" let bundle
 import from "gradus:model/capsule" let capsule
 import from "gradus:model/expert_bank" let eb
+import from "gradus:model/gguf_manifest" let gguf_manifest
 import from "gradus:model/tensor_directory" let td
+import from "gradus:storage" let storage
 
 fn id_with(string hex_char, int len) → artifact.ContentIdentity {
     mut string hex ← ""
@@ -1793,6 +4355,207 @@ test "expert_bank routed_expert_matvec (B=1) and routed_expert_matmul (B=C) matc
 
         assert close(tyb_u8[[0]], ref_u8_e1[0])
         assert close(tyb_u8[[1]], ref_u8_e0[0])
+
+        # 4. Unified 2D DenseF32 + DenseBf16
+        mut tensor<f32, [2, 2]> tyb_dense2d ← tf32[2, 2] {}
+        eb.dispatch_routed_matmul_dense_2d<size 2, size 2, size 2, size 4>(spec_dense, tw_dense, tx_batch, te_idx, mut tyb_dense2d)
+        assert close(tyb_dense2d[[0, 0]], ref_d_e1[0])
+        assert close(tyb_dense2d[[0, 1]], ref_d_e1[1])
+        assert close(tyb_dense2d[[1, 0]], ref_d_e0[0])
+        assert close(tyb_dense2d[[1, 1]], ref_d_e0[1])
+
+        let eb.BankedMatrixSpec spec_bf16 ← eb.BankedMatrixSpec { kind = variant eb.ExpertWeightKind.DenseBf16, expert_count = 2, out_features = 1, in_features = 4, bits = 0, group_size = 0, packed_cols = 0, group_cols = 0 }
+        mut tensor<bf16, [2, 1, 4]> tw_bf16 ← tbf16[2, 1, 4] {}
+        tw_bf16[[0, 0, 0]] ← (1.0 ∷ f32) ↦ bf16
+        tw_bf16[[0, 0, 1]] ← (2.0 ∷ f32) ↦ bf16
+        tw_bf16[[0, 0, 2]] ← (-1.0 ∷ f32) ↦ bf16
+        tw_bf16[[0, 0, 3]] ← (0.5 ∷ f32) ↦ bf16
+        tw_bf16[[1, 0, 0]] ← (2.0 ∷ f32) ↦ bf16
+        tw_bf16[[1, 0, 1]] ← (0.0 ∷ f32) ↦ bf16
+        tw_bf16[[1, 0, 2]] ← (1.0 ∷ f32) ↦ bf16
+        tw_bf16[[1, 0, 3]] ← (-2.0 ∷ f32) ↦ bf16
+        mut tensor<f32, [1]> ty1_bf16 ← tf32[1] {}
+        mut tensor<f32, [2, 1]> tyb_bf16 ← tf32[2, 1] {}
+        eb.dispatch_routed_matvec_dense_bf16<size 2, size 1, size 4>(spec_bf16, tw_bf16, tx0, mut ty1_bf16, 1)
+        eb.dispatch_routed_matmul_dense_bf16<size 2, size 2, size 1, size 4>(spec_bf16, tw_bf16, tx_batch, te_idx, mut tyb_bf16)
+        assert close(ty1_bf16[[0]], 3.0 ∷ f32)
+        assert close(tyb_bf16[[0, 0]], 3.0 ∷ f32)
+        assert close(tyb_bf16[[1, 0]], 4.0 ∷ f32)
+
+        # 5. Native bf16 GroupAffine (U32 matvec + U8 matmul)
+        let eb.BankedMatrixSpec spec_u32_bf ← eb.BankedMatrixSpec { kind = variant eb.ExpertWeightKind.GroupAffineU32, expert_count = 2, out_features = 1, in_features = 4, bits = 8, group_size = 2, packed_cols = 1, group_cols = 2, scales_dtype = "BF16" }
+        let eb.BankedMatrixSpec spec_u8_bf ← eb.BankedMatrixSpec { kind = variant eb.ExpertWeightKind.GroupAffineU8, expert_count = 2, out_features = 1, in_features = 4, bits = 4, group_size = 2, packed_cols = 2, group_cols = 2, scales_dtype = "BF16" }
+        mut tensor<bf16, [2, 1, 2]> ts_bf16 ← tbf16[2, 1, 2] {}
+        mut tensor<bf16, [2, 1, 2]> tb_bf16 ← tbf16[2, 1, 2] {}
+        for exclusive 2 let ee {
+            for exclusive 2 let gg {
+                ts_bf16[[ee, 0, gg]] ← s_u32[ee * 2 + gg] ↦ bf16
+                tb_bf16[[ee, 0, gg]] ← b_u32[ee * 2 + gg] ↦ bf16
+            }
+        }
+        mut tensor<f32, [1]> ty1_u32_bf ← tf32[1] {}
+        mut tensor<f32, [2, 1]> tyb_u8_bf ← tf32[2, 1] {}
+        eb.dispatch_routed_matvec_ga_u32_bf16<size 2, size 1, size 1, size 2, size 4>(spec_u32_bf, tw_u32, ts_bf16, tb_bf16, tx0, mut ty1_u32_bf, 1)
+        eb.dispatch_routed_matmul_ga_u8_bf16<size 2, size 2, size 1, size 2, size 2, size 4>(spec_u8_bf, tw_u8, ts_bf16, tb_bf16, tx_batch, te_idx, mut tyb_u8_bf)
+        assert close(ty1_u32_bf[[0]], ref_u32_e1[0])
+        assert close(tyb_u8_bf[[0, 0]], ref_u8_e1[0])
+        assert close(tyb_u8_bf[[1, 0]], ref_u8_e0[0])
+
+        # 6. BlockFp8 (U32 UE8M0 matvec + U8 F32 block scales matmul)
+        let eb.BankedMatrixSpec spec_bf8_u32 ← eb.BankedMatrixSpec { kind = variant eb.ExpertWeightKind.BlockFp8, expert_count = 2, out_features = 1, in_features = 4, bits = 8, group_size = 2, packed_cols = 1, group_cols = 2, block_rows = 1, block_cols = 2, pack = variant eb.PackKind.PackU32, scales_dtype = "U8" }
+        let eb.BankedMatrixSpec spec_bf8_f32 ← eb.BankedMatrixSpec { kind = variant eb.ExpertWeightKind.BlockFp8, expert_count = 2, out_features = 1, in_features = 4, bits = 8, group_size = 2, packed_cols = 4, group_cols = 2, block_rows = 1, block_cols = 2, pack = variant eb.PackKind.PackU8, scales_dtype = "F32" }
+        mut tensor<u32, [2, 1, 1]> tw_bf8_u32 ← tu32[2, 1, 1] {}
+        tw_bf8_u32[[0, 0, 0]] ← 0x38383838 ∷ u32
+        tw_bf8_u32[[1, 0, 0]] ← 0x003c4038 ∷ u32
+        mut tensor<u8, [2, 1, 2]> ts_bf8_u8 ← tu8[2, 1, 2] {}
+        ts_bf8_u8[[0, 0, 0]] ← 127 ∷ u8
+        ts_bf8_u8[[0, 0, 1]] ← 127 ∷ u8
+        ts_bf8_u8[[1, 0, 0]] ← 127 ∷ u8
+        ts_bf8_u8[[1, 0, 1]] ← 128 ∷ u8
+        mut tensor<u8, [2, 1, 4]> tw_bf8_u8 ← tu8[2, 1, 4] {}
+        tw_bf8_u8[[0, 0, 0]] ← 0x38 ∷ u8
+        tw_bf8_u8[[0, 0, 1]] ← 0x38 ∷ u8
+        tw_bf8_u8[[0, 0, 2]] ← 0x38 ∷ u8
+        tw_bf8_u8[[0, 0, 3]] ← 0x38 ∷ u8
+        tw_bf8_u8[[1, 0, 0]] ← 0x38 ∷ u8
+        tw_bf8_u8[[1, 0, 1]] ← 0x40 ∷ u8
+        tw_bf8_u8[[1, 0, 2]] ← 0x3c ∷ u8
+        tw_bf8_u8[[1, 0, 3]] ← 0x00 ∷ u8
+        mut tensor<f32, [2, 1, 2]> ts_bf8_f32 ← tf32[2, 1, 2] {}
+        ts_bf8_f32[[0, 0, 0]] ← 2.0 ∷ f32
+        ts_bf8_f32[[0, 0, 1]] ← 0.5 ∷ f32
+        ts_bf8_f32[[1, 0, 0]] ← 1.0 ∷ f32
+        ts_bf8_f32[[1, 0, 1]] ← 2.0 ∷ f32
+        mut tensor<f32, [1]> ty1_bf8 ← tf32[1] {}
+        mut tensor<f32, [2, 1]> tyb_bf8 ← tf32[2, 1] {}
+        eb.dispatch_routed_matvec_block_fp8_u32<size 2, size 1, size 1, size 1, size 2, size 4>(spec_bf8_u32, tw_bf8_u32, ts_bf8_u8, tx0, mut ty1_bf8, 1)
+        eb.dispatch_routed_matmul_block_fp8_u8_f32<size 2, size 2, size 1, size 4, size 1, size 2>(spec_bf8_f32, tw_bf8_u8, ts_bf8_f32, tx_batch, te_idx, mut tyb_bf8)
+        assert close(ty1_bf8[[0]], 5.0 ∷ f32)
+        assert close(tyb_bf8[[0, 0]], 5.0 ∷ f32)
+        assert close(tyb_bf8[[1, 0]], 3.75 ∷ f32)
+
+        # 7. DualScaledFp4 ModelOpt (per-expert f32[E] amax + outer_scale_denominator)
+        let eb.BankedMatrixSpec spec_fp4_mo ← eb.BankedMatrixSpec { kind = variant eb.ExpertWeightKind.DualScaledFp4, expert_count = 2, out_features = 1, in_features = 4, bits = 4, group_size = 2, packed_cols = 2, group_cols = 2, block_rows = 1, block_cols = 2, pack = variant eb.PackKind.PackU8, scales_dtype = "F8_E4M3", has_modelopt_amax = true }
+        mut tensor<u8, [2, 1, 2]> tw_fp4 ← tu8[2, 1, 2] {}
+        tw_fp4[[0, 0, 0]] ← 0x22 ∷ u8
+        tw_fp4[[0, 0, 1]] ← 0x22 ∷ u8
+        tw_fp4[[1, 0, 0]] ← 0x22 ∷ u8
+        tw_fp4[[1, 0, 1]] ← 0x44 ∷ u8
+        mut tensor<u8, [2, 1, 2]> ts_fp4 ← tu8[2, 1, 2] {}
+        ts_fp4[[0, 0, 0]] ← 0x38 ∷ u8
+        ts_fp4[[0, 0, 1]] ← 0x38 ∷ u8
+        ts_fp4[[1, 0, 0]] ← 0x38 ∷ u8
+        ts_fp4[[1, 0, 1]] ← 0x40 ∷ u8
+        mut tensor<f32, [2]> amax_fp4 ← tf32[2] {}
+        amax_fp4[[0]] ← 2.0 ∷ f32
+        amax_fp4[[1]] ← 0.5 ∷ f32
+        mut tensor<f32, [1]> ty1_fp4 ← tf32[1] {}
+        mut tensor<f32, [2, 1]> tyb_fp4 ← tf32[2, 1] {}
+        eb.dispatch_routed_matvec_dual_scaled_fp4_modelopt_u8<size 2, size 1, size 2, size 2, size 4>(spec_fp4_mo, tw_fp4, ts_fp4, amax_fp4, tx0, mut ty1_fp4, 1, 1.0 ∷ f32)
+        eb.dispatch_routed_matmul_dual_scaled_fp4_modelopt_u8<size 2, size 2, size 1, size 2, size 2, size 4>(spec_fp4_mo, tw_fp4, ts_fp4, amax_fp4, tx_batch, te_idx, mut tyb_fp4, 1.0 ∷ f32)
+        assert close(ty1_fp4[[0]], 5.0 ∷ f32)
+        assert close(tyb_fp4[[0, 0]], 5.0 ∷ f32)
+        assert close(tyb_fp4[[1, 0]], 6.0 ∷ f32)
+
+        # 8. SITU softcapped activation kernels
+        mut tensor<f32, [2]> g_situ ← tf32[2] {}
+        mut tensor<f32, [2]> u_situ ← tf32[2] {}
+        mut tensor<f32, [2]> o_situ ← tf32[2] {}
+        g_situ[[0]] ← 0.0 ∷ f32
+        g_situ[[1]] ← 1.0 ∷ f32
+        u_situ[[0]] ← 2.0 ∷ f32
+        u_situ[[1]] ← 2.0 ∷ f32
+        eb.routed_expert_situ<size 2>(g_situ, u_situ, mut o_situ, 2.0 ∷ f32, 3.0 ∷ f32)
+        assert close(o_situ[[0]], 0.0 ∷ f32)
+        assert o_situ[[1]] ≻ (0.5 ∷ f32)
+
+        mut tensor<f32, [2, 2]> gm_situ ← tf32[2, 2] {}
+        mut tensor<f32, [2, 2]> um_situ ← tf32[2, 2] {}
+        mut tensor<f32, [2, 2]> om_situ ← tf32[2, 2] {}
+        gm_situ[[0, 1]] ← 1.0 ∷ f32
+        um_situ[[0, 1]] ← 2.0 ∷ f32
+        eb.routed_expert_situ_batch<size 2, size 2>(gm_situ, um_situ, mut om_situ, 2.0 ∷ f32, 3.0 ∷ f32)
+        assert close(om_situ[[0, 1]], o_situ[[1]])
+
+        # 9. GGML 3D routed contractions across Q8_0, Q4_1, Q5_0, IQ4_NL, Q4_K, Q5_K, Q6_K
+        mut tensor<f32, [32]> tx32 ← tf32[32] {}
+        mut tensor<f32, [1, 32]> txm32 ← tf32[1, 32] {}
+        mut list<f32> lx32 ← empty
+        for exclusive 32 let k {
+            tx32[[k]] ← 1.0 ∷ f32
+            txm32[[0, k]] ← 1.0 ∷ f32
+            lx32.append(1.0 ∷ f32)
+        }
+        mut tensor<i32, [1]> idx_e1 ← ti32[1] {}
+        idx_e1[[0]] ← 1 ∷ i32
+        mut tensor<f32, [1]> ty1_g ← tf32[1] {}
+        mut tensor<f32, [1, 1]> tym_g ← tf32[1, 1] {}
+
+        let eb.BankedMatrixSpec sp_q8 ← eb.BankedMatrixSpec { kind = variant eb.ExpertWeightKind.GgmlBlockQ8_0, expert_count = 2, out_features = 1, in_features = 32, bits = 0, group_size = 0, packed_cols = 0, group_cols = 0 }
+        mut tensor<u8, [2, 1, 34]> tg_q8 ← tu8[2, 1, 34] {}
+        tg_q8[[1, 0, 0]] ← 0x00 ∷ u8
+        tg_q8[[1, 0, 1]] ← 0x38 ∷ u8
+        for exclusive 32 let k { tg_q8[[1, 0, 2 + k]] ← 1 ∷ u8 }
+        eb.dispatch_routed_matvec_ggml_q8_0<size 2, size 1, size 1, size 34, size 32>(sp_q8, tg_q8, tx32, mut ty1_g, 1)
+        eb.dispatch_routed_matmul_ggml_q8_0<size 1, size 2, size 1, size 1, size 34, size 32>(sp_q8, tg_q8, txm32, idx_e1, mut tym_g)
+        assert close(ty1_g[[0]], 16.0 ∷ f32)
+        assert close(tym_g[[0, 0]], 16.0 ∷ f32)
+
+        let eb.BankedMatrixSpec sp_q41 ← eb.BankedMatrixSpec { kind = variant eb.ExpertWeightKind.GgmlBlockQ4_1, expert_count = 2, out_features = 1, in_features = 32, bits = 0, group_size = 0, packed_cols = 0, group_cols = 0 }
+        mut tensor<u8, [2, 1, 20]> tg_q41 ← tu8[2, 1, 20] {}
+        tg_q41[[1, 0, 0]] ← 0x00 ∷ u8
+        tg_q41[[1, 0, 1]] ← 0x38 ∷ u8
+        for exclusive 16 let k { tg_q41[[1, 0, 4 + k]] ← 0x11 ∷ u8 }
+        eb.dispatch_routed_matmul_ggml_q4_1<size 1, size 2, size 1, size 1, size 20, size 32>(sp_q41, tg_q41, txm32, idx_e1, mut tym_g)
+        assert close(tym_g[[0, 0]], 16.0 ∷ f32)
+
+        let eb.BankedMatrixSpec sp_q50 ← eb.BankedMatrixSpec { kind = variant eb.ExpertWeightKind.GgmlBlockQ5_0, expert_count = 2, out_features = 1, in_features = 32, bits = 0, group_size = 0, packed_cols = 0, group_cols = 0 }
+        mut tensor<u8, [2, 1, 22]> tg_q50 ← tu8[2, 1, 22] {}
+        tg_q50[[1, 0, 0]] ← 0x00 ∷ u8
+        tg_q50[[1, 0, 1]] ← 0x38 ∷ u8
+        for exclusive 4 let h { tg_q50[[1, 0, 2 + h]] ← 0xff ∷ u8 }
+        for exclusive 16 let k { tg_q50[[1, 0, 6 + k]] ← 0x11 ∷ u8 }
+        eb.dispatch_routed_matmul_ggml_q5_0<size 1, size 2, size 1, size 1, size 22, size 32>(sp_q50, tg_q50, txm32, idx_e1, mut tym_g)
+        assert close(tym_g[[0, 0]], 16.0 ∷ f32)
+
+        let eb.BankedMatrixSpec sp_iq4 ← eb.BankedMatrixSpec { kind = variant eb.ExpertWeightKind.GgmlBlockIQ4_NL, expert_count = 2, out_features = 1, in_features = 32, bits = 0, group_size = 0, packed_cols = 0, group_cols = 0 }
+        mut tensor<u8, [2, 1, 18]> tg_iq4 ← tu8[2, 1, 18] {}
+        tg_iq4[[1, 0, 0]] ← 0x00 ∷ u8
+        tg_iq4[[1, 0, 1]] ← 0x3c ∷ u8
+        for exclusive 16 let k { tg_iq4[[1, 0, 2 + k]] ← 0x88 ∷ u8 }
+        eb.dispatch_routed_matmul_ggml_iq4_nl<size 1, size 2, size 1, size 1, size 18, size 32>(sp_iq4, tg_iq4, txm32, idx_e1, mut tym_g)
+        assert close(tym_g[[0, 0]], 32.0 ∷ f32)
+
+        mut tensor<f32, [1, 256]> txm256 ← tf32[1, 256] {}
+        for exclusive 256 let k { txm256[[0, k]] ← 1.0 ∷ f32 }
+
+        let eb.BankedMatrixSpec sp_q4k ← eb.BankedMatrixSpec { kind = variant eb.ExpertWeightKind.GgmlBlockQ4_K, expert_count = 2, out_features = 1, in_features = 256, bits = 0, group_size = 0, packed_cols = 0, group_cols = 0 }
+        mut tensor<u8, [2, 1, 144]> tg_q4k ← tu8[2, 1, 144] {}
+        tg_q4k[[1, 0, 0]] ← 0x00 ∷ u8
+        tg_q4k[[1, 0, 1]] ← 0x3c ∷ u8
+        for exclusive 12 let s { tg_q4k[[1, 0, 4 + s]] ← 0x11 ∷ u8 }
+        for exclusive 128 let q { tg_q4k[[1, 0, 16 + q]] ← 0x11 ∷ u8 }
+        eb.dispatch_routed_matmul_ggml_q4_k<size 1, size 2, size 1, size 1, size 144, size 256>(sp_q4k, tg_q4k, txm256, idx_e1, mut tym_g)
+        assert tym_g[[0, 0]] ≻ (0.0 ∷ f32)
+
+        let eb.BankedMatrixSpec sp_q5k ← eb.BankedMatrixSpec { kind = variant eb.ExpertWeightKind.GgmlBlockQ5_K, expert_count = 2, out_features = 1, in_features = 256, bits = 0, group_size = 0, packed_cols = 0, group_cols = 0 }
+        mut tensor<u8, [2, 1, 176]> tg_q5k ← tu8[2, 1, 176] {}
+        tg_q5k[[1, 0, 0]] ← 0x00 ∷ u8
+        tg_q5k[[1, 0, 1]] ← 0x3c ∷ u8
+        for exclusive 12 let s { tg_q5k[[1, 0, 4 + s]] ← 0x11 ∷ u8 }
+        for exclusive 128 let q { tg_q5k[[1, 0, 48 + q]] ← 0x11 ∷ u8 }
+        eb.dispatch_routed_matmul_ggml_q5_k<size 1, size 2, size 1, size 1, size 176, size 256>(sp_q5k, tg_q5k, txm256, idx_e1, mut tym_g)
+        assert tym_g[[0, 0]] ≻ (0.0 ∷ f32)
+
+        let eb.BankedMatrixSpec sp_q6k ← eb.BankedMatrixSpec { kind = variant eb.ExpertWeightKind.GgmlBlockQ6_K, expert_count = 2, out_features = 1, in_features = 256, bits = 0, group_size = 0, packed_cols = 0, group_cols = 0 }
+        mut tensor<u8, [2, 1, 210]> tg_q6k ← tu8[2, 1, 210] {}
+        tg_q6k[[1, 0, 208]] ← 0x00 ∷ u8
+        tg_q6k[[1, 0, 209]] ← 0x3c ∷ u8
+        for exclusive 128 let q { tg_q6k[[1, 0, q]] ← 0x11 ∷ u8 }
+        for exclusive 64 let h { tg_q6k[[1, 0, 128 + h]] ← 0xff ∷ u8 }
+        for exclusive 16 let s { tg_q6k[[1, 0, 192 + s]] ← 1 ∷ u8 }
+        eb.dispatch_routed_matmul_ggml_q6_k<size 1, size 2, size 1, size 1, size 210, size 256>(sp_q6k, tg_q6k, txm256, idx_e1, mut tym_g)
+        assert close(tym_g[[0, 0]], 4352.0 ∷ f32)
     }
     catch err {
         assert false
@@ -1835,6 +4598,242 @@ test "expert_bank FusedGateUp and GgmlBlockQ8_0 reference eval" {
 
         let list<f32> y_q8 ← eb.ref_expert_matvec(q8_spec, q8_pay, 1, x32)
         assert close(y_q8[0], 16.0 ∷ f32)
+    }
+    catch err {
+        assert false
+    }
+}
+
+fn mk_gguf_tensor_nd(string name, list<int> shape, int dtype_id, int offset, int elems_per_block, int bytes_per_block, int byte_length) → gguf_manifest.GgufTensorDescriptor {
+    mut int elem_count ← 1
+    for from shape let d {
+        elem_count ← elem_count * d
+    }
+    return gguf_manifest.GgufTensorDescriptor {
+        name = name,
+        shape = shape,
+        dtype_ggml = dtype_id,
+        representation = storage.ggml_representation(dtype_id),
+        relative_offset = offset,
+        elements = elem_count,
+        layout = variant gguf_manifest.GgmlLayout.Known { elements_per_block = elems_per_block, bytes_per_block = bytes_per_block, byte_length = byte_length },
+        block = storage.BlockMetadata { known = true, elements_per_block = elems_per_block, bytes_per_block = bytes_per_block, block_count = elem_count / elems_per_block, byte_length = byte_length }
+    }
+}
+
+fn mk_gguf_bundle(artifact.ContentIdentity bb_id) → bundle.ModelBundle {
+    do {
+        return bundle.gguf_single(bb_id)
+    }
+    catch err {
+        assert false
+        return bundle.ModelBundle { schema = "", primary_container = variant bundle.ContainerKind.Gguf, backbone_shards = [], drafter = null, vision = null, config = null, quant_config = null, shard_index = null, tokenizer = null, shard_map = variant bundle.ShardMapping.Unindexed { shard_count = 0 } }
+    }
+}
+
+fn build_gguf_dir(bundle.ModelBundle b, gguf_manifest.GgufManifest gm) → td.TensorDirectory ∪ none {
+    do {
+        return td.build(b, [
+            variant td.ShardSource.GgufSource { role = variant bundle.MemberRole.Backbone, manifest = gm }
+        ], [], [])
+    }
+    catch err {
+        return null
+    }
+}
+
+test "expert_bank binds ModelOpt NVFP4 (per-expert amax), MXFP8, weight_scale_inv, and overrides stale Inkling hints" {
+    let artifact.ContentIdentity bb_id ← id_with("f", 32768)
+    let bundle.ModelBundle b ← mk_unindexed([bb_id])
+    let capsule.SafetensorsManifest m ← st_manifest(32768, 16384, [
+        st_desc("model.layers.0.mlp.switch_mlp.gate_proj.weight", "U32", [8, 64, 16], 0, 512, 256),
+        st_desc("model.layers.0.mlp.switch_mlp.gate_proj.scales", "BF16", [8, 64, 1], 512, 768, 256),
+        st_desc("model.layers.0.mlp.switch_mlp.gate_proj.biases", "BF16", [8, 64, 1], 768, 1024, 256),
+        st_desc("model.layers.0.mlp.switch_mlp.up_proj.weight", "U8", [8, 64, 32], 1024, 1536, 256),
+        st_desc("model.layers.0.mlp.switch_mlp.up_proj.scales", "F8_E4M3", [8, 64, 4], 1536, 1792, 256),
+        st_desc("model.layers.0.mlp.switch_mlp.up_proj._amax", "F32", [8], 1792, 1824, 8),
+        st_desc("model.layers.0.mlp.switch_mlp.up_proj._outer_scale_denominator", "F32", [1], 1824, 1828, 1),
+        st_desc("model.layers.0.mlp.switch_mlp.down_proj.weight", "U32", [8, 64, 16], 1828, 2340, 256),
+        st_desc("model.layers.0.mlp.switch_mlp.down_proj.scales", "U8", [8, 64, 2], 2340, 2596, 256),
+        st_desc("model.layers.0.mlp.extra.weight", "F8_E4M3", [8, 64, 128], 2596, 3620, 256),
+        st_desc("model.layers.0.mlp.extra.weight_scale_inv", "F32", [8, 2, 4], 3620, 3876, 64)
+    ])
+
+    let td.TensorDirectory ∪ none maybe_dir ← build_dir(b, m)
+    assert maybe_dir is td.TensorDirectory
+    if maybe_dir is td.TensorDirectory {
+      do {
+        let eb.ExpertQuantHint stale_nvfp4 ← eb.ExpertQuantHint { mode = "nvfp4", bits = 4, group_size = 16 }
+        let eb.ExpertBank l0 ← eb.bind_auto(maybe_dir, variant bundle.MemberRole.Backbone, "model.layers.0.mlp.switch_mlp", stale_nvfp4, 0)
+        match l0.layout {
+            case SplitGateUp let gate, up, down {
+                assert gate.kind ≡ variant eb.ExpertWeightKind.GroupAffineU32
+                assert gate.bits ≡ 8
+                assert gate.group_size ≡ 64
+                assert gate.scales_dtype ≡ "BF16"
+
+                assert up.kind ≡ variant eb.ExpertWeightKind.DualScaledFp4
+                assert eb.spec_pack_kind(up) ≡ variant eb.PackKind.PackU8
+                assert up.has_modelopt_amax ≡ true
+                assert up.group_size ≡ 16
+
+                assert down.kind ≡ variant eb.ExpertWeightKind.BlockFp8
+                assert eb.spec_pack_kind(down) ≡ variant eb.PackKind.PackU32
+                assert down.block_rows ≡ 1
+                assert down.block_cols ≡ 32
+                assert down.scales_dtype ≡ "U8"
+            }
+            default { assert false }
+        }
+
+        let eb.BankedMatrixSpec fp8_inv ← eb.bind_matrix_with_config(maybe_dir, variant bundle.MemberRole.Backbone, "model.layers.0.mlp.extra", eb.default_quant_hint())
+        assert fp8_inv.kind ≡ variant eb.ExpertWeightKind.BlockFp8
+        assert fp8_inv.block_rows ≡ 32
+        assert fp8_inv.block_cols ≡ 32
+        assert fp8_inv.scales_dtype ≡ "F32"
+      }
+      catch err {
+        assert false
+      }
+    }
+}
+
+test "expert_bank binds raw HF w13_weight/w2_weight with SITU activation" {
+    let artifact.ContentIdentity bb_id ← id_with("1", 16384)
+    let bundle.ModelBundle b ← mk_unindexed([bb_id])
+    let capsule.SafetensorsManifest m ← st_manifest(16384, 8192, [
+        st_desc("model.layers.1.mlp.experts.w13_weight", "U8", [8, 128, 32], 0, 1024, 256),
+        st_desc("model.layers.1.mlp.experts.w13_weight._scale", "U8", [8, 128, 4], 1024, 1280, 256),
+        st_desc("model.layers.1.mlp.experts.w13_weight._amax", "F32", [8], 1280, 1312, 8),
+        st_desc("model.layers.1.mlp.experts.w13_weight._outer_scale_denominator", "F32", [1], 1312, 1316, 1),
+        st_desc("model.layers.1.mlp.experts.w2_weight", "U8", [8, 64, 32], 1316, 1828, 256),
+        st_desc("model.layers.1.mlp.experts.w2_weight._scale", "U8", [8, 64, 4], 1828, 2084, 256),
+        st_desc("model.layers.1.mlp.experts.w2_weight.global_scale", "F32", [8], 2084, 2116, 8)
+    ])
+
+    let td.TensorDirectory ∪ none maybe_dir ← build_dir(b, m)
+    assert maybe_dir is td.TensorDirectory
+    if maybe_dir is td.TensorDirectory {
+      do {
+        let eb.ExpertBank hf_fused ← eb.bind_auto_with_activation(maybe_dir, variant bundle.MemberRole.Backbone, "model.layers.1.mlp.experts", eb.default_quant_hint(), 0, variant eb.ExpertActivation.Situ { gate_cap = 7.0 ∷ f32, up_cap = 7.0 ∷ f32 })
+        match hf_fused.layout {
+            case FusedGateUp let gate_up, gate_rows, up_rows, down {
+                assert gate_up.kind ≡ variant eb.ExpertWeightKind.DualScaledFp4
+                assert gate_up.has_modelopt_amax ≡ true
+                assert gate_rows ≡ 64
+                assert up_rows ≡ 64
+                assert down.kind ≡ variant eb.ExpertWeightKind.DualScaledFp4
+                assert down.has_modelopt_amax ≡ false
+            }
+            default { assert false }
+        }
+        let eb.ExpertActivation act ← eb.bank_activation(hf_fused)
+        match act {
+            case Situ let gc, uc {
+                assert close(gc, 7.0 ∷ f32) and close(uc, 7.0 ∷ f32)
+            }
+            default { assert false }
+        }
+      }
+      catch err {
+        assert false
+      }
+    }
+}
+
+test "expert_bank binds GGUF ffn_*_exps via raw blk prefix and canonical prefix" {
+    let artifact.ContentIdentity gg_id ← id_with("2", 16777216)
+    let bundle.ModelBundle gb ← mk_gguf_bundle(gg_id)
+    let gguf_manifest.GgufManifest gm ← gguf_manifest.GgufManifest {
+        identity = gg_id,
+        version = 3,
+        alignment = 32,
+        data_start = 256,
+        artifact_length = 16777216,
+        metadata = [],
+        tensors = [
+            mk_gguf_tensor_nd("blk.0.ffn_gate_exps.weight", [64, 32, 4], 8, 0, 32, 34, 8704),
+            mk_gguf_tensor_nd("blk.0.ffn_up_exps.weight", [64, 32, 4], 8, 8704, 32, 34, 8704),
+            mk_gguf_tensor_nd("blk.0.ffn_down_exps.weight", [32, 64, 4], 8, 17408, 32, 34, 8704),
+            mk_gguf_tensor_nd("blk.0.ffn_gate_inp.bias", [4], 0, 26112, 1, 4, 16),
+            mk_gguf_tensor_nd("blk.1.ffn_gate_up_exps.weight", [256, 512, 4], 12, 26128, 256, 144, 294912),
+            mk_gguf_tensor_nd("blk.1.ffn_down_exps.weight", [256, 256, 4], 12, 321040, 256, 144, 147456)
+        ]
+    }
+    let td.TensorDirectory ∪ none gg_dir ← build_gguf_dir(gb, gm)
+    assert gg_dir is td.TensorDirectory
+    if gg_dir is td.TensorDirectory {
+      do {
+        let eb.ExpertBank g_raw ← eb.bind_auto(gg_dir, variant bundle.MemberRole.Backbone, "blk.0", eb.default_quant_hint(), 0)
+        assert g_raw.expert_count ≡ 4
+        assert g_raw.hidden_size ≡ 64
+        assert g_raw.intermediate_size ≡ 32
+        assert g_raw.has_router_bias ≡ true
+        let eb.ExpertBank g_canon ← eb.bind_auto(gg_dir, variant bundle.MemberRole.Backbone, "model.layers.0.mlp.experts", eb.default_quant_hint(), 0)
+        assert g_canon.expert_count ≡ 4 and g_canon.intermediate_size ≡ 32
+
+        let eb.ExpertBank g_fused ← eb.bind_auto(gg_dir, variant bundle.MemberRole.Backbone, "blk.1", eb.default_quant_hint(), 0)
+        assert g_fused.expert_count ≡ 4 and g_fused.hidden_size ≡ 256 and g_fused.intermediate_size ≡ 256
+        match g_fused.layout {
+            case FusedGateUp let gate_up, gate_rows, up_rows, down {
+                assert gate_up.kind ≡ variant eb.ExpertWeightKind.GgmlBlockQ4_K
+                assert down.kind ≡ variant eb.ExpertWeightKind.GgmlBlockQ4_K
+                assert gate_rows ≡ 256 and up_rows ≡ 256
+            }
+            default { assert false }
+        }
+      }
+      catch err {
+        assert false
+      }
+    }
+}
+
+test "expert_bank host eval handles native bf16 GroupAffine, BlockFp8, ModelOpt NVFP4 per-expert amax, and SITU softcapping" {
+    let list<f32> x4 ← [1.0, -1.0, 2.0, 0.5]
+    let list<f32> x8 ← [1.0, -1.0, 2.0, 0.5, 0.0, 0.0, 0.0, 0.0]
+    let list<bf16> bf_s ← [(0.5 ∷ f32) ↦ bf16, (2.0 ∷ f32) ↦ bf16, (1.0 ∷ f32) ↦ bf16, (0.5 ∷ f32) ↦ bf16]
+    let list<bf16> bf_b ← [(-1.0 ∷ f32) ↦ bf16, (0.25 ∷ f32) ↦ bf16, (0.0 ∷ f32) ↦ bf16, (-0.5 ∷ f32) ↦ bf16]
+
+    do {
+        # Native bf16 GroupAffine U32 & U8
+        let eb.BankedMatrixSpec sp_ga32 ← eb.BankedMatrixSpec { kind = variant eb.ExpertWeightKind.GroupAffineU32, expert_count = 2, out_features = 1, in_features = 4, bits = 8, group_size = 2, packed_cols = 1, group_cols = 2, scales_dtype = "BF16" }
+        let eb.BankedMatrixSpec sp_ga8 ← eb.BankedMatrixSpec { kind = variant eb.ExpertWeightKind.GroupAffineU8, expert_count = 2, out_features = 1, in_features = 4, bits = 4, group_size = 2, packed_cols = 2, group_cols = 2, scales_dtype = "BF16" }
+        let list<f32> y_ga32_e0 ← eb.ref_expert_matvec(sp_ga32, variant eb.BankedPayload.GroupAffineU32Bf16BankPayload { weight = [0x04030201 ∷ u32, 0x02040103 ∷ u32], scales = bf_s, biases = bf_b }, 0, x4)
+        let list<f32> y_ga8_e0 ← eb.ref_expert_matvec(sp_ga8, variant eb.BankedPayload.GroupAffineU8Bf16BankPayload { weight = [0x21 ∷ u8, 0x43 ∷ u8, 0x13 ∷ u8, 0x24 ∷ u8], scales = bf_s, biases = bf_b }, 0, x4)
+        assert close(y_ga32_e0[0], 16.125 ∷ f32)
+        assert close(y_ga8_e0[0], 16.125 ∷ f32)
+
+        # BlockFp8 U8 & U32 host ref eval
+        let eb.BankedMatrixSpec sp_bf8_u8 ← eb.BankedMatrixSpec { kind = variant eb.ExpertWeightKind.BlockFp8, expert_count = 2, out_features = 1, in_features = 4, bits = 8, group_size = 2, packed_cols = 4, group_cols = 2, block_rows = 1, block_cols = 2, pack = variant eb.PackKind.PackU8, scales_dtype = "U8" }
+        let eb.BankedMatrixSpec sp_bf8_u32 ← eb.BankedMatrixSpec { kind = variant eb.ExpertWeightKind.BlockFp8, expert_count = 2, out_features = 1, in_features = 4, bits = 8, group_size = 2, packed_cols = 1, group_cols = 2, block_rows = 1, block_cols = 2, pack = variant eb.PackKind.PackU32, scales_dtype = "U8" }
+        let list<f32> y_f8_u8 ← eb.ref_expert_matvec(sp_bf8_u8, variant eb.BankedPayload.BlockFp8U8BankPayload { weight = [0x38 ∷ u8, 0x38 ∷ u8, 0x38 ∷ u8, 0x38 ∷ u8, 0x38 ∷ u8, 0x40 ∷ u8, 0x3c ∷ u8, 0x00 ∷ u8], scales = [127 ∷ u8, 127 ∷ u8, 127 ∷ u8, 128 ∷ u8], f32_scales = [] }, 1, x4)
+        let list<f32> y_f8_u32 ← eb.ref_expert_matvec(sp_bf8_u32, variant eb.BankedPayload.BlockFp8U32BankPayload { weight = [0x38383838 ∷ u32, 0x003c4038 ∷ u32], scales = [127 ∷ u8, 127 ∷ u8, 127 ∷ u8, 128 ∷ u8], f32_scales = [] }, 1, x4)
+        assert close(y_f8_u8[0], 5.0 ∷ f32)
+        assert close(y_f8_u32[0], 5.0 ∷ f32)
+
+        # DualScaledFp4 U8 (per-expert global scales [E]) & U32 host ref eval
+        let eb.BankedMatrixSpec sp_fp4_u8 ← eb.BankedMatrixSpec { kind = variant eb.ExpertWeightKind.DualScaledFp4, expert_count = 2, out_features = 1, in_features = 4, bits = 4, group_size = 2, packed_cols = 2, group_cols = 2, block_rows = 1, block_cols = 2, pack = variant eb.PackKind.PackU8, scales_dtype = "F8_E4M3", has_modelopt_amax = true }
+        let eb.BankedMatrixSpec sp_fp4_u32 ← eb.BankedMatrixSpec { kind = variant eb.ExpertWeightKind.DualScaledFp4, expert_count = 1, out_features = 1, in_features = 8, bits = 4, group_size = 4, packed_cols = 1, group_cols = 2, block_rows = 1, block_cols = 4, pack = variant eb.PackKind.PackU32, scales_dtype = "F8_E4M3" }
+        let eb.BankedPayload fp4_u8_pay ← variant eb.BankedPayload.DualScaledFp4U8BankPayload { weight = [0x22 ∷ u8, 0x22 ∷ u8, 0x22 ∷ u8, 0x44 ∷ u8], scales = [0x38 ∷ u8, 0x38 ∷ u8, 0x38 ∷ u8, 0x40 ∷ u8], expert_global_scales = [2.0 ∷ f32, 0.5 ∷ f32] }
+        let list<f32> y_p4_e0 ← eb.ref_expert_matvec(sp_fp4_u8, fp4_u8_pay, 0, x4)
+        let list<f32> y_p4_e1 ← eb.ref_expert_matvec(sp_fp4_u8, fp4_u8_pay, 1, x4)
+        let list<f32> y_p4_u32 ← eb.ref_expert_matvec(sp_fp4_u32, variant eb.BankedPayload.DualScaledFp4U32BankPayload { weight = [0x00004422 ∷ u32], scales = [0x38 ∷ u8, 0x38 ∷ u8], expert_global_scales = [0.5 ∷ f32] }, 0, x8)
+        assert close(y_p4_e0[0], 5.0 ∷ f32)
+        assert close(y_p4_e1[0], 5.0 ∷ f32)
+        assert close(y_p4_u32[0], 2.5 ∷ f32)
+
+        # SITU activation matches Inkling softcap formula in ref_eval_token
+        let eb.BankedMatrixSpec sp_gu ← eb.BankedMatrixSpec { kind = variant eb.ExpertWeightKind.DenseF32, expert_count = 1, out_features = 4, in_features = 2, bits = 0, group_size = 0, packed_cols = 0, group_cols = 0 }
+        let eb.BankedMatrixSpec sp_dn ← eb.BankedMatrixSpec { kind = variant eb.ExpertWeightKind.DenseF32, expert_count = 1, out_features = 2, in_features = 2, bits = 0, group_size = 0, packed_cols = 0, group_cols = 0 }
+        let eb.ExpertBank base_bank ← eb.ExpertBank { expert_count = 1, hidden_size = 2, intermediate_size = 2, layout = variant eb.ExpertBankLayout.FusedGateUp { gate_up = sp_gu, gate_rows = 2, up_rows = 2, down = sp_dn }, has_router_bias = false, shared_expert_count = 0 }
+        let eb.ExpertBank situ_bank ← eb.with_activation(base_bank, variant eb.ExpertActivation.Situ { gate_cap = 2.0 ∷ f32, up_cap = 3.0 ∷ f32 })
+        let eb.BankedPayload pay_id ← variant eb.BankedPayload.DenseBankPayload { weight = [1.0 ∷ f32, 0.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32, 1.0 ∷ f32, 0.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32] }
+        let eb.BankedPayload pay_dn ← variant eb.BankedPayload.DenseBankPayload { weight = [1.0 ∷ f32, 0.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32] }
+        let list<f32> situ_out ← eb.ref_eval_token(situ_bank, pay_id, pay_id, pay_dn, eb.RouteSelection { indices = [0], weights = [1.0 ∷ f32], scores = [] }, [4.0 ∷ f32, 1.0 ∷ f32], empty)
+        let list<f32> situ_ref ← eb.situ_list([4.0 ∷ f32, 1.0 ∷ f32], [4.0 ∷ f32, 1.0 ∷ f32], 2.0 ∷ f32, 3.0 ∷ f32)
+        assert close(situ_out[0], situ_ref[0])
+        assert close(situ_out[1], situ_ref[1])
     }
     catch err {
         assert false
