@@ -35,6 +35,22 @@ class QuantConfig {
 }
 
 @ public
+class TensorQuantOverride {
+    let string pattern
+    let string ∪ none quant_algo
+    let int ∪ none bits
+    let int ∪ none group_size
+    let bool excluded = false
+}
+
+@ public
+class HfQuantConfig {
+    let QuantConfig base
+    let list<string> exclude_modules = []
+    let list<TensorQuantOverride> overrides = []
+}
+
+@ public
 class ModelConfig {
     let string model_type
     let int hidden_size
@@ -56,6 +72,37 @@ class ModelConfig {
     let int kv_value_bits
     let int kv_group_size
     let QuantConfig ∪ none quantization
+    # Flint optional fields
+    let list<int> mlp_only_layers = []
+    let int ∪ none leading_dense_block_count = null
+    let string ∪ none softmax_type = null
+    let int ∪ none num_local_experts = null
+    let int ∪ none num_experts_per_tok = null
+    let int ∪ none num_shared_experts = null
+    let string ∪ none expert_gating_func = null
+    let bool ∪ none norm_topk_prob = null
+    # Qwen3.6 optional fields
+    let list<int> rope_dimension_sections = []
+    let int ∪ none ssm_conv_kernel = null
+    let int ∪ none ssm_state_size = null
+    let int ∪ none ssm_group_count = null
+    let int ∪ none ssm_time_step_rank = null
+    let int ∪ none ssm_inner_size = null
+    # Inkling optional fields
+    let int ∪ none loop_core_start = null
+    let int ∪ none loop_core_end = null
+    let int ∪ none loop_num_passes = null
+    let int ∪ none loop_gate_rank = null
+    let bool is_varloop = false
+    let int ∪ none n_layers_per_attn_res_block = null
+    let int ∪ none unpadded_vocab_size = null
+    let f32 ∪ none mlp_gate_softcap = null
+    let f32 ∪ none mlp_up_softcap = null
+    let f32 ∪ none final_logit_softcap = null
+    # DFlash optional fields
+    let list<int> target_layers = []
+    let int ∪ none block_size = null
+    let bool has_markov_context = false
 }
 
 # -------------------------------------------------------------------------
@@ -555,6 +602,32 @@ fn get_opt_bool_list(list<JsonEntry> entries, string key) → list<bool> ⇥ Con
     }
 }
 
+fn get_opt_int_list(list<JsonEntry> entries, string key) → list<int> ⇥ ConfigError {
+    let JsonValue v ← find_field(entries, key)
+    mut list<int> out ← empty
+    match v {
+        case JNull {
+            return out
+        }
+        case JArr let items {
+            for from items let item {
+                match item {
+                    case JNum let raw {
+                        out.append(parse_int_raw(raw, key))
+                    }
+                    default {
+                        throw variant BadType { message = "array '§' must contain integers"(key) }
+                    }
+                }
+            }
+            return out
+        }
+        default {
+            throw variant BadType { message = "field '§' must be an array of integers"(key) }
+        }
+    }
+}
+
 fn extract_quant_config(list<JsonEntry> entries) → QuantConfig ⇥ ConfigError {
     mut string ∪ none mode ← get_opt_string(entries, "mode")
     if mode is none {
@@ -576,6 +649,76 @@ fn extract_quant_config(list<JsonEntry> entries) → QuantConfig ⇥ ConfigError
     return QuantConfig { mode = mode, bits = bits, group_size = group_size }
 }
 
+fn parse_override_entry(string pattern, JsonValue val) → TensorQuantOverride ⇥ ConfigError {
+    match val {
+        case JStr let algo {
+            let bool is_none ← algo ≡ "NONE" or algo ≡ "none"
+            return TensorQuantOverride { pattern = pattern, quant_algo = algo, bits = null, group_size = null, excluded = is_none }
+        }
+        case JObj let sub {
+            mut string ∪ none algo ← get_opt_string(sub, "quant_algo")
+            if algo is none {
+                algo ← get_opt_string(sub, "mode")
+            }
+            if algo is none {
+                algo ← get_opt_string(sub, "quant_method")
+            }
+            let int ∪ none bits ← get_opt_int(sub, "bits")
+            let int ∪ none group_size ← get_opt_int(sub, "group_size")
+            let bool excluded ← get_opt_bool(sub, "excluded") coalesce ((algo coalesce "") ≡ "NONE")
+            return TensorQuantOverride { pattern = pattern, quant_algo = algo, bits = bits, group_size = group_size, excluded = excluded }
+        }
+        default {
+            throw variant BadType { message = "quant override for '§' must be a string or object"(pattern) }
+        }
+    }
+}
+
+fn append_overrides_from(mut list<TensorQuantOverride> out, list<JsonEntry> entries, string key) → void ⇥ ConfigError {
+    let JsonValue v ← find_field(entries, key)
+    match v {
+        case JNull {
+            pass
+        }
+        case JObj let items {
+            for from items let item {
+                out.append(parse_override_entry(item.key, item.val))
+            }
+        }
+        default {
+            throw variant BadType { message = "field '§' must be an object"(key) }
+        }
+    }
+}
+
+fn match_wildcard(string pattern, string name) → bool {
+    if pattern ≡ name then return true
+
+    # Support simple leading/trailing '*' wildcard patterns in exclude_modules.
+    if pattern.length() ≥ 2 and pattern.slice(0, 1) ≡ "*" and pattern.slice(pattern.length() - 1, pattern.length()) ≡ "*" {
+        let string mid ← pattern.slice(1, pattern.length() - 1)
+        return name.contains(mid)
+    }
+
+    if pattern.length() ≥ 1 and pattern.slice(0, 1) ≡ "*" {
+        let string suffix ← pattern.slice(1, pattern.length())
+        if name.length() ≥ suffix.length() {
+            return name.slice(name.length() - suffix.length(), name.length()) ≡ suffix
+        }
+        return false
+    }
+
+    if pattern.length() ≥ 1 and pattern.slice(pattern.length() - 1, pattern.length()) ≡ "*" {
+        let string prefix ← pattern.slice(0, pattern.length() - 1)
+        if name.length() ≥ prefix.length() {
+            return name.slice(0, prefix.length()) ≡ prefix
+        }
+        return false
+    }
+
+    return name.contains(pattern)
+}
+
 # -------------------------------------------------------------------------
 # Public entry points
 # -------------------------------------------------------------------------
@@ -584,6 +727,53 @@ fn extract_quant_config(list<JsonEntry> entries) → QuantConfig ⇥ ConfigError
 fn parse_quant_config(string json_text) → QuantConfig ⇥ ConfigError {
     let list<JsonEntry> entries ← parse_root_object(json_text)
     return extract_quant_config(entries)
+}
+
+@ public
+fn parse_hf_quant_config(string json_text) → HfQuantConfig ⇥ ConfigError {
+    let list<JsonEntry> root ← parse_root_object(json_text)
+    ref list<JsonEntry> q_entries ← root
+    let JsonValue nested ← find_field(root, "quantization")
+    match nested {
+        case JNull {
+            pass
+        }
+        case JObj let sub {
+            q_entries ← sub
+        }
+        default {
+            throw variant BadType { message = "quantization must be a JSON object" }
+        }
+    }
+
+    let QuantConfig base ← extract_quant_config(q_entries)
+    mut list<string> exclude_modules ← get_opt_string_list(q_entries, "exclude_modules")
+    let list<string> not_conv ← get_opt_string_list(q_entries, "modules_to_not_convert")
+    for from not_conv let m {
+        if m ∉ exclude_modules then exclude_modules.append(m)
+    }
+
+    mut list<TensorQuantOverride> overrides ← empty
+    append_overrides_from(mut overrides, q_entries, "quantized_layers")
+    append_overrides_from(mut overrides, q_entries, "per_tensor_overrides")
+    append_overrides_from(mut overrides, q_entries, "overrides")
+
+    return HfQuantConfig { base = base, exclude_modules = exclude_modules, overrides = overrides }
+}
+
+@ public
+fn resolve_tensor_quant(HfQuantConfig cfg, string tensor_name) → TensorQuantOverride ∪ none {
+    for from cfg.overrides let ov {
+        if match_wildcard(ov.pattern, tensor_name) then return ov
+    }
+
+    for from cfg.exclude_modules let ex {
+        if match_wildcard(ex, tensor_name) {
+            return TensorQuantOverride { pattern = ex, quant_algo = "NONE", bits = null, group_size = null, excluded = true }
+        }
+    }
+
+    return null
 }
 
 @ public
@@ -626,6 +816,50 @@ fn parse_json(string json_text) → ModelConfig ⇥ ConfigError {
     let int kv_value_bits ← get_opt_int(entries, "kv_value_bits") coalesce 0
     let int kv_group_size ← get_opt_int(entries, "kv_group_size") coalesce 0
 
+    # Flint optional fields
+    let list<int> mlp_only_layers ← get_opt_int_list(entries, "mlp_only_layers")
+    let int ∪ none leading_dense_block_count ← get_opt_int(entries, "leading_dense_block_count")
+    let string ∪ none softmax_type ← get_opt_string(entries, "softmax_type")
+    mut int ∪ none num_local_experts ← get_opt_int(entries, "num_local_experts")
+    if num_local_experts is none {
+        num_local_experts ← get_opt_int(entries, "num_experts")
+    }
+    let int ∪ none num_experts_per_tok ← get_opt_int(entries, "num_experts_per_tok")
+    let int ∪ none num_shared_experts ← get_opt_int(entries, "num_shared_experts")
+    let string ∪ none expert_gating_func ← get_opt_string(entries, "expert_gating_func")
+    let bool ∪ none norm_topk_prob ← get_opt_bool(entries, "norm_topk_prob")
+
+    # Qwen3.6 optional fields
+    let list<int> rope_dimension_sections ← get_opt_int_list(entries, "rope_dimension_sections")
+    mut int ∪ none ssm_conv_kernel ← get_opt_int(entries, "ssm_conv_kernel")
+    if ssm_conv_kernel is none {
+        ssm_conv_kernel ← get_opt_int(entries, "linear_conv_kernel_dim")
+    }
+    let int ∪ none ssm_state_size ← get_opt_int(entries, "ssm_state_size")
+    let int ∪ none ssm_group_count ← get_opt_int(entries, "ssm_group_count")
+    let int ∪ none ssm_time_step_rank ← get_opt_int(entries, "ssm_time_step_rank")
+    let int ∪ none ssm_inner_size ← get_opt_int(entries, "ssm_inner_size")
+
+    # Inkling optional fields
+    let int ∪ none loop_core_start ← get_opt_int(entries, "loop_core_start")
+    let int ∪ none loop_core_end ← get_opt_int(entries, "loop_core_end")
+    let int ∪ none loop_num_passes ← get_opt_int(entries, "loop_num_passes")
+    let int ∪ none loop_gate_rank ← get_opt_int(entries, "loop_gate_rank")
+    let bool is_varloop ← get_opt_bool(entries, "is_varloop") coalesce false
+    let int ∪ none n_layers_per_attn_res_block ← get_opt_int(entries, "n_layers_per_attn_res_block")
+    let int ∪ none unpadded_vocab_size ← get_opt_int(entries, "unpadded_vocab_size")
+    let f32 ∪ none mlp_gate_softcap ← get_opt_f32(entries, "mlp_gate_softcap")
+    let f32 ∪ none mlp_up_softcap ← get_opt_f32(entries, "mlp_up_softcap")
+    let f32 ∪ none final_logit_softcap ← get_opt_f32(entries, "final_logit_softcap")
+
+    # DFlash optional fields
+    mut list<int> target_layers ← get_opt_int_list(entries, "target_layers")
+    if target_layers.length() ≡ 0 {
+        target_layers ← get_opt_int_list(entries, "dflash_target_layers")
+    }
+    let int ∪ none block_size ← get_opt_int(entries, "block_size")
+    let bool has_markov_context ← get_opt_bool(entries, "has_markov_context") coalesce false
+
     mut JsonValue quant_val ← find_field(entries, "quantization")
     match quant_val {
         case JNull {
@@ -648,7 +882,7 @@ fn parse_json(string json_text) → ModelConfig ⇥ ConfigError {
         }
     }
 
-    return ModelConfig { model_type = model_type, hidden_size = hidden_size, num_hidden_layers = num_hidden_layers, num_attention_heads = num_attention_heads, num_key_value_heads = num_key_value_heads, head_dim = head_dim, intermediate_size = intermediate_size, vocab_size = vocab_size, max_position_embeddings = max_position_embeddings, rms_norm_eps = rms_norm_eps, rope_theta = rope_theta, tie_word_embeddings = tie_word_embeddings, sliding_window = sliding_window, full_attention_interval = full_attention_interval, layer_types = layer_types, rope_pattern = rope_pattern, kv_key_bits = kv_key_bits, kv_value_bits = kv_value_bits, kv_group_size = kv_group_size, quantization = quantization }
+    return ModelConfig { model_type = model_type, hidden_size = hidden_size, num_hidden_layers = num_hidden_layers, num_attention_heads = num_attention_heads, num_key_value_heads = num_key_value_heads, head_dim = head_dim, intermediate_size = intermediate_size, vocab_size = vocab_size, max_position_embeddings = max_position_embeddings, rms_norm_eps = rms_norm_eps, rope_theta = rope_theta, tie_word_embeddings = tie_word_embeddings, sliding_window = sliding_window, full_attention_interval = full_attention_interval, layer_types = layer_types, rope_pattern = rope_pattern, kv_key_bits = kv_key_bits, kv_value_bits = kv_value_bits, kv_group_size = kv_group_size, quantization = quantization, mlp_only_layers = mlp_only_layers, leading_dense_block_count = leading_dense_block_count, softmax_type = softmax_type, num_local_experts = num_local_experts, num_experts_per_tok = num_experts_per_tok, num_shared_experts = num_shared_experts, expert_gating_func = expert_gating_func, norm_topk_prob = norm_topk_prob, rope_dimension_sections = rope_dimension_sections, ssm_conv_kernel = ssm_conv_kernel, ssm_state_size = ssm_state_size, ssm_group_count = ssm_group_count, ssm_time_step_rank = ssm_time_step_rank, ssm_inner_size = ssm_inner_size, loop_core_start = loop_core_start, loop_core_end = loop_core_end, loop_num_passes = loop_num_passes, loop_gate_rank = loop_gate_rank, is_varloop = is_varloop, n_layers_per_attn_res_block = n_layers_per_attn_res_block, unpadded_vocab_size = unpadded_vocab_size, mlp_gate_softcap = mlp_gate_softcap, mlp_up_softcap = mlp_up_softcap, final_logit_softcap = final_logit_softcap, target_layers = target_layers, block_size = block_size, has_markov_context = has_markov_context }
 }
 
 @ public
@@ -755,6 +989,79 @@ test "ModelConfig decodes \\uXXXX and surrogate pair escapes" {
     do {
         let cfg.ModelConfig c ← cfg.parse_json(raw)
         assert c.model_type ≡ "clama-😀"
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "ModelConfig parses Flint, Qwen3.6, Inkling, and DFlash extended fields" {
+    let string raw ← "{\"model_type\": \"inkling\", \"hidden_size\": 2048, \"num_hidden_layers\": 40, \"num_attention_heads\": 16, \"num_key_value_heads\": 2, \"head_dim\": 256, \"intermediate_size\": 512, \"vocab_size\": 248320, \"mlp_only_layers\": [0, 1], \"leading_dense_block_count\": 2, \"softmax_type\": \"zero_sink\", \"num_local_experts\": 256, \"num_experts_per_tok\": 8, \"num_shared_experts\": 1, \"expert_gating_func\": \"softmax\", \"norm_topk_prob\": true, \"rope_dimension_sections\": [11, 11, 10, 0], \"ssm_conv_kernel\": 4, \"ssm_state_size\": 128, \"ssm_group_count\": 16, \"ssm_time_step_rank\": 32, \"ssm_inner_size\": 4096, \"loop_core_start\": 4, \"loop_core_end\": 12, \"loop_num_passes\": 3, \"loop_gate_rank\": 64, \"is_varloop\": true, \"n_layers_per_attn_res_block\": 4, \"unpadded_vocab_size\": 200058, \"mlp_gate_softcap\": 15.0, \"mlp_up_softcap\": 15.0, \"final_logit_softcap\": 30.0, \"target_layers\": [3, 7, 11], \"block_size\": 16, \"has_markov_context\": true}"
+    do {
+        let cfg.ModelConfig c ← cfg.parse_json(raw)
+        assert c.mlp_only_layers.length() ≡ 2 and c.mlp_only_layers[1] ≡ 1
+        assert (c.leading_dense_block_count coalesce 0) ≡ 2
+        assert (c.softmax_type coalesce "") ≡ "zero_sink"
+        assert (c.num_local_experts coalesce 0) ≡ 256
+        assert (c.num_experts_per_tok coalesce 0) ≡ 8
+        assert (c.num_shared_experts coalesce 0) ≡ 1
+        assert (c.expert_gating_func coalesce "") ≡ "softmax"
+        assert (c.norm_topk_prob coalesce false) ≡ true
+
+        assert c.rope_dimension_sections.length() ≡ 4 and c.rope_dimension_sections[0] ≡ 11
+        assert (c.ssm_conv_kernel coalesce 0) ≡ 4
+        assert (c.ssm_state_size coalesce 0) ≡ 128
+        assert (c.ssm_group_count coalesce 0) ≡ 16
+        assert (c.ssm_time_step_rank coalesce 0) ≡ 32
+        assert (c.ssm_inner_size coalesce 0) ≡ 4096
+
+        assert (c.loop_core_start coalesce 0) ≡ 4
+        assert (c.loop_core_end coalesce 0) ≡ 12
+        assert (c.loop_num_passes coalesce 0) ≡ 3
+        assert (c.loop_gate_rank coalesce 0) ≡ 64
+        assert c.is_varloop ≡ true
+        assert (c.n_layers_per_attn_res_block coalesce 0) ≡ 4
+        assert (c.unpadded_vocab_size coalesce 0) ≡ 200058
+        assert (c.final_logit_softcap coalesce (0.0 ∷ f32)) ≻ (29.0 ∷ f32)
+
+        assert c.target_layers.length() ≡ 3 and c.target_layers[2] ≡ 11
+        assert (c.block_size coalesce 0) ≡ 16
+        assert c.has_markov_context ≡ true
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "ModelConfig parse_hf_quant_config parses ModelOpt overrides and exclusions" {
+    let string raw ← "{\"producer\": {\"name\": \"modelopt\"}, \"quantization\": {\"quant_algo\": \"NVFP4\", \"group_size\": 16, \"exclude_modules\": [\"lm_head\", \"*mlp.gate*\"], \"quantized_layers\": {\"model.layers.0.self_attn.q_proj\": {\"quant_algo\": \"FP8\", \"bits\": 8}, \"model.layers.0.mlp.down_proj\": \"NONE\"}}}"
+    do {
+        let cfg.HfQuantConfig hq ← cfg.parse_hf_quant_config(raw)
+        assert (hq.base.mode coalesce "") ≡ "NVFP4"
+        assert (hq.base.group_size coalesce 0) ≡ 16
+        assert hq.exclude_modules.length() ≡ 2
+        assert hq.overrides.length() ≡ 2
+
+        let cfg.TensorQuantOverride ∪ none q_ov ← cfg.resolve_tensor_quant(hq, "model.layers.0.self_attn.q_proj.weight")
+        assert q_ov is cfg.TensorQuantOverride
+        if q_ov is cfg.TensorQuantOverride {
+            assert (q_ov.quant_algo coalesce "") ≡ "FP8"
+            assert not q_ov.excluded
+        }
+
+        let cfg.TensorQuantOverride ∪ none d_ov ← cfg.resolve_tensor_quant(hq, "model.layers.0.mlp.down_proj.weight")
+        assert d_ov is cfg.TensorQuantOverride
+        if d_ov is cfg.TensorQuantOverride {
+            assert d_ov.excluded
+        }
+
+        let cfg.TensorQuantOverride ∪ none gate_ov ← cfg.resolve_tensor_quant(hq, "model.layers.1.mlp.gate.weight")
+        assert gate_ov is cfg.TensorQuantOverride
+        if gate_ov is cfg.TensorQuantOverride {
+            assert gate_ov.excluded
+        }
+
+        assert cfg.resolve_tensor_quant(hq, "model.layers.1.self_attn.v_proj.weight") is none
     }
     catch err {
         assert false
