@@ -39,6 +39,15 @@ locale = "en"
 # Calls `decode_step` kernels in sequence so the host stays allocation-free and
 # blocking-free across layers. Both the convenience `*_step` entrypoints and
 # the streaming `layer_wide` launch natively on Metal GPU and Cranelift CPU.
+#
+# Every multi-launch sequence (`prime_workspace`, `layer_step`, `layer_wide`,
+# `head_step`, `head_wide`) runs inside one `do device` region: a checked
+# device-resident block with no host work between launches (gradus #75).
+# `faber check --device` reports each region's inputs, in-outs and host-sync
+# count; the checked region is the seam the compiler lowers as one
+# kernel-of-kernels unit when a target synthesizes batched launches. Greedy
+# token selection uses `argmax_token`, which leaves the id on the device and
+# reads back 4 bytes; `argmax_host` stays as the host-side reference form.
 
 import from "gradus:decode_step" let ds
 
@@ -115,89 +124,92 @@ class Workspace<size D, size QD, size KVD, size F, size H, size C, size P> {
     mut tensor<f32, [F]> act
 }
 
-# Embedding lookup: hidden[D] <- embed[ids[0], :].
+# Embedding lookup: hidden[D] <- embed[ids[0], :]. Delegates to the wide
+# gather, which uses the output row as its own lane domain, so the step
+# allocates no dummy domain tensor.
 @ public
 fn embed_step<size V, size D>(tensor<f32, [V, D]> embed, tensor<i32, [1]> ids, mut tensor<f32, [D]> hidden) → void {
-    let tensor<f32, [D]> dom ← tf32[D] {}
-    ds.gather_row(dom, embed, ids, mut hidden)
+    ds.gather_wide(embed, ids, mut hidden)
 }
 
 # Transformer layer block: hout = layer(hin) at the slot's position, updating
 # the slot's KV rows. Convenience path with internal scratch; for
 # zero-allocation multi-layer streaming under `--strict-engine`, use
-# `layer_wide`.
+# `layer_wide`. The scratch tensors are allocated up front and the whole
+# launch sequence runs inside one `do device` region (checked device-resident;
+# no host work between launches).
 @ public
 fn layer_step<size D, size QD, size KVD, size F, size H, size C>(tensor<f32, [H, C]> hcdom, tensor<f32, [D]> hin, mut tensor<f32, [D]> hout, LayerWeights<D, QD, KVD, F> lw, mut SlotView<C, KVD> sv, LayerParams lp) → void {
     let i32 tpos ← sv.pos
     mut tensor<f32, [D]> an ← tf32[D] {}
-    ds.rmsnorm(hin, lw.anorm, mut an, lp.peps)
-
     mut tensor<f32, [QD]> q ← tf32[QD] {}
     mut tensor<f32, [KVD]> k ← tf32[KVD] {}
     mut tensor<f32, [KVD]> v ← tf32[KVD] {}
-    ds.qkv_proj(lw.wq, lw.wk, lw.wv, an, mut q, mut k, mut v)
-
-    if lw.qkv_bias {
-        ds.add_bias(lw.bq, mut q)
-        ds.add_bias(lw.bk, mut k)
-        ds.add_bias(lw.bv, mut v)
-    }
-
     mut tensor<f32, [QD]> qr ← tf32[QD] {}
     mut tensor<f32, [KVD]> kr ← tf32[KVD] {}
-
     let tensor<f32, [QD]> qdom ← tf32[QD] {}
     mut tensor<f32, [H, C]> sc ← tf32[H, C] {}
     mut tensor<f32, [H, C]> pr ← tf32[H, C] {}
     mut tensor<f32, [QD]> ctx ← tf32[QD] {}
-
-    match lp.prope {
-        case RopeKind.None {
-            ds.kv_write_kv(k, v, mut sv.kin, mut sv.vin, tpos)
-            ds.attn_scores(hcdom, q, sv.kin, mut sc, tpos, lp.pgroup, lp.pdh, lp.pscale)
-        }
-        case RopeKind.Half {
-            ds.rope_half(q, mut qr, tpos, lp.pspan, lp.plntheta)
-            ds.rope_half(k, mut kr, tpos, lp.pspan, lp.plntheta)
-            ds.kv_write_kv(kr, v, mut sv.kin, mut sv.vin, tpos)
-            ds.attn_scores(hcdom, qr, sv.kin, mut sc, tpos, lp.pgroup, lp.pdh, lp.pscale)
-        }
-        case RopeKind.Pairs {
-            ds.rope_pairs(q, mut qr, tpos, lp.pspan, lp.plntheta)
-            ds.rope_pairs(k, mut kr, tpos, lp.pspan, lp.plntheta)
-            ds.kv_write_kv(kr, v, mut sv.kin, mut sv.vin, tpos)
-            ds.attn_scores(hcdom, qr, sv.kin, mut sc, tpos, lp.pgroup, lp.pdh, lp.pscale)
-        }
-    }
-
-    ds.row_softmax(sc, mut pr)
-    ds.attn_context(qdom, pr, sv.vin, mut ctx, tpos, lp.pgroup, lp.pdh)
-
     mut tensor<f32, [D]> ao ← tf32[D] {}
     mut tensor<f32, [D]> h1 ← tf32[D] {}
-    ds.gemv(lw.wo, ctx, mut ao)
-    ds.residual_add(hin, ao, mut h1)
-
     mut tensor<f32, [D]> fnx ← tf32[D] {}
-    ds.rmsnorm(h1, lw.fnorm, mut fnx, lp.peps)
-
     mut tensor<f32, [F]> gate ← tf32[F] {}
     mut tensor<f32, [F]> up ← tf32[F] {}
     mut tensor<f32, [F]> act ← tf32[F] {}
     mut tensor<f32, [D]> down ← tf32[D] {}
-    ds.gate_up_proj(lw.wg, lw.wu, fnx, mut gate, mut up)
-    ds.swiglu(gate, up, mut act)
-    ds.gemv(lw.wd, act, mut down)
-    ds.residual_add(h1, down, mut hout)
+
+    do device {
+        ds.rmsnorm(hin, lw.anorm, mut an, lp.peps)
+        ds.qkv_proj(lw.wq, lw.wk, lw.wv, an, mut q, mut k, mut v)
+
+        if lw.qkv_bias {
+            ds.add_bias(lw.bq, mut q)
+            ds.add_bias(lw.bk, mut k)
+            ds.add_bias(lw.bv, mut v)
+        }
+
+        match lp.prope {
+            case RopeKind.None {
+                ds.kv_write_kv(k, v, mut sv.kin, mut sv.vin, tpos)
+                ds.attn_scores(hcdom, q, sv.kin, mut sc, tpos, lp.pgroup, lp.pdh, lp.pscale)
+            }
+            case RopeKind.Half {
+                ds.rope_half(q, mut qr, tpos, lp.pspan, lp.plntheta)
+                ds.rope_half(k, mut kr, tpos, lp.pspan, lp.plntheta)
+                ds.kv_write_kv(kr, v, mut sv.kin, mut sv.vin, tpos)
+                ds.attn_scores(hcdom, qr, sv.kin, mut sc, tpos, lp.pgroup, lp.pdh, lp.pscale)
+            }
+            case RopeKind.Pairs {
+                ds.rope_pairs(q, mut qr, tpos, lp.pspan, lp.plntheta)
+                ds.rope_pairs(k, mut kr, tpos, lp.pspan, lp.plntheta)
+                ds.kv_write_kv(kr, v, mut sv.kin, mut sv.vin, tpos)
+                ds.attn_scores(hcdom, qr, sv.kin, mut sc, tpos, lp.pgroup, lp.pdh, lp.pscale)
+            }
+        }
+
+        ds.row_softmax(sc, mut pr)
+        ds.attn_context(qdom, pr, sv.vin, mut ctx, tpos, lp.pgroup, lp.pdh)
+        ds.gemv(lw.wo, ctx, mut ao)
+        ds.residual_add(hin, ao, mut h1)
+        ds.rmsnorm(h1, lw.fnorm, mut fnx, lp.peps)
+        ds.gate_up_proj(lw.wg, lw.wu, fnx, mut gate, mut up)
+        ds.swiglu(gate, up, mut act)
+        ds.gemv(lw.wd, act, mut down)
+        ds.residual_add(h1, down, mut hout)
+    }
 }
 
 # logits[V] = head @ rmsnorm(hidden) (tied head: pass the embedding table;
-# untied: pass the model's lm_head).
+# untied: pass the model's lm_head). The scratch tensor is allocated up front
+# and the two launches run inside one `do device` region.
 @ public
 fn head_step<size V, size D>(tensor<f32, [D]> hidden, tensor<f32, [D]> onorm, tensor<f32, [V, D]> head, mut tensor<f32, [V]> logits, f32 peps) → void {
     mut tensor<f32, [D]> hn ← tf32[D] {}
-    ds.rmsnorm(hidden, onorm, mut hn, peps)
-    ds.gemv(head, hn, mut logits)
+    do device {
+        ds.rmsnorm(hidden, onorm, mut hn, peps)
+        ds.gemv(head, hn, mut logits)
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -207,67 +219,74 @@ fn head_step<size V, size D>(tensor<f32, [D]> hidden, tensor<f32, [D]> onorm, te
 # QKV/gate+up, native RMSNorm and softmax, and split-K attention context over
 # `P` parallel partitions.
 # ---------------------------------------------------------------------------
-# Prime every scratch tensor written by `layer_wide` and `head_wide`.
+# Prime every scratch tensor written by `layer_wide` and `head_wide`. The
+# priming launches run inside one `do device` region.
 @ public
 fn prime_workspace<size D, size QD, size KVD, size F, size H, size C, size P>(Workspace<D, QD, KVD, F, H, C, P> ws, mut tensor<f32, [1]> sink) → void {
-    ds.prime1(ws.xn, mut sink)
-    ds.prime1(ws.q, mut sink)
-    ds.prime1(ws.qr, mut sink)
-    ds.prime1(ws.k, mut sink)
-    ds.prime1(ws.kr, mut sink)
-    ds.prime1(ws.v, mut sink)
-    ds.prime2(ws.sc, mut sink)
-    ds.prime2(ws.pr, mut sink)
-    ds.prime2(ws.cp, mut sink)
-    ds.prime1(ws.ctx, mut sink)
-    ds.prime1(ws.h1, mut sink)
-    ds.prime1(ws.gate, mut sink)
-    ds.prime1(ws.up, mut sink)
-    ds.prime1(ws.act, mut sink)
+    do device {
+        ds.prime1(ws.xn, mut sink)
+        ds.prime1(ws.q, mut sink)
+        ds.prime1(ws.qr, mut sink)
+        ds.prime1(ws.k, mut sink)
+        ds.prime1(ws.kr, mut sink)
+        ds.prime1(ws.v, mut sink)
+        ds.prime2(ws.sc, mut sink)
+        ds.prime2(ws.pr, mut sink)
+        ds.prime2(ws.cp, mut sink)
+        ds.prime1(ws.ctx, mut sink)
+        ds.prime1(ws.h1, mut sink)
+        ds.prime1(ws.gate, mut sink)
+        ds.prime1(ws.up, mut sink)
+        ds.prime1(ws.act, mut sink)
+    }
 }
 
 # One layer: hout = layer(hin) at the slot's position, zero host allocations.
+# The whole launch sequence runs inside one `do device` region (checked
+# device-resident; no host work between launches).
 @ public
 fn layer_wide<size D, size QD, size KVD, size F, size H, size C, size P>(tensor<f32, [D]> hin, mut tensor<f32, [D]> hout, LayerWeights<D, QD, KVD, F> lw, mut SlotView<C, KVD> sv, LayerParams lp, mut Workspace<D, QD, KVD, F, H, C, P> ws) → void {
     let i32 tpos ← sv.pos
-    ds.rmsnorm(hin, lw.anorm, mut ws.xn, lp.peps)
-    ds.qkv_proj(lw.wq, lw.wk, lw.wv, ws.xn, mut ws.q, mut ws.k, mut ws.v)
+    do device {
+        ds.rmsnorm(hin, lw.anorm, mut ws.xn, lp.peps)
+        ds.qkv_proj(lw.wq, lw.wk, lw.wv, ws.xn, mut ws.q, mut ws.k, mut ws.v)
 
-    if lw.qkv_bias {
-        ds.add_bias(lw.bq, mut ws.q)
-        ds.add_bias(lw.bk, mut ws.k)
-        ds.add_bias(lw.bv, mut ws.v)
+        if lw.qkv_bias {
+            ds.add_bias(lw.bq, mut ws.q)
+            ds.add_bias(lw.bk, mut ws.k)
+            ds.add_bias(lw.bv, mut ws.v)
+        }
+
+        match lp.prope {
+            case RopeKind.None {
+                ds.kv_write_kv(ws.k, ws.v, mut sv.kin, mut sv.vin, tpos)
+                ds.attn_scores(ws.hcdom, ws.q, sv.kin, mut ws.sc, tpos, lp.pgroup, lp.pdh, lp.pscale)
+            }
+            case RopeKind.Half {
+                ds.rope_half(ws.q, mut ws.qr, tpos, lp.pspan, lp.plntheta)
+                ds.rope_half(ws.k, mut ws.kr, tpos, lp.pspan, lp.plntheta)
+                ds.kv_write_kv(ws.kr, ws.v, mut sv.kin, mut sv.vin, tpos)
+                ds.attn_scores(ws.hcdom, ws.qr, sv.kin, mut ws.sc, tpos, lp.pgroup, lp.pdh, lp.pscale)
+            }
+            case RopeKind.Pairs {
+                ds.rope_pairs(ws.q, mut ws.qr, tpos, lp.pspan, lp.plntheta)
+                ds.rope_pairs(ws.k, mut ws.kr, tpos, lp.pspan, lp.plntheta)
+                ds.kv_write_kv(ws.kr, ws.v, mut sv.kin, mut sv.vin, tpos)
+                ds.attn_scores(ws.hcdom, ws.qr, sv.kin, mut ws.sc, tpos, lp.pgroup, lp.pdh, lp.pscale)
+            }
+        }
+
+        ds.row_softmax(ws.sc, mut ws.pr)
+        ds.context_part(ws.cpdom, ws.pr, sv.vin, mut ws.cp, tpos, lp.pgroup, lp.pdh)
+        ds.context_fin(ws.qdom, ws.cp, mut ws.ctx)
+        ds.gemv(lw.wo, ws.ctx, mut ws.xn)
+        ds.residual_add(hin, ws.xn, mut ws.h1)
+        ds.rmsnorm(ws.h1, lw.fnorm, mut ws.xn, lp.peps)
+        ds.gate_up_proj(lw.wg, lw.wu, ws.xn, mut ws.gate, mut ws.up)
+        ds.swiglu(ws.gate, ws.up, mut ws.act)
+        ds.gemv(lw.wd, ws.act, mut ws.xn)
+        ds.residual_add(ws.h1, ws.xn, mut hout)
     }
-
-    match lp.prope {
-        case RopeKind.None {
-            ds.kv_write_kv(ws.k, ws.v, mut sv.kin, mut sv.vin, tpos)
-            ds.attn_scores(ws.hcdom, ws.q, sv.kin, mut ws.sc, tpos, lp.pgroup, lp.pdh, lp.pscale)
-        }
-        case RopeKind.Half {
-            ds.rope_half(ws.q, mut ws.qr, tpos, lp.pspan, lp.plntheta)
-            ds.rope_half(ws.k, mut ws.kr, tpos, lp.pspan, lp.plntheta)
-            ds.kv_write_kv(ws.kr, ws.v, mut sv.kin, mut sv.vin, tpos)
-            ds.attn_scores(ws.hcdom, ws.qr, sv.kin, mut ws.sc, tpos, lp.pgroup, lp.pdh, lp.pscale)
-        }
-        case RopeKind.Pairs {
-            ds.rope_pairs(ws.q, mut ws.qr, tpos, lp.pspan, lp.plntheta)
-            ds.rope_pairs(ws.k, mut ws.kr, tpos, lp.pspan, lp.plntheta)
-            ds.kv_write_kv(ws.kr, ws.v, mut sv.kin, mut sv.vin, tpos)
-            ds.attn_scores(ws.hcdom, ws.qr, sv.kin, mut ws.sc, tpos, lp.pgroup, lp.pdh, lp.pscale)
-        }
-    }
-
-    ds.row_softmax(ws.sc, mut ws.pr)
-    ds.context_part(ws.cpdom, ws.pr, sv.vin, mut ws.cp, tpos, lp.pgroup, lp.pdh)
-    ds.context_fin(ws.qdom, ws.cp, mut ws.ctx)
-    ds.gemv(lw.wo, ws.ctx, mut ws.xn)
-    ds.residual_add(hin, ws.xn, mut ws.h1)
-    ds.rmsnorm(ws.h1, lw.fnorm, mut ws.xn, lp.peps)
-    ds.gate_up_proj(lw.wg, lw.wu, ws.xn, mut ws.gate, mut ws.up)
-    ds.swiglu(ws.gate, ws.up, mut ws.act)
-    ds.gemv(lw.wd, ws.act, mut ws.xn)
-    ds.residual_add(ws.h1, ws.xn, mut hout)
 }
 
 # hidden[D] <- embed[ids[0], :] (the id is read on the device).
@@ -277,16 +296,33 @@ fn embed_wide<size V, size D>(tensor<f32, [V, D]> embed, tensor<i32, [1]> ids, m
 }
 
 # logits[V] = head @ rmsnorm(hidden), reusing the normalized scratch `hn`.
-# Tied head: pass the embedding table as `head`; untied: pass `lm_head`.
+# Tied head: pass the embedding table as `head`; untied: pass `lm_head`. The
+# two launches run inside one `do device` region.
 @ public
 fn head_wide<size V, size D>(tensor<f32, [D]> hidden, tensor<f32, [D]> onorm, tensor<f32, [V, D]> head, mut tensor<f32, [D]> hn, mut tensor<f32, [V]> logits, f32 peps) → void {
-    ds.rmsnorm(hidden, onorm, mut hn, peps)
-    ds.gemv(head, hn, mut logits)
+    do device {
+        ds.rmsnorm(hidden, onorm, mut hn, peps)
+        ds.gemv(head, hn, mut logits)
+    }
 }
 
-# Greedy pick on the host: the index of the largest logit (first on ties). The
-# streaming path uses `decode_step.argmax_token` instead, which leaves the id
-# on the device.
+# Greedy pick on the device: launches `decode_step.argmax_token` and reads
+# back the 4-byte id instead of the whole logits row (the host loop in
+# `argmax_host` reads one element per comparison, so a V-row readback costs V
+# waits; this costs one). Ties keep the lowest index, the same contract as
+# `argmax_host`. This is the token-selection path for the record contract:
+# the logits stay on the device and only the id crosses to the host.
+@ public
+fn argmax_token<size V>(tensor<f32, [V]> logits) → int {
+    mut tensor<i32, [1]> id ← tensor<i32, [1]> {}
+    ds.argmax_token(logits, mut id)
+    return id[0] ↦ int
+}
+
+# Greedy pick on the host: the index of the largest logit (first on ties).
+# Host-side convenience and reference form — it reads the logits row back one
+# element at a time. Token selection uses `argmax_token`, which runs
+# `decode_step.argmax_token` on the device and reads back the 4-byte id.
 @ public
 fn argmax_host<size V>(tensor<f32, [V]> logits) → int {
     mut int best ← 0
@@ -332,6 +368,17 @@ test "decode_token argmax_host picks the largest logit, first on ties" {
     lg[[3]] ← -1.0
     lg[[4]] ← 1.0
     assert argmax_host(lg) ≡ 1
+}
+
+test "decode_token argmax_token matches argmax_host on the device, first on ties" {
+    mut tensor<f32, [5]> lg ← tf32[5] {}
+    lg[[0]] ← 0.5
+    lg[[1]] ← 2.0
+    lg[[2]] ← 2.0
+    lg[[3]] ← -1.0
+    lg[[4]] ← 1.0
+    assert argmax_token(lg) ≡ argmax_host(lg)
+    assert argmax_token(lg) ≡ 1
 }
 
 test "decode_token head_step is the tied lm_head over the normalised hidden" {
