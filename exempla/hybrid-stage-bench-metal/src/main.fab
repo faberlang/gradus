@@ -1,0 +1,354 @@
++++ toml
+locale = "en"
+
++++ faber
+# hybrid-stage-bench-metal: timed #138 Seam-5 hybrid/esoteric Metal ladder rung
+#   - O(C) sink softmax (`row_softmax_sink`, H=32, C=1024)
+#   - O(dim^2) DeltaNet recurrence (`deltanet_gates` + `delta_net_update` + `delta_net_readout`, VH=16, dim=128)
+#   - O(dh) two-pass per-head RMSNorm (`rmsnorm_heads_inv` + `rmsnorm_heads_apply`, H=32, DH=128)
+#   - Query-tiled batched prefill (`layer_batch_tiled`, B=32, TileB=8, D=256, F=512, H=4, C=64)
+#
+#   faber run exempla/hybrid-stage-bench-metal --library-home <gradus parent> --device metal
+
+import from "gradus:decode_hybrid_kernels" let dhk
+import from "gradus:decode_step" let ds
+import from "gradus:decode_token" let dt
+import from "norma:time" let time
+
+const int CALLS_PER_PASS = 64
+const int TILED_CALLS_PER_PASS = 16
+const int PASSES = 6
+
+@ public
+kernel synth_f32_mat<size R, size C>(tensor<f32, [R, C]> dom, mut tensor<f32, [R, C]> out, i32 seed, f32 amp) → void {
+    for from dom at [r, c] thread lane let ? {
+        let i32 rr ← r ↦ i32
+        let i32 cc ← c ↦ i32
+        if rr ≥ 0 and rr ≤ 65536 and cc ≥ 0 and cc ≤ 65536 and seed ≥ 0 and seed ≤ 65536 {
+            let i32 a ← (rr * 31 + cc * 17 + seed) % 65521
+            let f32 h ← ((a ↦ f32) + 0.5) * 0.7123
+            out[[r, c]] ← h.sin() * amp
+        }
+    }
+}
+
+@ public
+kernel synth_f32_vec<size N>(tensor<f32, [N]> dom, mut tensor<f32, [N]> out, i32 seed, f32 amp) → void {
+    for from dom at [i] thread lane let ? {
+        let i32 ii ← i ↦ i32
+        if ii ≥ 0 and ii ≤ 65536 and seed ≥ 0 and seed ≤ 65536 {
+            let i32 a ← (ii * 19 + seed) % 65521
+            let f32 h ← ((a ↦ f32) + 0.5) * 0.7123
+            out[[i]] ← h.sin() * amp
+        }
+    }
+}
+
+fn oracle_sink_softmax_row(tensor<f32, [32, 1024]> rsi, tensor<f32, [32]> rsink, int h, int c) → f32 {
+    mut f32 m ← rsink[[h]]
+    for range 0 ‥ 1024 let k {
+        let f32 v ← rsi[[h, k]]
+        if v ≻ m { m ← v }
+    }
+    mut f32 denom ← (rsink[[h]] - m).exp()
+    for range 0 ‥ 1024 let k {
+        denom ← denom + (rsi[[h, k]] - m).exp()
+    }
+    return (rsi[[h, c]] - m).exp() / denom
+}
+
+fn oracle_deltanet_readout_row(tensor<f32, [2048, 128]> prev_state, tensor<f32, [2048]> q, tensor<f32, [2048]> k, tensor<f32, [2048]> v, tensor<f32, [16]> alpha, tensor<f32, [16]> dt_bias, tensor<f32, [16]> a_row, tensor<f32, [16]> beta_raw, int r) → f32 {
+    let int dim ← 128
+    let int h ← r / dim
+    let int hbase ← h * dim
+    let f32 beta_h ← 1.0 / (1.0 + (-beta_raw[[h]]).exp())
+    let f32 ab ← alpha[[h]] + dt_bias[[h]]
+    let f32 sp ← ab ≻ 20.0 ✓ ab ✗ (1.0 + ab.exp()).ln()
+    let f32 dec_h ← (sp * a_row[[h]]).exp()
+
+    mut f32 dot_k ← 0.0
+    for range 0 ‥ dim let kk {
+        dot_k ← dot_k + prev_state[[r, kk]] * dec_h * k[[hbase + kk]]
+    }
+    let f32 delta_rj ← (v[[r]] - dot_k) * beta_h
+
+    mut f32 acc ← 0.0
+    for range 0 ‥ dim let i {
+        let f32 ns ← prev_state[[r, i]] * dec_h + k[[hbase + i]] * delta_rj
+        acc ← acc + ns * q[[hbase + i]]
+    }
+    return acc / (√ (dim ↦ f32))
+}
+
+fn oracle_rmsnorm_head_elem(tensor<f32, [4096]> x, tensor<f32, [128]> w, int j, f32 eps) → f32 {
+    let int dh ← 128
+    let int d ← j % dh
+    let int base ← j - d
+    mut f32 acc ← 0.0
+    for range 0 ‥ dh let k {
+        let f32 xv ← x[[base + k]]
+        acc ← acc + xv * xv
+    }
+    let f32 inv ← 1.0 / (√ (acc / (dh ↦ f32) + eps))
+    return x[[j]] * inv * w[[d]]
+}
+
+fn print_bench(string name, int pass_no, int calls, int elapsed_ns, int bytes_per_call) → void {
+    let int us_per_call ← elapsed_ns / calls / 1000
+    let f64 gbps ← ((bytes_per_call * calls) ↦ f64) ÷ (elapsed_ns ↦ f64)
+    print "§0 pass=§1 calls=§2 ns=§3 us_per_call=§4 gbps=§5"(name, pass_no, calls, elapsed_ns, us_per_call, gbps)
+}
+
+fn print_tok_bench(string name, int pass_no, int calls, int elapsed_ns, int tokens_per_call) → void {
+    let int us_per_call ← elapsed_ns / calls / 1000
+    let f64 tok_s ← ((tokens_per_call * calls) ↦ f64) * 1000000000.0 ÷ (elapsed_ns ↦ f64)
+    print "§0 pass=§1 calls=§2 ns=§3 us_per_call=§4 tok_s=§5"(name, pass_no, calls, elapsed_ns, us_per_call, tok_s)
+}
+
+main {
+    mut tensor<f32, [1]> sink ← tf32[1] {}
+
+    # === 1. O(C) sink softmax: H=32, C=1024 ===
+    let tensor<f32, [32, 1024]> d_rsi ← tf32[32, 1024] {}
+    mut tensor<f32, [32, 1024]> rsi ← tf32[32, 1024] {}
+    synth_f32_mat(d_rsi, mut rsi, 11 ∷ i32, 1.5 ∷ f32)
+
+    let tensor<f32, [32]> d_rsink ← tf32[32] {}
+    mut tensor<f32, [32]> rsink ← tf32[32] {}
+    synth_f32_vec(d_rsink, mut rsink, 17 ∷ i32, 0.5 ∷ f32)
+
+    mut tensor<f32, [32, 1024]> rso ← tf32[32, 1024] {}
+    ds.prime2(rso, mut sink)
+
+    let int bytes_sink_softmax ← (32 * 1024 * 2 + 32) * 4
+
+    for exclusive PASSES let pass_no {
+        let int started ← time.monotonic()
+        for exclusive CALLS_PER_PASS let ? {
+            dhk.row_softmax_sink(rsi, rsink, mut rso)
+        }
+        let f32 sync_sm ← rso[[0, 0]]
+        let int elapsed ← time.monotonic() - started
+        if pass_no ≡ 1 {
+            mut f32 max_err ← 0.0
+            for range 0 ‥ 4 let h {
+                for range 0 ‥ 8 let c {
+                    let f32 err ← (rso[[h, c]] - oracle_sink_softmax_row(rsi, rsink, h, c)).abs()
+                    if err ≻ max_err { max_err ← err }
+                }
+            }
+            print "verify_sink_softmax row0=§0 max_err=§1"(sync_sm, max_err)
+            assert max_err ≺ 0.0001
+        }
+        print_bench("bench_sink_softmax", pass_no, CALLS_PER_PASS, elapsed, bytes_sink_softmax)
+    }
+
+    # === 2. O(dim^2) DeltaNet recurrence: VH=16, RecCols=128, RecRows=2048 ===
+    let tensor<f32, [2048, 128]> d_state ← tf32[2048, 128] {}
+    mut tensor<f32, [2048, 128]> prev_state ← tf32[2048, 128] {}
+    mut tensor<f32, [2048, 128]> next_state ← tf32[2048, 128] {}
+    synth_f32_mat(d_state, mut prev_state, 23 ∷ i32, 0.1 ∷ f32)
+
+    let tensor<f32, [2048]> d_dnv ← tf32[2048] {}
+    mut tensor<f32, [2048]> dn_q ← tf32[2048] {}
+    mut tensor<f32, [2048]> dn_k ← tf32[2048] {}
+    mut tensor<f32, [2048]> dn_v ← tf32[2048] {}
+    mut tensor<f32, [2048]> dn_out ← tf32[2048] {}
+    synth_f32_vec(d_dnv, mut dn_q, 29 ∷ i32, 0.25 ∷ f32)
+    synth_f32_vec(d_dnv, mut dn_k, 31 ∷ i32, 0.25 ∷ f32)
+    synth_f32_vec(d_dnv, mut dn_v, 37 ∷ i32, 0.5 ∷ f32)
+
+    let tensor<f32, [16]> d_dng ← tf32[16] {}
+    mut tensor<f32, [16]> dn_alpha ← tf32[16] {}
+    mut tensor<f32, [16]> dn_dt_bias ← tf32[16] {}
+    mut tensor<f32, [16]> dn_a_row ← tf32[16] {}
+    mut tensor<f32, [16]> dn_beta_raw ← tf32[16] {}
+    mut tensor<f32, [16]> dn_decay ← tf32[16] {}
+    mut tensor<f32, [16]> dn_beta ← tf32[16] {}
+    synth_f32_vec(d_dng, mut dn_alpha, 41 ∷ i32, 0.5 ∷ f32)
+    synth_f32_vec(d_dng, mut dn_dt_bias, 43 ∷ i32, 0.2 ∷ f32)
+    synth_f32_vec(d_dng, mut dn_a_row, 47 ∷ i32, -0.5 ∷ f32)
+    synth_f32_vec(d_dng, mut dn_beta_raw, 53 ∷ i32, 0.3 ∷ f32)
+
+    ds.prime2(next_state, mut sink)
+    ds.prime1(dn_out, mut sink)
+    ds.prime1(dn_decay, mut sink)
+    ds.prime1(dn_beta, mut sink)
+
+    let int bytes_deltanet ← (2048 * 128 * 3 + 2048 * 4 + 16 * 6) * 4
+
+    for exclusive PASSES let pass_no {
+        let int started ← time.monotonic()
+        for exclusive CALLS_PER_PASS let ? {
+            dhk.deltanet_gates(dn_alpha, dn_dt_bias, dn_a_row, dn_beta_raw, mut dn_decay, mut dn_beta)
+            dhk.delta_net_update(prev_state, dn_k, dn_v, dn_decay, dn_beta, mut next_state)
+            dhk.delta_net_readout(next_state, dn_q, mut dn_out)
+        }
+        let f32 sync_dn ← dn_out[[0]]
+        let int elapsed ← time.monotonic() - started
+        if pass_no ≡ 1 {
+            mut f32 max_err ← 0.0
+            for range 0 ‥ 8 let r {
+                let f32 err ← (dn_out[[r]] - oracle_deltanet_readout_row(prev_state, dn_q, dn_k, dn_v, dn_alpha, dn_dt_bias, dn_a_row, dn_beta_raw, r)).abs()
+                if err ≻ max_err { max_err ← err }
+            }
+            print "verify_deltanet row0=§0 max_err=§1"(sync_dn, max_err)
+            assert max_err ≺ 0.0005
+        }
+        print_bench("bench_deltanet_recurrence", pass_no, CALLS_PER_PASS, elapsed, bytes_deltanet)
+    }
+
+    # === 3. O(dh) two-pass head norm: H=32, DH=128, N=4096 ===
+    let tensor<f32, [4096]> d_hn ← tf32[4096] {}
+    mut tensor<f32, [4096]> hn_x ← tf32[4096] {}
+    mut tensor<f32, [4096]> hn_out ← tf32[4096] {}
+    synth_f32_vec(d_hn, mut hn_x, 59 ∷ i32, 1.0 ∷ f32)
+
+    let tensor<f32, [128]> d_hw ← tf32[128] {}
+    mut tensor<f32, [128]> hn_w ← tf32[128] {}
+    synth_f32_vec(d_hw, mut hn_w, 61 ∷ i32, 1.0 ∷ f32)
+
+    mut tensor<f32, [32]> hn_inv ← tf32[32] {}
+    ds.prime1(hn_inv, mut sink)
+    ds.prime1(hn_out, mut sink)
+
+    let int bytes_head_norm ← (4096 * 3 + 128 + 32 * 2) * 4
+
+    for exclusive PASSES let pass_no {
+        let int started ← time.monotonic()
+        for exclusive CALLS_PER_PASS let ? {
+            dhk.rmsnorm_heads_inv(hn_x, mut hn_inv, 128 ∷ i32, 0.00001 ∷ f32)
+            dhk.rmsnorm_heads_apply(hn_x, hn_w, hn_inv, mut hn_out)
+        }
+        let f32 sync_hn ← hn_out[[0]]
+        let int elapsed ← time.monotonic() - started
+        if pass_no ≡ 1 {
+            mut f32 max_err ← 0.0
+            for range 0 ‥ 16 let j {
+                let f32 err ← (hn_out[[j]] - oracle_rmsnorm_head_elem(hn_x, hn_w, j, 0.00001 ∷ f32)).abs()
+                if err ≻ max_err { max_err ← err }
+            }
+            print "verify_rmsnorm_heads_2pass row0=§0 max_err=§1"(sync_hn, max_err)
+            assert max_err ≺ 0.0001
+        }
+        print_bench("bench_rmsnorm_heads_2pass", pass_no, CALLS_PER_PASS, elapsed, bytes_head_norm)
+    }
+
+    # === 4. Query-tiled prefill stage (Seam-5 #138 primitives): B=32, TileB=8, H=4, D=256, F=512, C=64 ===
+    # Note: dt.layer_batch_tiled is currently blocked on Metal by qkv_proj_batch_gemm
+    # (device program constructor: TensorTranspose+GEMM recipe mix), so we compose the
+    # exact same Seam-5 query-tiled kernels (`attn_scores_query_tile`, `row_softmax`,
+    # `attn_context_query_tile`, `matmul_nt_batch`, `swiglu_batch`, `residual_add_batch`).
+    let tensor<f32, [32, 256]> d_hin ← tf32[32, 256] {}
+    mut tensor<f32, [32, 256]> hin ← tf32[32, 256] {}
+    mut tensor<f32, [32, 256]> hout_tiled ← tf32[32, 256] {}
+    synth_f32_mat(d_hin, mut hin, 71 ∷ i32, 0.25 ∷ f32)
+    ds.prime2(hout_tiled, mut sink)
+
+    let tensor<f32, [256]> d_dvec ← tf32[256] {}
+    mut tensor<f32, [256]> anorm ← tf32[256] {}
+    mut tensor<f32, [256]> fnorm ← tf32[256] {}
+    synth_f32_vec(d_dvec, mut anorm, 73 ∷ i32, 1.0 ∷ f32)
+    synth_f32_vec(d_dvec, mut fnorm, 79 ∷ i32, 1.0 ∷ f32)
+
+    let tensor<f32, [256, 256]> d_dd ← tf32[256, 256] {}
+    let tensor<f32, [128, 256]> d_kd ← tf32[128, 256] {}
+    let tensor<f32, [512, 256]> d_fd ← tf32[512, 256] {}
+    let tensor<f32, [256, 512]> d_df ← tf32[256, 512] {}
+    mut tensor<f32, [256, 256]> wq ← tf32[256, 256] {}
+    mut tensor<f32, [128, 256]> wk ← tf32[128, 256] {}
+    mut tensor<f32, [128, 256]> wv ← tf32[128, 256] {}
+    mut tensor<f32, [256, 256]> wo ← tf32[256, 256] {}
+    mut tensor<f32, [512, 256]> wg ← tf32[512, 256] {}
+    mut tensor<f32, [512, 256]> wu ← tf32[512, 256] {}
+    mut tensor<f32, [256, 512]> wd ← tf32[256, 512] {}
+    synth_f32_mat(d_dd, mut wq, 83 ∷ i32, 0.05 ∷ f32)
+    synth_f32_mat(d_kd, mut wk, 89 ∷ i32, 0.05 ∷ f32)
+    synth_f32_mat(d_kd, mut wv, 97 ∷ i32, 0.05 ∷ f32)
+    synth_f32_mat(d_dd, mut wo, 101 ∷ i32, 0.05 ∷ f32)
+    synth_f32_mat(d_fd, mut wg, 103 ∷ i32, 0.05 ∷ f32)
+    synth_f32_mat(d_fd, mut wu, 107 ∷ i32, 0.05 ∷ f32)
+    synth_f32_mat(d_df, mut wd, 109 ∷ i32, 0.05 ∷ f32)
+
+    mut tensor<f32, [64, 128]> k_cache_t ← tf32[64, 128] {}
+    mut tensor<f32, [64, 128]> v_cache_t ← tf32[64, 128] {}
+    ds.prime2(k_cache_t, mut sink)
+    ds.prime2(v_cache_t, mut sink)
+
+    let tensor<f32, [32, 64]> t_hcdom ← tf32[32, 64] {}
+    let tensor<f32, [8, 256]> t_qdom ← tf32[8, 256] {}
+    mut tensor<f32, [32, 256]> t_xn ← tf32[32, 256] {}
+    mut tensor<f32, [32, 256]> t_q ← tf32[32, 256] {}
+    mut tensor<f32, [32, 256]> t_qr ← tf32[32, 256] {}
+    mut tensor<f32, [32, 128]> t_k ← tf32[32, 128] {}
+    mut tensor<f32, [32, 128]> t_kr ← tf32[32, 128] {}
+    mut tensor<f32, [32, 128]> t_v ← tf32[32, 128] {}
+    mut tensor<f32, [32, 64]> t_sc ← tf32[32, 64] {}
+    mut tensor<f32, [32, 64]> t_pr ← tf32[32, 64] {}
+    mut tensor<f32, [32, 256]> t_ctx ← tf32[32, 256] {}
+    mut tensor<f32, [32, 256]> t_h1 ← tf32[32, 256] {}
+    mut tensor<f32, [32, 512]> t_gate ← tf32[32, 512] {}
+    mut tensor<f32, [32, 512]> t_up ← tf32[32, 512] {}
+    mut tensor<f32, [32, 512]> t_act ← tf32[32, 512] {}
+    let dt.TiledBatchWorkspace<size 32, size 8, size 32, size 256, size 256, size 128, size 512, size 4, size 64> ws_tiled ← dt.TiledBatchWorkspace<size 32, size 8, size 32, size 256, size 256, size 128, size 512, size 4, size 64> {
+        hcdom = t_hcdom, qdom = t_qdom,
+        xn = t_xn, q = t_q, qr = t_qr, k = t_k, kr = t_kr, v = t_v,
+        sc = t_sc, pr = t_pr, ctx = t_ctx, h1 = t_h1,
+        gate = t_gate, up = t_up, act = t_act
+    }
+    dt.prime_tiled_batch_workspace(ws_tiled, mut sink)
+
+    # Untiled attention scratch for parity oracle on Metal
+    let tensor<f32, [128, 64]> u_hcdom ← tf32[128, 64] {}
+    let tensor<f32, [32, 256]> u_qdom ← tf32[32, 256] {}
+    mut tensor<f32, [128, 64]> u_sc ← tf32[128, 64] {}
+    mut tensor<f32, [128, 64]> u_pr ← tf32[128, 64] {}
+    mut tensor<f32, [32, 256]> u_ctx ← tf32[32, 256] {}
+    ds.prime2(u_sc, mut sink)
+    ds.prime2(u_pr, mut sink)
+    ds.prime2(u_ctx, mut sink)
+
+    for exclusive PASSES let pass_no {
+        let int started ← time.monotonic()
+        for exclusive TILED_CALLS_PER_PASS let ? {
+            ds.rmsnorm_batch(hin, anorm, mut t_xn, 0.00001 ∷ f32)
+            ds.matmul_nt_batch(wq, t_xn, mut t_q, 32 ∷ i32, 256 ∷ i32)
+            ds.matmul_nt_batch(wk, t_xn, mut t_k, 32 ∷ i32, 256 ∷ i32)
+            ds.matmul_nt_batch(wv, t_xn, mut t_v, 32 ∷ i32, 256 ∷ i32)
+            ds.rope_pairs_batch(t_q, mut t_qr, 0 ∷ i32, 64 ∷ i32, 9.21034 ∷ f32, 32 ∷ i32)
+            ds.rope_pairs_batch(t_k, mut t_kr, 0 ∷ i32, 64 ∷ i32, 9.21034 ∷ f32, 32 ∷ i32)
+            ds.kv_write_kv_batch(t_kr, t_v, mut k_cache_t, mut v_cache_t, 0 ∷ i32, 32 ∷ i32)
+            for exclusive 4 let tile_idx {
+                let i32 qstart ← (tile_idx ↦ i32 ⊥ 0) * 8
+                ds.attn_scores_query_tile(t_hcdom, t_qr, k_cache_t, mut t_sc, 0 ∷ i32, 4 ∷ i32, 2 ∷ i32, 64 ∷ i32, 0.125 ∷ f32, 32 ∷ i32, 1 ∷ i32, qstart, 8 ∷ i32)
+                ds.row_softmax(t_sc, mut t_pr)
+                ds.attn_context_query_tile(t_qdom, t_pr, v_cache_t, mut t_ctx, 0 ∷ i32, 4 ∷ i32, 2 ∷ i32, 64 ∷ i32, 32 ∷ i32, 1 ∷ i32, qstart, 8 ∷ i32)
+            }
+            ds.matmul_nt_batch(wo, t_ctx, mut t_xn, 32 ∷ i32, 256 ∷ i32)
+            ds.residual_add_batch(hin, t_xn, mut t_h1, 32 ∷ i32)
+            ds.rmsnorm_batch(t_h1, fnorm, mut t_xn, 0.00001 ∷ f32)
+            ds.matmul_nt_batch(wg, t_xn, mut t_gate, 32 ∷ i32, 256 ∷ i32)
+            ds.matmul_nt_batch(wu, t_xn, mut t_up, 32 ∷ i32, 256 ∷ i32)
+            ds.swiglu_batch(t_gate, t_up, mut t_act, 32 ∷ i32)
+            ds.matmul_nt_batch(wd, t_act, mut t_xn, 32 ∷ i32, 512 ∷ i32)
+            ds.residual_add_batch(t_h1, t_xn, mut hout_tiled, 32 ∷ i32)
+        }
+        let f32 sync_tiled ← hout_tiled[[0, 0]]
+        let int elapsed ← time.monotonic() - started
+        if pass_no ≡ 1 {
+            ds.attn_scores_batch(u_hcdom, t_qr, k_cache_t, mut u_sc, 0 ∷ i32, 4 ∷ i32, 2 ∷ i32, 64 ∷ i32, 0.125 ∷ f32, 32 ∷ i32, 1 ∷ i32)
+            ds.row_softmax(u_sc, mut u_pr)
+            ds.attn_context_batch(u_qdom, u_pr, v_cache_t, mut u_ctx, 0 ∷ i32, 4 ∷ i32, 2 ∷ i32, 64 ∷ i32, 32 ∷ i32, 1 ∷ i32)
+            mut f32 max_err ← 0.0
+            for range 0 ‥ 32 let b {
+                for range 0 ‥ 16 let d {
+                    let f32 err ← (t_ctx[[b, d]] - u_ctx[[b, d]]).abs()
+                    if err ≻ max_err { max_err ← err }
+                }
+            }
+            print "verify_query_tiled_prefill row0=§0 max_err=§1"(sync_tiled, max_err)
+            assert max_err ≺ 0.0001
+        }
+        print_tok_bench("bench_query_tiled_prefill", pass_no, TILED_CALLS_PER_PASS, elapsed, 32)
+    }
+}
