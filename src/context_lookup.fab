@@ -29,12 +29,13 @@ class LookupBounds {
     mut int max_block
     mut int tokens_available
     mut int window_maximum
+    mut int min_suffix_length = 1
 }
 
 # Placeholder for `var LookupBounds` bindings. Not valid search state.
 @ public
 fn default() → LookupBounds {
-    return LookupBounds { max_block = 0, tokens_available = 0, window_maximum = 0 }
+    return LookupBounds { max_block = 0, tokens_available = 0, window_maximum = 0, min_suffix_length = MIN_SUFFIX_LENGTH }
 }
 
 @ public
@@ -48,34 +49,61 @@ fn minimum_suffix_length() → int {
 }
 
 # Construct the admitted search bounds. `max_block` is the existing policy
-# maximum and `tokens_available` is prompt plus accepted history. No independent
-# lookup window is admitted.
+# maximum and `tokens_available` is prompt plus accepted history.
 @ public
 fn construct_bounds(int max_block, int tokens_available) → LookupBounds ⇥ speculative.SpeculativeError {
+    return construct_bounds_with_min_suffix(max_block, tokens_available, MIN_SUFFIX_LENGTH)
+}
+
+# Construct search bounds with an explicit configurable minimum suffix length.
+@ public
+fn construct_bounds_with_min_suffix(int max_block, int tokens_available, int min_suffix_length) → LookupBounds ⇥ speculative.SpeculativeError {
+    require min_suffix_length ≥ MIN_SUFFIX_LENGTH throw variant speculative.InvalidBlockSize { message = "minimum suffix length must be at least one" }
+
     require max_block ≥ MIN_SUFFIX_LENGTH throw variant speculative.InvalidBlockSize { message = "lookup maximum block size must be at least one" }
 
-    require tokens_available ≥ 2 throw variant speculative.MalformedRequest { message = "context lookup requires at least two context tokens" }
+    if min_suffix_length ≡ MIN_SUFFIX_LENGTH {
+        require tokens_available ≥ 2 throw variant speculative.MalformedRequest { message = "context lookup requires at least two context tokens" }
+    }
+    else {
+        require tokens_available ≥ min_suffix_length + 1 throw variant speculative.MalformedRequest { message = "context lookup requires enough tokens for minimum suffix plus following token" }
+    }
 
     let int available_window ← tokens_available - MIN_SUFFIX_LENGTH
     mut int window ← max_block
+
+    if window ≺ min_suffix_length {
+        window ← min_suffix_length
+    }
 
     if window ≻ available_window {
         window ← available_window
     }
 
-    return LookupBounds { max_block = max_block, tokens_available = tokens_available, window_maximum = window }
+    return LookupBounds { max_block = max_block, tokens_available = tokens_available, window_maximum = window, min_suffix_length = min_suffix_length }
 }
 
 # Validate both constructed and manually-bound values before any helper uses
 # them. A malformed bound never silently becomes an empty proposal.
 fn validate_bounds(LookupBounds bounds) → void ⇥ speculative.SpeculativeError {
+    require bounds.min_suffix_length ≥ MIN_SUFFIX_LENGTH throw variant speculative.InvalidBlockSize { message = "minimum suffix length must be at least one" }
+
     require bounds.max_block ≥ MIN_SUFFIX_LENGTH throw variant speculative.InvalidBlockSize { message = "lookup maximum block size must be at least one" }
 
-    require bounds.tokens_available ≥ 2 throw variant speculative.MalformedRequest { message = "context lookup requires at least two context tokens" }
+    if bounds.min_suffix_length ≡ MIN_SUFFIX_LENGTH {
+        require bounds.tokens_available ≥ 2 throw variant speculative.MalformedRequest { message = "context lookup requires at least two context tokens" }
 
-    require bounds.window_maximum ≥ MIN_SUFFIX_LENGTH throw variant speculative.MalformedRequest { message = "lookup window maximum must be at least one" }
+        require bounds.window_maximum ≥ MIN_SUFFIX_LENGTH throw variant speculative.MalformedRequest { message = "lookup window maximum must be at least one" }
+    }
+    else {
+        require bounds.tokens_available ≥ bounds.min_suffix_length + 1 throw variant speculative.MalformedRequest { message = "context lookup requires enough tokens for minimum suffix plus following token" }
 
-    require bounds.window_maximum ≤ bounds.max_block throw variant speculative.MalformedRequest { message = "lookup window exceeds policy maximum" }
+        require bounds.window_maximum ≥ bounds.min_suffix_length throw variant speculative.MalformedRequest { message = "lookup window maximum must meet minimum suffix length" }
+    }
+
+    let int search_cap ← bounds.max_block ≥ bounds.min_suffix_length ✓ bounds.max_block ✗ bounds.min_suffix_length
+
+    require bounds.window_maximum ≤ search_cap throw variant speculative.MalformedRequest { message = "lookup window exceeds policy maximum" }
 
     require bounds.window_maximum ≤ bounds.tokens_available - MIN_SUFFIX_LENGTH throw variant speculative.MalformedRequest { message = "lookup window exceeds available context" }
 }
@@ -88,7 +116,7 @@ fn suffix_lengths(LookupBounds bounds) → list<int> ⇥ speculative.Speculative
     mut list<int> lengths ← empty
     mut int length ← bounds.window_maximum
 
-    while length ≥ MIN_SUFFIX_LENGTH {
+    while length ≥ bounds.min_suffix_length {
         lengths.append(length)
         length ← length - 1
     }
@@ -104,7 +132,12 @@ fn following_source_index(LookupBounds bounds, int source_offset, int match_leng
 
     require source_offset ≥ 0 throw variant speculative.MalformedRequest { message = "match source offset must be non-negative" }
 
-    require match_length ≥ MIN_SUFFIX_LENGTH throw variant speculative.MalformedRequest { message = "match length must be at least one" }
+    if bounds.min_suffix_length ≡ MIN_SUFFIX_LENGTH {
+        require match_length ≥ MIN_SUFFIX_LENGTH throw variant speculative.MalformedRequest { message = "match length must be at least one" }
+    }
+    else {
+        require match_length ≥ bounds.min_suffix_length throw variant speculative.MalformedRequest { message = "match length must be at least minimum suffix length" }
+    }
 
     let int following ← source_offset + match_length
 
@@ -215,13 +248,22 @@ fn candidate_extension(list<int> prompt, list<int> history, int prompt_length, i
 # read, and no sampler, train, cache, or generation surface is imported.
 @ public
 fn propose(speculative.ProviderRequest request) → speculative.ProviderResult ⇥ speculative.SpeculativeError {
+    return propose_with_min_suffix(request, MIN_SUFFIX_LENGTH)
+}
+
+# Deterministic context-only provider with configurable minimum suffix match
+# length so short stopword matches do not preempt coupled MTP drafters.
+@ public
+fn propose_with_min_suffix(speculative.ProviderRequest request, int min_suffix_length) → speculative.ProviderResult ⇥ speculative.SpeculativeError {
     validate_request(request)
+    require min_suffix_length ≥ MIN_SUFFIX_LENGTH throw variant speculative.InvalidBlockSize { message = "minimum suffix length must be at least one" }
+
     let int prompt_length ← request.prompt.length()
     let int available ← prompt_length + request.history.length()
 
-    if available ≺ 2 then return speculative.no_draft()
+    if available ≺ min_suffix_length + 1 then return speculative.no_draft()
 
-    let LookupBounds bounds ← construct_bounds(request.block_size, available)
+    let LookupBounds bounds ← construct_bounds_with_min_suffix(request.block_size, available, min_suffix_length)
     let list<int> lengths ← suffix_lengths(bounds)
 
     for from lengths let match_length {
@@ -538,6 +580,36 @@ describe "SD4-U4 — no-match fallback carries no acceleration provenance" {
         match trap_result_1 {
             case returned let ? { }
             case thrown let ? { assert false }
+        }
+    }
+    test "configurable min_suffix_length ignores 1-token stopwords while admitting longer matches" {
+        let _ trap_min_suffix ← trap {
+            # Only 1-token stopword 10 repeats: min_suffix_length=1 matches, min_suffix_length=2 yields no_draft.
+            let speculative.ProviderRequest stopword_req ← request_p([10, 20, 30, 10], empty, 3)
+            let speculative.ProviderResult r1 ← context_lookup.propose_with_min_suffix(stopword_req, 1)
+            assert not speculative.is_no_draft(r1)
+            assert speculative.candidate_provenance(r1).match_length ≡ 1
+
+            let speculative.ProviderResult r2 ← context_lookup.propose_with_min_suffix(stopword_req, 2)
+            assert speculative.is_no_draft(r2)
+
+            # A 3-token suffix match still succeeds even when requested block_size=1.
+            let speculative.ProviderRequest deep_req ← request_p([10, 20, 30, 40, 10, 20, 30], empty, 1)
+            let speculative.ProviderResult r3 ← context_lookup.propose_with_min_suffix(deep_req, 3)
+            assert not speculative.is_no_draft(r3)
+            assert speculative.candidate_ids(r3) ≡ ([40] ↦ list<int>)
+            assert speculative.candidate_provenance(r3).match_length ≡ 3
+        }
+        match trap_min_suffix {
+            case returned let ? { }
+            case thrown let ? { assert false }
+        }
+        do {
+            let speculative.ProviderResult ? ← context_lookup.propose_with_min_suffix(request_p([1, 2, 1], empty, 1), 0)
+            assert false
+        }
+        catch err {
+            assert err.message ≡ "minimum suffix length must be at least one"
         }
     }
 }

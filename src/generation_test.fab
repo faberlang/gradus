@@ -50,6 +50,11 @@ import from "gradus:cache/structure" structure
 import from "gradus:generation/config" config
 import from "gradus:generation/decoder" decoder
 import from "gradus:generation/dense" dense_gen
+import from "gradus:draft_verify" draft_verify
+import from "gradus:decode_token" let dt
+import from "gradus:cache/session" let session
+import from "gradus:cache/hybrid_arenas" let hybrid
+import from "gradus:model/schedule" let model_schedule
 
 
 # ---- helpers (the loss.proba pattern)
@@ -1055,6 +1060,459 @@ describe "SD4-U4 — disabled and no-match fallback with typed rejects" {
             }
         }
         match trap_result_4 {
+            case returned let ? { }
+            case thrown let ? { assert false }
+        }
+    }
+}
+
+# =========================================================================
+# Issue #139 — generation/dense off-by-one target verify & mode/sampled gate
+# =========================================================================
+
+fn cycle_dense_cfg() → dense.DenseConfig {
+    return dense.DenseConfig { layers = 1, heads = 1, kv_heads = 1, head_dim = 4, hidden_dim = 4, vocab = 4, tied = false }
+}
+
+fn cycle_dense_engine() → dense_gen.DenseEngine {
+    return dense_gen.construct_dense_engine(cycle_dense_cfg(), 0.00001 ∷ f32, 0.5 ∷ f32, 2, corpus_rope())
+}
+
+fn cycle_eye_scaled(f32 scale) → tensor.NumericBlock {
+    mut list<f32> xs ← empty
+    for exclusive 4 let r {
+        for exclusive 4 let c {
+            xs.append(r ≡ c ✓ scale ✗ 0.0 ∷ f32)
+        }
+    }
+    return hold(xs, [4, 4])
+}
+
+fn cycle_ones4() → tensor.NumericBlock {
+    return hold([1.0 ∷ f32, 1.0 ∷ f32, 1.0 ∷ f32, 1.0 ∷ f32], [4])
+}
+
+fn cycle_lm_head() → tensor.NumericBlock {
+    # Row d selects column next(d): 0->1, 1->2, 2->0, 3->3.
+    return hold([
+        0.0 ∷ f32, 1.0 ∷ f32, 0.0 ∷ f32, 0.0 ∷ f32,
+        0.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32, 0.0 ∷ f32,
+        1.0 ∷ f32, 0.0 ∷ f32, 0.0 ∷ f32, 0.0 ∷ f32,
+        0.0 ∷ f32, 0.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32
+    ], [4, 4])
+}
+
+fn cycle_lookup(string name, int layer) → tensor.NumericBlock ⇥ dense.DenseError {
+    if name ≡ "model.embed_tokens" then return cycle_eye_scaled(1.0 ∷ f32)
+    if name ≡ "model.norm" then return cycle_ones4()
+    if name ≡ "lm_head" then return cycle_lm_head()
+    if layer ≢ 0 {
+        throw variant MissingTensor { message = "canonical tensor missing: §"(name) }
+    }
+    if name ≡ "model.layers.0.input_layernorm" then return cycle_ones4()
+    if name ≡ "model.layers.0.self_attn.q_proj" then return cycle_eye_scaled(0.01 ∷ f32)
+    if name ≡ "model.layers.0.self_attn.k_proj" then return cycle_eye_scaled(0.01 ∷ f32)
+    if name ≡ "model.layers.0.self_attn.v_proj" then return cycle_eye_scaled(0.01 ∷ f32)
+    if name ≡ "model.layers.0.self_attn.o_proj" then return cycle_eye_scaled(0.01 ∷ f32)
+    if name ≡ "model.layers.0.post_attention_layernorm" then return cycle_ones4()
+    if name ≡ "model.layers.0.mlp.gate_proj" then return cycle_eye_scaled(0.01 ∷ f32)
+    if name ≡ "model.layers.0.mlp.up_proj" then return cycle_eye_scaled(0.01 ∷ f32)
+    if name ≡ "model.layers.0.mlp.down_proj" then return cycle_eye_scaled(0.01 ∷ f32)
+    throw variant MissingTensor { message = "canonical tensor missing: §"(name) }
+}
+
+fn cycle_layers() → list<kv.KVCache> {
+    let structure.KVStructure st ← test_util.or_default(() → structure.KVStructure ⇥ kv.CacheError ∴ do {
+        let structure.LayerSet set ← structure.construct_layer_set([0], structure.dense_structure(), 1, 4)
+        mut list<structure.LayerSet> sets ← empty
+        sets.append(set)
+        return structure.construct_kv_structure(sets, structure.kv_dtype_f32(), structure.kv_dtype_f32(), structure.v_layout_transposed(), structure.sharing_single(), structure.attention_classic(), 1, 4, 16)
+    }, structure.default_kv_structure())
+    return dense.empty_caches(st, "cycle-dense", "1.0.0", "causal-rope-d4", "vocab4") ⊥ empty
+}
+
+fn cycle_cfg(config.AccelerationMode mode, f32 temperature, int max_tokens, list<int> eog_ids) → config.GenerationConfig {
+    return test_util.or_default(() → config.GenerationConfig ⇥ config.GenerationError ∴ do {
+        let config.AccelerationPolicy policy ← config.construct_acceleration("1.1.0", mode, 1, 3, 1, 3)
+        return config.construct_generation_with_policy(16, 8, max_tokens, 1, temperature, 0, 1.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32, eog_ids, policy)
+    }, config.default())
+}
+
+fn cycle_run(config.GenerationConfig g, list<int> prompt, decoder.StopPolicy stop) → list<int> ⇥ config.GenerationError {
+    return dense_gen.generate_dense_with_stop(g, prompt, cycle_dense_engine(), (string n, int s) → tensor.NumericBlock ⇥ dense.DenseError ∴ cycle_lookup(n, s), cycle_layers(), decode.fresh_cancellation(), stop)
+}
+
+fn cycle_detail(config.GenerationConfig g, list<int> prompt) → string {
+    let _ outcome ← trap {
+        cycle_run(g, prompt, decoder.eog_stop())
+    }
+    match outcome {
+        case returned let ? {
+            return "ok"
+        }
+        case thrown let err {
+            return err.message
+        }
+    }
+}
+
+describe "issue #139 — generation/dense off-by-one target verify & mode/sampled gate" {
+    test "non-constant cycle model: c0 divergence, partial accept corrective token, and full accept match disabled baseline" {
+        let _ trap_cycle ← trap {
+            # Prompt [0, 3, 2, 0]: candidate 0 is 3 (wrong: target after 0 is 1).
+            # The old off-by-one bug compared verified.logits[0] (3->3) against c0=3 and accepted 3!
+            let list<int> p_div0 ← [0, 3, 2, 0]
+            let list<int> base_div0 ← cycle_run(cycle_cfg(config.acceleration_disabled(), 0.0 ∷ f32, 6, empty), p_div0, decoder.eog_stop())
+            let list<int> acc_div0 ← cycle_run(cycle_cfg(config.acceleration_context_lookup(), 0.0 ∷ f32, 6, empty), p_div0, decoder.eog_stop())
+            assert base_div0 ≡ ([1, 2, 0, 1, 2, 0] ↦ list<int>)
+            assert acc_div0 ≡ base_div0
+
+            # Prompt [0, 1, 3, 0]: candidate block [1, 3, 0] accepts c0=1, diverges at c1=3,
+            # and emits true corrective token 2 (not c0=1 as the old :536 bug did).
+            let list<int> p_part ← [0, 1, 3, 0]
+            let list<int> base_part ← cycle_run(cycle_cfg(config.acceleration_disabled(), 0.0 ∷ f32, 6, empty), p_part, decoder.eog_stop())
+            let list<int> acc_part ← cycle_run(cycle_cfg(config.acceleration_context_lookup(), 0.0 ∷ f32, 6, empty), p_part, decoder.eog_stop())
+            assert base_part ≡ ([1, 2, 0, 1, 2, 0] ↦ list<int>)
+            assert acc_part ≡ base_part
+
+            # Prompt [0, 1, 2, 0, 1, 2]: full accept + bonus + EOG stop on [1].
+            let list<int> p_full ← [0, 1, 2, 0, 1, 2]
+            let list<int> base_full ← cycle_run(cycle_cfg(config.acceleration_disabled(), 0.0 ∷ f32, 6, empty), p_full, decoder.eog_stop())
+            let list<int> acc_full ← cycle_run(cycle_cfg(config.acceleration_context_lookup(), 0.0 ∷ f32, 6, empty), p_full, decoder.eog_stop())
+            assert base_full ≡ ([0, 1, 2, 0, 1, 2] ↦ list<int>)
+            assert acc_full ≡ base_full
+
+            let list<int> base_eog ← cycle_run(cycle_cfg(config.acceleration_disabled(), 0.0 ∷ f32, 6, [1]), p_full, decoder.eog_stop())
+            let list<int> acc_eog ← cycle_run(cycle_cfg(config.acceleration_context_lookup(), 0.0 ∷ f32, 6, [1]), p_full, decoder.eog_stop())
+            assert base_eog ≡ ([0, 1] ↦ list<int>)
+            assert acc_eog ≡ base_eog
+        }
+        match trap_cycle {
+            case returned let ? { }
+            case thrown let ? { assert false }
+        }
+    }
+    test "mode/sampled gate rejects sampled and unsupported modes instead of bypassing into context_lookup" {
+        assert cycle_detail(cycle_cfg(config.acceleration_feature_tapped(), 0.8 ∷ f32, 4, empty), [0, 1]) ≡ "sampled acceleration is not supported"
+        assert cycle_detail(cycle_cfg(config.acceleration_standalone_draft(), 0.8 ∷ f32, 4, empty), [0, 1]) ≡ "sampled acceleration is not supported"
+        assert cycle_detail(cycle_cfg(config.acceleration_pld_then_mtp(), 0.8 ∷ f32, 4, empty), [0, 1]) ≡ "sampled acceleration is not supported"
+
+        assert cycle_detail(cycle_cfg(config.acceleration_feature_tapped(), 0.0 ∷ f32, 4, empty), [0, 1]) ≡ "acceleration mode feature_tapped is not supported on generate_dense; use draft_verify"
+        assert cycle_detail(cycle_cfg(config.acceleration_standalone_draft(), 0.0 ∷ f32, 4, empty), [0, 1]) ≡ "acceleration mode standalone_draft is not supported on generate_dense; use draft_verify"
+        assert cycle_detail(cycle_cfg(config.acceleration_pld_then_mtp(), 0.0 ∷ f32, 4, empty), [0, 1]) ≡ "acceleration mode pld_then_mtp is not supported on generate_dense; use draft_verify"
+    }
+}
+
+# =========================================================================
+# Issue #139 — HybridTxn B=k verify across 5 modes & 4 arenas + arbitration
+# =========================================================================
+
+fn make_hybrid_batch_lw(bool use_bias, f32 scale) → dt.LayerWeights<4, 4, 4, 6> {
+    mut tensor<f32, [4]> an ← tf32[4] {}
+    mut tensor<f32, [4]> fn2 ← tf32[4] {}
+
+    for exclusive 4 let j {
+        an[[j]] ← 1.0
+        fn2[[j]] ← 1.0
+    }
+
+    mut tensor<f32, [4, 4]> wq ← tf32[4, 4] {}
+    mut tensor<f32, [4, 4]> wk ← tf32[4, 4] {}
+    mut tensor<f32, [4, 4]> wv ← tf32[4, 4] {}
+    mut tensor<f32, [4, 4]> wo ← tf32[4, 4] {}
+    mut tensor<f32, [6, 4]> wg ← tf32[6, 4] {}
+    mut tensor<f32, [6, 4]> wu ← tf32[6, 4] {}
+    mut tensor<f32, [4, 6]> wd ← tf32[4, 6] {}
+
+    for exclusive 4 let r {
+        for exclusive 4 let c {
+            let f32 v ← ((r + c + 1) ↦ f32) * scale
+            wq[[r, c]] ← v
+            wk[[r, c]] ← v
+            wv[[r, c]] ← v
+            wo[[r, c]] ← (r ≡ c ✓ scale ✗ 0.0)
+        }
+    }
+
+    for exclusive 6 let r {
+        for exclusive 4 let c {
+            wg[[r, c]] ← scale
+            wu[[r, c]] ← scale
+            wd[[c, r]] ← scale * 0.5
+        }
+    }
+
+    mut tensor<f32, [4]> bq ← tf32[4] {}
+    mut tensor<f32, [4]> bk ← tf32[4] {}
+    mut tensor<f32, [4]> bv ← tf32[4] {}
+
+    if use_bias {
+        for exclusive 4 let j {
+            bq[[j]] ← scale
+            bk[[j]] ← scale
+            bv[[j]] ← scale
+        }
+    }
+
+    return dt.LayerWeights<4, 4, 4, 6> { anorm = an, wq = wq, wk = wk, wv = wv, wo = wo, fnorm = fn2, wg = wg, wu = wu, wd = wd, qkv_bias = use_bias, bq = bq, bk = bk, bv = bv }
+}
+
+fn make_hybrid_cycle_target() → draft_verify.BatchTarget<4, 4, 4, 4, 6> {
+    mut tensor<f32, [4, 4]> embed ← tf32[4, 4] {}
+    mut tensor<f32, [4, 4]> head ← tf32[4, 4] {}
+    mut tensor<f32, [4]> onorm ← tf32[4] {}
+
+    for exclusive 4 let i {
+        embed[[i, i]] ← 1.0
+        onorm[[i]] ← 1.0
+    }
+
+    head[[1, 0]] ← 1.0
+    head[[2, 1]] ← 1.0
+    head[[0, 2]] ← 1.0
+    head[[3, 3]] ← 1.0
+    let dt.LayerParams lp ← dt.LayerParams { pdh = 2, pspan = 1, pgroup = 1, prope = variant dt.RopeKind.Pairs, peps = 0.00001, plntheta = 11.512925, pscale = 0.70710677 }
+    let list<dt.LayerWeights<4, 4, 4, 6>> layers ← [make_hybrid_batch_lw(true, 0.02), make_hybrid_batch_lw(false, 0.02)]
+    let list<dt.LayerParams> params ← [lp, lp]
+    return draft_verify.BatchTarget<4, 4, 4, 4, 6> { embed = embed, layers = layers, params = params, onorm = onorm, head = head, peps = 0.00001 }
+}
+
+fn make_hybrid_div_target() → draft_verify.BatchTarget<4, 4, 4, 4, 6> {
+    mut tensor<f32, [4, 4]> embed ← tf32[4, 4] {}
+    mut tensor<f32, [4, 4]> head ← tf32[4, 4] {}
+    mut tensor<f32, [4]> onorm ← tf32[4] {}
+
+    for exclusive 4 let i {
+        embed[[i, i]] ← 1.0
+        onorm[[i]] ← 1.0
+    }
+
+    head[[2, 0]] ← 1.0
+    head[[0, 1]] ← 1.0
+    head[[1, 2]] ← 1.0
+    head[[0, 3]] ← 1.0
+    let dt.LayerParams lp ← dt.LayerParams { pdh = 2, pspan = 1, pgroup = 1, prope = variant dt.RopeKind.Pairs, peps = 0.00001, plntheta = 11.512925, pscale = 0.70710677 }
+    let list<dt.LayerWeights<4, 4, 4, 6>> layers ← [make_hybrid_batch_lw(true, 0.02), make_hybrid_batch_lw(false, 0.02)]
+    let list<dt.LayerParams> params ← [lp, lp]
+    return draft_verify.BatchTarget<4, 4, 4, 4, 6> { embed = embed, layers = layers, params = params, onorm = onorm, head = head, peps = 0.00001 }
+}
+
+fn sched_16() → model_schedule.ExecutionSchedule {
+    let list<model_schedule.AttentionKind> attns ← [
+        variant model_schedule.AttentionKind.Full,
+        variant model_schedule.AttentionKind.Full,
+        variant model_schedule.AttentionKind.SlidingWindow { window = 4 },
+        variant model_schedule.AttentionKind.LinearSsm
+    ]
+    let list<model_schedule.RopeKind> ropes ← [
+        variant model_schedule.RopeKind.Standard,
+        variant model_schedule.RopeKind.Standard,
+        variant model_schedule.RopeKind.None,
+        variant model_schedule.RopeKind.None
+    ]
+    return model_schedule.patterned_schedule(attns, ropes, 0, []) ⊥ model_schedule.ExecutionSchedule { layers = [], segments = [], steps = [], slots = [], residual = variant model_schedule.ResidualKind.Standard, taps = [] }
+}
+
+fn sess_p_16() → session.SessionState<16, 4, 4> {
+    let model_schedule.ExecutionSchedule sc ← sched_16()
+    return session.from_schedule<size 16, size 4, size 4>(sc) ⊥ session.SessionState<16, 4, 4> { sched = sc, full_kv = session.FullKvArena<16, 4> { capacity = 0, kv_dim = 0, slot_ids = empty, keys = empty, values = empty, lengths = empty }, ring_kv = session.RingKvArena<4, 4> { max_window = 0, kv_dim = 0, slot_ids = empty, window_sizes = empty, keys = empty, values = empty, total_written = empty }, slot_arena_kind = empty, slot_local_index = empty, slot_window_sizes = empty, slot_kv_quant = empty, txn_depth = 0 }
+}
+
+fn make_hybrid_4arena_session() → hybrid.HybridSession<16, 4, 4, 2, 4, 2, 2> {
+    let model_schedule.ExecutionSchedule sched ← sched_16()
+    return hybrid.from_schedule<size 16, size 4, size 4, size 2, size 4, size 2, size 2>(sched, 1, 2, false) ⊥ hybrid.HybridSession<16, 4, 4, 2, 4, 2, 2> { kv = sess_p_16(), conv = hybrid.ConvStateArena<2, 4> { sites_per_slot = 0, history_len = 0, channels = 4, slot_ids = empty, buffers = empty, steps_written = empty, site_base = 0, txn_depth = 0, scratch_alloc_count = 0 }, recurrent = hybrid.RecurrentStateArena<2, 2> { rows = 2, cols = 2, slot_ids = empty, states = empty, steps_written = empty, txn_depth = 0 } }
+}
+
+fn close_hybrid_tol(f32 got, f32 ref) → bool {
+    let f32 diff ← (got - ref).abs()
+    let f32 lim ← 0.00001 + 0.0001 * ref.abs()
+    return diff ≤ lim
+}
+
+fn hybrid_4arenas_close(hybrid.HybridSession<16, 4, 4, 2, 4, 2, 2> a, hybrid.HybridSession<16, 4, 4, 2, 4, 2, 2> b) → bool {
+    do {
+        if not session.active_rows_equal(a.kv, b.kv, 0.0001 ∷ f32) then return false
+    }
+    catch err {
+        return false
+    }
+
+    if a.conv.slot_ids.length() ≢ b.conv.slot_ids.length() then return false
+
+    for exclusive a.conv.slot_ids.length() let c {
+        if a.conv.steps_written[c] ≢ b.conv.steps_written[c] then return false
+        let tensor<f32, [2, 4]> ba ← a.conv.buffers[c]
+        let tensor<f32, [2, 4]> bb ← b.conv.buffers[c]
+
+        for exclusive 2 let r {
+            for exclusive 4 let ch {
+                if not close_hybrid_tol(ba[[r, ch]], bb[[r, ch]]) then return false
+            }
+        }
+    }
+
+    if a.recurrent.slot_ids.length() ≢ b.recurrent.slot_ids.length() then return false
+
+    for exclusive a.recurrent.slot_ids.length() let r {
+        if a.recurrent.steps_written[r] ≢ b.recurrent.steps_written[r] then return false
+        let tensor<f32, [2, 2]> sa ← a.recurrent.states[r]
+        let tensor<f32, [2, 2]> sb ← b.recurrent.states[r]
+
+        for exclusive 2 let rr {
+            for exclusive 2 let rc {
+                if not close_hybrid_tol(sa[[rr, rc]], sb[[rr, rc]]) then return false
+            }
+        }
+    }
+
+    return true
+}
+
+fn hybrid_mode_cfg(config.AccelerationMode mode, int ctx, int max_tokens, list<int> eog_ids) → config.GenerationConfig {
+    let config.AccelerationPolicy policy ← config.construct_acceleration("1.1.0", mode, 1, 4, 1, 4) ⊥ config.default_acceleration()
+    return config.construct_generation_with_policy(ctx, ctx, max_tokens, 7, 0.0 ∷ f32, 0, 1.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32, eog_ids, policy) ⊥ config.default()
+}
+
+fn hybrid_coupled_ctx(hybrid.HybridSession<16, 4, 4, 2, 4, 2, 2> hs, config.AccelerationPolicy policy) → speculative.DrafterContext {
+    let speculative.AdaptiveBudget b ← speculative.budget_from_policy(policy) ⊥ speculative.default_budget()
+    let list<int> views ← draft_verify.backbone_views_from_hybrid<size 16, size 4, size 4, size 2, size 4, size 2, size 2>(hs)
+    return speculative.construct_drafter_context(empty, [1.0 ∷ f32], views, [0], b) ⊥ speculative.default_context()
+}
+
+fn fresh_hybrid_ws_16() → dt.BatchWorkspace<4, 8, 4, 4, 4, 6, 2, 16> {
+    let tensor<f32, [8, 16]> hcdom ← tf32[8, 16] {}
+    let tensor<f32, [4, 4]> qdom ← tf32[4, 4] {}
+    let tensor<f32, [4, 4]> ws_xn ← tf32[4, 4] {}
+    let tensor<f32, [4, 4]> ws_q ← tf32[4, 4] {}
+    let tensor<f32, [4, 4]> ws_qr ← tf32[4, 4] {}
+    let tensor<f32, [4, 4]> ws_k ← tf32[4, 4] {}
+    let tensor<f32, [4, 4]> ws_kr ← tf32[4, 4] {}
+    let tensor<f32, [4, 4]> ws_v ← tf32[4, 4] {}
+    let tensor<f32, [8, 16]> ws_sc ← tf32[8, 16] {}
+    let tensor<f32, [8, 16]> ws_pr ← tf32[8, 16] {}
+    let tensor<f32, [4, 4]> ws_ctx ← tf32[4, 4] {}
+    let tensor<f32, [4, 4]> ws_h1 ← tf32[4, 4] {}
+    let tensor<f32, [4, 6]> ws_gate ← tf32[4, 6] {}
+    let tensor<f32, [4, 6]> ws_up ← tf32[4, 6] {}
+    let tensor<f32, [4, 6]> ws_act ← tf32[4, 6] {}
+    mut tensor<f32, [1]> sink ← tf32[1] {}
+    let dt.BatchWorkspace<4, 8, 4, 4, 4, 6, 2, 16> bws ← dt.BatchWorkspace<4, 8, 4, 4, 4, 6, 2, 16> { hcdom = hcdom, qdom = qdom, xn = ws_xn, q = ws_q, qr = ws_qr, k = ws_k, kr = ws_kr, v = ws_v, sc = ws_sc, pr = ws_pr, ctx = ws_ctx, h1 = ws_h1, gate = ws_gate, up = ws_up, act = ws_act }
+    dt.prime_batch_workspace(bws, mut sink)
+    return bws
+}
+
+describe "issue #139 — unified HybridTxn B=k verify across 5 modes & 4 arenas" {
+    test "HybridTxn B=k verify parity across Disabled, ContextLookup, FeatureTapped, StandaloneDraft, and PldThenMtp on all 4 arenas" {
+        let _ trap_res ← trap {
+            let draft_verify.BatchTarget<4, 4, 4, 4, 6> target ← make_hybrid_cycle_target()
+            let draft_verify.BatchTarget<4, 4, 4, 4, 6> div_drafter ← make_hybrid_div_target()
+            let list<int> prompt ← [0, 1, 2, 0, 1, 0]
+
+            let config.GenerationConfig dis_cfg ← hybrid_mode_cfg(config.acceleration_disabled(), 16, 6, empty)
+            mut hybrid.HybridSession<16, 4, 4, 2, 4, 2, 2> base_hs ← make_hybrid_4arena_session()
+            let draft_verify.VerifyRun base_run ← draft_verify.verify_generate_hybrid<size 4, size 4, size 4, size 4, size 6, size 2, size 16, size 4, size 2, size 4, size 2, size 2, size 4, size 8>(dis_cfg, prompt, target, target, false, speculative.default_context(), mut base_hs)
+            assert base_hs.kv.txn_depth ≡ 0
+            assert base_hs.conv.txn_depth ≡ 0
+            assert base_hs.recurrent.txn_depth ≡ 0
+
+            let config.GenerationConfig pld_cfg ← hybrid_mode_cfg(config.acceleration_context_lookup(), 16, 6, empty)
+            mut hybrid.HybridSession<16, 4, 4, 2, 4, 2, 2> pld_hs ← make_hybrid_4arena_session()
+            let draft_verify.VerifyRun pld_run ← draft_verify.verify_generate_hybrid<size 4, size 4, size 4, size 4, size 6, size 2, size 16, size 4, size 2, size 4, size 2, size 2, size 4, size 8>(pld_cfg, prompt, target, target, false, speculative.default_context(), mut pld_hs)
+            assert pld_run.tokens ≡ base_run.tokens
+            assert pld_run.stats.accepted_total ≻ 0
+            assert pld_run.stats.accepted_total ≺ pld_run.stats.drafted_total
+            assert pld_hs.kv.txn_depth ≡ 0
+            assert pld_hs.conv.txn_depth ≡ 0
+            assert pld_hs.recurrent.txn_depth ≡ 0
+            assert hybrid_4arenas_close(pld_hs, base_hs)
+
+            let config.GenerationConfig ft_cfg ← hybrid_mode_cfg(config.acceleration_feature_tapped(), 16, 6, empty)
+            mut hybrid.HybridSession<16, 4, 4, 2, 4, 2, 2> ft_hs ← make_hybrid_4arena_session()
+            let speculative.DrafterContext ft_ctx ← hybrid_coupled_ctx(ft_hs, ft_cfg.acceleration)
+            let draft_verify.VerifyRun ft_run ← draft_verify.verify_generate_hybrid<size 4, size 4, size 4, size 4, size 6, size 2, size 16, size 4, size 2, size 4, size 2, size 2, size 4, size 8>(ft_cfg, prompt, target, target, true, ft_ctx, mut ft_hs)
+            assert ft_run.tokens ≡ base_run.tokens
+            assert ft_run.stats.verify_rounds ≥ 1
+            assert ft_run.stats.accepted_total ≥ 1
+            assert ft_hs.kv.txn_depth ≡ 0
+            assert hybrid_4arenas_close(ft_hs, base_hs)
+
+            mut hybrid.HybridSession<16, 4, 4, 2, 4, 2, 2> ft_div_hs ← make_hybrid_4arena_session()
+            let draft_verify.VerifyRun ft_div ← draft_verify.verify_generate_hybrid<size 4, size 4, size 4, size 4, size 6, size 2, size 16, size 4, size 2, size 4, size 2, size 2, size 4, size 8>(ft_cfg, prompt, target, div_drafter, true, ft_ctx, mut ft_div_hs)
+            assert ft_div.tokens ≡ base_run.tokens
+            assert ft_div.stats.accepted_total ≡ 0
+            assert ft_div_hs.kv.txn_depth ≡ 0
+            assert hybrid_4arenas_close(ft_div_hs, base_hs)
+
+            let config.GenerationConfig sd_cfg ← hybrid_mode_cfg(config.acceleration_standalone_draft(), 16, 6, empty)
+            mut hybrid.HybridSession<16, 4, 4, 2, 4, 2, 2> sd_hs ← make_hybrid_4arena_session()
+            let speculative.DrafterContext sd_ctx ← speculative.construct_drafter_context(empty, empty, empty, [0], speculative.budget_from_policy(sd_cfg.acceleration))
+            let draft_verify.VerifyRun sd_run ← draft_verify.verify_generate_hybrid<size 4, size 4, size 4, size 4, size 6, size 2, size 16, size 4, size 2, size 4, size 2, size 2, size 4, size 8>(sd_cfg, prompt, target, target, true, sd_ctx, mut sd_hs)
+            assert sd_run.tokens ≡ base_run.tokens
+            assert sd_run.stats.accepted_total ≥ 1
+            assert sd_hs.kv.txn_depth ≡ 0
+            assert hybrid_4arenas_close(sd_hs, base_hs)
+
+            let config.GenerationConfig comp_cfg ← hybrid_mode_cfg(config.acceleration_pld_then_mtp(), 16, 6, empty)
+            mut hybrid.HybridSession<16, 4, 4, 2, 4, 2, 2> comp_hs ← make_hybrid_4arena_session()
+            let speculative.DrafterContext comp_ctx ← hybrid_coupled_ctx(comp_hs, comp_cfg.acceleration)
+            let draft_verify.VerifyRun comp_run ← draft_verify.verify_generate_hybrid<size 4, size 4, size 4, size 4, size 6, size 2, size 16, size 4, size 2, size 4, size 2, size 2, size 4, size 8>(comp_cfg, prompt, target, div_drafter, true, comp_ctx, mut comp_hs)
+            assert comp_run.tokens ≡ base_run.tokens
+            assert comp_hs.kv.txn_depth ≡ 0
+            assert hybrid_4arenas_close(comp_hs, base_hs)
+        }
+        match trap_res {
+            case returned let ? { }
+            case thrown let ? { assert false }
+        }
+    }
+    test "FeatureTapped consumes target_tap_buffer dynamically while keeping HybridTxn parity" {
+        let _ trap_res ← trap {
+            let draft_verify.BatchTarget<4, 4, 4, 4, 6> target ← make_hybrid_cycle_target()
+            let config.GenerationConfig ft_cfg ← hybrid_mode_cfg(config.acceleration_feature_tapped(), 16, 4, empty)
+            let speculative.AdaptiveBudget b ← speculative.budget_from_policy(ft_cfg.acceleration)
+            mut dt.BatchWorkspace<4, 8, 4, 4, 4, 6, 2, 16> bws ← fresh_hybrid_ws_16()
+
+            let speculative.DrafterContext tap_a ← speculative.construct_drafter_context([1], [20.0 ∷ f32, 0.0 ∷ f32, 0.0 ∷ f32, 0.0 ∷ f32], [0], empty, b)
+            let speculative.DrafterContext tap_b ← speculative.construct_drafter_context([1], [0.0 ∷ f32, 0.0 ∷ f32, 20.0 ∷ f32, 0.0 ∷ f32], [0], empty, b)
+            let speculative.ProviderResult res_a ← draft_verify.draft_round_mode_batch<size 4, size 4, size 4, size 4, size 6, size 2, size 16, size 4, size 8>(target, mut bws, "feature_tapped", [0], tap_a, ft_cfg, true)
+            let speculative.ProviderResult res_b ← draft_verify.draft_round_mode_batch<size 4, size 4, size 4, size 4, size 6, size 2, size 16, size 4, size 8>(target, mut bws, "feature_tapped", [0], tap_b, ft_cfg, true)
+            assert speculative.candidate_ids(res_a) ≢ speculative.candidate_ids(res_b)
+        }
+        match trap_res {
+            case returned let ? { }
+            case thrown let ? { assert false }
+        }
+    }
+    test "PldThenMtp min_suffix_length prevents 1-token stopwords from preempting MTP" {
+        let _ trap_res ← trap {
+            let draft_verify.BatchTarget<4, 4, 4, 4, 6> target ← make_hybrid_cycle_target()
+            let config.GenerationConfig comp_cfg ← hybrid_mode_cfg(config.acceleration_pld_then_mtp(), 16, 6, empty)
+            let list<int> prompt ← [3, 0, 1, 3]
+            let list<int> history ← [3]
+            let speculative.AdaptiveBudget b_pld ← speculative.construct_budget(1, 4)
+            let speculative.AdaptiveBudget b_mtp ← speculative.construct_budget(1, 4)
+
+            let speculative.DrafterContext ctx_default ← speculative.construct_split_drafter_context(history, [1.0 ∷ f32], [0], [0], b_pld, b_mtp, 0)
+            mut dt.BatchWorkspace<4, 8, 4, 4, 4, 6, 2, 16> bws ← fresh_hybrid_ws_16()
+
+            let speculative.ProviderResult res_default ← draft_verify.draft_round_mode_batch<size 4, size 4, size 4, size 4, size 6, size 2, size 16, size 4, size 8>(target, mut bws, "pld_then_mtp", prompt, ctx_default, comp_cfg, true)
+            assert not speculative.is_no_draft(res_default)
+            assert speculative.candidate_provenance(res_default).source ≡ "feature_tapped"
+
+            let speculative.DrafterContext ctx_one ← speculative.with_min_suffix_length(ctx_default, 1)
+            let speculative.ProviderResult res_one ← draft_verify.draft_round_mode_batch<size 4, size 4, size 4, size 4, size 6, size 2, size 16, size 4, size 8>(target, mut bws, "pld_then_mtp", prompt, ctx_one, comp_cfg, true)
+            assert not speculative.is_no_draft(res_one)
+            assert speculative.candidate_provenance(res_one).source ≡ "context_lookup"
+
+            mut hybrid.HybridSession<16, 4, 4, 2, 4, 2, 2> base_hs ← make_hybrid_4arena_session()
+            let draft_verify.VerifyRun base_run ← draft_verify.verify_generate_hybrid<size 4, size 4, size 4, size 4, size 6, size 2, size 16, size 4, size 2, size 4, size 2, size 2, size 4, size 8>(hybrid_mode_cfg(config.acceleration_disabled(), 16, 6, empty), prompt, target, target, false, speculative.default_context(), mut base_hs)
+
+            mut hybrid.HybridSession<16, 4, 4, 2, 4, 2, 2> comp_hs ← make_hybrid_4arena_session()
+            let draft_verify.VerifyRun comp_run ← draft_verify.verify_generate_hybrid<size 4, size 4, size 4, size 4, size 6, size 2, size 16, size 4, size 2, size 4, size 2, size 2, size 4, size 8>(comp_cfg, prompt, target, target, true, ctx_default, mut comp_hs)
+            assert comp_run.tokens ≡ base_run.tokens
+            assert hybrid_4arenas_close(comp_hs, base_hs)
+        }
+        match trap_res {
             case returned let ? { }
             case thrown let ? { assert false }
         }

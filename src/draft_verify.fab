@@ -50,6 +50,8 @@ import from "gradus:context_lookup"
 
 import from "gradus:cache/session"
 
+import from "gradus:cache/hybrid_arenas" let hybrid
+
 import from "gradus:decode_token" let dt
 
 import from "gradus:model/residual" let residual
@@ -150,50 +152,26 @@ fn default_run() → VerifyRun {
 # f32 for realistic vocabularies and capacities). Deterministic in
 # (token, position, lane) on every route — plain writes, transactional
 # writes, and the reference replay all produce identical bytes.
-fn project_kv<size KVD>(int token, int pos, mut tensor<f32, [KVD]> k, mut tensor<f32, [KVD]> v) → void ⇥ VerifyError {
+# Plain (non-transactional) write of one token's rows into every KV arena
+# slot of the session, at the token's consumed position.
+fn write_plain_all<size C, size W, size KVD>(mut session.SessionState<size C, size W, size KVD> sess, int token, int pos) → void ⇥ VerifyError {
     require token ≥ 0 throw variant InvalidConfig { message = "projected token id must be non-negative" }
-
     require pos ≥ 0 throw variant InvalidConfig { message = "projected position must be non-negative" }
+
+    mut tensor<f32, [KVD]> k ← tf32[KVD] {}
+    mut tensor<f32, [KVD]> v ← tf32[KVD] {}
 
     for exclusive KVD let j {
         k[[j]] ← (pos * 16 + j + 1) ↦ f32
         v[[j]] ← (token * 16 + j + 1) ↦ f32
     }
-}
 
-# Plain (non-transactional) write of one token's rows into every KV arena
-# slot of the session, at the token's consumed position.
-fn write_plain_all<size C, size W, size KVD>(mut session.SessionState<size C, size W, size KVD> sess, int token, int pos) → void ⇥ VerifyError {
     for from sess.full_kv.slot_ids let slot {
-        mut tensor<f32, [KVD]> k ← tf32[KVD] {}
-        mut tensor<f32, [KVD]> v ← tf32[KVD] {}
-        project_kv<size KVD>(token, pos, mut k, mut v)
         session.write_kv(mut sess, slot, k, v, pos ↦ i32 ⊥ 0)
     }
 
     for from sess.ring_kv.slot_ids let slot {
-        mut tensor<f32, [KVD]> k ← tf32[KVD] {}
-        mut tensor<f32, [KVD]> v ← tf32[KVD] {}
-        project_kv<size KVD>(token, pos, mut k, mut v)
         session.write_kv(mut sess, slot, k, v, pos ↦ i32 ⊥ 0)
-    }
-}
-
-# Transactional write of one candidate token's rows into every KV arena
-# slot, at the candidate's verify position.
-fn write_txn_all<size C, size W, size KVD>(mut session.SessionState<size C, size W, size KVD> sess, mut session.SessionTxn<size C, size W, size KVD> txn, int token, int pos) → void ⇥ VerifyError {
-    for from sess.full_kv.slot_ids let slot {
-        mut tensor<f32, [KVD]> k ← tf32[KVD] {}
-        mut tensor<f32, [KVD]> v ← tf32[KVD] {}
-        project_kv<size KVD>(token, pos, mut k, mut v)
-        session.txn_write_kv(mut sess, mut txn, slot, k, v, pos ↦ i32 ⊥ 0)
-    }
-
-    for from sess.ring_kv.slot_ids let slot {
-        mut tensor<f32, [KVD]> k ← tf32[KVD] {}
-        mut tensor<f32, [KVD]> v ← tf32[KVD] {}
-        project_kv<size KVD>(token, pos, mut k, mut v)
-        session.txn_write_kv(mut sess, mut txn, slot, k, v, pos ↦ i32 ⊥ 0)
     }
 }
 
@@ -252,6 +230,12 @@ fn backbone_views_from_session<size C, size W, size KVD>(session.SessionState<si
     return views
 }
 
+# Collect shared backbone arena slot ids from a HybridSession.
+@ public
+fn backbone_views_from_hybrid<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols>(hybrid.HybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> hs) → list<int> {
+    return backbone_views_from_session<size C, size W, size KVD>(hs.kv)
+}
+
 # Collect validated drafter-role arena slot indices from a TensorDirectory.
 @ public
 fn drafter_slots_from_directory(td.TensorDirectory dir, list<string> tensor_names) → list<int> ⇥ VerifyError {
@@ -273,7 +257,16 @@ fn drafter_slots_from_directory(td.TensorDirectory dir, list<string> tensor_name
 @ public
 fn construct_coupled_context<size C, size W, size KVD, size D>(list<int> token_history, residual.TapStore<size D> store, string tap_name, session.SessionState<size C, size W, size KVD> sess, td.TensorDirectory dir, list<string> drafter_tensors, speculative.AdaptiveBudget budget) → speculative.DrafterContext ⇥ VerifyError {
     let list<f32> tap_buf ← populate_tap_buffer<size D>(store, tap_name)
-    let list<int> views ← backbone_views_from_session<size C, size W, size KVD>(sess)
+    mut list<int> views ← empty
+
+    for from sess.full_kv.slot_ids let slot {
+        views.append(slot)
+    }
+
+    for from sess.ring_kv.slot_ids let slot {
+        views.append(slot)
+    }
+
     let list<int> drafter_slots ← drafter_slots_from_directory(dir, drafter_tensors)
     return speculative.construct_drafter_context(token_history, tap_buf, views, drafter_slots, budget)
 }
@@ -357,7 +350,11 @@ fn verify_generate_coupled<size C, size W, size KVD>(config.GenerationConfig g, 
     let sampling.Config drawn ← config.config(g)
     mut random.Seed rng ← config.seed(g)
 
-    mut speculative.DrafterContext ctx ← speculative.construct_drafter_context(empty, initial_ctx.target_tap_buffer, initial_ctx.shared_backbone_views, initial_ctx.drafter_session_state, speculative.budget_from_policy(g.acceleration))
+    mut speculative.DrafterContext ctx ← speculative.construct_split_drafter_context(empty, initial_ctx.target_tap_buffer, initial_ctx.shared_backbone_views, initial_ctx.drafter_session_state, speculative.budget_from_policy(g.acceleration), speculative.budget_from_policy(g.acceleration), initial_ctx.min_suffix_length)
+
+    if initial_ctx.mtp_budget.min_depth ≥ g.acceleration.min_depth and initial_ctx.mtp_budget.max_depth ≤ g.acceleration.max_depth {
+        ctx ← speculative.construct_split_drafter_context(empty, initial_ctx.target_tap_buffer, initial_ctx.shared_backbone_views, initial_ctx.drafter_session_state, speculative.budget_from_policy(g.acceleration), initial_ctx.mtp_budget, initial_ctx.min_suffix_length)
+    }
 
     mut VerifyStats stats ← default_stats()
     mut list<int> tokens ← empty
@@ -381,7 +378,6 @@ fn verify_generate_coupled<size C, size W, size KVD>(config.GenerationConfig g, 
     mut bool finished ← false
 
     while emitted ≺ g.max_tokens and prompt_ids.length() + emitted ≺ g.context and not finished {
-        let int depth ← speculative.next_depth(ctx.adaptive_budget)
         let speculative.ProviderResult result ← draft_round_mode(mode, prompt_ids, ctx, position, g, drawn, drafter)
 
         if speculative.is_no_draft(result) {
@@ -407,7 +403,7 @@ fn verify_generate_coupled<size C, size W, size KVD>(config.GenerationConfig g, 
                 finished ← true
             }
 
-            ctx ← speculative.construct_drafter_context(history, ctx.target_tap_buffer, ctx.shared_backbone_views, ctx.drafter_session_state, ctx.adaptive_budget)
+            ctx ← speculative.construct_split_drafter_context(history, ctx.target_tap_buffer, ctx.shared_backbone_views, ctx.drafter_session_state, ctx.adaptive_budget, ctx.mtp_budget, ctx.min_suffix_length)
         }
         else {
             # Verify path: branch, accept the matching candidate prefix,
@@ -444,8 +440,26 @@ fn verify_generate_coupled<size C, size W, size KVD>(config.GenerationConfig g, 
                 }
 
                 accepted_ids.append(candidate)
-                write_txn_all<size C, size W, size KVD>(mut sess, mut txn, candidate, frontier_base + accepted_ids.length() - 1)
-                verify_last ← step_logits(candidate, frontier_base + accepted_ids.length() - 1, m)
+                let int txn_pos ← frontier_base + accepted_ids.length() - 1
+                require candidate ≥ 0 throw variant InvalidConfig { message = "projected token id must be non-negative" }
+                require txn_pos ≥ 0 throw variant InvalidConfig { message = "projected position must be non-negative" }
+                mut tensor<f32, [KVD]> tk ← tf32[KVD] {}
+                mut tensor<f32, [KVD]> tv ← tf32[KVD] {}
+
+                for exclusive KVD let j {
+                    tk[[j]] ← (txn_pos * 16 + j + 1) ↦ f32
+                    tv[[j]] ← (candidate * 16 + j + 1) ↦ f32
+                }
+
+                for from sess.full_kv.slot_ids let slot {
+                    session.txn_write_kv(mut sess, mut txn, slot, tk, tv, txn_pos ↦ i32 ⊥ 0)
+                }
+
+                for from sess.ring_kv.slot_ids let slot {
+                    session.txn_write_kv(mut sess, mut txn, slot, tk, tv, txn_pos ↦ i32 ⊥ 0)
+                }
+
+                verify_last ← step_logits(candidate, txn_pos, m)
                 rng ← decision.seed
                 decision ← sampling.sample(verify_last, drawn, concat_history(history, accepted_ids), rng)
             }
@@ -513,8 +527,9 @@ fn verify_generate_coupled<size C, size W, size KVD>(config.GenerationConfig g, 
             stats.drafted_total ← stats.drafted_total + candidates.length()
             stats.accepted_total ← stats.accepted_total + accepted_ids.length()
 
-            let speculative.AdaptiveBudget advanced ← speculative.observe_block(ctx.adaptive_budget, candidates.length(), accepted_ids.length())
-            ctx ← speculative.construct_drafter_context(history, ctx.target_tap_buffer, ctx.shared_backbone_views, ctx.drafter_session_state, advanced)
+            let string draft_src ← speculative.candidate_provenance(result).source
+            let speculative.DrafterContext advanced_ctx ← speculative.observe_source_block(ctx, draft_src, candidates.length(), accepted_ids.length())
+            ctx ← speculative.construct_split_drafter_context(history, advanced_ctx.target_tap_buffer, advanced_ctx.shared_backbone_views, advanced_ctx.drafter_session_state, advanced_ctx.adaptive_budget, advanced_ctx.mtp_budget, advanced_ctx.min_suffix_length)
 
             # Eagerly consume the last kept token when the loop
             # continues, so the next round decides from the post-token
@@ -590,34 +605,44 @@ fn draft_mtp(speculative.ProviderRequest req, list<int> prompt_ids, speculative.
 }
 
 # One drafter round dispatched by the admitted acceleration mode.
-# PldThenMtp attempts PLD (context_lookup.propose) first and falls back to
-# the coupled MTP drafter when PLD returns NoDraft.
+# PldThenMtp attempts PLD (context_lookup.propose_with_min_suffix) using
+# effective_min_suffix_length first, and falls back to the coupled MTP
+# drafter with its independent mtp_budget when PLD returns NoDraft.
 @ public
 fn draft_round_mode(string mode, list<int> prompt_ids, speculative.DrafterContext ctx, int position, config.GenerationConfig g, sampling.Config drawn, decode.Decoder drafter) → speculative.ProviderResult ⇥ VerifyError {
-    let int depth ← speculative.next_depth(ctx.adaptive_budget)
-    let speculative.ProviderRequest req ← speculative.construct_request(prompt_ids, ctx.token_history, depth, g.acceleration.min_block, g.acceleration.max_block)
+    let int eff_min ← speculative.effective_min_suffix_length(ctx, mode)
 
     if mode ≡ "context_lookup" {
-        return context_lookup.propose(req)
+        let int depth ← speculative.next_depth(ctx.adaptive_budget)
+        let speculative.ProviderRequest req ← speculative.construct_request(prompt_ids, ctx.token_history, depth, g.acceleration.min_block, g.acceleration.max_block)
+        return context_lookup.propose_with_min_suffix(req, eff_min)
     }
 
     if mode ≡ "feature_tapped" {
+        let int depth ← speculative.next_depth(ctx.mtp_budget)
+        let speculative.ProviderRequest req ← speculative.construct_request(prompt_ids, ctx.token_history, depth, g.acceleration.min_block, g.acceleration.max_block)
         return draft_mtp(req, prompt_ids, ctx, position, drawn, drafter, speculative.feature_tapped_source())
     }
 
     if mode ≡ "standalone_draft" {
+        let int depth ← speculative.next_depth(ctx.mtp_budget)
+        let speculative.ProviderRequest req ← speculative.construct_request(prompt_ids, ctx.token_history, depth, g.acceleration.min_block, g.acceleration.max_block)
         return draft_mtp(req, prompt_ids, ctx, position, drawn, drafter, speculative.standalone_draft_source())
     }
 
     if mode ≡ "pld_then_mtp" {
-        let speculative.ProviderResult pld_res ← context_lookup.propose(req)
+        let int pld_depth ← speculative.next_depth(ctx.adaptive_budget)
+        let speculative.ProviderRequest pld_req ← speculative.construct_request(prompt_ids, ctx.token_history, pld_depth, g.acceleration.min_block, g.acceleration.max_block)
+        let speculative.ProviderResult pld_res ← context_lookup.propose_with_min_suffix(pld_req, eff_min)
 
         if not speculative.is_no_draft(pld_res) {
             return pld_res
         }
 
+        let int mtp_depth ← speculative.next_depth(ctx.mtp_budget)
+        let speculative.ProviderRequest mtp_req ← speculative.construct_request(prompt_ids, ctx.token_history, mtp_depth, g.acceleration.min_block, g.acceleration.max_block)
         let string fallback_src ← has_feature_tapped_inputs(ctx) ✓ speculative.feature_tapped_source() ✗ speculative.standalone_draft_source()
-        return draft_mtp(req, prompt_ids, ctx, position, drawn, drafter, fallback_src)
+        return draft_mtp(mtp_req, prompt_ids, ctx, position, drawn, drafter, fallback_src)
     }
 
     throw variant ModeNotImplemented { message = "the § acceleration mode is not runnable on the verify route yet"(mode) }
@@ -652,40 +677,300 @@ fn argmax_batch_row<size V, size MaxBatch>(tensor<f32, [MaxBatch, V]> logits, in
     return best
 }
 
-fn copy_hidden_rows<size MaxBatch, size D>(tensor<f32, [MaxBatch, D]> src, mut tensor<f32, [MaxBatch, D]> dst, int active_b) → void {
-    for exclusive active_b let b {
-        for exclusive D let j {
-            dst[[b, j]] ← src[[b, j]]
-        }
-    }
+fn should_capture_tap(string mode) → bool {
+    return mode ≡ "feature_tapped" or mode ≡ "pld_then_mtp"
 }
 
-# Run one B=k batched greedy speculative generation over a transactional
-# SessionState using decode_token.layer_batch(..., AttentionRegime.Causal).
+fn run_target_batch_forward<size V, size D, size QD, size KVD, size F, size H, size C, size W, size ConvRows, size ConvCh, size RecRows, size RecCols, size MaxBatch, size BH>(BatchTarget<V, D, QD, KVD, F> target, mut hybrid.HybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> hs, mut dt.BatchWorkspace<MaxBatch, BH, D, QD, KVD, F, H, C> bws, tensor<i32, [MaxBatch]> step_ids, int active_b, int frontier_base, mut tensor<f32, [MaxBatch, D]> tap_hin, mut tensor<f32, [MaxBatch, V]> logits, bool commit_plain) → void ⇥ VerifyError {
+    mut tensor<f32, [MaxBatch, D]> v_hin ← tf32[MaxBatch, D] {}
+    mut tensor<f32, [MaxBatch, D]> v_hout ← tf32[MaxBatch, D] {}
+    mut tensor<f32, [MaxBatch, D]> v_hn ← tf32[MaxBatch, D] {}
+    let i32 v_ab ← active_b ↦ i32 ⊥ 1
+    let i32 v_tp ← frontier_base ↦ i32 ⊥ 0
+    dt.embed_batch(target.embed, step_ids, mut v_hin, v_ab)
+
+    mut session.SessionState<size C, size W, size KVD> kv ← hs.kv
+
+    for exclusive target.layers.length() let l {
+        mut tensor<f32, [C, KVD]> sv_k ← kv.full_kv.keys[l]
+        mut tensor<f32, [C, KVD]> sv_v ← kv.full_kv.values[l]
+        mut dt.SlotView<C, KVD> sv ← dt.SlotView<C, KVD> { kin = sv_k, vin = sv_v, pos = v_tp }
+        dt.layer_batch(v_hin, mut v_hout, target.layers[l], mut sv, target.params[l], mut bws, v_ab, variant dt.AttentionRegime.Causal)
+        kv.full_kv.keys[l] ← sv.kin
+        kv.full_kv.values[l] ← sv.vin
+
+        for exclusive active_b let b {
+            for exclusive D let j {
+                v_hin[[b, j]] ← v_hout[[b, j]]
+            }
+        }
+    }
+
+    hs.kv ← kv
+
+    for exclusive active_b let b {
+        for exclusive D let j {
+            tap_hin[[b, j]] ← v_hin[[b, j]]
+        }
+    }
+
+    dt.head_batch(v_hin, target.onorm, target.head, mut v_hn, mut logits, target.peps, v_ab)
+
+    if not commit_plain {
+        return
+    }
+
+    mut session.SessionState<size C, size W, size KVD> p_kv ← hs.kv
+    let int full_count ← p_kv.full_kv.slot_ids.length()
+
+    for exclusive full_count let l {
+        let int slot_id ← p_kv.full_kv.slot_ids[l]
+
+        for exclusive active_b let b {
+            let int pos ← frontier_base + b
+            mut tensor<f32, [KVD]> k_row ← tf32[KVD] {}
+            mut tensor<f32, [KVD]> v_row ← tf32[KVD] {}
+            let tensor<f32, [C, KVD]> fk_mat ← p_kv.full_kv.keys[l]
+            let tensor<f32, [C, KVD]> fv_mat ← p_kv.full_kv.values[l]
+
+            for exclusive KVD let j {
+                k_row[[j]] ← fk_mat[[pos, j]]
+                v_row[[j]] ← fv_mat[[pos, j]]
+            }
+
+            session.write_kv(mut p_kv, slot_id, k_row, v_row, pos ↦ i32 ⊥ 0)
+        }
+    }
+
+    let int ring_count ← p_kv.ring_kv.slot_ids.length()
+
+    for exclusive ring_count let r {
+        let int slot_id ← p_kv.ring_kv.slot_ids[r]
+        let int src_l ← r % full_count
+
+        for exclusive active_b let b {
+            let int pos ← frontier_base + b
+            mut tensor<f32, [KVD]> k_row ← tf32[KVD] {}
+            mut tensor<f32, [KVD]> v_row ← tf32[KVD] {}
+            let tensor<f32, [C, KVD]> fk_mat ← p_kv.full_kv.keys[src_l]
+            let tensor<f32, [C, KVD]> fv_mat ← p_kv.full_kv.values[src_l]
+
+            for exclusive KVD let j {
+                k_row[[j]] ← fk_mat[[pos, j]]
+                v_row[[j]] ← fv_mat[[pos, j]]
+            }
+
+            session.write_kv(mut p_kv, slot_id, k_row, v_row, pos ↦ i32 ⊥ 0)
+        }
+    }
+
+    hs.kv ← p_kv
+
+    mut hybrid.ConvStateArena<size ConvRows, size ConvCh> conv ← hs.conv
+    let int conv_count ← conv.slot_ids.length()
+    let int conv_sites ← conv.sites_per_slot
+    let int conv_base ← conv.site_base
+
+    for exclusive conv_count let c {
+        let int slot_id ← conv.slot_ids[c]
+
+        for exclusive active_b let b {
+            mut tensor<f32, [ConvCh]> conv_row ← tf32[ConvCh] {}
+
+            for exclusive ConvCh let ch {
+                conv_row[[ch]] ← v_hin[[b, ch % D]]
+            }
+
+            for exclusive conv_sites let s {
+                hybrid.conv_push_row(mut conv, slot_id, conv_base + s, conv_row)
+            }
+        }
+    }
+
+    hs.conv ← conv
+
+    mut hybrid.RecurrentStateArena<size RecRows, size RecCols> rec ← hs.recurrent
+    let int rec_count ← rec.slot_ids.length()
+
+    for exclusive rec_count let r {
+        let int slot_id ← rec.slot_ids[r]
+
+        for exclusive active_b let b {
+            let tensor<f32, [RecRows, RecCols]> prev ← rec.states[r]
+            mut tensor<f32, [RecRows, RecCols]> next_state ← tf32[RecRows, RecCols] {}
+
+            for exclusive RecRows let rr {
+                for exclusive RecCols let rc {
+                    let int lane ← (rr * RecCols + rc) % D
+                    next_state[[rr, rc]] ← (0.5 ∷ f32) * prev[[rr, rc]] + v_hin[[b, lane]]
+                }
+            }
+
+            hybrid.recurrent_update(mut rec, slot_id, next_state)
+        }
+    }
+
+    hs.recurrent ← rec
+}
+
+# Batched MTP drafter round over BatchTarget: reads DrafterContext fields
+# (`token_history`, `target_tap_buffer`, `shared_backbone_views`,
+# `drafter_session_state`) and drafts up to `req.block_size` greedy candidate
+# tokens without altering the context or target session.
+fn draft_mtp_batch<size V, size D, size QD, size KVD, size F, size H, size C, size MaxBatch, size BH>(BatchTarget<V, D, QD, KVD, F> drafter, mut dt.BatchWorkspace<MaxBatch, BH, D, QD, KVD, F, H, C> bws, speculative.ProviderRequest req, list<int> prompt_ids, speculative.DrafterContext ctx, string source) → speculative.ProviderResult ⇥ VerifyError {
+    mut int cur_tok ← 0
+
+    if ctx.token_history.length() ≻ 0 {
+        cur_tok ← ctx.token_history.get(ctx.token_history.length() - 1) coalesce 0
+    }
+    elif prompt_ids.length() ≻ 0 {
+        cur_tok ← prompt_ids.get(prompt_ids.length() - 1) coalesce 0
+    }
+    else {
+        return speculative.no_draft()
+    }
+
+    mut list<tensor<f32, [C, KVD]>> dk ← empty
+    mut list<tensor<f32, [C, KVD]>> dv ← empty
+
+    for exclusive drafter.layers.length() let ? {
+        let tensor<f32, [C, KVD]> zk ← tf32[C, KVD] {}
+        let tensor<f32, [C, KVD]> zv ← tf32[C, KVD] {}
+        dk.append(zk)
+        dv.append(zv)
+    }
+
+    mut list<int> drafted ← empty
+
+    for exclusive req.block_size let step {
+        if step ≥ C {
+            break
+        }
+
+        mut tensor<i32, [MaxBatch]> d_ids ← tensor<i32, [MaxBatch]> {}
+        d_ids[[0]] ← cur_tok ↦ i32 ⊥ 0
+        mut tensor<f32, [MaxBatch, D]> d_hin ← tf32[MaxBatch, D] {}
+        mut tensor<f32, [MaxBatch, D]> d_hout ← tf32[MaxBatch, D] {}
+        mut tensor<f32, [MaxBatch, D]> d_hn ← tf32[MaxBatch, D] {}
+        mut tensor<f32, [MaxBatch, V]> d_logits ← tf32[MaxBatch, V] {}
+        dt.embed_batch(drafter.embed, d_ids, mut d_hin, 1)
+
+        if step ≡ 0 and source ≡ speculative.feature_tapped_source() and ctx.target_tap_buffer.length() ≥ 1 {
+            for exclusive D let j {
+                if j ≺ ctx.target_tap_buffer.length() {
+                    let f32 tap_val ← ctx.target_tap_buffer.get(j) coalesce 0.0 ∷ f32
+                    d_hin[[0, j]] ← d_hin[[0, j]] + (0.25 ∷ f32) * tap_val
+                }
+            }
+        }
+
+        let i32 d_tp ← step ↦ i32 ⊥ 0
+
+        for exclusive drafter.layers.length() let l {
+            mut tensor<f32, [C, KVD]> sv_k ← dk[l]
+            mut tensor<f32, [C, KVD]> sv_v ← dv[l]
+            mut dt.SlotView<C, KVD> sv ← dt.SlotView<C, KVD> { kin = sv_k, vin = sv_v, pos = d_tp }
+            dt.layer_batch(d_hin, mut d_hout, drafter.layers[l], mut sv, drafter.params[l], mut bws, 1, variant dt.AttentionRegime.Causal)
+            dk[l] ← sv.kin
+            dv[l] ← sv.vin
+
+            for exclusive D let j {
+                d_hin[[0, j]] ← d_hout[[0, j]]
+            }
+        }
+
+        dt.head_batch(d_hin, drafter.onorm, drafter.head, mut d_hn, mut d_logits, drafter.peps, 1)
+        cur_tok ← argmax_batch_row<size V, size MaxBatch>(d_logits, 0)
+        drafted.append(cur_tok)
+    }
+
+    if drafted.length() ≡ 0 {
+        return speculative.no_draft()
+    }
+
+    let int source_offset ← (source ≡ speculative.feature_tapped_source()) ✓ (ctx.shared_backbone_views.get(0) coalesce 0) ✗ (ctx.drafter_session_state.get(0) coalesce 0)
+    let speculative.CandidateProvenance prov ← speculative.construct_provenance(source, source_offset, 1)
+    return speculative.construct_candidates(req, drafted, prov)
+}
+
+# Batched drafter round dispatched by the admitted acceleration mode.
+# Supports ContextLookup, FeatureTapped, StandaloneDraft, and PldThenMtp
+# with effective_min_suffix_length arbitration and independent PLD/MTP budgets.
 @ public
-fn verify_generate_batch<size V, size D, size QD, size KVD, size F, size H, size C, size W, size MaxBatch, size BH>(config.GenerationConfig g, list<int> prompt_ids, BatchTarget<V, D, QD, KVD, F> target, mut session.SessionState<size C, size W, size KVD> sess) → VerifyRun ⇥ VerifyError {
+fn draft_round_mode_batch<size V, size D, size QD, size KVD, size F, size H, size C, size MaxBatch, size BH>(BatchTarget<V, D, QD, KVD, F> drafter, mut dt.BatchWorkspace<MaxBatch, BH, D, QD, KVD, F, H, C> bws, string mode, list<int> prompt_ids, speculative.DrafterContext ctx, config.GenerationConfig g, bool has_drafter) → speculative.ProviderResult ⇥ VerifyError {
+    let int eff_min ← speculative.effective_min_suffix_length(ctx, mode)
+
+    if mode ≡ "context_lookup" {
+        let int depth ← speculative.next_depth(ctx.adaptive_budget)
+        let speculative.ProviderRequest req ← speculative.construct_request(prompt_ids, ctx.token_history, depth, g.acceleration.min_block, g.acceleration.max_block)
+        return context_lookup.propose_with_min_suffix(req, eff_min)
+    }
+
+    if mode ≡ "feature_tapped" {
+        require has_drafter throw variant InvalidConfig { message = "feature_tapped mode requires a drafter model" }
+        let int depth ← speculative.next_depth(ctx.mtp_budget)
+        let speculative.ProviderRequest req ← speculative.construct_request(prompt_ids, ctx.token_history, depth, g.acceleration.min_block, g.acceleration.max_block)
+        return draft_mtp_batch<size V, size D, size QD, size KVD, size F, size H, size C, size MaxBatch, size BH>(drafter, mut bws, req, prompt_ids, ctx, speculative.feature_tapped_source())
+    }
+
+    if mode ≡ "standalone_draft" {
+        require has_drafter throw variant InvalidConfig { message = "standalone_draft mode requires a drafter model" }
+        let int depth ← speculative.next_depth(ctx.mtp_budget)
+        let speculative.ProviderRequest req ← speculative.construct_request(prompt_ids, ctx.token_history, depth, g.acceleration.min_block, g.acceleration.max_block)
+        return draft_mtp_batch<size V, size D, size QD, size KVD, size F, size H, size C, size MaxBatch, size BH>(drafter, mut bws, req, prompt_ids, ctx, speculative.standalone_draft_source())
+    }
+
+    if mode ≡ "pld_then_mtp" {
+        let int pld_depth ← speculative.next_depth(ctx.adaptive_budget)
+        let speculative.ProviderRequest pld_req ← speculative.construct_request(prompt_ids, ctx.token_history, pld_depth, g.acceleration.min_block, g.acceleration.max_block)
+        let speculative.ProviderResult pld_res ← context_lookup.propose_with_min_suffix(pld_req, eff_min)
+
+        if not speculative.is_no_draft(pld_res) {
+            return pld_res
+        }
+
+        require has_drafter throw variant InvalidConfig { message = "pld_then_mtp fallback requires a drafter model" }
+        let int mtp_depth ← speculative.next_depth(ctx.mtp_budget)
+        let speculative.ProviderRequest mtp_req ← speculative.construct_request(prompt_ids, ctx.token_history, mtp_depth, g.acceleration.min_block, g.acceleration.max_block)
+        let string fallback_src ← has_feature_tapped_inputs(ctx) ✓ speculative.feature_tapped_source() ✗ speculative.standalone_draft_source()
+        return draft_mtp_batch<size V, size D, size QD, size KVD, size F, size H, size C, size MaxBatch, size BH>(drafter, mut bws, mtp_req, prompt_ids, ctx, fallback_src)
+    }
+
+    throw variant ModeNotImplemented { message = "the § acceleration mode is not runnable on the verify route yet"(mode) }
+}
+
+fn run_verify_hybrid_coordinator<size V, size D, size QD, size KVD, size F, size H, size C, size W, size ConvRows, size ConvCh, size RecRows, size RecCols, size MaxBatch, size BH>(BatchTarget<V, D, QD, KVD, F> target, mut hybrid.HybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> hs, BatchTarget<V, D, QD, KVD, F> drafter, bool has_drafter, config.GenerationConfig g, list<int> prompt_ids, speculative.DrafterContext initial_ctx) → VerifyRun ⇥ VerifyError {
     let string mode ← config.acceleration_mode_name(g.acceleration.mode)
 
-    if mode ≡ "disabled" {
-        throw variant InvalidConfig { message = "the verify route needs an enabled acceleration policy; the Disabled baseline is decoder.generate" }
+    if mode ≢ "disabled" {
+        let speculative.AdmissionResult ? ← speculative.admit_greedy(g.acceleration, g)
+        require g.repetition_penalty ≡ 1.0 ∷ f32 throw variant InvalidConfig { message = "batched verify requires repetition_penalty == 1.0" }
+        validate_mode_context(mode, initial_ctx)
+
+        if mode ≡ "feature_tapped" or mode ≡ "standalone_draft" or mode ≡ "pld_then_mtp" {
+            require has_drafter throw variant InvalidConfig { message = "mode § requires a drafter model"(mode) }
+        }
     }
 
-    if mode ≢ "context_lookup" {
-        throw variant ModeNotImplemented { message = "the § acceleration mode is not runnable on the verify route yet"(mode) }
-    }
-
-    let speculative.AdmissionResult ? ← speculative.admit_greedy(g.acceleration, g)
-
-    require g.repetition_penalty ≡ 1.0 ∷ f32 throw variant InvalidConfig { message = "batched verify requires repetition_penalty == 1.0" }
     require prompt_ids.length() ≥ 1 throw variant InvalidConfig { message = "needs at least one prompt token" }
     require prompt_ids.length() ≤ g.max_prompt throw variant InvalidConfig { message = "prompt length exceeds max_prompt" }
     require prompt_ids.length() ≺ g.context throw variant InvalidConfig { message = "prompt length does not fit context" }
     require g.context ≤ C throw variant InvalidConfig { message = "session capacity must cover the generation context" }
     require target.layers.length() ≥ 1 throw variant InvalidConfig { message = "batch target needs at least one layer" }
     require target.layers.length() ≡ target.params.length() throw variant InvalidConfig { message = "batch target layer/param count mismatch" }
-    require sess.full_kv.slot_ids.length() ≡ target.layers.length() throw variant InvalidConfig { message = "session FullKv slot count must match target layers" }
+    require hs.kv.full_kv.slot_ids.length() ≡ target.layers.length() throw variant InvalidConfig { message = "session FullKv slot count must match target layers" }
     require MaxBatch ≥ 1 and MaxBatch ≤ dt.MAX_BATCH_ROWS throw variant InvalidConfig { message = "invalid MaxBatch capacity" }
     require BH ≡ MaxBatch * H throw variant InvalidConfig { message = "BH must equal MaxBatch * H" }
+
+    if has_drafter {
+        require drafter.layers.length() ≥ 1 throw variant InvalidConfig { message = "drafter needs at least one layer" }
+        require drafter.layers.length() ≡ drafter.params.length() throw variant InvalidConfig { message = "drafter layer/param count mismatch" }
+    }
+
+    let sampling.Config drawn ← config.config(g)
+    mut random.Seed rng ← config.seed(g)
+    let decoder.StopPolicy stop ← decoder.eog_stop()
+    let bool fast_greedy ← drawn.temperature ≤ 0.0 and drawn.top_k ≤ 0 and (drawn.top_p ≤ 0.0 or drawn.top_p ≥ 1.0) and drawn.min_p ≤ 0.0 and g.repetition_penalty ≡ 1.0 ∷ f32
 
     let tensor<f32, [BH, C]> hcdom ← tf32[BH, C] {}
     let tensor<f32, [MaxBatch, QD]> qdom ← tf32[MaxBatch, QD] {}
@@ -705,304 +990,406 @@ fn verify_generate_batch<size V, size D, size QD, size KVD, size F, size H, size
     mut tensor<f32, [1]> sink ← tf32[1] {}
     mut dt.BatchWorkspace<MaxBatch, BH, D, QD, KVD, F, H, C> bws ← dt.BatchWorkspace<MaxBatch, BH, D, QD, KVD, F, H, C> { hcdom = hcdom, qdom = qdom, xn = ws_xn, q = ws_q, qr = ws_qr, k = ws_k, kr = ws_kr, v = ws_v, sc = ws_sc, pr = ws_pr, ctx = ws_ctx, h1 = ws_h1, gate = ws_gate, up = ws_up, act = ws_act }
     dt.prime_batch_workspace(bws, mut sink)
-    mut speculative.DrafterContext ctx ← speculative.construct_pld_context(empty, speculative.budget_from_policy(g.acceleration))
+
+    mut speculative.DrafterContext ctx ← speculative.default_context()
+
+    if mode ≢ "disabled" {
+        mut speculative.AdaptiveBudget mtp_init ← speculative.budget_from_policy(g.acceleration)
+
+        if initial_ctx.mtp_budget.min_depth ≥ g.acceleration.min_depth and initial_ctx.mtp_budget.max_depth ≤ g.acceleration.max_depth {
+            mtp_init ← initial_ctx.mtp_budget
+        }
+
+        ctx ← speculative.construct_split_drafter_context(empty, initial_ctx.target_tap_buffer, initial_ctx.shared_backbone_views, initial_ctx.drafter_session_state, speculative.budget_from_policy(g.acceleration), mtp_init, initial_ctx.min_suffix_length)
+    }
+
     mut VerifyStats stats ← default_stats()
     mut list<int> tokens ← empty
     mut list<int> history ← empty
 
     mut int pending_token ← 0
     mut int pre_pos ← 0
+
     while pre_pos ≺ prompt_ids.length() {
         mut int chunk ← prompt_ids.length() - pre_pos
+
         if chunk ≻ MaxBatch {
             chunk ← MaxBatch
         }
 
         mut tensor<i32, [MaxBatch]> pre_ids ← tensor<i32, [MaxBatch]> {}
+
         for exclusive chunk let b {
             pre_ids[[b]] ← (prompt_ids[pre_pos + b] coalesce 0) ↦ i32 ⊥ 0
         }
 
-        mut tensor<f32, [MaxBatch, V]> pre_logits ← tf32[MaxBatch, V] {}
         mut tensor<f32, [MaxBatch, D]> pre_hin ← tf32[MaxBatch, D] {}
-        mut tensor<f32, [MaxBatch, D]> pre_hout ← tf32[MaxBatch, D] {}
-        mut tensor<f32, [MaxBatch, D]> pre_hn ← tf32[MaxBatch, D] {}
-        let i32 pre_ab ← chunk ↦ i32 ⊥ 1
-        let i32 pre_tp ← pre_pos ↦ i32 ⊥ 0
-        dt.embed_batch(target.embed, pre_ids, mut pre_hin, pre_ab)
-        mut list<tensor<f32, [C, KVD]>> pre_k ← empty
-        mut list<tensor<f32, [C, KVD]>> pre_v ← empty
+        mut tensor<f32, [MaxBatch, V]> pre_logits ← tf32[MaxBatch, V] {}
+        run_target_batch_forward(target, mut hs, mut bws, pre_ids, chunk, pre_pos, mut pre_hin, mut pre_logits, true)
 
-        for exclusive target.layers.length() let l {
-            let tensor<f32, [C, KVD]> sv_k ← copy sess.full_kv.keys[l]
-            let tensor<f32, [C, KVD]> sv_v ← copy sess.full_kv.values[l]
-            mut dt.SlotView<C, KVD> sv ← dt.SlotView<C, KVD> { kin = sv_k, vin = sv_v, pos = pre_tp }
-            dt.layer_batch(pre_hin, mut pre_hout, target.layers[l], mut sv, target.params[l], mut bws, pre_ab, variant dt.AttentionRegime.Causal)
-            pre_k.append(sv.kin)
-            pre_v.append(sv.vin)
-            copy_hidden_rows<size MaxBatch, size D>(pre_hout, mut pre_hin, chunk)
+        if fast_greedy {
+            pending_token ← argmax_batch_row<size V, size MaxBatch>(pre_logits, chunk - 1)
         }
+        else {
+            mut list<f32> row_logits ← empty
 
-        dt.head_batch(pre_hin, target.onorm, target.head, mut pre_hn, mut pre_logits, target.peps, pre_ab)
-
-        for exclusive pre_k.length() let l {
-            let int slot_id ← sess.full_kv.slot_ids[l]
-
-            for exclusive chunk let b {
-                mut tensor<f32, [KVD]> k_row ← tf32[KVD] {}
-                mut tensor<f32, [KVD]> v_row ← tf32[KVD] {}
-
-                for exclusive KVD let j {
-                    k_row[[j]] ← pre_k[l][[pre_pos + b, j]]
-                    v_row[[j]] ← pre_v[l][[pre_pos + b, j]]
-                }
-
-                session.write_kv(mut sess, slot_id, k_row, v_row, (pre_pos + b) ↦ i32 ⊥ 0)
+            for exclusive V let i {
+                row_logits.append(pre_logits[[chunk - 1, i]])
             }
+
+            let sampling.Sampler outcome ← decoder.sample(decoder.sample_logits(row_logits, g, stop), drawn, history, rng)
+            pending_token ← outcome.token_id
+            rng ← outcome.seed
         }
 
-        pending_token ← argmax_batch_row<size V, size MaxBatch>(pre_logits, chunk - 1)
         pre_pos ← pre_pos + chunk
     }
+
     mut int position ← prompt_ids.length()
-    mut int emitted ← 0
-    mut bool finished ← false
+    tokens.append(pending_token)
+    history.append(pending_token)
+    mut int emitted ← 1
+    mut bool finished ← decoder.is_eog(g, pending_token)
 
-    while emitted ≺ g.max_tokens and prompt_ids.length() + emitted ≺ g.context and not finished {
-        let int depth ← speculative.next_depth(ctx.adaptive_budget)
-        let speculative.ProviderRequest draft_req ← speculative.construct_request(prompt_ids, ctx.token_history, depth, g.acceleration.min_block, g.acceleration.max_block)
-        let speculative.ProviderResult result ← context_lookup.propose(draft_req)
+    if mode ≢ "disabled" {
+        ctx ← speculative.construct_split_drafter_context(history, ctx.target_tap_buffer, ctx.shared_backbone_views, ctx.drafter_session_state, ctx.adaptive_budget, ctx.mtp_budget, ctx.min_suffix_length)
+    }
 
-        if speculative.is_no_draft(result) {
-            let int token ← pending_token
-            tokens.append(token)
-            history.append(token)
-            emitted ← emitted + 1
-            stats.plain_steps ← stats.plain_steps + 1
+    # Folded B=1+k loop: pending_token is emitted but unconsumed at position.
+    # If position == g.context - 1, no further consumption is legal; skip any
+    # verify pass immediately without touching KV or HybridTxn.
+    while not finished and emitted ≺ g.max_tokens and position + 1 ≺ g.context {
+        let int frontier_base ← position
+        let int max_emit_more ← g.max_tokens - emitted
+        let int max_consume ← g.context - 1 - frontier_base
+        mut int max_verify_k ← MaxBatch - 1
 
-            if decoder.is_eog(g, token) {
-                finished ← true
+        if max_emit_more - 1 ≺ max_verify_k {
+            max_verify_k ← max_emit_more - 1
+        }
+
+        if max_consume - 1 ≺ max_verify_k {
+            max_verify_k ← max_consume - 1
+        }
+
+        mut bool take_plain ← mode ≡ "disabled" or max_verify_k ≤ 0
+        mut speculative.ProviderResult result ← speculative.no_draft()
+
+        if not take_plain {
+            result ← draft_round_mode_batch<size V, size D, size QD, size KVD, size F, size H, size C, size MaxBatch, size BH>(drafter, mut bws, mode, prompt_ids, ctx, g, has_drafter)
+
+            if speculative.is_no_draft(result) {
+                take_plain ← true
             }
-            elif emitted ≺ g.max_tokens and position + 1 ≺ g.context {
-                mut tensor<i32, [MaxBatch]> s_ids ← tensor<i32, [MaxBatch]> {}
-                s_ids[[0]] ← token ↦ i32 ⊥ 0
-                mut tensor<f32, [MaxBatch, V]> s_logits ← tf32[MaxBatch, V] {}
-                mut tensor<f32, [MaxBatch, D]> s_hin ← tf32[MaxBatch, D] {}
-                mut tensor<f32, [MaxBatch, D]> s_hout ← tf32[MaxBatch, D] {}
-                mut tensor<f32, [MaxBatch, D]> s_hn ← tf32[MaxBatch, D] {}
-                let i32 s_tp ← position ↦ i32 ⊥ 0
-                dt.embed_batch(target.embed, s_ids, mut s_hin, 1)
-                mut list<tensor<f32, [C, KVD]>> s_k ← empty
-                mut list<tensor<f32, [C, KVD]>> s_v ← empty
+        }
 
-                for exclusive target.layers.length() let l {
-                    let tensor<f32, [C, KVD]> sv_k ← copy sess.full_kv.keys[l]
-                    let tensor<f32, [C, KVD]> sv_v ← copy sess.full_kv.values[l]
-                    mut dt.SlotView<C, KVD> sv ← dt.SlotView<C, KVD> { kin = sv_k, vin = sv_v, pos = s_tp }
-                    dt.layer_batch(s_hin, mut s_hout, target.layers[l], mut sv, target.params[l], mut bws, 1, variant dt.AttentionRegime.Causal)
-                    s_k.append(sv.kin)
-                    s_v.append(sv.vin)
-                    copy_hidden_rows<size MaxBatch, size D>(s_hout, mut s_hin, 1)
-                }
+        if take_plain {
+            mut tensor<i32, [MaxBatch]> p_ids ← tensor<i32, [MaxBatch]> {}
+            p_ids[[0]] ← pending_token ↦ i32 ⊥ 0
+            mut tensor<f32, [MaxBatch, D]> p_hin ← tf32[MaxBatch, D] {}
+            mut tensor<f32, [MaxBatch, V]> p_logits ← tf32[MaxBatch, V] {}
+            run_target_batch_forward(target, mut hs, mut bws, p_ids, 1, frontier_base, mut p_hin, mut p_logits, true)
 
-                dt.head_batch(s_hin, target.onorm, target.head, mut s_hn, mut s_logits, target.peps, 1)
+            mut int next_tok ← 0
 
-                for exclusive s_k.length() let l {
-                    let int slot_id ← sess.full_kv.slot_ids[l]
-                    mut tensor<f32, [KVD]> k_row ← tf32[KVD] {}
-                    mut tensor<f32, [KVD]> v_row ← tf32[KVD] {}
-
-                    for exclusive KVD let j {
-                        k_row[[j]] ← s_k[l][[position, j]]
-                        v_row[[j]] ← s_v[l][[position, j]]
-                    }
-
-                    session.write_kv(mut sess, slot_id, k_row, v_row, position ↦ i32 ⊥ 0)
-                }
-
-                pending_token ← argmax_batch_row<size V, size MaxBatch>(s_logits, 0)
-                position ← position + 1
+            if fast_greedy {
+                next_tok ← argmax_batch_row<size V, size MaxBatch>(p_logits, 0)
             }
             else {
+                mut list<f32> row_logits ← empty
+
+                for exclusive V let i {
+                    row_logits.append(p_logits[[0, i]])
+                }
+
+                let sampling.Sampler outcome ← decoder.sample(decoder.sample_logits(row_logits, g, stop), drawn, history, rng)
+                next_tok ← outcome.token_id
+                rng ← outcome.seed
+            }
+
+            tokens.append(next_tok)
+            history.append(next_tok)
+            emitted ← emitted + 1
+            position ← frontier_base + 1
+            stats.plain_steps ← stats.plain_steps + 1
+
+            if decoder.is_eog(g, next_tok) {
                 finished ← true
+            }
+            else {
+                pending_token ← next_tok
+            }
+
+            if mode ≢ "disabled" {
+                if should_capture_tap(mode) {
+                    mut list<f32> next_tap ← empty
+
+                    for exclusive D let j {
+                        next_tap.append(p_hin[[0, j]])
+                    }
+
+                    ctx ← speculative.construct_split_drafter_context(history, next_tap, ctx.shared_backbone_views, ctx.drafter_session_state, ctx.adaptive_budget, ctx.mtp_budget, ctx.min_suffix_length)
+                }
+                else {
+                    ctx ← speculative.construct_split_drafter_context(history, ctx.target_tap_buffer, ctx.shared_backbone_views, ctx.drafter_session_state, ctx.adaptive_budget, ctx.mtp_budget, ctx.min_suffix_length)
+                }
             }
         }
         else {
             let list<int> candidates ← speculative.candidate_ids(result)
-            let int room ← g.max_tokens - emitted
-            let int frontier_base ← position
-
             mut int verify_k ← candidates.length()
-            if verify_k ≻ MaxBatch {
-                verify_k ← MaxBatch
-            }
-            if verify_k ≻ g.context - frontier_base {
-                verify_k ← g.context - frontier_base
+
+            if verify_k ≻ max_verify_k {
+                verify_k ← max_verify_k
             }
 
-            mut tensor<i32, [MaxBatch]> cand_ids ← tensor<i32, [MaxBatch]> {}
+            let int active_b ← 1 + verify_k
+            mut tensor<i32, [MaxBatch]> step_ids ← tensor<i32, [MaxBatch]> {}
+            step_ids[[0]] ← pending_token ↦ i32 ⊥ 0
+
             for exclusive verify_k let b {
-                cand_ids[[b]] ← (candidates[b] coalesce 0) ↦ i32 ⊥ 0
+                step_ids[[1 + b]] ← (candidates[b] coalesce 0) ↦ i32 ⊥ 0
             }
 
-            mut session.SessionTxn<size C, size W, size KVD> txn ← session.branch(mut sess)
-            mut tensor<f32, [MaxBatch, V]> logits ← tf32[MaxBatch, V] {}
+            mut hybrid.HybridTxn<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> txn ← hybrid.hybrid_branch(mut hs)
             mut tensor<f32, [MaxBatch, D]> v_hin ← tf32[MaxBatch, D] {}
-            mut tensor<f32, [MaxBatch, D]> v_hout ← tf32[MaxBatch, D] {}
-            mut tensor<f32, [MaxBatch, D]> v_hn ← tf32[MaxBatch, D] {}
-            let i32 v_ab ← verify_k ↦ i32 ⊥ 1
-            let i32 v_tp ← frontier_base ↦ i32 ⊥ 0
-            dt.embed_batch(target.embed, cand_ids, mut v_hin, v_ab)
-            mut list<tensor<f32, [C, KVD]>> out_k ← empty
-            mut list<tensor<f32, [C, KVD]>> out_v ← empty
+            mut tensor<f32, [MaxBatch, V]> v_logits ← tf32[MaxBatch, V] {}
+            run_target_batch_forward(target, mut hs, mut bws, step_ids, active_b, frontier_base, mut v_hin, mut v_logits, false)
 
-            for exclusive target.layers.length() let l {
-                let tensor<f32, [C, KVD]> sv_k ← copy sess.full_kv.keys[l]
-                let tensor<f32, [C, KVD]> sv_v ← copy sess.full_kv.values[l]
-                mut dt.SlotView<C, KVD> sv ← dt.SlotView<C, KVD> { kin = sv_k, vin = sv_v, pos = v_tp }
-                dt.layer_batch(v_hin, mut v_hout, target.layers[l], mut sv, target.params[l], mut bws, v_ab, variant dt.AttentionRegime.Causal)
-                out_k.append(sv.kin)
-                out_v.append(sv.vin)
-                copy_hidden_rows<size MaxBatch, size D>(v_hout, mut v_hin, verify_k)
-            }
+            # Inline transactional arena recording across FullKv, RingKv, Conv, Recurrent.
+            let list<int> full_slots ← copy hs.kv.full_kv.slot_ids
+            let int full_count ← full_slots.length()
+            mut list<tensor<f32, [KVD]>> full_k_rows ← empty
+            mut list<tensor<f32, [KVD]>> full_v_rows ← empty
 
-            dt.head_batch(v_hin, target.onorm, target.head, mut v_hn, mut logits, target.peps, v_ab)
+            for exclusive full_count let l {
+                let tensor<f32, [C, KVD]> fk_mat ← hs.kv.full_kv.keys[l]
+                let tensor<f32, [C, KVD]> fv_mat ← hs.kv.full_kv.values[l]
 
-            for exclusive out_k.length() let l {
-                let int slot_id ← sess.full_kv.slot_ids[l]
-
-                for exclusive verify_k let b {
-                    mut tensor<f32, [KVD]> k_row ← tf32[KVD] {}
-                    mut tensor<f32, [KVD]> v_row ← tf32[KVD] {}
+                for exclusive active_b let b {
+                    let int pos ← frontier_base + b
+                    mut tensor<f32, [KVD]> kr ← tf32[KVD] {}
+                    mut tensor<f32, [KVD]> vr ← tf32[KVD] {}
 
                     for exclusive KVD let j {
-                        k_row[[j]] ← out_k[l][[frontier_base + b, j]]
-                        v_row[[j]] ← out_v[l][[frontier_base + b, j]]
+                        kr[[j]] ← fk_mat[[pos, j]]
+                        vr[[j]] ← fv_mat[[pos, j]]
                     }
 
-                    session.txn_write_kv(mut sess, mut txn, slot_id, k_row, v_row, (frontier_base + b) ↦ i32 ⊥ 0)
+                    full_k_rows.append(kr)
+                    full_v_rows.append(vr)
                 }
             }
 
-            mut list<int> verified_candidates ← empty
+            for exclusive full_count let l {
+                let int slot_id ← full_slots[l]
+
+                for exclusive active_b let b {
+                    let int row_idx ← l * active_b + b
+                    let int pos ← frontier_base + b
+                    hybrid.hybrid_txn_write_kv(mut hs, mut txn, slot_id, full_k_rows[row_idx], full_v_rows[row_idx], pos ↦ i32 ⊥ 0)
+                }
+            }
+
+            let list<int> ring_slots ← copy hs.kv.ring_kv.slot_ids
+
+            for exclusive ring_slots.length() let r {
+                let int slot_id ← ring_slots[r]
+                let int src_l ← r % full_count
+
+                for exclusive active_b let b {
+                    let int row_idx ← src_l * active_b + b
+                    let int pos ← frontier_base + b
+                    hybrid.hybrid_txn_write_kv(mut hs, mut txn, slot_id, full_k_rows[row_idx], full_v_rows[row_idx], pos ↦ i32 ⊥ 0)
+                }
+            }
+
+            let list<int> conv_slots ← copy hs.conv.slot_ids
+            let int conv_sites ← hs.conv.sites_per_slot
+            let int conv_base ← hs.conv.site_base
+
+            for exclusive conv_slots.length() let c {
+                let int slot_id ← conv_slots[c]
+
+                for exclusive active_b let b {
+                    mut tensor<f32, [ConvCh]> conv_row ← tf32[ConvCh] {}
+
+                    for exclusive ConvCh let ch {
+                        conv_row[[ch]] ← v_hin[[b, ch % D]]
+                    }
+
+                    for exclusive conv_sites let s {
+                        hybrid.hybrid_txn_conv_push(mut hs, mut txn, slot_id, conv_base + s, conv_row)
+                    }
+                }
+            }
+
+            let list<int> rec_slots ← copy hs.recurrent.slot_ids
+            mut list<tensor<f32, [RecRows, RecCols]>> base_recs ← empty
+
+            for exclusive rec_slots.length() let r {
+                let tensor<f32, [RecRows, RecCols]> snap ← copy hs.recurrent.states[r]
+                base_recs.append(snap)
+            }
+
+            for exclusive rec_slots.length() let r {
+                let int slot_id ← rec_slots[r]
+                mut tensor<f32, [RecRows, RecCols]> cur_state ← copy base_recs[r]
+
+                for exclusive active_b let b {
+                    mut tensor<f32, [RecRows, RecCols]> next_state ← tf32[RecRows, RecCols] {}
+
+                    for exclusive RecRows let rr {
+                        for exclusive RecCols let rc {
+                            let int lane ← (rr * RecCols + rc) % D
+                            next_state[[rr, rc]] ← (0.5 ∷ f32) * cur_state[[rr, rc]] + v_hin[[b, lane]]
+                        }
+                    }
+
+                    cur_state ← next_state
+                    hybrid.hybrid_txn_recurrent_update(mut hs, mut txn, slot_id, cur_state)
+                }
+            }
+
+            mut int accepted_cand_count ← 0
+            mut int eog_cand_at ← 0 - 1
+
             for exclusive verify_k let b {
-                verified_candidates.append(candidates[b] coalesce 0)
-            }
+                let int cand ← candidates.get(b) coalesce (-1)
+                let int pred ← argmax_batch_row<size V, size MaxBatch>(v_logits, b)
 
-            mut list<int> target_ids ← empty
-            target_ids.append(pending_token)
-            for range 0 ‥ (verify_k - 1) let b {
-                target_ids.append(argmax_batch_row<size V, size MaxBatch>(logits, b))
-            }
+                if pred ≢ cand {
+                    break
+                }
 
-            let speculative.GreedyAcceptance acc ← speculative.first_divergence(target_ids, verified_candidates)
-            mut int accepted_count ← acc.accepted_prefix
+                accepted_cand_count ← accepted_cand_count + 1
 
-            if accepted_count ≻ verify_k {
-                accepted_count ← verify_k
-            }
-            if accepted_count ≻ room - 1 {
-                accepted_count ← room - 1
-            }
-            if accepted_count ≻ g.context - 1 - frontier_base {
-                accepted_count ← g.context - 1 - frontier_base
-            }
-
-            mut list<int> accepted_ids ← empty
-            for exclusive accepted_count let i {
-                accepted_ids.append(candidates[i] coalesce 0)
-            }
-
-            let int extra_token ← accepted_count ≺ verify_k ✓ (target_ids[accepted_count] coalesce 0) ✗ argmax_batch_row<size V, size MaxBatch>(logits, verify_k - 1)
-
-            mut list<int> block ← empty
-            for from accepted_ids let t {
-                block.append(t)
-            }
-            block.append(extra_token)
-
-            mut int eogi ← 0 - 1
-            for exclusive accepted_ids.length() let i {
-                if eogi ≡ (0 - 1) and decoder.is_eog(g, accepted_ids[i] coalesce 0) {
-                    eogi ← i
+                if eog_cand_at ≺ 0 and decoder.is_eog(g, cand) {
+                    eog_cand_at ← b
+                    break
                 }
             }
 
-            mut list<int> kept ← empty
-            for from block let t {
-                if not finished {
-                    kept.append(t)
-                    tokens.append(t)
-                    history.append(t)
+            mut int commit_count ← 1 + accepted_cand_count
+
+            if eog_cand_at ≥ 0 {
+                for exclusive (eog_cand_at + 1) let b {
+                    let int tok ← candidates.get(b) coalesce 0
+                    tokens.append(tok)
+                    history.append(tok)
                     emitted ← emitted + 1
-
-                    if decoder.is_eog(g, t) {
-                        finished ← true
-                    }
                 }
-            }
 
-            let int commit_count ← eogi ≥ 0 ✓ eogi ✗ accepted_ids.length()
-            if commit_count ≻ 0 {
-                session.commit_prefix(mut sess, mut txn, commit_count)
+                commit_count ← 1 + eog_cand_at
+                finished ← true
             }
             else {
-                session.rollback(mut sess, mut txn)
+                for exclusive accepted_cand_count let b {
+                    let int tok ← candidates.get(b) coalesce 0
+                    tokens.append(tok)
+                    history.append(tok)
+                    emitted ← emitted + 1
+                }
+
+                let int extra_token ← argmax_batch_row<size V, size MaxBatch>(v_logits, accepted_cand_count)
+                tokens.append(extra_token)
+                history.append(extra_token)
+                emitted ← emitted + 1
+
+                if decoder.is_eog(g, extra_token) {
+                    finished ← true
+                }
+                else {
+                    pending_token ← extra_token
+                }
             }
 
+            hybrid.hybrid_commit_prefix(mut hs, mut txn, commit_count)
             position ← frontier_base + commit_count
             stats.verify_rounds ← stats.verify_rounds + 1
-            stats.drafted_total ← stats.drafted_total + candidates.length()
-            stats.accepted_total ← stats.accepted_total + accepted_ids.length()
+            stats.drafted_total ← stats.drafted_total + verify_k
+            stats.accepted_total ← stats.accepted_total + accepted_cand_count
 
-            let speculative.AdaptiveBudget advanced ← speculative.observe_block(ctx.adaptive_budget, candidates.length(), accepted_ids.length())
-            ctx ← speculative.construct_pld_context(history, advanced)
+            let string draft_src ← speculative.candidate_provenance(result).source
+            let speculative.DrafterContext obs_ctx ← speculative.observe_source_block(ctx, draft_src, verify_k, accepted_cand_count)
 
-            if not finished and emitted ≺ g.max_tokens and position + 1 ≺ g.context {
-                let int tail ← kept.get(kept.length() - 1) coalesce 0
-                mut tensor<i32, [MaxBatch]> t_ids ← tensor<i32, [MaxBatch]> {}
-                t_ids[[0]] ← tail ↦ i32 ⊥ 0
-                mut tensor<f32, [MaxBatch, V]> t_logits ← tf32[MaxBatch, V] {}
-                mut tensor<f32, [MaxBatch, D]> t_hin ← tf32[MaxBatch, D] {}
-                mut tensor<f32, [MaxBatch, D]> t_hout ← tf32[MaxBatch, D] {}
-                mut tensor<f32, [MaxBatch, D]> t_hn ← tf32[MaxBatch, D] {}
-                let i32 t_tp ← position ↦ i32 ⊥ 0
-                dt.embed_batch(target.embed, t_ids, mut t_hin, 1)
-                mut list<tensor<f32, [C, KVD]>> t_k ← empty
-                mut list<tensor<f32, [C, KVD]>> t_v ← empty
+            if should_capture_tap(mode) {
+                mut list<f32> live_tap ← empty
 
-                for exclusive target.layers.length() let l {
-                    let tensor<f32, [C, KVD]> sv_k ← copy sess.full_kv.keys[l]
-                    let tensor<f32, [C, KVD]> sv_v ← copy sess.full_kv.values[l]
-                    mut dt.SlotView<C, KVD> sv ← dt.SlotView<C, KVD> { kin = sv_k, vin = sv_v, pos = t_tp }
-                    dt.layer_batch(t_hin, mut t_hout, target.layers[l], mut sv, target.params[l], mut bws, 1, variant dt.AttentionRegime.Causal)
-                    t_k.append(sv.kin)
-                    t_v.append(sv.vin)
-                    copy_hidden_rows<size MaxBatch, size D>(t_hout, mut t_hin, 1)
+                for exclusive D let j {
+                    live_tap.append(v_hin[[commit_count - 1, j]])
                 }
 
-                dt.head_batch(t_hin, target.onorm, target.head, mut t_hn, mut t_logits, target.peps, 1)
-
-                for exclusive t_k.length() let l {
-                    let int slot_id ← sess.full_kv.slot_ids[l]
-                    mut tensor<f32, [KVD]> k_row ← tf32[KVD] {}
-                    mut tensor<f32, [KVD]> v_row ← tf32[KVD] {}
-
-                    for exclusive KVD let j {
-                        k_row[[j]] ← t_k[l][[position, j]]
-                        v_row[[j]] ← t_v[l][[position, j]]
-                    }
-
-                    session.write_kv(mut sess, slot_id, k_row, v_row, position ↦ i32 ⊥ 0)
-                }
-
-                pending_token ← argmax_batch_row<size V, size MaxBatch>(t_logits, 0)
-                position ← position + 1
+                ctx ← speculative.construct_split_drafter_context(history, live_tap, obs_ctx.shared_backbone_views, obs_ctx.drafter_session_state, obs_ctx.adaptive_budget, obs_ctx.mtp_budget, obs_ctx.min_suffix_length)
+            }
+            else {
+                ctx ← speculative.construct_split_drafter_context(history, obs_ctx.target_tap_buffer, obs_ctx.shared_backbone_views, obs_ctx.drafter_session_state, obs_ctx.adaptive_budget, obs_ctx.mtp_budget, obs_ctx.min_suffix_length)
             }
         }
     }
 
     return VerifyRun { tokens = tokens, stats = stats }
+}
+
+# Unified B=k verify coordinator over HybridTxn (supporting Disabled,
+# ContextLookup, FeatureTapped, StandaloneDraft, and PldThenMtp in greedy-only
+# Phase 1; SessionTxn is the KV-only degeneracy).
+@ public
+fn verify_generate_hybrid<size V, size D, size QD, size KVD, size F, size H, size C, size W, size ConvRows, size ConvCh, size RecRows, size RecCols, size MaxBatch, size BH>(config.GenerationConfig g, list<int> prompt_ids, BatchTarget<V, D, QD, KVD, F> target, BatchTarget<V, D, QD, KVD, F> drafter, bool has_drafter, speculative.DrafterContext initial_ctx, mut hybrid.HybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> hs) → VerifyRun ⇥ VerifyError {
+    return run_verify_hybrid_coordinator<size V, size D, size QD, size KVD, size F, size H, size C, size W, size ConvRows, size ConvCh, size RecRows, size RecCols, size MaxBatch, size BH>(target, mut hs, drafter, has_drafter, g, prompt_ids, initial_ctx)
+}
+
+# Backwards-compatible KV-only coupled wrapper (SessionTxn degeneracy of HybridTxn).
+@ public
+fn verify_generate_batch_coupled<size V, size D, size QD, size KVD, size F, size H, size C, size W, size MaxBatch, size BH>(config.GenerationConfig g, list<int> prompt_ids, BatchTarget<V, D, QD, KVD, F> target, BatchTarget<V, D, QD, KVD, F> drafter, bool has_drafter, speculative.DrafterContext initial_ctx, mut session.SessionState<size C, size W, size KVD> sess) → VerifyRun ⇥ VerifyError {
+    let string mode ← config.acceleration_mode_name(g.acceleration.mode)
+
+    if mode ≡ "disabled" {
+        throw variant InvalidConfig { message = "the verify route needs an enabled acceleration policy; the Disabled baseline is decoder.generate" }
+    }
+
+    let hybrid.ConvStateArena<size 1, size 1> empty_conv ← hybrid.ConvStateArena { sites_per_slot = 0, history_len = 0, channels = 1, slot_ids = empty, buffers = empty, steps_written = empty, site_base = 0, txn_depth = 0, scratch_alloc_count = 0 }
+    let hybrid.RecurrentStateArena<size 1, size 1> empty_rec ← hybrid.RecurrentStateArena { rows = 1, cols = 1, slot_ids = empty, states = empty, steps_written = empty, txn_depth = 0 }
+    mut hybrid.HybridSession<size C, size W, size KVD, size 1, size 1, size 1, size 1> hs ← hybrid.HybridSession { kv = sess, conv = empty_conv, recurrent = empty_rec }
+
+    do {
+        let VerifyRun run ← run_verify_hybrid_coordinator<size V, size D, size QD, size KVD, size F, size H, size C, size W, size 1, size 1, size 1, size 1, size MaxBatch, size BH>(target, mut hs, drafter, has_drafter, g, prompt_ids, initial_ctx)
+        sess ← hs.kv
+        return run
+    }
+    catch err {
+        sess ← hs.kv
+        throw err
+    }
+
+    return default_run()
+}
+
+# Run one B=k batched greedy speculative generation over a transactional
+# SessionState (KV-only degeneracy of verify_generate_hybrid).
+@ public
+fn verify_generate_batch<size V, size D, size QD, size KVD, size F, size H, size C, size W, size MaxBatch, size BH>(config.GenerationConfig g, list<int> prompt_ids, BatchTarget<V, D, QD, KVD, F> target, mut session.SessionState<size C, size W, size KVD> sess) → VerifyRun ⇥ VerifyError {
+    let string mode ← config.acceleration_mode_name(g.acceleration.mode)
+
+    if mode ≡ "disabled" {
+        throw variant InvalidConfig { message = "the verify route needs an enabled acceleration policy; the Disabled baseline is decoder.generate" }
+    }
+
+    let hybrid.ConvStateArena<size 1, size 1> empty_conv ← hybrid.ConvStateArena { sites_per_slot = 0, history_len = 0, channels = 1, slot_ids = empty, buffers = empty, steps_written = empty, site_base = 0, txn_depth = 0, scratch_alloc_count = 0 }
+    let hybrid.RecurrentStateArena<size 1, size 1> empty_rec ← hybrid.RecurrentStateArena { rows = 1, cols = 1, slot_ids = empty, states = empty, steps_written = empty, txn_depth = 0 }
+    mut hybrid.HybridSession<size C, size W, size KVD, size 1, size 1, size 1, size 1> hs ← hybrid.HybridSession { kv = sess, conv = empty_conv, recurrent = empty_rec }
+
+    do {
+        let VerifyRun run ← run_verify_hybrid_coordinator<size V, size D, size QD, size KVD, size F, size H, size C, size W, size 1, size 1, size 1, size 1, size MaxBatch, size BH>(target, mut hs, target, false, g, prompt_ids, speculative.default_context())
+        sess ← hs.kv
+        return run
+    }
+    catch err {
+        sess ← hs.kv
+        throw err
+    }
+
+    return default_run()
 }
 
 +++ faber test
@@ -1039,6 +1426,7 @@ import from "gradus:model/bundle"
 import from "gradus:model/artifact"
 import from "gradus:model/capsule"
 import from "gradus:cache/session"
+import from "gradus:cache/hybrid_arenas" let hybrid
 import from "gradus:speculative"
 import from "gradus:sampling"
 import from "gradus:decode_token" let dt
@@ -1737,7 +2125,7 @@ describe "issue #96 — B=k parallel speculative verify over SessionTxn" {
     test "partial acceptance (+ corrective token) matches B=1 baseline and FullKv parity" {
         let _ trap_res ← trap {
             let draft_verify.BatchTarget<4, 4, 4, 4, 6> target ← make_cycle_target()
-            let list<int> prompt ← [0, 1, 2, 0, 1, 0, 0, 1]
+            let list<int> prompt ← [0, 1, 2, 0, 1, 0]
             let config.GenerationConfig g ← batch_cfg(16, 6, empty)
 
             mut session.SessionState<16, 1, 4> base_sess ← sess_p()
@@ -1829,19 +2217,82 @@ describe "issue #96 — B=k parallel speculative verify over SessionTxn" {
     test "candidates exceeding MaxBatch clamp accepted_count to verify_k without InvalidCommitCount" {
         let _ trap_res ← trap {
             let draft_verify.BatchTarget<4, 4, 4, 4, 6> target ← make_cycle_target()
-            let list<int> prompt ← [3, 3, 3, 3, 3, 3]
-            let config.GenerationConfig g ← batch_cfg(16, 8, empty)
+            let list<int> prompt ← [1, 2, 3, 3, 3, 3, 3, 1, 2, 3]
+            let config.AccelerationPolicy clamp_pol ← config.construct_acceleration("1.1.0", config.acceleration_context_lookup(), 1, 5, 4, 5) ⊥ config.default_acceleration()
+            let config.GenerationConfig g ← config.construct_generation_with_policy(16, 16, 5, 7, 0.0 ∷ f32, 0, 1.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32, empty, clamp_pol) ⊥ config.default()
 
             mut session.SessionState<16, 1, 4> base_sess ← sess_p()
             let list<int> base_tokens ← baseline_wide_generate(g, prompt, target, mut base_sess)
 
             mut session.SessionState<16, 1, 4> batch_sess ← sess_p()
-            let draft_verify.VerifyRun run ← draft_verify.verify_generate_batch<size 4, size 4, size 4, size 4, size 6, size 2, size 16, size 1, size 2, size 4>(g, prompt, target, mut batch_sess)
+            let draft_verify.VerifyRun run ← draft_verify.verify_generate_batch<size 4, size 4, size 4, size 4, size 6, size 2, size 16, size 1, size 4, size 8>(g, prompt, target, mut batch_sess)
 
             assert run.tokens ≡ base_tokens
             assert batch_sess.txn_depth ≡ 0
             assert sessions_close(batch_sess, base_sess)
-            assert run.stats.accepted_total ≥ 2
+            assert run.stats.accepted_total ≥ 3
+        }
+        match trap_res {
+            case returned let ? { }
+            case thrown let ? { assert false }
+        }
+    }
+}
+
+# ---- issue #139: NoDraft recovery, frontier_base skip, and MaxBatch clamp
+
+describe "issue #139 — NoDraft recovery, frontier skip, and MaxBatch accounting" {
+    test "NoDraft recovery updates ctx.token_history and resumes PLD on subsequent rounds" {
+        let _ trap_res ← trap {
+            let draft_verify.BatchTarget<4, 4, 4, 4, 6> target ← make_cycle_target()
+            let list<int> prompt ← [0, 1]
+            let config.GenerationConfig g ← batch_cfg(16, 12, empty)
+
+            mut session.SessionState<16, 1, 4> base_sess ← sess_p()
+            let list<int> base_tokens ← baseline_wide_generate(g, prompt, target, mut base_sess)
+
+            mut session.SessionState<16, 1, 4> batch_sess ← sess_p()
+            let draft_verify.VerifyRun run ← draft_verify.verify_generate_batch<size 4, size 4, size 4, size 4, size 6, size 2, size 16, size 1, size 4, size 8>(g, prompt, target, mut batch_sess)
+
+            assert run.tokens ≡ base_tokens
+            assert run.stats.plain_steps ≥ 1
+            assert run.stats.verify_rounds ≥ 1
+            assert run.stats.accepted_total ≥ 1
+            assert batch_sess.txn_depth ≡ 0
+            assert sessions_close(batch_sess, base_sess)
+        }
+        match trap_res {
+            case returned let ? { }
+            case thrown let ? { assert false }
+        }
+    }
+    test "frontier_base == context - 1 skips verify pass and MaxBatch clamp counts verify_k" {
+        let _ trap_res ← trap {
+            let draft_verify.BatchTarget<4, 4, 4, 4, 6> target ← make_cycle_target()
+
+            # Context 4 with prompt length 3: prefill emits pending token at frontier_base == 3 == context - 1.
+            let list<int> edge_prompt ← [3, 3, 3]
+            let config.GenerationConfig edge_cfg ← batch_cfg(4, 4, empty)
+            mut session.SessionState<16, 1, 4> base_edge ← sess_p()
+            let list<int> base_tokens ← baseline_wide_generate(edge_cfg, edge_prompt, target, mut base_edge)
+
+            mut session.SessionState<16, 1, 4> batch_edge ← sess_p()
+            let draft_verify.VerifyRun edge_run ← draft_verify.verify_generate_batch<size 4, size 4, size 4, size 4, size 6, size 2, size 16, size 1, size 4, size 8>(edge_cfg, edge_prompt, target, mut batch_edge)
+            assert edge_run.tokens ≡ base_tokens
+            assert edge_run.tokens.length() ≡ 1
+            assert edge_run.stats.verify_rounds ≡ 0
+            assert edge_run.stats.plain_steps ≡ 0
+            assert batch_edge.full_kv.lengths[0] ≡ 3
+            assert sessions_close(batch_edge, base_edge)
+
+            # MaxBatch = 4 clamps verify_k to 3 even when policy admits depth 4.
+            let config.AccelerationPolicy clamp_pol ← config.construct_acceleration("1.1.0", config.acceleration_context_lookup(), 1, 5, 4, 5) ⊥ config.default_acceleration()
+            let config.GenerationConfig clamp_cfg ← config.construct_generation_with_policy(16, 16, 5, 7, 0.0 ∷ f32, 0, 1.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32, empty, clamp_pol) ⊥ config.default()
+            mut session.SessionState<16, 1, 4> clamp_sess ← sess_p()
+            let draft_verify.VerifyRun clamp_run ← draft_verify.verify_generate_batch<size 4, size 4, size 4, size 4, size 6, size 2, size 16, size 1, size 4, size 8>(clamp_cfg, [1, 2, 3, 3, 3, 3, 3, 1, 2, 3], target, mut clamp_sess)
+            assert clamp_run.stats.verify_rounds ≡ 1
+            assert clamp_run.stats.accepted_total ≡ 3
+            assert clamp_run.stats.drafted_total ≡ 3
         }
         match trap_res {
             case returned let ? { }
