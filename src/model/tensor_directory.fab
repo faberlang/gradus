@@ -57,7 +57,18 @@ union LoadView {
         int channels
         int kernel_size
     },
+    Conv1dLayout {
+        int channels
+        int kernel_size
+        bool transpose_to_kc
+        bool flip_kernel
+    },
     FusedGateUpSplit {
+        int gate_rows
+        int up_rows
+        bool select_up
+    },
+    FusedGateUpInterleaved {
         int gate_rows
         int up_rows
         bool select_up
@@ -67,6 +78,7 @@ union LoadView {
         int hidden_dim
     },
     FuseWeight {
+        int rows
         int taps
     }
 }
@@ -131,6 +143,8 @@ class ViewSpec {
 class TensorDirectory {
     let bundle.ModelBundle bundle
     let list<DirectoryEntry> entries
+    let map<string, int> canonical_index = empty
+    let map<string, int> source_index = empty
 }
 
 # -------------------------------------------------------------------------
@@ -141,6 +155,9 @@ fn gguf_suffix_to_canonical(string suffix) → string {
     switch suffix {
         case "attn_norm.weight" {
             return "input_layernorm.weight"
+        }
+        case "post_attention_norm.weight" {
+            return "post_attention_layernorm.weight"
         }
         case "attn_q.weight" {
             return "self_attn.q_proj.weight"
@@ -166,6 +183,21 @@ fn gguf_suffix_to_canonical(string suffix) → string {
         case "attn_v.bias" {
             return "self_attn.v_proj.bias"
         }
+        case "attn_q_norm.weight" {
+            return "self_attn.q_norm.weight"
+        }
+        case "attn_k_norm.weight" {
+            return "self_attn.k_norm.weight"
+        }
+        case "attn_sinks.weight" {
+            return "self_attn.sinks.weight"
+        }
+        case "softmax_offset" {
+            return "self_attn.softmax_offset"
+        }
+        case "softmax_offset.weight" {
+            return "self_attn.softmax_offset.weight"
+        }
         case "ffn_norm.weight" {
             return "post_attention_layernorm.weight"
         }
@@ -177,6 +209,21 @@ fn gguf_suffix_to_canonical(string suffix) → string {
         }
         case "ffn_down.weight" {
             return "mlp.down_proj.weight"
+        }
+        case "ffn_gate_exps.weight" {
+            return "mlp.experts.gate_proj.weight"
+        }
+        case "ffn_up_exps.weight" {
+            return "mlp.experts.up_proj.weight"
+        }
+        case "ffn_down_exps.weight" {
+            return "mlp.experts.down_proj.weight"
+        }
+        case "ffn_gate_up_exps.weight" {
+            return "mlp.experts.gate_up_proj.weight"
+        }
+        case "ffn_gate_inp.weight" {
+            return "mlp.gate.weight"
         }
         default {
             return suffix
@@ -292,14 +339,20 @@ fn validate_view(LoadView view) → void ⇥ DirectoryError {
         case Conv1d let channels, kernel_size {
             require channels ≻ 0 and kernel_size ≻ 0 throw variant BadView { message = "Conv1d channels and kernel_size must be positive" }
         }
+        case Conv1dLayout let channels, kernel_size, ?, ? {
+            require channels ≻ 0 and kernel_size ≻ 0 throw variant BadView { message = "Conv1dLayout channels and kernel_size must be positive" }
+        }
         case FusedGateUpSplit let gate_rows, up_rows, select_up {
             require gate_rows ≻ 0 and up_rows ≻ 0 throw variant BadView { message = "FusedGateUpSplit gate_rows and up_rows must be positive" }
+        }
+        case FusedGateUpInterleaved let gate_rows, up_rows, select_up {
+            require gate_rows ≻ 0 and up_rows ≻ 0 and gate_rows ≡ up_rows throw variant BadView { message = "FusedGateUpInterleaved gate_rows and up_rows must be positive and equal" }
         }
         case AttnResQuery let head_rows, hidden_dim {
             require head_rows ≻ 0 and hidden_dim ≻ 0 throw variant BadView { message = "AttnResQuery head_rows and hidden_dim must be positive" }
         }
-        case FuseWeight let taps {
-            require taps ≻ 0 throw variant BadView { message = "FuseWeight taps must be positive" }
+        case FuseWeight let rows, taps {
+            require rows ≻ 0 and taps ≻ 0 throw variant BadView { message = "FuseWeight rows and taps must be positive" }
         }
     }
 }
@@ -337,22 +390,27 @@ fn role_member(bundle.ModelBundle b, bundle.MemberRole role, int shard_index) �
     }
 }
 
-fn indexed_shard_for(bundle.ShardMapping map, string name) → int ∪ none {
-    match map {
-        case bundle.ShardMapping.Indexed let entries {
-            for from entries let e {
-                if e.tensor_name ≡ name then return e.shard_index
-            }
-
-            return null
-        }
-        case bundle.ShardMapping.Unindexed let shard_count {
-            return null
-        }
-    }
+fn role_key(bundle.MemberRole role, string name) → string {
+    return "§\n§"(bundle.role_name(role), name)
 }
 
-fn find_entry_index(list<DirectoryEntry> entries, bundle.MemberRole role, string name) → int {
+fn find_entry_index_maps(map<string, int> canon_idx, map<string, int> source_idx, bundle.MemberRole role, string name) → int {
+    let string key ← role_key(role, name)
+    let int ci ← canon_idx.get(key) coalesce -1
+    let int si ← source_idx.get(key) coalesce -1
+
+    if ci ≥ 0 and si ≥ 0 {
+        return ci ≺ si ✓ ci ✗ si
+    }
+
+    if ci ≥ 0 then return ci
+
+    if si ≥ 0 then return si
+
+    return -1
+}
+
+fn find_entry_index_scan(list<DirectoryEntry> entries, bundle.MemberRole role, string name) → int {
     for exclusive entries.length() let i {
         let DirectoryEntry e ← entries[i]
 
@@ -362,18 +420,29 @@ fn find_entry_index(list<DirectoryEntry> entries, bundle.MemberRole role, string
     return -1
 }
 
-fn append_checked(mut list<DirectoryEntry> entries, DirectoryEntry entry) → void ⇥ DirectoryError {
-    for from entries let existing {
-        if same_role(existing.role, entry.role) {
-            reject existing.canonical_name ≡ entry.canonical_name throw variant DuplicateTensor { message = "duplicate canonical tensor § in role §"(entry.canonical_name, bundle.role_name(entry.role)) }
-            reject existing.source_name ≡ entry.source_name throw variant DuplicateTensor { message = "duplicate source tensor § in role §"(entry.source_name, bundle.role_name(entry.role)) }
-        }
+fn find_entry_index(TensorDirectory dir, bundle.MemberRole role, string name) → int {
+    if dir.canonical_index.length() ≻ 0 or dir.source_index.length() ≻ 0 {
+        return find_entry_index_maps(dir.canonical_index, dir.source_index, role, name)
     }
 
-    entries.append(entry)
+    return find_entry_index_scan(dir.entries, role, name)
 }
 
-fn ingest_gguf(mut list<DirectoryEntry> entries, bundle.BundleMember member, gguf_manifest.GgufManifest m) → void ⇥ DirectoryError {
+fn append_checked(mut list<DirectoryEntry> entries, mut map<string, int> canon_idx, mut map<string, int> source_idx, DirectoryEntry entry) → void ⇥ DirectoryError {
+    let string ck ← role_key(entry.role, entry.canonical_name)
+    let string sk ← role_key(entry.role, entry.source_name)
+
+    reject (canon_idx.get(ck) coalesce -1) ≥ 0 throw variant DuplicateTensor { message = "duplicate canonical tensor § in role §"(entry.canonical_name, bundle.role_name(entry.role)) }
+
+    reject (source_idx.get(sk) coalesce -1) ≥ 0 throw variant DuplicateTensor { message = "duplicate source tensor § in role §"(entry.source_name, bundle.role_name(entry.role)) }
+
+    let int pos ← entries.length()
+    entries.append(entry)
+    canon_idx.put(ck, pos)
+    source_idx.put(sk, pos)
+}
+
+fn ingest_gguf(mut list<DirectoryEntry> entries, mut map<string, int> canon_idx, mut map<string, int> source_idx, bundle.BundleMember member, gguf_manifest.GgufManifest m) → void ⇥ DirectoryError {
     require m.artifact_length ≤ member.identity.length and m.data_start ≥ 0 and m.data_start ≤ m.artifact_length throw variant OutOfBoundsRange { message = "GGUF manifest bounds exceed bundle member length" }
 
     let string mid ← member_id_for(member)
@@ -387,7 +456,7 @@ fn ingest_gguf(mut list<DirectoryEntry> entries, bundle.BundleMember member, ggu
                 byte_length ← blen
             }
             case gguf_manifest.GgmlLayout.Unknown let kind {
-                byte_length ← 0
+                throw variant OutOfBoundsRange { message = "GGUF tensor § has unknown GGML layout kind §"(t.name, kind ↦ string) }
             }
         }
 
@@ -395,12 +464,12 @@ fn ingest_gguf(mut list<DirectoryEntry> entries, bundle.BundleMember member, ggu
 
         let string canon ← canonicalize_gguf_name(t.name)
         let DirectoryEntry entry ← DirectoryEntry { canonical_name = canon, source_name = t.name, role = member.role, source_role = member.role, member_id = mid, shard_index = member.shard_index, container = member.container, byte_offset = byte_offset, byte_length = byte_length, raw_dtype = ggml_dtype_name(t.dtype_ggml), raw_dtype_id = t.dtype_ggml, shape = t.shape, view = variant Full }
-        append_checked(mut entries, entry)
+        append_checked(mut entries, mut canon_idx, mut source_idx, entry)
     }
 }
 
-fn ingest_safetensors(mut list<DirectoryEntry> entries, bundle.ModelBundle b, bundle.BundleMember member, capsule.SafetensorsManifest m) → void ⇥ DirectoryError {
-    require m.artifact_length ≤ member.identity.length and m.data_length ≻ 0 and m.data_length ≤ m.artifact_length - 8 throw variant OutOfBoundsRange { message = "Safetensors manifest bounds exceed bundle member length" }
+fn ingest_safetensors(mut list<DirectoryEntry> entries, mut map<string, int> canon_idx, mut map<string, int> source_idx, mut set<string> seen_backbone, bundle.ModelBundle b, bundle.BundleMember member, capsule.SafetensorsManifest m) → void ⇥ DirectoryError {
+    require m.artifact_length ≡ member.identity.length and m.data_length ≻ 0 and m.data_length ≤ m.artifact_length - 8 throw variant OutOfBoundsRange { message = "Safetensors manifest bounds exceed bundle member length" }
 
     let int data_start ← m.artifact_length - m.data_length
     let string mid ← member_id_for(member)
@@ -413,13 +482,18 @@ fn ingest_safetensors(mut list<DirectoryEntry> entries, bundle.ModelBundle b, bu
 
         if same_role(member.role, variant bundle.MemberRole.Backbone) {
             match b.shard_map {
-                case bundle.ShardMapping.Indexed let shard_entries {
-                    let int ∪ none expected ← indexed_shard_for(b.shard_map, t.name)
+                case bundle.ShardMapping.Indexed let ? {
+                    mut int exp_idx ← -1
+                    do {
+                        exp_idx ← bundle.resolve_tensor_shard(b, t.name)
+                    }
+                    catch err {
+                        throw variant BadShard { message = "indexed shard map missing tensor §"(t.name) }
+                    }
 
-                    require expected not is none throw variant BadShard { message = "indexed shard map missing tensor §"(t.name) }
-
-                    let int exp_idx ← expected
                     require exp_idx ≡ member.shard_index throw variant BadShard { message = "tensor § belongs to shard §, found in shard §"(t.name, exp_idx ↦ string, member.shard_index ↦ string) }
+
+                    seen_backbone.add(t.name)
                 }
                 case bundle.ShardMapping.Unindexed let shard_count {
                     require member.shard_index ≥ 0 and member.shard_index ≺ shard_count throw variant BadShard { message = "shard index § out of range"(member.shard_index ↦ string) }
@@ -428,7 +502,7 @@ fn ingest_safetensors(mut list<DirectoryEntry> entries, bundle.ModelBundle b, bu
         }
 
         let DirectoryEntry entry ← DirectoryEntry { canonical_name = t.name, source_name = t.name, role = member.role, source_role = member.role, member_id = mid, shard_index = member.shard_index, container = member.container, byte_offset = byte_offset, byte_length = byte_length, raw_dtype = t.dtype, raw_dtype_id = -1, shape = t.shape, view = variant Full }
-        append_checked(mut entries, entry)
+        append_checked(mut entries, mut canon_idx, mut source_idx, entry)
     }
 }
 
@@ -439,6 +513,9 @@ fn ingest_safetensors(mut list<DirectoryEntry> entries, bundle.ModelBundle b, bu
 @ public
 fn build(bundle.ModelBundle b, list<ShardSource> sources, list<BorrowSpec> borrows, list<ViewSpec> views) → TensorDirectory ⇥ DirectoryError {
     mut list<DirectoryEntry> entries ← empty
+    mut map<string, int> canon_idx ← empty
+    mut map<string, int> source_idx ← empty
+    mut set<string> seen_backbone ← empty
     mut int backbone_seen ← 0
 
     for from sources let src {
@@ -448,7 +525,7 @@ fn build(bundle.ModelBundle b, list<ShardSource> sources, list<BorrowSpec> borro
 
                 require bundle.container_name(member.container) ≡ "gguf" throw variant BadShard { message = "bundle member for § is not GGUF"(bundle.role_name(role)) }
 
-                ingest_gguf(mut entries, member, manifest)
+                ingest_gguf(mut entries, mut canon_idx, mut source_idx, member, manifest)
 
                 if same_role(role, variant bundle.MemberRole.Backbone) then backbone_seen ↑
             }
@@ -457,7 +534,7 @@ fn build(bundle.ModelBundle b, list<ShardSource> sources, list<BorrowSpec> borro
 
                 require bundle.container_name(member.container) ≡ "safetensors" throw variant BadShard { message = "bundle member for § is not Safetensors"(bundle.role_name(role)) }
 
-                ingest_safetensors(mut entries, b, member, manifest)
+                ingest_safetensors(mut entries, mut canon_idx, mut source_idx, mut seen_backbone, b, member, manifest)
 
                 if same_role(role, variant bundle.MemberRole.Backbone) then backbone_seen ↑
             }
@@ -466,9 +543,20 @@ fn build(bundle.ModelBundle b, list<ShardSource> sources, list<BorrowSpec> borro
 
     require backbone_seen ≡ b.backbone_shards.length() throw variant BadShard { message = "expected § backbone shard sources, got §"(b.backbone_shards.length() ↦ string, backbone_seen ↦ string) }
 
+    match b.shard_map {
+        case bundle.ShardMapping.Indexed let shard_entries {
+            for from shard_entries let se {
+                require se.tensor_name ∈ seen_backbone throw variant BadShard { message = "indexed shard map entry § missing from backbone shards"(se.tensor_name) }
+            }
+        }
+        case bundle.ShardMapping.Unindexed let ? {
+            pass
+        }
+    }
+
     for from views let vs {
         validate_view(vs.view)
-        let int idx ← find_entry_index(entries, vs.role, vs.canonical_name)
+        let int idx ← find_entry_index_maps(canon_idx, source_idx, vs.role, vs.canonical_name)
 
         require idx ≥ 0 throw variant UnknownTensor { message = "view target § not found in role §"(vs.canonical_name, bundle.role_name(vs.role)) }
 
@@ -481,20 +569,20 @@ fn build(bundle.ModelBundle b, list<ShardSource> sources, list<BorrowSpec> borro
 
         reject same_role(br.target_role, br.source_role) throw variant BadBorrow { message = "cross-role borrow requires distinct target and source roles" }
 
-        let int existing_idx ← find_entry_index(entries, br.target_role, br.canonical_name)
+        let int existing_idx ← find_entry_index_maps(canon_idx, source_idx, br.target_role, br.canonical_name)
 
         reject existing_idx ≥ 0 throw variant BadBorrow { message = "target role § already defines §"(bundle.role_name(br.target_role), br.canonical_name) }
 
-        let int src_idx ← find_entry_index(entries, br.source_role, br.source_canonical_name)
+        let int src_idx ← find_entry_index_maps(canon_idx, source_idx, br.source_role, br.source_canonical_name)
 
         require src_idx ≥ 0 throw variant BadBorrow { message = "borrow source § missing from role §"(br.source_canonical_name, bundle.role_name(br.source_role)) }
 
         let DirectoryEntry src ← entries[src_idx]
         let DirectoryEntry borrowed ← DirectoryEntry { canonical_name = br.canonical_name, source_name = src.source_name, role = br.target_role, source_role = src.source_role, member_id = src.member_id, shard_index = src.shard_index, container = src.container, byte_offset = src.byte_offset, byte_length = src.byte_length, raw_dtype = src.raw_dtype, raw_dtype_id = src.raw_dtype_id, shape = src.shape, view = br.view }
-        append_checked(mut entries, borrowed)
+        append_checked(mut entries, mut canon_idx, mut source_idx, borrowed)
     }
 
-    return TensorDirectory { bundle = b, entries = entries }
+    return TensorDirectory { bundle = b, entries = entries, canonical_index = canon_idx, source_index = source_idx }
 }
 
 fn starts_with(string s, string prefix) → bool {
@@ -520,7 +608,7 @@ fn effective_role_for_lookup(TensorDirectory dir, bundle.MemberRole role, string
 @ public
 fn lookup(TensorDirectory dir, bundle.MemberRole role, string name) → DirectoryEntry ⇥ DirectoryError {
     let bundle.MemberRole target_role ← effective_role_for_lookup(dir, role, name)
-    let int idx ← find_entry_index(dir.entries, target_role, name)
+    let int idx ← find_entry_index(dir, target_role, name)
 
     require idx ≥ 0 throw variant UnknownTensor { message = "tensor § not found in role §"(name, bundle.role_name(role)) }
 
@@ -540,7 +628,7 @@ fn lookup_vision(TensorDirectory dir, string name) → DirectoryEntry ⇥ Direct
 @ public
 fn has_tensor(TensorDirectory dir, bundle.MemberRole role, string name) → bool {
     let bundle.MemberRole target_role ← effective_role_for_lookup(dir, role, name)
-    return find_entry_index(dir.entries, target_role, name) ≥ 0
+    return find_entry_index(dir, target_role, name) ≥ 0
 }
 
 @ public
@@ -572,31 +660,109 @@ fn vision_entries(TensorDirectory dir) → list<DirectoryEntry> {
 }
 
 fn find_optional_sibling(TensorDirectory dir, bundle.MemberRole role, string name) → DirectoryEntry ∪ none {
-    let int idx ← find_entry_index(dir.entries, role, name)
+    let int idx ← find_entry_index(dir, role, name)
 
     if idx ≥ 0 then return dir.entries[idx]
 
     return null
 }
 
+fn first_optional_sibling(TensorDirectory dir, bundle.MemberRole role, list<string> candidates) → DirectoryEntry ∪ none {
+    for from candidates let name {
+        let DirectoryEntry ∪ none hit ← find_optional_sibling(dir, role, name)
+        if hit not is none then return hit
+    }
+
+    return null
+}
+
+fn ends_with(string s, string suffix) → bool {
+    let int s_len ← s.length()
+    let int suf_len ← suffix.length()
+
+    if s_len ≺ suf_len then return false
+
+    return s.slice(s_len - suf_len, s_len) ≡ suffix
+}
+
 @ public
 fn siblings(TensorDirectory dir, bundle.MemberRole role, string module_prefix) → SiblingSet ⇥ DirectoryError {
     let bundle.MemberRole target_role ← effective_role_for_lookup(dir, role, "§.weight"(module_prefix))
-    let DirectoryEntry weight ← lookup(dir, target_role, "§.weight"(module_prefix))
-    let DirectoryEntry ∪ none scales ← find_optional_sibling(dir, target_role, "§.scales"(module_prefix))
-    let DirectoryEntry ∪ none biases ← find_optional_sibling(dir, target_role, "§.biases"(module_prefix))
-    let DirectoryEntry ∪ none global_scale ← find_optional_sibling(dir, target_role, "§.global_scale"(module_prefix))
-    mut DirectoryEntry ∪ none amax ← find_optional_sibling(dir, target_role, "§._amax"(module_prefix))
 
-    if amax is none {
-        amax ← find_optional_sibling(dir, target_role, "§.weight._amax"(module_prefix))
+    mut string stem ← module_prefix
+    mut DirectoryEntry ∪ none weight_opt ← find_optional_sibling(dir, target_role, "§.weight"(module_prefix))
+
+    if weight_opt is none {
+        weight_opt ← find_optional_sibling(dir, target_role, "§_weight"(module_prefix))
     }
 
-    mut DirectoryEntry ∪ none outer_scale_denominator ← find_optional_sibling(dir, target_role, "§._outer_scale_denominator"(module_prefix))
-
-    if outer_scale_denominator is none {
-        outer_scale_denominator ← find_optional_sibling(dir, target_role, "§.weight._outer_scale_denominator"(module_prefix))
+    if weight_opt is none and ends_with(module_prefix, "_weight") {
+        weight_opt ← find_optional_sibling(dir, target_role, module_prefix)
+        if weight_opt not is none {
+            stem ← module_prefix.slice(0, module_prefix.length() - 7)
+        }
     }
+
+    if weight_opt is none and ends_with(module_prefix, ".gate_up_proj") {
+        let string parent ← module_prefix.slice(0, module_prefix.length() - 13)
+        let string w13_stem ← "§.w13"(parent)
+        weight_opt ← first_optional_sibling(dir, target_role, ["§_weight"(w13_stem), "§.weight"(w13_stem)])
+        if weight_opt not is none {
+            stem ← w13_stem
+        }
+    }
+
+    if weight_opt is none and ends_with(module_prefix, ".down_proj") {
+        let string parent ← module_prefix.slice(0, module_prefix.length() - 10)
+        let string w2_stem ← "§.w2"(parent)
+        weight_opt ← first_optional_sibling(dir, target_role, ["§_weight"(w2_stem), "§.weight"(w2_stem)])
+        if weight_opt not is none {
+            stem ← w2_stem
+        }
+    }
+
+    let DirectoryEntry weight ← weight_opt coalesce lookup(dir, target_role, "§.weight"(module_prefix))
+    let string wname ← weight.source_name
+
+    let DirectoryEntry ∪ none scales ← first_optional_sibling(dir, target_role, [
+        "§.scales"(stem),
+        "§._scale"(stem),
+        "§_scale"(stem),
+        "§._scale"(wname),
+        "§_scale"(wname),
+        "§.weight_scale"(stem),
+        "§.weight._scale"(stem),
+        "§.scales"(module_prefix)
+    ])
+    let DirectoryEntry ∪ none biases ← first_optional_sibling(dir, target_role, [
+        "§.biases"(stem),
+        "§.biases"(module_prefix)
+    ])
+    let DirectoryEntry ∪ none global_scale ← first_optional_sibling(dir, target_role, [
+        "§.global_scale"(stem),
+        "§.global_scale"(wname),
+        "§_global_scale"(stem),
+        "§.weight_scale_2"(stem),
+        "§.global_scale"(module_prefix)
+    ])
+    let DirectoryEntry ∪ none amax ← first_optional_sibling(dir, target_role, [
+        "§._amax"(stem),
+        "§._amax"(wname),
+        "§_amax"(stem),
+        "§_amax"(wname),
+        "§.weight._amax"(stem),
+        "§.weight_amax"(stem),
+        "§._amax"(module_prefix)
+    ])
+    let DirectoryEntry ∪ none outer_scale_denominator ← first_optional_sibling(dir, target_role, [
+        "§._outer_scale_denominator"(stem),
+        "§._outer_scale_denominator"(wname),
+        "§_outer_scale_denominator"(stem),
+        "§_outer_scale_denominator"(wname),
+        "§.weight._outer_scale_denominator"(stem),
+        "§.weight_outer_scale_denominator"(stem),
+        "§._outer_scale_denominator"(module_prefix)
+    ])
 
     return SiblingSet { weight = weight, scales = scales, biases = biases, global_scale = global_scale, amax = amax, outer_scale_denominator = outer_scale_denominator }
 }
@@ -633,6 +799,82 @@ fn trailing_cols(list<int> shape) → int ⇥ DirectoryError {
     return cols
 }
 
+fn conv1d_source_kind(list<int> source_shape, int channels, int kernel_size) → int ⇥ DirectoryError {
+    let int expected ← channels * kernel_size
+    let int actual ← shape_product(source_shape)
+    require actual ≡ expected throw variant BadView { message = "Conv1d element count § does not match source shape count §"(expected ↦ string, actual ↦ string) }
+
+    if source_shape.length() ≡ 2 {
+        if source_shape[0] ≡ channels and source_shape[1] ≡ kernel_size then return 0
+        if source_shape[0] ≡ kernel_size and source_shape[1] ≡ channels then return 1
+    }
+    elif source_shape.length() ≡ 3 {
+        if source_shape[0] ≡ channels and (source_shape[1] ≡ kernel_size and source_shape[2] ≡ 1 or source_shape[1] ≡ 1 and source_shape[2] ≡ kernel_size) then return 0
+        if source_shape[0] ≡ 1 and source_shape[1] ≡ channels and source_shape[2] ≡ kernel_size then return 0
+        if source_shape[0] ≡ kernel_size and (source_shape[1] ≡ channels and source_shape[2] ≡ 1 or source_shape[1] ≡ 1 and source_shape[2] ≡ channels) then return 1
+        if source_shape[0] ≡ 1 and source_shape[1] ≡ kernel_size and source_shape[2] ≡ channels then return 1
+    }
+
+    throw variant BadView { message = "Conv1d source shape incompatible with [§, §]"(channels ↦ string, kernel_size ↦ string) }
+}
+
+fn apply_conv1d_f32(int channels, int kernel_size, bool out_kc, bool flip_kernel, list<int> source_shape, list<f32> data) → list<f32> ⇥ DirectoryError {
+    let int kind ← conv1d_source_kind(source_shape, channels, kernel_size)
+    let int need ← channels * kernel_size
+    require data.length() ≡ need throw variant BadView { message = "Conv1d data length § != §"(data.length() ↦ string, need ↦ string) }
+
+    if kind ≡ 0 and not out_kc and not flip_kernel {
+        return data
+    }
+
+    mut list<f32> out ← empty
+
+    if out_kc {
+        for exclusive kernel_size let k {
+            let int src_k ← flip_kernel ✓ (kernel_size - 1 - k) ✗ k
+            for exclusive channels let c {
+                let int idx ← kind ≡ 0 ✓ (c * kernel_size + src_k) ✗ (src_k * channels + c)
+                out.append(data[idx])
+            }
+        }
+    }
+    else {
+        for exclusive channels let c {
+            for exclusive kernel_size let k {
+                let int src_k ← flip_kernel ✓ (kernel_size - 1 - k) ✗ k
+                let int idx ← kind ≡ 0 ✓ (c * kernel_size + src_k) ✗ (src_k * channels + c)
+                out.append(data[idx])
+            }
+        }
+    }
+
+    return out
+}
+
+fn gate_up_shape_out(list<int> source_shape, int gate_rows, int up_rows, bool select_up) → list<int> ⇥ DirectoryError {
+    require source_shape.length() ≥ 1 throw variant BadView { message = "FusedGateUpSplit requires non-empty source shape" }
+    let int total_rows ← gate_rows + up_rows
+    require source_shape[0] ≡ total_rows throw variant BadView { message = "FusedGateUpSplit rows § != source rows §"(total_rows ↦ string, source_shape[0] ↦ string) }
+    let int chosen ← select_up ✓ up_rows ✗ gate_rows
+    mut list<int> out ← [chosen]
+
+    for range 1 ‥ source_shape.length() let i {
+        out.append(source_shape[i])
+    }
+
+    return out
+}
+
+fn attn_res_source_kind(list<int> source_shape, int head_rows, int hidden_dim) → int ⇥ DirectoryError {
+    if source_shape.length() ≡ 1 and source_shape[0] ≡ hidden_dim then return 0
+    if source_shape.length() ≡ 2 {
+        if source_shape[0] ≡ head_rows and source_shape[1] ≡ hidden_dim then return 1
+        if source_shape[0] ≡ hidden_dim and source_shape[1] ≡ head_rows then return 2
+    }
+
+    throw variant BadView { message = "AttnResQuery source shape incompatible with [§, §]"(head_rows ↦ string, hidden_dim ↦ string) }
+}
+
 @ public
 fn view_shape(LoadView view, list<int> source_shape) → list<int> ⇥ DirectoryError {
     validate_view(view)
@@ -653,31 +895,27 @@ fn view_shape(LoadView view, list<int> source_shape) → list<int> ⇥ Directory
             return out
         }
         case Conv1d let channels, kernel_size {
-            let int expected ← channels * kernel_size
-            let int actual ← shape_product(source_shape)
-
-            require actual ≡ expected throw variant BadView { message = "Conv1d element count § does not match source shape count §"(expected ↦ string, actual ↦ string) }
-
+            let int ? ← conv1d_source_kind(source_shape, channels, kernel_size)
+            return [channels, kernel_size]
+        }
+        case Conv1dLayout let channels, kernel_size, transpose_to_kc, ? {
+            let int ? ← conv1d_source_kind(source_shape, channels, kernel_size)
+            if transpose_to_kc then return [kernel_size, channels]
             return [channels, kernel_size]
         }
         case FusedGateUpSplit let gate_rows, up_rows, select_up {
-            require source_shape.length() ≥ 1 throw variant BadView { message = "FusedGateUpSplit requires non-empty source shape" }
-            let int total_rows ← gate_rows + up_rows
-            require source_shape[0] ≡ total_rows throw variant BadView { message = "FusedGateUpSplit rows § != source rows §"(total_rows ↦ string, source_shape[0] ↦ string) }
-            let int chosen ← select_up ✓ up_rows ✗ gate_rows
-            mut list<int> out ← [chosen]
-
-            for range 1 ‥ source_shape.length() let i {
-                out.append(source_shape[i])
-            }
-
-            return out
+            return gate_up_shape_out(source_shape, gate_rows, up_rows, select_up)
+        }
+        case FusedGateUpInterleaved let gate_rows, up_rows, select_up {
+            return gate_up_shape_out(source_shape, gate_rows, up_rows, select_up)
         }
         case AttnResQuery let head_rows, hidden_dim {
+            let int ? ← attn_res_source_kind(source_shape, head_rows, hidden_dim)
             return [head_rows, hidden_dim]
         }
-        case FuseWeight let taps {
-            return [taps]
+        case FuseWeight let rows, taps {
+            require source_shape.length() ≡ 2 and source_shape[0] ≡ rows and source_shape[1] ≡ taps throw variant BadView { message = "FuseWeight requires source shape [§, §]"(rows ↦ string, taps ↦ string) }
+            return [rows, taps]
         }
     }
 }
@@ -703,9 +941,10 @@ fn apply_load_view_f32(LoadView view, list<int> source_shape, list<f32> data) �
             return data[0 ‥ need]
         }
         case Conv1d let channels, kernel_size {
-            let int need ← channels * kernel_size
-            require data.length() ≡ need throw variant BadView { message = "Conv1d data length § != §"(data.length() ↦ string, need ↦ string) }
-            return data
+            return apply_conv1d_f32(channels, kernel_size, false, false, source_shape, data)
+        }
+        case Conv1dLayout let channels, kernel_size, transpose_to_kc, flip_kernel {
+            return apply_conv1d_f32(channels, kernel_size, transpose_to_kc, flip_kernel, source_shape, data)
         }
         case FusedGateUpSplit let gate_rows, up_rows, select_up {
             let int cols ← trailing_cols(source_shape)
@@ -721,14 +960,30 @@ fn apply_load_view_f32(LoadView view, list<int> source_shape, list<f32> data) �
 
             return data[0 ‥ gate_elems]
         }
-        case AttnResQuery let head_rows, hidden_dim {
-            let int full_elems ← head_rows * hidden_dim
+        case FusedGateUpInterleaved let gate_rows, up_rows, select_up {
+            let int cols ← trailing_cols(source_shape)
+            let int total_rows ← gate_rows + up_rows
+            require source_shape[0] ≡ total_rows throw variant BadView { message = "FusedGateUpInterleaved source rows § != gate+up §"(source_shape[0] ↦ string, total_rows ↦ string) }
+            let int expected ← total_rows * cols
+            require data.length() ≡ expected throw variant BadView { message = "FusedGateUpInterleaved data length § != §"(data.length() ↦ string, expected ↦ string) }
 
-            if data.length() ≡ full_elems {
-                return data
+            mut list<f32> out ← empty
+
+            for exclusive gate_rows let r {
+                let int src_row ← select_up ✓ (2 * r + 1) ✗ (2 * r)
+                let int base ← src_row * cols
+                for exclusive cols let c {
+                    out.append(data[base + c])
+                }
             }
 
-            if data.length() ≡ hidden_dim {
+            return out
+        }
+        case AttnResQuery let head_rows, hidden_dim {
+            let int kind ← attn_res_source_kind(source_shape, head_rows, hidden_dim)
+
+            if kind ≡ 0 {
+                require data.length() ≡ hidden_dim throw variant BadView { message = "AttnResQuery 1D data length § != §"(data.length() ↦ string, hidden_dim ↦ string) }
                 mut list<f32> expanded ← empty
 
                 for exclusive head_rows let r {
@@ -740,11 +995,55 @@ fn apply_load_view_f32(LoadView view, list<int> source_shape, list<f32> data) �
                 return expanded
             }
 
-            throw variant BadView { message = "AttnResQuery data length § matches neither [§, §] nor [§]"(data.length() ↦ string, head_rows ↦ string, hidden_dim ↦ string, hidden_dim ↦ string) }
+            let int full_elems ← head_rows * hidden_dim
+            require data.length() ≡ full_elems throw variant BadView { message = "AttnResQuery data length § != §"(data.length() ↦ string, full_elems ↦ string) }
+
+            if kind ≡ 1 {
+                return data
+            }
+
+            # Transpose [hidden_dim, head_rows] -> [head_rows, hidden_dim].
+            mut list<f32> transposed ← empty
+
+            for exclusive head_rows let r {
+                for exclusive hidden_dim let d {
+                    transposed.append(data[d * head_rows + r])
+                }
+            }
+
+            return transposed
         }
-        case FuseWeight let taps {
-            require data.length() ≡ taps throw variant BadView { message = "FuseWeight data length § != taps §"(data.length() ↦ string, taps ↦ string) }
-            return data
+        case FuseWeight let rows, taps {
+            require source_shape.length() ≡ 2 and source_shape[0] ≡ rows and source_shape[1] ≡ taps throw variant BadView { message = "FuseWeight requires source shape [§, §]"(rows ↦ string, taps ↦ string) }
+            let int expected ← rows * taps
+            require data.length() ≡ expected throw variant BadView { message = "FuseWeight data length § != §"(data.length() ↦ string, expected ↦ string) }
+
+            mut list<f32> out ← empty
+
+            for exclusive rows let r {
+                let int base ← r * taps
+                mut f32 max_v ← data[base]
+                for range 1 ‥ taps let k {
+                    let f32 v ← data[base + k]
+                    if v ≻ max_v {
+                        max_v ← v
+                    }
+                }
+
+                mut list<f32> exps ← empty
+                mut f32 sum_e ← 0.0 ∷ f32
+                for exclusive taps let k {
+                    let f32 e ← (data[base + k] - max_v).exp()
+                    exps.append(e)
+                    sum_e ← sum_e + e
+                }
+
+                for exclusive taps let k {
+                    out.append(exps[k] / sum_e)
+                }
+            }
+
+            return out
         }
     }
 }
@@ -760,7 +1059,9 @@ import from "gradus:model/bundle" let bundle
 import from "gradus:model/capsule" let capsule
 import from "gradus:model/dense_llama" let dense_llama
 import from "gradus:model/dense_qwen2" let dense_qwen2
+import from "gradus:model/gguf_manifest" let gguf_manifest
 import from "gradus:model/tensor_directory" let td
+import from "gradus:storage" let storage
 
 fn id_with(string hex_char, int len) → artifact.ContentIdentity {
     mut string hex ← ""
@@ -1088,9 +1389,155 @@ test "TensorDirectory LoadView AttnResQuery, FuseWeight, and apply_load_view_f32
         let list<int> q_shape ← td.view_shape(variant td.LoadView.AttnResQuery { head_rows = 3, hidden_dim = 2 }, [2])
         assert q_shape.length() ≡ 2 and q_shape[0] ≡ 3 and q_shape[1] ≡ 2
 
-        let list<f32> fw ← [0.2 ∷ f32, 0.3 ∷ f32, 0.5 ∷ f32]
-        let list<f32> fw_out ← td.apply_load_view_f32(variant td.LoadView.FuseWeight { taps = 3 }, [3], fw)
-        assert fw_out.length() ≡ 3 and fw_out[2] ≡ (0.5 ∷ f32)
+        let list<f32> fw ← [
+            0.0 ∷ f32, 0.0 ∷ f32, 0.0 ∷ f32, 0.0 ∷ f32,
+            1.0 ∷ f32, 2.0 ∷ f32, 3.0 ∷ f32, 4.0 ∷ f32,
+            0.0 ∷ f32, 0.0 ∷ f32, 0.0 ∷ f32, 0.0 ∷ f32,
+            2.0 ∷ f32, 2.0 ∷ f32, 2.0 ∷ f32, 2.0 ∷ f32
+        ]
+        let list<int> fw_shape ← td.view_shape(variant td.LoadView.FuseWeight { rows = 4, taps = 4 }, [4, 4])
+        assert fw_shape.length() ≡ 2 and fw_shape[0] ≡ 4 and fw_shape[1] ≡ 4
+        let list<f32> fw_out ← td.apply_load_view_f32(variant td.LoadView.FuseWeight { rows = 4, taps = 4 }, [4, 4], fw)
+        assert fw_out.length() ≡ 16
+        assert fw_out[0] ≻ (0.24 ∷ f32) and fw_out[0] ≺ (0.26 ∷ f32)
+        assert fw_out[7] ≻ fw_out[6] and fw_out[6] ≻ fw_out[5] and fw_out[5] ≻ fw_out[4]
+        assert (fw_out[4] + fw_out[5] + fw_out[6] + fw_out[7]) ≻ (0.999 ∷ f32) and (fw_out[4] + fw_out[5] + fw_out[6] + fw_out[7]) ≺ (1.001 ∷ f32)
+
+        # AttnResQuery [D, 3] -> [3, D] transpose
+        let list<f32> q_d3 ← [1.0 ∷ f32, 10.0 ∷ f32, 100.0 ∷ f32, 2.0 ∷ f32, 20.0 ∷ f32, 200.0 ∷ f32]
+        let list<f32> q_3d ← td.apply_load_view_f32(variant td.LoadView.AttnResQuery { head_rows = 3, hidden_dim = 2 }, [2, 3], q_d3)
+        assert q_3d.length() ≡ 6
+        assert q_3d[0] ≡ (1.0 ∷ f32) and q_3d[1] ≡ (2.0 ∷ f32)
+        assert q_3d[2] ≡ (10.0 ∷ f32) and q_3d[3] ≡ (20.0 ∷ f32)
+        assert q_3d[4] ≡ (100.0 ∷ f32) and q_3d[5] ≡ (200.0 ∷ f32)
+
+        # Conv1dLayout transpose [C, K] -> [K, C] + kernel tap flip
+        let list<f32> conv_ck ← [1.0 ∷ f32, 2.0 ∷ f32, 3.0 ∷ f32, 4.0 ∷ f32, 5.0 ∷ f32, 6.0 ∷ f32]
+        let list<int> conv_kc_shape ← td.view_shape(variant td.LoadView.Conv1dLayout { channels = 2, kernel_size = 3, transpose_to_kc = true, flip_kernel = true }, [2, 3])
+        assert conv_kc_shape[0] ≡ 3 and conv_kc_shape[1] ≡ 2
+        let list<f32> conv_kc ← td.apply_load_view_f32(variant td.LoadView.Conv1dLayout { channels = 2, kernel_size = 3, transpose_to_kc = true, flip_kernel = true }, [2, 3], conv_ck)
+        assert conv_kc[0] ≡ (3.0 ∷ f32) and conv_kc[1] ≡ (6.0 ∷ f32) and conv_kc[4] ≡ (1.0 ∷ f32) and conv_kc[5] ≡ (4.0 ∷ f32)
+
+        # FusedGateUpInterleaved extracts alternating gate/up rows
+        let list<f32> gu_inter ← [10.0 ∷ f32, 11.0 ∷ f32, 20.0 ∷ f32, 21.0 ∷ f32, 30.0 ∷ f32, 31.0 ∷ f32, 40.0 ∷ f32, 41.0 ∷ f32]
+        let list<f32> g_rows ← td.apply_load_view_f32(variant td.LoadView.FusedGateUpInterleaved { gate_rows = 2, up_rows = 2, select_up = false }, [4, 2], gu_inter)
+        let list<f32> u_rows ← td.apply_load_view_f32(variant td.LoadView.FusedGateUpInterleaved { gate_rows = 2, up_rows = 2, select_up = true }, [4, 2], gu_inter)
+        assert g_rows[0] ≡ (10.0 ∷ f32) and g_rows[2] ≡ (30.0 ∷ f32)
+        assert u_rows[0] ≡ (20.0 ∷ f32) and u_rows[2] ≡ (40.0 ∷ f32)
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "TensorDirectory ModelOpt w13_weight/w2_weight siblings, GGUF MoE/sinks/norm canonicalization, and strict indexed/length validation" {
+    # GGUF canonicalization
+    assert td.canonicalize_gguf_name("blk.0.ffn_gate_exps.weight") ≡ "model.layers.0.mlp.experts.gate_proj.weight"
+    assert td.canonicalize_gguf_name("blk.1.ffn_up_exps.weight") ≡ "model.layers.1.mlp.experts.up_proj.weight"
+    assert td.canonicalize_gguf_name("blk.2.ffn_down_exps.weight") ≡ "model.layers.2.mlp.experts.down_proj.weight"
+    assert td.canonicalize_gguf_name("blk.3.ffn_gate_up_exps.weight") ≡ "model.layers.3.mlp.experts.gate_up_proj.weight"
+    assert td.canonicalize_gguf_name("blk.4.ffn_gate_inp.weight") ≡ "model.layers.4.mlp.gate.weight"
+    assert td.canonicalize_gguf_name("blk.5.post_attention_norm.weight") ≡ "model.layers.5.post_attention_layernorm.weight"
+    assert td.canonicalize_gguf_name("blk.6.attn_q_norm.weight") ≡ "model.layers.6.self_attn.q_norm.weight"
+    assert td.canonicalize_gguf_name("blk.6.attn_k_norm.weight") ≡ "model.layers.6.self_attn.k_norm.weight"
+    assert td.canonicalize_gguf_name("blk.7.attn_sinks.weight") ≡ "model.layers.7.self_attn.sinks.weight"
+    assert td.canonicalize_gguf_name("blk.7.softmax_offset") ≡ "model.layers.7.self_attn.softmax_offset"
+
+    let artifact.ContentIdentity bb_id ← id_with("f", 4096)
+    let bundle.ModelBundle b ← mk_unindexed([bb_id], null, null, null)
+    do {
+        # Raw HF ModelOpt w13_weight / w2_weight + _scale + _amax + _outer_scale_denominator
+        let capsule.SafetensorsManifest m ← st_manifest(4096, 2048, [
+            st_desc("model.layers.0.mlp.experts.w13_weight", "U8", [128, 512, 1024], 0, 512, 67108864),
+            st_desc("model.layers.0.mlp.experts.w13_weight._scale", "U8", [128, 512, 64], 512, 768, 4194304),
+            st_desc("model.layers.0.mlp.experts.w13_weight._amax", "F32", [1], 768, 772, 1),
+            st_desc("model.layers.0.mlp.experts.w13_weight._outer_scale_denominator", "F32", [1], 772, 776, 1),
+            st_desc("model.layers.0.mlp.experts.w2_weight", "U8", [128, 1024, 256], 776, 1288, 33554432),
+            st_desc("model.layers.0.mlp.experts.w2_weight._scale", "U8", [128, 1024, 16], 1288, 1544, 2097152)
+        ])
+        let td.TensorDirectory dir ← td.build(b, [
+            variant td.ShardSource.SafetensorsSource { role = variant bundle.MemberRole.Backbone, shard_index = 0, manifest = m }
+        ], [], [])
+
+        let td.SiblingSet w13 ← td.siblings(dir, variant bundle.MemberRole.Backbone, "model.layers.0.mlp.experts.gate_up_proj")
+        assert w13.weight.source_name ≡ "model.layers.0.mlp.experts.w13_weight"
+        assert w13.scales not is none
+        assert w13.amax not is none
+        assert w13.outer_scale_denominator not is none
+
+        let td.SiblingSet w2 ← td.siblings(dir, variant bundle.MemberRole.Backbone, "model.layers.0.mlp.experts.w2")
+        assert w2.weight.source_name ≡ "model.layers.0.mlp.experts.w2_weight"
+        assert w2.scales not is none
+
+        # Reject Safetensors artifact_length < member.identity.length (strict equality)
+        mut bool caught_len ← false
+        do {
+            let capsule.SafetensorsManifest short_m ← st_manifest(2048, 1024, [st_desc("w", "F32", [4], 0, 16, 4)])
+            td.build(b, [variant td.ShardSource.SafetensorsSource { role = variant bundle.MemberRole.Backbone, shard_index = 0, manifest = short_m }], [], [])
+        }
+        catch err {
+            caught_len ← true
+        }
+        assert caught_len
+
+        # Reject ShardMapping.Indexed when an indexed tensor is missing from ingested shards
+        let bundle.ModelBundle idx_b ← mk_indexed([bb_id], id_with("e", 128), [
+            bundle.ShardEntry { tensor_name = "present.weight", shard_index = 0 },
+            bundle.ShardEntry { tensor_name = "missing.weight", shard_index = 0 }
+        ])
+        mut bool caught_missing ← false
+        do {
+            let capsule.SafetensorsManifest partial_m ← st_manifest(4096, 1024, [st_desc("present.weight", "F32", [4], 0, 16, 4)])
+            td.build(idx_b, [variant td.ShardSource.SafetensorsSource { role = variant bundle.MemberRole.Backbone, shard_index = 0, manifest = partial_m }], [], [])
+        }
+        catch err {
+            caught_missing ← true
+        }
+        assert caught_missing
+
+        # Reject GgufManifest containing GgmlLayout.Unknown
+        let artifact.ContentIdentity gguf_id ← id_with("c", 4096)
+        mut bundle.ModelBundle ∪ none maybe_gguf_b ← null
+        do {
+            maybe_gguf_b ← bundle.gguf_single(gguf_id)
+        }
+        catch err {
+            assert false
+        }
+        if maybe_gguf_b is none {
+            assert false
+        }
+        else {
+            let bundle.ModelBundle gguf_b ← maybe_gguf_b
+            let gguf_manifest.GgufManifest bad_gm ← gguf_manifest.GgufManifest {
+                identity = gguf_id,
+                version = 3,
+                alignment = 32,
+                data_start = 128,
+                artifact_length = 4096,
+                metadata = [],
+                tensors = [
+                    gguf_manifest.GgufTensorDescriptor {
+                        name = "token_embd.weight",
+                        shape = [2048, 248320],
+                        dtype_ggml = 999,
+                        representation = storage.representation("ggml", "unknown", "unspecified", 999),
+                        relative_offset = 0,
+                        elements = 508559360,
+                        layout = variant gguf_manifest.GgmlLayout.Unknown { dtype = 999 },
+                        block = storage.BlockMetadata { known = false, elements_per_block = 0, bytes_per_block = 0, block_count = 0, byte_length = 0 }
+                    }
+                ]
+            }
+            mut bool caught_unknown_ggml ← false
+            do {
+                td.build(gguf_b, [variant td.ShardSource.GgufSource { role = variant bundle.MemberRole.Backbone, manifest = bad_gm }], [], [])
+            }
+            catch err {
+                caught_unknown_ggml ← true
+            }
+            assert caught_unknown_ggml
+        }
     }
     catch err {
         assert false
