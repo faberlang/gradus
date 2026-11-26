@@ -189,14 +189,12 @@ fn ref_matvec(int out_features, int in_features, list<f32> w_dense, list<f32> x)
 kernel linear_matvec_u8<size Out, size In, size ScaleRows, size ScaleCols>(tensor<u8, [Out, In]> weight, tensor<u8, [ScaleRows, ScaleCols]> scales, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, i32 block_rows, i32 block_cols) → void {
     for from y at [row] thread lane let e {
         if block_rows ≥ 1 and block_rows ≤ 4096 and block_cols ≥ 1 and block_cols ≤ 4096 {
-            let i32 rr ← (row ↦ i32) ∧ 65535
-            let i32 sr ← (rr / block_rows) ∧ 65535
+            let i32 sr ← row / block_rows
             mut f32 acc ← 0.0 ∷ f32
 
             for exclusive In let j {
-                let i32 ji ← (j ↦ i32) ∧ 65535
-                let i32 sc ← (ji / block_cols) ∧ 65535
-                let i32 wb ← weight[[rr, ji]] ↦ i32
+                let i32 sc ← j / block_cols
+                let i32 wb ← weight[[row, j]] ↦ i32
                 let i32 w_sign ← (wb ⇒ 7) ∧ 1
                 let i32 w_exp ← (wb ⇒ 3) ∧ 15
                 let i32 w_mant ← wb ∧ 7
@@ -303,7 +301,7 @@ kernel linear_matvec_u8<size Out, size In, size ScaleRows, size ScaleCols>(tenso
                     }
                 }
 
-                acc ← acc + (w * s) * x[[ji]]
+                acc ← acc + (w * s) * x[[j]]
             }
 
             y[[row]] ← acc
@@ -315,16 +313,14 @@ kernel linear_matvec_u8<size Out, size In, size ScaleRows, size ScaleCols>(tenso
 kernel linear_matvec_u32<size Out, size PackedIn, size ScaleRows, size ScaleCols, size In>(tensor<u32, [Out, PackedIn]> weight, tensor<u8, [ScaleRows, ScaleCols]> scales, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, i32 block_rows, i32 block_cols) → void {
     for from y at [row] thread lane let e {
         if block_rows ≥ 1 and block_rows ≤ 4096 and block_cols ≥ 1 and block_cols ≤ 4096 {
-            let i32 rr ← (row ↦ i32) ∧ 65535
-            let i32 sr ← (rr / block_rows) ∧ 65535
+            let i32 sr ← row / block_rows
             mut f32 acc ← 0.0 ∷ f32
 
             for exclusive In let j {
-                let i32 ji ← (j ↦ i32) ∧ 65535
-                let i32 sc ← (ji / block_cols) ∧ 65535
-                let i32 word_idx ← (ji / 4) ∧ 65535
-                let i32 byte_lane ← ji % 4
-                let u32 w0 ← weight[[rr, word_idx]]
+                let i32 sc ← j / block_cols
+                let i32 word_idx ← j / 4
+                let i32 byte_lane ← j % 4
+                let u32 w0 ← weight[[row, word_idx]]
                 mut u32 raw_bits ← 0 ∷ u32
 
                 if byte_lane ≡ 0 {
@@ -447,7 +443,7 @@ kernel linear_matvec_u32<size Out, size PackedIn, size ScaleRows, size ScaleCols
                     }
                 }
 
-                acc ← acc + (w * s) * x[[ji]]
+                acc ← acc + (w * s) * x[[j]]
             }
 
             y[[row]] ← acc
@@ -563,4 +559,41 @@ test "BlockFp8 MLX-converted u32 (Inkling L20-23) ref decode and kernel matvec m
     catch err {
         assert false
     }
+}
+
+test "BlockFp8 u8 and u32 kernels handle rows above 65536 without aliasing" {
+    # Out=65540 (> 65536), In=4, block_rows=2, block_cols=4 -> ScaleRows=32770, ScaleCols=1
+    mut tensor<u8, [65540, 4]> w_u8 ← tu8[65540, 4] {}
+    w_u8[[1, 0]] ← 0x38 ∷ u8
+    w_u8[[65537, 0]] ← 0x40 ∷ u8
+    w_u8[[65537, 1]] ← 0x40 ∷ u8
+    w_u8[[65537, 2]] ← 0x40 ∷ u8
+    w_u8[[65537, 3]] ← 0x40 ∷ u8
+
+    mut tensor<u32, [65540, 1]> w_u32 ← tu32[65540, 1] {}
+    w_u32[[1, 0]] ← 0x00000038 ∷ u32
+    w_u32[[65537, 0]] ← 0x40404040 ∷ u32
+
+    mut tensor<u8, [32770, 1]> scales ← tu8[32770, 1] {}
+    scales[[0, 0]] ← 127 ∷ u8
+    scales[[32768, 0]] ← 128 ∷ u8
+
+    mut tensor<f32, [4]> x_t ← tf32[4] {}
+    for exclusive 4 let j {
+        x_t[[j]] ← 1.0 ∷ f32
+    }
+
+    mut tensor<f32, [65540]> y_u8 ← tf32[65540] {}
+    mut tensor<f32, [65540]> y_u32 ← tf32[65540] {}
+
+    bf8.linear_matvec_u8(w_u8, scales, x_t, mut y_u8, 2, 4)
+    bf8.linear_matvec_u32(w_u32, scales, x_t, mut y_u32, 2, 4)
+
+    assert close(y_u8[[0]], 0.0 ∷ f32)
+    assert close(y_u8[[1]], 1.0 ∷ f32)
+    assert close(y_u8[[65537]], 16.0 ∷ f32)
+
+    assert close(y_u32[[0]], 0.0 ∷ f32)
+    assert close(y_u32[[1]], 1.0 ∷ f32)
+    assert close(y_u32[[65537]], 16.0 ∷ f32)
 }
