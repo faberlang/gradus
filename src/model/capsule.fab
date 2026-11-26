@@ -375,16 +375,14 @@ fn hex_ok(string s) → bool {
 }
 
 # Safetensors tensor-descriptor predicate: non-empty name and dtype, a
-# positive element count that exactly equals the checked shape product, and
-# a non-negative, ordered, in-bounds data range.
+# positive element count that equals 1 for 0-D scalars or the checked shape
+# product otherwise, and a non-negative, ordered, in-bounds data range.
 fn description_ok(SafetensorsTensorDescriptor t, int data_length) → bool {
     if t.name.length() ≡ 0 then return false
 
     if t.dtype.length() ≡ 0 then return false
 
     if t.elements ≺ 1 then return false
-
-    if t.shape.length() ≡ 0 then return false
 
     mut int product ← 1
 
@@ -620,20 +618,32 @@ fn to_bundle(Capsule c) → bundle.ModelBundle ⇥ AdmissionError {
 
 # Reconstruct a single-file Capsule from a single-member ModelBundle and its
 # parsed per-format Manifest. Fails closed on multi-shard/multi-member
-# bundles or container kind mismatch.
+# bundles, auxiliary members (config, quant_config, shard_index, tokenizer),
+# indexed shard maps, or container kind mismatch.
 @ public
 fn from_single_member_bundle(bundle.ModelBundle b, Manifest m) → Capsule ⇥ AdmissionError {
     require b.backbone_shards.length() ≡ 1 throw variant BadManifest { message = "from_single_member_bundle requires exactly 1 backbone shard" }
     require b.drafter is none and b.vision is none throw variant BadManifest { message = "from_single_member_bundle rejects multi-role bundles" }
+    require b.config is none and b.quant_config is none and b.shard_index is none and b.tokenizer is none throw variant BadManifest { message = "from_single_member_bundle rejects auxiliary bundle members (config, quant_config, shard_index, tokenizer)" }
+
+    match b.shard_map {
+        case bundle.ShardMapping.Indexed let ? {
+            throw variant BadManifest { message = "from_single_member_bundle rejects indexed shard maps" }
+        }
+        case bundle.ShardMapping.Unindexed let shard_count {
+            require shard_count ≡ 1 throw variant BadManifest { message = "from_single_member_bundle requires single-shard unindexed mapping" }
+        }
+    }
 
     let bundle.BundleMember bb ← b.backbone_shards[0]
+    require bb.shard_index ≡ 0 throw variant BadManifest { message = "from_single_member_bundle requires shard_index 0" }
 
     match m {
         case Gguf let gguf {
-            require bundle.container_name(bb.container) ≡ "gguf" throw variant BadManifest { message = "bundle member container is not GGUF" }
+            require bundle.container_name(b.primary_container) ≡ "gguf" and bundle.container_name(bb.container) ≡ "gguf" throw variant BadManifest { message = "bundle member container is not GGUF" }
         }
         case Safetensors let saf {
-            require bundle.container_name(bb.container) ≡ "safetensors" throw variant BadManifest { message = "bundle member container is not Safetensors" }
+            require bundle.container_name(b.primary_container) ≡ "safetensors" and bundle.container_name(bb.container) ≡ "safetensors" throw variant BadManifest { message = "bundle member container is not Safetensors" }
         }
     }
 
@@ -1059,6 +1069,44 @@ test "to_bundle and from_single_member_bundle round-trip single-file safetensors
             assert false
         }
         assert caught_multi
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "admits 0-D scalar descriptors and rejects non-unit scalar element count" {
+    let list<capsule.SafetensorsTensorDescriptor> scalars ← [
+        description("model.layers.0.self_attn.q_proj.global_scale", "F32", [], 0, 4, 1),
+        description("model.layers.0.self_attn.q_proj._amax", "F32", [], 4, 8, 1),
+        description("model.layers.0.self_attn.q_proj._outer_scale_denominator", "F32", [], 8, 12, 1)
+    ]
+    assert construct_result(F_SCHEMA, identity_fixture(), manifest_variant("safetensors", "1.0.0", F_LENGTH, 12, scalars)) ≡ "ok"
+    assert construct_result(F_SCHEMA, identity_fixture(), manifest_variant("safetensors", "1.0.0", F_LENGTH, 12, [description("global_scale", "F32", [], 0, 8, 2)])) ≡ "manifest is inconsistent with the artifact identity"
+}
+
+test "from_single_member_bundle rejects auxiliary bundle members and indexed shard maps" {
+    let artifact.ContentIdentity bb_id ← identity_fixture()
+    let artifact.ContentIdentity aux_id ← identity_variant(F_ALGO, F_ALT_DIGEST, 256)
+    let capsule.Manifest m ← capsule.safetensors_manifest(manifest_fixture())
+    do {
+        let list<bundle.ModelBundle> rejected ← [
+            bundle.safetensors_unindexed([bb_id], aux_id, null, null, null, null),
+            bundle.safetensors_unindexed([bb_id], null, aux_id, null, null, null),
+            bundle.safetensors_unindexed([bb_id], null, null, aux_id, null, null),
+            bundle.safetensors_indexed([bb_id], aux_id, [bundle.ShardEntry { tensor_name = "w", shard_index = 0 }], null, null, null, null, null)
+        ]
+
+        for from rejected let bad_b {
+            mut bool caught ← false
+            do {
+                capsule.from_single_member_bundle(bad_b, m)
+            }
+            catch err {
+                caught ← true
+            }
+            assert caught
+        }
     }
     catch err {
         assert false
