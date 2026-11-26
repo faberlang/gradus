@@ -195,36 +195,45 @@ kernel rmsnorm_unit<size N>(tensor<f32, [N]> x, mut tensor<f32, [N]> out, i32 dh
 # Input-dependent sink softmax & sigmoid output gate
 # ---------------------------------------------------------------------------
 
-# Row softmax with per-head attention sink logit `sink[H]`:
+# O(C) two-pass online row softmax with per-head attention sink logit `sink[H]`:
 #   m = max(sink[h], max_{c < valid_cols} scores[h, c])
 #   Z = exp(sink[h] - m) + sum_{c < valid_cols} exp(scores[h, c] - m)
 #   probs[h, c] = exp(scores[h, c] - m) / Z  (0.0 for c >= valid_cols).
 @ public
 kernel row_softmax_with_sink<size H, size C>(tensor<f32, [H, C]> scores, tensor<f32, [H]> sink, mut tensor<f32, [H, C]> probs, i32 valid_cols) → void {
-    for from scores at [h, c] thread lane let s {
-        if valid_cols ≤ 0 or c ≥ valid_cols {
-            probs[[h, c]] ← 0.0
+    for from sink at [h] thread lane let sink_logit {
+        mut i32 n ← valid_cols
+        if n ≻ C {
+            n ← C
+        }
+
+        if n ≤ 0 {
+            for range 0 ‥ C let c {
+                probs[[h, c]] ← 0.0
+            }
         }
         else {
-            mut i32 n ← valid_cols
-            if n ≻ C {
-                n ← C
-            }
+            mut f32 m ← sink_logit
+            mut f32 z ← 1.0
 
-            mut f32 m ← sink[[h]]
             for range 0 ‥ n let k {
                 let f32 sc ← scores[[h, k]]
                 if sc ≻ m {
+                    z ← z * (m - sc).exp() + 1.0
                     m ← sc
+                }
+                else {
+                    z ← z + (sc - m).exp()
                 }
             }
 
-            mut f32 z ← (sink[[h]] - m).exp()
-            for range 0 ‥ n let k {
-                z ← z + (scores[[h, k]] - m).exp()
+            for range 0 ‥ n let c {
+                probs[[h, c]] ← (scores[[h, c]] - m).exp() / z
             }
 
-            probs[[h, c]] ← (s - m).exp() / z
+            for range n ‥ C let c {
+                probs[[h, c]] ← 0.0
+            }
         }
     }
 }
@@ -559,27 +568,29 @@ fn inkling_attn_step<size D, size QD, size KVD, size F, size H, size HD_REL, siz
 @ public
 fn inkling_ffn_step<size D, size QD, size KVD, size F, size H, size HD_REL, size D_REL, size REL_EXTENT, size H_TAPS, size ConvRows>(tensor<f32, [D]> h1, mut tensor<f32, [D]> hout, InklingLayerWeights<D, QD, KVD, F, H, HD_REL, D_REL, REL_EXTENT, H_TAPS> lw, InklingLayerParams lp, mut hybrid.ConvStateArena<ConvRows, D> post_conv, int slot_id) → void ⇥ sess_mod.SessionError {
     mut tensor<f32, [D]> fn_in ← tf32[D] {}
-    ds.rmsnorm(h1, lw.fnorm, mut fn_in, lp.peps)
-
     mut tensor<f32, [F]> gate ← tf32[F] {}
     mut tensor<f32, [F]> up ← tf32[F] {}
-    ds.gate_up_proj(lw.wg, lw.wu, fn_in, mut gate, mut up)
-
     mut tensor<f32, [F]> act ← tf32[F] {}
-    match lp.mlp_act {
-        case Situ let gate_cap, up_cap {
-            situ(gate, up, mut act, gate_cap, up_cap)
-        }
-        case Gelu {
-            geglu_tanh(gate, up, mut act)
-        }
-        case Swiglu {
-            ds.swiglu(gate, up, mut act)
-        }
-    }
-
     mut tensor<f32, [D]> ffn_out ← tf32[D] {}
-    ds.gemv(lw.wd, act, mut ffn_out)
+
+    do device {
+        ds.rmsnorm(h1, lw.fnorm, mut fn_in, lp.peps)
+        ds.gate_up_proj(lw.wg, lw.wu, fn_in, mut gate, mut up)
+
+        match lp.mlp_act {
+            case Situ let gate_cap, up_cap {
+                situ(gate, up, mut act, gate_cap, up_cap)
+            }
+            case Gelu {
+                geglu_tanh(gate, up, mut act)
+            }
+            case Swiglu {
+                ds.swiglu(gate, up, mut act)
+            }
+        }
+
+        ds.gemv(lw.wd, act, mut ffn_out)
+    }
 
     mut tensor<f32, [D]> ffn_branch ← tf32[D] {}
     if lp.use_post_conv {
@@ -589,7 +600,9 @@ fn inkling_ffn_step<size D, size QD, size KVD, size F, size H, size HD_REL, size
         ffn_branch ⇇ ffn_out
     }
 
-    ds.residual_add(h1, ffn_branch, mut hout)
+    do device {
+        ds.residual_add(h1, ffn_branch, mut hout)
+    }
 }
 
 # Single-token Inkling layer step over `SessionState` and `ConvStateArena`.
@@ -605,16 +618,15 @@ fn inkling_layer_step<size D, size QD, size KVD, size F, size H, size HD_REL, si
 @ public
 fn inkling_head_step<size D, size PADDED_V, size UNPADDED_V>(tensor<f32, [D]> hin, tensor<f32, [D]> fnorm_final, tensor<f32, [PADDED_V, D]> lm_head, mut tensor<f32, [UNPADDED_V]> logits_out, mut tensor<i32, [1]> token_id, f32 eps, f32 softcap) → void {
     mut tensor<f32, [D]> xn ← tf32[D] {}
-    ds.rmsnorm(hin, fnorm_final, mut xn, eps)
-
     mut tensor<f32, [PADDED_V]> raw_logits ← tf32[PADDED_V] {}
-    ds.gemv(lm_head, xn, mut raw_logits)
-
     mut tensor<f32, [PADDED_V]> capped ← tf32[PADDED_V] {}
-    logit_softcap(raw_logits, mut capped, softcap)
-
-    vocab_slice(capped, mut logits_out)
-    ds.argmax_token(logits_out, mut token_id)
+    do device {
+        ds.rmsnorm(hin, fnorm_final, mut xn, eps)
+        ds.gemv(lm_head, xn, mut raw_logits)
+        logit_softcap(raw_logits, mut capped, softcap)
+        vocab_slice(capped, mut logits_out)
+        ds.argmax_token(logits_out, mut token_id)
+    }
 }
 
 +++ faber test
@@ -849,4 +861,41 @@ test "Inkling SITU, GELU, logit_softcap, and vocab_slice" {
     vocab_slice(capped, mut sliced)
     assert close(sliced[[0]], 0.0)
     assert close(sliced[[1]], 30.0)
+}
+
+test "Inkling row_softmax_with_sink O(C) online masks beyond valid_cols" {
+    mut tensor<f32, [2, 4]> sc ← tf32[2, 4] {}
+    mut tensor<f32, [2]> sink ← tf32[2] {}
+    mut tensor<f32, [2, 4]> pr ← tf32[2, 4] {}
+    sc[[0, 0]] ← 1.0
+    sc[[0, 1]] ← 3.0
+    sc[[0, 2]] ← 100.0
+    sc[[0, 3]] ← 100.0
+    sink[[0]] ← 2.0
+    sc[[1, 0]] ← -1.0
+    sc[[1, 1]] ← 2.0
+    sc[[1, 2]] ← 50.0
+    sc[[1, 3]] ← 50.0
+    sink[[1]] ← 0.0
+
+    row_softmax_with_sink(sc, sink, mut pr, 2)
+    assert close(pr[[0, 2]], 0.0)
+    assert close(pr[[0, 3]], 0.0)
+    assert close(pr[[1, 2]], 0.0)
+    assert close(pr[[1, 3]], 0.0)
+    for range 0‥2 let h {
+        mut f32 m ← sink[[h]]
+        for range 0‥2 let c {
+            if sc[[h, c]] ≻ m {
+                m ← sc[[h, c]]
+            }
+        }
+        mut f32 z ← (sink[[h]] - m).exp()
+        for range 0‥2 let c {
+            z ← z + (sc[[h, c]] - m).exp()
+        }
+        for range 0‥2 let c {
+            assert close(pr[[h, c]], (sc[[h, c]] - m).exp() / z)
+        }
+    }
 }
