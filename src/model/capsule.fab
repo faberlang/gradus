@@ -76,6 +76,7 @@ locale = "en"
 #   * physical upload/device residency — hosts; paths/config — apps.
 
 import from "gradus:model/artifact"
+import from "gradus:model/bundle"
 
 const int INTEGER_MAX = 9223372036854775807
 
@@ -597,6 +598,48 @@ fn deserialize_identity(string wire) → Identity ⇥ AdmissionError {
     return Identity { schema = schema, algorithm = algorithm, digest = digest, byte_length = length }
 }
 
+# Project an admitted single-file Capsule onto a single-member ModelBundle.
+@ public
+fn to_bundle(Capsule c) → bundle.ModelBundle ⇥ AdmissionError {
+    verify(c)
+
+    do {
+        match c.manifest {
+            case Gguf let gguf {
+                return bundle.gguf_single(c.identity)
+            }
+            case Safetensors let saf {
+                return bundle.safetensors_unindexed([c.identity], null, null, null, null, null)
+            }
+        }
+    }
+    catch err {
+        throw variant BadManifest { message = err.message }
+    }
+}
+
+# Reconstruct a single-file Capsule from a single-member ModelBundle and its
+# parsed per-format Manifest. Fails closed on multi-shard/multi-member
+# bundles or container kind mismatch.
+@ public
+fn from_single_member_bundle(bundle.ModelBundle b, Manifest m) → Capsule ⇥ AdmissionError {
+    require b.backbone_shards.length() ≡ 1 throw variant BadManifest { message = "from_single_member_bundle requires exactly 1 backbone shard" }
+    require b.drafter is none and b.vision is none throw variant BadManifest { message = "from_single_member_bundle rejects multi-role bundles" }
+
+    let bundle.BundleMember bb ← b.backbone_shards[0]
+
+    match m {
+        case Gguf let gguf {
+            require bundle.container_name(bb.container) ≡ "gguf" throw variant BadManifest { message = "bundle member container is not GGUF" }
+        }
+        case Safetensors let saf {
+            require bundle.container_name(bb.container) ≡ "safetensors" throw variant BadManifest { message = "bundle member container is not Safetensors" }
+        }
+    }
+
+    return construct_manifest(schema_version, bb.identity, m)
+}
+
 +++ faber test
 # Co-located package test for capsule.fab (PML2-U1 admitted-model capsule,
 # capsule-schema-2.0.0, A1C-M1).
@@ -621,6 +664,7 @@ fn deserialize_identity(string wire) → Identity ⇥ AdmissionError {
 import from "gradus:model/capsule" capsule
 
 import from "gradus:model/artifact" artifact
+import from "gradus:model/bundle" bundle
 
 # -- pinned fixture facts (structural Safetensors row) ----------------------
 
@@ -976,4 +1020,47 @@ test "deserialization rejects a non-numeric byte length" {
 
 test "deserialization rejects a non-positive byte length" {
     assert identity_wire_result("capsule/identity/2.0.0/sha-256/§/0"(F_DIGEST)) ≡ "invalid byte length in capsule identity"
+}
+
+test "to_bundle and from_single_member_bundle round-trip single-file safetensors capsule" {
+    do {
+        let capsule.Capsule c ← capsule.construct_manifest(F_SCHEMA, identity_fixture(), capsule.safetensors_manifest(manifest_fixture()))
+        let bundle.ModelBundle b ← capsule.to_bundle(c)
+        assert b.backbone_shards.length() ≡ 1
+        assert b.backbone_shards[0].identity.digest ≡ F_DIGEST
+        assert bundle.container_name(b.primary_container) ≡ "safetensors"
+
+        let capsule.Capsule round ← capsule.from_single_member_bundle(b, capsule.safetensors_manifest(manifest_fixture()))
+        assert capsule.identity_equal(c.identity(), round.identity())
+        assert round.tensor_count() ≡ 2
+
+        # Retired schema-1 capsule fails closed in to_bundle
+        mut bool caught_retired ← false
+        do {
+            capsule.to_bundle(capsule_schema_retired())
+        }
+        catch err {
+            caught_retired ← true
+        }
+        assert caught_retired
+
+        # Multi-shard bundle fails closed in from_single_member_bundle
+        mut bool caught_multi ← false
+        do {
+            let bundle.ModelBundle multi ← bundle.safetensors_unindexed([identity_fixture(), identity_variant(F_ALGO, F_ALT_DIGEST, F_LENGTH)], null, null, null, null, null)
+            do {
+                capsule.from_single_member_bundle(multi, capsule.safetensors_manifest(manifest_fixture()))
+            }
+            catch err {
+                caught_multi ← true
+            }
+        }
+        catch err {
+            assert false
+        }
+        assert caught_multi
+    }
+    catch err {
+        assert false
+    }
 }

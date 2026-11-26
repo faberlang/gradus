@@ -61,6 +61,13 @@ union LoadView {
         int gate_rows
         int up_rows
         bool select_up
+    },
+    AttnResQuery {
+        int head_rows
+        int hidden_dim
+    },
+    FuseWeight {
+        int taps
     }
 }
 
@@ -87,6 +94,8 @@ class SiblingSet {
     let DirectoryEntry ∪ none scales
     let DirectoryEntry ∪ none biases
     let DirectoryEntry ∪ none global_scale
+    let DirectoryEntry ∪ none amax = null
+    let DirectoryEntry ∪ none outer_scale_denominator = null
 }
 
 @ public
@@ -286,6 +295,12 @@ fn validate_view(LoadView view) → void ⇥ DirectoryError {
         case FusedGateUpSplit let gate_rows, up_rows, select_up {
             require gate_rows ≻ 0 and up_rows ≻ 0 throw variant BadView { message = "FusedGateUpSplit gate_rows and up_rows must be positive" }
         }
+        case AttnResQuery let head_rows, hidden_dim {
+            require head_rows ≻ 0 and hidden_dim ≻ 0 throw variant BadView { message = "AttnResQuery head_rows and hidden_dim must be positive" }
+        }
+        case FuseWeight let taps {
+            require taps ≻ 0 throw variant BadView { message = "FuseWeight taps must be positive" }
+        }
     }
 }
 
@@ -482,9 +497,30 @@ fn build(bundle.ModelBundle b, list<ShardSource> sources, list<BorrowSpec> borro
     return TensorDirectory { bundle = b, entries = entries }
 }
 
+fn starts_with(string s, string prefix) → bool {
+    let int p_len ← prefix.length()
+
+    if s.length() ≺ p_len then return false
+
+    return s.slice(0, p_len) ≡ prefix
+}
+
+fn is_vision_tensor_name(string name) → bool {
+    return starts_with(name, "model.vision_tower.") or starts_with(name, "model.visual.") or starts_with(name, "vision_tower.") or starts_with(name, "visual.")
+}
+
+fn effective_role_for_lookup(TensorDirectory dir, bundle.MemberRole role, string name) → bundle.MemberRole {
+    if same_role(role, variant bundle.MemberRole.Vision) and dir.bundle.vision is none and is_vision_tensor_name(name) {
+        return variant bundle.MemberRole.Backbone
+    }
+
+    return role
+}
+
 @ public
 fn lookup(TensorDirectory dir, bundle.MemberRole role, string name) → DirectoryEntry ⇥ DirectoryError {
-    let int idx ← find_entry_index(dir.entries, role, name)
+    let bundle.MemberRole target_role ← effective_role_for_lookup(dir, role, name)
+    let int idx ← find_entry_index(dir.entries, target_role, name)
 
     require idx ≥ 0 throw variant UnknownTensor { message = "tensor § not found in role §"(name, bundle.role_name(role)) }
 
@@ -497,8 +533,14 @@ fn lookup_backbone(TensorDirectory dir, string name) → DirectoryEntry ⇥ Dire
 }
 
 @ public
+fn lookup_vision(TensorDirectory dir, string name) → DirectoryEntry ⇥ DirectoryError {
+    return lookup(dir, variant bundle.MemberRole.Vision, name)
+}
+
+@ public
 fn has_tensor(TensorDirectory dir, bundle.MemberRole role, string name) → bool {
-    return find_entry_index(dir.entries, role, name) ≥ 0
+    let bundle.MemberRole target_role ← effective_role_for_lookup(dir, role, name)
+    return find_entry_index(dir.entries, target_role, name) ≥ 0
 }
 
 @ public
@@ -513,22 +555,203 @@ fn entries_for_role(TensorDirectory dir, bundle.MemberRole role) → list<Direct
 }
 
 @ public
+fn vision_entries(TensorDirectory dir) → list<DirectoryEntry> {
+    if dir.bundle.vision not is none {
+        return entries_for_role(dir, variant bundle.MemberRole.Vision)
+    }
+
+    mut list<DirectoryEntry> out ← empty
+
+    for from dir.entries let e {
+        if same_role(e.role, variant bundle.MemberRole.Backbone) and (is_vision_tensor_name(e.canonical_name) or is_vision_tensor_name(e.source_name)) {
+            out.append(e)
+        }
+    }
+
+    return out
+}
+
+fn find_optional_sibling(TensorDirectory dir, bundle.MemberRole role, string name) → DirectoryEntry ∪ none {
+    let int idx ← find_entry_index(dir.entries, role, name)
+
+    if idx ≥ 0 then return dir.entries[idx]
+
+    return null
+}
+
+@ public
 fn siblings(TensorDirectory dir, bundle.MemberRole role, string module_prefix) → SiblingSet ⇥ DirectoryError {
-    let DirectoryEntry weight ← lookup(dir, role, "§.weight"(module_prefix))
-    let int s_idx ← find_entry_index(dir.entries, role, "§.scales"(module_prefix))
-    let int b_idx ← find_entry_index(dir.entries, role, "§.biases"(module_prefix))
-    let int g_idx ← find_entry_index(dir.entries, role, "§.global_scale"(module_prefix))
-    mut DirectoryEntry ∪ none scales ← null
-    mut DirectoryEntry ∪ none biases ← null
-    mut DirectoryEntry ∪ none global_scale ← null
+    let bundle.MemberRole target_role ← effective_role_for_lookup(dir, role, "§.weight"(module_prefix))
+    let DirectoryEntry weight ← lookup(dir, target_role, "§.weight"(module_prefix))
+    let DirectoryEntry ∪ none scales ← find_optional_sibling(dir, target_role, "§.scales"(module_prefix))
+    let DirectoryEntry ∪ none biases ← find_optional_sibling(dir, target_role, "§.biases"(module_prefix))
+    let DirectoryEntry ∪ none global_scale ← find_optional_sibling(dir, target_role, "§.global_scale"(module_prefix))
+    mut DirectoryEntry ∪ none amax ← find_optional_sibling(dir, target_role, "§._amax"(module_prefix))
 
-    if s_idx ≥ 0 then scales ← dir.entries[s_idx]
+    if amax is none {
+        amax ← find_optional_sibling(dir, target_role, "§.weight._amax"(module_prefix))
+    }
 
-    if b_idx ≥ 0 then biases ← dir.entries[b_idx]
+    mut DirectoryEntry ∪ none outer_scale_denominator ← find_optional_sibling(dir, target_role, "§._outer_scale_denominator"(module_prefix))
 
-    if g_idx ≥ 0 then global_scale ← dir.entries[g_idx]
+    if outer_scale_denominator is none {
+        outer_scale_denominator ← find_optional_sibling(dir, target_role, "§.weight._outer_scale_denominator"(module_prefix))
+    }
 
-    return SiblingSet { weight = weight, scales = scales, biases = biases, global_scale = global_scale }
+    return SiblingSet { weight = weight, scales = scales, biases = biases, global_scale = global_scale, amax = amax, outer_scale_denominator = outer_scale_denominator }
+}
+
+# -------------------------------------------------------------------------
+# Load-time view shape & f32 materialization helpers
+# -------------------------------------------------------------------------
+
+fn shape_product(list<int> shape) → int {
+    if shape.length() ≡ 0 then return 0
+
+    mut int p ← 1
+
+    for from shape let d {
+        p ← p * d
+    }
+
+    return p
+}
+
+fn trailing_cols(list<int> shape) → int ⇥ DirectoryError {
+    require shape.length() ≥ 1 throw variant BadView { message = "view requires non-empty source shape" }
+
+    if shape.length() ≡ 1 then return 1
+
+    mut int cols ← 1
+
+    for range 1 ‥ shape.length() let i {
+        let int d ← shape[i]
+        require d ≻ 0 throw variant BadView { message = "view source shape dimension must be positive" }
+        cols ← cols * d
+    }
+
+    return cols
+}
+
+@ public
+fn view_shape(LoadView view, list<int> source_shape) → list<int> ⇥ DirectoryError {
+    validate_view(view)
+
+    match view {
+        case Full {
+            return source_shape
+        }
+        case RowPrefix let rows {
+            require source_shape.length() ≥ 1 throw variant BadView { message = "RowPrefix requires non-empty source shape" }
+            require rows ≤ source_shape[0] throw variant BadView { message = "RowPrefix rows § exceeds source rows §"(rows ↦ string, source_shape[0] ↦ string) }
+            mut list<int> out ← [rows]
+
+            for range 1 ‥ source_shape.length() let i {
+                out.append(source_shape[i])
+            }
+
+            return out
+        }
+        case Conv1d let channels, kernel_size {
+            let int expected ← channels * kernel_size
+            let int actual ← shape_product(source_shape)
+
+            require actual ≡ expected throw variant BadView { message = "Conv1d element count § does not match source shape count §"(expected ↦ string, actual ↦ string) }
+
+            return [channels, kernel_size]
+        }
+        case FusedGateUpSplit let gate_rows, up_rows, select_up {
+            require source_shape.length() ≥ 1 throw variant BadView { message = "FusedGateUpSplit requires non-empty source shape" }
+            let int total_rows ← gate_rows + up_rows
+            require source_shape[0] ≡ total_rows throw variant BadView { message = "FusedGateUpSplit rows § != source rows §"(total_rows ↦ string, source_shape[0] ↦ string) }
+            let int chosen ← select_up ✓ up_rows ✗ gate_rows
+            mut list<int> out ← [chosen]
+
+            for range 1 ‥ source_shape.length() let i {
+                out.append(source_shape[i])
+            }
+
+            return out
+        }
+        case AttnResQuery let head_rows, hidden_dim {
+            return [head_rows, hidden_dim]
+        }
+        case FuseWeight let taps {
+            return [taps]
+        }
+    }
+}
+
+@ public
+fn apply_load_view_f32(LoadView view, list<int> source_shape, list<f32> data) → list<f32> ⇥ DirectoryError {
+    validate_view(view)
+
+    match view {
+        case Full {
+            if source_shape.length() ≻ 0 {
+                let int expected ← shape_product(source_shape)
+                require data.length() ≡ expected throw variant BadView { message = "Full view data length § != shape elements §"(data.length() ↦ string, expected ↦ string) }
+            }
+
+            return data
+        }
+        case RowPrefix let rows {
+            let int cols ← trailing_cols(source_shape)
+            require rows ≤ source_shape[0] throw variant BadView { message = "RowPrefix rows § exceeds source rows §"(rows ↦ string, source_shape[0] ↦ string) }
+            let int need ← rows * cols
+            require data.length() ≥ need throw variant BadView { message = "RowPrefix data length § < required §"(data.length() ↦ string, need ↦ string) }
+            return data[0 ‥ need]
+        }
+        case Conv1d let channels, kernel_size {
+            let int need ← channels * kernel_size
+            require data.length() ≡ need throw variant BadView { message = "Conv1d data length § != §"(data.length() ↦ string, need ↦ string) }
+            return data
+        }
+        case FusedGateUpSplit let gate_rows, up_rows, select_up {
+            let int cols ← trailing_cols(source_shape)
+            let int total_rows ← gate_rows + up_rows
+            require source_shape[0] ≡ total_rows throw variant BadView { message = "FusedGateUpSplit source rows § != gate+up §"(source_shape[0] ↦ string, total_rows ↦ string) }
+            let int expected ← total_rows * cols
+            require data.length() ≡ expected throw variant BadView { message = "FusedGateUpSplit data length § != §"(data.length() ↦ string, expected ↦ string) }
+            let int gate_elems ← gate_rows * cols
+
+            if select_up {
+                return data[gate_elems ‥ expected]
+            }
+
+            return data[0 ‥ gate_elems]
+        }
+        case AttnResQuery let head_rows, hidden_dim {
+            let int full_elems ← head_rows * hidden_dim
+
+            if data.length() ≡ full_elems {
+                return data
+            }
+
+            if data.length() ≡ hidden_dim {
+                mut list<f32> expanded ← empty
+
+                for exclusive head_rows let r {
+                    for from data let v {
+                        expanded.append(v)
+                    }
+                }
+
+                return expanded
+            }
+
+            throw variant BadView { message = "AttnResQuery data length § matches neither [§, §] nor [§]"(data.length() ↦ string, head_rows ↦ string, hidden_dim ↦ string, hidden_dim ↦ string) }
+        }
+        case FuseWeight let taps {
+            require data.length() ≡ taps throw variant BadView { message = "FuseWeight data length § != taps §"(data.length() ↦ string, taps ↦ string) }
+            return data
+        }
+    }
+}
+
+@ public
+fn materialize_entry_f32(DirectoryEntry entry, list<f32> data) → list<f32> ⇥ DirectoryError {
+    return apply_load_view_f32(entry.view, entry.shape, data)
 }
 
 +++ faber test
@@ -791,5 +1014,85 @@ test "TensorDirectory dense_llama and dense_qwen2 resolve from directory without
         catch err {
             assert false
         }
+    }
+}
+
+test "TensorDirectory ModelOpt NVFP4 siblings (_amax, _outer_scale_denominator)" {
+    let artifact.ContentIdentity bb_id ← id_with("d", 4096)
+    let bundle.ModelBundle b ← mk_unindexed([bb_id], null, null, null)
+    do {
+        let capsule.SafetensorsManifest m ← st_manifest(4096, 2048, [
+            st_desc("model.layers.0.self_attn.q_proj.weight", "U8", [512, 256], 0, 1024, 131072),
+            st_desc("model.layers.0.self_attn.q_proj._amax", "F32", [1], 1024, 1028, 1),
+            st_desc("model.layers.0.self_attn.q_proj._outer_scale_denominator", "F32", [1], 1028, 1032, 1),
+            st_desc("model.layers.0.self_attn.q_proj.scales", "U8", [512, 32], 1032, 2048, 16384)
+        ])
+
+        let td.TensorDirectory dir ← td.build(b, [
+            variant td.ShardSource.SafetensorsSource { role = variant bundle.MemberRole.Backbone, shard_index = 0, manifest = m }
+        ], [], [])
+
+        let td.SiblingSet q ← td.siblings(dir, variant bundle.MemberRole.Backbone, "model.layers.0.self_attn.q_proj")
+        assert q.weight.raw_dtype ≡ "U8"
+        assert q.scales not is none
+        assert q.amax not is none
+        assert q.outer_scale_denominator not is none
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "TensorDirectory vision-in-backbone resolution and vision_entries" {
+    let artifact.ContentIdentity bb_id ← id_with("e", 4096)
+    let bundle.ModelBundle b ← mk_unindexed([bb_id], null, null, null)
+    do {
+        let capsule.SafetensorsManifest m ← st_manifest(4096, 2048, [
+            st_desc("model.embed_tokens.weight", "BF16", [100, 64], 0, 512, 6400),
+            st_desc("model.vision_tower.patch_embed.weight", "BF16", [64, 3, 14, 14], 512, 1024, 37632),
+            st_desc("model.visual.blocks.0.attn.qkv.weight", "BF16", [192, 64], 1024, 2048, 12288)
+        ])
+
+        let td.TensorDirectory dir ← td.build(b, [
+            variant td.ShardSource.SafetensorsSource { role = variant bundle.MemberRole.Backbone, shard_index = 0, manifest = m }
+        ], [], [])
+
+        let list<td.DirectoryEntry> vis ← td.vision_entries(dir)
+        assert vis.length() ≡ 2
+        assert td.has_tensor(dir, variant bundle.MemberRole.Vision, "model.vision_tower.patch_embed.weight")
+        assert td.has_tensor(dir, variant bundle.MemberRole.Vision, "model.visual.blocks.0.attn.qkv.weight")
+        let td.DirectoryEntry v0 ← td.lookup_vision(dir, "model.vision_tower.patch_embed.weight")
+        assert v0.raw_dtype ≡ "BF16"
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "TensorDirectory LoadView AttnResQuery, FuseWeight, and apply_load_view_f32" {
+    do {
+        let list<f32> gate_up ← [1.0 ∷ f32, 2.0 ∷ f32, 3.0 ∷ f32, 4.0 ∷ f32, 5.0 ∷ f32, 6.0 ∷ f32]
+        let list<f32> gate_only ← td.apply_load_view_f32(variant td.LoadView.FusedGateUpSplit { gate_rows = 2, up_rows = 1, select_up = false }, [3, 2], gate_up)
+        assert gate_only.length() ≡ 4
+        assert gate_only[0] ≡ (1.0 ∷ f32) and gate_only[3] ≡ (4.0 ∷ f32)
+
+        let list<f32> up_only ← td.apply_load_view_f32(variant td.LoadView.FusedGateUpSplit { gate_rows = 2, up_rows = 1, select_up = true }, [3, 2], gate_up)
+        assert up_only.length() ≡ 2
+        assert up_only[0] ≡ (5.0 ∷ f32) and up_only[1] ≡ (6.0 ∷ f32)
+
+        let list<f32> q1d ← [0.25 ∷ f32, 0.5 ∷ f32]
+        let list<f32> q_exp ← td.apply_load_view_f32(variant td.LoadView.AttnResQuery { head_rows = 3, hidden_dim = 2 }, [2], q1d)
+        assert q_exp.length() ≡ 6
+        assert q_exp[4] ≡ (0.25 ∷ f32) and q_exp[5] ≡ (0.5 ∷ f32)
+
+        let list<int> q_shape ← td.view_shape(variant td.LoadView.AttnResQuery { head_rows = 3, hidden_dim = 2 }, [2])
+        assert q_shape.length() ≡ 2 and q_shape[0] ≡ 3 and q_shape[1] ≡ 2
+
+        let list<f32> fw ← [0.2 ∷ f32, 0.3 ∷ f32, 0.5 ∷ f32]
+        let list<f32> fw_out ← td.apply_load_view_f32(variant td.LoadView.FuseWeight { taps = 3 }, [3], fw)
+        assert fw_out.length() ≡ 3 and fw_out[2] ≡ (0.5 ∷ f32)
+    }
+    catch err {
+        assert false
     }
 }
