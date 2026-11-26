@@ -5,9 +5,8 @@ locale = "en"
 # Mixture-of-experts routing and full-layer FFN over typed carriers.
 #
 # Public import: import from "gradus:model/moe" moe
-# Depends on: gradus:dtype (finite-value checks), gradus:math (carrier
-# arithmetic), gradus:nn (SwiGLU and transpose carriers), and
-# gradus:tensor (carrier construction).
+# Depends on: gradus:dtype (finite-value checks), gradus:nn (the shared
+# expert gate sigmoid), and gradus:tensor (carrier construction).
 #
 # The module validates the routed windows before arithmetic, preserves
 # deterministic lowest-index ties, normalizes selected weights, and combines
@@ -15,10 +14,16 @@ locale = "en"
 # ordered by ascending expert index because f32 addition is order-sensitive.
 # Source callbacks remain the caller's seam; this module owns no backend,
 # model registry, or device handle.
+#
+# Issue #79: projections run as direct storage-order GEMV walks over flat
+# lists — the column/row/flatten_row shape-only carrier copies and the
+# per-token down-matrix transpose are gone, and the down matrices are read
+# strided in their [embedding, ffn] storage order at every point (load time
+# included). The traced entry points keep their per-call window validation;
+# the prepared entry points validate once at load time and never re-read
+# the weight source per decode token.
 
 import from "gradus:dtype"
-
-import from "gradus:math"
 
 import from "gradus:nn"
 
@@ -42,17 +47,9 @@ union MoeError {
     BadShape,
     BadWindow,
     NonFinite,
-    MathFailure {
-        math.MathError inner
-    },
     NnFailure {
         nn.NnError inner
     }
-}
-
-@ conversion
-fn from_math_error(math.MathError err) → MoeError {
-    return variant MathFailure { message = err.message, inner = err }
 }
 
 @ conversion
@@ -134,14 +131,70 @@ fn router_weights((string, int, int) → tensor.NumericBlock ⇥ MoeError source
 
 const f32 ROUTER_WEIGHT_FLOOR = 0.00006103515625 ∷ f32
 
-fn column(tensor.NumericBlock x, MoeConfig cfg) → tensor.NumericBlock {
-    mut list<f32> data ← empty
+# [out, in] storage-order weight x [in] input -> [out] list. The
+# accumulation order (ascending inner index, f32 store per step) matches
+# the former carrier matmul over the column form exactly, so routed values
+# are bit-identical (issue #79: this walk replaces the column/row carrier
+# copies around math.matmul).
+fn gemv_list(tensor.NumericBlock weight, list<f32> x, int in_dim, int out_dim) → list<f32> ⇥ MoeError {
+    require weight.data.length() ≡ out_dim * in_dim throw variant BadShape { message = "projection weight window has the wrong length" }
 
-    for from x.data let item {
-        data.append(item)
+    require x.length() ≡ in_dim throw variant BadShape { message = "projection input has the wrong length" }
+
+    mut list<f32> out ← empty
+
+    for range 0 ‥ out_dim let o {
+        mut f32 sum ← 0.0 ∷ f32
+
+        for range 0 ‥ in_dim let i {
+            sum ← sum + (weight.data.get(o * in_dim + i) coalesce 0.0 ∷ f32) * (x.get(i) coalesce 0.0 ∷ f32)
+        }
+
+        out.append(sum)
     }
 
-    return tensor.stage_f32([cfg.embedding_length, 1], data)
+    return out
+}
+
+# The carrier ladder's SiLU row, bit-identical: v * sigmoid(v) with the
+# branch-stabilized sigmoid.
+fn silu_scalar(f32 v) → f32 {
+    if v ≥ 0.0 then return v * (1.0 / ((-v).exp() + 1.0))
+
+    let f32 e ← v.exp()
+    return v * (e / (e + 1.0))
+}
+
+# One expert (or the shared expert) over flat lists: gate/up GEMVs, the
+# SwiGLU hidden row, and the down projection read strided off the [embd,
+# ffn] storage order — the down transpose of the former carrier chain is
+# never materialized, and every per-element operation keeps the former
+# order (issue #79).
+fn expert_rows(tensor.NumericBlock gate_w, tensor.NumericBlock up_w, tensor.NumericBlock down_w, list<f32> x, int ffn_length, MoeConfig cfg) → list<f32> ⇥ MoeError {
+    let int embd ← cfg.embedding_length
+
+    let list<f32> gate ← gemv_list(gate_w, x, embd, ffn_length)
+    let list<f32> up ← gemv_list(up_w, x, embd, ffn_length)
+
+    mut list<f32> hidden ← empty
+
+    for range 0 ‥ ffn_length let f {
+        hidden.append(silu_scalar(gate.get(f) coalesce 0.0 ∷ f32) * (up.get(f) coalesce 0.0 ∷ f32))
+    }
+
+    mut list<f32> out ← empty
+
+    for range 0 ‥ embd let e {
+        mut f32 sum ← 0.0 ∷ f32
+
+        for range 0 ‥ ffn_length let f {
+            sum ← sum + (hidden.get(f) coalesce 0.0 ∷ f32) * (down_w.data.get(e * ffn_length + f) coalesce 0.0 ∷ f32)
+        }
+
+        out.append(sum)
+    }
+
+    return out
 }
 
 fn softmax(list<f32> logits) → list<f32> ⇥ MoeError {
@@ -210,35 +263,9 @@ fn best_index(list<f32> probabilities, list<int> selected) → int {
     return best
 }
 
-@ public
-fn route(tensor.NumericBlock x, int layer, (string, int, int) → tensor.NumericBlock ⇥ MoeError source, MoeConfig cfg) → MoeSelection ⇥ MoeError {
-    # --- config + input (fail closed) -------------------------------------
-    validate_config(cfg)
-
-    require layer ≥ 0 throw variant BadConfig { message = "layer index must be non-negative" }
-
-    validate_input(x, cfg)
-
-    # --- router weights + logits (fail closed) ----------------------------
-    let tensor.NumericBlock weights ← router_weights(source, layer, cfg)
-    let tensor.NumericBlock matrix ← math.matmul(weights, column(x, cfg))
-
-    require matrix.valid() throw variant BadShape { message = "router logits carrier is invalid" }
-
-    require matrix.shape ≡ ([cfg.expert_count, 1] ↦ list<int>) throw variant BadShape { message = "router logits carrier has the wrong shape" }
-
-    require finite_tensor(matrix) throw variant NonFinite { message = "router logits contain a non-finite value" }
-
-    # --- softmax over expert logits ---------------------------------------
-    mut list<f32> logits ← empty
-
-    for from matrix.data let value {
-        logits.append(value)
-    }
-
-    let list<f32> probabilities ← softmax(logits)
-
-    # --- top-k selection (lowest index on ties) ---------------------------
+# Top-k selection (lowest index on ties) + selected-weight renormalization
+# over the router probabilities; shared by the traced and prepared routes.
+fn selection_from(list<f32> logits, list<f32> probabilities, MoeConfig cfg) → MoeSelection ⇥ MoeError {
     mut list<int> indices ← empty
     mut list<f32> selected_probabilities ← empty
     mut f32 selected_total ← 0.0 ∷ f32
@@ -256,7 +283,6 @@ fn route(tensor.NumericBlock x, int layer, (string, int, int) → tensor.Numeric
 
     require dtype.finite(selected_total) throw variant NonFinite { message = "router selection normalizer is non-finite" }
 
-    # --- weight normalization + construct ---------------------------------
     mut f32 denominator ← ROUTER_WEIGHT_FLOOR
 
     if selected_total ≻ denominator {
@@ -272,45 +298,56 @@ fn route(tensor.NumericBlock x, int layer, (string, int, int) → tensor.Numeric
     return MoeSelection { indices = indices, weights = weights_out, logits = logits, probabilities = probabilities }
 }
 
-# The storage-order GEMV produces a column, while nn.swiglu_carrier consumes
-# a row. This view changes only the carrier shape; it does not reread weights.
-fn row(tensor.NumericBlock column, int width) → tensor.NumericBlock ⇥ MoeError {
-    require column.valid() throw variant BadShape { message = "projection carrier is invalid" }
+# Ascending-expert-index iteration order over the selected experts: each
+# round consumes the unread selection slot with the smallest expert index
+# (f32 addition is order-sensitive, so the traced and prepared routes share
+# this scan).
+fn next_slot(list<int> selected, list<int> consumed) → int ⇥ MoeError {
+    mut int slot ← -1
 
-    require column.shape ≡ ([width, 1] ↦ list<int>) throw variant BadShape { message = "projection carrier has the wrong shape" }
+    for range 0 ‥ selected.length() let j {
+        if j ∉ consumed {
+            if slot ≺ 0 {
+                slot ← j
+            }
+            else {
+                let int candidate ← selected.get(j) coalesce (-1)
+                let int incumbent ← selected.get(slot) coalesce (-1)
 
-    require column.data.length() ≡ width throw variant BadWindow { message = "projection carrier has the wrong length" }
-
-    mut list<f32> data ← empty
-
-    for from column.data let item {
-        data.append(item)
+                if candidate ≺ incumbent {
+                    slot ← j
+                }
+            }
+        }
     }
 
-    return tensor.stage_f32([1, width], data)
+    require slot ≥ 0 throw variant BadConfig { message = "router selection index is unavailable" }
+
+    return slot
 }
 
-# A stored down matrix is [embedding, expert_ffn]. The bias-free dense
-# SwiGLU call consumes [expert_ffn, embedding]; transpose only the bounded
-# materialized window, after its storage-order shape and length are checked.
-fn swiglu_no_bias(tensor.NumericBlock gate, tensor.NumericBlock up, tensor.NumericBlock down) → tensor.NumericBlock ⇥ MoeError {
-    return nn.swiglu_carrier(gate, up, down, tensor.default())
-}
+@ public
+fn route(tensor.NumericBlock x, int layer, (string, int, int) → tensor.NumericBlock ⇥ MoeError source, MoeConfig cfg) → MoeSelection ⇥ MoeError {
+    # --- config + input (fail closed) -------------------------------------
+    validate_config(cfg)
 
-fn flatten_row(tensor.NumericBlock row, int width) → tensor.NumericBlock ⇥ MoeError {
-    require row.valid() throw variant BadShape { message = "expert output carrier is invalid" }
+    require layer ≥ 0 throw variant BadConfig { message = "layer index must be non-negative" }
 
-    require row.shape ≡ ([1, width] ↦ list<int>) throw variant BadShape { message = "expert output carrier has the wrong shape" }
+    validate_input(x, cfg)
 
-    require row.data.length() ≡ width throw variant BadWindow { message = "expert output has the wrong length" }
+    # --- router weights + logits (fail closed) ----------------------------
+    let tensor.NumericBlock weights ← router_weights(source, layer, cfg)
+    let list<f32> logits ← gemv_list(weights, x.data, cfg.embedding_length, cfg.expert_count)
 
-    mut list<f32> data ← empty
-
-    for from row.data let item {
-        data.append(item)
+    for from logits let value {
+        require dtype.finite(value) throw variant NonFinite { message = "router logits contain a non-finite value" }
     }
 
-    return tensor.stage_f32([width], data)
+    # --- softmax over expert logits ---------------------------------------
+    let list<f32> probabilities ← softmax(logits)
+
+    # --- top-k selection + renormalization --------------------------------
+    return selection_from(logits, probabilities, cfg)
 }
 
 @ public
@@ -332,14 +369,11 @@ fn expert_out(tensor.NumericBlock x, int layer, int expert_index, (string, int, 
     let tensor.NumericBlock up_window ← window(source, prefix + ".ffn_up_exps", start, length, [cfg.expert_ffn_length, cfg.embedding_length])
     let tensor.NumericBlock down_window ← window(source, prefix + ".ffn_down_exps", start, length, [cfg.embedding_length, cfg.expert_ffn_length])
 
-    # --- projections + SwiGLU ---------------------------------------------
-    let tensor.NumericBlock x_column ← column(x, cfg)
-    let tensor.NumericBlock gate ← row(math.matmul(gate_window, x_column), cfg.expert_ffn_length)
-    let tensor.NumericBlock up ← row(math.matmul(up_window, x_column), cfg.expert_ffn_length)
-    let tensor.NumericBlock output_row ← swiglu_no_bias(gate, up, nn.transpose_carrier(down_window))
+    # --- projections + SwiGLU + strided down -------------------------------
+    let list<f32> out ← expert_rows(gate_window, up_window, down_window, x.data, cfg.expert_ffn_length, cfg)
 
     # --- flatten + finite check -------------------------------------------
-    let tensor.NumericBlock output ← flatten_row(output_row, cfg.embedding_length)
+    let tensor.NumericBlock output ← tensor.stage_f32([cfg.embedding_length], out)
 
     require finite_tensor(output) throw variant NonFinite { message = "expert output contains a non-finite value" }
 
@@ -358,36 +392,55 @@ fn dot(tensor.NumericBlock a, tensor.NumericBlock b) → f32 ⇥ MoeError {
     return out
 }
 
-fn scalar(f32 value) → tensor.NumericBlock {
-    mut tensor.NumericBlock out ← tensor.default()
-
-    do {
-        out ← tensor.construct([value], [1])
-    }
-    catch err {
-        return out
-    }
-
-    return out
+# Load-time-prepared MoE layer weights (issue #79): the router, every
+# routed expert, the shared expert, and the shared gate are read,
+# shape-checked, and finiteness-validated once here — never per decode
+# token. Down matrices stay in their [embedding, ffn] storage order; the
+# projections read them strided, so no transpose is materialized at any
+# point.
+@ public
+class MoeLayerWeights {
+    mut tensor.NumericBlock router
+    mut list<tensor.NumericBlock> gate_exps
+    mut list<tensor.NumericBlock> up_exps
+    mut list<tensor.NumericBlock> down_exps
+    mut tensor.NumericBlock gate_shexp
+    mut tensor.NumericBlock up_shexp
+    mut tensor.NumericBlock down_shexp
+    mut tensor.NumericBlock gate_inp_shexp
 }
 
-fn zeros(int width) → tensor.NumericBlock {
-    mut list<f32> data ← empty
+# Read and validate the whole MoE layer weight set once. Reads run in
+# canonical order: router, experts ascending, shared expert, shared gate.
+@ public
+fn prepare_moe_layer((string, int, int) → tensor.NumericBlock ⇥ MoeError source, int layer, MoeConfig cfg) → MoeLayerWeights ⇥ MoeError {
+    validate_config(cfg)
 
-    for range 0 ‥ width {
-        data.append(0.0 ∷ f32)
+    require layer ≥ 0 throw variant BadConfig { message = "layer index must be non-negative" }
+
+    let string prefix ← layer_prefix(layer)
+    let int expert_length ← cfg.expert_ffn_length * cfg.embedding_length
+    let int shared_length ← cfg.shared_ffn_length * cfg.embedding_length
+
+    let tensor.NumericBlock router ← router_weights(source, layer, cfg)
+
+    mut list<tensor.NumericBlock> gates ← empty
+    mut list<tensor.NumericBlock> ups ← empty
+    mut list<tensor.NumericBlock> downs ← empty
+
+    for range 0 ‥ cfg.expert_count let e {
+        let int start ← e * expert_length
+        gates.append(window(source, prefix + ".ffn_gate_exps", start, expert_length, [cfg.expert_ffn_length, cfg.embedding_length]))
+        ups.append(window(source, prefix + ".ffn_up_exps", start, expert_length, [cfg.expert_ffn_length, cfg.embedding_length]))
+        downs.append(window(source, prefix + ".ffn_down_exps", start, expert_length, [cfg.embedding_length, cfg.expert_ffn_length]))
     }
 
-    mut tensor.NumericBlock out ← tensor.default()
+    let tensor.NumericBlock gate_shexp ← window(source, prefix + ".ffn_gate_shexp", 0, shared_length, [cfg.shared_ffn_length, cfg.embedding_length])
+    let tensor.NumericBlock up_shexp ← window(source, prefix + ".ffn_up_shexp", 0, shared_length, [cfg.shared_ffn_length, cfg.embedding_length])
+    let tensor.NumericBlock down_shexp ← window(source, prefix + ".ffn_down_shexp", 0, shared_length, [cfg.embedding_length, cfg.shared_ffn_length])
+    let tensor.NumericBlock gate_inp_shexp ← window(source, prefix + ".ffn_gate_inp_shexp", 0, cfg.embedding_length, [cfg.embedding_length])
 
-    do {
-        out ← tensor.construct_f32(data, [width])
-    }
-    catch err {
-        return out
-    }
-
-    return out
+    return MoeLayerWeights { router = router, gate_exps = gates, up_exps = ups, down_exps = downs, gate_shexp = gate_shexp, up_shexp = up_shexp, down_shexp = down_shexp, gate_inp_shexp = gate_inp_shexp }
 }
 
 @ public
@@ -404,17 +457,15 @@ fn ffn_moe(tensor.NumericBlock x, int layer, (string, int, int) → tensor.Numer
 
     # --- shared expert (SwiGLU + sigmoid gate) ----------------------------
     let string prefix ← layer_prefix(layer)
-    let tensor.NumericBlock x_column ← column(x, cfg)
     let int shared_length ← cfg.shared_ffn_length * cfg.embedding_length
     let tensor.NumericBlock gate_shexp ← window(source, prefix + ".ffn_gate_shexp", 0, shared_length, [cfg.shared_ffn_length, cfg.embedding_length])
     let tensor.NumericBlock up_shexp ← window(source, prefix + ".ffn_up_shexp", 0, shared_length, [cfg.shared_ffn_length, cfg.embedding_length])
     let tensor.NumericBlock down_shexp ← window(source, prefix + ".ffn_down_shexp", 0, shared_length, [cfg.embedding_length, cfg.shared_ffn_length])
-    let tensor.NumericBlock gate_shexp_row ← row(math.matmul(gate_shexp, x_column), cfg.shared_ffn_length)
-    let tensor.NumericBlock up_shexp_row ← row(math.matmul(up_shexp, x_column), cfg.shared_ffn_length)
-    let tensor.NumericBlock shexp_row ← swiglu_no_bias(gate_shexp_row, up_shexp_row, nn.transpose_carrier(down_shexp))
-    let tensor.NumericBlock shexp ← flatten_row(shexp_row, cfg.embedding_length)
+    let list<f32> shexp_row ← expert_rows(gate_shexp, up_shexp, down_shexp, x.data, cfg.shared_ffn_length, cfg)
 
-    require finite_tensor(shexp) throw variant NonFinite { message = "shared expert output contains a non-finite value" }
+    for from shexp_row let value {
+        require dtype.finite(value) throw variant NonFinite { message = "shared expert output contains a non-finite value" }
+    }
 
     let tensor.NumericBlock gate_input ← window(source, prefix + ".ffn_gate_inp_shexp", 0, cfg.embedding_length, [cfg.embedding_length])
     let f32 gate ← nn.σ(dot(x, gate_input))
@@ -422,42 +473,130 @@ fn ffn_moe(tensor.NumericBlock x, int layer, (string, int, int) → tensor.Numer
     require dtype.finite(gate) throw variant NonFinite { message = "shared expert gate is non-finite" }
 
     # --- weighted accumulation (ascending expert index) -------------------
+    let int expert_length ← cfg.expert_ffn_length * cfg.embedding_length
     let list<int> selected ← selection.indices
     mut list<int> consumed ← empty
-    mut tensor.NumericBlock moe_out ← zeros(cfg.embedding_length)
+    mut list<f32> moe_acc ← empty
+
+    for range 0 ‥ cfg.embedding_length {
+        moe_acc.append(0.0 ∷ f32)
+    }
 
     for range 0 ‥ cfg.expert_used_count {
-        mut int slot ← -1
-
-        for range 0 ‥ selected.length() let j {
-            if j ∉ consumed {
-                if slot ≺ 0 {
-                    slot ← j
-                }
-                else {
-                    let int candidate ← selected.get(j) coalesce (-1)
-                    let int incumbent ← selected.get(slot) coalesce (-1)
-
-                    if candidate ≺ incumbent {
-                        slot ← j
-                    }
-                }
-            }
-        }
-
-        require slot ≥ 0 throw variant BadConfig { message = "router selection index is unavailable" }
-
+        let int slot ← next_slot(selected, consumed)
         consumed.append(slot)
         let int expert ← selected.get(slot) coalesce 0
         let f32 weight ← selection.weights.get(slot) coalesce 0.0 ∷ f32
-        let tensor.NumericBlock output ← expert_out(x, layer, expert, source, cfg)
-        moe_out ← math.add_carrier(moe_out, math.mul_carrier(output, scalar(weight)))
+        let int start ← expert * expert_length
+        let tensor.NumericBlock gate_window ← window(source, prefix + ".ffn_gate_exps", start, expert_length, [cfg.expert_ffn_length, cfg.embedding_length])
+        let tensor.NumericBlock up_window ← window(source, prefix + ".ffn_up_exps", start, expert_length, [cfg.expert_ffn_length, cfg.embedding_length])
+        let tensor.NumericBlock down_window ← window(source, prefix + ".ffn_down_exps", start, expert_length, [cfg.embedding_length, cfg.expert_ffn_length])
+        let list<f32> expert_row ← expert_rows(gate_window, up_window, down_window, x.data, cfg.expert_ffn_length, cfg)
+
+        for from expert_row let value {
+            require dtype.finite(value) throw variant NonFinite { message = "expert output contains a non-finite value" }
+        }
+
+        mut list<f32> accumulated ← empty
+
+        for range 0 ‥ cfg.embedding_length let d {
+            accumulated.append((moe_acc.get(d) coalesce 0.0 ∷ f32) + (expert_row.get(d) coalesce 0.0 ∷ f32) * weight)
+        }
+
+        moe_acc ← accumulated
     }
 
     # --- combine + fail-closed output -------------------------------------
-    mut tensor.NumericBlock result ← tensor.default()
-    let tensor.NumericBlock gated_shared ← math.mul_carrier(shexp, scalar(gate))
-    result ← math.add_carrier(moe_out, gated_shared)
+    mut list<f32> combined ← empty
+
+    for range 0 ‥ cfg.embedding_length let d {
+        combined.append((moe_acc.get(d) coalesce 0.0 ∷ f32) + (shexp_row.get(d) coalesce 0.0 ∷ f32) * gate)
+    }
+
+    let tensor.NumericBlock result ← tensor.stage_f32([cfg.embedding_length], combined)
+
+    require result.valid() throw variant BadShape { message = "FFN output carrier is invalid" }
+
+    require result.shape ≡ ([cfg.embedding_length] ↦ list<int>) throw variant BadShape { message = "FFN output carrier has the wrong shape" }
+
+    require finite_tensor(result) throw variant NonFinite { message = "FFN output contains a non-finite value" }
+
+    return result
+}
+
+# Lean prepared form (the decode route): the full routed MoE FFN layer over
+# one hidden-state row, consuming the load-time-prepared weight record —
+# no weight source reads, no weight finiteness scans, no per-token
+# transposes or carrier shape copies. Per-element operations and their
+# order match the traced ffn_moe (issue #79).
+@ public
+fn ffn_moe_prepared(tensor.NumericBlock x, MoeLayerWeights weights, MoeConfig cfg) → tensor.NumericBlock ⇥ MoeError {
+    # --- config + input (fail closed; the activation row stays checked) ---
+    validate_config(cfg)
+
+    validate_input(x, cfg)
+
+    # --- router selection over the prepared router weights ----------------
+    let list<f32> logits ← gemv_list(weights.router, x.data, cfg.embedding_length, cfg.expert_count)
+
+    for from logits let value {
+        require dtype.finite(value) throw variant NonFinite { message = "router logits contain a non-finite value" }
+    }
+
+    let list<f32> probabilities ← softmax(logits)
+    let MoeSelection selection ← selection_from(logits, probabilities, cfg)
+
+    # --- shared expert (SwiGLU + sigmoid gate) ----------------------------
+    let list<f32> shexp_row ← expert_rows(weights.gate_shexp, weights.up_shexp, weights.down_shexp, x.data, cfg.shared_ffn_length, cfg)
+
+    for from shexp_row let value {
+        require dtype.finite(value) throw variant NonFinite { message = "shared expert output contains a non-finite value" }
+    }
+
+    let f32 gate ← nn.σ(dot(x, weights.gate_inp_shexp))
+
+    require dtype.finite(gate) throw variant NonFinite { message = "shared expert gate is non-finite" }
+
+    # --- weighted accumulation (ascending expert index) -------------------
+    let list<int> selected ← selection.indices
+    mut list<int> consumed ← empty
+    mut list<f32> moe_acc ← empty
+
+    for range 0 ‥ cfg.embedding_length {
+        moe_acc.append(0.0 ∷ f32)
+    }
+
+    for range 0 ‥ cfg.expert_used_count {
+        let int slot ← next_slot(selected, consumed)
+        consumed.append(slot)
+        let int expert ← selected.get(slot) coalesce 0
+        let f32 weight ← selection.weights.get(slot) coalesce 0.0 ∷ f32
+        let tensor.NumericBlock gate_window ← weights.gate_exps.get(expert) coalesce tensor.default()
+        let tensor.NumericBlock up_window ← weights.up_exps.get(expert) coalesce tensor.default()
+        let tensor.NumericBlock down_window ← weights.down_exps.get(expert) coalesce tensor.default()
+        let list<f32> expert_row ← expert_rows(gate_window, up_window, down_window, x.data, cfg.expert_ffn_length, cfg)
+
+        for from expert_row let value {
+            require dtype.finite(value) throw variant NonFinite { message = "expert output contains a non-finite value" }
+        }
+
+        mut list<f32> accumulated ← empty
+
+        for range 0 ‥ cfg.embedding_length let d {
+            accumulated.append((moe_acc.get(d) coalesce 0.0 ∷ f32) + (expert_row.get(d) coalesce 0.0 ∷ f32) * weight)
+        }
+
+        moe_acc ← accumulated
+    }
+
+    # --- combine + fail-closed output -------------------------------------
+    mut list<f32> combined ← empty
+
+    for range 0 ‥ cfg.embedding_length let d {
+        combined.append((moe_acc.get(d) coalesce 0.0 ∷ f32) + (shexp_row.get(d) coalesce 0.0 ∷ f32) * gate)
+    }
+
+    let tensor.NumericBlock result ← tensor.stage_f32([cfg.embedding_length], combined)
 
     require result.valid() throw variant BadShape { message = "FFN output carrier is invalid" }
 
@@ -474,7 +613,10 @@ fn ffn_moe(tensor.NumericBlock x, int layer, (string, int, int) → tensor.Numer
 # The negative rows prove that bad configuration, carrier shape, source
 # window, and non-finite input remain typed MoeError failures. The router
 # rows pin GEMV logits, stabilized softmax, deterministic top-k ties, and
-# selected-weight renormalization.
+# selected-weight renormalization. The prepared rows pin the issue #79
+# load-time seam: prepare validates every window once (fail closed on the
+# first non-finite weight) and the lean prepared route reproduces the
+# traced route's values over the same fixture.
 
 import from "gradus:model/moe" moe
 import from "gradus:tensor" tensor
@@ -634,12 +776,36 @@ fn full_layer_source(string name, int start, int length) → tensor.NumericBlock
     throw variant BadWindow {message = "unexpected full-layer window"}
 }
 
-# NonFinite intermediate gate: the shared gate window carries +Inf.
+# Prepared-layer source: the full-layer fixture extended to serve every
+# expert window offset (prepare reads all experts once). Experts past the
+# dispatch pair reuse the expert-0 pattern shifted by the expert index.
+fn prepared_layer_source(string name, int start, int length) → tensor.NumericBlock ⇥ moe.MoeError {
+    if name ≡ "blk.0.ffn_gate_exps" or name ≡ "blk.0.ffn_up_exps" or name ≡ "blk.0.ffn_down_exps" {
+        if start ≡ 0 or start ≡ 4 {
+            return dispatch_source(name, start, length)
+        }
+        let int expert ← start / 4
+        if name ≡ "blk.0.ffn_gate_exps" {
+            return tene([0.0, 0.0, (expert ↦ f32), 0.0], [2, 2])
+        }
+        if name ≡ "blk.0.ffn_up_exps" {
+            return tene([0.0, 0.0, 1.0, 0.0], [2, 2])
+        }
+        return tene([0.0, 0.5, 0.0, 0.0], [2, 2])
+    }
+    return full_layer_source(name, start, length)
+}
+
+# NonFinite intermediate gate: the shared gate window carries +Inf. Expert
+# windows delegate to the prepared source so both the traced layer call
+# (which reads the shared windows before any expert window) and prepare
+# (which reads every expert before the shared windows) reach the poisoned
+# window deterministically.
 fn nonfinite_shexp_source(string name, int start, int length) → tensor.NumericBlock ⇥ moe.MoeError {
     if name ≡ "blk.0.ffn_gate_shexp" and start ≡ 0 {
         return tene([1.0 / 0.0, 0.0, 0.0, 0.0], [2, 2])
     }
-    return full_layer_source(name, start, length)
+    return prepared_layer_source(name, start, length)
 }
 
 fn ffn_with_full(tensor.NumericBlock x, int layer, moe.MoeConfig cfg) → string {
@@ -655,6 +821,21 @@ fn ffn_with_full(tensor.NumericBlock x, int layer, moe.MoeConfig cfg) → string
 fn ffn_with_nonfinite_shexp(tensor.NumericBlock x, int layer, moe.MoeConfig cfg) → string {
     do {
         let tensor.NumericBlock value ← moe.ffn_moe(x, layer, (string name, int start, int length) → tensor.NumericBlock ⇥ moe.MoeError ∴ nonfinite_shexp_source(name, start, length), cfg)
+        return "no error"
+    }
+    catch err {
+        return err.message
+    }
+}
+
+fn prepare_with(string source_name) → string {
+    do {
+        if source_name ≡ "nonfinite" {
+            let moe.MoeLayerWeights weights ← moe.prepare_moe_layer((string name, int start, int length) → tensor.NumericBlock ⇥ moe.MoeError ∴ nonfinite_shexp_source(name, start, length), 0, base_config())
+        }
+        else {
+            let moe.MoeLayerWeights weights ← moe.prepare_moe_layer((string name, int start, int length) → tensor.NumericBlock ⇥ moe.MoeError ∴ prepared_layer_source(name, start, length), 0, base_config())
+        }
         return "no error"
     }
     catch err {
@@ -788,4 +969,26 @@ test "ffn moe rejects a non-finite shared expert window" {
 
 test "ffn moe rejects a malformed hidden carrier" {
     assert ffn_with_full(tene([0.25], [1, 1]), 0, base_config()) ≡ "hidden state must have shape [1, embedding_length]"
+}
+
+test "prepare moe layer reads and validates every window once" {
+    assert prepare_with("full") ≡ "no error"
+    assert prepare_with("nonfinite") ≡ "tensor window contains a non-finite value"
+}
+
+test "ffn moe prepared reproduces the traced full-layer values" {
+    do {
+        let moe.MoeLayerWeights weights ← moe.prepare_moe_layer((string name, int start, int length) → tensor.NumericBlock ⇥ moe.MoeError ∴ prepared_layer_source(name, start, length), 0, base_config())
+        let tensor.NumericBlock out ← moe.ffn_moe_prepared(hidden(), weights, base_config())
+        assert out.shape ≡ ([2] ↦ list<int>)
+        assert e1(out, 0).approx(0.125170, 0.0005 ∷ f32)
+        assert e1(out, 1).approx(0.0, 0.0005 ∷ f32)
+        assert weights.router.shape ≡ ([8, 2] ↦ list<int>)
+        assert weights.gate_exps.length() ≡ 8
+        assert weights.up_exps.length() ≡ 8
+        assert weights.down_exps.length() ≡ 8
+    }
+    catch err {
+        assert false
+    }
 }

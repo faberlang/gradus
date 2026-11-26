@@ -642,3 +642,154 @@ test "replay is deterministic across fresh sessions" {
         assert false
     }
 }
+
+test "schedule precomputes the linear and full slot index arrays" {
+    do {
+    let schedule.Qwen35moeSchedule s ← schedule.schedule(pinned_config())
+    assert s.linear_slots.length() ≡ 41
+    assert s.full_slots.length() ≡ 41
+    assert (s.linear_slots.get(0) coalesce -2) ≡ 0
+    assert (s.linear_slots.get(38) coalesce -2) ≡ 29
+    assert (s.linear_slots.get(3) coalesce -2) ≡ -1
+    assert (s.linear_slots.get(39) coalesce -2) ≡ -1
+    assert (s.linear_slots.get(40) coalesce -2) ≡ -1
+    assert (s.full_slots.get(3) coalesce -2) ≡ 0
+    assert (s.full_slots.get(39) coalesce -2) ≡ 9
+    assert (s.full_slots.get(0) coalesce -2) ≡ -1
+    assert (s.full_slots.get(40) coalesce -2) ≡ -1
+    let schedule.Qwen35moeSchedule h ← schedule.schedule(heretic_config())
+    assert h.linear_slots.length() ≡ 40
+    assert h.full_slots.length() ≡ 40
+    assert (h.linear_slots.get(39) coalesce -2) ≡ -1
+    assert (h.full_slots.get(39) coalesce -2) ≡ 9
+    }
+    catch err {
+        assert false
+    }
+}
+
+# Mid-size full-attention row for the budget-bound prepared-path rows:
+# pinned-row field relationships (rope dims <= head dim, GQA heads/kv
+# heads) at small widths.
+fn mid_full_config() → qwen35moe.Qwen35moeConfig {
+    let qwen35moe.Qwen35moeConfig c ← config(41, 1)
+    return qwen35moe.Qwen35moeConfig {
+        architecture = c.architecture,
+        file_type = c.file_type,
+        quantization_version = c.quantization_version,
+        block_count = c.block_count,
+        context_length = c.context_length,
+        embedding_length = 64,
+        head_count = 4,
+        head_count_kv = 2,
+        key_length = 32,
+        value_length = 32,
+        rms_norm_epsilon = c.rms_norm_epsilon,
+        freq_base = c.freq_base,
+        rope_dimension_count = 16,
+        rope_sections = [4, 4, 4, 4],
+        expert_count = c.expert_count,
+        expert_used_count = c.expert_used_count,
+        expert_ffn_length = c.expert_ffn_length,
+        shared_ffn_length = c.shared_ffn_length,
+        conv_kernel = c.conv_kernel,
+        state_size = c.state_size,
+        group_count = c.group_count,
+        gradus_temporis = c.gradus_temporis,
+        inner_size = c.inner_size,
+        full_attention_interval = c.full_attention_interval,
+        nextn_predict_layers = c.nextn_predict_layers,
+        tokenizer_model = c.tokenizer_model,
+        tokenizer_pre = c.tokenizer_pre,
+        token_count = c.token_count,
+        token_type_count = c.token_type_count,
+        merge_count = c.merge_count,
+        eos_token_id = c.eos_token_id,
+        padding_token_id = c.padding_token_id,
+        bos_token_id = c.bos_token_id,
+        add_bos_token = c.add_bos_token
+    }
+}
+
+# Carrier shapes for the mid full-attention row (the module checks every
+# returned shape against its own expectation).
+fn mid_full_carrier_shape(string name) → list<int> {
+    if ends_with(name, ".attn_norm") {
+        return [64]
+    }
+    if ends_with(name, ".attn_q") {
+        return [256, 64]
+    }
+    if ends_with(name, ".attn_k") {
+        return [64, 64]
+    }
+    if ends_with(name, ".attn_v") {
+        return [64, 64]
+    }
+    if ends_with(name, ".attn_q_norm") {
+        return [32]
+    }
+    if ends_with(name, ".attn_k_norm") {
+        return [32]
+    }
+    if ends_with(name, ".attn_output") {
+        return [64, 128]
+    }
+    return [1]
+}
+
+fn mid_full_window(string name, int start, int length) → tensor.NumericBlock ⇥ schedule.Qwen35moeStateError {
+    do {
+        return tensor.construct(fill(length, 7), mid_full_carrier_shape(name))
+    }
+    catch err {
+        throw variant BadWindow {message = "mid-row synthetic carrier failed"}
+    }
+}
+
+# Issue #79 lean-path rows: the prepared entry points read and validate the
+# weight windows once (prepare), then reproduce the traced window path
+# bit-for-bit while allocating no trace buffers.
+test "linear attention prepared matches the traced path without trace buffers" {
+    let qwen35moe.Qwen35moeConfig c ← mid_config()
+    let int embd ← mid_embd()
+    let list<f32> rows ← fill(embd, 19)
+    do {
+    let linear_attn.LinearAttentionOutcome traced ← linear_attn.linear_attention_step(rows, 0, session.fresh_conv_state(c), session.fresh_recurrent_state(c), (string name, int start, int length) → tensor.NumericBlock ⇥ schedule.Qwen35moeStateError ∴ mid_window(name, start, length), c)
+    let linear_attn.LinearAttentionWeights weights ← linear_attn.prepare_linear_attention((string name, int start, int length) → tensor.NumericBlock ⇥ schedule.Qwen35moeStateError ∴ mid_window(name, start, length), 0, c)
+    let linear_attn.LinearAttentionOutcome lean ← linear_attn.linear_attention_step_prepared(rows, session.fresh_conv_state(c), session.fresh_recurrent_state(c), weights, c)
+    assert lean.out ≡ traced.out
+    assert session.conv_equal(lean.conv, traced.conv)
+    assert session.recurrent_equal(lean.recurrent, traced.recurrent)
+    assert lean.trace.normed.length() ≡ 0
+    assert lean.trace.qkv_mixed.length() ≡ 0
+    assert lean.trace.core_out.length() ≡ 0
+    assert lean.trace.final_output.length() ≡ 0
+    assert traced.trace.normed.length() ≡ embd
+    assert traced.trace.core_out.length() ≡ 8 * 16
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "full attention prepared matches the traced path without trace buffers" {
+    let qwen35moe.Qwen35moeConfig c ← mid_full_config()
+    let list<f32> rows ← fill(2 * 64, 23)
+    do {
+    let full_attn.FullAttentionOutcome traced ← full_attn.full_attention(rows, 3, session.fresh_kv_state(c, 8), 0, (string name, int start, int length) → tensor.NumericBlock ⇥ schedule.Qwen35moeStateError ∴ mid_full_window(name, start, length), c)
+    let full_attn.FullAttentionWeights weights ← full_attn.prepare_full_attention((string name, int start, int length) → tensor.NumericBlock ⇥ schedule.Qwen35moeStateError ∴ mid_full_window(name, start, length), 3, c)
+    let full_attn.FullAttentionOutcome lean ← full_attn.full_attention_prepared(rows, session.fresh_kv_state(c, 8), 0, weights, c)
+    assert lean.out ≡ traced.out
+    assert session.kv_equal(lean.kv, traced.kv)
+    assert lean.trace.normed.length() ≡ 0
+    assert lean.trace.q_normed.length() ≡ 0
+    assert lean.trace.k_normed.length() ≡ 0
+    assert lean.trace.softmax.length() ≡ 0
+    assert traced.trace.softmax.length() ≡ 2 * 4 * 2
+    assert traced.trace.q_normed.length() ≡ 2 * 4 * 32
+    }
+    catch err {
+        assert false
+    }
+}
