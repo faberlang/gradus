@@ -13,6 +13,7 @@ locale = "en"
 # Zero NumericBlock / list<f32> in the device compute paths.
 
 import from "gradus:decode_step" let ds
+import from "gradus:decode_hybrid_kernels" let dhk
 import from "gradus:decode_stages" let stages
 import from "gradus:decode_token" let dt
 import from "gradus:cache/session" let sess_mod
@@ -70,6 +71,20 @@ class MoeFfnWeights<size D, size E, size EF, size ED, size FE, size FS> {
     let tensor<f32, [D, FS]> shared_wd
     let bool has_shared_gate
     let tensor<f32, [1, D]> shared_gate_w
+    let bool use_sigmoid_routing = false
+}
+
+# Full-attention weights for Slice B (Qwen3.6) with 2*QD interleaved Q + gate projection.
+@ public
+class Qwen36FullAttnWeights<size D, size TwoQD, size QD, size KVD, size DH, size H> {
+    let tensor<f32, [D]> anorm
+    let tensor<f32, [TwoQD, D]> wq
+    let tensor<f32, [KVD, D]> wk
+    let tensor<f32, [KVD, D]> wv
+    let tensor<f32, [D, QD]> wo
+    let bool has_qk_norm
+    let tensor<f32, [DH]> q_norm
+    let tensor<f32, [DH]> k_norm
 }
 
 # Gated DeltaNet + ShortConv weights for Slice B (Qwen3.6) linear-attention layers.
@@ -138,7 +153,7 @@ fn dense_ffn_step<size D, size F>(tensor<f32, [D]> h1, mut tensor<f32, [D]> hout
 # Routed + optional shared MoE FFN step.
 @ public
 fn moe_ffn_step<size D, size E, size EF, size ED, size K, size FE, size FS>(tensor<f32, [D]> h1, mut tensor<f32, [D]> hout, MoeFfnWeights<D, E, EF, ED, FE, FS> mw, mut tensor<i32, [K]> top_idx, f32 eps) → void {
-    stages.moe_ffn_stage(h1, mut hout, mw.fnorm, mw.router, mw.wg, mw.wu, mw.wd, mw.has_shared, mw.shared_wg, mw.shared_wu, mw.shared_wd, mw.has_shared_gate, mw.shared_gate_w, mut top_idx, eps)
+    stages.moe_ffn_stage(h1, mut hout, mw.fnorm, mw.router, mw.wg, mw.wu, mw.wd, mw.has_shared, mw.shared_wg, mw.shared_wu, mw.shared_wd, mw.has_shared_gate, mw.shared_gate_w, mut top_idx, eps, mw.use_sigmoid_routing)
 }
 
 # Slice B0 full layer step: attention + dense FFN (when `is_dense`) or MoE FFN.
@@ -155,17 +170,23 @@ fn flint_layer_step<size D, size QD, size KVD, size DH, size H, size C, size W, 
     }
 }
 
-# Slice B (Qwen3.6) full-attention step with sectional RoPE (`dimension_sections`)
-# and optional per-head QK-norm over FullKvArena.
+# Slice B (Qwen3.6) full-attention step with 2*QD interleaved Q+gate projection,
+# sectional RoPE (`dimension_sections`), optional per-head QK-norm over FullKvArena,
+# and per-element sigmoid Q output gate (`ctx * sigmoid(q_gate)`).
 @ public
-fn qwen36_full_attn_step<size D, size QD, size KVD, size DH, size H, size C, size W>(tensor<f32, [D]> hin, mut tensor<f32, [D]> hout, FlintAttnWeights<D, QD, KVD, DH, H> aw, FlintAttnParams ap, tensor<i32, [4]> sections, mut sess_mod.SessionState<C, W, KVD> sess, int slot_id, i32 pos) → void ⇥ sess_mod.SessionError {
+fn qwen36_full_attn_step<size D, size TwoQD, size QD, size KVD, size DH, size H, size C, size W>(tensor<f32, [D]> hin, mut tensor<f32, [D]> hout, Qwen36FullAttnWeights<D, TwoQD, QD, KVD, DH, H> aw, FlintAttnParams ap, tensor<i32, [4]> sections, mut sess_mod.SessionState<C, W, KVD> sess, int slot_id, i32 pos) → void ⇥ sess_mod.SessionError {
     mut tensor<f32, [D]> xn ← tf32[D] {}
+    mut tensor<f32, [TwoQD]> q_full ← tf32[TwoQD] {}
     mut tensor<f32, [QD]> q ← tf32[QD] {}
+    mut tensor<f32, [QD]> q_gate ← tf32[QD] {}
     mut tensor<f32, [KVD]> k ← tf32[KVD] {}
     mut tensor<f32, [KVD]> v ← tf32[KVD] {}
     do device {
         ds.rmsnorm(hin, aw.anorm, mut xn, ap.eps)
-        ds.qkv_proj(aw.wq, aw.wk, aw.wv, xn, mut q, mut k, mut v)
+        ds.gemv(aw.wq, xn, mut q_full)
+        ds.gemv(aw.wk, xn, mut k)
+        ds.gemv(aw.wv, xn, mut v)
+        dhk.split_q_gate_interleaved(q_full, mut q, mut q_gate, ap.dh)
     }
 
     mut tensor<f32, [QD]> qn ← tf32[QD] {}
@@ -179,9 +200,11 @@ fn qwen36_full_attn_step<size D, size QD, size KVD, size DH, size H, size C, siz
     mut tensor<f32, [QD]> ctx ← tf32[QD] {}
     stages.attn_sectional_and_session<size QD, size KVD, size H, size C, size W>(qn, kn, v, mut qr, mut kr, pos, ap.dh, sections, ap.lntheta, ap.group, ap.scale, mut sess, slot_id, mut ctx)
 
+    mut tensor<f32, [QD]> gated_ctx ← tf32[QD] {}
     mut tensor<f32, [D]> ao ← tf32[D] {}
     do device {
-        ds.gemv(aw.wo, ctx, mut ao)
+        dhk.sigmoid_mul(ctx, q_gate, mut gated_ctx)
+        ds.gemv(aw.wo, gated_ctx, mut ao)
         ds.residual_add(hin, ao, mut hout)
     }
 }
@@ -192,6 +215,12 @@ fn qwen36_full_attn_step<size D, size QD, size KVD, size DH, size H, size C, siz
 @ public
 fn qwen36_linear_attn_step<size D, size ConvCh, size RecRows, size VH, size K, size RecCols, size ConvRows>(tensor<f32, [D]> hin, mut tensor<f32, [D]> hout, LinearAttnWeights<D, ConvCh, RecRows, VH, K, RecCols> lw, LinearAttnParams lp, mut hybrid.ConvStateArena<ConvRows, ConvCh> conv_arena, mut hybrid.RecurrentStateArena<RecRows, RecCols> rec_arena, int slot_id) → void ⇥ sess_mod.SessionError {
     stages.deltanet_linear_attn_stage(hin, mut hout, lw.anorm, lw.wqkv, lw.wgate, lw.conv_w, lw.dt_bias, lw.a_row, lw.wbeta, lw.walpha, lw.ssm_norm, lw.wout, lp.group_heads, lp.key_dim, lp.eps, lp.site_idx, lp.history_len, mut conv_arena, mut rec_arena, slot_id)
+}
+
+# Slice B (Qwen3.6) linear-attention step directly over HybridSession (Seam 4).
+@ public
+fn qwen36_linear_attn_hybrid_step<size C, size W, size KVD, size D, size ConvCh, size RecRows, size VH, size K, size RecCols, size ConvRows>(tensor<f32, [D]> hin, mut tensor<f32, [D]> hout, LinearAttnWeights<D, ConvCh, RecRows, VH, K, RecCols> lw, LinearAttnParams lp, mut hybrid.HybridSession<C, W, KVD, ConvRows, ConvCh, RecRows, RecCols> hs, int slot_id) → void ⇥ sess_mod.SessionError {
+    stages.deltanet_hybrid_stage(hin, mut hout, lw.anorm, lw.wqkv, lw.wgate, lw.conv_w, lw.dt_bias, lw.a_row, lw.wbeta, lw.walpha, lw.ssm_norm, lw.wout, lp.group_heads, lp.key_dim, lp.eps, lp.site_idx, lp.history_len, mut hs, slot_id)
 }
 
 +++ faber test
@@ -417,6 +446,38 @@ test "decode_hybrid flint_layer_step supports leading dense FFN and routed+share
     }
 }
 
+fn mk_q36_linear_weights() → dh.LinearAttnWeights<2, 6, 2, 1, 4, 2> {
+    mut tensor<f32, [2]> anorm ← tf32[2] {}
+    anorm[[0]] ← 1.0
+    anorm[[1]] ← 1.0
+    mut tensor<f32, [6, 2]> wqkv ← tf32[6, 2] {}
+    wqkv[[0, 0]] ← 1.0
+    wqkv[[2, 0]] ← 1.0
+    wqkv[[4, 0]] ← 1.0
+    mut tensor<f32, [2, 2]> wgate ← tf32[2, 2] {}
+    wgate[[0, 0]] ← 1.0
+    mut tensor<f32, [6, 4]> conv_w ← tf32[6, 4] {}
+    conv_w[[0, 3]] ← 1.0
+    conv_w[[2, 3]] ← 1.0
+    conv_w[[4, 3]] ← 1.0
+    mut tensor<f32, [1]> dt_bias ← tf32[1] {}
+    mut tensor<f32, [1]> a_row ← tf32[1] {}
+    a_row[[0]] ← -1.0
+    mut tensor<f32, [1, 2]> wbeta ← tf32[1, 2] {}
+    mut tensor<f32, [1, 2]> walpha ← tf32[1, 2] {}
+    mut tensor<f32, [2]> ssm_norm ← tf32[2] {}
+    ssm_norm[[0]] ← 1.0
+    ssm_norm[[1]] ← 1.0
+    mut tensor<f32, [2, 2]> wout ← tf32[2, 2] {}
+    wout[[0, 0]] ← 1.0
+
+    return dh.LinearAttnWeights<2, 6, 2, 1, 4, 2> {
+        anorm = anorm, wqkv = wqkv, wgate = wgate, conv_w = conv_w,
+        dt_bias = dt_bias, a_row = a_row, wbeta = wbeta, walpha = walpha,
+        ssm_norm = ssm_norm, wout = wout
+    }
+}
+
 test "decode_hybrid qwen36_linear_attn_step advances ConvStateArena and RecurrentStateArena" {
     let model_schedule.ExecutionSchedule sched ← mk_q36_linear_sched()
     do {
@@ -427,35 +488,7 @@ test "decode_hybrid qwen36_linear_attn_step advances ConvStateArena and Recurren
         mut tensor<f32, [2]> hin ← tf32[2] {}
         hin[[0]] ← 1.0
         hin[[1]] ← 1.0
-        mut tensor<f32, [2]> anorm ← tf32[2] {}
-        anorm[[0]] ← 1.0
-        anorm[[1]] ← 1.0
-        mut tensor<f32, [6, 2]> wqkv ← tf32[6, 2] {}
-        wqkv[[0, 0]] ← 1.0
-        wqkv[[2, 0]] ← 1.0
-        wqkv[[4, 0]] ← 1.0
-        mut tensor<f32, [2, 2]> wgate ← tf32[2, 2] {}
-        wgate[[0, 0]] ← 1.0
-        mut tensor<f32, [6, 4]> conv_w ← tf32[6, 4] {}
-        conv_w[[0, 3]] ← 1.0
-        conv_w[[2, 3]] ← 1.0
-        conv_w[[4, 3]] ← 1.0
-        mut tensor<f32, [1]> dt_bias ← tf32[1] {}
-        mut tensor<f32, [1]> a_row ← tf32[1] {}
-        a_row[[0]] ← -1.0
-        mut tensor<f32, [1, 2]> wbeta ← tf32[1, 2] {}
-        mut tensor<f32, [1, 2]> walpha ← tf32[1, 2] {}
-        mut tensor<f32, [2]> ssm_norm ← tf32[2] {}
-        ssm_norm[[0]] ← 1.0
-        ssm_norm[[1]] ← 1.0
-        mut tensor<f32, [2, 2]> wout ← tf32[2, 2] {}
-        wout[[0, 0]] ← 1.0
-
-        let dh.LinearAttnWeights<2, 6, 2, 1, 4, 2> lw ← dh.LinearAttnWeights<2, 6, 2, 1, 4, 2> {
-            anorm = anorm, wqkv = wqkv, wgate = wgate, conv_w = conv_w,
-            dt_bias = dt_bias, a_row = a_row, wbeta = wbeta, walpha = walpha,
-            ssm_norm = ssm_norm, wout = wout
-        }
+        let dh.LinearAttnWeights<2, 6, 2, 1, 4, 2> lw ← mk_q36_linear_weights()
         let dh.LinearAttnParams lp ← dh.LinearAttnParams {
             group_heads = 1, key_dim = 2, eps = 0.00001, site_idx = 0, history_len = 3
         }
@@ -466,6 +499,37 @@ test "decode_hybrid qwen36_linear_attn_step advances ConvStateArena and Recurren
         assert conv.steps_written[0] ≡ 1
         assert rec.steps_written[0] ≡ 1
         assert hout[[0]] ≻ 1.0
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "decode_hybrid qwen36_linear_attn_hybrid_step matches qwen36_linear_attn_step over HybridSession" {
+    let model_schedule.ExecutionSchedule sched ← mk_q36_linear_sched()
+    do {
+        mut hybrid.ConvStateArena<3, 6> conv_ref ← hybrid.conv_from_schedule<size 3, size 6>(sched, 1, 3, false)
+        mut hybrid.RecurrentStateArena<2, 2> rec_ref ← hybrid.recurrent_from_schedule<size 2, size 2>(sched)
+        mut hybrid.HybridSession<8, 1, 2, 3, 6, 2, 2> hs ← hybrid.from_schedule<size 8, size 1, size 2, size 3, size 6, size 2, size 2>(sched, 1, 3, false)
+
+        mut tensor<f32, [2]> hin ← tf32[2] {}
+        hin[[0]] ← 1.0
+        hin[[1]] ← 1.0
+        let dh.LinearAttnWeights<2, 6, 2, 1, 4, 2> lw ← mk_q36_linear_weights()
+        let dh.LinearAttnParams lp ← dh.LinearAttnParams {
+            group_heads = 1, key_dim = 2, eps = 0.00001, site_idx = 0, history_len = 3
+        }
+
+        mut tensor<f32, [2]> hout_ref ← tf32[2] {}
+        mut tensor<f32, [2]> hout_hybrid ← tf32[2] {}
+        dh.qwen36_linear_attn_step(hin, mut hout_ref, lw, lp, mut conv_ref, mut rec_ref, 0)
+        dh.qwen36_linear_attn_hybrid_step(hin, mut hout_hybrid, lw, lp, mut hs, 0)
+
+        assert hs.conv.steps_written[0] ≡ 1
+        assert hs.recurrent.steps_written[0] ≡ 1
+        assert hout_hybrid[[0]] ≻ 1.0
+        assert close(hout_hybrid[[0]], hout_ref[[0]])
+        assert close(hout_hybrid[[1]], hout_ref[[1]])
     }
     catch err {
         assert false
@@ -487,15 +551,17 @@ test "decode_hybrid qwen36_full_attn_step applies sectional RoPE and writes Full
             ones4[[i]] ← 1.0
         }
         mut tensor<f32, [4, 4]> eye4 ← tf32[4, 4] {}
+        mut tensor<f32, [8, 4]> wq_2qd ← tf32[8, 4] {}
         for range 0‥4 let i {
             eye4[[i, i]] ← 1.0
+            wq_2qd[[i, i]] ← 1.0
         }
-        mut tensor<f32, [1]> sink ← tf32[1] {}
+        # Set gate rows (4..7) to 2.0 on diagonal -> gate = [2.0, 0, 0, 0] -> sigmoid(2.0) ~ 0.8808
+        wq_2qd[[4, 0]] ← 2.0
 
-        let dh.FlintAttnWeights<4, 4, 4, 4, 1> aw ← dh.FlintAttnWeights<4, 4, 4, 4, 1> {
-            anorm = ones4, wq = eye4, wk = eye4, wv = eye4, wo = eye4,
-            has_qk_norm = true, q_norm = ones4, k_norm = ones4,
-            has_sink = false, softmax_sink = sink
+        let dh.Qwen36FullAttnWeights<4, 8, 4, 4, 4, 1> aw ← dh.Qwen36FullAttnWeights<4, 8, 4, 4, 4, 1> {
+            anorm = ones4, wq = wq_2qd, wk = eye4, wv = eye4, wo = eye4,
+            has_qk_norm = true, q_norm = ones4, k_norm = ones4
         }
         let dh.FlintAttnParams ap ← dh.FlintAttnParams {
             dh = 4, span = 1, group = 1, rope = variant dt.RopeKind.Half,
@@ -513,9 +579,65 @@ test "decode_hybrid qwen36_full_attn_step applies sectional RoPE and writes Full
         dh.qwen36_full_attn_step(hin, mut hout, aw, ap, sections, mut sess, 0, 1)
 
         assert sess.full_kv.lengths[0] ≡ 2
-        assert hout[[0]] ≻ 1.0
+        # At dim 0, gate = 2.0 -> sigmoid(2.0) ~ 0.8808, so hout[0] ~ 1.0 + 0.8808 = 1.8808
+        # At dim 1, gate = 0.0 -> sigmoid(0.0) = 0.5, so hout[1] = 1.0 + 0.5 = 1.5
+        let f32 sig2 ← (1.0 ∷ f32) / ((1.0 ∷ f32) + (-2.0 ∷ f32).exp())
+        assert close(hout[[0]], 1.0 + sig2)
+        assert close(hout[[1]], 1.5)
     }
     catch err {
         assert false
     }
+}
+
+test "decode_hybrid Flint sigmoid MoE routing matches sigmoid/sum vs softmax" {
+    mut tensor<f32, [2]> h1 ← tf32[2] {}
+    h1[[0]] ← 1.0
+    h1[[1]] ← 1.0
+    mut tensor<f32, [2]> ones2 ← tf32[2] {}
+    ones2[[0]] ← 1.0
+    ones2[[1]] ← 1.0
+
+    # Router logits: expert 0 gets 0.0, expert 1 gets 2.0.
+    mut tensor<f32, [2, 2]> router ← tf32[2, 2] {}
+    router[[1, 0]] ← 2.0
+    # Expert 0 down = [1, 0], Expert 1 down = [3, 0] (with gate/up = 1*1 -> silu(1)*1).
+    mut tensor<f32, [4, 2]> wg ← tf32[4, 2] {}
+    wg[[0, 0]] ← 1.0
+    wg[[2, 0]] ← 1.0
+    mut tensor<f32, [4, 2]> wu ← tf32[4, 2] {}
+    wu[[0, 0]] ← 1.0
+    wu[[2, 0]] ← 1.0
+    mut tensor<f32, [4, 2]> wd ← tf32[4, 2] {}
+    wd[[0, 0]] ← 1.0
+    wd[[2, 0]] ← 3.0
+    mut tensor<f32, [2, 2]> sw ← tf32[2, 2] {}
+    mut tensor<f32, [1, 2]> sgw ← tf32[1, 2] {}
+
+    let dh.MoeFfnWeights<2, 2, 4, 4, 2, 2> mw_sig ← dh.MoeFfnWeights<2, 2, 4, 4, 2, 2> {
+        fnorm = ones2, router = router, wg = wg, wu = wu, wd = wd,
+        has_shared = false, shared_wg = sw, shared_wu = sw, shared_wd = sw,
+        has_shared_gate = false, shared_gate_w = sgw, use_sigmoid_routing = true
+    }
+    let dh.MoeFfnWeights<2, 2, 4, 4, 2, 2> mw_soft ← dh.MoeFfnWeights<2, 2, 4, 4, 2, 2> {
+        fnorm = ones2, router = router, wg = wg, wu = wu, wd = wd,
+        has_shared = false, shared_wg = sw, shared_wu = sw, shared_wd = sw,
+        has_shared_gate = false, shared_gate_w = sgw, use_sigmoid_routing = false
+    }
+
+    mut tensor<i32, [2]> top_idx ← ti32[2] {}
+    mut tensor<f32, [2]> out_sig ← tf32[2] {}
+    mut tensor<f32, [2]> out_soft ← tf32[2] {}
+    dh.moe_ffn_step(h1, mut out_sig, mw_sig, mut top_idx, 0.0)
+    dh.moe_ffn_step(h1, mut out_soft, mw_soft, mut top_idx, 0.0)
+
+    # Sigmoid weights: s0 = 0.5, s1 = sigmoid(2.0) -> w0 = s0/(s0+s1), w1 = s1/(s0+s1)
+    # Softmax weights: e0 = 1.0, e1 = exp(2.0) -> noticeably higher weight on expert 1 (wd=3.0)
+    assert out_soft[[0]] ≻ out_sig[[0]] + 0.1 ∷ f32
+    let f32 s0 ← 0.5 ∷ f32
+    let f32 s1 ← (1.0 ∷ f32) / ((1.0 ∷ f32) + (-2.0 ∷ f32).exp())
+    let f32 w0 ← s0 / (s0 + s1)
+    let f32 w1 ← s1 / (s0 + s1)
+    let f32 silu1 ← (1.0 ∷ f32) / ((1.0 ∷ f32) + (-1.0 ∷ f32).exp())
+    assert close(out_sig[[0]], 1.0 + silu1 * (w0 * 1.0 + w1 * 3.0))
 }
