@@ -1,0 +1,592 @@
++++ toml
+locale = "en"
+
++++ faber
+# Device kernels for hybrid decode layers:
+#   - Slice B0 (Flint): per-head QK-norm, learnable softmax offset / attn_sinks,
+#     and routed + shared MoE FFN kernels.
+#   - Slice B (Qwen3.6): sectional RoPE, fused attn_qkv split, causal 1D ShortConv
+#     over ConvStateArena, and Gated DeltaNet recurrence over RecurrentStateArena.
+#
+# Public import: import from "gradus:decode_hybrid_kernels" let dhk
+# Zero imports: self-contained under the compiler's kernel subset (portable
+# across Cranelift CPU and Metal GPU KIR).
+
+# Per-head RMSNorm over a flat vector of heads [N = heads * DH], sharing
+# per-head weight w[DH]. Used for attn_q_norm and attn_k_norm.
+@ public
+kernel rmsnorm_heads<size N, size DH>(tensor<f32, [N]> x, tensor<f32, [DH]> w, mut tensor<f32, [N]> out, f32 eps) → void {
+    let i32 dh ← DH ↦ i32 ⊥ 1
+
+    for from x at [j] thread lane let v {
+        if dh ≥ 1 and dh ≤ 960 and j ∈ 0 … 16777215 {
+            let i32 jj ← j ∧ 16777215
+            let i32 d ← jj % dh
+            let i32 base ← jj - d
+            mut f32 acc ← 0.0
+
+            for range 0 ‥ dh let k {
+                let f32 xv ← x[[base + k]]
+                acc ← acc + xv * xv
+            }
+
+            let f32 inv ← 1.0 / (√ (acc / (dh ↦ f32) + eps))
+            out[[j]] ← v * inv * w[[d]]
+        }
+    }
+}
+
+# Row softmax with per-head learnable softmax_offset / attn_sinks[H]:
+#   m = max(rsink[h], max_k rsi[h, k])
+#   denom = exp(rsink[h] - m) + sum_k exp(rsi[h, k] - m)
+#   rso[h, c] = exp(rsi[h, c] - m) / denom
+@ public
+kernel row_softmax_sink<size H, size C>(tensor<f32, [H, C]> rsi, tensor<f32, [H]> rsink, mut tensor<f32, [H, C]> rso) → void {
+    for from rsi at [h, c] thread lane let s {
+        let f32 sink_logit ← rsink[[h]]
+        mut f32 m ← sink_logit
+
+        for range 0 ‥ C let k {
+            let f32 sk ← rsi[[h, k]]
+            if sk ≻ m {
+                m ← sk
+            }
+        }
+
+        mut f32 denom ← (sink_logit - m).exp()
+
+        for range 0 ‥ C let k {
+            denom ← denom + (rsi[[h, k]] - m).exp()
+        }
+
+        rso[[h, c]] ← (s - m).exp() / denom
+    }
+}
+
+# MoE top-K router selection (indices + raw top-K logits).
+# Ties break to the lowest expert index.
+@ public
+kernel moe_topk_indices<size E, size K>(tensor<f32, [E]> logits, mut tensor<i32, [K]> idx_out, mut tensor<f32, [K]> val_out) → void {
+    for from idx_out at [k] thread lane let ? {
+        mut f32 pv ← 3.4028235e38
+        mut i32 pf ← -1
+
+        for range 0 … k let rank {
+            mut f32 best ← -3.4028235e38
+            mut i32 bi ← -1
+
+            for range 0 ‥ E let e {
+                let f32 v ← logits[[e]]
+                if v ≺ pv or (v ≡ pv and e ≻ pf) {
+                    if bi ≺ 0 or v ≻ best {
+                        best ← v
+                        bi ← e
+                    }
+                }
+            }
+
+            pv ← best
+            pf ← bi
+        }
+
+        idx_out[[k]] ← pf
+        val_out[[k]] ← pv
+    }
+}
+
+# Softmax renormalization over the selected top-K expert logits.
+@ public
+kernel moe_renorm_weights<size K>(tensor<f32, [K]> val_in, mut tensor<f32, [K]> weight_out) → void {
+    for from weight_out at [k] thread lane let ? {
+        mut f32 m ← val_in[[0]]
+
+        for range 1 ‥ K let r {
+            let f32 vr ← val_in[[r]]
+            if vr ≻ m {
+                m ← vr
+            }
+        }
+
+        mut f32 denom ← 0.0
+
+        for range 0 ‥ K let r {
+            denom ← denom + (val_in[[r]] - m).exp()
+        }
+
+        weight_out[[k]] ← (val_in[[k]] - m).exp() / denom
+    }
+}
+
+# MoE routed expert gate+up projection + SwiGLU activation for selected experts.
+# `wg` and `wu` are packed 2D `[E * F, D]` so indexing stays 2D and i64-free.
+@ public
+kernel moe_experts_gate_up_swiglu<size EF, size K, size D, size F>(tensor<f32, [EF, D]> wg, tensor<f32, [EF, D]> wu, tensor<f32, [D]> x, tensor<i32, [K]> idx, mut tensor<f32, [K, F]> act_out) → void {
+    let i32 f_dim ← F ↦ i32 ⊥ 1
+    let i32 d_dim ← D ↦ i32 ⊥ 1
+    let i32 ef_dim ← EF ↦ i32 ⊥ 1
+
+    for from act_out at [k, f] thread lane let ? {
+        let i32 e ← idx[[k]]
+        if e ∈ 0 … 1023 and f ∈ 0 … 16383 and f_dim ∈ 1 … 16383 and d_dim ∈ 1 … 16383 {
+            let i32 ee ← e ∧ 1023
+            let i32 ff ← f ∧ 16383
+            let i32 fd ← f_dim ∧ 16383
+            let i32 dd ← d_dim ∧ 16383
+            let i32 row ← ee * fd + ff
+
+            if row ≺ ef_dim {
+                mut f32 g ← 0.0
+                mut f32 u ← 0.0
+
+                for range 0 ‥ dd let j {
+                    let i32 jj ← j ∧ 16383
+                    let f32 xj ← x[[jj]]
+                    g ← g + wg[[row, jj]] * xj
+                    u ← u + wu[[row, jj]] * xj
+                }
+
+                act_out[[k, f]] ← g / (1.0 + (-g).exp()) * u
+            }
+            else {
+                act_out[[k, f]] ← 0.0
+            }
+        }
+        else {
+            act_out[[k, f]] ← 0.0
+        }
+    }
+}
+
+# MoE routed expert down-projection and weighted sum across selected experts.
+# `wd` is packed 2D `[E * D, F]` so indexing stays 2D and i64-free.
+@ public
+kernel moe_experts_down_accum<size ED, size K, size D, size F>(tensor<f32, [ED, F]> wd, tensor<f32, [K, F]> act, tensor<i32, [K]> idx, tensor<f32, [K]> weight, mut tensor<f32, [D]> out) → void {
+    let i32 d_dim ← D ↦ i32 ⊥ 1
+    let i32 f_dim ← F ↦ i32 ⊥ 1
+    let i32 ed_dim ← ED ↦ i32 ⊥ 1
+
+    for from out at [d] thread lane let ? {
+        mut f32 acc ← 0.0
+
+        if d ∈ 0 … 16383 and d_dim ∈ 1 … 16383 and f_dim ∈ 1 … 16383 {
+            let i32 dd ← d ∧ 16383
+            let i32 dstride ← d_dim ∧ 16383
+            let i32 fstride ← f_dim ∧ 16383
+
+            for range 0 ‥ K let k {
+                let i32 e ← idx[[k]]
+                if e ∈ 0 … 1023 {
+                    let i32 ee ← e ∧ 1023
+                    let i32 row ← ee * dstride + dd
+                    if row ≺ ed_dim {
+                        mut f32 dot ← 0.0
+
+                        for range 0 ‥ fstride let f {
+                            let i32 ff ← f ∧ 16383
+                            dot ← dot + wd[[row, ff]] * act[[k, ff]]
+                        }
+
+                        acc ← acc + weight[[k]] * dot
+                    }
+                }
+            }
+        }
+
+        out[[d]] ← acc
+    }
+}
+
+# Gated residual/shared-expert combine: out[d] = a[d] + sigmoid(gate[0]) * b[d].
+@ public
+kernel sigmoid_gate_add<size D>(tensor<f32, [D]> a, tensor<f32, [D]> b, tensor<f32, [1]> gate_logit, mut tensor<f32, [D]> out) → void {
+    let f32 g ← 1.0 / (1.0 + (-gate_logit[[0]]).exp())
+    for from a at [d] thread lane let av {
+        out[[d]] ← av + g * b[[d]]
+    }
+}
+
+# Sectional half-split RoPE over flat heads [N = heads * head_dim].
+# Rotates the first `2 * active_pairs` dims of each head (where
+# `active_pairs = sum(sections[0..4])`, e.g. [11, 11, 10, 0] -> 32 pairs = 64 dims)
+# and passes through trailing dimensions unchanged.
+@ public
+kernel rope_sectional<size N>(tensor<f32, [N]> rx, mut tensor<f32, [N]> ro, i32 pos, i32 head_dim, tensor<i32, [4]> sections, f32 lntheta) → void {
+    let i32 active_pairs ← sections[[0]] + sections[[1]] + sections[[2]] + sections[[3]]
+    let i32 rdims ← 2 * active_pairs
+
+    for from rx at [j] thread lane let v {
+        if head_dim ≥ 1 and head_dim ≤ 960 and active_pairs ≥ 0 and rdims ≤ head_dim and j ∈ 0 … 16777215 {
+            let i32 jv ← j ∧ 16777215
+            let i32 jj ← jv % head_dim
+            let i32 base ← jv - jj
+
+            if jj ≥ rdims or active_pairs ≤ 0 {
+                ro[[j]] ← v
+            }
+            else {
+                let i32 hf ← active_pairs
+                if hf ≥ 1 and hf ≤ 480 {
+                    let i32 p ← jj % hf
+                    let f32 freq ← (-(p ↦ f32) / (hf ↦ f32) * lntheta).exp()
+                    let f32 ang ← (pos ↦ f32) * freq
+                    let f32 c ← ang.cos()
+                    let f32 s ← ang.sin()
+
+                    if jj ≺ hf {
+                        ro[[j]] ← v * c - rx[[base + jj + hf]] * s
+                    }
+                    else {
+                        ro[[j]] ← rx[[base + jj - hf]] * s + v * c
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+# Copy a contiguous slice `src[offset .. offset + DST]` into `dst[DST]`.
+@ public
+kernel copy_slice<size SRC, size DST>(tensor<f32, [SRC]> src, mut tensor<f32, [DST]> dst, i32 offset) → void {
+    for from dst at [j] thread lane let ? {
+        if offset ≥ 0 and offset ≤ 16777215 and j ∈ 0 … 16777215 {
+            dst[[j]] ← src[[offset + (j ∧ 16777215)]]
+        }
+    }
+}
+
+# Split fused QKV projection [QD + KD + VD] into q[QD], k[KD], v[VD].
+@ public
+fn split_qkv<size QKV, size QD, size KD, size VD>(tensor<f32, [QKV]> qkv, mut tensor<f32, [QD]> q, mut tensor<f32, [KD]> k, mut tensor<f32, [VD]> v) → void {
+    let i32 qd ← QD ↦ i32 ⊥ 0
+    let i32 kd ← KD ↦ i32 ⊥ 0
+    copy_slice<size QKV, size QD>(qkv, mut q, 0)
+    copy_slice<size QKV, size KD>(qkv, mut k, qd)
+    copy_slice<size QKV, size VD>(qkv, mut v, qd + kd)
+}
+
+# Portable rolling conv-state shift+write over ConvStateArena buffer [ConvRows, ConvCh].
+@ public
+kernel conv_shift_write_row<size ConvRows, size ConvCh>(tensor<f32, [ConvRows, ConvCh]> src, mut tensor<f32, [ConvRows, ConvCh]> dst, tensor<f32, [ConvCh]> new_row, i32 site_idx, i32 history_len) → void {
+    for from dst at [r, c] thread lane let ? {
+        if site_idx ∈ 0 … 1023 and history_len ∈ 1 … 63 and r ∈ 0 … 65535 and c ∈ 0 … 65535 {
+            let i32 ri ← r ∧ 65535
+            let i32 ci ← c ∧ 65535
+            let i32 sidx ← site_idx ∧ 1023
+            let i32 hlen ← history_len ∧ 63
+            let i32 site_start ← sidx * hlen
+            let i32 site_end ← site_start + hlen
+
+            if ri ≥ site_start and ri ≺ site_end - 1 {
+                dst[[r, c]] ← src[[ri + 1, ci]]
+            }
+            elif ri ≡ site_end - 1 {
+                dst[[r, c]] ← new_row[[ci]]
+            }
+            else {
+                dst[[r, c]] ← src[[r, c]]
+            }
+        }
+    }
+}
+
+# Causal 1D ShortConv dot + SiLU over ConvStateArena buffer [ConvRows, ConvCh]
+# and incoming row `new_row[ConvCh]`, using history_len = K - 1 prior rows at
+# `site_idx * history_len`.
+@ public
+kernel conv_dot_silu<size ConvRows, size ConvCh, size K>(tensor<f32, [ConvRows, ConvCh]> conv_buf, tensor<f32, [ConvCh]> new_row, tensor<f32, [ConvCh, K]> conv_w, mut tensor<f32, [ConvCh]> out, i32 site_idx, i32 history_len) → void {
+    let i32 k_taps ← K ↦ i32 ⊥ 1
+    let i32 conv_rows ← ConvRows ↦ i32 ⊥ 0
+
+    for from out at [ch] thread lane let ? {
+        if site_idx ∈ 0 … 1023 and history_len ∈ 0 … 63 and history_len + 1 ≡ k_taps {
+            let i32 sidx ← site_idx ∧ 1023
+            let i32 hlen ← history_len ∧ 63
+            let i32 site_start ← sidx * hlen
+            if site_start + hlen ≤ conv_rows {
+                mut f32 acc ← new_row[[ch]] * conv_w[[ch, hlen]]
+
+                for range 0 ‥ hlen let tap {
+                    let i32 tt ← tap ∧ 63
+                    acc ← acc + conv_buf[[site_start + tt, ch]] * conv_w[[ch, tt]]
+                }
+
+                out[[ch]] ← acc / (1.0 + (-acc).exp())
+            }
+        }
+    }
+}
+
+# L2-normalize and head-repeat a slice of `conv_out[ConvCh]` starting at
+# `offset` into `out[VQD]` (`group_heads` source heads of width `key_dim`).
+@ public
+kernel l2norm_repeat_slice<size ConvCh, size VQD>(tensor<f32, [ConvCh]> conv_out, mut tensor<f32, [VQD]> out, i32 offset, i32 group_heads, i32 key_dim, f32 eps) → void {
+    for from out at [j] thread lane let ? {
+        if offset ≥ 0 and offset ≤ 16777215 and group_heads ≥ 1 and group_heads ≤ 1024 and key_dim ≥ 1 and key_dim ≤ 960 and j ∈ 0 … 16777215 {
+            let i32 jj ← j ∧ 16777215
+            let i32 vh ← jj / key_dim
+            let i32 d ← jj % key_dim
+            let i32 src_h ← vh % group_heads
+            let i32 base ← offset + src_h * key_dim
+            mut f32 acc ← 0.0
+
+            for range 0 ‥ key_dim let kk {
+                let f32 val ← conv_out[[base + kk]]
+                acc ← acc + val * val
+            }
+
+            let f32 norm ← √ acc
+            let f32 scale ← norm ≺ eps ✓ 1.0 / eps ✗ 1.0 / norm
+            out[[j]] ← conv_out[[base + d]] * scale
+        }
+    }
+}
+
+
+# Compute Gated DeltaNet decay = exp(softplus(alpha + dt_bias) * a_row) and
+# beta = sigmoid(beta_raw) per value head [VH].
+@ public
+kernel deltanet_gates<size VH>(tensor<f32, [VH]> alpha, tensor<f32, [VH]> dt_bias, tensor<f32, [VH]> a_row, tensor<f32, [VH]> beta_raw, mut tensor<f32, [VH]> decay_out, mut tensor<f32, [VH]> beta_out) → void {
+    for from decay_out at [h] thread lane let ? {
+        let f32 b ← beta_raw[[h]]
+        beta_out[[h]] ← 1.0 / (1.0 + (-b).exp())
+        let f32 ab ← alpha[[h]] + dt_bias[[h]]
+        let f32 sp ← ab ≻ 20.0 ✓ ab ✗ (1.0 + ab.exp()).ln()
+        decay_out[[h]] ← (sp * a_row[[h]]).exp()
+    }
+}
+
+# Gated DeltaNet state recurrence over RecurrentStateArena tensor [RecRows, RecCols],
+# where RecRows = VH * RecCols and RecCols = key_dim = value_dim:
+#   decayed = prev_state * decay[h]
+#   delta[h, j] = (v[r] - dot(decayed[r, :], k[h, :])) * beta[h]
+#   next_state[r, i] = decayed[r, i] + k[h, i] * delta[h, j]
+@ public
+kernel delta_net_update<size RecRows, size RecCols, size VH>(tensor<f32, [RecRows, RecCols]> prev_state, tensor<f32, [RecRows]> k, tensor<f32, [RecRows]> v, tensor<f32, [VH]> decay, tensor<f32, [VH]> beta, mut tensor<f32, [RecRows, RecCols]> next_state) → void {
+    let i32 dim ← RecCols ↦ i32 ⊥ 1
+
+    for from next_state at [r, i] thread lane let ? {
+        if dim ≥ 1 and dim ≤ 960 and r ∈ 0 … 16777215 {
+            let i32 rr ← r ∧ 16777215
+            let i32 h ← rr / dim
+            if h ∈ 0 … 4095 {
+                let i32 hh ← h ∧ 4095
+                let i32 hbase ← hh * dim
+                let f32 dec_h ← decay[[hh]]
+                let f32 beta_h ← beta[[hh]]
+                mut f32 dot_k ← 0.0
+
+                for range 0 ‥ dim let kk {
+                    dot_k ← dot_k + prev_state[[rr, kk]] * dec_h * k[[hbase + kk]]
+                }
+
+                let f32 delta_rj ← (v[[rr]] - dot_k) * beta_h
+                next_state[[r, i]] ← prev_state[[r, i]] * dec_h + k[[hbase + i]] * delta_rj
+            }
+        }
+    }
+}
+
+# Gated DeltaNet readout from updated RecurrentStateArena tensor [RecRows, RecCols]:
+#   out[r] = dot(state[r, :], q[h, :]) / sqrt(RecCols)
+@ public
+kernel delta_net_readout<size RecRows, size RecCols>(tensor<f32, [RecRows, RecCols]> state, tensor<f32, [RecRows]> q, mut tensor<f32, [RecRows]> out) → void {
+    let i32 dim ← RecCols ↦ i32 ⊥ 1
+
+    for from out at [r] thread lane let ? {
+        if dim ≥ 1 and dim ≤ 960 and r ∈ 0 … 16777215 {
+            let i32 rr ← r ∧ 16777215
+            let i32 h ← rr / dim
+            if h ∈ 0 … 4095 {
+                let i32 hh ← h ∧ 4095
+                let i32 hbase ← hh * dim
+                mut f32 acc ← 0.0
+
+                for range 0 ‥ dim let i {
+                    acc ← acc + state[[rr, i]] * q[[hbase + i]]
+                }
+
+                let f32 scale ← 1.0 / (√ (dim ↦ f32))
+                out[[r]] ← acc * scale
+            }
+        }
+    }
+}
+
+# Z-gated per-head RMSNorm: out[j] = rmsnorm_head(core, w)[j] * silu(z[j]).
+@ public
+kernel z_gated_rmsnorm<size N, size DH>(tensor<f32, [N]> core, tensor<f32, [N]> z, tensor<f32, [DH]> w, mut tensor<f32, [N]> out, f32 eps) → void {
+    let i32 dh ← DH ↦ i32 ⊥ 1
+
+    for from core at [j] thread lane let v {
+        if dh ≥ 1 and dh ≤ 960 and j ∈ 0 … 16777215 {
+            let i32 jj ← j ∧ 16777215
+            let i32 d ← jj % dh
+            let i32 base ← jj - d
+            mut f32 acc ← 0.0
+
+            for range 0 ‥ dh let k {
+                let f32 cv ← core[[base + k]]
+                acc ← acc + cv * cv
+            }
+
+            let f32 inv ← 1.0 / (√ (acc / (dh ↦ f32) + eps))
+            let f32 zv ← z[[j]]
+            let f32 silu_z ← zv / (1.0 + (-zv).exp())
+            out[[j]] ← v * inv * w[[d]] * silu_z
+        }
+    }
+}
+
++++ faber test
+import from "gradus:decode_hybrid_kernels" let dhk
+
+fn close(f32 a, f32 b) → bool {
+    return (a - b).abs() ≺ 0.0001
+}
+
+test "decode_hybrid_kernels rmsnorm_heads normalises each head with shared weight" {
+    mut tensor<f32, [4]> x ← tf32[4] {}
+    mut tensor<f32, [2]> w ← tf32[2] {}
+    mut tensor<f32, [4]> out ← tf32[4] {}
+    x[[0]] ← 3.0
+    x[[1]] ← 4.0
+    x[[2]] ← 1.0
+    x[[3]] ← 1.0
+    w[[0]] ← 1.0
+    w[[1]] ← 2.0
+    dhk.rmsnorm_heads(x, w, mut out, 0.0)
+    # head 0: mean(9+16)/2 = 12.5, inv = 1/sqrt(12.5) = 0.2828427
+    assert close(out[[0]], 0.8485281)
+    assert close(out[[1]], 2.2627417)
+    # head 1: [1, 1], rms = 1.0
+    assert close(out[[2]], 1.0)
+    assert close(out[[3]], 2.0)
+}
+
+test "decode_hybrid_kernels row_softmax_sink includes per-head sink in denominator" {
+    mut tensor<f32, [2, 2]> sc ← tf32[2, 2] {}
+    mut tensor<f32, [2]> sink ← tf32[2] {}
+    mut tensor<f32, [2, 2]> pr ← tf32[2, 2] {}
+    sc[[0, 0]] ← 0.0
+    sc[[0, 1]] ← 0.0
+    sink[[0]] ← 0.0
+    # head 0: exp(0) / (1 + 1 + 1) = 1/3
+    sc[[1, 0]] ← 1.0
+    sc[[1, 1]] ← 1.0
+    sink[[1]] ← 1.0
+    # head 1: exp(1) / (e + e + e) = 1/3
+    dhk.row_softmax_sink(sc, sink, mut pr)
+    assert close(pr[[0, 0]], 0.3333333)
+    assert close(pr[[0, 1]], 0.3333333)
+    assert close(pr[[1, 0]], 0.3333333)
+    assert close(pr[[1, 1]], 0.3333333)
+}
+
+test "decode_hybrid_kernels rope_sectional rotates active sections and passes through trailing dims" {
+    mut tensor<f32, [8]> x ← tf32[8] {}
+    mut tensor<f32, [8]> out ← tf32[8] {}
+    mut tensor<i32, [4]> sec ← tensor<i32, [4]> {}
+    # 2 heads of head_dim 4; active_pairs = 1 -> rdims = 2, trailing 2 dims pass through.
+    sec[[0]] ← 1
+    sec[[1]] ← 0
+    sec[[2]] ← 0
+    sec[[3]] ← 0
+    x[[0]] ← 1.0
+    x[[1]] ← 2.0
+    x[[2]] ← 7.0
+    x[[3]] ← 8.0
+    x[[4]] ← 1.0
+    x[[5]] ← 2.0
+    x[[6]] ← 9.0
+    x[[7]] ← 10.0
+    dhk.rope_sectional(x, mut out, 1, 4, sec, 0.0)
+    # angle = 1, active pair (1, 2) -> (cos(1)-2*sin(1), sin(1)+2*cos(1))
+    assert close(out[[0]], -1.1426397)
+    assert close(out[[1]], 1.9220756)
+    assert close(out[[2]], 7.0)
+    assert close(out[[3]], 8.0)
+    assert close(out[[4]], -1.1426397)
+    assert close(out[[5]], 1.9220756)
+    assert close(out[[6]], 9.0)
+    assert close(out[[7]], 10.0)
+}
+
+test "decode_hybrid_kernels split_qkv splits fused QKV projection" {
+    mut tensor<f32, [6]> qkv ← tf32[6] {}
+    mut tensor<f32, [2]> q ← tf32[2] {}
+    mut tensor<f32, [2]> k ← tf32[2] {}
+    mut tensor<f32, [2]> v ← tf32[2] {}
+    for range 0‥6 let i {
+        qkv[[i]] ← (i + 1) ↦ f32
+    }
+    dhk.split_qkv(qkv, mut q, mut k, mut v)
+    assert close(q[[0]], 1.0)
+    assert close(q[[1]], 2.0)
+    assert close(k[[0]], 3.0)
+    assert close(k[[1]], 4.0)
+    assert close(v[[0]], 5.0)
+    assert close(v[[1]], 6.0)
+}
+
+test "decode_hybrid_kernels conv_dot_silu computes causal 1D conv + SiLU" {
+    # 1 site, history_len = 3 (K = 4 taps), 2 channels
+    mut tensor<f32, [3, 2]> buf ← tf32[3, 2] {}
+    mut tensor<f32, [2]> row ← tf32[2] {}
+    mut tensor<f32, [2, 4]> w ← tf32[2, 4] {}
+    mut tensor<f32, [2]> out ← tf32[2] {}
+    buf[[0, 0]] ← 1.0
+    buf[[1, 0]] ← 2.0
+    buf[[2, 0]] ← 3.0
+    row[[0]] ← 4.0
+    w[[0, 0]] ← 0.1
+    w[[0, 1]] ← 0.2
+    w[[0, 2]] ← 0.3
+    w[[0, 3]] ← 0.4
+    # ch 0 dot = 1*0.1 + 2*0.2 + 3*0.3 + 4*0.4 = 3.0; silu(3.0) = 3 / (1 + exp(-3)) = 2.8577224
+    dhk.conv_dot_silu(buf, row, w, mut out, 0, 3)
+    assert close(out[[0]], 2.8577224)
+    assert close(out[[1]], 0.0)
+}
+
+test "decode_hybrid_kernels delta_net_update and readout match DeltaNet recurrence" {
+    # 2 value heads, dim = 2 -> RecRows = 4, RecCols = 2
+    mut tensor<f32, [4, 2]> st ← tf32[4, 2] {}
+    mut tensor<f32, [4, 2]> next_st ← tf32[4, 2] {}
+    mut tensor<f32, [4]> q ← tf32[4] {}
+    mut tensor<f32, [4]> k ← tf32[4] {}
+    mut tensor<f32, [4]> v ← tf32[4] {}
+    mut tensor<f32, [2]> decay ← tf32[2] {}
+    mut tensor<f32, [2]> beta ← tf32[2] {}
+    mut tensor<f32, [4]> out ← tf32[4] {}
+    decay[[0]] ← 1.0
+    decay[[1]] ← 0.5
+    beta[[0]] ← 1.0
+    beta[[1]] ← 1.0
+    k[[0]] ← 1.0
+    v[[0]] ← 2.0
+    q[[0]] ← 1.0
+    # head 0: prev=0 -> delta[0]=(2-0)*1=2 -> next[0,0]=2 -> out[0]=2/sqrt(2)=1.4142136
+    dhk.delta_net_update(st, k, v, decay, beta, mut next_st)
+    dhk.delta_net_readout(next_st, q, mut out)
+    assert close(next_st[[0, 0]], 2.0)
+    assert close(out[[0]], 1.4142136)
+    assert close(out[[1]], 0.0)
+}
+
+test "decode_hybrid_kernels moe_topk_indices and renorm_weights select top-K" {
+    mut tensor<f32, [4]> logits ← tf32[4] {}
+    mut tensor<i32, [2]> idx ← tensor<i32, [2]> {}
+    mut tensor<f32, [2]> vals ← tf32[2] {}
+    mut tensor<f32, [2]> weights ← tf32[2] {}
+    logits[[0]] ← 0.1
+    logits[[1]] ← 2.0
+    logits[[2]] ← 1.0
+    logits[[3]] ← -1.0
+    dhk.moe_topk_indices(logits, mut idx, mut vals)
+    dhk.moe_renorm_weights(vals, mut weights)
+    assert idx[[0]] ≡ 1
+    assert idx[[1]] ≡ 2
+    assert close(weights[[0]], 0.7310586)
+    assert close(weights[[1]], 0.2689414)
+}
