@@ -24,6 +24,8 @@ locale = "en"
 # Reserved hook points for Inkling Slice C: `LoopedSegment` and
 # `ResidualKind.AttnRes`.
 
+import from "gradus:model/config" let cfg
+
 @ public
 union ScheduleError {
     @ shared
@@ -90,6 +92,8 @@ class LayerSpec {
     let AttentionKind attention
     let RopeKind rope
     let FfnKind ffn
+    let int conv_sites = 0
+    let int conv_kernel = 0
 }
 
 @ public
@@ -104,12 +108,16 @@ class PatternedSegment {
     let int end_layer
 }
 
-# Reserved for Inkling Slice C cross-pass looping.
+# Cross-pass looping segment (Inkling Slice C / VarLoop).
 @ public
 class LoopedSegment {
     let int start_layer
     let int end_layer
     let int pass_count
+    let bool reset_to_prelude = false
+    let int gate_rank = 0
+    let bool is_varloop = false
+    let int max_passes = 0
 }
 
 @ public
@@ -133,6 +141,9 @@ class ExecutionStep {
     let AttentionKind attention
     let RopeKind rope
     let FfnKind ffn
+    let int pass_index = 0
+    let bool resets_to_prelude = false
+    let bool uses_cross_pass = false
 }
 
 @ public
@@ -140,6 +151,8 @@ class SlotSpec {
     let int slot_id
     let int physical_layer_id
     let ArenaKind arena
+    let int conv_sites = 0
+    let int conv_kernel = 0
 }
 
 @ public
@@ -175,6 +188,8 @@ fn arena_for_attention(AttentionKind attn) → ArenaKind {
 
 fn validate_layer(LayerSpec layer, int expected_id) → bool ⇥ ScheduleError {
     require layer.physical_layer_id ≡ expected_id throw variant InvalidLayer { message = "physical_layer_id mismatch at layer §"(expected_id ↦ string) }
+    require layer.conv_sites ≥ 0 throw variant InvalidLayer { message = "conv_sites must be non-negative at layer §"(expected_id ↦ string) }
+    require layer.conv_kernel ≥ 0 throw variant InvalidLayer { message = "conv_kernel must be non-negative at layer §"(expected_id ↦ string) }
 
     match layer.attention {
         case SlidingWindow let w {
@@ -197,10 +212,22 @@ fn validate_layer(LayerSpec layer, int expected_id) → bool ⇥ ScheduleError {
     return true
 }
 
-fn segment_bounds(ScheduleSegment seg, int layer_count) → list<int> ⇥ ScheduleError {
+class SegmentInfo {
+    let int start
+    let int end
+    let int passes
+    let bool is_looped
+    let bool reset_to_prelude
+    let int gate_rank
+}
+
+fn segment_info(ScheduleSegment seg, int layer_count) → SegmentInfo ⇥ ScheduleError {
     mut int start ← 0
     mut int end ← 0
     mut int passes ← 1
+    mut bool is_looped ← false
+    mut bool reset_to_prelude ← false
+    mut int gate_rank ← 0
 
     match seg {
         case Linear let s {
@@ -215,13 +242,20 @@ fn segment_bounds(ScheduleSegment seg, int layer_count) → list<int> ⇥ Schedu
             start ← s.start_layer
             end ← s.end_layer
             passes ← s.pass_count
+            is_looped ← true
+            reset_to_prelude ← s.reset_to_prelude
+            gate_rank ← s.gate_rank
             require passes ≥ 1 throw variant InvalidSegment { message = "looped segment pass_count must be at least 1" }
+            require s.gate_rank ≥ 0 throw variant InvalidSegment { message = "looped segment gate_rank must be non-negative" }
+            if s.max_passes ≻ 0 {
+                require s.max_passes ≥ passes throw variant InvalidSegment { message = "looped segment max_passes must be >= pass_count" }
+            }
         }
     }
 
     require start ≥ 0 and start ≺ end and end ≤ layer_count throw variant InvalidSegment { message = "segment bounds [§..§) invalid for § layers"(start ↦ string, end ↦ string, layer_count ↦ string) }
 
-    return [start, end, passes]
+    return SegmentInfo { start = start, end = end, passes = passes, is_looped = is_looped, reset_to_prelude = reset_to_prelude, gate_rank = gate_rank }
 }
 
 # -------------------------------------------------------------------------
@@ -244,10 +278,10 @@ fn build_schedule(list<LayerSpec> layers, list<ScheduleSegment> segments, Residu
     mut int next_slot ← 0
 
     for from segments let seg {
-        let list<int> bounds ← segment_bounds(seg, layers.length())
-        let int start ← bounds[0]
-        let int end ← bounds[1]
-        let int passes ← bounds[2]
+        let SegmentInfo info ← segment_info(seg, layers.length())
+        let int start ← info.start
+        let int end ← info.end
+        let int passes ← info.passes
 
         for range 0 ‥ passes let pass_idx {
             for range start ‥ end let phys {
@@ -255,8 +289,10 @@ fn build_schedule(list<LayerSpec> layers, list<ScheduleSegment> segments, Residu
                 let ArenaKind arena ← arena_for_attention(layer.attention)
                 let int slot_id ← next_slot
                 next_slot ↑
-                slots.append(SlotSpec { slot_id = slot_id, physical_layer_id = phys, arena = arena })
-                steps.append(ExecutionStep { visit_id = next_visit, physical_layer_id = phys, slot_id = slot_id, attention = layer.attention, rope = layer.rope, ffn = layer.ffn })
+                let bool resets ← info.is_looped and info.reset_to_prelude and pass_idx ≻ 0 and phys ≡ start
+                let bool cross_pass ← info.is_looped and pass_idx ≻ 0
+                slots.append(SlotSpec { slot_id = slot_id, physical_layer_id = phys, arena = arena, conv_sites = layer.conv_sites, conv_kernel = layer.conv_kernel })
+                steps.append(ExecutionStep { visit_id = next_visit, physical_layer_id = phys, slot_id = slot_id, attention = layer.attention, rope = layer.rope, ffn = layer.ffn, pass_index = pass_idx, resets_to_prelude = resets, uses_cross_pass = cross_pass })
                 next_visit ↑
             }
         }
@@ -306,19 +342,25 @@ fn interval_hybrid_schedule(int block_count, int nextn_predict_layers, int full_
     for range 0 ‥ block_count let b {
         mut AttentionKind attn ← variant LinearSsm
         mut RopeKind rope ← variant None
+        mut int conv_sites ← 1
+        mut int conv_kernel ← 4
 
         if b ≥ trunk {
             attn ← variant Nextn
             rope ← full_rope
+            conv_sites ← 0
+            conv_kernel ← 0
         }
         else {
             if (b + 1) % full_attention_interval ≡ 0 {
                 attn ← variant Full
                 rope ← full_rope
+                conv_sites ← 0
+                conv_kernel ← 0
             }
         }
 
-        layers.append(LayerSpec { physical_layer_id = b, attention = attn, rope = rope, ffn = ffn })
+        layers.append(LayerSpec { physical_layer_id = b, attention = attn, rope = rope, ffn = ffn, conv_sites = conv_sites, conv_kernel = conv_kernel })
     }
 
     let list<ScheduleSegment> segs ← [variant Patterned { seg = PatternedSegment { start_layer = 0, end_layer = block_count } }]
@@ -351,6 +393,148 @@ fn patterned_schedule(list<AttentionKind> layer_types, list<RopeKind> rope_patte
 
     let list<ScheduleSegment> segs ← [variant Patterned { seg = PatternedSegment { start_layer = 0, end_layer = n } }]
     return build_schedule(layers, segs, variant ResidualKind.Standard, taps)
+}
+
+# Inkling looped schedule: prelude [0..prelude_layers), looped core
+# [prelude_layers..prelude_layers + loop_layers) repeated `pass_count` times
+# with reset_to_prelude, followed by coda [prelude_layers + loop_layers..total).
+@ public
+fn inkling_schedule(int prelude_layers, int loop_layers, int coda_layers, int pass_count, int gate_rank, bool is_varloop, int max_passes, int conv_sites, int conv_kernel, list<TapBuffer> taps) → ExecutionSchedule ⇥ ScheduleError {
+    require prelude_layers ≥ 1 throw variant InvalidConfig { message = "inkling schedule requires at least 1 prelude layer" }
+    require loop_layers ≥ 1 throw variant InvalidConfig { message = "inkling schedule requires at least 1 loop layer" }
+    require coda_layers ≥ 1 throw variant InvalidConfig { message = "inkling schedule requires at least 1 coda layer" }
+    require pass_count ≥ 1 throw variant InvalidConfig { message = "inkling schedule requires pass_count >= 1" }
+    require gate_rank ≥ 0 throw variant InvalidConfig { message = "inkling schedule requires gate_rank >= 0" }
+    require conv_sites ≥ 0 throw variant InvalidConfig { message = "inkling schedule requires conv_sites >= 0" }
+    require conv_kernel ≥ 0 throw variant InvalidConfig { message = "inkling schedule requires conv_kernel >= 0" }
+
+    let int total ← prelude_layers + loop_layers + coda_layers
+    mut list<LayerSpec> layers ← empty
+
+    for range 0 ‥ total let i {
+        layers.append(LayerSpec { physical_layer_id = i, attention = variant Full, rope = variant RopeKind.Standard, ffn = variant Dense, conv_sites = conv_sites, conv_kernel = conv_kernel })
+    }
+
+    let int loop_end ← prelude_layers + loop_layers
+    let list<ScheduleSegment> segs ← [
+        variant Linear { seg = LinearSegment { start_layer = 0, end_layer = prelude_layers } },
+        variant Looped { seg = LoopedSegment { start_layer = prelude_layers, end_layer = loop_end, pass_count = pass_count, reset_to_prelude = true, gate_rank = gate_rank, is_varloop = is_varloop, max_passes = max_passes } },
+        variant Linear { seg = LinearSegment { start_layer = loop_end, end_layer = total } }
+    ]
+
+    return build_schedule(layers, segs, variant ResidualKind.AttnRes, taps)
+}
+
+# Inkling-2-Mini default topology: 24 physical layers -> 48 execution visits
+# and 48 distinct isolated state slots (prelude 0..6, 3-pass core 6..18,
+# coda 18..24), AttnRes residual, rank-64 cross-pass gate, 4 conv sites.
+@ public
+fn inkling_2_mini_schedule(list<TapBuffer> taps) → ExecutionSchedule ⇥ ScheduleError {
+    return inkling_schedule(6, 12, 6, 3, 64, false, 3, 4, 4, taps)
+}
+
+# -------------------------------------------------------------------------
+# ModelConfig -> ExecutionSchedule builders
+# -------------------------------------------------------------------------
+
+@ public
+fn dense_from_config(cfg.ModelConfig c, list<TapBuffer> taps) → ExecutionSchedule ⇥ ScheduleError {
+    require c.num_hidden_layers ≥ 1 throw variant InvalidConfig { message = "ModelConfig num_hidden_layers must be at least 1" }
+
+    return dense_schedule(c.num_hidden_layers, variant RopeKind.Standard, variant Dense, taps)
+}
+
+@ public
+fn interval_hybrid_from_config(cfg.ModelConfig c, int nextn_predict_layers, list<int> dimension_sections, FfnKind ffn, list<TapBuffer> taps) → ExecutionSchedule ⇥ ScheduleError {
+    require c.num_hidden_layers ≥ 1 throw variant InvalidConfig { message = "ModelConfig num_hidden_layers must be at least 1" }
+
+    let int interval ← c.full_attention_interval coalesce 0
+    require interval ≥ 1 throw variant InvalidConfig { message = "ModelConfig full_attention_interval must be present and >= 1" }
+
+    mut RopeKind full_rope ← variant RopeKind.Standard
+    if dimension_sections.length() ≥ 1 {
+        full_rope ← variant Sectional { dimension_sections = dimension_sections }
+    }
+
+    return interval_hybrid_schedule(c.num_hidden_layers, nextn_predict_layers, interval, full_rope, ffn, taps)
+}
+
+fn attention_from_layer_type(string kind, int ∪ none sliding_window) → AttentionKind ⇥ ScheduleError {
+    if kind ≡ "full_attention" or kind ≡ "full" {
+        return variant Full
+    }
+    if kind ≡ "sliding_attention" or kind ≡ "sliding_window" {
+        let int w ← sliding_window coalesce 0
+        require w ≥ 1 throw variant InvalidConfig { message = "sliding_attention layer requires positive sliding_window in ModelConfig" }
+        return variant SlidingWindow { window = w }
+    }
+    if kind ≡ "linear_attention" or kind ≡ "linear_ssm" {
+        return variant LinearSsm
+    }
+    if kind ≡ "nextn" {
+        return variant Nextn
+    }
+
+    throw variant InvalidConfig { message = "unsupported ModelConfig layer_type: §"(kind) }
+}
+
+@ public
+fn patterned_from_config(cfg.ModelConfig c, int leading_dense_blocks, list<TapBuffer> taps) → ExecutionSchedule ⇥ ScheduleError {
+    let int n ← c.num_hidden_layers
+    require n ≥ 1 throw variant InvalidConfig { message = "ModelConfig num_hidden_layers must be at least 1" }
+    require c.layer_types.length() ≡ n throw variant InvalidConfig { message = "ModelConfig layer_types length must match num_hidden_layers" }
+
+    let bool has_rope_pattern ← c.rope_pattern.length() ≥ 1
+    if has_rope_pattern {
+        require c.rope_pattern.length() ≡ n throw variant InvalidConfig { message = "ModelConfig rope_pattern length must match num_hidden_layers" }
+    }
+
+    mut list<AttentionKind> attn_list ← empty
+    mut list<RopeKind> rope_list ← empty
+
+    for range 0 ‥ n let i {
+        let AttentionKind attn ← attention_from_layer_type(c.layer_types[i], c.sliding_window)
+        attn_list.append(attn)
+
+        if has_rope_pattern {
+            if c.rope_pattern[i] {
+                rope_list.append(variant RopeKind.Standard)
+            }
+            else {
+                rope_list.append(variant None)
+            }
+        }
+        else {
+            rope_list.append(variant RopeKind.Standard)
+        }
+    }
+
+    return patterned_schedule(attn_list, rope_list, leading_dense_blocks, taps)
+}
+
+@ public
+fn inkling_from_config(cfg.ModelConfig c, int prelude_layers, int loop_layers, int coda_layers, int pass_count, int gate_rank, bool is_varloop, int max_passes, int conv_sites, int conv_kernel, list<TapBuffer> taps) → ExecutionSchedule ⇥ ScheduleError {
+    require c.num_hidden_layers ≡ prelude_layers + loop_layers + coda_layers throw variant InvalidConfig { message = "ModelConfig num_hidden_layers must equal prelude + loop + coda" }
+
+    return inkling_schedule(prelude_layers, loop_layers, coda_layers, pass_count, gate_rank, is_varloop, max_passes, conv_sites, conv_kernel, taps)
+}
+
+@ public
+fn from_model_config(cfg.ModelConfig c, list<TapBuffer> taps) → ExecutionSchedule ⇥ ScheduleError {
+    if c.layer_types.length() ≥ 1 {
+        return patterned_from_config(c, 0, taps)
+    }
+
+    if c.full_attention_interval is int {
+        return interval_hybrid_from_config(c, 0, empty, variant MoE, taps)
+    }
+
+    if c.model_type ≡ "inkling" or c.model_type ≡ "inkling2" {
+        require c.num_hidden_layers ≡ 24 throw variant InvalidConfig { message = "default inkling config dispatch expects 24 layers (use inkling_from_config for custom splits)" }
+        return inkling_2_mini_schedule(taps)
+    }
+
+    return dense_from_config(c, taps)
 }
 
 # -------------------------------------------------------------------------
@@ -451,8 +635,34 @@ fn recurrent_ssm_slot_count(ExecutionSchedule s) → int {
     return n
 }
 
+@ public
+fn slot_conv_sites(ExecutionSchedule s, int slot_id) → int ⇥ ScheduleError {
+    require slot_id ≥ 0 and slot_id ≺ s.slots.length() throw variant InvalidSlot { message = "slot_id outside schedule" }
+
+    return s.slots[slot_id].conv_sites
+}
+
+@ public
+fn slot_conv_kernel(ExecutionSchedule s, int slot_id) → int ⇥ ScheduleError {
+    require slot_id ≥ 0 and slot_id ≺ s.slots.length() throw variant InvalidSlot { message = "slot_id outside schedule" }
+
+    return s.slots[slot_id].conv_kernel
+}
+
+@ public
+fn total_conv_sites(ExecutionSchedule s) → int {
+    mut int total ← 0
+
+    for from s.slots let slot {
+        total ← total + slot.conv_sites
+    }
+
+    return total
+}
+
 +++ faber test
 import from "gradus:model/schedule" sched
+import from "gradus:model/config" let cfg
 
 fn flint_full_indices() → list<int> {
     return [0, 1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41, 45, 48]
@@ -621,4 +831,132 @@ test "Schedule validation fails closed on bad layer counts and out-of-range taps
     assert build_result_dense(0) ≡ "dense schedule requires at least one layer"
     assert build_result_tap(4, "bad") ≡ "tap visit_id 4 outside [0..4)"
     assert build_result_tap(0, "") ≡ "tap buffer name must not be empty"
+}
+
+test "Inkling-2-Mini topology: 24 physical layers -> 48 visits & 48 isolated slots with pass metadata" {
+    do {
+        let list<sched.TapBuffer> taps ← [
+            sched.TapBuffer { name = "prelude_end", visit_id = 5 },
+            sched.TapBuffer { name = "pass1_end", visit_id = 17 },
+            sched.TapBuffer { name = "pass2_end", visit_id = 29 },
+            sched.TapBuffer { name = "loop_end", visit_id = 41 },
+            sched.TapBuffer { name = "coda_end", visit_id = 47 }
+        ]
+        let sched.ExecutionSchedule s ← sched.inkling_2_mini_schedule(taps)
+        assert sched.physical_layer_count(s) ≡ 24
+        assert sched.step_count(s) ≡ 48
+        assert sched.slot_count(s) ≡ 48
+        assert sched.full_kv_slot_count(s) ≡ 48
+        assert sched.total_conv_sites(s) ≡ 48 * 4
+
+        match s.residual {
+            case AttnRes {
+                assert true
+            }
+            default {
+                assert false
+            }
+        }
+
+        # Prelude: visits 0..6 -> physical 0..6, pass_index 0, no reset, no cross_pass
+        let sched.ExecutionStep st5 ← sched.step_at(s, 5)
+        assert st5.physical_layer_id ≡ 5
+        assert st5.slot_id ≡ 5
+        assert st5.pass_index ≡ 0
+        assert st5.resets_to_prelude ≡ false
+        assert st5.uses_cross_pass ≡ false
+
+        # Loop pass 0: visit 6 -> physical 6, pass_index 0
+        let sched.ExecutionStep st6 ← sched.step_at(s, 6)
+        assert st6.physical_layer_id ≡ 6
+        assert st6.slot_id ≡ 6
+        assert st6.pass_index ≡ 0
+        assert st6.resets_to_prelude ≡ false
+        assert st6.uses_cross_pass ≡ false
+
+        # Loop pass 1: visit 18 -> physical 6, pass_index 1, resets_to_prelude = true, uses_cross_pass = true
+        let sched.ExecutionStep st18 ← sched.step_at(s, 18)
+        assert st18.physical_layer_id ≡ 6
+        assert st18.slot_id ≡ 18
+        assert st18.pass_index ≡ 1
+        assert st18.resets_to_prelude ≡ true
+        assert st18.uses_cross_pass ≡ true
+
+        # Loop pass 1 inner layer: visit 19 -> physical 7, pass_index 1, resets_to_prelude = false, uses_cross_pass = true
+        let sched.ExecutionStep st19 ← sched.step_at(s, 19)
+        assert st19.physical_layer_id ≡ 7
+        assert st19.slot_id ≡ 19
+        assert st19.pass_index ≡ 1
+        assert st19.resets_to_prelude ≡ false
+        assert st19.uses_cross_pass ≡ true
+
+        # Loop pass 2: visit 30 -> physical 6, pass_index 2, resets_to_prelude = true, uses_cross_pass = true
+        let sched.ExecutionStep st30 ← sched.step_at(s, 30)
+        assert st30.physical_layer_id ≡ 6
+        assert st30.slot_id ≡ 30
+        assert st30.pass_index ≡ 2
+        assert st30.resets_to_prelude ≡ true
+        assert st30.uses_cross_pass ≡ true
+
+        # Coda: visits 42..48 -> physical 18..24, slot_id 42..48
+        let sched.ExecutionStep st42 ← sched.step_at(s, 42)
+        assert st42.physical_layer_id ≡ 18
+        assert st42.slot_id ≡ 42
+        assert st42.pass_index ≡ 0
+        assert st42.resets_to_prelude ≡ false
+        assert st42.uses_cross_pass ≡ false
+
+        assert sched.slot_conv_sites(s, 0) ≡ 4
+        assert sched.slot_conv_kernel(s, 0) ≡ 4
+    }
+    catch err {
+        assert false
+    }
+}
+
+fn must_parse_cfg(string raw) → cfg.ModelConfig {
+    do {
+        return cfg.parse_json(raw)
+    }
+    catch err {
+        assert false
+        return cfg.ModelConfig { model_type = "", hidden_size = 1, num_hidden_layers = 1, num_attention_heads = 1, num_key_value_heads = 1, head_dim = 1, intermediate_size = 1, vocab_size = 1, max_position_embeddings = 1, rms_norm_eps = (1.0e-5 ∷ f32), rope_theta = (10000.0 ∷ f32), tie_word_embeddings = true, sliding_window = null, full_attention_interval = null, layer_types = empty, rope_pattern = empty, kv_key_bits = 0, kv_value_bits = 0, kv_group_size = 0, quantization = null }
+    }
+}
+
+test "ModelConfig -> ExecutionSchedule builders cover Dense, Interval-Hybrid, Patterned, and Inkling" {
+    let cfg.ModelConfig llama_cfg ← must_parse_cfg("{\"model_type\": \"llama\", \"hidden_size\": 576, \"num_hidden_layers\": 6, \"num_attention_heads\": 9, \"num_key_value_heads\": 3, \"intermediate_size\": 1536, \"vocab_size\": 49152}")
+    let cfg.ModelConfig qwen_cfg ← must_parse_cfg("{\"model_type\": \"qwen3_next\", \"hidden_size\": 256, \"num_hidden_layers\": 8, \"num_attention_heads\": 4, \"num_key_value_heads\": 2, \"intermediate_size\": 512, \"vocab_size\": 1024, \"full_attention_interval\": 4}")
+    let cfg.ModelConfig flint_cfg ← must_parse_cfg("{\"model_type\": \"flint\", \"hidden_size\": 256, \"num_hidden_layers\": 4, \"num_attention_heads\": 4, \"num_key_value_heads\": 2, \"intermediate_size\": 512, \"vocab_size\": 1024, \"sliding_window\": 513, \"layer_types\": [\"full_attention\", \"sliding_attention\", \"sliding_attention\", \"full_attention\"], \"rope_pattern\": [false, true, true, false]}")
+    let cfg.ModelConfig ink_cfg ← must_parse_cfg("{\"model_type\": \"inkling\", \"hidden_size\": 256, \"num_hidden_layers\": 24, \"num_attention_heads\": 4, \"num_key_value_heads\": 2, \"intermediate_size\": 512, \"vocab_size\": 1024}")
+
+    do {
+        # Dense Llama
+        let sched.ExecutionSchedule s_dense ← sched.from_model_config(llama_cfg, empty)
+        assert sched.physical_layer_count(s_dense) ≡ 6
+        assert sched.step_count(s_dense) ≡ 6
+        assert sched.total_conv_sites(s_dense) ≡ 0
+
+        # Qwen3.6 Interval-Hybrid
+        let sched.ExecutionSchedule s_qwen ← sched.interval_hybrid_from_config(qwen_cfg, 0, [11, 11, 10, 0], variant MoE, empty)
+        assert sched.full_kv_slot_count(s_qwen) ≡ 2
+        assert sched.recurrent_ssm_slot_count(s_qwen) ≡ 6
+        assert sched.slot_conv_sites(s_qwen, 0) ≡ 1
+        assert sched.slot_conv_sites(s_qwen, 3) ≡ 0
+        assert sched.total_conv_sites(s_qwen) ≡ 6
+
+        # Flint Patterned
+        let sched.ExecutionSchedule s_flint ← sched.patterned_from_config(flint_cfg, 1, empty)
+        assert sched.full_kv_slot_count(s_flint) ≡ 2
+        assert sched.ring_kv_slot_count(s_flint) ≡ 2
+
+        # Inkling-2-Mini via from_model_config
+        let sched.ExecutionSchedule s_ink ← sched.from_model_config(ink_cfg, empty)
+        assert sched.physical_layer_count(s_ink) ≡ 24
+        assert sched.step_count(s_ink) ≡ 48
+        assert sched.slot_count(s_ink) ≡ 48
+    }
+    catch err {
+        assert false
+    }
 }
