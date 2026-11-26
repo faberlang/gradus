@@ -136,6 +136,69 @@ kernel rope_pairs<size N>(tensor<f32, [N]> rpx, mut tensor<f32, [N]> rpo, i32 rp
     }
 }
 
+# Precompute [P] RoPE cosine and sine tables at position `rtpos` once per token
+# so Q and K head rotations share trig across all heads.
+@ public
+kernel rope_table<size P>(mut tensor<f32, [P]> rtcos, mut tensor<f32, [P]> rtsin, i32 rtpos, f32 rtlntheta) → void {
+    let i32 span ← P ↦ i32 ⊥ 1
+
+    for from rtcos at [p] thread lane let ? {
+        if span ≻ 0 and span ≤ 960 {
+            let f32 freq ← (-(p ↦ f32) / (span ↦ f32) * rtlntheta).exp()
+            let f32 ang ← (rtpos ↦ f32) * freq
+            rtcos[[p]] ← ang.cos()
+            rtsin[[p]] ← ang.sin()
+        }
+    }
+}
+
+# Table-driven rotate-half RoPE twin of `rope_half`: reads precomputed [P]
+# cosine and sine tables (P = rhspan) with zero per-lane trig.
+@ public
+kernel rope_half_table<size N, size P>(tensor<f32, [N]> rhx, tensor<f32, [P]> rhcos, tensor<f32, [P]> rhsin, mut tensor<f32, [N]> rho) → void {
+    let i32 hf ← P ↦ i32 ⊥ 1
+
+    for from rhx at [j] thread lane let v {
+        if hf ≻ 0 and hf ≤ 960 {
+            let i32 jj ← j % (2 * hf)
+            let i32 base ← j - jj
+            let i32 p ← jj % hf
+            let f32 c ← rhcos[[p]]
+            let f32 s ← rhsin[[p]]
+
+            if jj ≺ hf {
+                rho[[j]] ← v * c - rhx[[base + jj + hf]] * s
+            }
+            else {
+                rho[[j]] ← rhx[[base + jj - hf]] * s + v * c
+            }
+        }
+    }
+}
+
+# Table-driven consecutive-pair (llama NORM) RoPE twin of `rope_pairs`: reads
+# precomputed [P] cosine and sine tables (P = rpspan) with zero per-lane trig.
+@ public
+kernel rope_pairs_table<size N, size P>(tensor<f32, [N]> rpx, tensor<f32, [P]> rpcos, tensor<f32, [P]> rpsin, mut tensor<f32, [N]> rpo) → void {
+    let i32 hf ← P ↦ i32 ⊥ 1
+
+    for from rpx at [j] thread lane let v {
+        if hf ≻ 0 and hf ≤ 960 {
+            let i32 jj ← j % (2 * hf)
+            let i32 p ← jj / 2
+            let f32 c ← rpcos[[p]]
+            let f32 s ← rpsin[[p]]
+
+            if jj % 2 ≡ 0 {
+                rpo[[j]] ← v * c - rpx[[j + 1]] * s
+            }
+            else {
+                rpo[[j]] ← rpx[[j - 1]] * s + v * c
+            }
+        }
+    }
+}
+
 # KV-row write: update row `kwpos` in the existing cache. A negative or
 # out-of-capacity position leaves the cache unchanged.
 @ public
@@ -165,12 +228,12 @@ kernel kv_write_kv<size C, size K>(tensor<f32, [K]> kwk, tensor<f32, [K]> kwv, m
 }
 
 # KV-block write: update rows `kwpos .. kwpos + N` from `kwblock` in one
-# launch. Rows outside the cache are skipped independently.
+# O(N * K) launch. Rows outside the cache are skipped independently.
 @ public
 kernel kv_write_rows<size N, size C, size K>(tensor<f32, [N, K]> kwblock, mut tensor<f32, [C, K]> kwcache, i32 kwpos) → void {
-    for from kwcache at [r, j] thread lane let old {
-        if kwpos ≥ 0 and r ≥ kwpos and r - kwpos ≺ N {
-            kwcache[[r, j]] ← kwblock[[r - kwpos, j]]
+    for from kwblock at [n, j] thread lane let v {
+        if kwpos ≥ 0 and kwpos + n ≺ C {
+            kwcache[[kwpos + n, j]] ← v
         }
     }
 }
@@ -377,42 +440,60 @@ kernel argmax_token<size V>(tensor<f32, [V]> atx, mut tensor<i32, [1]> atid) →
     } coalesce 0
 }
 
-# Chunked top-M: lane (p, m) of [P, M] writes the m-th best pair of chunk p
-# (descending value, ties to the lowest index). Values stay f32. Indices are
-# i32, including the -1 sentinel, so a later kernel can read them. The old
-# f32 index scratch existed only because an i32 store across kernel passes
-# was refused; that refusal is gone.
+# Chunked top-M: lane `p` of `[P]` scans chunk `p` once (`O(V)` global reads)
+# into lane-private `[M]` buffers, writing the M best pairs in descending
+# value with ties resolved to the lowest index. Chunks shorter than M fill
+# trailing slots with `-3.4028235e38` and sentinel index `-1`.
 @ public
-kernel topm_chunks<size P, size V, size M>(tensor<f32, [P, M]> tmdom, tensor<f32, [V]> tmx, mut tensor<f32, [P, M]> tmval, mut tensor<i32, [P, M]> tmidx, i32 tmchunk) → void {
-    for from tmdom at [p, m] thread lane let e {
-        if tmchunk ≥ 1 {
+kernel topm_chunks<size P, size V, size M>(tensor<f32, [P]> tmdom, tensor<f32, [V]> tmx, mut tensor<f32, [P, M]> tmval, mut tensor<i32, [P, M]> tmidx, i32 tmchunk) → void {
+    for from tmdom at [p] thread lane let ? {
+        let i32 mlen ← M
+
+        if tmchunk ≥ 1 and mlen ≥ 1 and mlen ≤ 1023 and p ∈ 0 … 16383 {
+            let i32 pp ← p ∧ 16383
+            let i32 vlen ← V
             let i32 n ← tmchunk
-            let i32 start ← p * n
-            let i32 stop ← start + n
-            mut f32 pv ← 3.4028235e38
-            mut i32 pf ← -1
+            let i32 start ← pp * n
+            let i32 end ← start + n
+            let i32 stop ← end ≻ vlen ✓ vlen ✗ end
+            mut tensor<f32, [M]> best_v ← empty
+            mut tensor<i32, [M]> best_i ← empty
 
-            for range 0 … m let rank {
-                mut f32 best ← -3.4028235e38
-                mut i32 bi ← -1
+            for exclusive M let r {
+                let i32 rr ← r ∧ 1023
+                best_v[[rr]] ← -3.4028235e38
+                best_i[[rr]] ← -1
+            }
 
+            if start ≺ stop {
                 for range start ‥ stop let k {
-                    let f32 v ← tmx[[k]]
+                    let f32 raw ← tmx[[k]]
 
-                    if v ≺ pv or (v ≡ pv and k ≻ pf) {
-                        if bi ≺ 0 or v ≻ best {
-                            best ← v
-                            bi ← k
+                    if raw ≡ raw {
+                        mut f32 cur_v ← raw
+                        mut i32 cur_i ← k
+
+                        for exclusive M let r {
+                            let i32 rr ← r ∧ 1023
+                            let i32 bi ← best_i[[rr]]
+                            let f32 bv ← best_v[[rr]]
+
+                            if cur_i ≥ 0 and (bi ≺ 0 or cur_v ≻ bv or (cur_v ≡ bv and cur_i ≺ bi)) {
+                                best_v[[rr]] ← cur_v
+                                best_i[[rr]] ← cur_i
+                                cur_v ← bv
+                                cur_i ← bi
+                            }
                         }
                     }
                 }
-
-                pv ← best
-                pf ← bi
             }
 
-            tmval[[p, m]] ← pv
-            tmidx[[p, m]] ← pf
+            for exclusive M let r {
+                let i32 rr ← r ∧ 1023
+                tmval[[p, rr]] ← best_v[[rr]]
+                tmidx[[p, rr]] ← best_i[[rr]]
+            }
         }
     }
 }
@@ -530,15 +611,76 @@ kernel rope_pairs_batch<size B, size N>(tensor<f32, [B, N]> rpx, mut tensor<f32,
     }
 }
 
+# Precompute [B, P] RoPE cosine and sine tables for `b < rtactive` at `rttpos + b`.
+@ public
+kernel rope_table_batch<size B, size P>(mut tensor<f32, [B, P]> rtcos, mut tensor<f32, [B, P]> rtsin, i32 rttpos, f32 rtlntheta, i32 rtactive) → void {
+    let i32 span ← P ↦ i32 ⊥ 1
+
+    for from rtcos at [b, p] thread lane let ? {
+        if b ≺ rtactive and span ≻ 0 and span ≤ 960 {
+            let f32 freq ← (-(p ↦ f32) / (span ↦ f32) * rtlntheta).exp()
+            let f32 ang ← ((rttpos + b) ↦ f32) * freq
+            rtcos[[b, p]] ← ang.cos()
+            rtsin[[b, p]] ← ang.sin()
+        }
+    }
+}
+
+# Table-driven batched rotate-half RoPE twin of `rope_half_batch`.
+@ public
+kernel rope_half_table_batch<size B, size N, size P>(tensor<f32, [B, N]> rhx, tensor<f32, [B, P]> rhcos, tensor<f32, [B, P]> rhsin, mut tensor<f32, [B, N]> rho, i32 rhactive) → void {
+    let i32 hf ← P ↦ i32 ⊥ 1
+
+    for from rhx at [b, j] thread lane let v {
+        if b ≺ rhactive and hf ≻ 0 and hf ≤ 960 and b ∈ 0 … 16383 {
+            let i32 bb ← b ∧ 16383
+            let i32 jj ← j % (2 * hf)
+            let i32 base ← j - jj
+            let i32 p ← jj % hf
+            let f32 c ← rhcos[[bb, p]]
+            let f32 s ← rhsin[[bb, p]]
+
+            if jj ≺ hf {
+                rho[[b, j]] ← v * c - rhx[[b, base + jj + hf]] * s
+            }
+            else {
+                rho[[b, j]] ← rhx[[b, base + jj - hf]] * s + v * c
+            }
+        }
+    }
+}
+
+# Table-driven batched consecutive-pair RoPE twin of `rope_pairs_batch`.
+@ public
+kernel rope_pairs_table_batch<size B, size N, size P>(tensor<f32, [B, N]> rpx, tensor<f32, [B, P]> rpcos, tensor<f32, [B, P]> rpsin, mut tensor<f32, [B, N]> rpo, i32 rpactive) → void {
+    let i32 hf ← P ↦ i32 ⊥ 1
+
+    for from rpx at [b, j] thread lane let v {
+        if b ≺ rpactive and hf ≻ 0 and hf ≤ 960 and b ∈ 0 … 16383 {
+            let i32 bb ← b ∧ 16383
+            let i32 jj ← j % (2 * hf)
+            let i32 p ← jj / 2
+            let f32 c ← rpcos[[bb, p]]
+            let f32 s ← rpsin[[bb, p]]
+
+            if jj % 2 ≡ 0 {
+                rpo[[b, j]] ← v * c - rpx[[b, j + 1]] * s
+            }
+            else {
+                rpo[[b, j]] ← rpx[[b, j - 1]] * s + v * c
+            }
+        }
+    }
+}
+
 # Batched fused K and V cache write: writes rows `0 .. active_b` into
-# `kwkc` / `kwvc` at `[kwpos .. kwpos + active_b)`.
+# `kwkc` / `kwvc` at `[kwpos .. kwpos + active_b)` in one O(B * K) launch.
 @ public
 kernel kv_write_kv_batch<size B, size C, size K>(tensor<f32, [B, K]> kwk, tensor<f32, [B, K]> kwv, mut tensor<f32, [C, K]> kwkc, mut tensor<f32, [C, K]> kwvc, i32 kwpos, i32 kwactive) → void {
-    for from kwkc at [r, j] thread lane let old {
-        if kwpos ≥ 0 and r ≥ kwpos and r - kwpos ≺ kwactive and r - kwpos ≺ B {
-            let i32 src ← r - kwpos
-            kwkc[[r, j]] ← kwk[[src, j]]
-            kwvc[[r, j]] ← kwv[[src, j]]
+    for from kwk at [b, j] thread lane let vk {
+        if b ≺ kwactive and kwpos ≥ 0 and kwpos + b ≺ C {
+            kwkc[[kwpos + b, j]] ← vk
+            kwvc[[kwpos + b, j]] ← kwv[[b, j]]
         }
     }
 }
@@ -1127,7 +1269,7 @@ test "decode_step argmax_token all-equal picks zero and later maximum wins" {
 }
 
 test "decode_step topm_chunks writes each chunk's top-M pairs in descending value, ties to the lowest index" {
-    mut tensor<f32, [2, 3]> dom ← tf32[2, 3] {}
+    mut tensor<f32, [2]> dom ← tf32[2] {}
     mut tensor<f32, [8]> x ← tf32[8] {}
     mut tensor<f32, [2, 3]> val ← tf32[2, 3] {}
     mut tensor<i32, [2, 3]> idx ← ti32[2, 3] {}
@@ -1156,7 +1298,7 @@ test "decode_step topm_chunks writes each chunk's top-M pairs in descending valu
 }
 
 test "decode_step topm_chunks: a tie across a chunk boundary keeps the lowest index per chunk" {
-    mut tensor<f32, [2, 2]> dom ← tf32[2, 2] {}
+    mut tensor<f32, [2]> dom ← tf32[2] {}
     mut tensor<f32, [8]> x ← tf32[8] {}
     mut tensor<f32, [2, 2]> val ← tf32[2, 2] {}
     mut tensor<i32, [2, 2]> idx ← ti32[2, 2] {}
@@ -1175,7 +1317,7 @@ test "decode_step topm_chunks: a tie across a chunk boundary keeps the lowest in
 }
 
 test "decode_step topm_chunks: a chunk shorter than M fills the trailing slots with the sentinel index -1" {
-    mut tensor<f32, [2, 3]> dom ← tf32[2, 3] {}
+    mut tensor<f32, [2]> dom ← tf32[2] {}
     mut tensor<f32, [4]> x ← tf32[4] {}
     mut tensor<f32, [2, 3]> val ← tf32[2, 3] {}
     mut tensor<i32, [2, 3]> idx ← ti32[2, 3] {}
@@ -1210,7 +1352,7 @@ kernel read_topm_indices<size P, size M>(tensor<i32, [P, M]> ridx, mut tensor<i3
 }
 
 test "decode_step topm_chunks selects lower-index elements after a tie" {
-    mut tensor<f32, [1, 3]> dom ← tf32[1, 3] {}
+    mut tensor<f32, [1]> dom ← tf32[1] {}
     mut tensor<f32, [4]> x ← tf32[4] {}
     mut tensor<f32, [1, 3]> val ← tf32[1, 3] {}
     mut tensor<i32, [1, 3]> idx ← ti32[1, 3] {}
@@ -1228,7 +1370,7 @@ test "decode_step topm_chunks selects lower-index elements after a tie" {
 }
 
 test "decode_step topm_chunks i32 indices and -1 sentinels are readable by a downstream kernel" {
-    mut tensor<f32, [2, 3]> dom ← tf32[2, 3] {}
+    mut tensor<f32, [2]> dom ← tf32[2] {}
     mut tensor<f32, [4]> x ← tf32[4] {}
     mut tensor<f32, [2, 3]> val ← tf32[2, 3] {}
     mut tensor<i32, [2, 3]> idx ← ti32[2, 3] {}
@@ -1241,4 +1383,162 @@ test "decode_step topm_chunks i32 indices and -1 sentinels are readable by a dow
     read_topm_indices(idx, mut sum)
     assert sum[[0]] ≡ 1
     assert sum[[1]] ≡ 5
+}
+
+test "decode_step topm_chunks preserves tie order when a later maximum shifts earlier ties down" {
+    mut tensor<f32, [1]> dom ← tf32[1] {}
+    mut tensor<f32, [6]> x ← tf32[6] {}
+    mut tensor<f32, [1, 4]> val ← tf32[1, 4] {}
+    mut tensor<i32, [1, 4]> idx ← ti32[1, 4] {}
+    x[[0]] ← 2.0
+    x[[1]] ← 2.0
+    x[[2]] ← 4.0
+    x[[3]] ← 2.0
+    x[[4]] ← 4.0
+    x[[5]] ← 1.0
+    ds.topm_chunks(dom, x, mut val, mut idx, 6)
+    assert close(val[[0, 0]], 4.0)
+    assert idx[[0, 0]] ≡ 2
+    assert close(val[[0, 1]], 4.0)
+    assert idx[[0, 1]] ≡ 4
+    assert close(val[[0, 2]], 2.0)
+    assert idx[[0, 2]] ≡ 0
+    assert close(val[[0, 3]], 2.0)
+    assert idx[[0, 3]] ≡ 1
+}
+
+test "decode_step topm_chunks handles sentinel-magnitude values and partial trailing chunks" {
+    mut tensor<f32, [2]> dom ← tf32[2] {}
+    mut tensor<f32, [5]> x ← tf32[5] {}
+    mut tensor<f32, [2, 3]> val ← tf32[2, 3] {}
+    mut tensor<i32, [2, 3]> idx ← ti32[2, 3] {}
+    x[[0]] ← -3.4028235e38
+    x[[1]] ← 4.0
+    x[[2]] ← 1.5
+    x[[3]] ← -2.0
+    x[[4]] ← 7.0
+    ds.topm_chunks(dom, x, mut val, mut idx, 3)
+    assert close(val[[0, 0]], 4.0)
+    assert idx[[0, 0]] ≡ 1
+    assert close(val[[0, 1]], 1.5)
+    assert idx[[0, 1]] ≡ 2
+    assert idx[[0, 2]] ≡ 0
+    assert close(val[[1, 0]], 7.0)
+    assert idx[[1, 0]] ≡ 4
+    assert close(val[[1, 1]], -2.0)
+    assert idx[[1, 1]] ≡ 3
+    assert idx[[1, 2]] ≡ -1
+}
+
+test "decode_step kv_write_rows skips negative and out-of-capacity positions" {
+    mut tensor<f32, [4, 2]> cache ← tf32[4, 2] {}
+    mut tensor<f32, [2, 2]> block ← tf32[2, 2] {}
+    for range 0‥4 let r {
+        for range 0‥2 let c {
+            cache[[r, c]] ← (r * 10 + c) ↦ f32
+        }
+    }
+    for range 0‥2 let r {
+        for range 0‥2 let c {
+            block[[r, c]] ← (100 + r * 10 + c) ↦ f32
+        }
+    }
+    ds.kv_write_rows(block, mut cache, -1)
+    ds.kv_write_rows(block, mut cache, 4)
+    ds.kv_write_rows(block, mut cache, 3)
+    for range 0‥3 let r {
+        for range 0‥2 let c {
+            assert cache[[r, c]] ≡ (r * 10 + c) ↦ f32
+        }
+    }
+    assert cache[[3, 0]] ≡ (100.0 ↦ f32)
+    assert cache[[3, 1]] ≡ (101.0 ↦ f32)
+}
+
+test "decode_step kv_write_kv_batch writes active rows only and clips at capacity" {
+    mut tensor<f32, [4, 2]> kc ← tf32[4, 2] {}
+    mut tensor<f32, [4, 2]> vc ← tf32[4, 2] {}
+    mut tensor<f32, [3, 2]> bk ← tf32[3, 2] {}
+    mut tensor<f32, [3, 2]> bv ← tf32[3, 2] {}
+    for range 0‥4 let r {
+        for range 0‥2 let c {
+            kc[[r, c]] ← (r * 10 + c) ↦ f32
+            vc[[r, c]] ← (50 + r * 10 + c) ↦ f32
+        }
+    }
+    for range 0‥3 let r {
+        for range 0‥2 let c {
+            bk[[r, c]] ← (100 + r * 10 + c) ↦ f32
+            bv[[r, c]] ← (200 + r * 10 + c) ↦ f32
+        }
+    }
+    ds.kv_write_kv_batch(bk, bv, mut kc, mut vc, 1, 2)
+    assert kc[[0, 0]] ≡ (0.0 ↦ f32)
+    assert kc[[1, 0]] ≡ (100.0 ↦ f32)
+    assert kc[[2, 1]] ≡ (111.0 ↦ f32)
+    assert kc[[3, 0]] ≡ (30.0 ↦ f32)
+    assert vc[[0, 1]] ≡ (51.0 ↦ f32)
+    assert vc[[1, 1]] ≡ (201.0 ↦ f32)
+    assert vc[[2, 0]] ≡ (210.0 ↦ f32)
+    assert vc[[3, 1]] ≡ (81.0 ↦ f32)
+
+    ds.kv_write_kv_batch(bk, bv, mut kc, mut vc, -1, 2)
+    ds.kv_write_kv_batch(bk, bv, mut kc, mut vc, 3, 3)
+    assert kc[[2, 1]] ≡ (111.0 ↦ f32)
+    assert kc[[3, 0]] ≡ (100.0 ↦ f32)
+    assert vc[[3, 1]] ≡ (201.0 ↦ f32)
+}
+
+test "decode_step table-driven rope_half_table and rope_pairs_table match direct RoPE kernels" {
+    mut tensor<f32, [8]> x ← tf32[8] {}
+    mut tensor<f32, [8]> direct_half ← tf32[8] {}
+    mut tensor<f32, [8]> table_half ← tf32[8] {}
+    mut tensor<f32, [8]> direct_pairs ← tf32[8] {}
+    mut tensor<f32, [8]> table_pairs ← tf32[8] {}
+    mut tensor<f32, [2]> tcos ← tf32[2] {}
+    mut tensor<f32, [2]> tsin ← tf32[2] {}
+    for range 0‥8 let j {
+        x[[j]] ← (j + 1) ↦ f32
+    }
+    ds.rope_table(mut tcos, mut tsin, 2, 2.7725887)
+    ds.rope_half(x, mut direct_half, 2, 2, 2.7725887)
+    ds.rope_half_table(x, tcos, tsin, mut table_half)
+    ds.rope_pairs(x, mut direct_pairs, 2, 2, 2.7725887)
+    ds.rope_pairs_table(x, tcos, tsin, mut table_pairs)
+    for range 0‥8 let j {
+        assert close(table_half[[j]], direct_half[[j]])
+        assert close(table_pairs[[j]], direct_pairs[[j]])
+    }
+}
+
+test "decode_step batched table-driven RoPE twins match direct batched kernels for active rows" {
+    mut tensor<f32, [3, 8]> bx ← tf32[3, 8] {}
+    mut tensor<f32, [3, 8]> direct_half ← tf32[3, 8] {}
+    mut tensor<f32, [3, 8]> table_half ← tf32[3, 8] {}
+    mut tensor<f32, [3, 8]> direct_pairs ← tf32[3, 8] {}
+    mut tensor<f32, [3, 8]> table_pairs ← tf32[3, 8] {}
+    mut tensor<f32, [3, 2]> bcos ← tf32[3, 2] {}
+    mut tensor<f32, [3, 2]> bsin ← tf32[3, 2] {}
+    for range 0‥3 let b {
+        for range 0‥8 let j {
+            bx[[b, j]] ← (b * 10 + j + 1) ↦ f32
+            direct_half[[b, j]] ← -9.0
+            table_half[[b, j]] ← -9.0
+            direct_pairs[[b, j]] ← -9.0
+            table_pairs[[b, j]] ← -9.0
+        }
+    }
+    ds.rope_table_batch(mut bcos, mut bsin, 3, 2.7725887, 2)
+    ds.rope_half_batch(bx, mut direct_half, 3, 2, 2.7725887, 2)
+    ds.rope_half_table_batch(bx, bcos, bsin, mut table_half, 2)
+    ds.rope_pairs_batch(bx, mut direct_pairs, 3, 2, 2.7725887, 2)
+    ds.rope_pairs_table_batch(bx, bcos, bsin, mut table_pairs, 2)
+    for range 0‥3 let b {
+        for range 0‥8 let j {
+            assert close(table_half[[b, j]], direct_half[[b, j]])
+            assert close(table_pairs[[b, j]], direct_pairs[[b, j]])
+        }
+    }
+    assert close(table_half[[2, 0]], -9.0)
+    assert close(table_pairs[[2, 7]], -9.0)
 }
