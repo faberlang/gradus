@@ -584,7 +584,8 @@ kernel rmsnorm_batch<size B, size D>(tensor<f32, [B, D]> rmx, tensor<f32, [D]> r
 # Full-batch tiled GEMM with [Out, In] weights: mmy = mmx · mmwᵀ.
 @ public
 kernel matmul_nt_gemm<size B, size N, size K>(tensor<f32, [N, K]> mmw, tensor<f32, [B, K]> mmx, mut tensor<f32, [B, N]> mmy) → void {
-    mmy ⇇ mmx · mmwᵀ
+    let tensor<f32, [K, N]> wt ← mmwᵀ
+    mmy ⇇ mmx · wt
 }
 
 # Batched linear projection with [Out, In] weights:
@@ -622,17 +623,22 @@ fn matmul_nt_dispatch<size B, size N, size K>(tensor<f32, [N, K]> mmw, tensor<f3
 #   q = x · wqᵀ, k = x · wkᵀ, v = x · wvᵀ.
 @ public
 kernel qkv_proj_batch_gemm<size B, size QD, size KVD, size D>(tensor<f32, [QD, D]> wq, tensor<f32, [KVD, D]> wk, tensor<f32, [KVD, D]> wv, tensor<f32, [B, D]> x, mut tensor<f32, [B, QD]> q, mut tensor<f32, [B, KVD]> k, mut tensor<f32, [B, KVD]> v) → void {
-    q ⇇ x · wqᵀ
-    k ⇇ x · wkᵀ
-    v ⇇ x · wvᵀ
+    let tensor<f32, [D, QD]> wqt ← wqᵀ
+    let tensor<f32, [D, KVD]> wkt ← wkᵀ
+    let tensor<f32, [D, KVD]> wvt ← wvᵀ
+    q ⇇ x · wqt
+    k ⇇ x · wkt
+    v ⇇ x · wvt
 }
 
 # Full-batch fused gate/up tiled GEMM sharing input `x`:
 #   g = x · wgᵀ, u = x · wuᵀ.
 @ public
 kernel gate_up_proj_batch_gemm<size B, size F, size D>(tensor<f32, [F, D]> wg, tensor<f32, [F, D]> wu, tensor<f32, [B, D]> x, mut tensor<f32, [B, F]> g, mut tensor<f32, [B, F]> u) → void {
-    g ⇇ x · wgᵀ
-    u ⇇ x · wuᵀ
+    let tensor<f32, [D, F]> wgt ← wgᵀ
+    let tensor<f32, [D, F]> wut ← wuᵀ
+    g ⇇ x · wgt
+    u ⇇ x · wut
 }
 
 # Batched Q/K/V projection sharing input `x`.
@@ -1802,6 +1808,54 @@ test "decode_step query-tiled attention matches full attn_scores_batch and attn_
     ds.attn_context_query_tile(tile_qdom, tile_pr, vc, mut tile_ctx, 1, 2, 2, 2, 4, 1, 2, 2)
 
     for range 0‥4 let b {
+        for range 0‥4 let j {
+            assert close(tile_ctx[[b, j]], full_ctx[[b, j]])
+        }
+    }
+}
+
+test "decode_step query-tiled attention matches full batch on partial active_b and trailing tile" {
+    # B=4, active_b=3, H=2, dh=2, QD=4, KVD=2 (group=2), C=6, TileB=2 -> TileBH=4
+    # Tile 0 processes qstart=0, qcount=2; trailing tile 1 processes qstart=2, qcount=1 (padding qb=1).
+    mut tensor<f32, [8, 6]> full_dom ← tf32[8, 6] {}
+    mut tensor<f32, [4, 4]> full_qdom ← tf32[4, 4] {}
+    mut tensor<f32, [4, 6]> tile_dom ← tf32[4, 6] {}
+    mut tensor<f32, [2, 4]> tile_qdom ← tf32[2, 4] {}
+    mut tensor<f32, [4, 4]> q ← tf32[4, 4] {}
+    mut tensor<f32, [6, 2]> kc ← tf32[6, 2] {}
+    mut tensor<f32, [6, 2]> vc ← tf32[6, 2] {}
+    mut tensor<f32, [8, 6]> full_sc ← tf32[8, 6] {}
+    mut tensor<f32, [8, 6]> full_pr ← tf32[8, 6] {}
+    mut tensor<f32, [4, 4]> full_ctx ← tf32[4, 4] {}
+    mut tensor<f32, [4, 6]> tile_sc ← tf32[4, 6] {}
+    mut tensor<f32, [4, 6]> tile_pr ← tf32[4, 6] {}
+    mut tensor<f32, [4, 4]> tile_ctx ← tf32[4, 4] {}
+
+    for range 0‥4 let b {
+        for range 0‥4 let j {
+            q[[b, j]] ← ((b * 2 + j + 1) ↦ f32) * 0.2
+        }
+    }
+    for range 0‥6 let c {
+        for range 0‥2 let d {
+            kc[[c, d]] ← ((c * 2 + d + 1) ↦ f32) * 0.1
+            vc[[c, d]] ← ((c + d * 3 + 1) ↦ f32) * 0.15
+        }
+    }
+
+    ds.attn_scores_batch(full_dom, q, kc, mut full_sc, 1, 2, 2, 2, 0.5, 3, 2)
+    ds.row_softmax(full_sc, mut full_pr)
+    ds.attn_context_batch(full_qdom, full_pr, vc, mut full_ctx, 1, 2, 2, 2, 3, 2)
+
+    ds.attn_scores_query_tile(tile_dom, q, kc, mut tile_sc, 1, 2, 2, 2, 0.5, 3, 2, 0, 2)
+    ds.row_softmax(tile_sc, mut tile_pr)
+    ds.attn_context_query_tile(tile_qdom, tile_pr, vc, mut tile_ctx, 1, 2, 2, 2, 3, 2, 0, 2)
+
+    ds.attn_scores_query_tile(tile_dom, q, kc, mut tile_sc, 1, 2, 2, 2, 0.5, 3, 2, 2, 1)
+    ds.row_softmax(tile_sc, mut tile_pr)
+    ds.attn_context_query_tile(tile_qdom, tile_pr, vc, mut tile_ctx, 1, 2, 2, 2, 3, 2, 2, 1)
+
+    for range 0‥3 let b {
         for range 0‥4 let j {
             assert close(tile_ctx[[b, j]], full_ctx[[b, j]])
         }

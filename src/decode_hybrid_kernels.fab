@@ -38,8 +38,8 @@ kernel rmsnorm_heads<size N, size DH>(tensor<f32, [N]> x, tensor<f32, [DH]> w, m
 
 # O(dh) per-head RMSNorm pass 1: one lane per head computes inverse RMS into `inv_out[H]`.
 @ public
-kernel rmsnorm_heads_inv<size H, size N, size DH>(tensor<f32, [N]> x, mut tensor<f32, [H]> inv_out, f32 eps) → void {
-    let i32 dh ← DH ↦ i32 ⊥ 1
+kernel rmsnorm_heads_inv<size H, size N>(tensor<f32, [N]> x, mut tensor<f32, [H]> inv_out, i32 head_dim, f32 eps) → void {
+    let i32 dh ← head_dim
 
     for from inv_out at [h] thread lane let ? {
         if dh ≥ 1 and dh ≤ 960 and h ∈ 0 … 4095 {
@@ -82,23 +82,28 @@ kernel rmsnorm_heads_apply<size H, size N, size DH>(tensor<f32, [N]> x, tensor<f
 #   rso[h, c] = exp(rsi[h, c] - m) / denom
 @ public
 kernel row_softmax_sink<size H, size C>(tensor<f32, [H, C]> rsi, tensor<f32, [H]> rsink, mut tensor<f32, [H, C]> rso) → void {
+    let i32 c_len ← C ↦ i32 ⊥ 0
+
     for from rsink at [h] thread lane let sink_logit {
-        mut f32 m ← sink_logit
-        mut f32 denom ← 1.0
+        if c_len ∈ 1 … 16777215 {
+            let i32 cc_len ← c_len ∧ 16777215
+            mut f32 m ← sink_logit
+            mut f32 denom ← 1.0
 
-        for range 0 ‥ C let k {
-            let f32 sk ← rsi[[h, k]]
-            if sk ≻ m {
-                denom ← denom * (m - sk).exp() + 1.0
-                m ← sk
+            for range 0 ‥ cc_len let k {
+                let f32 sk ← rsi[[h, k]]
+                if sk ≻ m {
+                    denom ← denom * (m - sk).exp() + 1.0
+                    m ← sk
+                }
+                else {
+                    denom ← denom + (sk - m).exp()
+                }
             }
-            else {
-                denom ← denom + (sk - m).exp()
-            }
-        }
 
-        for range 0 ‥ C let c {
-            rso[[h, c]] ← (rsi[[h, c]] - m).exp() / denom
+            for range 0 ‥ cc_len let c {
+                rso[[h, c]] ← (rsi[[h, c]] - m).exp() / denom
+            }
         }
     }
 }
@@ -755,8 +760,32 @@ test "decode_hybrid_kernels l2norm_repeat_slice and z_gated_rmsnorm O(dh) match 
     w[[1]] ← 2.0
     dhk.z_gated_rmsnorm(conv_out, z, w, mut zg, 0.0)
     # head 0: rms = sqrt(12.5) = 3.535534; silu(0) = 0, silu(2) = 2/(1+exp(-2)) = 1.761594
+    let f32 silu_pos2 ← (2.0 ∷ f32) / ((1.0 ∷ f32) + (-2.0 ∷ f32).exp())
+    let f32 silu_neg2 ← (-2.0 ∷ f32) / ((1.0 ∷ f32) + (2.0 ∷ f32).exp())
     assert close(zg[[0]], 0.0)
-    assert close(zg[[1]], 4.0 / 3.535534 * 2.0 * (2.0 / (1.0 + (-2.0 ∷ f32).exp())))
+    assert close(zg[[1]], (4.0 ∷ f32) / (3.535534 ∷ f32) * (2.0 ∷ f32) * silu_pos2)
     assert close(zg[[2]], 0.0)
-    assert close(zg[[3]], 2.0 / 1.4142135 * 2.0 * (-2.0 / (1.0 + (2.0 ∷ f32).exp())))
+    assert close(zg[[3]], (2.0 ∷ f32) / (1.4142135 ∷ f32) * (2.0 ∷ f32) * silu_neg2)
+
+    # Direct O(dh) two-pass kernels match the legacy single-pass forms.
+    mut tensor<f32, [2]> l2_scale ← tf32[2] {}
+    mut tensor<f32, [8]> rep2 ← tf32[8] {}
+    dhk.l2norm_src_scale(conv_out, mut l2_scale, 0, 2, 0.00001)
+    dhk.l2norm_repeat_apply(conv_out, l2_scale, mut rep2, 0, 2, 2)
+    for range 0‥8 let i {
+        assert close(rep2[[i]], rep[[i]])
+    }
+
+    mut tensor<f32, [2]> inv_h ← tf32[2] {}
+    mut tensor<f32, [4]> rn_out ← tf32[4] {}
+    mut tensor<f32, [4]> rn_ref ← tf32[4] {}
+    mut tensor<f32, [4]> zg2 ← tf32[4] {}
+    dhk.rmsnorm_heads_inv(conv_out, mut inv_h, 2, 0.0)
+    dhk.rmsnorm_heads_apply(conv_out, w, inv_h, mut rn_out)
+    dhk.rmsnorm_heads(conv_out, w, mut rn_ref, 0.0)
+    dhk.z_gated_rmsnorm_apply(conv_out, z, w, inv_h, mut zg2)
+    for range 0‥4 let i {
+        assert close(rn_out[[i]], rn_ref[[i]])
+        assert close(zg2[[i]], zg[[i]])
+    }
 }
