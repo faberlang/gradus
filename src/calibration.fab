@@ -174,19 +174,37 @@ fn bake(CalibrationCorpus corpus, list<list<f32>> bases, f32 threshold, string a
     for from corpus.activations let row {
         let int slot ← slot_index(row.layer, row.expert, corpus.experts)
         let f32 n2 ← norm2(row.output)
-        mass ← put_f32(mass, slot, mass.get(slot) coalesce 0.0 ∷ f32 + row.mass)
-        energy ← put_f32(energy, slot, energy.get(slot) coalesce 0.0 ∷ f32 + row.mass * n2)
+        mass[slot] ← mass.get(slot) coalesce 0.0 ∷ f32 + row.mass
+        energy[slot] ← energy.get(slot) coalesce 0.0 ∷ f32 + row.mass * n2
 
-        for range 0 ‥ dim let d {
+        for exclusive dim let d {
             let int wi ← slot * dim + d
             let f32 y ← row.output.get(d) coalesce 0.0 ∷ f32
-            weighted ← put_f32(weighted, wi, weighted.get(wi) coalesce 0.0 ∷ f32 + row.mass * y)
+            weighted[wi] ← weighted.get(wi) coalesce 0.0 ∷ f32 + row.mass * y
         }
 
-        for range 0 ‥ k_max + 1 let k {
-            let f32 r2 ← residual2(row.output, qs, k)
+        # Keep: running captured accumulator across K — the residual at K is
+        # n2 minus the in-order squared-projection sum, so every K reuses the
+        # row's n2 instead of recomputing the prefix dots.
+        mut f32 captured ← 0.0
+
+        for exclusive k_max + 1 let k {
             let int ri ← k * slots + slot
-            residual_k ← put_f32(residual_k, ri, residual_k.get(ri) coalesce 0.0 ∷ f32 + row.mass * r2)
+            let f32 left ← n2 - captured
+            mut f32 r2 ← left
+
+            if left ≺ 0.0 {
+                r2 ← 0.0
+            }
+
+            residual_k[ri] ← residual_k.get(ri) coalesce 0.0 ∷ f32 + row.mass * r2
+
+            if k ≺ k_max {
+                let list<f32> vac ← empty
+                let list<f32> q ← qs.get(k) coalesce vac
+                let f32 proj ← dot(row.output, q)
+                captured ← captured + proj * proj
+            }
         }
     }
 
@@ -350,7 +368,7 @@ fn validate_corpus(list<RoutingActivation> activations, int layers, int experts,
         require finite_vec(row.output) throw variant NonFinite { message = "non-finite calibration value" }
 
         let int slot ← slot_index(row.layer, row.expert, experts)
-        mass ← put_f32(mass, slot, mass.get(slot) coalesce 0.0 ∷ f32 + row.mass)
+        mass[slot] ← mass.get(slot) coalesce 0.0 ∷ f32 + row.mass
     }
 
     for from mass let m {
@@ -379,22 +397,6 @@ fn zeros(int n) → list<f32> {
 
     for range 0 ‥ n {
         out.append(0.0)
-    }
-
-    return out
-}
-
-# Keep: index-space in-place write emulation; no covering construct.
-fn put_f32(list<f32> xs, int i, f32 v) → list<f32> {
-    mut list<f32> out ← empty
-
-    for range 0 ‥ xs.length() let j {
-        if j ≡ i {
-            out.append(v)
-        }
-        else {
-            out.append(xs.get(j) coalesce 0.0 ∷ f32)
-        }
     }
 
     return out
@@ -456,33 +458,14 @@ fn orthonormal(list<list<f32>> bases, int dimension) → list<list<f32>> ⇥ Cal
     return qs
 }
 
-# Keep: per-element projection squared; a reducer would double-evaluate
-# dot per element.
-fn residual2(list<f32> y, list<list<f32>> qs, int k) → f32 {
-    mut f32 captured ← 0.0
-
-    for range 0 ‥ k let i {
-        let list<f32> vac ← empty
-        let list<f32> q ← qs.get(i) coalesce vac
-        let f32 proj ← dot(y, q)
-        captured ← captured + proj * proj
-    }
-
-    let f32 n2 ← norm2(y)
-    let f32 left ← n2 - captured
-
-    if left ≺ 0.0 then return 0.0
-
-    return left
-}
-
 fn census_row(list<f32> weighted, list<f32> mass, int layers, int experts, int dim) → list<SimilarityCell> {
+    let list<f32> units ← census_units(weighted, mass, layers * experts, dim)
     mut list<SimilarityCell> out ← empty
 
     for range 0 ‥ layers let layer {
         for range 0 ‥ experts let a {
             for range a ‥ experts let b {
-                out.append(SimilarityCell { layer = layer, expert_a = a, expert_b = b, cosine = cosine(weighted, mass, layer, a, b, experts, dim) })
+                out.append(SimilarityCell { layer = layer, expert_a = a, expert_b = b, cosine = cosine(units, slot_index(layer, a, experts), slot_index(layer, b, experts), dim) })
             }
         }
     }
@@ -490,35 +473,49 @@ fn census_row(list<f32> weighted, list<f32> mass, int layers, int experts, int d
     return out
 }
 
-# Keep: triple accumulator (dot, na, nb) over one index space; no
-# construct folds three streams at once.
-fn cosine(list<f32> weighted, list<f32> mass, int layer, int a, int b, int experts, int dim) → f32 {
-    let int sa ← slot_index(layer, a, experts)
-    let int sb ← slot_index(layer, b, experts)
-    let f32 ma ← mass.get(sa) coalesce 0.0 ∷ f32
-    let f32 mb ← mass.get(sb) coalesce 0.0 ∷ f32
+# One-time per-slot unit normalization of the routing-weighted mean
+# vectors: each slot's components are divided by its mass and its norm
+# once, so every upper-triangle pair costs a single dot. Slots with zero
+# mass or zero norm keep a zero vector and every pair cosine stays 0.0,
+# matching the per-pair guards this pass replaces.
+fn census_units(list<f32> weighted, list<f32> mass, int slots, int dim) → list<f32> {
+    mut list<f32> units ← zeros(slots * dim)
 
-    if not (ma ≻ 0.0) then return 0.0
+    for exclusive slots let s {
+        let f32 m ← mass.get(s) coalesce 0.0 ∷ f32
 
-    if not (mb ≻ 0.0) then return 0.0
+        if m ≻ 0.0 {
+            mut f32 na ← 0.0
 
-    mut f32 dot ← 0.0
-    mut f32 na ← 0.0
-    mut f32 nb ← 0.0
+            for exclusive dim let d {
+                let f32 v ← weighted.get(s * dim + d) coalesce 0.0 ∷ f32 / m
+                na ← na + v * v
+            }
 
-    for range 0 ‥ dim let d {
-        let f32 va ← weighted.get(sa * dim + d) coalesce 0.0 ∷ f32 / ma
-        let f32 vb ← weighted.get(sb * dim + d) coalesce 0.0 ∷ f32 / mb
-        dot ← dot + va * vb
-        na ← na + va * va
-        nb ← nb + vb * vb
+            if na ≻ 0.0 {
+                let f32 n ← √ na
+
+                for exclusive dim let d {
+                    let f32 v ← weighted.get(s * dim + d) coalesce 0.0 ∷ f32 / m
+                    units[s * dim + d] ← v / n
+                }
+            }
+        }
     }
 
-    let f32 denom ← √ na * √ nb
+    return units
+}
 
-    if not (denom ≻ 0.0) then return 0.0
+# Keep: pair dot over pre-normalized unit vectors; the per-pair mass and
+# norm divisions moved into the one-time census_units pass.
+fn cosine(list<f32> units, int sa, int sb, int dim) → f32 {
+    mut f32 dot ← 0.0
 
-    return dot / denom
+    for exclusive dim let d {
+        dot ← dot + units.get(sa * dim + d) coalesce 0.0 ∷ f32 * units.get(sb * dim + d) coalesce 0.0 ∷ f32
+    }
+
+    return dot
 }
 
 +++ faber test
