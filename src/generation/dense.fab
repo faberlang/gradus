@@ -18,6 +18,8 @@ import from "gradus:cache/kv"
 
 import from "gradus:decode"
 
+import from "gradus:dtype"
+
 import from "gradus:model/dense"
 
 import from "gradus:sampling"
@@ -44,21 +46,6 @@ fn dense_prefill(DenseEngine engine, (string, int) → tensor.NumericBlock ⇥ d
     }
 }
 
-fn copy_prefix(list<int> base, list<int> ids, int count) → list<int> {
-    mut list<int> out ← empty
-
-    for from base let token {
-        out.append(token)
-    }
-
-    # The count selects a prefix, so the source list cannot be walked to its end.
-    for range 0 ‥ count let i {
-        out.append(ids.get(i) coalesce 0)
-    }
-
-    return out
-}
-
 fn advance_n(config.GenerationConfig g, decoder.GenerationCursor start, int count) → decoder.GenerationCursor ⇥ config.GenerationError {
     mut decoder.GenerationCursor out ← copy start
 
@@ -69,7 +56,10 @@ fn advance_n(config.GenerationConfig g, decoder.GenerationCursor start, int coun
     return out
 }
 
-fn logit_row(tensor.NumericBlock logits, int row, int vocab) → list<f32> ⇥ config.GenerationError {
+# The shared rank/row/vocabulary gate for one logits-row read: the copied
+# row (logit_row) and the inline greedy argmax (greedy_row_token) keep the
+# same fail-closed contract.
+fn require_logits_row(tensor.NumericBlock logits, int row, int vocab) → void ⇥ config.GenerationError {
     require logits.rank() ≡ 2 throw variant config.GenerationError.DecodeFailure { message = "decode logits must be rank two" }
 
     # NumericBlock carries a runtime shape; validate its rank before indexing.
@@ -81,6 +71,12 @@ fn logit_row(tensor.NumericBlock logits, int row, int vocab) → list<f32> ⇥ c
 
     require cols ≡ vocab throw variant config.GenerationError.DecodeFailure { message = "decode logits shape does not match the vocabulary" }
 
+    return
+}
+
+fn logit_row(tensor.NumericBlock logits, int row, int vocab) → list<f32> ⇥ config.GenerationError {
+    require_logits_row(logits, row, vocab)
+
     mut list<f32> out ← empty
 
     # NumericBlock data is flat; the row index selects the requested value.
@@ -91,16 +87,70 @@ fn logit_row(tensor.NumericBlock logits, int row, int vocab) → list<f32> ⇥ c
     return out
 }
 
-fn draw_target_ids(tensor.NumericBlock logits, int rows, int vocab, sampling.Config drawn, random.Seed rng, config.GenerationConfig g, decoder.StopPolicy stop) → list<int> ⇥ config.GenerationError {
-    mut list<int> out ← empty
+# The greedy target token for one verified logits row: the EOG-masked argmax
+# computed inline over the flat row — no [V] copy (issue #77). It matches
+# sample(sample_logits(row, g, stop), drawn, empty, rng) exactly when the
+# drawn config takes the greedy path (temperature zero ignores the history,
+# the penalty, and the seed): the same -1000000000 mask, the same first-index
+# tie-break, and the same fail-closed shape and finite gates.
+fn greedy_row_token(tensor.NumericBlock logits, int row, int vocab, config.GenerationConfig g, decoder.StopPolicy stop) → int ⇥ config.GenerationError {
+    require_logits_row(logits, row, vocab)
 
-    for range 0 ‥ rows let row {
-        let list<f32> values ← logit_row(logits, row, vocab)
-        let sampling.Sampler target ← decoder.sample(decoder.sample_logits(values, g, stop), drawn, empty, rng)
-        out.append(target.token_id)
+    mut int best ← 0 - 1
+    mut f32 best_value ← 0.0 ∷ f32
+
+    for exclusive vocab let i {
+        mut f32 value ← logits.data.get(row * vocab + i) coalesce 0.0 ∷ f32
+
+        if not decoder.stops_on_eog(stop) and decoder.is_eog(g, i) {
+            value ← (-1000000000.0) ∷ f32
+        }
+
+        require dtype.finite(value) throw variant config.GenerationError.DecodeFailure { message = "logits must be finite" }
+
+        if best ≺ 0 or value ≻ best_value {
+            best ← i
+            best_value ← value
+        }
     }
 
-    return out
+    require best ≥ 0 throw variant config.GenerationError.DecodeFailure { message = "logits must be non-empty" }
+
+    return best
+}
+
+# The target token for one verified row: the greedy path computes the masked
+# argmax inline; the sampled path runs the full sampling pipeline with an
+# empty history (the outcome seed is discarded either way, so the walk never
+# moves the RNG).
+fn target_row_token(tensor.NumericBlock logits, int row, int vocab, sampling.Config drawn, random.Seed rng, config.GenerationConfig g, decoder.StopPolicy stop) → int ⇥ config.GenerationError {
+    if drawn.temperature ≤ 0.0 {
+        return greedy_row_token(logits, row, vocab, g, stop)
+    }
+
+    let list<f32> values ← logit_row(logits, row, vocab)
+    let sampling.Sampler target ← decoder.sample(decoder.sample_logits(values, g, stop), drawn, empty, rng)
+    return target.token_id
+}
+
+# The sequential target verification: walk the verified rows in order and
+# stop at the first row whose target token disagrees with the candidate
+# (issue #77 — rows after the first mismatch are never drawn). Returns the
+# accepted prefix length.
+fn verify_target_rows(tensor.NumericBlock logits, int rows, int vocab, list<int> candidate_ids, sampling.Config drawn, random.Seed rng, config.GenerationConfig g, decoder.StopPolicy stop) → int ⇥ config.GenerationError {
+    mut int bound ← rows
+
+    if candidate_ids.length() ≺ bound {
+        bound ← candidate_ids.length()
+    }
+
+    for exclusive bound let row {
+        let int target ← target_row_token(logits, row, vocab, drawn, rng, g, stop)
+
+        if target ≢ (candidate_ids.get(row) coalesce (-1)) then return row
+    }
+
+    return bound
 }
 
 fn accepted_prefix(list<int> ids, int count, config.GenerationConfig g, decoder.StopPolicy stop) → int {
@@ -114,38 +164,32 @@ fn accepted_prefix(list<int> ids, int count, config.GenerationConfig g, decoder.
     return count
 }
 
-fn lookup_context(list<int> prompt, list<int> history) → list<int> {
-    mut list<int> context ← empty
-
-    for from prompt let token {
-        context.append(token)
+# The context token at flat position i without materializing the context:
+# the prompt precedes the accepted history (issue #77 — no per-step copy).
+fn context_token(list<int> prompt, list<int> history, int prompt_length, int i) → int {
+    if i ≺ prompt_length {
+        return prompt.get(i) coalesce (-1)
     }
 
-    for from history let token {
-        context.append(token)
-    }
-
-    return context
+    return history.get(i - prompt_length) coalesce (-1)
 }
 
-fn accepted_target_count(list<int> target_ids, list<int> candidate_ids) → int {
-    mut int bound ← target_ids.length()
-
-    if candidate_ids.length() ≺ bound {
-        bound ← candidate_ids.length()
+# Compare one source window with the final context suffix by token id,
+# stopping at the first mismatch (issue #77 — the walk no longer runs to the
+# window end).
+fn window_matches(list<int> prompt, list<int> history, int prompt_length, int source_offset, int suffix_start, int match_length) → bool {
+    for exclusive match_length let i {
+        if context_token(prompt, history, prompt_length, source_offset + i) ≢ context_token(prompt, history, prompt_length, suffix_start + i) {
+            return false
+        }
     }
 
-    # The bound is the shorter list; a full lockstep walk would require equal lengths.
-    for range 0 ‥ bound let count {
-        if target_ids.get(count) coalesce (-1) ≢ candidate_ids.get(count) coalesce (-1) then return count
-    }
-
-    return bound
+    return true
 }
 
 fn lookup_candidates(list<int> prompt, list<int> history, int block_size) → list<int> {
-    let list<int> context ← lookup_context(prompt, history)
-    let int available ← context.length()
+    let int prompt_length ← prompt.length()
+    let int available ← prompt_length + history.length()
 
     if available ≺ 2 then return empty
 
@@ -157,19 +201,12 @@ fn lookup_candidates(list<int> prompt, list<int> history, int block_size) → li
 
     while match_length ≥ 1 {
         let int suffix_start ← available - match_length
-        let int source_limit ← available - match_length
 
-        for range 0 ‥ source_limit + 1 let source_offset {
-            mut bool matches ← true
-
-            # Both windows use computed offsets into the flat context.
-            for range 0 ‥ match_length let i {
-                if context.get(source_offset + i) coalesce (-1) ≢ context.get(suffix_start + i) coalesce (-1) {
-                    matches ← false
-                }
-            }
-
-            if matches {
+        # The final position is excluded from the source walk: a match there
+        # is the suffix comparing with itself and has no following token to
+        # begin a candidate extension (issue #77).
+        for exclusive suffix_start let source_offset {
+            if window_matches(prompt, history, prompt_length, source_offset, suffix_start, match_length) {
                 let int following ← source_offset + match_length
                 mut int extension ← block_size
 
@@ -180,9 +217,9 @@ fn lookup_candidates(list<int> prompt, list<int> history, int block_size) → li
                 if extension ≥ 1 {
                     mut list<int> candidates ← empty
 
-                    # This range extracts a computed suffix from the flat context.
-                    for range 0 ‥ extension let i {
-                        candidates.append(context.get(following + i) coalesce (-1))
+                    # This range extracts the tokens that followed the match.
+                    for exclusive extension let i {
+                        candidates.append(context_token(prompt, history, prompt_length, following + i))
                     }
 
                     return candidates
@@ -196,45 +233,30 @@ fn lookup_candidates(list<int> prompt, list<int> history, int block_size) → li
     return empty
 }
 
-fn slice_rows(tensor.NumericBlock value, int start, int rows, int dimension) → tensor.NumericBlock ⇥ config.GenerationError {
-    require value.shape ≡ ([start + rows, dimension] ↦ list<int>) throw variant config.GenerationError.DecodeFailure { message = "verified cache shape does not match the candidate block" }
-
-    mut list<f32> data ← empty
-
-    # NumericBlock data is flat; these coordinates select a row window.
-    for range start ‥ start + rows let row {
-        for range 0 ‥ dimension let column {
-            data.append(value.data.get(row * dimension + column) coalesce 0.0 ∷ f32)
-        }
-    }
-
-    do {
-        return tensor.construct(data, [rows, dimension])
-    }
-    catch err {
-        throw variant config.GenerationError.DecodeFailure { message = err.message }
-    }
-}
-
-fn commit_dense_block(mut list<kv.KVCache> base, dense.DenseStep verified, list<int> candidate_ids, int accepted_count) → list<kv.KVCache> ⇥ config.GenerationError {
+fn commit_dense_block(list<kv.KVCache> base, dense.DenseStep verified, list<int> candidate_ids, int accepted_count) → list<kv.KVCache> ⇥ config.GenerationError {
     require accepted_count ≥ 1 throw variant config.GenerationError.DecodeFailure { message = "accepted candidate block must not be empty" }
 
     require accepted_count ≤ candidate_ids.length() throw variant config.GenerationError.DecodeFailure { message = "accepted candidate block exceeds the proposal" }
 
     require verified.layers.length() ≡ base.length() throw variant config.GenerationError.DecodeFailure { message = "verified cache layer count does not match the base" }
 
-    mut list<kv.KVCache> committed ← empty
-    let kv.KVCache first ← base.get(0) coalesce kv.default()
-    let int prefix ← first.length()
-    let list<int> accepted_ids ← copy_prefix(empty, candidate_ids, accepted_count)
+    # Full accept: the verified views already hold every accepted row over
+    # the pre-allocated buffers — reuse them as the committed state (issue
+    # #77, no second write and no fork copy).
+    if accepted_count ≡ candidate_ids.length() {
+        return verified.layers
+    }
 
-    for range 0 ‥ base.length() let i {
-        let kv.KVCache after ← verified.layers[i]
-        let tensor.NumericBlock key ← slice_rows(after.key, prefix, accepted_count, base[i].dimension)
-        let tensor.NumericBlock payload ← slice_rows(after.payload, prefix, accepted_count, base[i].dimension)
+    mut list<kv.KVCache> committed ← empty
+
+    for exclusive base.length() let i {
+        # Partial accept: roll the verified branch back to the accepted
+        # prefix — a view over the same pre-allocated buffers whose rows
+        # past the accepted count are not part of the value (issue #77).
+        let int kept ← base[i].length() + accepted_count
 
         do {
-            committed.append(kv.extend(mut base[i], accepted_ids, key, payload))
+            committed.append(kv.prefix_view(verified.layers[i], kept))
         }
         catch err {
             throw variant config.GenerationError.DecodeFailure { message = err.message }
@@ -369,11 +391,11 @@ fn generate_dense_with_stop(config.GenerationConfig g, list<int> prompt_ids, Den
                     attempt_ok ← false
                 }
 
-                mut list<int> target_ids ← empty
+                mut int raw_accepted ← 0
 
                 if attempt_ok {
                     do {
-                        target_ids ← draw_target_ids(verified.logits, candidate_ids.length(), engine.architecture.vocab, drawn, rng, g, stop)
+                        raw_accepted ← verify_target_rows(verified.logits, candidate_ids.length(), engine.architecture.vocab, candidate_ids, drawn, rng, g, stop)
                     }
                     catch err {
                         attempt_ok ← false
@@ -403,7 +425,6 @@ fn generate_dense_with_stop(config.GenerationConfig g, list<int> prompt_ids, Den
                     }
                 }
                 else {
-                    let int raw_accepted ← accepted_target_count(target_ids, candidate_ids)
                     let int remaining ← g.max_tokens - cursor.emitted
                     mut int accepted_count ← raw_accepted
 
@@ -424,7 +445,11 @@ fn generate_dense_with_stop(config.GenerationConfig g, list<int> prompt_ids, Den
 
                     mut list<f32> staged_last ← last
 
-                    if staging_ok and accepted_count ≻ 0 {
+                    # The verified row copy feeds the corrective sample and the
+                    # next step's logits. The greedy partial-accept path reuses
+                    # the verified token instead of sampling the row, so its
+                    # copy is skipped (issue #77).
+                    if staging_ok and accepted_count ≻ 0 and (raw_accepted ≡ candidate_ids.length() or drawn.temperature ≻ 0.0) {
                         do {
                             staged_last ← logit_row(verified.logits, accepted_count - 1, engine.architecture.vocab)
                         }
@@ -437,7 +462,7 @@ fn generate_dense_with_stop(config.GenerationConfig g, list<int> prompt_ids, Den
 
                     if staging_ok and accepted_count ≻ 0 {
                         do {
-                            committed ← commit_dense_block(mut state, verified, candidate_ids, accepted_count)
+                            committed ← commit_dense_block(state, verified, candidate_ids, accepted_count)
                         }
                         catch err {
                             staging_ok ← false
@@ -491,8 +516,15 @@ fn generate_dense_with_stop(config.GenerationConfig g, list<int> prompt_ids, Den
                         }
                         else {
                             state ← committed
-                            tokens ← copy_prefix(tokens, candidate_ids, accepted_count)
-                            history ← copy_prefix(history, candidate_ids, accepted_count)
+
+                            # The accepted candidates append in place — no
+                            # full-list prefix copy (issue #77).
+                            for exclusive accepted_count let i {
+                                let int accepted ← candidate_ids.get(i) coalesce (-1)
+                                tokens.append(accepted)
+                                history.append(accepted)
+                            }
+
                             cursor ← staged_cursor
                             last ← staged_last
 
@@ -501,11 +533,21 @@ fn generate_dense_with_stop(config.GenerationConfig g, list<int> prompt_ids, Den
                             }
 
                             if raw_accepted ≺ candidate_ids.length() and accepted_count ≡ raw_accepted and decoder.token_allowed(g, cursor) and not finished {
-                                let sampling.Sampler outcome ← decoder.sample(decoder.sample_logits(last, g, stop), drawn, history, rng)
-                                let int token ← outcome.token_id
+                                mut int token ← candidate_ids.get(accepted_count - 1) coalesce (-1)
+
+                                # The greedy path reuses the verified token at
+                                # accepted_count - 1 (its argmax already agreed
+                                # with the candidate); the sampled path re-draws
+                                # the corrective row with the running history
+                                # and seed (issue #77).
+                                if drawn.temperature ≻ 0.0 {
+                                    let sampling.Sampler outcome ← decoder.sample(decoder.sample_logits(last, g, stop), drawn, history, rng)
+                                    token ← outcome.token_id
+                                    rng ← outcome.seed
+                                }
+
                                 tokens.append(token)
                                 history.append(token)
-                                rng ← outcome.seed
                                 cursor ← decoder.cursor_advance(g, cursor)
 
                                 if decoder.is_eog(g, token) and decoder.stops_on_eog(stop) {
