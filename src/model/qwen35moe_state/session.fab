@@ -146,9 +146,73 @@ fn digit_value(string c) → int {
     }
 }
 
+fn int_list_text(list<int> xs) → string {
+    if xs.length() ≡ 0 then return "-"
+    mut string out ← ""
+    for exclusive xs.length() let i {
+        if i ≻ 0 {
+            out ← out + ","
+        }
+        out ← out + (xs[i] ↦ string)
+    }
+    return out
+}
+
+fn parse_nonneg_int_text(string s, string message) → int ⇥ schedule.Qwen35moeStateError {
+    require s.length() ≥ 1 and s.length() ≤ 18 throw variant BadState {message = message}
+    mut int value ← 0
+    for from s let c {
+        let int digit ← digit_value(c ↦ string)
+        require digit ≥ 0 throw variant BadState {message = message}
+        value ← value * 10 + digit
+    }
+    return value
+}
+
+fn parse_rope_sections_wire(string exec_cfg) → list<int> ⇥ schedule.Qwen35moeStateError {
+    let list<string> fields ← exec_cfg.split(":")
+    for from fields let field {
+        if field.starts_with("sections=") {
+            let string raw ← field.slice(9, field.length())
+            require raw.length() ≥ 1 and raw ≢ "-" throw variant BadState {message = "missing rope_sections in identity wire"}
+            let list<string> items ← raw.split(",")
+            mut list<int> out ← empty
+            for from items let item {
+                out.append(parse_nonneg_int_text(item, "malformed rope_sections in identity wire"))
+            }
+            require out.length() ≥ 1 throw variant BadState {message = "missing rope_sections in identity wire"}
+            return out
+        }
+    }
+    throw variant BadState {message = "missing rope_sections in identity wire"}
+}
+
+fn parse_conv_history_wire(string state_types, string exec_cfg, int conv_rows) → int ⇥ schedule.Qwen35moeStateError {
+    mut int history_len ← -1
+    let list<string> families ← state_types.split(";")
+    for from families let entry {
+        if entry.starts_with("conv=") {
+            let string spec ← entry.slice(5, entry.length())
+            let list<string> dims ← spec.split("x")
+            require dims.length() ≡ 2 throw variant BadState {message = "malformed conv state_types in identity wire"}
+            history_len ← parse_nonneg_int_text(dims.get(0) coalesce "", "malformed conv history length in identity wire")
+        }
+    }
+    require history_len ≥ 1 throw variant BadState {message = "missing conv history length in identity wire"}
+    let list<string> fields ← exec_cfg.split(":")
+    for from fields let field {
+        if field.starts_with("conv=") {
+            let int conv_kernel ← parse_nonneg_int_text(field.slice(5, field.length()), "malformed conv kernel in identity wire")
+            require conv_kernel ≥ 2 and conv_kernel - 1 ≡ history_len throw variant BadState {message = "inconsistent conv history length in identity wire"}
+        }
+    }
+    require history_len ≤ conv_rows throw variant BadState {message = "conv history length exceeds ConvRows capacity"}
+    return history_len
+}
+
 fn execution_config(qwen35moe.Qwen35moeConfig c) → string {
     # "/" and ";" never appear in these rendered fields.
-    return "embd=§:heads=§:kv=§:key=§:conv=§:state=§:group=§:dt=§:inner=§:interval=§:rope=§:base=§"(c.embedding_length ↦ string, c.head_count ↦ string, c.head_count_kv ↦ string, c.key_length ↦ string, c.conv_kernel ↦ string, c.state_size ↦ string, c.group_count ↦ string, c.gradus_temporis ↦ string, c.inner_size ↦ string, c.full_attention_interval ↦ string, c.rope_dimension_count ↦ string, (c.freq_base ↦ string))
+    return "embd=§:heads=§:kv=§:key=§:conv=§:state=§:group=§:dt=§:inner=§:interval=§:rope=§:base=§:sections=§"(c.embedding_length ↦ string, c.head_count ↦ string, c.head_count_kv ↦ string, c.key_length ↦ string, c.conv_kernel ↦ string, c.state_size ↦ string, c.group_count ↦ string, c.gradus_temporis ↦ string, c.inner_size ↦ string, c.full_attention_interval ↦ string, c.rope_dimension_count ↦ string, (c.freq_base ↦ string), int_list_text(c.rope_sections))
 }
 
 fn schedule_wire(schedule.Qwen35moeSchedule s) → string {
@@ -159,10 +223,27 @@ fn schedule_wire(schedule.Qwen35moeSchedule s) → string {
     return out
 }
 
-fn tensor_2d_equal<size R, size C>(tensor<f32, [R, C]> a, tensor<f32, [R, C]> b) → bool {
-    for exclusive R let r {
+fn tensor_active_rows_equal<size R, size C>(tensor<f32, [R, C]> a, tensor<f32, [R, C]> b, int rows) → bool {
+    if rows ≺ 0 or rows ≻ R then return false
+    for exclusive rows let r {
         for exclusive C let c {
             if a[[r, c]] ≢ b[[r, c]] then return false
+        }
+    }
+    return true
+}
+
+fn ring_active_rows_equal<size W, size KVD>(tensor<f32, [W, KVD]> a, tensor<f32, [W, KVD]> b, int total_written, int win) → bool {
+    if total_written ≺ 0 or win ≺ 1 or win ≻ W then return false
+    if total_written ≡ 0 then return true
+    mut int start ← total_written - win
+    if start ≺ 0 {
+        start ← 0
+    }
+    for range start ‥ total_written let p {
+        let int slot ← p % win
+        for exclusive KVD let c {
+            if a[[slot, c]] ≢ b[[slot, c]] then return false
         }
     }
     return true
@@ -173,11 +254,14 @@ fn conv_arena_equal<size ConvRows, size ConvCh>(hybrid.ConvStateArena<size ConvR
     if a.sites_per_slot ≢ b.sites_per_slot then return false
     if a.history_len ≢ b.history_len then return false
     if a.channels ≢ b.channels then return false
+    if a.site_base ≢ b.site_base then return false
+    if a.txn_depth ≢ b.txn_depth then return false
     if a.slot_ids ≢ b.slot_ids then return false
     if a.steps_written ≢ b.steps_written then return false
     if a.buffers.length() ≢ b.buffers.length() then return false
+    let int active_rows ← a.sites_per_slot * a.history_len
     for exclusive a.buffers.length() let i {
-        if not tensor_2d_equal<size ConvRows, size ConvCh>(a.buffers[i], b.buffers[i]) then return false
+        if not tensor_active_rows_equal<size ConvRows, size ConvCh>(a.buffers[i], b.buffers[i], active_rows) then return false
     }
     return true
 }
@@ -186,11 +270,12 @@ fn conv_arena_equal<size ConvRows, size ConvCh>(hybrid.ConvStateArena<size ConvR
 fn recurrent_arena_equal<size RecRows, size RecCols>(hybrid.RecurrentStateArena<size RecRows, size RecCols> a, hybrid.RecurrentStateArena<size RecRows, size RecCols> b) → bool {
     if a.rows ≢ b.rows then return false
     if a.cols ≢ b.cols then return false
+    if a.txn_depth ≢ b.txn_depth then return false
     if a.slot_ids ≢ b.slot_ids then return false
     if a.steps_written ≢ b.steps_written then return false
     if a.states.length() ≢ b.states.length() then return false
     for exclusive a.states.length() let i {
-        if not tensor_2d_equal<size RecRows, size RecCols>(a.states[i], b.states[i]) then return false
+        if not tensor_active_rows_equal<size RecRows, size RecCols>(a.states[i], b.states[i], RecRows) then return false
     }
     return true
 }
@@ -210,16 +295,21 @@ fn session_kv_equal<size C, size W, size KVD>(sess_mod.SessionState<size C, size
     if a.full_kv.capacity ≢ b.full_kv.capacity or a.full_kv.kv_dim ≢ b.full_kv.kv_dim then return false
     if a.full_kv.slot_ids ≢ b.full_kv.slot_ids or a.full_kv.lengths ≢ b.full_kv.lengths then return false
     if a.full_kv.keys.length() ≢ b.full_kv.keys.length() or a.full_kv.values.length() ≢ b.full_kv.values.length() then return false
+    if a.full_kv.lengths.length() ≢ a.full_kv.keys.length() then return false
     for exclusive a.full_kv.keys.length() let i {
-        if not tensor_2d_equal<size C, size KVD>(a.full_kv.keys[i], b.full_kv.keys[i]) then return false
-        if not tensor_2d_equal<size C, size KVD>(a.full_kv.values[i], b.full_kv.values[i]) then return false
+        let int active ← a.full_kv.lengths[i]
+        if not tensor_active_rows_equal<size C, size KVD>(a.full_kv.keys[i], b.full_kv.keys[i], active) then return false
+        if not tensor_active_rows_equal<size C, size KVD>(a.full_kv.values[i], b.full_kv.values[i], active) then return false
     }
     if a.ring_kv.max_window ≢ b.ring_kv.max_window or a.ring_kv.kv_dim ≢ b.ring_kv.kv_dim then return false
     if a.ring_kv.slot_ids ≢ b.ring_kv.slot_ids or a.ring_kv.window_sizes ≢ b.ring_kv.window_sizes or a.ring_kv.total_written ≢ b.ring_kv.total_written then return false
     if a.ring_kv.keys.length() ≢ b.ring_kv.keys.length() or a.ring_kv.values.length() ≢ b.ring_kv.values.length() then return false
+    if a.ring_kv.total_written.length() ≢ a.ring_kv.keys.length() or a.ring_kv.window_sizes.length() ≢ a.ring_kv.keys.length() then return false
     for exclusive a.ring_kv.keys.length() let i {
-        if not tensor_2d_equal<size W, size KVD>(a.ring_kv.keys[i], b.ring_kv.keys[i]) then return false
-        if not tensor_2d_equal<size W, size KVD>(a.ring_kv.values[i], b.ring_kv.values[i]) then return false
+        let int tw ← a.ring_kv.total_written[i]
+        let int win ← a.ring_kv.window_sizes[i]
+        if not ring_active_rows_equal<size W, size KVD>(a.ring_kv.keys[i], b.ring_kv.keys[i], tw, win) then return false
+        if not ring_active_rows_equal<size W, size KVD>(a.ring_kv.values[i], b.ring_kv.values[i], tw, win) then return false
     }
     return true
 }
@@ -271,11 +361,11 @@ fn session_identity_key<size C, size W, size KVD, size ConvRows, size ConvCh, si
 }
 
 # Parse an identity wire back into a session-shaped record with fresh
-# empty placeholder arenas sized to the caller's type extents (`ConvRows`).
-# Identity wires carry no tensor payloads or `rope_sections`; callers
-# needing full arena payload round-trips should use `gradus:prepared_state`
-# wire v2 (`serialize_hybrid_session` / `deserialize_hybrid_session`).
-# Round-trips through session_identity_key.
+# empty placeholder arenas sized from the wire's `state_types` conv history
+# length and `execution_config` `rope_sections`. Identity wires carry no
+# tensor payloads; callers needing full arena payload round-trips should use
+# `gradus:prepared_state` wire v2 (`serialize_hybrid_session` /
+# `deserialize_hybrid_session`). Round-trips through session_identity_key.
 @ public
 fn deserialize_session_identity<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols>(string wire) → HybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> ⇥ schedule.Qwen35moeStateError {
     let list<string> parts ← wire.split("/")
@@ -283,20 +373,23 @@ fn deserialize_session_identity<size C, size W, size KVD, size ConvRows, size Co
     require (parts.get(0) coalesce "") ≡ "qwen35moe-state" throw variant BadState {message = "unknown identity marker"}
     require (parts.get(1) coalesce "") ≡ "identity" throw variant BadState {message = "unknown identity marker"}
     require (parts.get(2) coalesce "") ≡ IDENTITY_SCHEMA throw variant BadState {message = "unknown identity schema"}
-    mut list<int> kinds ← empty
+    let string model ← parts.get(3) coalesce ""
+    let string model_version ← parts.get(4) coalesce ""
+    let string exec_cfg ← parts.get(5) coalesce ""
+    let string tokenizer ← parts.get(6) coalesce ""
     let string schedule_wire ← parts.get(7) coalesce ""
+    let string state_types ← parts.get(8) coalesce ""
+    let string dtype ← parts.get(9) coalesce ""
+    require schedule_wire.length() ≥ 1 throw variant BadState {message = "malformed schedule wire"}
+    mut list<int> kinds ← empty
     for from schedule_wire let c {
         let int kind ← digit_value(c ↦ string)
         require kind ≥ 0 and kind ≤ 2 throw variant BadState {message = "malformed schedule wire"}
         kinds.append(kind)
     }
-    mut int generation ← 0
-    let string generation_wire ← parts.get(10) coalesce "0"
-    for from generation_wire let c {
-        let int digit ← digit_value(c ↦ string)
-        require digit ≥ 0 throw variant BadState {message = "malformed generation wire"}
-        generation ← generation * 10 + digit
-    }
+    let int generation ← parse_nonneg_int_text(parts.get(10) coalesce "", "malformed generation wire")
+    let list<int> rope_sections ← parse_rope_sections_wire(exec_cfg)
+    let int conv_history_len ← parse_conv_history_wire(state_types, exec_cfg, ConvRows)
     mut int linear ← 0
     mut int full ← 0
     mut int nextn ← 0
@@ -322,10 +415,10 @@ fn deserialize_session_identity<size C, size W, size KVD, size ConvRows, size Co
         }
     }
     let schedule.Qwen35moeSchedule s ← schedule.Qwen35moeSchedule {trunk_layers = linear + full, linear_layers = linear, full_layers = full, nextn_layers = nextn, kinds = kinds, linear_slots = linear_slots, full_slots = full_slots}
-    let _ exec_sched ← schedule.to_execution_schedule(s, [11, 11, 10, 0])
+    let _ exec_sched ← schedule.to_execution_schedule(s, rope_sections)
     do {
-        let hybrid.HybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> arenas ← hybrid.from_schedule<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols>(exec_sched, 1, ConvRows, false)
-        return HybridSession {schedule = s, arenas = arenas, generation = generation, model = parts.get(3) coalesce "", model_version = parts.get(4) coalesce "", execution_config = parts.get(5) coalesce "", tokenizer = parts.get(6) coalesce "", state_types = parts.get(8) coalesce "", dtype = parts.get(9) coalesce ""}
+        let hybrid.HybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> arenas ← hybrid.from_schedule<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols>(exec_sched, 1, conv_history_len, false)
+        return HybridSession {schedule = s, arenas = arenas, generation = generation, model = model, model_version = model_version, execution_config = exec_cfg, tokenizer = tokenizer, state_types = state_types, dtype = dtype}
     }
     catch err {
         throw variant schedule.Qwen35moeStateError.BadState {message = err.message}
@@ -419,23 +512,6 @@ fn prefix(int layer) → string {
 @ public
 fn empty_f32_row() → list<f32> {
     return empty
-}
-
-# [out, in] x [in, 1] -> out column as a plain list (GEMV row walk).
-@ public
-fn gemv(tensor.NumericBlock weight, list<f32> x, int in_dim, int out_dim) → list<f32> ⇥ schedule.Qwen35moeStateError {
-    require weight.data.length() ≡ out_dim * in_dim throw variant schedule.Qwen35moeStateError.BadShape {message = "projection weight window has the wrong length"}
-    require x.length() ≡ in_dim throw variant schedule.Qwen35moeStateError.BadShape {message = "projection input has the wrong length"}
-    mut list<f32> out ← empty
-    for range 0‥out_dim let o {
-        mut f32 sum ← 0.0
-        for range 0‥in_dim let i {
-            sum ← sum + (weight.data.get(o * in_dim + i) coalesce 0.0) * (x.get(i) coalesce 0.0)
-        }
-        require dtype.finite(sum) throw variant schedule.Qwen35moeStateError.NonFinite {message = "projection produced a non-finite value"}
-        out.append(sum)
-    }
-    return out
 }
 
 # [out, in] x [in, T] -> [T][out] rows (one projection over a whole window;

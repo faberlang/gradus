@@ -21,21 +21,27 @@ locale = "en"
 #   `prepared_state` is a host-side leaf. Typed `SessionState` and
 #   `HybridSession` arenas (`FullKvArena`, `RingKvArena`, `ConvStateArena`,
 #   `RecurrentStateArena`) hold device-ready `tensor<f32, [R, C]>` buffers.
-#   Serializing an arena reads each tensor elementwise across the device→host
-#   boundary (`t[[r, c]]`) into host-side shortest round-trip `f32` text
-#   tokens; deserializing parses and validates all metadata and payloads
-#   atomically on the host before allocating and populating fresh typed
-#   `tensor<f32, [R, C]>` buffers (`tf32[R, C] {}`).
+#   Wire v2 serializes `PreparedIdentity`, `ExecutionSchedule`, slot
+#   metadata, and ONLY active arena rows (`[0..length)` for `FullKvArena`,
+#   `[0..min(total_written, window))` for `RingKvArena`,
+#   `[0..sites_per_slot * history_len)` for `ConvStateArena`, and
+#   `[0..RecRows)` for `RecurrentStateArena`) into binary little-endian
+#   `list<b8>` without touching dirty rolled-back tail rows `[length..C)`.
+#   Deserialization validates headers, version, identity, schedule,
+#   counts, finite floats (`NaN`/`Inf` rejected), and EOF BEFORE allocating
+#   and populating fresh typed `tensor<f32, [R, C]>` buffers.
 #
-# Wire fields use `|` as a reserved separator. Empty prefix and digest values
-# use `-`. Tokenizer semantics remain owned by gradus:tokenizer; this module
-# checks only the structural facts needed at this boundary.
+# Identity v1 wire fields use `|` as a reserved separator; empty prefix and
+# digest values use `-`. Tokenizer semantics remain owned by gradus:tokenizer;
+# this module checks only the structural facts needed at this boundary.
 
 import from "gradus:tokenizer/identity"
 
 import from "gradus:cache/kv"
 
 import from "gradus:storage"
+
+import from "gradus:dtype" let dtype
 
 import from "gradus:model/schedule" let model_schedule
 
@@ -46,18 +52,20 @@ import from "gradus:cache/hybrid_arenas" let hybrid
 # The prepared identity wire schema version (v1).
 const string IDENTITY_SCHEMA_VERSION = "1.0.0"
 
-# The prepared arena wire schema version (v2).
-const string ARENA_WIRE_VERSION = "2.0.0"
+# Binary LE arena wire v2 header constants ("GPSW" v2.0.0).
+const int WIRE_V2_MAGIC_0 = 71
+const int WIRE_V2_MAGIC_1 = 80
+const int WIRE_V2_MAGIC_2 = 83
+const int WIRE_V2_MAGIC_3 = 87
+const int WIRE_V2_MAJOR = 2
+const int WIRE_V2_MINOR = 0
+const int WIRE_V2_PATCH = 0
+const int WIRE_KIND_SESSION = 1
+const int WIRE_KIND_HYBRID = 2
+const int U32_MAX_INT = 4294967295
 
-# The wire field separator (reserved in every free-text field) and the
-# documented empty-segment sentinel.
+# The v1 identity wire field separator and empty-segment sentinel.
 const string IDENTITY_SEPARATOR = "|"
-
-const string SECTION_SEPARATOR = ";"
-
-const string FIELD_SEPARATOR = ","
-
-const string ELEM_SEPARATOR = " "
 
 const string IDENTITY_EMPTY = "-"
 
@@ -801,547 +809,837 @@ fn continue_state(PreparedState s, list<int> suffix, list<kv.KVCache> next_layer
     return PreparedState { identity = next_identity, kv_layers = copy_kv_layers(next_layers), declared_slots = copy_slots(s.declared_slots), generation = s.generation }
 }
 
-# --- wire v2: atomic SessionState & HybridSession arena serialization ----
+# --- wire v2: binary LE atomic SessionState & HybridSession serialization -
 #
-# Device→host boundary:
-#   Arena tensors live on the compute route (`tensor<f32, [R, C]>`).
-#   Serialization reads each tensor elementwise into host `f32` text tokens;
-#   deserialization parses and validates all metadata and numeric payloads
-#   on the host BEFORE allocating fresh typed `tensor<f32, [R, C]>` buffers.
-#   Any version mismatch throws `UnknownVersion`; any structural, count,
-#   dimension, or open-transaction error fails closed without partial state.
+# Wire v2 encodes `PreparedIdentity`, `ExecutionSchedule`, slot metadata,
+# and ONLY active arena rows in little-endian binary (`list<b8>`).
+# Deserialization validates the header, version, identity, schedule, counts,
+# open-transaction guard, payload finiteness (`NaN`/`Inf` rejected), and EOF
+# BEFORE allocating any typed arena tensors.
 
-fn wire_v2_safe(string s) → bool {
-    if s.contains(IDENTITY_SEPARATOR) then return false
-    if s.contains(SECTION_SEPARATOR) then return false
-    if s.contains(FIELD_SEPARATOR) then return false
-    if s.contains(ELEM_SEPARATOR) then return false
-    if s.contains(":") then return false
-    return true
+@ public
+class PreparedSessionState<size C, size W, size KVD> {
+    mut PreparedIdentity identity
+    mut sess_mod.SessionState<size C, size W, size KVD> session
 }
 
-fn parse_nonneg_int(string s, string label) → int ⇥ PreparedStateError {
-    require numeric(s) throw variant BadWire { message = "malformed integer in §"(label) }
-    mut int v ← 0
-    do {
-        v ↤ s
-    }
-    catch err {
-        throw variant BadWire { message = "malformed integer in §"(label) }
-    }
-    return v
+@ public
+class PreparedHybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> {
+    mut PreparedIdentity identity
+    mut hybrid.HybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> session
 }
 
-fn parse_bool_wire(string s, string label) → bool ⇥ PreparedStateError {
-    require s ≡ "true" or s ≡ "false" throw variant BadWire { message = "malformed boolean in §"(label) }
-    return s ≡ "true"
+class WireCursor {
+    mut int pos
 }
 
-fn parse_f32_wire(string s) → f32 ⇥ PreparedStateError {
-    require s.length() ≢ 0 throw variant BadWire { message = "empty float token in arena payload" }
-    mut f32 v ← 0.0 ∷ f32
-    do {
-        v ↤ s
-    }
-    catch err {
-        throw variant BadWire { message = "malformed float token in arena payload" }
-    }
-    return v
+class SessionWireMeta {
+    let PreparedIdentity identity
+    let model_schedule.ExecutionSchedule sched
+    let int session_id
+    let list<sess_mod.KvQuantConfig> quants
+    let list<int> full_lens
+    let list<int> ring_windows
+    let list<int> ring_written
 }
 
-fn serialize_int_list_wire(list<int> xs, string sep) → string {
-    if xs.length() ≡ 0 then return IDENTITY_EMPTY
-    mut string out ← ""
-    for exclusive xs.length() let i {
-        if i ≻ 0 {
-            out ← out + sep
+class ConvWireMeta {
+    let int sites_per_slot
+    let int history_len
+    let int channels
+    let int conv_rows
+    let int site_base
+    let list<int> slot_ids
+    let list<int> steps_written
+}
+
+class RecWireMeta {
+    let int rows
+    let int cols
+    let list<int> slot_ids
+    let list<int> steps_written
+}
+
+fn wire_u8_at(list<b8> wire, int i) → int {
+    return (wire.get(i) coalesce 0x00 ∷ b8) ↦ u8 ↦ int
+}
+
+fn append_u8(mut list<u8> buf, int v) → void ⇥ PreparedStateError {
+    require v ≥ 0 and v ≤ 255 throw variant BadWire { message = "byte value out of u8 range" }
+    buf.append(v ↦ u8 ⊥ 0)
+}
+
+fn append_bool(mut list<u8> buf, bool v) → void {
+    if v {
+        buf.append(1 ↦ u8)
+    }
+    else {
+        buf.append(0 ↦ u8)
+    }
+}
+
+fn append_u32_le(mut list<u8> buf, int n) → void ⇥ PreparedStateError {
+    require n ≥ 0 and n ≤ U32_MAX_INT throw variant BadWire { message = "integer out of u32 wire range" }
+    buf.append(((n ⇒ 0) ↦ wrapping<u8>) ↦ u8)
+    buf.append(((n ⇒ 8) ↦ wrapping<u8>) ↦ u8)
+    buf.append(((n ⇒ 16) ↦ wrapping<u8>) ↦ u8)
+    buf.append(((n ⇒ 24) ↦ wrapping<u8>) ↦ u8)
+}
+
+fn append_i64_le(mut list<u8> buf, int n) → void {
+    buf.append(((n ⇒ 0) ↦ wrapping<u8>) ↦ u8)
+    buf.append(((n ⇒ 8) ↦ wrapping<u8>) ↦ u8)
+    buf.append(((n ⇒ 16) ↦ wrapping<u8>) ↦ u8)
+    buf.append(((n ⇒ 24) ↦ wrapping<u8>) ↦ u8)
+    buf.append(((n ⇒ 32) ↦ wrapping<u8>) ↦ u8)
+    buf.append(((n ⇒ 40) ↦ wrapping<u8>) ↦ u8)
+    buf.append(((n ⇒ 48) ↦ wrapping<u8>) ↦ u8)
+    buf.append(((n ⇒ 56) ↦ wrapping<u8>) ↦ u8)
+}
+
+fn append_text(mut list<u8> buf, string s) → void ⇥ PreparedStateError {
+    let list<b8> raw ↤ s
+    let list<u8> ub ← raw ↦ list<u8>
+    append_u32_le(mut buf, ub.length())
+    for from ub let b {
+        buf.append(b)
+    }
+}
+
+fn append_i64_list_le(mut list<u8> buf, list<int> xs) → void ⇥ PreparedStateError {
+    append_u32_le(mut buf, xs.length())
+    for from xs let x {
+        append_i64_le(mut buf, x)
+    }
+}
+
+fn append_f32_active_rows<size R, size C>(mut list<u8> buf, tensor<f32, [R, C]> t, int active_rows, int cols) → void ⇥ PreparedStateError {
+    require active_rows ≥ 0 and active_rows ≤ R throw variant PayloadMismatch { message = "active row count exceeds tensor extent" }
+    require cols ≥ 0 and cols ≤ C throw variant PayloadMismatch { message = "active col count exceeds tensor extent" }
+    if active_rows ≡ 0 or cols ≡ 0 then return
+    mut list<f32> flat ← empty
+    for exclusive active_rows let r {
+        for exclusive cols let c {
+            let f32 v ← t[[r, c]]
+            require dtype.finite(v) throw variant PayloadMismatch { message = "non-finite float in prepared-state payload" }
+            flat.append(v)
         }
-        out ← out + (xs[i] ↦ string)
     }
-    return out
+    let list<u8> raw ← (flat ↦ list<b8> via Le) ↦ list<u8>
+    for from raw let b {
+        buf.append(b)
+    }
 }
 
-fn parse_int_list_wire(string s, string sep, string label) → list<int> ⇥ PreparedStateError {
+fn read_u8(list<b8> wire, mut WireCursor cur) → int ⇥ PreparedStateError {
+    require 1 ≤ wire.length() - cur.pos throw variant BadWire { message = "truncated byte in prepared-state wire" }
+    let int v ← wire_u8_at(wire, cur.pos)
+    cur.pos ← cur.pos + 1
+    return v
+}
+
+fn read_bool(list<b8> wire, mut WireCursor cur, string label) → bool ⇥ PreparedStateError {
+    let int v ← read_u8(wire, mut cur)
+    require v ≡ 0 or v ≡ 1 throw variant BadWire { message = "malformed boolean in §"(label) }
+    return v ≡ 1
+}
+
+fn read_u32_le(list<b8> wire, mut WireCursor cur) → int ⇥ PreparedStateError {
+    require 4 ≤ wire.length() - cur.pos throw variant BadWire { message = "truncated u32 in prepared-state wire" }
+    let int p ← cur.pos
+    let int v ← (wire[p ‥ p + 4] ↦ u32 via Le) ↦ int ⊥ 0
+    cur.pos ← p + 4
+    return v
+}
+
+fn read_i64_le(list<b8> wire, mut WireCursor cur) → int ⇥ PreparedStateError {
+    require 8 ≤ wire.length() - cur.pos throw variant BadWire { message = "truncated i64 in prepared-state wire" }
+    let int p ← cur.pos
+    let int v ← (wire[p ‥ p + 8] ↦ i64 via Le) ↦ int ⊥ 0
+    cur.pos ← p + 8
+    return v
+}
+
+fn read_nonneg_i64_le(list<b8> wire, mut WireCursor cur, string label) → int ⇥ PreparedStateError {
+    let int v ← read_i64_le(wire, mut cur)
+    require v ≥ 0 throw variant BadWire { message = "negative integer in §"(label) }
+    return v
+}
+
+fn read_text(list<b8> wire, mut WireCursor cur) → string ⇥ PreparedStateError {
+    let int len ← read_u32_le(wire, mut cur)
+    require len ≥ 0 and len ≤ wire.length() - cur.pos throw variant BadWire { message = "truncated text field in prepared-state wire" }
+    let int start ← cur.pos
+    cur.pos ← start + len
+    do {
+        let string s ↤ wire[start ‥ start + len]
+        return s
+    }
+    catch err {
+        throw variant BadWire { message = "invalid UTF-8 text in prepared-state wire" }
+    }
+    throw variant BadWire { message = "unreachable text decode" }
+}
+
+fn read_nonneg_i64_list_le(list<b8> wire, mut WireCursor cur, string label) → list<int> ⇥ PreparedStateError {
+    let int count ← read_u32_le(wire, mut cur)
+    require count ≤ (wire.length() - cur.pos) / 8 throw variant BadWire { message = "truncated integer list in §"(label) }
     mut list<int> out ← empty
-    if s ≡ IDENTITY_EMPTY then return out
-    let list<string> items ← s.split(sep)
-    for from items let item {
-        out.append(parse_nonneg_int(item, label))
+    for exclusive count {
+        out.append(read_nonneg_i64_le(wire, mut cur, label))
     }
     return out
 }
 
-# Device→host read: elementwise tensor read into host-side f32 text tokens.
-fn serialize_tensor_2d_host<size R, size C>(tensor<f32, [R, C]> t) → string {
-    mut string out ← ""
-    mut bool first ← true
-    for exclusive R let r {
-        for exclusive C let c {
-            if not first {
-                out ← out + ELEM_SEPARATOR
-            }
-            out ← out + ((t[[r, c]] ↦ f32) ↦ string)
-            first ← false
-        }
-    }
-    if out.length() ≡ 0 then return IDENTITY_EMPTY
-    return out
-}
-
-# Host-side parse & exact element-count validation before tensor allocation.
-fn parse_tensor_2d_payload<size R, size C>(string payload) → list<f32> ⇥ PreparedStateError {
-    let int expected ← R * C
-    if payload ≡ IDENTITY_EMPTY {
-        require expected ≡ 0 throw variant BadWire { message = "empty tensor payload for non-empty shape" }
-        return empty
-    }
-    let list<string> tokens ← payload.split(ELEM_SEPARATOR)
-    require tokens.length() ≡ expected throw variant PayloadMismatch { message = "tensor payload element count mismatch" }
+fn read_f32_into(list<b8> wire, mut WireCursor cur, int rows, int cols, mut list<f32> dst) → void ⇥ PreparedStateError {
+    require rows ≥ 0 and cols ≥ 0 throw variant PayloadMismatch { message = "negative tensor shape in prepared-state wire" }
+    if rows ≡ 0 or cols ≡ 0 then return
+    let int remaining ← wire.length() - cur.pos
+    let int max_elems ← remaining / 4
+    require rows ≤ max_elems / cols throw variant BadWire { message = "truncated tensor payload in prepared-state wire" }
+    let int total ← rows * cols
+    let int byte_len ← total * 4
+    let int start ← cur.pos
     mut list<f32> vals ← empty
-    for from tokens let tok {
-        vals.append(parse_f32_wire(tok))
+    do {
+        vals ← wire[start ‥ start + byte_len] ↦ list<f32> via Le
     }
-    return vals
+    catch err {
+        throw variant BadWire { message = "malformed float payload in prepared-state wire" }
+    }
+    cur.pos ← start + byte_len
+    require vals.length() ≡ total throw variant PayloadMismatch { message = "tensor payload element count mismatch" }
+    for from vals let v {
+        require dtype.finite(v) throw variant PayloadMismatch { message = "non-finite float in prepared-state wire" }
+        dst.append(v)
+    }
 }
 
-# Host→device allocation: populate fresh typed tensor<f32, [R, C]>.
-fn materialize_tensor_2d<size R, size C>(list<f32> host_vals) → tensor<f32, [R, C]> {
+fn materialize_active_rows_2d<size R, size C>(list<f32> flat, int offset, int rows, int cols) → tensor<f32, [R, C]> {
     mut tensor<f32, [R, C]> t ← tf32[R, C] {}
-    for exclusive R let r {
-        for exclusive C let c {
-            t[[r, c]] ← host_vals[r * C + c]
+    for exclusive rows let r {
+        for exclusive cols let c {
+            t[[r, c]] ← flat[offset + r * cols + c]
         }
     }
     return t
 }
 
-fn serialize_attention_kind(model_schedule.AttentionKind a) → string {
+fn append_wire_v2_header(mut list<u8> buf, int kind) → void ⇥ PreparedStateError {
+    append_u8(mut buf, WIRE_V2_MAGIC_0)
+    append_u8(mut buf, WIRE_V2_MAGIC_1)
+    append_u8(mut buf, WIRE_V2_MAGIC_2)
+    append_u8(mut buf, WIRE_V2_MAGIC_3)
+    append_u8(mut buf, WIRE_V2_MAJOR)
+    append_u8(mut buf, WIRE_V2_MINOR)
+    append_u8(mut buf, WIRE_V2_PATCH)
+    append_u8(mut buf, kind)
+}
+
+fn read_wire_v2_header(list<b8> wire, mut WireCursor cur, int expected_kind) → void ⇥ PreparedStateError {
+    require wire.length() ≥ 8 throw variant BadWire { message = "truncated prepared-state wire header" }
+    let int m0 ← wire_u8_at(wire, 0)
+    let int m1 ← wire_u8_at(wire, 1)
+    let int m2 ← wire_u8_at(wire, 2)
+    let int m3 ← wire_u8_at(wire, 3)
+    require m0 ≡ WIRE_V2_MAGIC_0 and m1 ≡ WIRE_V2_MAGIC_1 and m2 ≡ WIRE_V2_MAGIC_2 and m3 ≡ WIRE_V2_MAGIC_3 throw variant BadWire { message = "unknown prepared-state wire magic" }
+    let int major ← wire_u8_at(wire, 4)
+    let int minor ← wire_u8_at(wire, 5)
+    let int patch ← wire_u8_at(wire, 6)
+    require major ≡ WIRE_V2_MAJOR and minor ≡ WIRE_V2_MINOR and patch ≡ WIRE_V2_PATCH throw variant UnknownVersion { message = "unknown prepared-state wire version" }
+    let int kind ← wire_u8_at(wire, 7)
+    require kind ≡ expected_kind throw variant BadWire { message = "unexpected prepared-state wire kind" }
+    cur.pos ← 8
+}
+
+fn validate_identity(PreparedIdentity i) → PreparedIdentity ⇥ PreparedStateError {
+    return construct(i.model, i.model_version, i.config, i.tokenizer_identity, i.prefix, i.lookup_digest, i.position_start)
+}
+
+fn append_prepared_identity(mut list<u8> buf, PreparedIdentity i) → void ⇥ PreparedStateError {
+    let PreparedIdentity valid ← validate_identity(i)
+    let identity.TokenizerIdentity tok ← valid.tokenizer_identity
+    append_text(mut buf, valid.model)
+    append_text(mut buf, valid.model_version)
+    append_text(mut buf, valid.config)
+    append_text(mut buf, tok.schema)
+    append_text(mut buf, tok.merge_kind)
+    append_text(mut buf, tok.pre_tokenizer)
+    append_text(mut buf, tok.vocab_digest)
+    append_text(mut buf, tok.eog)
+    append_bool(mut buf, tok.bos_free)
+    append_bool(mut buf, tok.space_free)
+    append_i64_list_le(mut buf, valid.prefix)
+    append_text(mut buf, valid.lookup_digest)
+    append_i64_le(mut buf, valid.position_start)
+    append_i64_le(mut buf, valid.position_next())
+}
+
+fn read_prepared_identity(list<b8> wire, mut WireCursor cur) → PreparedIdentity ⇥ PreparedStateError {
+    let string model ← read_text(wire, mut cur)
+    let string model_version ← read_text(wire, mut cur)
+    let string config ← read_text(wire, mut cur)
+    let string tok_schema ← read_text(wire, mut cur)
+    let string tok_kind ← read_text(wire, mut cur)
+    let string tok_pre ← read_text(wire, mut cur)
+    let string tok_vocab ← read_text(wire, mut cur)
+    let string tok_eog ← read_text(wire, mut cur)
+    let bool tok_bos ← read_bool(wire, mut cur, "tokenizer.bos_free")
+    let bool tok_space ← read_bool(wire, mut cur, "tokenizer.space_free")
+    let identity.TokenizerIdentity tok ← identity.TokenizerIdentity { schema = tok_schema, merge_kind = tok_kind, pre_tokenizer = tok_pre, vocab_digest = tok_vocab, eog = tok_eog, bos_free = tok_bos, space_free = tok_space }
+    let list<int> prefix ← read_nonneg_i64_list_le(wire, mut cur, "identity.prefix")
+    let string digest ← read_text(wire, mut cur)
+    let int position_start ← read_nonneg_i64_le(wire, mut cur, "identity.position_start")
+    let int position_next ← read_nonneg_i64_le(wire, mut cur, "identity.position_next")
+    require position_next ≡ position_start + prefix.length() throw variant BadWire { message = "inconsistent consumed range in prepared-state wire v2" }
+    return construct(model, model_version, config, tok, prefix, digest, position_start)
+}
+
+fn append_attention_kind(mut list<u8> buf, model_schedule.AttentionKind a) → void ⇥ PreparedStateError {
     match a {
-        case Full { return "full" }
-        case SlidingWindow let w { return "ring:§"(w ↦ string) }
-        case LinearSsm { return "linear" }
-        case Nextn { return "nextn" }
+        case Full {
+            append_u8(mut buf, 0)
+        }
+        case SlidingWindow let w {
+            append_u8(mut buf, 1)
+            append_i64_le(mut buf, w)
+        }
+        case LinearSsm {
+            append_u8(mut buf, 2)
+        }
+        case Nextn {
+            append_u8(mut buf, 3)
+        }
     }
 }
 
-fn deserialize_attention_kind(string s) → model_schedule.AttentionKind ⇥ PreparedStateError {
-    if s ≡ "full" then return variant model_schedule.AttentionKind.Full
-    if s ≡ "linear" then return variant model_schedule.AttentionKind.LinearSsm
-    if s ≡ "nextn" then return variant model_schedule.AttentionKind.Nextn
-    let list<string> parts ← s.split(":")
-    require parts.length() ≡ 2 and (parts.get(0) coalesce "") ≡ "ring" throw variant BadWire { message = "unknown attention kind in wire v2" }
-    let int w ← parse_nonneg_int(parts.get(1) coalesce "", "sliding window")
-    require w ≥ 1 throw variant BadWire { message = "sliding window must be positive" }
-    return variant model_schedule.AttentionKind.SlidingWindow { window = w }
+fn read_attention_kind(list<b8> wire, mut WireCursor cur) → model_schedule.AttentionKind ⇥ PreparedStateError {
+    let int tag ← read_u8(wire, mut cur)
+    switch tag {
+        case 0 { return variant model_schedule.AttentionKind.Full }
+        case 1 {
+            let int w ← read_nonneg_i64_le(wire, mut cur, "sliding window")
+            require w ≥ 1 throw variant BadWire { message = "sliding window must be positive" }
+            return variant model_schedule.AttentionKind.SlidingWindow { window = w }
+        }
+        case 2 { return variant model_schedule.AttentionKind.LinearSsm }
+        case 3 { return variant model_schedule.AttentionKind.Nextn }
+        default { throw variant BadWire { message = "unknown attention kind in wire v2" } }
+    }
 }
 
-fn serialize_rope_kind(model_schedule.RopeKind r) → string {
+fn append_rope_kind(mut list<u8> buf, model_schedule.RopeKind r) → void ⇥ PreparedStateError {
     match r {
-        case model_schedule.RopeKind.None { return "none" }
-        case model_schedule.RopeKind.Standard { return "std" }
-        case model_schedule.RopeKind.RelativeBias { return "rel" }
+        case model_schedule.RopeKind.None {
+            append_u8(mut buf, 0)
+        }
+        case model_schedule.RopeKind.Standard {
+            append_u8(mut buf, 1)
+        }
+        case model_schedule.RopeKind.RelativeBias {
+            append_u8(mut buf, 2)
+        }
         case model_schedule.RopeKind.Sectional let secs {
-            if secs.length() ≡ 0 then return "sec:-"
-            return "sec:§"(serialize_int_list_wire(secs, "+"))
+            append_u8(mut buf, 3)
+            append_i64_list_le(mut buf, secs)
         }
     }
 }
 
-fn deserialize_rope_kind(string s) → model_schedule.RopeKind ⇥ PreparedStateError {
-    if s ≡ "none" then return variant model_schedule.RopeKind.None
-    if s ≡ "std" then return variant model_schedule.RopeKind.Standard
-    if s ≡ "rel" then return variant model_schedule.RopeKind.RelativeBias
-    let list<string> parts ← s.split(":")
-    require parts.length() ≡ 2 and (parts.get(0) coalesce "") ≡ "sec" throw variant BadWire { message = "unknown rope kind in wire v2" }
-    let list<int> secs ← parse_int_list_wire(parts.get(1) coalesce "", "+", "rope section")
-    return variant model_schedule.RopeKind.Sectional { dimension_sections = secs }
+fn read_rope_kind(list<b8> wire, mut WireCursor cur) → model_schedule.RopeKind ⇥ PreparedStateError {
+    let int tag ← read_u8(wire, mut cur)
+    switch tag {
+        case 0 { return variant model_schedule.RopeKind.None }
+        case 1 { return variant model_schedule.RopeKind.Standard }
+        case 2 { return variant model_schedule.RopeKind.RelativeBias }
+        case 3 {
+            let list<int> secs ← read_nonneg_i64_list_le(wire, mut cur, "rope sections")
+            return variant model_schedule.RopeKind.Sectional { dimension_sections = secs }
+        }
+        default { throw variant BadWire { message = "unknown rope kind in wire v2" } }
+    }
 }
 
-fn serialize_ffn_kind(model_schedule.FfnKind f) → string {
+fn append_ffn_kind(mut list<u8> buf, model_schedule.FfnKind f) → void ⇥ PreparedStateError {
     match f {
-        case Dense { return "dense" }
-        case MoE { return "moe" }
+        case Dense { append_u8(mut buf, 0) }
+        case MoE { append_u8(mut buf, 1) }
     }
 }
 
-fn deserialize_ffn_kind(string s) → model_schedule.FfnKind ⇥ PreparedStateError {
-    if s ≡ "dense" then return variant model_schedule.FfnKind.Dense
-    if s ≡ "moe" then return variant model_schedule.FfnKind.MoE
-    throw variant BadWire { message = "unknown ffn kind in wire v2" }
-}
-
-fn serialize_schedule_layers(list<model_schedule.LayerSpec> layers) → string {
-    if layers.length() ≡ 0 then return IDENTITY_EMPTY
-    mut string out ← ""
-    for exclusive layers.length() let i {
-        let model_schedule.LayerSpec sp ← layers[i]
-        if i ≻ 0 {
-            out ← out + SECTION_SEPARATOR
-        }
-        out ← out + "§,§,§,§"(sp.physical_layer_id ↦ string, serialize_attention_kind(sp.attention), serialize_rope_kind(sp.rope), serialize_ffn_kind(sp.ffn))
+fn read_ffn_kind(list<b8> wire, mut WireCursor cur) → model_schedule.FfnKind ⇥ PreparedStateError {
+    let int tag ← read_u8(wire, mut cur)
+    switch tag {
+        case 0 { return variant model_schedule.FfnKind.Dense }
+        case 1 { return variant model_schedule.FfnKind.MoE }
+        default { throw variant BadWire { message = "unknown ffn kind in wire v2" } }
     }
-    return out
 }
 
-fn deserialize_schedule_layers(string s) → list<model_schedule.LayerSpec> ⇥ PreparedStateError {
+fn append_schedule_layers(mut list<u8> buf, list<model_schedule.LayerSpec> layers) → void ⇥ PreparedStateError {
+    append_u32_le(mut buf, layers.length())
+    for from layers let sp {
+        append_i64_le(mut buf, sp.physical_layer_id)
+        append_attention_kind(mut buf, sp.attention)
+        append_rope_kind(mut buf, sp.rope)
+        append_ffn_kind(mut buf, sp.ffn)
+        append_i64_le(mut buf, sp.conv_sites)
+        append_i64_le(mut buf, sp.conv_kernel)
+    }
+}
+
+fn read_schedule_layers(list<b8> wire, mut WireCursor cur) → list<model_schedule.LayerSpec> ⇥ PreparedStateError {
+    let int count ← read_u32_le(wire, mut cur)
+    require count ≥ 1 and count ≤ (wire.length() - cur.pos) / 16 throw variant BadWire { message = "invalid schedule layer count in wire v2" }
     mut list<model_schedule.LayerSpec> out ← empty
-    if s ≡ IDENTITY_EMPTY then return out
-    let list<string> items ← s.split(SECTION_SEPARATOR)
-    for from items let item {
-        let list<string> f ← item.split(FIELD_SEPARATOR)
-        require f.length() ≡ 4 throw variant BadWire { message = "malformed layer spec in wire v2" }
-        let int pid ← parse_nonneg_int(f.get(0) coalesce "", "physical_layer_id")
-        let model_schedule.AttentionKind attn ← deserialize_attention_kind(f.get(1) coalesce "")
-        let model_schedule.RopeKind rope ← deserialize_rope_kind(f.get(2) coalesce "")
-        let model_schedule.FfnKind ffn ← deserialize_ffn_kind(f.get(3) coalesce "")
-        out.append(model_schedule.LayerSpec { physical_layer_id = pid, attention = attn, rope = rope, ffn = ffn })
+    for exclusive count {
+        let int pid ← read_nonneg_i64_le(wire, mut cur, "physical_layer_id")
+        let model_schedule.AttentionKind attn ← read_attention_kind(wire, mut cur)
+        let model_schedule.RopeKind rope ← read_rope_kind(wire, mut cur)
+        let model_schedule.FfnKind ffn ← read_ffn_kind(wire, mut cur)
+        let int cs ← read_nonneg_i64_le(wire, mut cur, "conv_sites")
+        let int ck ← read_nonneg_i64_le(wire, mut cur, "conv_kernel")
+        out.append(model_schedule.LayerSpec { physical_layer_id = pid, attention = attn, rope = rope, ffn = ffn, conv_sites = cs, conv_kernel = ck })
     }
     return out
 }
 
-fn serialize_schedule_segments(list<model_schedule.ScheduleSegment> segs) → string {
-    if segs.length() ≡ 0 then return IDENTITY_EMPTY
-    mut string out ← ""
-    for exclusive segs.length() let i {
-        if i ≻ 0 {
-            out ← out + SECTION_SEPARATOR
-        }
-        let model_schedule.ScheduleSegment seg ← segs[i]
+fn append_schedule_segments(mut list<u8> buf, list<model_schedule.ScheduleSegment> segs) → void ⇥ PreparedStateError {
+    append_u32_le(mut buf, segs.length())
+    for from segs let seg {
         match seg {
             case Linear let ls {
-                out ← out + "lin:§:§"(ls.start_layer ↦ string, ls.end_layer ↦ string)
+                append_u8(mut buf, 0)
+                append_i64_le(mut buf, ls.start_layer)
+                append_i64_le(mut buf, ls.end_layer)
             }
             case Patterned let ps {
-                out ← out + "pat:§:§"(ps.start_layer ↦ string, ps.end_layer ↦ string)
+                append_u8(mut buf, 1)
+                append_i64_le(mut buf, ps.start_layer)
+                append_i64_le(mut buf, ps.end_layer)
             }
             case Looped let lp {
-                out ← out + "loop:§:§:§"(lp.start_layer ↦ string, lp.end_layer ↦ string, lp.pass_count ↦ string)
+                append_u8(mut buf, 2)
+                append_i64_le(mut buf, lp.start_layer)
+                append_i64_le(mut buf, lp.end_layer)
+                append_i64_le(mut buf, lp.pass_count)
+                append_bool(mut buf, lp.reset_to_prelude)
+                append_i64_le(mut buf, lp.gate_rank)
+                append_bool(mut buf, lp.is_varloop)
+                append_i64_le(mut buf, lp.max_passes)
+            }
+        }
+    }
+}
+
+fn read_schedule_segments(list<b8> wire, mut WireCursor cur) → list<model_schedule.ScheduleSegment> ⇥ PreparedStateError {
+    let int count ← read_u32_le(wire, mut cur)
+    require count ≥ 1 and count ≤ (wire.length() - cur.pos) / 17 throw variant BadWire { message = "invalid schedule segment count in wire v2" }
+    mut list<model_schedule.ScheduleSegment> out ← empty
+    for exclusive count {
+        let int tag ← read_u8(wire, mut cur)
+        let int start_layer ← read_nonneg_i64_le(wire, mut cur, "segment start_layer")
+        let int end_layer ← read_nonneg_i64_le(wire, mut cur, "segment end_layer")
+        switch tag {
+            case 0 {
+                out.append(variant model_schedule.ScheduleSegment.Linear { seg = model_schedule.LinearSegment { start_layer = start_layer, end_layer = end_layer } })
+            }
+            case 1 {
+                out.append(variant model_schedule.ScheduleSegment.Patterned { seg = model_schedule.PatternedSegment { start_layer = start_layer, end_layer = end_layer } })
+            }
+            case 2 {
+                let int pass_count ← read_nonneg_i64_le(wire, mut cur, "segment pass_count")
+                let bool reset_to_prelude ← read_bool(wire, mut cur, "segment reset_to_prelude")
+                let int gate_rank ← read_nonneg_i64_le(wire, mut cur, "segment gate_rank")
+                let bool is_varloop ← read_bool(wire, mut cur, "segment is_varloop")
+                let int max_passes ← read_nonneg_i64_le(wire, mut cur, "segment max_passes")
+                out.append(variant model_schedule.ScheduleSegment.Looped { seg = model_schedule.LoopedSegment { start_layer = start_layer, end_layer = end_layer, pass_count = pass_count, reset_to_prelude = reset_to_prelude, gate_rank = gate_rank, is_varloop = is_varloop, max_passes = max_passes } })
+            }
+            default {
+                throw variant BadWire { message = "unknown schedule segment kind in wire v2" }
             }
         }
     }
     return out
 }
 
-fn deserialize_schedule_segments(string s) → list<model_schedule.ScheduleSegment> ⇥ PreparedStateError {
-    mut list<model_schedule.ScheduleSegment> out ← empty
-    if s ≡ IDENTITY_EMPTY then return out
-    let list<string> items ← s.split(SECTION_SEPARATOR)
-    for from items let item {
-        let list<string> f ← item.split(":")
-        let string kind ← f.get(0) coalesce ""
-        if kind ≡ "lin" {
-            require f.length() ≡ 3 throw variant BadWire { message = "malformed linear segment in wire v2" }
-            let int a ← parse_nonneg_int(f.get(1) coalesce "", "segment start")
-            let int b ← parse_nonneg_int(f.get(2) coalesce "", "segment end")
-            out.append(variant model_schedule.ScheduleSegment.Linear { seg = model_schedule.LinearSegment { start_layer = a, end_layer = b } })
-        }
-        elif kind ≡ "pat" {
-            require f.length() ≡ 3 throw variant BadWire { message = "malformed patterned segment in wire v2" }
-            let int a ← parse_nonneg_int(f.get(1) coalesce "", "segment start")
-            let int b ← parse_nonneg_int(f.get(2) coalesce "", "segment end")
-            out.append(variant model_schedule.ScheduleSegment.Patterned { seg = model_schedule.PatternedSegment { start_layer = a, end_layer = b } })
-        }
-        elif kind ≡ "loop" {
-            require f.length() ≡ 4 throw variant BadWire { message = "malformed looped segment in wire v2" }
-            let int a ← parse_nonneg_int(f.get(1) coalesce "", "segment start")
-            let int b ← parse_nonneg_int(f.get(2) coalesce "", "segment end")
-            let int p ← parse_nonneg_int(f.get(3) coalesce "", "segment pass_count")
-            out.append(variant model_schedule.ScheduleSegment.Looped { seg = model_schedule.LoopedSegment { start_layer = a, end_layer = b, pass_count = p } })
-        }
-        else {
-            throw variant BadWire { message = "unknown schedule segment kind in wire v2" }
-        }
+fn append_schedule(mut list<u8> buf, model_schedule.ExecutionSchedule sched) → void ⇥ PreparedStateError {
+    append_schedule_layers(mut buf, sched.layers)
+    append_schedule_segments(mut buf, sched.segments)
+    match sched.residual {
+        case model_schedule.ResidualKind.Standard { append_u8(mut buf, 0) }
+        case model_schedule.ResidualKind.AttnRes { append_u8(mut buf, 1) }
     }
-    return out
-}
-
-fn serialize_schedule_residual(model_schedule.ResidualKind r) → string {
-    match r {
-        case model_schedule.ResidualKind.Standard { return "std" }
-        case model_schedule.ResidualKind.AttnRes { return "attnres" }
+    append_u32_le(mut buf, sched.taps.length())
+    for from sched.taps let tb {
+        require tb.name.length() ≥ 1 throw variant BadWire { message = "empty tap buffer name in schedule" }
+        append_text(mut buf, tb.name)
+        append_i64_le(mut buf, tb.visit_id)
     }
 }
 
-fn deserialize_schedule_residual(string s) → model_schedule.ResidualKind ⇥ PreparedStateError {
-    if s ≡ "std" then return variant model_schedule.ResidualKind.Standard
-    if s ≡ "attnres" then return variant model_schedule.ResidualKind.AttnRes
-    throw variant BadWire { message = "unknown residual kind in wire v2" }
-}
-
-fn serialize_schedule_taps(list<model_schedule.TapBuffer> taps) → string ⇥ PreparedStateError {
-    if taps.length() ≡ 0 then return IDENTITY_EMPTY
-    mut string out ← ""
-    for exclusive taps.length() let i {
-        let model_schedule.TapBuffer tb ← taps[i]
-        require tb.name.length() ≢ 0 and wire_v2_safe(tb.name) throw variant BadWire { message = "invalid tap buffer name in wire v2" }
-        if i ≻ 0 {
-            out ← out + SECTION_SEPARATOR
-        }
-        out ← out + "§:§"(tb.name, tb.visit_id ↦ string)
+fn read_schedule(list<b8> wire, mut WireCursor cur) → model_schedule.ExecutionSchedule ⇥ PreparedStateError {
+    let list<model_schedule.LayerSpec> layers ← read_schedule_layers(wire, mut cur)
+    let list<model_schedule.ScheduleSegment> segs ← read_schedule_segments(wire, mut cur)
+    let int rtag ← read_u8(wire, mut cur)
+    mut model_schedule.ResidualKind res ← variant model_schedule.ResidualKind.Standard
+    if rtag ≡ 0 {
+        res ← variant model_schedule.ResidualKind.Standard
     }
-    return out
-}
-
-fn deserialize_schedule_taps(string s) → list<model_schedule.TapBuffer> ⇥ PreparedStateError {
-    mut list<model_schedule.TapBuffer> out ← empty
-    if s ≡ IDENTITY_EMPTY then return out
-    let list<string> items ← s.split(SECTION_SEPARATOR)
-    for from items let item {
-        let list<string> f ← item.split(":")
-        require f.length() ≡ 2 throw variant BadWire { message = "malformed tap buffer in wire v2" }
-        let string name ← f.get(0) coalesce ""
-        require name.length() ≢ 0 throw variant BadWire { message = "empty tap buffer name in wire v2" }
-        let int vid ← parse_nonneg_int(f.get(1) coalesce "", "tap visit_id")
-        out.append(model_schedule.TapBuffer { name = name, visit_id = vid })
+    elif rtag ≡ 1 {
+        res ← variant model_schedule.ResidualKind.AttnRes
     }
-    return out
-}
-
-fn serialize_kv_quant_list(list<sess_mod.KvQuantConfig> qs) → string {
-    if qs.length() ≡ 0 then return IDENTITY_EMPTY
-    mut string out ← ""
-    for exclusive qs.length() let i {
-        let sess_mod.KvQuantConfig q ← qs[i]
-        if i ≻ 0 {
-            out ← out + SECTION_SEPARATOR
-        }
-        out ← out + "§,§,§,§"(q.key_bits ↦ string, q.value_bits ↦ string, q.group_size ↦ string, q.enabled ↦ string)
+    else {
+        throw variant BadWire { message = "unknown residual kind in wire v2" }
     }
-    return out
-}
-
-fn deserialize_kv_quant_list(string s) → list<sess_mod.KvQuantConfig> ⇥ PreparedStateError {
-    mut list<sess_mod.KvQuantConfig> out ← empty
-    if s ≡ IDENTITY_EMPTY then return out
-    let list<string> items ← s.split(SECTION_SEPARATOR)
-    for from items let item {
-        let list<string> f ← item.split(FIELD_SEPARATOR)
-        require f.length() ≡ 4 throw variant BadWire { message = "malformed KvQuantConfig in wire v2" }
-        let int kb ← parse_nonneg_int(f.get(0) coalesce "", "key_bits")
-        let int vb ← parse_nonneg_int(f.get(1) coalesce "", "value_bits")
-        let int gs ← parse_nonneg_int(f.get(2) coalesce "", "group_size")
-        let bool en ← parse_bool_wire(f.get(3) coalesce "", "kv_quant.enabled")
-        out.append(sess_mod.KvQuantConfig { key_bits = kb, value_bits = vb, group_size = gs, enabled = en })
+    let int taps_count ← read_u32_le(wire, mut cur)
+    require taps_count ≤ (wire.length() - cur.pos) / 12 throw variant BadWire { message = "invalid tap count in wire v2" }
+    mut list<model_schedule.TapBuffer> taps ← empty
+    for exclusive taps_count {
+        let string name ← read_text(wire, mut cur)
+        require name.length() ≥ 1 throw variant BadWire { message = "empty tap buffer name in wire v2" }
+        let int vid ← read_nonneg_i64_le(wire, mut cur, "tap visit_id")
+        taps.append(model_schedule.TapBuffer { name = name, visit_id = vid })
     }
-    return out
-}
-
-fn serialize_kv_pairs_2d<size R, size C>(list<tensor<f32, [R, C]>> keys, list<tensor<f32, [R, C]>> values) → string {
-    if keys.length() ≡ 0 then return IDENTITY_EMPTY
-    mut string out ← ""
-    for exclusive keys.length() let i {
-        if i ≻ 0 {
-            out ← out + SECTION_SEPARATOR
-        }
-        out ← out + "§,§"(serialize_tensor_2d_host<size R, size C>(keys[i]), serialize_tensor_2d_host<size R, size C>(values[i]))
-    }
-    return out
-}
-
-fn parse_kv_pairs_payload<size R, size C>(string s, int expected_count) → list<list<f32>> ⇥ PreparedStateError {
-    if s ≡ IDENTITY_EMPTY {
-        require expected_count ≡ 0 throw variant PayloadMismatch { message = "missing KV arena tensor payloads" }
-        return empty
-    }
-    let list<string> items ← s.split(SECTION_SEPARATOR)
-    require items.length() ≡ expected_count throw variant PayloadMismatch { message = "KV arena slot count mismatch" }
-    mut list<list<f32>> out ← empty
-    for from items let item {
-        let list<string> pair ← item.split(FIELD_SEPARATOR)
-        require pair.length() ≡ 2 throw variant BadWire { message = "malformed KV tensor pair in wire v2" }
-        out.append(parse_tensor_2d_payload<size R, size C>(pair.get(0) coalesce ""))
-        out.append(parse_tensor_2d_payload<size R, size C>(pair.get(1) coalesce ""))
-    }
-    return out
-}
-
-fn serialize_session_body<size C, size W, size KVD>(sess_mod.SessionState<size C, size W, size KVD> s) → string ⇥ PreparedStateError {
-    require s.txn_depth ≡ 0 throw variant PayloadMismatch { message = "cannot serialize SessionState with open transaction" }
-    let string dims ← "§,§,§"(C ↦ string, W ↦ string, KVD ↦ string)
-    let string layers ← serialize_schedule_layers(s.sched.layers)
-    let string segs ← serialize_schedule_segments(s.sched.segments)
-    let string res ← serialize_schedule_residual(s.sched.residual)
-    let string taps ← serialize_schedule_taps(s.sched.taps)
-    let string quants ← serialize_kv_quant_list(s.slot_kv_quant)
-    let string full_lens ← serialize_int_list_wire(s.full_kv.lengths, ELEM_SEPARATOR)
-    let string full_tensors ← serialize_kv_pairs_2d<size C, size KVD>(s.full_kv.keys, s.full_kv.values)
-    let string ring_written ← serialize_int_list_wire(s.ring_kv.total_written, ELEM_SEPARATOR)
-    let string ring_tensors ← serialize_kv_pairs_2d<size W, size KVD>(s.ring_kv.keys, s.ring_kv.values)
-    return "§|§|§|§|§|§|§|§|§|§"(dims, layers, segs, res, taps, quants, full_lens, full_tensors, ring_written, ring_tensors)
-}
-
-fn deserialize_session_fields<size C, size W, size KVD>(list<string> parts, int offset) → sess_mod.SessionState<size C, size W, size KVD> ⇥ PreparedStateError {
-    let list<string> dims ← (parts.get(offset) coalesce "").split(FIELD_SEPARATOR)
-    require dims.length() ≡ 3 throw variant BadWire { message = "malformed SessionState dims in wire v2" }
-    let int wc ← parse_nonneg_int(dims.get(0) coalesce "", "C")
-    let int ww ← parse_nonneg_int(dims.get(1) coalesce "", "W")
-    let int wkvd ← parse_nonneg_int(dims.get(2) coalesce "", "KVD")
-    require wc ≡ C and ww ≡ W and wkvd ≡ KVD throw variant PayloadMismatch { message = "SessionState arena dimensions do not match target extents" }
-
-    let list<model_schedule.LayerSpec> layers ← deserialize_schedule_layers(parts.get(offset + 1) coalesce "")
-    let list<model_schedule.ScheduleSegment> segs ← deserialize_schedule_segments(parts.get(offset + 2) coalesce "")
-    let model_schedule.ResidualKind res ← deserialize_schedule_residual(parts.get(offset + 3) coalesce "")
-    let list<model_schedule.TapBuffer> taps ← deserialize_schedule_taps(parts.get(offset + 4) coalesce "")
-
-    mut model_schedule.ExecutionSchedule sched ← model_schedule.ExecutionSchedule { layers = [], segments = [], steps = [], slots = [], residual = variant model_schedule.ResidualKind.Standard, taps = [] }
     do {
-        sched ← model_schedule.build_schedule(layers, segs, res, taps)
+        return model_schedule.build_schedule(layers, segs, res, taps)
     }
     catch err {
         throw variant BadWire { message = err.message }
     }
+    throw variant BadWire { message = "unreachable schedule build" }
+}
 
-    mut sess_mod.SessionState<size C, size W, size KVD> st ← sess_mod.SessionState { sched = sched, full_kv = sess_mod.FullKvArena { capacity = C, kv_dim = KVD, slot_ids = [], keys = [], values = [], lengths = [] }, ring_kv = sess_mod.RingKvArena { max_window = W, kv_dim = KVD, slot_ids = [], window_sizes = [], keys = [], values = [], total_written = [] }, slot_arena_kind = [], slot_local_index = [], slot_window_sizes = [], slot_kv_quant = [], txn_depth = 0 }
+fn validate_session_for_serialize<size C, size W, size KVD>(sess_mod.SessionState<size C, size W, size KVD> s) → void ⇥ PreparedStateError {
+    require s.txn_depth ≡ 0 and s.active_txn_id ≡ 0 throw variant PayloadMismatch { message = "cannot serialize SessionState with open transaction" }
+    require s.slot_kv_quant.length() ≡ s.sched.slots.length() throw variant PayloadMismatch { message = "KvQuantConfig count mismatch" }
+    for from s.slot_kv_quant let q {
+        require q.key_bits ≥ 0 and q.value_bits ≥ 0 and q.group_size ≥ 0 throw variant PayloadMismatch { message = "negative KvQuantConfig field" }
+    }
+    require s.full_kv.lengths.length() ≡ s.full_kv.keys.length() and s.full_kv.values.length() ≡ s.full_kv.keys.length() throw variant PayloadMismatch { message = "FullKvArena field count mismatch" }
+    for from s.full_kv.lengths let fl {
+        require fl ≥ 0 and fl ≤ C throw variant PayloadMismatch { message = "FullKvArena length exceeds capacity" }
+    }
+    require s.ring_kv.total_written.length() ≡ s.ring_kv.keys.length() and s.ring_kv.values.length() ≡ s.ring_kv.keys.length() and s.ring_kv.window_sizes.length() ≡ s.ring_kv.keys.length() throw variant PayloadMismatch { message = "RingKvArena field count mismatch" }
+    for exclusive s.ring_kv.keys.length() let i {
+        let int win ← s.ring_kv.window_sizes[i]
+        let int tw ← s.ring_kv.total_written[i]
+        require win ≥ 1 and win ≤ W throw variant PayloadMismatch { message = "RingKvArena window exceeds capacity" }
+        require tw ≥ 0 throw variant PayloadMismatch { message = "negative RingKvArena total_written" }
+    }
+}
+
+fn append_session_meta<size C, size W, size KVD>(mut list<u8> buf, sess_mod.SessionState<size C, size W, size KVD> s) → void ⇥ PreparedStateError {
+    append_i64_le(mut buf, C)
+    append_i64_le(mut buf, W)
+    append_i64_le(mut buf, KVD)
+    append_i64_le(mut buf, s.txn_depth)
+    append_i64_le(mut buf, s.session_id)
+    append_u32_le(mut buf, s.slot_kv_quant.length())
+    for from s.slot_kv_quant let q {
+        append_i64_le(mut buf, q.key_bits)
+        append_i64_le(mut buf, q.value_bits)
+        append_i64_le(mut buf, q.group_size)
+        append_bool(mut buf, q.enabled)
+    }
+    append_i64_list_le(mut buf, s.full_kv.lengths)
+    append_u32_le(mut buf, s.ring_kv.total_written.length())
+    for exclusive s.ring_kv.total_written.length() let i {
+        append_i64_le(mut buf, s.ring_kv.window_sizes[i])
+        append_i64_le(mut buf, s.ring_kv.total_written[i])
+    }
+}
+
+fn append_session_payloads<size C, size W, size KVD>(mut list<u8> buf, sess_mod.SessionState<size C, size W, size KVD> s) → void ⇥ PreparedStateError {
+    for exclusive s.full_kv.keys.length() let i {
+        let int active ← s.full_kv.lengths[i]
+        append_f32_active_rows<size C, size KVD>(mut buf, s.full_kv.keys[i], active, KVD)
+        append_f32_active_rows<size C, size KVD>(mut buf, s.full_kv.values[i], active, KVD)
+    }
+    for exclusive s.ring_kv.keys.length() let i {
+        let int active ← s.ring_kv.total_written[i] ⤓ s.ring_kv.window_sizes[i]
+        append_f32_active_rows<size W, size KVD>(mut buf, s.ring_kv.keys[i], active, KVD)
+        append_f32_active_rows<size W, size KVD>(mut buf, s.ring_kv.values[i], active, KVD)
+    }
+}
+
+fn expected_ring_windows(model_schedule.ExecutionSchedule sched) → list<int> {
+    mut list<int> out ← empty
+    for from sched.slots let sp {
+        match sp.arena {
+            case model_schedule.ArenaKind.RingKv let w {
+                out.append(w)
+            }
+            default { pass }
+        }
+    }
+    return out
+}
+
+fn read_session_wire_meta<size C, size W, size KVD>(list<b8> wire, mut WireCursor cur) → SessionWireMeta ⇥ PreparedStateError {
+    let PreparedIdentity ident ← read_prepared_identity(wire, mut cur)
+    let model_schedule.ExecutionSchedule sched ← read_schedule(wire, mut cur)
+    let int wc ← read_nonneg_i64_le(wire, mut cur, "C")
+    let int ww ← read_nonneg_i64_le(wire, mut cur, "W")
+    let int wkvd ← read_nonneg_i64_le(wire, mut cur, "KVD")
+    require wc ≡ C and ww ≡ W and wkvd ≡ KVD throw variant PayloadMismatch { message = "SessionState arena dimensions do not match target extents" }
+    require C ≥ 1 and W ≥ 1 and KVD ≥ 1 throw variant PayloadMismatch { message = "SessionState extents must be positive" }
+    let int wire_txn ← read_i64_le(wire, mut cur)
+    require wire_txn ≡ 0 throw variant PayloadMismatch { message = "cannot deserialize SessionState with open transaction" }
+    let int sid ← read_i64_le(wire, mut cur)
+
+    let int q_count ← read_u32_le(wire, mut cur)
+    require q_count ≡ sched.slots.length() throw variant PayloadMismatch { message = "KvQuantConfig count mismatch" }
+    require q_count ≤ (wire.length() - cur.pos) / 25 throw variant BadWire { message = "truncated KvQuantConfig list in wire v2" }
+    mut list<sess_mod.KvQuantConfig> quants ← empty
+    for exclusive q_count {
+        let int kb ← read_nonneg_i64_le(wire, mut cur, "key_bits")
+        let int vb ← read_nonneg_i64_le(wire, mut cur, "value_bits")
+        let int gs ← read_nonneg_i64_le(wire, mut cur, "group_size")
+        let bool en ← read_bool(wire, mut cur, "kv_quant.enabled")
+        quants.append(sess_mod.KvQuantConfig { key_bits = kb, value_bits = vb, group_size = gs, enabled = en })
+    }
+
+    let list<int> full_lens ← read_nonneg_i64_list_le(wire, mut cur, "full_kv.lengths")
+    require full_lens.length() ≡ model_schedule.full_kv_slot_count(sched) throw variant PayloadMismatch { message = "FullKvArena slot count mismatch" }
+    for from full_lens let fl {
+        require fl ≥ 0 and fl ≤ C throw variant PayloadMismatch { message = "FullKvArena length exceeds capacity" }
+    }
+
+    let list<int> sched_wins ← expected_ring_windows(sched)
+    let int ring_count ← read_u32_le(wire, mut cur)
+    require ring_count ≡ sched_wins.length() throw variant PayloadMismatch { message = "RingKvArena slot count mismatch" }
+    require ring_count ≤ (wire.length() - cur.pos) / 16 throw variant BadWire { message = "truncated RingKvArena metadata in wire v2" }
+    mut list<int> ring_windows ← empty
+    mut list<int> ring_written ← empty
+    for exclusive ring_count let i {
+        let int win ← read_nonneg_i64_le(wire, mut cur, "ring_kv.window_size")
+        let int tw ← read_nonneg_i64_le(wire, mut cur, "ring_kv.total_written")
+        require win ≥ 1 and win ≤ W and win ≡ sched_wins[i] throw variant PayloadMismatch { message = "RingKvArena window mismatch" }
+        ring_windows.append(win)
+        ring_written.append(tw)
+    }
+
+    return SessionWireMeta { identity = ident, sched = sched, session_id = sid, quants = quants, full_lens = full_lens, ring_windows = ring_windows, ring_written = ring_written }
+}
+
+fn read_session_payloads<size KVD>(list<b8> wire, mut WireCursor cur, SessionWireMeta smeta, mut list<f32> full_keys, mut list<f32> full_vals, mut list<f32> ring_keys, mut list<f32> ring_vals) → void ⇥ PreparedStateError {
+    for exclusive smeta.full_lens.length() let i {
+        let int active ← smeta.full_lens[i]
+        read_f32_into(wire, mut cur, active, KVD, mut full_keys)
+        read_f32_into(wire, mut cur, active, KVD, mut full_vals)
+    }
+    for exclusive smeta.ring_written.length() let i {
+        let int active ← smeta.ring_written[i] ⤓ smeta.ring_windows[i]
+        read_f32_into(wire, mut cur, active, KVD, mut ring_keys)
+        read_f32_into(wire, mut cur, active, KVD, mut ring_vals)
+    }
+}
+
+fn build_session_from_wire<size C, size W, size KVD>(SessionWireMeta smeta, list<f32> full_keys, list<f32> full_vals, list<f32> ring_keys, list<f32> ring_vals) → sess_mod.SessionState<size C, size W, size KVD> ⇥ PreparedStateError {
+    mut sess_mod.SessionState<size C, size W, size KVD> st ← sess_mod.SessionState { sched = smeta.sched, full_kv = sess_mod.FullKvArena { capacity = C, kv_dim = KVD, slot_ids = [], keys = [], values = [], lengths = [] }, ring_kv = sess_mod.RingKvArena { max_window = W, kv_dim = KVD, slot_ids = [], window_sizes = [], keys = [], values = [], total_written = [] }, slot_arena_kind = [], slot_local_index = [], slot_window_sizes = [], slot_kv_quant = [], txn_depth = 0 }
     do {
-        st ← sess_mod.from_schedule<size C, size W, size KVD>(sched)
+        st ← sess_mod.from_schedule_with_id<size C, size W, size KVD>(smeta.sched, smeta.session_id)
     }
     catch err {
         throw variant PayloadMismatch { message = err.message }
     }
-
-    let list<sess_mod.KvQuantConfig> quants ← deserialize_kv_quant_list(parts.get(offset + 5) coalesce "")
-    require quants.length() ≡ st.slot_kv_quant.length() throw variant PayloadMismatch { message = "KvQuantConfig count mismatch" }
-
-    let list<int> full_lens ← parse_int_list_wire(parts.get(offset + 6) coalesce "", ELEM_SEPARATOR, "full_kv.lengths")
-    require full_lens.length() ≡ st.full_kv.slot_ids.length() throw variant PayloadMismatch { message = "FullKvArena slot count mismatch" }
-    for from full_lens let fl {
-        require fl ≥ 0 and fl ≤ C throw variant PayloadMismatch { message = "FullKvArena length exceeds capacity" }
+    for exclusive smeta.quants.length() let i {
+        st.slot_kv_quant[i] ← smeta.quants[i]
     }
-    let list<list<f32>> full_payloads ← parse_kv_pairs_payload<size C, size KVD>(parts.get(offset + 7) coalesce "", st.full_kv.slot_ids.length())
-
-    let list<int> ring_written ← parse_int_list_wire(parts.get(offset + 8) coalesce "", ELEM_SEPARATOR, "ring_kv.total_written")
-    require ring_written.length() ≡ st.ring_kv.slot_ids.length() throw variant PayloadMismatch { message = "RingKvArena slot count mismatch" }
-    let list<list<f32>> ring_payloads ← parse_kv_pairs_payload<size W, size KVD>(parts.get(offset + 9) coalesce "", st.ring_kv.slot_ids.length())
-
-    # All metadata and host payloads validated — now commit into typed arenas.
-    for exclusive quants.length() let i {
-        st.slot_kv_quant[i] ← quants[i]
+    mut int f_off ← 0
+    for exclusive smeta.full_lens.length() let i {
+        let int active ← smeta.full_lens[i]
+        st.full_kv.lengths[i] ← active
+        st.full_kv.keys[i] ← materialize_active_rows_2d<size C, size KVD>(full_keys, f_off, active, KVD)
+        st.full_kv.values[i] ← materialize_active_rows_2d<size C, size KVD>(full_vals, f_off, active, KVD)
+        f_off ← f_off + active * KVD
     }
-    for exclusive full_lens.length() let i {
-        st.full_kv.lengths[i] ← full_lens[i]
-        st.full_kv.keys[i] ← materialize_tensor_2d<size C, size KVD>(full_payloads[i * 2])
-        st.full_kv.values[i] ← materialize_tensor_2d<size C, size KVD>(full_payloads[i * 2 + 1])
-    }
-    for exclusive ring_written.length() let i {
-        st.ring_kv.total_written[i] ← ring_written[i]
-        st.ring_kv.keys[i] ← materialize_tensor_2d<size W, size KVD>(ring_payloads[i * 2])
-        st.ring_kv.values[i] ← materialize_tensor_2d<size W, size KVD>(ring_payloads[i * 2 + 1])
+    mut int r_off ← 0
+    for exclusive smeta.ring_written.length() let i {
+        let int tw ← smeta.ring_written[i]
+        let int active ← tw ⤓ smeta.ring_windows[i]
+        st.ring_kv.total_written[i] ← tw
+        st.ring_kv.keys[i] ← materialize_active_rows_2d<size W, size KVD>(ring_keys, r_off, active, KVD)
+        st.ring_kv.values[i] ← materialize_active_rows_2d<size W, size KVD>(ring_vals, r_off, active, KVD)
+        r_off ← r_off + active * KVD
     }
     return st
 }
 
 @ public
-fn serialize_session_state<size C, size W, size KVD>(sess_mod.SessionState<size C, size W, size KVD> s) → string ⇥ PreparedStateError {
-    let string body ← serialize_session_body<size C, size W, size KVD>(s)
-    return "prepared-state/session/§|§"(ARENA_WIRE_VERSION, body)
+fn serialize_session_state<size C, size W, size KVD>(PreparedIdentity ident, sess_mod.SessionState<size C, size W, size KVD> s) → list<b8> ⇥ PreparedStateError {
+    validate_session_for_serialize<size C, size W, size KVD>(s)
+    mut list<u8> buf ← empty
+    append_wire_v2_header(mut buf, WIRE_KIND_SESSION)
+    append_prepared_identity(mut buf, ident)
+    append_schedule(mut buf, s.sched)
+    append_session_meta<size C, size W, size KVD>(mut buf, s)
+    append_session_payloads<size C, size W, size KVD>(mut buf, s)
+    let list<b8> wire ↤ buf
+    return wire
 }
 
 @ public
-fn deserialize_session_state<size C, size W, size KVD>(string wire) → sess_mod.SessionState<size C, size W, size KVD> ⇥ PreparedStateError {
-    let list<string> parts ← wire.split(IDENTITY_SEPARATOR)
-    require parts.length() ≡ 11 throw variant BadWire { message = "malformed prepared-state session wire" }
-    let list<string> marker ← (parts.get(0) coalesce "").split("/")
-    require marker.length() ≡ 3 throw variant BadWire { message = "unknown prepared-state session marker" }
-    require (marker.get(0) coalesce "") ≡ "prepared-state" throw variant BadWire { message = "unknown prepared-state session marker" }
-    require (marker.get(1) coalesce "") ≡ "session" throw variant BadWire { message = "unknown prepared-state session marker" }
-    require (marker.get(2) coalesce "") ≡ ARENA_WIRE_VERSION throw variant UnknownVersion { message = "unknown prepared-state session wire version" }
-    return deserialize_session_fields<size C, size W, size KVD>(parts, 1)
+fn deserialize_session_state<size C, size W, size KVD>(list<b8> wire) → PreparedSessionState<size C, size W, size KVD> ⇥ PreparedStateError {
+    mut WireCursor cur ← WireCursor { pos = 0 }
+    read_wire_v2_header(wire, mut cur, WIRE_KIND_SESSION)
+    let SessionWireMeta smeta ← read_session_wire_meta<size C, size W, size KVD>(wire, mut cur)
+    mut list<f32> full_keys ← empty
+    mut list<f32> full_vals ← empty
+    mut list<f32> ring_keys ← empty
+    mut list<f32> ring_vals ← empty
+    read_session_payloads<size KVD>(wire, mut cur, smeta, mut full_keys, mut full_vals, mut ring_keys, mut ring_vals)
+    require cur.pos ≡ wire.length() throw variant BadWire { message = "trailing bytes in prepared-state session wire" }
+    let sess_mod.SessionState<size C, size W, size KVD> st ← build_session_from_wire<size C, size W, size KVD>(smeta, full_keys, full_vals, ring_keys, ring_vals)
+    return PreparedSessionState { identity = smeta.identity, session = st }
 }
 
-fn serialize_tensor_list_2d<size R, size C>(list<tensor<f32, [R, C]>> ts) → string {
-    if ts.length() ≡ 0 then return IDENTITY_EMPTY
-    mut string out ← ""
-    for exclusive ts.length() let i {
-        if i ≻ 0 {
-            out ← out + SECTION_SEPARATOR
+fn slot_ids_unique(list<int> ids, int bound) → bool {
+    for exclusive ids.length() let i {
+        if ids[i] ≺ 0 then return false
+        if bound ≥ 0 and ids[i] ≥ bound then return false
+        for range i + 1 ‥ ids.length() let j {
+            if ids[i] ≡ ids[j] then return false
         }
-        out ← out + serialize_tensor_2d_host<size R, size C>(ts[i])
     }
-    return out
+    return true
 }
 
-fn parse_tensor_list_payload<size R, size C>(string s, int expected_count) → list<list<f32>> ⇥ PreparedStateError {
-    if s ≡ IDENTITY_EMPTY {
-        require expected_count ≡ 0 throw variant PayloadMismatch { message = "missing arena tensor payloads" }
-        return empty
+fn validate_hybrid_for_serialize<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols>(hybrid.HybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> hs) → void ⇥ PreparedStateError {
+    validate_session_for_serialize<size C, size W, size KVD>(hs.kv)
+    require hs.conv.txn_depth ≡ 0 and hs.recurrent.txn_depth ≡ 0 throw variant PayloadMismatch { message = "cannot serialize HybridSession with open transaction" }
+    require hs.conv.sites_per_slot ≥ 1 and hs.conv.history_len ≥ 1 and hs.conv.channels ≡ ConvCh and ConvCh ≥ 1 throw variant PayloadMismatch { message = "ConvStateArena dimensions do not match target extents" }
+    require hs.conv.site_base ≥ 0 throw variant PayloadMismatch { message = "negative ConvStateArena site_base" }
+    require hs.conv.sites_per_slot * hs.conv.history_len ≤ ConvRows throw variant PayloadMismatch { message = "ConvStateArena active rows exceed ConvRows" }
+    require hs.conv.slot_ids.length() ≡ hs.conv.buffers.length() and hs.conv.steps_written.length() ≡ hs.conv.buffers.length() throw variant PayloadMismatch { message = "ConvStateArena slot count mismatch" }
+    for from hs.conv.steps_written let sw {
+        require sw ≥ 0 throw variant PayloadMismatch { message = "negative ConvStateArena steps_written" }
     }
-    let list<string> items ← s.split(SECTION_SEPARATOR)
-    require items.length() ≡ expected_count throw variant PayloadMismatch { message = "arena slot count mismatch" }
-    mut list<list<f32>> out ← empty
-    for from items let item {
-        out.append(parse_tensor_2d_payload<size R, size C>(item))
+    require hs.recurrent.rows ≡ RecRows and hs.recurrent.cols ≡ RecCols and RecRows ≥ 1 and RecCols ≥ 1 throw variant PayloadMismatch { message = "RecurrentStateArena dimensions do not match target extents" }
+    require hs.recurrent.slot_ids.length() ≡ hs.recurrent.states.length() and hs.recurrent.steps_written.length() ≡ hs.recurrent.states.length() throw variant PayloadMismatch { message = "RecurrentStateArena slot count mismatch" }
+    for from hs.recurrent.steps_written let sw {
+        require sw ≥ 0 throw variant PayloadMismatch { message = "negative RecurrentStateArena steps_written" }
     }
-    return out
 }
 
-@ public
-fn serialize_hybrid_session<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols>(hybrid.HybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> hs) → string ⇥ PreparedStateError {
-    let string kv_body ← serialize_session_body<size C, size W, size KVD>(hs.kv)
-    let bool conv_all_slots ← hs.conv.slot_ids.length() ≡ hs.kv.sched.slots.length()
-    let string conv_meta ← "§,§,§,§,§"(hs.conv.sites_per_slot ↦ string, hs.conv.history_len ↦ string, ConvRows ↦ string, ConvCh ↦ string, conv_all_slots ↦ string)
-    let string conv_steps ← serialize_int_list_wire(hs.conv.steps_written, ELEM_SEPARATOR)
-    let string conv_bufs ← serialize_tensor_list_2d<size ConvRows, size ConvCh>(hs.conv.buffers)
-    let string rec_meta ← "§,§"(RecRows ↦ string, RecCols ↦ string)
-    let string rec_steps ← serialize_int_list_wire(hs.recurrent.steps_written, ELEM_SEPARATOR)
-    let string rec_states ← serialize_tensor_list_2d<size RecRows, size RecCols>(hs.recurrent.states)
-    return "prepared-state/hybrid/§|§|§|§|§|§|§|§"(ARENA_WIRE_VERSION, kv_body, conv_meta, conv_steps, conv_bufs, rec_meta, rec_steps, rec_states)
-}
-
-@ public
-fn deserialize_hybrid_session<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols>(string wire) → hybrid.HybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> ⇥ PreparedStateError {
-    let list<string> parts ← wire.split(IDENTITY_SEPARATOR)
-    require parts.length() ≡ 17 throw variant BadWire { message = "malformed prepared-state hybrid wire" }
-    let list<string> marker ← (parts.get(0) coalesce "").split("/")
-    require marker.length() ≡ 3 throw variant BadWire { message = "unknown prepared-state hybrid marker" }
-    require (marker.get(0) coalesce "") ≡ "prepared-state" throw variant BadWire { message = "unknown prepared-state hybrid marker" }
-    require (marker.get(1) coalesce "") ≡ "hybrid" throw variant BadWire { message = "unknown prepared-state hybrid marker" }
-    require (marker.get(2) coalesce "") ≡ ARENA_WIRE_VERSION throw variant UnknownVersion { message = "unknown prepared-state hybrid wire version" }
-
-    let sess_mod.SessionState<size C, size W, size KVD> kv ← deserialize_session_fields<size C, size W, size KVD>(parts, 1)
-
-    let list<string> cmeta ← (parts.get(11) coalesce "").split(FIELD_SEPARATOR)
-    require cmeta.length() ≡ 5 throw variant BadWire { message = "malformed ConvStateArena metadata in wire v2" }
-    let int sites ← parse_nonneg_int(cmeta.get(0) coalesce "", "sites_per_slot")
-    let int hlen ← parse_nonneg_int(cmeta.get(1) coalesce "", "history_len")
-    let int crows ← parse_nonneg_int(cmeta.get(2) coalesce "", "ConvRows")
-    let int cch ← parse_nonneg_int(cmeta.get(3) coalesce "", "ConvCh")
-    let bool conv_all ← parse_bool_wire(cmeta.get(4) coalesce "", "conv_all_slots")
+fn read_conv_wire_meta<size ConvRows, size ConvCh>(list<b8> wire, mut WireCursor cur, int slot_count) → ConvWireMeta ⇥ PreparedStateError {
+    let int sites ← read_nonneg_i64_le(wire, mut cur, "sites_per_slot")
+    let int hlen ← read_nonneg_i64_le(wire, mut cur, "history_len")
+    let int cch ← read_nonneg_i64_le(wire, mut cur, "ConvCh")
+    let int crows ← read_nonneg_i64_le(wire, mut cur, "ConvRows")
+    let int site_base ← read_nonneg_i64_le(wire, mut cur, "site_base")
+    let int wire_txn ← read_i64_le(wire, mut cur)
+    require wire_txn ≡ 0 throw variant PayloadMismatch { message = "cannot deserialize ConvStateArena with open transaction" }
+    require sites ≥ 1 and hlen ≥ 1 and ConvCh ≥ 1 throw variant PayloadMismatch { message = "ConvStateArena dimensions must be positive" }
     require crows ≡ ConvRows and cch ≡ ConvCh throw variant PayloadMismatch { message = "ConvStateArena dimensions do not match target extents" }
+    require sites * hlen ≤ ConvRows throw variant PayloadMismatch { message = "ConvStateArena active rows exceed ConvRows" }
+    let list<int> slot_ids ← read_nonneg_i64_list_le(wire, mut cur, "conv.slot_ids")
+    let list<int> steps_written ← read_nonneg_i64_list_le(wire, mut cur, "conv.steps_written")
+    require slot_ids.length() ≡ steps_written.length() throw variant PayloadMismatch { message = "ConvStateArena slot count mismatch" }
+    require slot_ids_unique(slot_ids, slot_count) throw variant PayloadMismatch { message = "invalid ConvStateArena slot_ids" }
+    return ConvWireMeta { sites_per_slot = sites, history_len = hlen, channels = cch, conv_rows = crows, site_base = site_base, slot_ids = slot_ids, steps_written = steps_written }
+}
 
-    let list<string> rmeta ← (parts.get(14) coalesce "").split(FIELD_SEPARATOR)
-    require rmeta.length() ≡ 2 throw variant BadWire { message = "malformed RecurrentStateArena metadata in wire v2" }
-    let int rrows ← parse_nonneg_int(rmeta.get(0) coalesce "", "RecRows")
-    let int rcols ← parse_nonneg_int(rmeta.get(1) coalesce "", "RecCols")
+fn read_rec_wire_meta<size RecRows, size RecCols>(list<b8> wire, mut WireCursor cur) → RecWireMeta ⇥ PreparedStateError {
+    let int rrows ← read_nonneg_i64_le(wire, mut cur, "RecRows")
+    let int rcols ← read_nonneg_i64_le(wire, mut cur, "RecCols")
+    let int wire_txn ← read_i64_le(wire, mut cur)
+    require wire_txn ≡ 0 throw variant PayloadMismatch { message = "cannot deserialize RecurrentStateArena with open transaction" }
+    require RecRows ≥ 1 and RecCols ≥ 1 throw variant PayloadMismatch { message = "RecurrentStateArena dimensions must be positive" }
     require rrows ≡ RecRows and rcols ≡ RecCols throw variant PayloadMismatch { message = "RecurrentStateArena dimensions do not match target extents" }
+    let list<int> slot_ids ← read_nonneg_i64_list_le(wire, mut cur, "recurrent.slot_ids")
+    let list<int> steps_written ← read_nonneg_i64_list_le(wire, mut cur, "recurrent.steps_written")
+    require slot_ids.length() ≡ steps_written.length() throw variant PayloadMismatch { message = "RecurrentStateArena slot count mismatch" }
+    require slot_ids_unique(slot_ids, -1) throw variant PayloadMismatch { message = "invalid RecurrentStateArena slot_ids" }
+    return RecWireMeta { rows = rrows, cols = rcols, slot_ids = slot_ids, steps_written = steps_written }
+}
 
-    mut hybrid.ConvStateArena<size ConvRows, size ConvCh> conv ← hybrid.ConvStateArena { sites_per_slot = sites, history_len = hlen, channels = ConvCh, slot_ids = [], buffers = [], steps_written = [] }
-    mut hybrid.RecurrentStateArena<size RecRows, size RecCols> rec ← hybrid.RecurrentStateArena { rows = RecRows, cols = RecCols, slot_ids = [], states = [], steps_written = [] }
-    do {
-        conv ← hybrid.conv_from_schedule<size ConvRows, size ConvCh>(kv.sched, sites, hlen, conv_all)
-        rec ← hybrid.recurrent_from_schedule<size RecRows, size RecCols>(kv.sched)
+@ public
+fn serialize_hybrid_session<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols>(PreparedIdentity ident, hybrid.HybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> hs) → list<b8> ⇥ PreparedStateError {
+    validate_hybrid_for_serialize<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols>(hs)
+    mut list<u8> buf ← empty
+    append_wire_v2_header(mut buf, WIRE_KIND_HYBRID)
+    append_prepared_identity(mut buf, ident)
+    append_schedule(mut buf, hs.kv.sched)
+    append_session_meta<size C, size W, size KVD>(mut buf, hs.kv)
+
+    append_i64_le(mut buf, hs.conv.sites_per_slot)
+    append_i64_le(mut buf, hs.conv.history_len)
+    append_i64_le(mut buf, hs.conv.channels)
+    append_i64_le(mut buf, ConvRows)
+    append_i64_le(mut buf, hs.conv.site_base)
+    append_i64_le(mut buf, hs.conv.txn_depth)
+    append_i64_list_le(mut buf, hs.conv.slot_ids)
+    append_i64_list_le(mut buf, hs.conv.steps_written)
+
+    append_i64_le(mut buf, RecRows)
+    append_i64_le(mut buf, RecCols)
+    append_i64_le(mut buf, hs.recurrent.txn_depth)
+    append_i64_list_le(mut buf, hs.recurrent.slot_ids)
+    append_i64_list_le(mut buf, hs.recurrent.steps_written)
+
+    append_session_payloads<size C, size W, size KVD>(mut buf, hs.kv)
+    let int active_conv_rows ← hs.conv.sites_per_slot * hs.conv.history_len
+    for exclusive hs.conv.buffers.length() let i {
+        append_f32_active_rows<size ConvRows, size ConvCh>(mut buf, hs.conv.buffers[i], active_conv_rows, ConvCh)
     }
-    catch err {
-        throw variant PayloadMismatch { message = err.message }
+    for exclusive hs.recurrent.states.length() let i {
+        append_f32_active_rows<size RecRows, size RecCols>(mut buf, hs.recurrent.states[i], RecRows, RecCols)
     }
 
-    let list<int> conv_steps ← parse_int_list_wire(parts.get(12) coalesce "", ELEM_SEPARATOR, "conv.steps_written")
-    require conv_steps.length() ≡ conv.slot_ids.length() throw variant PayloadMismatch { message = "ConvStateArena slot count mismatch" }
-    let list<list<f32>> conv_payloads ← parse_tensor_list_payload<size ConvRows, size ConvCh>(parts.get(13) coalesce "", conv.slot_ids.length())
+    let list<b8> wire ↤ buf
+    return wire
+}
 
-    let list<int> rec_steps ← parse_int_list_wire(parts.get(15) coalesce "", ELEM_SEPARATOR, "recurrent.steps_written")
-    require rec_steps.length() ≡ rec.slot_ids.length() throw variant PayloadMismatch { message = "RecurrentStateArena slot count mismatch" }
-    let list<list<f32>> rec_payloads ← parse_tensor_list_payload<size RecRows, size RecCols>(parts.get(16) coalesce "", rec.slot_ids.length())
+@ public
+fn deserialize_hybrid_session<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols>(list<b8> wire) → PreparedHybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> ⇥ PreparedStateError {
+    mut WireCursor cur ← WireCursor { pos = 0 }
+    read_wire_v2_header(wire, mut cur, WIRE_KIND_HYBRID)
+    let SessionWireMeta smeta ← read_session_wire_meta<size C, size W, size KVD>(wire, mut cur)
+    let ConvWireMeta cmeta ← read_conv_wire_meta<size ConvRows, size ConvCh>(wire, mut cur, smeta.sched.slots.length())
+    let RecWireMeta rmeta ← read_rec_wire_meta<size RecRows, size RecCols>(wire, mut cur)
 
-    for exclusive conv_steps.length() let i {
-        conv.steps_written[i] ← conv_steps[i]
-        conv.buffers[i] ← materialize_tensor_2d<size ConvRows, size ConvCh>(conv_payloads[i])
+    mut list<f32> full_keys ← empty
+    mut list<f32> full_vals ← empty
+    mut list<f32> ring_keys ← empty
+    mut list<f32> ring_vals ← empty
+    read_session_payloads<size KVD>(wire, mut cur, smeta, mut full_keys, mut full_vals, mut ring_keys, mut ring_vals)
+
+    let int active_conv_rows ← cmeta.sites_per_slot * cmeta.history_len
+    mut list<f32> conv_vals ← empty
+    for exclusive cmeta.slot_ids.length() {
+        read_f32_into(wire, mut cur, active_conv_rows, ConvCh, mut conv_vals)
     }
-    for exclusive rec_steps.length() let i {
-        rec.steps_written[i] ← rec_steps[i]
-        rec.states[i] ← materialize_tensor_2d<size RecRows, size RecCols>(rec_payloads[i])
+    mut list<f32> rec_vals ← empty
+    for exclusive rmeta.slot_ids.length() {
+        read_f32_into(wire, mut cur, RecRows, RecCols, mut rec_vals)
     }
 
-    return hybrid.HybridSession { kv = kv, conv = conv, recurrent = rec }
+    require cur.pos ≡ wire.length() throw variant BadWire { message = "trailing bytes in prepared-state hybrid wire" }
+
+    # Every header, metadata check, payload byte count, finiteness check, and
+    # EOF check passed — allocate typed arenas now.
+    let sess_mod.SessionState<size C, size W, size KVD> kv ← build_session_from_wire<size C, size W, size KVD>(smeta, full_keys, full_vals, ring_keys, ring_vals)
+
+    mut list<tensor<f32, [ConvRows, ConvCh]>> conv_bufs ← empty
+    mut int c_off ← 0
+    for exclusive cmeta.slot_ids.length() {
+        conv_bufs.append(materialize_active_rows_2d<size ConvRows, size ConvCh>(conv_vals, c_off, active_conv_rows, ConvCh))
+        c_off ← c_off + active_conv_rows * ConvCh
+    }
+    let hybrid.ConvStateArena<size ConvRows, size ConvCh> conv ← hybrid.ConvStateArena { sites_per_slot = cmeta.sites_per_slot, history_len = cmeta.history_len, channels = ConvCh, slot_ids = cmeta.slot_ids, buffers = conv_bufs, steps_written = cmeta.steps_written, site_base = cmeta.site_base, txn_depth = 0, scratch_alloc_count = 0 }
+
+    mut list<tensor<f32, [RecRows, RecCols]>> rec_states ← empty
+    mut int r_off ← 0
+    for exclusive rmeta.slot_ids.length() {
+        rec_states.append(materialize_active_rows_2d<size RecRows, size RecCols>(rec_vals, r_off, RecRows, RecCols))
+        r_off ← r_off + RecRows * RecCols
+    }
+    let hybrid.RecurrentStateArena<size RecRows, size RecCols> rec ← hybrid.RecurrentStateArena { rows = RecRows, cols = RecCols, slot_ids = rmeta.slot_ids, states = rec_states, steps_written = rmeta.steps_written, txn_depth = 0 }
+
+    let hybrid.HybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> hs ← hybrid.HybridSession { kv = kv, conv = conv, recurrent = rec }
+    return PreparedHybridSession { identity = smeta.identity, session = hs }
 }
 
 +++ faber test
@@ -1393,6 +1691,7 @@ import from "gradus:generation/dense" dense_gen
 import from "gradus:model/schedule" let model_schedule
 import from "gradus:cache/session" let v2_session
 import from "gradus:cache/hybrid_arenas" let v2_hybrid
+import from "gradus:model/qwen35moe_state/session" let v2_qwen_session
 
 
 
@@ -2657,11 +2956,66 @@ fn v2_tensor_close<size R, size C>(tensor<f32, [R, C]> a, tensor<f32, [R, C]> b)
     return true
 }
 
-test "wire v2: SessionState round-trips FullKvArena, RingKvArena, and KvQuantConfig atomically" {
+fn patch_wire_byte(list<b8> wire, int idx, int val) → list<b8> {
+    mut list<u8> out ← wire ↦ list<u8>
+    out[idx] ← val ↦ u8 ⊥ 0
+    let list<b8> res ↤ out
+    return res
+}
+
+fn wire_append_tail_byte(list<b8> wire, int val) → list<b8> {
+    mut list<u8> out ← wire ↦ list<u8>
+    out.append(val ↦ u8 ⊥ 0)
+    let list<b8> res ↤ out
+    return res
+}
+
+fn v2_inkling_looped_schedule() → model_schedule.ExecutionSchedule {
+    do {
+        return model_schedule.inkling_schedule(2, 2, 2, 2, 64, false, 5, 4, 4, [model_schedule.TapBuffer { name = "loop_end", visit_id = 6 }])
+    }
+    catch err {
+        assert false
+        return model_schedule.ExecutionSchedule { layers = [], segments = [], steps = [], slots = [], residual = variant model_schedule.ResidualKind.Standard, taps = [] }
+    }
+}
+
+fn v2_err_variant_session(list<b8> wire) → string {
+    do {
+        let _ unused ← prepared_state.deserialize_session_state<size 4, size 3, size 2>(wire)
+        return "ok"
+    }
+    catch err {
+        match err {
+            case prepared_state.PreparedStateError.UnknownVersion let ? { return "unknown_version" }
+            case prepared_state.PreparedStateError.BadWire let ? { return "bad_wire" }
+            case prepared_state.PreparedStateError.InvalidIdentity let ? { return "invalid_identity" }
+            case prepared_state.PreparedStateError.PayloadMismatch let ? { return "payload_mismatch" }
+        }
+    }
+}
+
+fn v2_err_variant_hybrid(list<b8> wire) → string {
+    do {
+        let _ unused ← prepared_state.deserialize_hybrid_session<size 4, size 3, size 2, size 3, size 4, size 2, size 2>(wire)
+        return "ok"
+    }
+    catch err {
+        match err {
+            case prepared_state.PreparedStateError.UnknownVersion let ? { return "unknown_version" }
+            case prepared_state.PreparedStateError.BadWire let ? { return "bad_wire" }
+            case prepared_state.PreparedStateError.InvalidIdentity let ? { return "invalid_identity" }
+            case prepared_state.PreparedStateError.PayloadMismatch let ? { return "payload_mismatch" }
+        }
+    }
+}
+
+test "wire v2: binary LE SessionState round-trips PreparedIdentity, FullKv, RingKv, and KvQuantConfig" {
+    let prepared_state.PreparedIdentity id ← ident(ids2(5, 2), "deadbeef", 0)
     let model_schedule.ExecutionSchedule sched ← v2_hybrid_schedule()
     mut v2_session.SessionState<4, 3, 2> s ← v2_session.SessionState { sched = sched, full_kv = v2_session.FullKvArena { capacity = 4, kv_dim = 2, slot_ids = [], keys = [], values = [], lengths = [] }, ring_kv = v2_session.RingKvArena { max_window = 3, kv_dim = 2, slot_ids = [], window_sizes = [], keys = [], values = [], total_written = [] }, slot_arena_kind = [], slot_local_index = [], slot_window_sizes = [], slot_kv_quant = [], txn_depth = 0 }
     do {
-        s ← v2_session.from_schedule<size 4, size 3, size 2>(sched)
+        s ← v2_session.from_schedule_with_id<size 4, size 3, size 2>(sched, 4242)
     }
     catch err {
         assert false
@@ -2676,112 +3030,246 @@ test "wire v2: SessionState round-trips FullKvArena, RingKvArena, and KvQuantCon
     s.ring_kv.values[0][[2, 1]] ← -0.75 ∷ f32
 
     do {
-        let string wire ← prepared_state.serialize_session_state<size 4, size 3, size 2>(s)
-        assert wire.slice(0, 27) ≡ "prepared-state/session/2.0."
+        let list<b8> wire ← prepared_state.serialize_session_state<size 4, size 3, size 2>(id, s)
+        # Header: "GPSW" + 2.0.0 + kind=1.
+        assert (wire[0] ↦ u8 ↦ int) ≡ 71 and (wire[1] ↦ u8 ↦ int) ≡ 80 and (wire[2] ↦ u8 ↦ int) ≡ 83 and (wire[3] ↦ u8 ↦ int) ≡ 87
+        assert (wire[4] ↦ u8 ↦ int) ≡ 2 and (wire[5] ↦ u8 ↦ int) ≡ 0 and (wire[6] ↦ u8 ↦ int) ≡ 0 and (wire[7] ↦ u8 ↦ int) ≡ 1
 
-        let v2_session.SessionState<4, 3, 2> decoded ← prepared_state.deserialize_session_state<size 4, size 3, size 2>(wire)
-        assert decoded.full_kv.lengths.length() ≡ 1 and decoded.full_kv.lengths[0] ≡ 2
-        assert decoded.ring_kv.total_written.length() ≡ 1 and decoded.ring_kv.total_written[0] ≡ 4
-        assert decoded.slot_kv_quant[1].enabled
-        assert decoded.slot_kv_quant[1].key_bits ≡ 8
-        assert decoded.slot_kv_quant[1].value_bits ≡ 4
-        assert decoded.slot_kv_quant[1].group_size ≡ 32
-        assert v2_tensor_close<size 4, size 2>(decoded.full_kv.keys[0], s.full_kv.keys[0])
-        assert v2_tensor_close<size 4, size 2>(decoded.full_kv.values[0], s.full_kv.values[0])
-        assert v2_tensor_close<size 3, size 2>(decoded.ring_kv.keys[0], s.ring_kv.keys[0])
-        assert v2_tensor_close<size 3, size 2>(decoded.ring_kv.values[0], s.ring_kv.values[0])
+        let prepared_state.PreparedSessionState<4, 3, 2> decoded ← prepared_state.deserialize_session_state<size 4, size 3, size 2>(wire)
+        let v2_session.SessionState<4, 3, 2> decoded_sess ← decoded.session
+        assert prepared_state.prepared_identity_equal(decoded.identity, id)
+        assert decoded.identity.lookup_digest ≡ "deadbeef"
+        assert decoded_sess.session_id ≡ 4242
+        assert decoded_sess.full_kv.lengths.length() ≡ 1 and decoded_sess.full_kv.lengths[0] ≡ 2
+        assert decoded_sess.ring_kv.total_written.length() ≡ 1 and decoded_sess.ring_kv.total_written[0] ≡ 4
+        assert decoded_sess.slot_kv_quant[1].enabled
+        assert decoded_sess.slot_kv_quant[1].key_bits ≡ 8
+        assert decoded_sess.slot_kv_quant[1].value_bits ≡ 4
+        assert decoded_sess.slot_kv_quant[1].group_size ≡ 32
+        assert v2_tensor_close<size 4, size 2>(decoded_sess.full_kv.keys[0], s.full_kv.keys[0])
+        assert v2_tensor_close<size 4, size 2>(decoded_sess.full_kv.values[0], s.full_kv.values[0])
+        assert v2_tensor_close<size 3, size 2>(decoded_sess.ring_kv.keys[0], s.ring_kv.keys[0])
+        assert v2_tensor_close<size 3, size 2>(decoded_sess.ring_kv.values[0], s.ring_kv.values[0])
+
+        # Verify v1 identity wire stays valid alongside wire v2.
+        let prepared_state.PreparedIdentity id_v1 ← prepared_state.deserialize_identity(prepared_state.serialize_identity(id))
+        assert prepared_state.prepared_identity_equal(id_v1, id)
     }
     catch err {
         assert false
     }
 }
 
-test "wire v2: HybridSession round-trips KV + ConvStateArena + RecurrentStateArena atomically" {
-    let model_schedule.ExecutionSchedule sched ← v2_hybrid_schedule()
-    mut v2_session.SessionState<4, 3, 2> kv_init ← v2_session.SessionState { sched = sched, full_kv = v2_session.FullKvArena { capacity = 4, kv_dim = 2, slot_ids = [], keys = [], values = [], lengths = [] }, ring_kv = v2_session.RingKvArena { max_window = 3, kv_dim = 2, slot_ids = [], window_sizes = [], keys = [], values = [], total_written = [] }, slot_arena_kind = [], slot_local_index = [], slot_window_sizes = [], slot_kv_quant = [], txn_depth = 0 }
-    mut v2_hybrid.HybridSession<4, 3, 2, 3, 4, 2, 2> hs ← v2_hybrid.HybridSession { kv = kv_init, conv = v2_hybrid.ConvStateArena { sites_per_slot = 1, history_len = 3, channels = 4, slot_ids = [], buffers = [], steps_written = [] }, recurrent = v2_hybrid.RecurrentStateArena { rows = 2, cols = 2, slot_ids = [], states = [], steps_written = [] } }
+test "wire v2: active-row serialization ignores rolled-back dirty FullKv tail rows [length..C)" {
+    let prepared_state.PreparedIdentity id ← ident(ids1(5), "deadbeef", 0)
+    mut model_schedule.ExecutionSchedule sched ← model_schedule.ExecutionSchedule { layers = [], segments = [], steps = [], slots = [], residual = variant model_schedule.ResidualKind.Standard, taps = [] }
     do {
-        hs ← v2_hybrid.from_schedule<size 4, size 3, size 2, size 3, size 4, size 2, size 2>(sched, 1, 3, false)
+        sched ← model_schedule.dense_schedule(1, variant model_schedule.RopeKind.Standard, variant model_schedule.FfnKind.Dense, [])
     }
     catch err {
         assert false
     }
-    hs.kv.slot_kv_quant[2] ← v2_session.KvQuantConfig { key_bits = 4, value_bits = 4, group_size = 64, enabled = true }
+    mut v2_session.SessionState<4, 1, 2> s_small ← v2_session.SessionState { sched = sched, full_kv = v2_session.FullKvArena { capacity = 4, kv_dim = 2, slot_ids = [], keys = [], values = [], lengths = [] }, ring_kv = v2_session.RingKvArena { max_window = 1, kv_dim = 2, slot_ids = [], window_sizes = [], keys = [], values = [], total_written = [] }, slot_arena_kind = [], slot_local_index = [], slot_window_sizes = [], slot_kv_quant = [], txn_depth = 0 }
+    mut v2_session.SessionState<16, 1, 2> s_large ← v2_session.SessionState { sched = sched, full_kv = v2_session.FullKvArena { capacity = 16, kv_dim = 2, slot_ids = [], keys = [], values = [], lengths = [] }, ring_kv = v2_session.RingKvArena { max_window = 1, kv_dim = 2, slot_ids = [], window_sizes = [], keys = [], values = [], total_written = [] }, slot_arena_kind = [], slot_local_index = [], slot_window_sizes = [], slot_kv_quant = [], txn_depth = 0 }
+    mut tensor<f32, [2]> k0 ← tf32[2] {}
+    mut tensor<f32, [2]> v0 ← tf32[2] {}
+    k0[[0]] ← 1.5 ∷ f32
+    k0[[1]] ← -2.5 ∷ f32
+    v0[[0]] ← 3.25 ∷ f32
+    v0[[1]] ← 4.75 ∷ f32
+    do {
+        s_small ← v2_session.from_dense_schedule<size 4, size 2>(sched)
+        s_large ← v2_session.from_dense_schedule<size 16, size 2>(sched)
+        v2_session.write_kv(mut s_small, 0, k0, v0, 0 ∷ i32)
+        v2_session.write_kv(mut s_large, 0, k0, v0, 0 ∷ i32)
+
+        # Branch, write dirty draft rows (including NaN in inactive tail), and rollback.
+        mut tensor<f32, [2]> dirty_k ← tf32[2] {}
+        mut tensor<f32, [2]> dirty_v ← tf32[2] {}
+        dirty_k[[0]] ← 999.0 ∷ f32
+        dirty_k[[1]] ← ("NaN" ↦ f32 ⊥ 0.0 ∷ f32)
+        dirty_v[[0]] ← -888.0 ∷ f32
+        dirty_v[[1]] ← (1.0 ∷ f32) / (0.0 ∷ f32)
+        mut v2_session.SessionTxn<4, 1, 2> txn ← v2_session.branch(mut s_small)
+        v2_session.txn_write_kv(mut s_small, mut txn, 0, dirty_k, dirty_v, 1 ∷ i32)
+        v2_session.txn_write_kv(mut s_small, mut txn, 0, dirty_k, dirty_v, 2 ∷ i32)
+        v2_session.rollback(mut s_small, mut txn)
+    }
+    catch err {
+        assert false
+    }
+
+    assert s_small.full_kv.lengths[0] ≡ 1
+    assert s_small.full_kv.keys[0][[1, 0]] ≡ 999.0 ∷ f32
+
+    # Wire bytes depend ONLY on active length (C=4 and C=16 produce identical wire length).
+    mut list<b8> wire_small ← ||
+    mut list<b8> wire_large ← ||
+    do {
+        wire_small ← prepared_state.serialize_session_state<size 4, size 1, size 2>(id, s_small)
+        wire_large ← prepared_state.serialize_session_state<size 16, size 1, size 2>(id, s_large)
+    }
+    catch err {
+        assert false
+    }
+    assert wire_small.length() ≡ wire_large.length()
+
+    # Adding 1 more active row increases wire length by exact 2 * KVD * 4 = 16 bytes.
+    do {
+        v2_session.write_kv(mut s_large, 0, k0, v0, 1 ∷ i32)
+    }
+    catch err {
+        assert false
+    }
+    do {
+        let list<b8> wire_len2 ← prepared_state.serialize_session_state<size 16, size 1, size 2>(id, s_large)
+        assert wire_len2.length() ≡ wire_large.length() + 16
+
+        # Deserializing restores active rows and leaves tail [length..C) clean zeros.
+        let prepared_state.PreparedSessionState<4, 1, 2> back ← prepared_state.deserialize_session_state<size 4, size 1, size 2>(wire_small)
+        let v2_session.SessionState<4, 1, 2> back_sess ← back.session
+        assert back_sess.full_kv.lengths[0] ≡ 1
+        assert back_sess.full_kv.keys[0][[0, 0]] ≡ 1.5 ∷ f32
+        assert back_sess.full_kv.keys[0][[0, 1]] ≡ -2.5 ∷ f32
+        assert back_sess.full_kv.values[0][[0, 0]] ≡ 3.25 ∷ f32
+        assert back_sess.full_kv.values[0][[0, 1]] ≡ 4.75 ∷ f32
+        assert back_sess.full_kv.keys[0][[1, 0]] ≡ 0.0 ∷ f32
+        assert back_sess.full_kv.keys[0][[1, 1]] ≡ 0.0 ∷ f32
+        assert back_sess.full_kv.values[0][[1, 0]] ≡ 0.0 ∷ f32
+        do {
+            assert v2_session.active_rows_equal(back_sess, s_small, 0.0001 ∷ f32)
+            assert v2_qwen_session.session_kv_equal(back_sess, s_small)
+        }
+        catch err {
+            assert false
+        }
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "wire v2: HybridSession preserves PreparedIdentity, LayerSpec.conv_*, LoopedSegment controls, and arenas" {
+    let prepared_state.PreparedIdentity id ← ident(ids3(5, 2, 9), "cafe1234", 4)
+    let model_schedule.ExecutionSchedule sched ← v2_inkling_looped_schedule()
+    mut v2_hybrid.HybridSession<4, 1024, 2, 12, 4, 2, 2> hs ← v2_hybrid.HybridSession { kv = v2_session.SessionState { sched = sched, full_kv = v2_session.FullKvArena { capacity = 4, kv_dim = 2, slot_ids = [], keys = [], values = [], lengths = [] }, ring_kv = v2_session.RingKvArena { max_window = 1024, kv_dim = 2, slot_ids = [], window_sizes = [], keys = [], values = [], total_written = [] }, slot_arena_kind = [], slot_local_index = [], slot_window_sizes = [], slot_kv_quant = [], txn_depth = 0 }, conv = v2_hybrid.ConvStateArena { sites_per_slot = 4, history_len = 3, channels = 4, slot_ids = [], buffers = [], steps_written = [] }, recurrent = v2_hybrid.RecurrentStateArena { rows = 2, cols = 2, slot_ids = [], states = [], steps_written = [] } }
+    do {
+        hs ← v2_hybrid.from_schedule_with_aux<size 4, size 1024, size 2, size 12, size 4, size 2, size 2>(sched, 4, 3, true, [100])
+    }
+    catch err {
+        assert false
+    }
+    hs.kv.slot_kv_quant[2] ← v2_session.KvQuantConfig { key_bits = 8, value_bits = 8, group_size = 64, enabled = false }
     hs.kv.full_kv.lengths[0] ← 1
     hs.kv.full_kv.keys[0][[0, 1]] ← 4.5 ∷ f32
     hs.kv.ring_kv.total_written[0] ← 2
     hs.kv.ring_kv.values[0][[1, 0]] ← -1.25 ∷ f32
     hs.conv.steps_written[0] ← 5
-    hs.conv.buffers[0][[2, 3]] ← 7.25 ∷ f32
-    hs.recurrent.steps_written[0] ← 5
+    hs.conv.buffers[0][[11, 3]] ← 7.25 ∷ f32
+    hs.recurrent.steps_written[0] ← 3
     hs.recurrent.states[0][[1, 1]] ← -3.5 ∷ f32
 
+    mut v2_hybrid.HybridSession<4, 1024, 2, 12, 4, 2, 2> decoded_sess ← hs
     do {
-        let string wire ← prepared_state.serialize_hybrid_session<size 4, size 3, size 2, size 3, size 4, size 2, size 2>(hs)
-        assert wire.slice(0, 26) ≡ "prepared-state/hybrid/2.0."
+        let list<b8> wire ← prepared_state.serialize_hybrid_session<size 4, size 1024, size 2, size 12, size 4, size 2, size 2>(id, hs)
+        assert (wire[4] ↦ u8 ↦ int) ≡ 2 and (wire[7] ↦ u8 ↦ int) ≡ 2
 
-        let v2_hybrid.HybridSession<4, 3, 2, 3, 4, 2, 2> decoded ← prepared_state.deserialize_hybrid_session<size 4, size 3, size 2, size 3, size 4, size 2, size 2>(wire)
-        assert decoded.kv.full_kv.lengths.length() ≡ 1 and decoded.kv.full_kv.lengths[0] ≡ 1
-        assert decoded.kv.ring_kv.total_written.length() ≡ 1 and decoded.kv.ring_kv.total_written[0] ≡ 2
-        assert decoded.kv.slot_kv_quant[2].enabled
-        assert decoded.kv.slot_kv_quant[2].group_size ≡ 64
-        assert decoded.conv.steps_written.length() ≡ 1 and decoded.conv.steps_written[0] ≡ 5
-        assert decoded.recurrent.steps_written.length() ≡ 1 and decoded.recurrent.steps_written[0] ≡ 5
-        assert v2_tensor_close<size 4, size 2>(decoded.kv.full_kv.keys[0], hs.kv.full_kv.keys[0])
-        assert v2_tensor_close<size 3, size 2>(decoded.kv.ring_kv.values[0], hs.kv.ring_kv.values[0])
-        assert v2_tensor_close<size 3, size 4>(decoded.conv.buffers[0], hs.conv.buffers[0])
-        assert v2_tensor_close<size 2, size 2>(decoded.recurrent.states[0], hs.recurrent.states[0])
+        let prepared_state.PreparedHybridSession<4, 1024, 2, 12, 4, 2, 2> decoded ← prepared_state.deserialize_hybrid_session<size 4, size 1024, size 2, size 12, size 4, size 2, size 2>(wire)
+        assert prepared_state.prepared_identity_equal(decoded.identity, id)
+        assert decoded.identity.position_start ≡ 4
+        assert decoded.identity.position_next() ≡ 7
+        decoded_sess ← decoded.session
     }
     catch err {
         assert false
     }
+
+    # Verify LayerSpec.conv_sites & conv_kernel preserved.
+    assert decoded_sess.kv.sched.layers[0].conv_sites ≡ 4
+    assert decoded_sess.kv.sched.layers[0].conv_kernel ≡ 4
+    do {
+        assert model_schedule.slot_conv_sites(decoded_sess.kv.sched, 0) ≡ 4
+        assert model_schedule.slot_conv_kernel(decoded_sess.kv.sched, 0) ≡ 4
+    }
+    catch err {
+        assert false
+    }
+
+    # Verify LoopedSegment controls preserved (`reset_to_prelude`, `gate_rank`, `is_varloop`, `max_passes`).
+    let model_schedule.ScheduleSegment seg1 ← decoded_sess.kv.sched.segments[1]
+    match seg1 {
+        case Looped let lp {
+            assert lp.start_layer ≡ 2
+            assert lp.end_layer ≡ 4
+            assert lp.pass_count ≡ 2
+            assert lp.reset_to_prelude ≡ true
+            assert lp.gate_rank ≡ 64
+            assert lp.is_varloop ≡ false
+            assert lp.max_passes ≡ 5
+        }
+        default {
+            assert false
+        }
+    }
+    assert decoded_sess.kv.sched.steps[2].snapshots_prelude ≡ true
+    assert decoded_sess.kv.sched.steps[4].resets_to_prelude ≡ true
+    assert decoded_sess.kv.sched.steps[4].uses_cross_pass ≡ true
+    assert decoded_sess.kv.sched.taps.length() ≡ 1
+    assert decoded_sess.kv.sched.taps[0].name ≡ "loop_end"
+    assert decoded_sess.kv.sched.taps[0].visit_id ≡ 6
+
+    # Verify arenas + auxiliary recurrent slot preserved.
+    assert decoded_sess.kv.full_kv.lengths[0] ≡ 1
+    assert decoded_sess.kv.ring_kv.total_written[0] ≡ 2
+    assert decoded_sess.conv.sites_per_slot ≡ 4
+    assert decoded_sess.conv.history_len ≡ 3
+    assert decoded_sess.conv.steps_written[0] ≡ 5
+    assert decoded_sess.recurrent.slot_ids ≡ ([100] ↦ list<int>)
+    assert decoded_sess.recurrent.steps_written[0] ≡ 3
+    assert v2_tensor_close<size 4, size 2>(decoded_sess.kv.full_kv.keys[0], hs.kv.full_kv.keys[0])
+    assert v2_tensor_close<size 1024, size 2>(decoded_sess.kv.ring_kv.values[0], hs.kv.ring_kv.values[0])
+    assert v2_tensor_close<size 12, size 4>(decoded_sess.conv.buffers[0], hs.conv.buffers[0])
+    assert v2_tensor_close<size 2, size 2>(decoded_sess.recurrent.states[0], hs.recurrent.states[0])
 }
 
-test "wire v2: unknown versions and malformed/open-txn wires fail closed" {
+test "wire v2: unknown versions, bad wire, open-txn, and NaN/Inf fail closed" {
+    let prepared_state.PreparedIdentity id ← ident(ids2(5, 2), "deadbeef", 0)
     let model_schedule.ExecutionSchedule sched ← v2_hybrid_schedule()
-    mut v2_session.SessionState<4, 3, 2> kv_init ← v2_session.SessionState { sched = sched, full_kv = v2_session.FullKvArena { capacity = 4, kv_dim = 2, slot_ids = [], keys = [], values = [], lengths = [] }, ring_kv = v2_session.RingKvArena { max_window = 3, kv_dim = 2, slot_ids = [], window_sizes = [], keys = [], values = [], total_written = [] }, slot_arena_kind = [], slot_local_index = [], slot_window_sizes = [], slot_kv_quant = [], txn_depth = 0 }
-    mut v2_hybrid.HybridSession<4, 3, 2, 3, 4, 2, 2> hs ← v2_hybrid.HybridSession { kv = kv_init, conv = v2_hybrid.ConvStateArena { sites_per_slot = 1, history_len = 3, channels = 4, slot_ids = [], buffers = [], steps_written = [] }, recurrent = v2_hybrid.RecurrentStateArena { rows = 2, cols = 2, slot_ids = [], states = [], steps_written = [] } }
+    mut v2_hybrid.HybridSession<4, 3, 2, 3, 4, 2, 2> hs ← v2_hybrid.HybridSession { kv = v2_session.SessionState { sched = sched, full_kv = v2_session.FullKvArena { capacity = 4, kv_dim = 2, slot_ids = [], keys = [], values = [], lengths = [] }, ring_kv = v2_session.RingKvArena { max_window = 3, kv_dim = 2, slot_ids = [], window_sizes = [], keys = [], values = [], total_written = [] }, slot_arena_kind = [], slot_local_index = [], slot_window_sizes = [], slot_kv_quant = [], txn_depth = 0 }, conv = v2_hybrid.ConvStateArena { sites_per_slot = 1, history_len = 3, channels = 4, slot_ids = [], buffers = [], steps_written = [] }, recurrent = v2_hybrid.RecurrentStateArena { rows = 2, cols = 2, slot_ids = [], states = [], steps_written = [] } }
     do {
         hs ← v2_hybrid.from_schedule<size 4, size 3, size 2, size 3, size 4, size 2, size 2>(sched, 1, 3, false)
     }
     catch err {
         assert false
     }
+    hs.kv.full_kv.lengths[0] ← 1
+    hs.kv.full_kv.keys[0][[0, 0]] ← 1.0 ∷ f32
 
-    mut string sess_wire ← ""
-    mut string hyb_wire ← ""
+    mut list<b8> sess_wire ← ||
+    mut list<b8> hyb_wire ← ||
     do {
-        sess_wire ← prepared_state.serialize_session_state<size 4, size 3, size 2>(hs.kv)
-        hyb_wire ← prepared_state.serialize_hybrid_session<size 4, size 3, size 2, size 3, size 4, size 2, size 2>(hs)
+        sess_wire ← prepared_state.serialize_session_state<size 4, size 3, size 2>(id, hs.kv)
+        hyb_wire ← prepared_state.serialize_hybrid_session<size 4, size 3, size 2, size 3, size 4, size 2, size 2>(id, hs)
     }
     catch err {
         assert false
     }
 
-    mut string sess_v3_err ← ""
-    do {
-        let _ unused_s3 ← prepared_state.deserialize_session_state<size 4, size 3, size 2>(sess_wire.replace("2.0.0", "3.0.0"))
-    }
-    catch err {
-        match err {
-            case prepared_state.PreparedStateError.UnknownVersion let ? { sess_v3_err ← "unknown_version" }
-            default { sess_v3_err ← "other" }
-        }
-    }
-    assert sess_v3_err ≡ "unknown_version"
+    # Unknown versions reject with UnknownVersion.
+    assert v2_err_variant_session(patch_wire_byte(sess_wire, 4, 3)) ≡ "unknown_version"
+    assert v2_err_variant_session(patch_wire_byte(sess_wire, 4, 1)) ≡ "unknown_version"
+    assert v2_err_variant_hybrid(patch_wire_byte(hyb_wire, 4, 3)) ≡ "unknown_version"
+    assert v2_err_variant_hybrid(patch_wire_byte(hyb_wire, 4, 1)) ≡ "unknown_version"
 
-    mut string hyb_v1_err ← ""
-    do {
-        let _ unused_h1 ← prepared_state.deserialize_hybrid_session<size 4, size 3, size 2, size 3, size 4, size 2, size 2>(hyb_wire.replace("2.0.0", "1.0.0"))
-    }
-    catch err {
-        match err {
-            case prepared_state.PreparedStateError.UnknownVersion let ? { hyb_v1_err ← "unknown_version" }
-            default { hyb_v1_err ← "other" }
-        }
-    }
-    assert hyb_v1_err ≡ "unknown_version"
+    # Bad magic, wrong kind, truncated wire, and trailing bytes reject with BadWire.
+    assert v2_err_variant_session(patch_wire_byte(sess_wire, 0, 88)) ≡ "bad_wire"
+    assert v2_err_variant_session(hyb_wire) ≡ "bad_wire"
+    assert v2_err_variant_hybrid(sess_wire) ≡ "bad_wire"
+    assert v2_err_variant_session(sess_wire[0 ‥ 5]) ≡ "bad_wire"
+    assert v2_err_variant_session(wire_append_tail_byte(sess_wire, 0)) ≡ "bad_wire"
+    assert v2_err_variant_hybrid(wire_append_tail_byte(hyb_wire, 0)) ≡ "bad_wire"
 
+    # Extent mismatch rejects with PayloadMismatch before allocating tensors.
     mut string dim_err ← ""
     do {
         let _ unused_dim ← prepared_state.deserialize_session_state<size 8, size 3, size 2>(sess_wire)
@@ -2794,21 +3282,102 @@ test "wire v2: unknown versions and malformed/open-txn wires fail closed" {
     }
     assert dim_err ≡ "payload_mismatch"
 
+    # NaN / Inf in active float payload rejected on both serialize and deserialize.
+    let list<b8> nan_wire ← patch_wire_byte(patch_wire_byte(sess_wire, sess_wire.length() - 2, 192), sess_wire.length() - 1, 127)
+    let list<b8> inf_wire ← patch_wire_byte(patch_wire_byte(sess_wire, sess_wire.length() - 2, 128), sess_wire.length() - 1, 127)
+    assert v2_err_variant_session(nan_wire) ≡ "payload_mismatch"
+    assert v2_err_variant_session(inf_wire) ≡ "payload_mismatch"
+
+    let f32 saved ← hs.kv.full_kv.keys[0][[0, 0]]
+    hs.kv.full_kv.keys[0][[0, 0]] ← ("NaN" ↦ f32 ⊥ 0.0 ∷ f32)
+    mut string ser_nan_err ← ""
+    do {
+        let _ unused_nan ← prepared_state.serialize_session_state<size 4, size 3, size 2>(id, hs.kv)
+    }
+    catch err {
+        match err {
+            case prepared_state.PreparedStateError.PayloadMismatch let ? { ser_nan_err ← "payload_mismatch" }
+            default { ser_nan_err ← "other" }
+        }
+    }
+    assert ser_nan_err ≡ "payload_mismatch"
+
+    hs.kv.full_kv.keys[0][[0, 0]] ← (1.0 ∷ f32) / (0.0 ∷ f32)
+    mut string ser_inf_err ← ""
+    do {
+        let _ unused_inf ← prepared_state.serialize_session_state<size 4, size 3, size 2>(id, hs.kv)
+    }
+    catch err {
+        match err {
+            case prepared_state.PreparedStateError.PayloadMismatch let ? { ser_inf_err ← "payload_mismatch" }
+            default { ser_inf_err ← "other" }
+        }
+    }
+    assert ser_inf_err ≡ "payload_mismatch"
+    hs.kv.full_kv.keys[0][[0, 0]] ← saved
+
+    # Invalid PreparedIdentity fails closed on serialize for both SessionState and HybridSession.
+    let prepared_state.PreparedIdentity bad_id ← prepared_state.PreparedIdentity {
+        model = "",
+        model_version = id.model_version,
+        config = id.config,
+        tokenizer_identity = id.tokenizer_identity,
+        prefix = id.prefix,
+        lookup_digest = id.lookup_digest,
+        position_start = id.position_start
+    }
+    mut string bad_id_sess_err ← ""
+    do {
+        let _ unused_bis ← prepared_state.serialize_session_state<size 4, size 3, size 2>(bad_id, hs.kv)
+    }
+    catch err {
+        match err {
+            case prepared_state.PreparedStateError.InvalidIdentity let ? { bad_id_sess_err ← "invalid_identity" }
+            default { bad_id_sess_err ← "other" }
+        }
+    }
+    assert bad_id_sess_err ≡ "invalid_identity"
+
+    mut string bad_id_hyb_err ← ""
+    do {
+        let _ unused_bih ← prepared_state.serialize_hybrid_session<size 4, size 3, size 2, size 3, size 4, size 2, size 2>(bad_id, hs)
+    }
+    catch err {
+        match err {
+            case prepared_state.PreparedStateError.InvalidIdentity let ? { bad_id_hyb_err ← "invalid_identity" }
+            default { bad_id_hyb_err ← "other" }
+        }
+    }
+    assert bad_id_hyb_err ≡ "invalid_identity"
+
+    # Open transaction fails closed on serialize for both SessionState and HybridSession.
     do {
         let _ open_txn ← v2_hybrid.hybrid_branch<size 4, size 3, size 2, size 3, size 4, size 2, size 2>(mut hs)
     }
     catch err {
         assert false
     }
-    mut string txn_err ← ""
+    mut string sess_txn_err ← ""
     do {
-        let _ unused_w ← prepared_state.serialize_hybrid_session<size 4, size 3, size 2, size 3, size 4, size 2, size 2>(hs)
+        let _ unused_s ← prepared_state.serialize_session_state<size 4, size 3, size 2>(id, hs.kv)
     }
     catch err {
         match err {
-            case prepared_state.PreparedStateError.PayloadMismatch let ? { txn_err ← "payload_mismatch" }
-            default { txn_err ← "other" }
+            case prepared_state.PreparedStateError.PayloadMismatch let ? { sess_txn_err ← "payload_mismatch" }
+            default { sess_txn_err ← "other" }
         }
     }
-    assert txn_err ≡ "payload_mismatch"
+    assert sess_txn_err ≡ "payload_mismatch"
+
+    mut string hyb_txn_err ← ""
+    do {
+        let _ unused_h ← prepared_state.serialize_hybrid_session<size 4, size 3, size 2, size 3, size 4, size 2, size 2>(id, hs)
+    }
+    catch err {
+        match err {
+            case prepared_state.PreparedStateError.PayloadMismatch let ? { hyb_txn_err ← "payload_mismatch" }
+            default { hyb_txn_err ← "other" }
+        }
+    }
+    assert hyb_txn_err ≡ "payload_mismatch"
 }
