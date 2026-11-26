@@ -1,0 +1,160 @@
++++ toml
+locale = "en"
+
++++ faber
+# quant-matvec-bench-metal: timed GroupAffine 4-bit and 8-bit u32-packed GEMV
+# on Metal over SmolLM2-360M MLP projection shape [2560, 960], group_size=64.
+#
+#   faber run exempla/quant-matvec-bench-metal --library-home <gradus parent> \
+#       --device metal
+
+import from "gradus:decode_step" let ds
+import from "gradus:quant/group_affine" let ga
+import from "norma:time" let time
+
+const int OUT = 2560
+const int IN_DIM = 960
+const int GROUP_SIZE = 64
+const int GROUPS = 15
+const int CALLS_PER_PASS = 32
+const int PASSES = 6
+
+@ public
+kernel synth_u32<size R, size C>(tensor<u32, [R, C]> dom, mut tensor<u32, [R, C]> out, i32 seed) → void {
+    for from dom at [r, c] thread lane let ? {
+        let i32 rr ← r ↦ i32
+        let i32 cc ← c ↦ i32
+        if rr ≥ 0 and rr ≤ 65536 and cc ≥ 0 and cc ≤ 65536 and seed ≥ 0 and seed ≤ 65536 {
+            let i32 v ← (rr * 131 + cc * 17 + seed) % 32767
+            let i32 packed ← v * 65537
+            out[[r, c]] ← packed ↦ u32 ⊥ (0 ∷ u32)
+        }
+    }
+}
+
+@ public
+kernel synth_f32_mat<size R, size C>(tensor<f32, [R, C]> dom, mut tensor<f32, [R, C]> out, i32 seed, f32 amp) → void {
+    for from dom at [r, c] thread lane let ? {
+        let i32 rr ← r ↦ i32
+        let i32 cc ← c ↦ i32
+        if rr ≥ 0 and rr ≤ 65536 and cc ≥ 0 and cc ≤ 65536 and seed ≥ 0 and seed ≤ 65536 {
+            let i32 a ← (rr * 31 + cc * 17 + seed) % 65521
+            let f32 h ← ((a ↦ f32) + 0.5) * 0.7123
+            out[[r, c]] ← h.sin() * amp
+        }
+    }
+}
+
+@ public
+kernel synth_f32_vec<size N>(tensor<f32, [N]> dom, mut tensor<f32, [N]> out, i32 seed, f32 amp) → void {
+    for from dom at [i] thread lane let ? {
+        let i32 ii ← i ↦ i32
+        if ii ≥ 0 and ii ≤ 65536 and seed ≥ 0 and seed ≤ 65536 {
+            let i32 a ← (ii * 19 + seed) % 65521
+            let f32 h ← ((a ↦ f32) + 0.5) * 0.7123
+            out[[i]] ← h.sin() * amp
+        }
+    }
+}
+
+fn ref_row_u32(tensor<u32, [2560, 120]> w4, tensor<f32, [2560, 15]> scales, tensor<f32, [2560, 15]> biases, tensor<f32, [960]> x, int row, int bits) → f32 {
+    mut f32 acc ← 0.0
+    for range 0 ‥ IN_DIM let j {
+        let int g ← j / GROUP_SIZE
+        let int bit_pos ← j * bits
+        let int word_idx ← bit_pos / 32
+        let int shift ← bit_pos % 32
+        let u32 word ← w4[[row, word_idx]]
+        let u32 q ← (word ⇒ (shift ↦ u32 ⊥ (0 ∷ u32))) ∧ (15 ∷ u32)
+        let f32 w ← (q ↦ f32) * scales[[row, g]] + biases[[row, g]]
+        acc ← acc + w * x[[j]]
+    }
+    return acc
+}
+
+fn ref_row_u32_8bit(tensor<u32, [2560, 240]> w8, tensor<f32, [2560, 15]> scales, tensor<f32, [2560, 15]> biases, tensor<f32, [960]> x, int row) → f32 {
+    mut f32 acc ← 0.0
+    for range 0 ‥ IN_DIM let j {
+        let int g ← j / GROUP_SIZE
+        let int bit_pos ← j * 8
+        let int word_idx ← bit_pos / 32
+        let int shift ← bit_pos % 32
+        let u32 word ← w8[[row, word_idx]]
+        let u32 q ← (word ⇒ (shift ↦ u32 ⊥ (0 ∷ u32))) ∧ (255 ∷ u32)
+        let f32 w ← (q ↦ f32) * scales[[row, g]] + biases[[row, g]]
+        acc ← acc + w * x[[j]]
+    }
+    return acc
+}
+
+main {
+    let tensor<u32, [2560, 120]> d4 ← tensor<u32, [2560, 120]> {}
+    mut tensor<u32, [2560, 120]> w4 ← tensor<u32, [2560, 120]> {}
+    synth_u32(d4, mut w4, 11 ∷ i32)
+
+    let tensor<u32, [2560, 240]> d8 ← tensor<u32, [2560, 240]> {}
+    mut tensor<u32, [2560, 240]> w8 ← tensor<u32, [2560, 240]> {}
+    synth_u32(d8, mut w8, 23 ∷ i32)
+
+    let tensor<f32, [2560, 15]> ds_mat ← tf32[2560, 15] {}
+    mut tensor<f32, [2560, 15]> scales ← tf32[2560, 15] {}
+    mut tensor<f32, [2560, 15]> biases ← tf32[2560, 15] {}
+    synth_f32_mat(ds_mat, mut scales, 37 ∷ i32, 0.05 ∷ f32)
+    synth_f32_mat(ds_mat, mut biases, 53 ∷ i32, 0.02 ∷ f32)
+
+    let tensor<f32, [960]> dx ← tf32[960] {}
+    mut tensor<f32, [960]> x ← tf32[960] {}
+    synth_f32_vec(dx, mut x, 71 ∷ i32, 1.0 ∷ f32)
+
+    mut tensor<f32, [2560]> y4 ← tf32[2560] {}
+    mut tensor<f32, [2560]> y8 ← tf32[2560] {}
+    mut tensor<f32, [1]> sink ← tf32[1] {}
+    ds.prime1(y4, mut sink)
+    ds.prime1(y8, mut sink)
+
+    for exclusive PASSES let pass_no {
+        let int started ← time.monotonic()
+        for exclusive CALLS_PER_PASS let ? {
+            ga.linear_matvec_u32(w4, scales, biases, x, mut y4, 4 ∷ i32, 64 ∷ i32)
+        }
+        let f32 sync4 ← y4[[0]]
+        let int elapsed ← time.monotonic() - started
+        if pass_no ≡ 1 {
+            mut f32 max_err ← 0.0
+            for range 0 ‥ 4 let r {
+                let f32 got ← y4[[r]]
+                let f32 ref ← ref_row_u32(w4, scales, biases, x, r, 4)
+                let f32 err ← (got - ref).abs()
+                if err ≻ max_err {
+                    max_err ← err
+                }
+            }
+            print "verify_4bit row0=§0 max_err=§1"(sync4, max_err)
+            assert max_err ≺ 0.001
+        }
+        print "bench_4bit pass=§0 calls=§1 ns=§2 us_per_call=§3"(pass_no, CALLS_PER_PASS, elapsed, elapsed / CALLS_PER_PASS / 1000)
+    }
+
+    for exclusive PASSES let pass_no {
+        let int started ← time.monotonic()
+        for exclusive CALLS_PER_PASS let ? {
+            ga.linear_matvec_u32(w8, scales, biases, x, mut y8, 8 ∷ i32, 64 ∷ i32)
+        }
+        let f32 sync8 ← y8[[0]]
+        let int elapsed ← time.monotonic() - started
+        if pass_no ≡ 1 {
+            mut f32 max_err ← 0.0
+            for range 0 ‥ 4 let r {
+                let f32 got ← y8[[r]]
+                let f32 ref ← ref_row_u32_8bit(w8, scales, biases, x, r)
+                let f32 err ← (got - ref).abs()
+                if err ≻ max_err {
+                    max_err ← err
+                }
+            }
+            print "verify_8bit row0=§0 max_err=§1"(sync8, max_err)
+            assert max_err ≺ 0.001
+        }
+        print "bench_8bit pass=§0 calls=§1 ns=§2 us_per_call=§3"(pass_no, CALLS_PER_PASS, elapsed, elapsed / CALLS_PER_PASS / 1000)
+    }
+}

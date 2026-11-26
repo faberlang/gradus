@@ -290,6 +290,53 @@ fn layer_wide<size D, size QD, size KVD, size F, size H, size C, size P>(tensor<
     }
 }
 
+# One layer using precomputed per-token RoPE cos/sin tables `[Span]`.
+@ public
+fn layer_wide_table<size D, size QD, size KVD, size F, size H, size C, size P, size Span>(tensor<f32, [D]> hin, mut tensor<f32, [D]> hout, LayerWeights<D, QD, KVD, F> lw, mut SlotView<C, KVD> sv, LayerParams lp, tensor<f32, [Span]> rtcos, tensor<f32, [Span]> rtsin, mut Workspace<D, QD, KVD, F, H, C, P> ws) → void {
+    let i32 tpos ← sv.pos
+    do device {
+        ds.rmsnorm(hin, lw.anorm, mut ws.xn, lp.peps)
+        ds.qkv_proj(lw.wq, lw.wk, lw.wv, ws.xn, mut ws.q, mut ws.k, mut ws.v)
+
+        if lw.qkv_bias {
+            ds.add_bias(lw.bq, mut ws.q)
+            ds.add_bias(lw.bk, mut ws.k)
+            ds.add_bias(lw.bv, mut ws.v)
+        }
+
+        match lp.prope {
+            case RopeKind.None {
+                ds.kv_write_kv(ws.k, ws.v, mut sv.kin, mut sv.vin, tpos)
+                ds.attn_scores(ws.hcdom, ws.q, sv.kin, mut ws.sc, tpos, lp.pgroup, lp.pdh, lp.pscale)
+            }
+            case RopeKind.Half {
+                ds.rope_half_table_qk_kv_write(ws.q, ws.k, ws.v, rtcos, rtsin, mut ws.qr, mut sv.kin, mut sv.vin, tpos)
+                ds.attn_scores(ws.hcdom, ws.qr, sv.kin, mut ws.sc, tpos, lp.pgroup, lp.pdh, lp.pscale)
+            }
+            case RopeKind.Pairs {
+                ds.rope_pairs_table_qk_kv_write(ws.q, ws.k, ws.v, rtcos, rtsin, mut ws.qr, mut sv.kin, mut sv.vin, tpos)
+                ds.attn_scores(ws.hcdom, ws.qr, sv.kin, mut ws.sc, tpos, lp.pgroup, lp.pdh, lp.pscale)
+            }
+        }
+
+        ds.row_softmax(ws.sc, mut ws.pr)
+        if C ≤ 64 {
+            ds.attn_context(ws.qdom, ws.pr, sv.vin, mut ws.ctx, tpos, lp.pgroup, lp.pdh)
+        }
+        else {
+            ds.context_part(ws.cpdom, ws.pr, sv.vin, mut ws.cp, tpos, lp.pgroup, lp.pdh)
+            ds.context_fin(ws.qdom, ws.cp, mut ws.ctx)
+        }
+        ds.gemv(lw.wo, ws.ctx, mut ws.xn)
+        ds.residual_add(hin, ws.xn, mut ws.h1)
+        ds.rmsnorm(ws.h1, lw.fnorm, mut ws.xn, lp.peps)
+        ds.gate_up_proj(lw.wg, lw.wu, ws.xn, mut ws.gate, mut ws.up)
+        ds.swiglu(ws.gate, ws.up, mut ws.act)
+        ds.gemv(lw.wd, ws.act, mut ws.xn)
+        ds.residual_add(ws.h1, ws.xn, mut hout)
+    }
+}
+
 # hidden[D] <- embed[ids[0], :] (the id is read on the device).
 @ public
 fn embed_wide<size V, size D>(tensor<f32, [V, D]> embed, tensor<i32, [1]> ids, mut tensor<f32, [D]> hidden) → void {
