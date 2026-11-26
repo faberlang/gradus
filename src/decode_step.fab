@@ -417,6 +417,237 @@ kernel topm_chunks<size P, size V, size M>(tensor<f32, [P, M]> tmdom, tensor<f32
     }
 }
 
+# ---------------------------------------------------------------------------
+# Batched regime-aware kernels (B = 1, B = k verify/diffusion, B = C prefill)
+# ---------------------------------------------------------------------------
+# Batched embedding gather: out[b, j] = table[ids[b], j] for b < active_b.
+@ public
+kernel gather_batch<size V, size B, size D>(tensor<f32, [V, D]> gbtable, tensor<i32, [B]> gbids, mut tensor<f32, [B, D]> gbout, i32 gbactive) → void {
+    for from gbout at [b, j] thread lane let e {
+        if b ≺ gbactive {
+            let i32 tid ← gbids[[b]]
+
+            if tid ≥ 0 and tid ≺ V {
+                gbout[[b, j]] ← gbtable[[tid, j]]
+            }
+        }
+    }
+}
+
+# Batched RMSNorm over axis 1: out[b, :] = (x[b, :] / rms(x[b, :], eps)) * w.
+@ public
+kernel rmsnorm_batch<size B, size D>(tensor<f32, [B, D]> rmx, tensor<f32, [D]> rmw, mut tensor<f32, [B, D]> rmo, f32 rmeps) → void {
+    rmo ⇇ rmx.norm_rms(axis 1, rmeps, rmw)
+}
+
+# Batched linear projection with [Out, In] weights:
+#   y[b, n] = sum_k x[b, k] * w[n, k] for b < active_b.
+@ public
+kernel matmul_nt_batch<size B, size N, size K>(tensor<f32, [N, K]> mmw, tensor<f32, [B, K]> mmx, mut tensor<f32, [B, N]> mmy, i32 mmactive, i32 mmk) → void {
+    for from mmy at [b, n] thread lane let e {
+        if b ≺ mmactive and mmk ≥ 1 and mmk ≤ 65535 and b ∈ 0 … 16383 and n ∈ 0 … 16777215 {
+            let i32 bb ← b ∧ 16383
+            let i32 nn ← n ∧ 16777215
+            mut f32 acc ← 0.0
+
+            for range 0 ‥ mmk let kk {
+                acc ← acc + mmx[[bb, kk]] * mmw[[nn, kk]]
+            }
+
+            mmy[[b, n]] ← acc
+        }
+    }
+}
+
+# Batched Q/K/V projection sharing input `x`.
+@ public
+fn qkv_proj_batch<size B, size QD, size KVD, size D>(tensor<f32, [QD, D]> wq, tensor<f32, [KVD, D]> wk, tensor<f32, [KVD, D]> wv, tensor<f32, [B, D]> x, mut tensor<f32, [B, QD]> q, mut tensor<f32, [B, KVD]> k, mut tensor<f32, [B, KVD]> v, i32 active_b) → void {
+    let i32 dlen ← D ↦ i32 ⊥ 1
+    matmul_nt_batch(wq, x, mut q, active_b, dlen)
+    matmul_nt_batch(wk, x, mut k, active_b, dlen)
+    matmul_nt_batch(wv, x, mut v, active_b, dlen)
+}
+
+# Batched gate/up projection sharing input `x`.
+@ public
+fn gate_up_proj_batch<size B, size F, size D>(tensor<f32, [F, D]> wg, tensor<f32, [F, D]> wu, tensor<f32, [B, D]> x, mut tensor<f32, [B, F]> g, mut tensor<f32, [B, F]> u, i32 active_b) → void {
+    let i32 dlen ← D ↦ i32 ⊥ 1
+    matmul_nt_batch(wg, x, mut g, active_b, dlen)
+    matmul_nt_batch(wu, x, mut u, active_b, dlen)
+}
+
+# Batched bias add in place: into[b, j] += bias[j] for b < active_b.
+@ public
+kernel add_bias_batch<size B, size N>(tensor<f32, [N]> abbias, mut tensor<f32, [B, N]> abinto, i32 abactive) → void {
+    for from abinto at [b, j] thread lane let cur {
+        if b ≺ abactive {
+            abinto[[b, j]] ← cur + abbias[[j]]
+        }
+    }
+}
+
+# Batched rotate-half RoPE over [B, N]: token b uses position `tpos + b`.
+@ public
+kernel rope_half_batch<size B, size N>(tensor<f32, [B, N]> rhx, mut tensor<f32, [B, N]> rho, i32 rhtpos, i32 rhspan, f32 rhlntheta, i32 rhactive) → void {
+    for from rhx at [b, j] thread lane let v {
+        if b ≺ rhactive and rhspan ≻ 0 and rhspan ≤ 960 {
+            let i32 hf ← rhspan
+            let i32 jj ← j % (2 * hf)
+            let i32 base ← j - jj
+            let i32 p ← jj % hf
+            let f32 freq ← (-(p ↦ f32) / (hf ↦ f32) * rhlntheta).exp()
+            let f32 ang ← ((rhtpos + b) ↦ f32) * freq
+            let f32 c ← ang.cos()
+            let f32 s ← ang.sin()
+
+            if jj ≺ hf {
+                rho[[b, j]] ← v * c - rhx[[b, base + jj + hf]] * s
+            }
+            else {
+                rho[[b, j]] ← rhx[[b, base + jj - hf]] * s + v * c
+            }
+        }
+    }
+}
+
+# Batched consecutive-pair RoPE over [B, N]: token b uses position `tpos + b`.
+@ public
+kernel rope_pairs_batch<size B, size N>(tensor<f32, [B, N]> rpx, mut tensor<f32, [B, N]> rpo, i32 rptpos, i32 rpspan, f32 rplntheta, i32 rpactive) → void {
+    for from rpx at [b, j] thread lane let v {
+        if b ≺ rpactive and rpspan ≻ 0 and rpspan ≤ 960 {
+            let i32 hf ← rpspan
+            let i32 jj ← j % (2 * hf)
+            let i32 p ← jj / 2
+            let f32 freq ← (-(p ↦ f32) / (hf ↦ f32) * rplntheta).exp()
+            let f32 ang ← ((rptpos + b) ↦ f32) * freq
+            let f32 c ← ang.cos()
+            let f32 s ← ang.sin()
+
+            if jj % 2 ≡ 0 {
+                rpo[[b, j]] ← v * c - rpx[[b, j + 1]] * s
+            }
+            else {
+                rpo[[b, j]] ← rpx[[b, j - 1]] * s + v * c
+            }
+        }
+    }
+}
+
+# Batched fused K and V cache write: writes rows `0 .. active_b` into
+# `kwkc` / `kwvc` at `[kwpos .. kwpos + active_b)`.
+@ public
+kernel kv_write_kv_batch<size B, size C, size K>(tensor<f32, [B, K]> kwk, tensor<f32, [B, K]> kwv, mut tensor<f32, [C, K]> kwkc, mut tensor<f32, [C, K]> kwvc, i32 kwpos, i32 kwactive) → void {
+    for from kwkc at [r, j] thread lane let old {
+        if kwpos ≥ 0 and r ≥ kwpos and r - kwpos ≺ kwactive and r - kwpos ≺ B {
+            let i32 src ← r - kwpos
+            kwkc[[r, j]] ← kwk[[src, j]]
+            kwvc[[r, j]] ← kwv[[src, j]]
+        }
+    }
+}
+
+# Batched GQA attention scores over flattened [BH, C] where BH = MaxBatch * H:
+#   - `block_size == 1`: causal (token b attends to c <= tpos + b).
+#   - `block_size > 1`: block diffusion (token b attends to prefix + its block,
+#     c < tpos + min((b / block_size + 1) * block_size, active_b)).
+@ public
+kernel attn_scores_batch<size B, size BH, size C, size QD, size KVD>(tensor<f32, [BH, C]> asdom, tensor<f32, [B, QD]> asq, tensor<f32, [C, KVD]> askc, mut tensor<f32, [BH, C]> assc, i32 aspos, i32 asheads, i32 asgroup, i32 asdh, f32 asscale, i32 asactive, i32 asblk) → void {
+    for from asdom at [bh, c] thread lane let e {
+        if aspos ≺ 0 or asheads ≺ 1 or asheads ≻ 4096 or asgroup ≺ 1 or asgroup ≻ 128 or asdh ≺ 1 or asdh ≻ 960 or asblk ≺ 1 or bh ∉ 0 … 16777215 or c ∉ 0 … 16777215 {
+            assc[[bh, c]] ← -3.0e38
+        }
+        else {
+            let i32 bhh ← bh ∧ 16777215
+            let i32 cc ← c ∧ 16777215
+            let i32 b ← bhh / asheads
+            let i32 hh ← bhh % asheads
+
+            if b ≥ asactive {
+                assc[[bh, c]] ← -3.0e38
+            }
+            else {
+                let i32 blk ← b / asblk
+                mut i32 bend ← (blk + 1) * asblk
+
+                if bend ≻ asactive {
+                    bend ← asactive
+                }
+
+                if cc ≥ aspos + bend {
+                    assc[[bh, c]] ← -3.0e38
+                }
+                else {
+                    let i32 qbase ← hh * asdh
+                    let i32 kbase ← hh / asgroup * asdh
+                    mut f32 acc ← 0.0
+
+                    for range 0 ‥ asdh let kk {
+                        acc ← acc + asq[[b, qbase + kk]] * askc[[cc, kbase + kk]]
+                    }
+
+                    assc[[bh, c]] ← acc * asscale
+                }
+            }
+        }
+    }
+}
+
+# Batched GQA attention context over flattened probability rows [BH, C]:
+#   ctx[b, j] = sum_{c < limit} pr[b * heads + h, c] * vc[c, (h / group) * dh + d].
+@ public
+kernel attn_context_batch<size B, size QD, size BH, size C, size KVD>(tensor<f32, [B, QD]> acdom, tensor<f32, [BH, C]> acp, tensor<f32, [C, KVD]> acvc, mut tensor<f32, [B, QD]> acctx, i32 acpos, i32 acheads, i32 acgroup, i32 acdh, i32 acactive, i32 acblk) → void {
+    for from acdom at [b, j] thread lane let e {
+        if b ≺ acactive and acpos ≥ 0 and acpos ≺ C and acheads ≥ 1 and acheads ≤ 4096 and acgroup ≥ 1 and acgroup ≤ 128 and acdh ≥ 1 and acdh ≤ 960 and acblk ≥ 1 and b ∈ 0 … 16383 {
+            let i32 bb ← b ∧ 16383
+            let i32 dh ← acdh
+            let i32 h ← j / dh
+            let i32 d ← j % dh
+            let i32 row ← bb * acheads + h
+            let i32 vcol ← h / acgroup * dh + d
+            let i32 blk ← bb / acblk
+            mut i32 bend ← (blk + 1) * acblk
+
+            if bend ≻ acactive {
+                bend ← acactive
+            }
+
+            mut i32 n ← acpos + bend
+
+            if n ≻ C {
+                n ← C
+            }
+
+            mut f32 acc ← 0.0
+
+            for range 0 ‥ n let c {
+                acc ← acc + acp[[row, c]] * acvc[[c, vcol]]
+            }
+
+            acctx[[b, j]] ← acc
+        }
+    }
+}
+
+# Batched residual add: out[b, j] = a[b, j] + b[b, j] for b < active_b.
+@ public
+kernel residual_add_batch<size B, size D>(tensor<f32, [B, D]> rea, tensor<f32, [B, D]> reb, mut tensor<f32, [B, D]> reo, i32 reactive) → void {
+    for from rea at [b, j] thread lane let a {
+        if b ≺ reactive {
+            reo[[b, j]] ← a + reb[[b, j]]
+        }
+    }
+}
+
+# Batched SwiGLU: out[b, j] = silu(g[b, j]) * u[b, j] for b < active_b.
+@ public
+kernel swiglu_batch<size B, size F>(tensor<f32, [B, F]> swg, tensor<f32, [B, F]> swu, mut tensor<f32, [B, F]> swo, i32 swactive) → void {
+    for from swg at [b, j] thread lane let v {
+        if b ≺ swactive {
+            swo[[b, j]] ← v / (1.0 + (-v).exp()) * swu[[b, j]]
+        }
+    }
+}
+
 +++ faber test
 # Co-located package test for decode_step.fab. Runs through KIR on CPU and Metal.
 
