@@ -11,62 +11,6 @@ import from "gradus:tokenizer/identity"
 
 # --- Codepoint ↔ text helpers -------------------------------------------
 
-fn text_from_bytes(list<int> bs) → string ⇥ identity.TokenizerError {
-    mut list<u8> u8s ← empty
-
-    for from bs let b {
-        do {
-            u8s.append(b ↦ u8)
-        }
-        catch err {
-            throw variant identity.TokenizerError.BadUtf8 { message = "display character byte is out of range" }
-        }
-    }
-
-    let list<b8> o ↤ u8s
-
-    do {
-        return o ↦ string
-    }
-    catch err {
-        throw variant identity.TokenizerError.BadUtf8 { message = "display character bytes are not valid UTF-8" }
-    }
-
-    throw variant identity.TokenizerError.BadUtf8 { message = "unreachable display character conversion" }
-}
-
-# UTF-8 encode one codepoint to its single-character text. Display
-# codepoints are ≤ 0x143, so the 1- and 2-byte arms cover the mapping; the
-# longer arms keep the helper total for arbitrary vocab content.
-fn text_from_code(int cpt) → string ⇥ identity.TokenizerError {
-    require cpt ≥ 0 throw variant identity.TokenizerError.BadWire { message = "negative codepoint" }
-
-    if cpt ≺ 128 then return text_from_bytes([cpt])
-
-    if cpt ≺ 2048 {
-        let int b0 ← 192 ∨ cpt ⇒ 6
-        let int b1 ← 128 ∨ cpt ∧ 63
-        return text_from_bytes([b0, b1])
-    }
-
-    if cpt ≺ 65536 {
-        let int b0 ← 224 ∨ cpt ⇒ 12
-        let int b1 ← 128 ∨ cpt ⇒ 6 ∧ 63
-        let int b2 ← 128 ∨ cpt ∧ 63
-        return text_from_bytes([b0, b1, b2])
-    }
-
-    if cpt ≺ 1114112 {
-        let int b0 ← 240 ∨ cpt ⇒ 18
-        let int b1 ← 128 ∨ cpt ⇒ 12 ∧ 63
-        let int b2 ← 128 ∨ cpt ⇒ 6 ∧ 63
-        let int b3 ← 128 ∨ cpt ∧ 63
-        return text_from_bytes([b0, b1, b2, b3])
-    }
-
-    throw variant identity.TokenizerError.BadWire { message = "codepoint exceeds the Unicode range" }
-}
-
 # UTF-8 decode one character back to its codepoint. A single character is
 # one to four bytes.
 fn code_from_trace(string c) → int ⇥ identity.TokenizerError {
@@ -349,16 +293,58 @@ fn category_name(string c) → string {
 # only; the full Unicode White_Space property is a documented boundary).
 # -------------------------------------------------------------------------
 
-# Raw text → codepoint list (one entry per character; string.slice is
-# codepoint-indexed, so i advances one character per step).
-# W0 stay: the transform calls a failable decoder for every character;
-# map cannot propagate the TokenizerError channel.
-fn text_codes(string s) → list<int> ⇥ identity.TokenizerError {
-    mut list<int> out ← empty
+# Codepoint at byte offset `i` of a text's byte values for a known sequence
+# width (the byte-list twin of the single-character decoder's arithmetic;
+# the continuation bytes fold in exactly as code_from_trace folds them).
+fn trace_code(list<int> bs, int i, int width) → int {
+    let int b0 ← bs.get(i) coalesce 0
+    let int b1 ← bs.get(i + 1) coalesce 0
 
-    for range 0 ‥ s.length() let i {
-        let string c ← s.slice(i, i + 1)
-        out.append(code_from_trace(c))
+    if width ≡ 2 then return (b0 ∧ 31) ⇐ 6 ∨ b1 ∧ 63
+
+    let int b2 ← bs.get(i + 2) coalesce 0
+
+    if width ≡ 3 then return (b0 ∧ 15) ⇐ 12 ∨ (b1 ∧ 63) ⇐ 6 ∨ b2 ∧ 63
+
+    let int b3 ← bs.get(i + 3) coalesce 0
+
+    return (b0 ∧ 7) ⇐ 18 ∨ (b1 ∧ 63) ⇐ 12 ∨ (b2 ∧ 63) ⇐ 6 ∨ b3 ∧ 63
+}
+
+# Raw text → codepoint list (one entry per character), decoded in a single
+# pass over the UTF-8 bytes: the lead byte selects the sequence width and
+# the continuation bytes fold in arithmetically. string indices stay
+# codepoint-based (string.slice is codepoint-indexed), so a codepoint
+# list and the source text address the same positions.
+# W0 stay: the walk carries a mutable byte cursor with per-sequence bounds
+# validation; map cannot propagate the TokenizerError channel.
+fn text_codes(string s) → list<int> ⇥ identity.TokenizerError {
+    let list<int> bs ← number_bytes(s ↦ list<b8>)
+    let int n ← bs.length()
+    mut list<int> out ← empty
+    mut int i ← 0
+
+    while i ≺ n {
+        let int b0 ← bs.get(i) coalesce 0
+
+        if b0 ≺ 128 {
+            out.append(b0)
+            i ← i + 1
+            continue
+        }
+
+        mut int width ← 0
+
+        if b0 ≥ 192 and b0 ≤ 223 then width ← 2
+
+        if b0 ≥ 224 and b0 ≤ 239 then width ← 3
+
+        if b0 ≥ 240 and b0 ≤ 247 then width ← 4
+
+        require width ≥ 2 and i + width ≤ n throw variant identity.TokenizerError.UnknownTrace { message = "malformed display character" }
+
+        out.append(trace_code(bs, i, width))
+        i ← i + width
     }
 
     return out
@@ -405,25 +391,16 @@ fn small_code(int cpt) → int {
     return cpt
 }
 
-# Codepoint range → the exact source slice (rebuilds the UTF-8 bytes).
-# W0 stay: this ordered string fold calls a failable codepoint conversion;
-# reduce closures cannot propagate that error channel.
-fn words_from_codes(list<int> cpts, int ini, int fin) → string ⇥ identity.TokenizerError {
-    mut string out ← ""
-
-    for range ini ‥ fin let i {
-        out ← out + text_from_code(cpts.get(i) coalesce 0)
-    }
-
-    return out
-}
+# Codepoint range → the exact source slice. Codepoint indices address the
+# same positions as string.slice's codepoint indices, so a word is the
+# direct slice of the source text — no per-character rebuild.
 
 # Split a raw prompt into words exactly like the pinned qwen35 scanner's
 # core families. Each returned word is a slice of the input text; the U2
 # word-level BPE core consumes one word at a time.
 # W0 stay: this ordered regex-alternation scanner has a mutable cursor,
-# early continues, and failable slice reconstruction; map/filter/reduce do
-# not preserve its token-boundary semantics.
+# early continues, and a failable codepoint decode at entry; map/filter/
+# reduce do not preserve its token-boundary semantics.
 @ public
 fn scan_words(string text) → list<string> ⇥ identity.TokenizerError {
     let list<int> cpts ← text_codes(text)
@@ -444,7 +421,7 @@ fn scan_words(string text) → list<string> ⇥ identity.TokenizerError {
 
             if prox ≡ 115 or prox ≡ 116 or prox ≡ 109 or prox ≡ 100 {
                 pos ← pos + 2
-                words.append(words_from_codes(cpts, start, pos))
+                words.append(text.slice(start, pos))
                 continue
             }
 
@@ -453,7 +430,7 @@ fn scan_words(string text) → list<string> ⇥ identity.TokenizerError {
 
                 if prox ≡ 114 and prox2 ≡ 101 or prox ≡ 118 and prox2 ≡ 101 or prox ≡ 108 and prox2 ≡ 108 {
                     pos ← pos + 3
-                    words.append(words_from_codes(cpts, start, pos))
+                    words.append(text.slice(start, pos))
                     continue
                 }
             }
@@ -482,7 +459,7 @@ fn scan_words(string text) → list<string> ⇥ identity.TokenizerError {
                     pos ← pos + 1
                 }
 
-                words.append(words_from_codes(cpts, start, pos))
+                words.append(text.slice(start, pos))
                 continue
             }
         }
@@ -490,7 +467,7 @@ fn scan_words(string text) → list<string> ⇥ identity.TokenizerError {
         # \p{N} — one digit per word.
         if number_code(cpt) {
             pos ← pos + 1
-            words.append(words_from_codes(cpts, start, pos))
+            words.append(text.slice(start, pos))
             continue
         }
 
@@ -529,7 +506,7 @@ fn scan_words(string text) → list<string> ⇥ identity.TokenizerError {
                 pos ← pos + 1
             }
 
-            words.append(words_from_codes(cpts, start, pos))
+            words.append(text.slice(start, pos))
             continue
         }
 
@@ -554,7 +531,7 @@ fn scan_words(string text) → list<string> ⇥ identity.TokenizerError {
         # \s*[\r\n]+ — consume through the last CR/LF of the run.
         if end_line ≻ 0 {
             pos ← end_line
-            words.append(words_from_codes(cpts, start, pos))
+            words.append(text.slice(start, pos))
             continue
         }
 
@@ -562,14 +539,14 @@ fn scan_words(string text) → list<string> ⇥ identity.TokenizerError {
         # whitespace for the next word.
         if multi ≻ 1 and pos + multi ≺ n {
             pos ← pos + multi - 1
-            words.append(words_from_codes(cpts, start, pos))
+            words.append(text.slice(start, pos))
             continue
         }
 
         # \s+ — plain whitespace run.
         if multi ≻ 0 {
             pos ← pos + multi
-            words.append(words_from_codes(cpts, start, pos))
+            words.append(text.slice(start, pos))
             continue
         }
 
@@ -577,7 +554,7 @@ fn scan_words(string text) → list<string> ⇥ identity.TokenizerError {
         # "no matches" arm; every bounded-table class matches a family,
         # so this is the safety net).
         pos ← pos + 1
-        words.append(words_from_codes(cpts, start, pos))
+        words.append(text.slice(start, pos))
     }
 
     return words
@@ -600,7 +577,7 @@ fn scan_smollm(string text) → list<string> ⇥ identity.TokenizerError {
 
     while pos ≺ n {
         if number_code(cpts.get(pos) coalesce 0) {
-            words.append(words_from_codes(cpts, pos, pos + 1))
+            words.append(text.slice(pos, pos + 1))
             pos ← pos + 1
             continue
         }
@@ -615,7 +592,7 @@ fn scan_smollm(string text) → list<string> ⇥ identity.TokenizerError {
             pos ← pos + 1
         }
 
-        let list<string> partes ← scan_gpt2_span(cpts, start, pos)
+        let list<string> partes ← scan_gpt2_span(text, cpts, start, pos)
 
         for from partes let p {
             words.append(p)
@@ -632,7 +609,7 @@ fn scan_smollm(string text) → list<string> ⇥ identity.TokenizerError {
 # all-but-last (add_space_prefix = false — P11).
 # W0 stay: this bounded scanner's branch order and mutable cursor define
 # token boundaries; no closure intrinsic preserves its early exits.
-fn scan_gpt2_span(list<int> cpts, int lo, int hi) → list<string> ⇥ identity.TokenizerError {
+fn scan_gpt2_span(string text, list<int> cpts, int lo, int hi) → list<string> {
     mut list<string> words ← empty
     mut int pos ← lo
 
@@ -645,7 +622,7 @@ fn scan_gpt2_span(list<int> cpts, int lo, int hi) → list<string> ⇥ identity.
 
             if prox ≡ 115 or prox ≡ 116 or prox ≡ 109 or prox ≡ 100 {
                 pos ← pos + 2
-                words.append(words_from_codes(cpts, start, pos))
+                words.append(text.slice(start, pos))
                 continue
             }
 
@@ -654,7 +631,7 @@ fn scan_gpt2_span(list<int> cpts, int lo, int hi) → list<string> ⇥ identity.
 
                 if prox ≡ 114 and prox2 ≡ 101 or prox ≡ 118 and prox2 ≡ 101 or prox ≡ 108 and prox2 ≡ 108 {
                     pos ← pos + 3
-                    words.append(words_from_codes(cpts, start, pos))
+                    words.append(text.slice(start, pos))
                     continue
                 }
             }
@@ -685,7 +662,7 @@ fn scan_gpt2_span(list<int> cpts, int lo, int hi) → list<string> ⇥ identity.
                 pos ← pos + 1
             }
 
-            words.append(words_from_codes(cpts, start, pos))
+            words.append(text.slice(start, pos))
             continue
         }
 
@@ -702,7 +679,7 @@ fn scan_gpt2_span(list<int> cpts, int lo, int hi) → list<string> ⇥ identity.
                 pos ← pos + 1
             }
 
-            words.append(words_from_codes(cpts, start, pos))
+            words.append(text.slice(start, pos))
             continue
         }
 
@@ -715,7 +692,7 @@ fn scan_gpt2_span(list<int> cpts, int lo, int hi) → list<string> ⇥ identity.
                 pos ← pos + 1
             }
 
-            words.append(words_from_codes(cpts, start, pos))
+            words.append(text.slice(start, pos))
             continue
         }
 
@@ -731,18 +708,18 @@ fn scan_gpt2_span(list<int> cpts, int lo, int hi) → list<string> ⇥ identity.
 
         if multi ≻ 1 and pos + multi ≺ hi {
             pos ← pos + multi - 1
-            words.append(words_from_codes(cpts, start, pos))
+            words.append(text.slice(start, pos))
             continue
         }
 
         if multi ≻ 0 {
             pos ← pos + multi
-            words.append(words_from_codes(cpts, start, pos))
+            words.append(text.slice(start, pos))
             continue
         }
 
         pos ← pos + 1
-        words.append(words_from_codes(cpts, start, pos))
+        words.append(text.slice(start, pos))
     }
 
     return words
