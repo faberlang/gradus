@@ -58,12 +58,15 @@ const list<string> FIM_SEP_NAMES = ["<|file_sep|>"]
 # The artifact-backed runtime record. `words` is the vocab array indexed
 # by token id (decode path); `vocab` is the display-token → id map and
 # `concursus` the "left right" merge-pair → rank map (encode path).
-# `special_texts`/`specialia_ids` are the artifact special-token cache
-# (parallel lists; every non-NORMAL token_type entry, U3-4) that drives the
-# parse-special on/off policy. `eog` is the artifact EOG stop set and
-# `add_bos` the artifact's add_bos_token flag (U3-5). `chat_template` is
-# the artifact's tokenizer.chat_template string (U3-6; absent → empty —
-# no hard-coded fallback).
+# `traces` is the precomputed 256-entry byte → display-character table
+# (the gpt2 byte-to-unicode convention, built once at construction and
+# shared by every encode). `special_texts`/`specialia_ids` are the
+# artifact special-token cache (parallel lists; every non-NORMAL
+# token_type entry, U3-4) that drives the parse-special on/off policy.
+# `eog` is the artifact EOG stop set and `add_bos` the artifact's
+# add_bos_token flag (U3-5). `chat_template` is the artifact's
+# tokenizer.chat_template string (U3-6; absent → empty — no hard-coded
+# fallback).
 
 
 @ public
@@ -71,6 +74,7 @@ class Tokenizer {
     mut list<string> words
     mut map<string, int> vocab
     mut map<string, int> concursus
+    mut list<string> traces
     mut list<string> special_texts
     mut list<int> specialia_ids
     mut list<int> eog
@@ -176,28 +180,23 @@ fn text_from_code(int cpt) → string ⇥ identity.TokenizerError {
     throw variant identity.TokenizerError.BadWire { message = "codepoint exceeds the Unicode range" }
 }
 
-# UTF-8 decode one character back to its codepoint. A single character is
-# one to four bytes.
-fn code_from_trace(string c) → int ⇥ identity.TokenizerError {
-    let list<int> bs ← number_bytes(c ↦ list<b8>)
-    let int n ← bs.length()
-    let int b0 ← bs.get(0) coalesce 0
+# Codepoint at byte offset `i` of a display text's byte values for a known
+# sequence width (the byte-list twin of the single-character decode
+# arithmetic: the lead byte's width selects the arm and the continuation
+# bytes fold in with the same masks and shifts).
+fn trace_code(list<int> bs, int i, int width) → int {
+    let int b0 ← bs.get(i) coalesce 0
+    let int b1 ← bs.get(i + 1) coalesce 0
 
-    if n ≡ 1 then return b0
+    if width ≡ 2 then return (b0 ∧ 31) ⇐ 6 ∨ b1 ∧ 63
 
-    let int b1 ← bs.get(1) coalesce 0
+    let int b2 ← bs.get(i + 2) coalesce 0
 
-    if n ≡ 2 then return (b0 ∧ 31) ⇐ 6 ∨ b1 ∧ 63
+    if width ≡ 3 then return (b0 ∧ 15) ⇐ 12 ∨ (b1 ∧ 63) ⇐ 6 ∨ b2 ∧ 63
 
-    let int b2 ← bs.get(2) coalesce 0
+    let int b3 ← bs.get(i + 3) coalesce 0
 
-    if n ≡ 3 then return (b0 ∧ 15) ⇐ 12 ∨ (b1 ∧ 63) ⇐ 6 ∨ b2 ∧ 63
-
-    let int b3 ← bs.get(3) coalesce 0
-
-    if n ≡ 4 then return (b0 ∧ 7) ⇐ 18 ∨ (b1 ∧ 63) ⇐ 12 ∨ (b2 ∧ 63) ⇐ 6 ∨ b3 ∧ 63
-
-    throw variant identity.TokenizerError.UnknownTrace { message = "malformed display character" }
+    return (b0 ∧ 7) ⇐ 18 ∨ (b1 ∧ 63) ⇐ 12 ∨ (b2 ∧ 63) ⇐ 6 ∨ b3 ∧ 63
 }
 
 # Bulk bytes → byte-value bridge (the runtime's analogue of the manifest
@@ -212,6 +211,20 @@ fn number_bytes(list<b8> o) → list<int> {
 # One display character (the byte-level BPE symbol for a single source byte).
 fn trace_from_byte(int byte) → string ⇥ identity.TokenizerError {
     return text_from_code(code_from_byte(byte))
+}
+
+# The precomputed 256-entry byte → display-character table, built once per
+# runtime: encode reads every source byte's symbol (and every fallback
+# piece's symbols) from this table instead of re-deriving the UTF-8 text
+# per byte.
+fn trace_table() → list<string> ⇥ identity.TokenizerError {
+    mut list<string> table ← empty
+
+    for exclusive 256 let b {
+        table.append(trace_from_byte(b))
+    }
+
+    return table
 }
 
 # --- Manifest reads and merge-table construction ---------------------------
@@ -259,6 +272,40 @@ fn artifact_optional_types(gguf_manifest.GgufManifest m) → list<int> ⇥ ident
     throw variant identity.TokenizerError.BadArtifact { message = "unreachable tokenizer token_type read" }
 }
 
+# Array-length read for the census admission: reads the declared element
+# count from the wire header without decoding the elements (the full decode
+# happens exactly once, in build). A malformed array fails closed.
+fn artifact_length(gguf_manifest.GgufManifest m, string key) → int ⇥ identity.TokenizerError {
+    do {
+        return gguf_manifest.list_length(m, key)
+    }
+    catch err {
+        throw variant identity.TokenizerError.BadArtifact { message = "tokenizer array is unavailable: §"(err.message) }
+    }
+
+    throw variant identity.TokenizerError.BadArtifact { message = "unreachable tokenizer array length read" }
+}
+
+# token_type array-length read: an absent array counts as zero rows
+# (mirrors artifact_optional_types for the length-only admission check).
+fn artifact_optional_length(gguf_manifest.GgufManifest m) → int ⇥ identity.TokenizerError {
+    do {
+        return gguf_manifest.list_length(m, "tokenizer.ggml.token_type")
+    }
+    catch err {
+        match err {
+            case gguf_manifest.GgufManifestError.NotFound let message {
+                return 0
+            }
+            case _ {
+                throw variant identity.TokenizerError.BadArtifact { message = "tokenizer token_type is malformed: §"(err.message) }
+            }
+        }
+    }
+
+    throw variant identity.TokenizerError.BadArtifact { message = "unreachable tokenizer token_type length read" }
+}
+
 # Merge-entry well-formedness: exactly "left right" with a single space
 # separator and non-empty halves (llama.cpp's find_bpe_rank asserts the same
 # no-space-in-token invariant).
@@ -278,62 +325,230 @@ fn pair_ok(string par) → bool {
 
 # --- BPE merge loop (llama.cpp one-at-a-time semantics) --------------------
 
+# The merge-table key of one adjacent symbol pair.
+fn pair_key(string l, string r) → string {
+    return "§ §"(l, r)
+}
+
+# Min-heap ordering over (rank, position) entries: strictly smaller rank,
+# else strictly smaller position (the leftmost tie-break).
+fn entry_before(list<int> ranks, list<int> poses, int a, int b) → bool {
+    let int ra ← ranks.get(a) coalesce 0
+    let int rb ← ranks.get(b) coalesce 0
+
+    if ra ≺ rb then return true
+
+    if ra ≻ rb then return false
+
+    return (poses.get(a) coalesce 0) ≺ (poses.get(b) coalesce 0)
+}
+
+# Sift the entry at index i up toward the root.
+fn heap_sift_up(mut list<int> ranks, mut list<int> poses, int i) → void {
+    mut int cur ← i
+
+    while cur ≻ 0 {
+        let int parent ← (cur - 1) / 2
+
+        if entry_before(ranks, poses, cur, parent) {
+            let int rank ← ranks.get(cur) coalesce 0
+            let int pos ← poses.get(cur) coalesce 0
+            ranks[cur] ← ranks.get(parent) coalesce 0
+            poses[cur] ← poses.get(parent) coalesce 0
+            ranks[parent] ← rank
+            poses[parent] ← pos
+            cur ← parent
+        }
+        else {
+            return
+        }
+    }
+}
+
+# Sift the entry at index i down inside the live region [0, extent).
+fn heap_sift_down(mut list<int> ranks, mut list<int> poses, int i, int extent) → void {
+    mut int cur ← i
+
+    while true {
+        let int child ← 2 * cur + 1
+
+        if child ≥ extent {
+            return
+        }
+
+        mut int pick ← child
+        let int other ← child + 1
+
+        if other ≺ extent {
+            if entry_before(ranks, poses, other, pick) {
+                pick ← other
+            }
+        }
+
+        if entry_before(ranks, poses, pick, cur) {
+            let int rank ← ranks.get(cur) coalesce 0
+            let int pos ← poses.get(cur) coalesce 0
+            ranks[cur] ← ranks.get(pick) coalesce 0
+            poses[cur] ← poses.get(pick) coalesce 0
+            ranks[pick] ← rank
+            poses[pick] ← pos
+            cur ← pick
+        }
+        else {
+            return
+        }
+    }
+}
+
+# Push one (rank, position) entry into the live region [0, extent): reuses
+# the dead slot at `extent` when earlier pops left one, else appends. The
+# caller increments its own extent afterwards.
+fn heap_push(mut list<int> ranks, mut list<int> poses, int extent, int rank, int pos) → void {
+    if ranks.length() ≡ extent {
+        ranks.append(rank)
+        poses.append(pos)
+    }
+    else {
+        ranks[extent] ← rank
+        poses[extent] ← pos
+    }
+
+    heap_sift_up(mut ranks, mut poses, extent)
+}
+
+# Pop the current minimum entry; restores the heap over the remaining
+# extent-1 entries. Caller must pass extent > 0 and decrement afterwards.
+fn heap_pop(mut list<int> ranks, mut list<int> poses, int extent) → tuple<int, int> {
+    let int rank ← ranks.get(0) coalesce 0
+    let int pos ← poses.get(0) coalesce 0
+    let int last ← extent - 1
+
+    if last ≻ 0 {
+        ranks[0] ← ranks.get(last) coalesce 0
+        poses[0] ← poses.get(last) coalesce 0
+        heap_sift_down(mut ranks, mut poses, 0, last)
+    }
+
+    return tuple<int, int> [rank, pos]
+}
+
 # Repeatedly merge the adjacent pair with the lowest merge rank (ties broken
 # by the leftmost position), one occurrence per step, until no pair merges.
-# Matches the pinned reference's priority-queue behavior; a fresh scan each
-# step makes stale entries impossible.
+# The symbol chain is a doubly-linked index array (prev/next over the
+# original positions; a merge's left node absorbs its right neighbor), and
+# a (rank, position) min-heap replaces the per-step full scan: each merge
+# pushes only the two newly adjacent pairs, and a popped entry is skipped
+# unless its left node is still alive and its current right neighbor still
+# forms the entry's ranked pair. A pair's string is constant while both
+# nodes stay adjacent (symbols change only by absorbing, which dissolves
+# the pair), so every mergeable pair always holds a live heap entry and
+# the pop order equals the scan's (rank, leftmost-position) choice.
 # W0 stay: this compound (rank, leftmost-position) key has no covering twin;
 # retain its sentinel guard pending a future operator ruling.
 fn bpe_merge(map<string, int> concursus, list<string> symbola) → list<string> {
-    mut list<string> cur ← copy symbola
+    let int n ← symbola.length()
 
-    while true {
-        let int n ← cur.length()
-
-        if n ≺ 2 {
-            break
-        }
-
-        mut int melior_rank ← MERGE_ABSENS
-        mut int melior_pos ← -1
-        mut int i ← 0
-
-        while i + 1 ≺ n {
-            let string l ← cur.get(i) coalesce ""
-            let string r ← cur.get(i + 1) coalesce ""
-            let int rank ← concursus.get("§ §"(l, r)) coalesce MERGE_ABSENS
-
-            if rank ≺ melior_rank or rank ≡ melior_rank and melior_pos ≥ 0 and i ≺ melior_pos {
-                melior_rank ← rank
-                melior_pos ← i
-            }
-
-            i ↑
-        }
-
-        if melior_pos ≺ 0 {
-            break
-        }
-
-        let string cohaesum ← "§§"(cur.get(melior_pos) coalesce "", cur.get(melior_pos + 1) coalesce "")
-        mut list<string> next ← empty
-        mut int j ← 0
-
-        while j ≺ n {
-            if j ≡ melior_pos {
-                next.append(cohaesum)
-                j ← j + 2
-            }
-            else {
-                next.append(cur.get(j) coalesce "")
-                j ← j + 1
-            }
-        }
-
-        cur ← next
+    if n ≺ 2 {
+        mut list<string> idem ← copy symbola
+        return idem
     }
 
-    return cur
+    mut list<string> sym ← empty
+    mut list<int> prev ← empty
+    mut list<int> next ← empty
+    mut list<bool> alive ← empty
+
+    for exclusive n let i {
+        sym.append(symbola.get(i) coalesce "")
+        prev.append(i - 1)
+
+        if i + 1 ≺ n {
+            next.append(i + 1)
+        }
+        else {
+            next.append(-1)
+        }
+
+        alive.append(true)
+    }
+
+    mut list<int> heap_rank ← empty
+    mut list<int> heap_pos ← empty
+    mut int extent ← 0
+
+    for exclusive (n - 1) let i {
+        let int rank ← concursus.get(pair_key(sym.get(i) coalesce "", sym.get(i + 1) coalesce "")) coalesce MERGE_ABSENS
+
+        if rank ≺ MERGE_ABSENS {
+            heap_push(mut heap_rank, mut heap_pos, extent, rank, i)
+            extent ↑
+        }
+    }
+
+    while extent ≻ 0 {
+        let tuple<int, int> entry ← heap_pop(mut heap_rank, mut heap_pos, extent)
+        extent ← extent - 1
+        let int rank ← entry[0]
+        let int p ← entry[1]
+
+        if not (alive.get(p) coalesce false) {
+            continue
+        }
+
+        let int q ← next.get(p) coalesce (-1)
+
+        if q ≺ 0 {
+            continue
+        }
+
+        let int cur_rank ← concursus.get(pair_key(sym.get(p) coalesce "", sym.get(q) coalesce "")) coalesce MERGE_ABSENS
+
+        if cur_rank ≢ rank {
+            continue
+        }
+
+        # Merge q into p: p keeps the position, q leaves the chain.
+        let string cohaesum ← "§§"(sym.get(p) coalesce "", sym.get(q) coalesce "")
+        sym[p] ← cohaesum
+        alive[q] ← false
+        let int tail ← next.get(q) coalesce (-1)
+        next[p] ← tail
+
+        if tail ≥ 0 {
+            prev[tail] ← p
+        }
+
+        # Only the two newly adjacent pairs can merge next.
+        let int before ← prev.get(p) coalesce (-1)
+
+        if before ≥ 0 {
+            let int near_rank ← concursus.get(pair_key(sym.get(before) coalesce "", sym.get(p) coalesce "")) coalesce MERGE_ABSENS
+
+            if near_rank ≺ MERGE_ABSENS {
+                heap_push(mut heap_rank, mut heap_pos, extent, near_rank, before)
+                extent ↑
+            }
+        }
+
+        if tail ≥ 0 {
+            let int far_rank ← concursus.get(pair_key(sym.get(p) coalesce "", sym.get(tail) coalesce "")) coalesce MERGE_ABSENS
+
+            if far_rank ≺ MERGE_ABSENS {
+                heap_push(mut heap_rank, mut heap_pos, extent, far_rank, p)
+                extent ↑
+            }
+        }
+    }
+
+    mut list<string> out ← empty
+    mut int node ← 0
+
+    while node ≥ 0 {
+        out.append(sym.get(node) coalesce "")
+        node ← next.get(node) coalesce (-1)
+    }
+
+    return out
 }
 
 # --- Runtime construction, encode, decode -----------------------------------
@@ -399,10 +614,11 @@ fn build(gguf_manifest.GgufManifest m) → Tokenizer ⇥ identity.TokenizerError
     # text-name fallback); add_bos reads tokenizer.ggml.add_bos_token.
     # The chat template (U3-6) reads tokenizer.chat_template (absent →
     # empty, the no-template state).
-    let list<int> eog ← manifest_eog(m, words)
+    let list<int> eog ← manifest_eog(m, words, vocab)
     let bool add_bos ← artifact_add_bos(m)
     let string chat_template ← artifact_chat_template(m)
-    return Tokenizer { words = words, vocab = vocab, concursus = concursus, special_texts = special_texts, specialia_ids = specialia_ids, eog = eog, add_bos = add_bos, chat_template = chat_template, multitudo = words.length() }
+    let list<string> traces ← trace_table()
+    return Tokenizer { words = words, vocab = vocab, concursus = concursus, traces = traces, special_texts = special_texts, specialia_ids = specialia_ids, eog = eog, add_bos = add_bos, chat_template = chat_template, multitudo = words.length() }
 }
 
 # Sparse table constructor — the provider builds a runtime over the model's
@@ -483,7 +699,8 @@ fn build_tables(list<int> ids, list<string> tokens, list<string> merges, list<in
         e ↑
     }
 
-    return Tokenizer { words = words, vocab = vocab, concursus = concursus, special_texts = special_texts, specialia_ids = specialia_ids, eog = sort_ascending(eog_cand), add_bos = false, chat_template = "", multitudo = words.length() }
+    let list<string> traces ← trace_table()
+    return Tokenizer { words = words, vocab = vocab, concursus = concursus, traces = traces, special_texts = special_texts, specialia_ids = specialia_ids, eog = sort_ascending(eog_cand), add_bos = false, chat_template = "", multitudo = words.length() }
 }
 
 # -------------------------------------------------------------------------
@@ -518,17 +735,19 @@ fn admit_gea3_tables(gguf_manifest.GgufManifest m) → Tokenizer ⇥ identity.To
 
     require pre ≡ GEA3_PRE_TOKENIZER throw variant identity.TokenizerError.UnknownPreTokenizer { message = "GEA3 tokenizer pre-tokenizer does not match the pinned census row: §"(pre) }
 
-    let list<string> tokens ← artifact_texts(m, "tokenizer.ggml.tokens")
+    # Census count checks read the declared array lengths from the wire
+    # headers; the arrays themselves decode exactly once, inside build.
+    let int token_count ← artifact_length(m, "tokenizer.ggml.tokens")
 
-    require tokens.length() ≡ GEA3_VOCAB throw variant identity.TokenizerError.BadVocab { message = "GEA3 tokenizer vocabulary count does not match the pinned census row" }
+    require token_count ≡ GEA3_VOCAB throw variant identity.TokenizerError.BadVocab { message = "GEA3 tokenizer vocabulary count does not match the pinned census row" }
 
-    let list<string> merges ← artifact_texts(m, "tokenizer.ggml.merges")
+    let int merge_count ← artifact_length(m, "tokenizer.ggml.merges")
 
-    require merges.length() ≡ GEA3_MERGES throw variant identity.TokenizerError.BadVocab { message = "GEA3 tokenizer merge count does not match the pinned census row" }
+    require merge_count ≡ GEA3_MERGES throw variant identity.TokenizerError.BadVocab { message = "GEA3 tokenizer merge count does not match the pinned census row" }
 
-    let list<int> kinds ← artifact_optional_types(m)
+    let int kind_count ← artifact_optional_length(m)
 
-    require kinds.length() ≡ GEA3_VOCAB throw variant identity.TokenizerError.BadVocab { message = "GEA3 tokenizer token_type count does not match the pinned census row" }
+    require kind_count ≡ GEA3_VOCAB throw variant identity.TokenizerError.BadVocab { message = "GEA3 tokenizer token_type count does not match the pinned census row" }
 
     let Tokenizer t ← build(m)
 
@@ -547,18 +766,53 @@ fn admit_gea3_tables(gguf_manifest.GgufManifest m) → Tokenizer ⇥ identity.To
     return t
 }
 
+# Fallback expansion of one piece missing from the vocab: decode the
+# piece's characters in one byte pass; each display character resolves
+# back through its source byte's table entry (a piece's characters are
+# exactly its source bytes' symbols, so the byte that produced each
+# character is byte_from_code of its codepoint). A missing byte token is
+# malformed vocab and fails closed.
+fn append_fallback_ids(Tokenizer t, mut list<int> ids, string piece) → void ⇥ identity.TokenizerError {
+    let list<int> bs ← number_bytes(piece ↦ list<b8>)
+    let int pm ← bs.length()
+    mut int pu ← 0
+
+    while pu ≺ pm {
+        let int b0 ← bs.get(pu) coalesce 0
+        let int width ← lead_width(b0)
+
+        require width ≥ 1 and pu + width ≤ pm throw variant identity.TokenizerError.UnknownTrace { message = "malformed display character" }
+
+        mut int cpt ← b0
+
+        if width ≻ 1 {
+            cpt ← trace_code(bs, pu, width)
+        }
+
+        let string c ← t.traces.get(byte_from_code(cpt)) coalesce ""
+        let int cid ← t.vocab.get(c) coalesce (-1)
+
+        require cid ≥ 0 throw variant identity.TokenizerError.UnknownTrace { message = "byte piece missing from the vocabulary: §"(c) }
+
+        ids.append(cid)
+        pu ← pu + width
+    }
+}
+
 # Word-level encode: UTF-8 bytes → display symbols → BPE merges → vocab ids.
-# A final piece missing from the vocab falls back to its single-byte display
-# characters; a missing byte token is malformed vocab and fails closed.
-# W0 stay: ordered BPE output expansion has a failable trace path and a
-# failable fallback path; no map/flat-map form preserves either branch.
+# The display symbols read from the runtime's precomputed 256-entry byte
+# table. A final piece missing from the vocab falls back to its single-byte
+# display characters (append_fallback_ids); a missing byte token is
+# malformed vocab and fails closed.
+# W0 stay: ordered BPE output expansion has a failable fallback path; no
+# map/flat-map form preserves it.
 @ public
 fn encode(Tokenizer t, string word) → list<int> ⇥ identity.TokenizerError {
     let list<int> byte_values ← number_bytes(word ↦ list<b8>)
     mut list<string> symbola ← empty
 
     for from byte_values let b {
-        symbola.append(trace_from_byte(b))
+        symbola.append(t.traces.get(b) coalesce "")
     }
 
     let list<string> end ← bpe_merge(t.concursus, symbola)
@@ -571,25 +825,72 @@ fn encode(Tokenizer t, string word) → list<int> ⇥ identity.TokenizerError {
             ids.append(id)
         }
         else {
-            for from piece let character {
-                let string c ← character ↦ string
-                let int cid ← t.vocab.get(c) coalesce (-1)
-
-                require cid ≥ 0 throw variant identity.TokenizerError.UnknownTrace { message = "byte piece missing from the vocabulary: §"(c) }
-
-                ids.append(cid)
-            }
+            append_fallback_ids(t, mut ids, piece)
         }
     }
 
     return ids
 }
 
+# UTF-8 sequence width of one lead byte (0 when the byte cannot lead a
+# sequence — a stray continuation byte or an out-of-range lead).
+fn lead_width(int b0) → int {
+    if b0 ≺ 128 then return 1
+
+    if b0 ≥ 192 and b0 ≤ 223 then return 2
+
+    if b0 ≥ 224 and b0 ≤ 239 then return 3
+
+    if b0 ≥ 240 and b0 ≤ 247 then return 4
+
+    return 0
+}
+
+# Append one display text's decoded bytes to the output: a direct UTF-8
+# byte pass over the token's text (the lead byte selects the sequence
+# width, each codepoint maps back through the inverse display mapping —
+# no per-character string slicing or byte-list round-trips). The inverse
+# mapping applies to one-byte characters too: byte_from_code is the
+# identity on the printable range and fails closed on unmappable
+# codepoints (vocab content).
+fn append_trace_bytes(mut list<u8> bytes, string trace) → void ⇥ identity.TokenizerError {
+    let list<int> bs ← number_bytes(trace ↦ list<b8>)
+    let int m ← bs.length()
+    mut int u ← 0
+
+    while u ≺ m {
+        let int b0 ← bs.get(u) coalesce 0
+        let int width ← lead_width(b0)
+
+        require width ≥ 1 and u + width ≤ m throw variant identity.TokenizerError.UnknownTrace { message = "malformed display character" }
+
+        mut int cpt ← b0
+
+        if width ≻ 1 {
+            cpt ← trace_code(bs, u, width)
+        }
+
+        let int byte ← byte_from_code(cpt)
+
+        do {
+            bytes.append(byte ↦ u8)
+        }
+        catch err {
+            throw variant identity.TokenizerError.BadUtf8 { message = "decoded byte is out of range" }
+        }
+
+        u ← u + width
+    }
+}
+
 # Word-level decode: ids → vocab display strings → inverse display mapping →
 # bytes → UTF-8 text. Unknown ids, unmappable display characters, and byte
-# sequences that are not valid UTF-8 fail with typed errors.
-# W0 stay: ordered decoding carries typed failures from each nested character;
-# map cannot propagate the error channel and reduce would obscure first failure.
+# sequences that are not valid UTF-8 fail with typed errors. Each token's
+# display text decodes in one direct UTF-8 byte pass (no per-character
+# string slicing or byte-list round-trips).
+# W0 stay: ordered decoding carries typed failures from each nested
+# sequence; map cannot propagate the error channel and reduce would
+# obscure first failure.
 @ public
 fn decode(Tokenizer t, list<int> ids) → string ⇥ identity.TokenizerError {
     mut list<u8> bytes ← empty
@@ -598,19 +899,7 @@ fn decode(Tokenizer t, list<int> ids) → string ⇥ identity.TokenizerError {
         reject id ≺ 0 or id ≥ t.multitudo throw variant identity.TokenizerError.UnknownId { message = "token id outside the vocabulary range: §"(id ↦ string) }
 
         let string trace ← t.words.get(id) coalesce ""
-
-        for from trace let character {
-            let string c ← character ↦ string
-            let int cpt ← code_from_trace(c)
-            let int byte ← byte_from_code(cpt)
-
-            do {
-                bytes.append(byte ↦ u8)
-            }
-            catch err {
-                throw variant identity.TokenizerError.BadUtf8 { message = "decoded byte is out of range" }
-            }
-        }
+        append_trace_bytes(mut bytes, trace)
     }
 
     let list<b8> o ↤ bytes
@@ -660,55 +949,97 @@ fn encode_prompt(Tokenizer t, string text) → list<int> ⇥ identity.TokenizerE
     return encode_words(t, text)
 }
 
+# Does `specialis` match `text` exactly at character position `pos`?
+# Compares character by character (single-character reads), so a
+# non-matching special allocates no slice at all.
+fn special_at(string text, string specialis, int pos) → bool {
+    let int m ← specialis.length()
+
+    if m ≡ 0 or pos + m ≻ text.length() then return false
+
+    for exclusive m let j {
+        if (specialis.get(j) coalesce "") ≢ (text.get(pos + j) coalesce "") then return false
+    }
+
+    return true
+}
+
 # Full-prompt encode with an explicit scanner. `specials` splits on the
 # artifact special cache first; `smollm` selects the SMOLLM scanner.
+# The special split indexes the special cache by first character and walks
+# the prompt once left to right: the first position where any indexed
+# special matches is the earliest occurrence, and the longest match at
+# that position wins ties (list order below equal lengths — the previous
+# scan's selection).
 # W0 stay: special selection uses the compound (position, length) key, not
 # an admitted unmasked argmax form.
 fn encode_prompt_kind(Tokenizer t, string text, bool specials, bool smollm) → list<int> ⇥ identity.TokenizerError {
     if not specials then return encode_words_kind(t, text, smollm)
 
+    let list<int> empty_ints ← empty
+    mut map<string, list<int>> by_first ← empty
+
+    for range 0 ‥ t.special_texts.length() let i {
+        let string specialis ← t.special_texts.get(i) coalesce ""
+
+        if specialis.length() ≻ 0 {
+            let string head_char ← specialis.get(0) coalesce ""
+            let list<int> prior ← by_first.get(head_char) coalesce empty_ints
+            mut list<int> candidates ← empty
+
+            for from prior let j {
+                candidates.append(j)
+            }
+
+            candidates.append(i)
+            by_first.put(head_char, candidates)
+        }
+    }
+
+    let int n ← text.length()
     mut list<int> ids ← empty
     mut int pos ← 0
+    mut int plain ← 0
 
-    while pos ≺ text.length() {
-        mut int melior_pos ← -1
+    while pos ≺ n {
+        let string c ← text.get(pos) coalesce ""
+        let list<int> candidates ← by_first.get(c) coalesce empty_ints
         mut int melior_id ← -1
         mut int melior_length ← -1
 
-        for range 0 ‥ t.special_texts.length() let i {
+        for from candidates let i {
             let string specialis ← t.special_texts.get(i) coalesce ""
 
-            if specialis.length() ≻ 0 {
-                let int p ← unicode.find_span(text, specialis, pos)
+            if specialis.length() ≻ melior_length and special_at(text, specialis, pos) {
+                melior_id ← t.specialia_ids.get(i) coalesce (-1)
+                melior_length ← specialis.length()
+            }
+        }
 
-                if p ≥ 0 and (melior_pos ≺ 0 or p ≺ melior_pos or p ≡ melior_pos and specialis.length() ≻ melior_length) {
-                    melior_pos ← p
-                    melior_id ← t.specialia_ids.get(i) coalesce (-1)
-                    melior_length ← specialis.length()
+        if melior_length ≻ 0 {
+            if pos ≻ plain {
+                let list<int> partes ← encode_words_kind(t, text.slice(plain, pos), smollm)
+
+                for from partes let id {
+                    ids.append(id)
                 }
             }
+
+            ids.append(melior_id)
+            pos ← pos + melior_length
+            plain ← pos
+            continue
         }
 
-        if melior_pos ≺ 0 {
-            let list<int> partes ← encode_words_kind(t, text.slice(pos, text.length()), smollm)
+        pos ↑
+    }
 
-            for from partes let id {
-                ids.append(id)
-            }
+    if plain ≺ n {
+        let list<int> partes ← encode_words_kind(t, text.slice(plain, n), smollm)
 
-            break
+        for from partes let id {
+            ids.append(id)
         }
-
-        if melior_pos ≻ pos {
-            let list<int> partes ← encode_words_kind(t, text.slice(pos, melior_pos), smollm)
-
-            for from partes let id {
-                ids.append(id)
-            }
-        }
-
-        ids.append(melior_id)
-        pos ← melior_pos + melior_length
     }
 
     return ids
@@ -808,11 +1139,12 @@ fn sort_ascending(list<int> a) → list<int> {
 }
 
 # One FIM slot: the metadata key first, else the reference text-name
-# fallback (first matching vocab entry in id order). -1 when nothing
-# resolves; a present-but-malformed key fails closed.
-# W0 stay: the fallback returns the first matching index, so filter/map do
+# fallback (the names resolve through the vocab map in list order — the
+# llama.cpp get_fid lookup). -1 when nothing resolves; a present-but-
+# malformed key fails closed.
+# W0 stay: the fallback returns the first resolving name, so filter/map do
 # not replace this order-sensitive search.
-fn artifact_end(gguf_manifest.GgufManifest m, list<string> words, string key, list<string> names) → int ⇥ identity.TokenizerError {
+fn artifact_end(gguf_manifest.GgufManifest m, list<string> words, string key, list<string> names, map<string, int> vocab) → int ⇥ identity.TokenizerError {
     mut int id ← -1
     mut bool adest ← false
 
@@ -837,18 +1169,22 @@ fn artifact_end(gguf_manifest.GgufManifest m, list<string> words, string key, li
         return id
     }
 
-    for range 0 ‥ words.length() let i {
-        if in_name(words.get(i) coalesce "", names) then return i
+    for from names let name {
+        let int found ← vocab.get(name) coalesce (-1)
+
+        if found ≥ 0 then return found
     }
 
     return -1
 }
 
 # The artifact EOG set: declared eos id + the EOG-name scan + the FIM
-# pad/rep/sep slots, deduped and ascending.
-# W0 stay: candidates arrive from ordered metadata and name scans before a
-# separate dedupe/sort pass; no single closure intrinsic covers this shape.
-fn manifest_eog(gguf_manifest.GgufManifest m, list<string> words) → list<int> ⇥ identity.TokenizerError {
+# pad/rep/sep slots, deduped and ascending. The name scans resolve through
+# the vocab map (O(names) lookups, not an O(vocabulary) walk per name).
+# W0 stay: candidates arrive from ordered metadata and name lookups before
+# a separate dedupe/sort pass; no single closure intrinsic covers this
+# shape.
+fn manifest_eog(gguf_manifest.GgufManifest m, list<string> words, map<string, int> vocab) → list<int> ⇥ identity.TokenizerError {
     mut list<int> candidati ← empty
     mut int eos ← -1
     mut bool eos_adest ← false
@@ -874,15 +1210,17 @@ fn manifest_eog(gguf_manifest.GgufManifest m, list<string> words) → list<int> 
         candidati.append(eos)
     }
 
-    for range 0 ‥ words.length() let i {
-        if in_name(words.get(i) coalesce "", EOG_NAMES) {
-            candidati.append(i)
+    for from EOG_NAMES let name {
+        let int found ← vocab.get(name) coalesce (-1)
+
+        if found ≥ 0 {
+            candidati.append(found)
         }
     }
 
-    candidati.append(artifact_end(m, words, "tokenizer.ggml.fim_pad_token_id", FIM_PAD_NAMES))
-    candidati.append(artifact_end(m, words, "tokenizer.ggml.fim_rep_token_id", FIM_REP_NAMES))
-    candidati.append(artifact_end(m, words, "tokenizer.ggml.fim_sep_token_id", FIM_SEP_NAMES))
+    candidati.append(artifact_end(m, words, "tokenizer.ggml.fim_pad_token_id", FIM_PAD_NAMES, vocab))
+    candidati.append(artifact_end(m, words, "tokenizer.ggml.fim_rep_token_id", FIM_REP_NAMES, vocab))
+    candidati.append(artifact_end(m, words, "tokenizer.ggml.fim_sep_token_id", FIM_SEP_NAMES, vocab))
     return sort_ascending(candidati)
 }
 
