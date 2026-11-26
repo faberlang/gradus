@@ -51,23 +51,23 @@ const int MAX_NUMBER = 9223372036854775807
 # Private helpers.
 # -------------------------------------------------------------------------
 
-# Immutable typed concatenation keeps source order while exposing the list
-# shape to the collection reducer.
-fn append_f32(list<f32> base, list<f32> values) → list<f32> {
-    return values.reduce((list<f32> out, f32 value) ∴ out.added(value), base)
-}
-
 # "/" and ";" are reserved in the identity wire fields (the U3 wire-safety
 # rule).
 fn contains_separator(string s) → bool {
     return s.contains("/") or s.contains(";")
 }
 
-# NumericBlock field-wise equality (shape + flat data).
+# NumericBlock field-wise equality over the VALID region (shape + the
+# first numel elements). Decoded F32 row buffers are pre-allocated at
+# capacity and shared along a derivation chain, so a view's tail may hold
+# rows a later derivation wrote past this view's count; those rows are not
+# part of the value.
 fn tensor_equal(tensor.NumericBlock a, tensor.NumericBlock b) → bool {
     if not (a.shape ≡ b.shape) then return false
 
-    if not (a.data ≡ b.data) then return false
+    for exclusive a.numel let i {
+        if (a.data.get(i) coalesce 0.0 ∷ f32) ≢ (b.data.get(i) coalesce 0.0 ∷ f32) then return false
+    }
 
     return true
 }
@@ -234,9 +234,12 @@ fn storage_block(storage.BlockMetadata template, int dimension, int count) → s
     return storage.known_block(template.elements_per_block, template.bytes_per_block, block_count, block_count * template.bytes_per_block)
 }
 
-fn decoded_storage(storage.Representation representation, storage.BlockMetadata template, tensor.NumericBlock block) → KVStorage ⇥ CacheError {
-    let storage.BlockMetadata metadata ← storage_block(template, block.shape.get(1) coalesce 0, row_count(block))
-    return KVStorage { encoded = storage.encoded(||, representation, metadata), shape = block.shape, count = row_count(block), decoded = representation_equal(representation, representation_f32()) }
+# Count-parameterized decoded storage: the row metadata for `count` valid
+# rows. The decoded F32 row buffers are pre-allocated at capacity; the count
+# (not the buffer length) is the logical row extent.
+fn decoded_storage_count(storage.Representation representation, storage.BlockMetadata template, int dimension, int count) → KVStorage ⇥ CacheError {
+    let storage.BlockMetadata metadata ← storage_block(template, dimension, count)
+    return KVStorage { encoded = storage.encoded(||, representation, metadata), shape = [count, dimension], count = count, decoded = representation_equal(representation, representation_f32()) }
 }
 
 fn empty_storage(storage.Representation representation, storage.BlockMetadata template, list<int> shape) → KVStorage ⇥ CacheError {
@@ -269,9 +272,11 @@ class KVCache {
     mut int layers
     # Layout tag (identity; "staged").
     mut string layout
-    # The cached K tensor [positions, dimension].
+    # The cached K tensor: a [count, dimension] VIEW over the pre-allocated
+    # fixed-capacity row buffer `key.data` (length capacity * dimension,
+    # zero-initialized). Rows past the view count are not part of the value.
     mut tensor.NumericBlock key
-    # The cached V tensor [positions, dimension].
+    # The cached V tensor: the same view contract over `payload.data`.
     mut tensor.NumericBlock payload
     # Physical storage identities. F32 decoded caches keep the old NumericBlock
     # fields populated; encoded caches keep bytes here and expose explicit
@@ -284,6 +289,11 @@ class KVCache {
     mut int dimension
     # Immutable admission bound copied from KVStructure.context_length.
     mut int capacity
+    # True when a derivation already writes rows past this cache's count in
+    # its shared row buffers: the next write from this cache must fork onto
+    # fresh buffers first (value semantics for branched histories). A pure
+    # control bit — never part of cache equality or any wire form.
+    mut bool sealed
 
     # Cached position count (= the history length). Distinct from capacity.
     fn length() → int {
@@ -403,10 +413,53 @@ fn admit_write(KVCache c, int added) → bool ⇥ CacheError {
     return true
 }
 
-fn keep(KVCache c, list<int> history, tensor.NumericBlock key, tensor.NumericBlock payload, int version) → KVCache ⇥ CacheError {
-    let KVStorage key_storage ← decoded_storage(c.key_storage.encoded.representation, c.key_storage.encoded.block, key)
-    let KVStorage value_storage ← decoded_storage(c.value_storage.encoded.representation, c.value_storage.encoded.block, payload)
-    return KVCache { model = c.model, model_version = c.model_version, config = c.config, tokenizer = c.tokenizer, history = history, layers = c.layers, layout = c.layout, key = key, payload = payload, key_storage = key_storage, value_storage = value_storage, version = version, dimension = c.dimension, capacity = c.capacity }
+# Pre-allocated fixed-capacity zero row buffer for a decoded F32 cache.
+fn capacity_zeros(int capacity, int dimension) → list<f32> {
+    let tensor.NumericBlock zeros ← tensor.fill([capacity * dimension], 0.0 ∷ f32) ⊥ tensor.default()
+    return zeros.data
+}
+
+# Write the new rows ([added, dimension]) IN PLACE into a pre-allocated row
+# buffer at write_pos. No history row is read or copied: only the added
+# rows move (issue #73 — the per-token full-history fold is gone).
+fn write_rows(mut list<f32> buffer, int write_pos, int dimension, tensor.NumericBlock rows) → void {
+    let int added ← rows.shape.get(0) coalesce 0
+
+    for exclusive added let r {
+        for exclusive dimension let j {
+            buffer[(write_pos + r) * dimension + j] ← rows.data.get(r * dimension + j) coalesce 0.0 ∷ f32
+        }
+    }
+}
+
+# Fresh capacity buffer carrying the valid region of `data` (rows
+# [0, count)) with zeros past it — the sealed-base fork path. This is the
+# only place a valid region is copied, once per branch, never per token.
+fn forked_data(list<f32> data, int count, int capacity, int dimension) → list<f32> {
+    mut list<f32> out ← empty
+
+    for exclusive count * dimension let i {
+        out.append(data.get(i) coalesce 0.0 ∷ f32)
+    }
+
+    for exclusive capacity * dimension - count * dimension let i {
+        out.append(0.0 ∷ f32)
+    }
+
+    return out
+}
+
+# Assemble the derived decoded cache over its row buffers at `count` valid
+# rows: fresh [count, dimension] view headers (stage_f32 — the producer's
+# shape arithmetic is the admission), fresh storage descriptors, and the
+# caller's history. The result owns nothing sealed.
+fn keep_decoded(KVCache c, list<int> history, list<f32> key_data, list<f32> value_data, int count) → KVCache ⇥ CacheError {
+    let list<int> shape ← [count, c.dimension]
+    let tensor.NumericBlock key ← tensor.stage_f32(shape, key_data)
+    let tensor.NumericBlock payload ← tensor.stage_f32(shape, value_data)
+    let KVStorage key_storage ← decoded_storage_count(c.key_storage.encoded.representation, c.key_storage.encoded.block, c.dimension, count)
+    let KVStorage value_storage ← decoded_storage_count(c.value_storage.encoded.representation, c.value_storage.encoded.block, c.dimension, count)
+    return KVCache { model = c.model, model_version = c.model_version, config = c.config, tokenizer = c.tokenizer, history = history, layers = c.layers, layout = c.layout, key = key, payload = payload, key_storage = key_storage, value_storage = value_storage, version = c.version + 1, dimension = c.dimension, capacity = c.capacity, sealed = false }
 }
 
 fn keep_encoded(KVCache c, list<int> history, list<b8> key_bytes, list<b8> value_bytes, int version) → KVCache ⇥ CacheError {
@@ -414,18 +467,12 @@ fn keep_encoded(KVCache c, list<int> history, list<b8> key_bytes, list<b8> value
     let KVStorage key_storage ← encoded_storage(c.key_storage.encoded.representation, c.key_storage.encoded.block, key_bytes, shape, history.length())
     let KVStorage value_storage ← encoded_storage(c.value_storage.encoded.representation, c.value_storage.encoded.block, value_bytes, shape, history.length())
     let tensor.NumericBlock vacant ← tensor.default()
-    return KVCache { model = c.model, model_version = c.model_version, config = c.config, tokenizer = c.tokenizer, history = history, layers = c.layers, layout = c.layout, key = vacant, payload = vacant, key_storage = key_storage, value_storage = value_storage, version = version, dimension = c.dimension, capacity = c.capacity }
+    return KVCache { model = c.model, model_version = c.model_version, config = c.config, tokenizer = c.tokenizer, history = history, layers = c.layers, layout = c.layout, key = vacant, payload = vacant, key_storage = key_storage, value_storage = value_storage, version = version, dimension = c.dimension, capacity = c.capacity, sealed = false }
 }
 
 @ public
 fn empty_cache_with_capacity(string model, string model_version, string config, string tokenizer, int layers, int dimension, int capacity) → KVCache ⇥ CacheError {
     return empty_cache_with_capacity_representations(model, model_version, config, tokenizer, layers, dimension, capacity, representation_f32(), block_f32(), representation_f32(), block_f32())
-}
-
-fn empty_block(storage.Representation representation, int dimension) → tensor.NumericBlock ⇥ CacheError {
-    if representation_equal(representation, representation_f32()) then return tensor.construct([], [0, dimension])
-
-    return tensor.default()
 }
 
 @ public
@@ -448,12 +495,22 @@ fn empty_cache_with_capacity_representations(string model, string model_version,
 
     row_bytes(key_block, dimension)
     row_bytes(value_block, dimension)
-    let tensor.NumericBlock key ← empty_block(key_representation, dimension)
-    let tensor.NumericBlock payload ← empty_block(value_representation, dimension)
     let list<int> shape ← [0, dimension]
     let KVStorage key_storage ← empty_storage(key_representation, key_block, shape)
     let KVStorage value_storage ← empty_storage(value_representation, value_block, shape)
-    return KVCache { model = model, model_version = model_version, config = config, tokenizer = tokenizer, history = empty, layers = layers, layout = "staged", key = key, payload = payload, key_storage = key_storage, value_storage = value_storage, version = 1, dimension = dimension, capacity = capacity }
+
+    # Decoded F32 caches start on PRE-ALLOCATED fixed-capacity zero row
+    # buffers: every later append/extend writes rows in place at write_pos
+    # and never copies the history (issue #73). Encoded (non-F32) caches
+    # keep the vacant placeholder blocks; their bytes live in storage.
+    if representation_equal(key_representation, representation_f32()) and representation_equal(value_representation, representation_f32()) {
+        let list<f32> key_data ← capacity_zeros(capacity, dimension)
+        let list<f32> value_data ← capacity_zeros(capacity, dimension)
+        return KVCache { model = model, model_version = model_version, config = config, tokenizer = tokenizer, history = empty, layers = layers, layout = "staged", key = tensor.stage_f32(shape, key_data), payload = tensor.stage_f32(shape, value_data), key_storage = key_storage, value_storage = value_storage, version = 1, dimension = dimension, capacity = capacity, sealed = false }
+    }
+
+    let tensor.NumericBlock vacant ← tensor.default()
+    return KVCache { model = model, model_version = model_version, config = config, tokenizer = tokenizer, history = empty, layers = layers, layout = "staged", key = vacant, payload = vacant, key_storage = key_storage, value_storage = value_storage, version = 1, dimension = dimension, capacity = capacity, sealed = false }
 }
 
 # -------------------------------------------------------------------------
@@ -478,18 +535,21 @@ fn default() → KVCache {
     let storage.BlockMetadata block ← block_f32()
     let storage.EncodedStorage encoded ← storage.encoded(||, representation, block)
     let KVStorage kv_storage ← KVStorage { encoded = encoded, shape = empty, count = 0, decoded = false }
-    return KVCache { model = "", model_version = "", config = "", tokenizer = "", history = empty, layers = 0, layout = "", key = t, payload = t, key_storage = kv_storage, value_storage = kv_storage, version = 0, dimension = 0, capacity = 0 }
+    return KVCache { model = "", model_version = "", config = "", tokenizer = "", history = empty, layers = 0, layout = "", key = t, payload = t, key_storage = kv_storage, value_storage = kv_storage, version = 0, dimension = 0, capacity = 0, sealed = false }
 }
 
 # -------------------------------------------------------------------------
 # append — the ONE mutation: extend the cache by exactly one position.
-# The token joins the exact history; the [1, dimension] f32 K/V extends
-# each cached tensor; the generation bumps by 1. Write position is the
-# current length. Gaps and overflow reject before any new rows exist.
+# The token joins the exact history; the [1, dimension] f32 K/V rows are
+# written IN PLACE at write_pos into the pre-allocated capacity buffers (no
+# history copy); the generation bumps by 1. Write position is the current
+# length. Gaps and overflow reject before any new rows exist. The receiver
+# is mut because the rows land in the shared pre-allocated buffers and the
+# base is sealed against a silent second branch writing the same rows.
 # -------------------------------------------------------------------------
 
 @ public
-fn append(KVCache c, int token_id, tensor.NumericBlock key, tensor.NumericBlock payload) → KVCache ⇥ CacheError {
+fn append(mut KVCache c, int token_id, tensor.NumericBlock key, tensor.NumericBlock payload) → KVCache ⇥ CacheError {
     require token_id ≥ 0 throw variant IdOutOfRange { message = "token id must be non-negative" }
 
     require representation_equal(c.key_storage.encoded.representation, representation_f32()) and representation_equal(c.value_storage.encoded.representation, representation_f32()) throw variant DtypeMismatch { message = "decoded append requires F32 K/V representations" }
@@ -505,22 +565,37 @@ fn append(KVCache c, int token_id, tensor.NumericBlock key, tensor.NumericBlock 
     require dtype.name(payload.dtype) ≡ "f32" throw variant DtypeMismatch { message = "unsupported dtype for cache" }
 
     admit_write(c, 1)
-    let list<int> new_history ← c.history.added(token_id)
-    let list<f32> new_key ← append_f32(c.key.data, key.data)
-    let list<f32> new_payload ← append_f32(c.payload.data, payload.data)
-    let int new_len ← c.length() + 1
-    return keep(c, new_history, tensor.construct(new_key, [new_len, c.dimension]), tensor.construct(new_payload, [new_len, c.dimension]), c.version + 1)
+    mut list<int> new_history ← copy c.history
+    new_history.append(token_id)
+    let int write_pos ← c.length()
+    let int dimension ← c.dimension
+
+    if c.sealed {
+        # Branched base: fork onto fresh capacity buffers (its valid region
+        # copied once); the base and its earlier derivation stay untouched.
+        mut list<f32> key_data ← forked_data(c.key.data, write_pos, c.capacity, dimension)
+        mut list<f32> value_data ← forked_data(c.payload.data, write_pos, c.capacity, dimension)
+        write_rows(mut key_data, write_pos, dimension, key)
+        write_rows(mut value_data, write_pos, dimension, payload)
+        return keep_decoded(c, new_history, key_data, value_data, write_pos + 1)
+    }
+
+    write_rows(mut c.key.data, write_pos, dimension, key)
+    write_rows(mut c.payload.data, write_pos, dimension, payload)
+    c.sealed ← true
+    return keep_decoded(c, new_history, c.key.data, c.payload.data, write_pos + 1)
 }
 
 # -------------------------------------------------------------------------
 # extend — append T new positions in one mutation (the prefill write).
-# tokens, key, and payload must share length T; each new K/V row is [T, dim].
+# tokens, key, and payload must share length T; each new K/V row is [T, dim]
+# and the T rows are written IN PLACE at write_pos (no history copy).
 # Generation bumps by 1 (one write). Write position is the current length.
 # Gaps and overflow reject before any new rows exist.
 # -------------------------------------------------------------------------
 
 @ public
-fn extend(KVCache c, list<int> tokens, tensor.NumericBlock key, tensor.NumericBlock payload) → KVCache ⇥ CacheError {
+fn extend(mut KVCache c, list<int> tokens, tensor.NumericBlock key, tensor.NumericBlock payload) → KVCache ⇥ CacheError {
     require tokens.length() ≢ 0 throw variant ElementMismatch { message = "empty token list" }
 
     require representation_equal(c.key_storage.encoded.representation, representation_f32()) and representation_equal(c.value_storage.encoded.representation, representation_f32()) throw variant DtypeMismatch { message = "decoded extend requires F32 K/V representations" }
@@ -538,16 +613,34 @@ fn extend(KVCache c, list<int> tokens, tensor.NumericBlock key, tensor.NumericBl
     admit_write(c, tokens.length())
 
     # Keep: token validation must reject the first bad id before any new
-    # collection is assembled; a transform cannot preserve this boundary.
+    # row is written; a transform cannot preserve this boundary.
     for from tokens let token_id {
         require token_id ≥ 0 throw variant IdOutOfRange { message = "token id must be non-negative" }
     }
 
-    let list<int> new_history ← tokens.reduce((list<int> out, int token_id) ∴ out.added(token_id), c.history)
-    let list<f32> new_key ← append_f32(c.key.data, key.data)
-    let list<f32> new_payload ← append_f32(c.payload.data, payload.data)
-    let int new_len ← c.length() + tokens.length()
-    return keep(c, new_history, tensor.construct(new_key, [new_len, c.dimension]), tensor.construct(new_payload, [new_len, c.dimension]), c.version + 1)
+    mut list<int> new_history ← copy c.history
+
+    for from tokens let token_id {
+        new_history.append(token_id)
+    }
+
+    let int write_pos ← c.length()
+    let int dimension ← c.dimension
+
+    if c.sealed {
+        # Branched base: fork onto fresh capacity buffers (its valid region
+        # copied once); the base and its earlier derivation stay untouched.
+        mut list<f32> key_data ← forked_data(c.key.data, write_pos, c.capacity, dimension)
+        mut list<f32> value_data ← forked_data(c.payload.data, write_pos, c.capacity, dimension)
+        write_rows(mut key_data, write_pos, dimension, key)
+        write_rows(mut value_data, write_pos, dimension, payload)
+        return keep_decoded(c, new_history, key_data, value_data, write_pos + tokens.length())
+    }
+
+    write_rows(mut c.key.data, write_pos, dimension, key)
+    write_rows(mut c.payload.data, write_pos, dimension, payload)
+    c.sealed ← true
+    return keep_decoded(c, new_history, c.key.data, c.payload.data, write_pos + tokens.length())
 }
 
 fn validate_encoded(KVCache c, list<b8> key, list<b8> value, int rows) → bool ⇥ CacheError {
@@ -629,15 +722,20 @@ fn join_bytes(list<b8> base, list<b8> extra) → list<b8> {
 
 # -------------------------------------------------------------------------
 # reset — logical prompt reset: empty history and empty K/V, same
-# identity fields and immutable capacity, generation advanced by 1.
+# identity fields and immutable capacity, generation advanced by 1. The
+# decoded path restarts on FRESH pre-allocated zero buffers (the old rows
+# never leak into a later comparison); the base cache is left untouched.
 # -------------------------------------------------------------------------
 
 @ public
 fn reset(KVCache c) → KVCache ⇥ CacheError {
     if representation_equal(c.key_storage.encoded.representation, representation_f32()) and representation_equal(c.value_storage.encoded.representation, representation_f32()) {
-        let tensor.NumericBlock key ← tensor.construct([], [0, c.dimension])
-        let tensor.NumericBlock payload ← tensor.construct([], [0, c.dimension])
-        return keep(c, empty, key, payload, c.version + 1)
+        let list<int> shape ← [0, c.dimension]
+        let list<f32> key_data ← capacity_zeros(c.capacity, c.dimension)
+        let list<f32> value_data ← capacity_zeros(c.capacity, c.dimension)
+        let KVStorage key_storage ← decoded_storage_count(c.key_storage.encoded.representation, c.key_storage.encoded.block, c.dimension, 0)
+        let KVStorage value_storage ← decoded_storage_count(c.value_storage.encoded.representation, c.value_storage.encoded.block, c.dimension, 0)
+        return KVCache { model = c.model, model_version = c.model_version, config = c.config, tokenizer = c.tokenizer, history = empty, layers = c.layers, layout = c.layout, key = tensor.stage_f32(shape, key_data), payload = tensor.stage_f32(shape, value_data), key_storage = key_storage, value_storage = value_storage, version = c.version + 1, dimension = c.dimension, capacity = c.capacity, sealed = false }
     }
 
     return keep_encoded(c, empty, ||, ||, c.version + 1)
