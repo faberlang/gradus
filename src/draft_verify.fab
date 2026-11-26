@@ -26,9 +26,11 @@ locale = "en"
 # semantics — branch isolation, exact-prefix commit, rollback restoration
 # — independently of the KV's provenance.
 #
-# Only the ContextLookup (PLD) mode runs today; FeatureTapped,
-# StandaloneDraft, and the composite PldThenMtp admit in policy but reject
-# here with a typed not-runnable error until their seams land.
+# Only the ContextLookup (PLD) mode, FeatureTapped (DSpark/DFlash),
+# StandaloneDraft (NextN), and composite PldThenMtp modes run through
+# the coordinator. Coupled MTP modes consume speculative.DrafterContext
+# populated from gradus:model/residual (TapStore / read_tap) and
+# drafter-role descriptors.
 
 import from "gradus:generation/config"
 
@@ -47,6 +49,12 @@ import from "gradus:speculative"
 import from "gradus:context_lookup"
 
 import from "gradus:cache/session"
+
+import from "gradus:model/residual" let residual
+
+import from "gradus:model/tensor_directory" let td
+
+import from "gradus:model/bundle"
 
 # -------------------------------------------------------------------------
 # VerifyError — typed vocabulary of the coordinator.
@@ -91,6 +99,16 @@ fn from_session_error(session.SessionError err) → VerifyError {
 @ conversion
 fn from_sampling_error(sampling.SamplingError err) → VerifyError {
     return variant DecodeFailure { message = err.message }
+}
+
+@ conversion
+fn from_residual_error(residual.ResidualError err) → VerifyError {
+    return variant DraftFailure { message = err.message }
+}
+
+@ conversion
+fn from_directory_error(td.DirectoryError err) → VerifyError {
+    return variant DraftFailure { message = err.message }
 }
 
 # -------------------------------------------------------------------------
@@ -200,33 +218,125 @@ fn concat_history(list<int> base, list<int> extra) → list<int> {
 }
 
 # -------------------------------------------------------------------------
+# Coupled MTP DrafterContext population and validation.
+# -------------------------------------------------------------------------
+
+# Populate target_tap_buffer from a captured TapStore slot via residual.read_tap.
+@ public
+fn populate_tap_buffer<size D>(residual.TapStore<size D> store, string tap_name) → list<f32> ⇥ VerifyError {
+    let tensor<f32, [D]> tapped ← residual.read_tap<size D>(store, tap_name)
+    mut list<f32> out ← empty
+
+    for exclusive D let i {
+        out.append(tapped[[i]])
+    }
+
+    return out
+}
+
+# Collect shared backbone arena slot ids from the target session.
+@ public
+fn backbone_views_from_session<size C, size W, size KVD>(session.SessionState<size C, size W, size KVD> sess) → list<int> {
+    mut list<int> views ← empty
+
+    for from sess.full_kv.slot_ids let slot {
+        views.append(slot)
+    }
+
+    for from sess.ring_kv.slot_ids let slot {
+        views.append(slot)
+    }
+
+    return views
+}
+
+# Collect validated drafter-role arena slot indices from a TensorDirectory.
+@ public
+fn drafter_slots_from_directory(td.TensorDirectory dir, list<string> tensor_names) → list<int> ⇥ VerifyError {
+    require tensor_names.length() ≥ 1 throw variant InvalidConfig { message = "drafter descriptor list must not be empty" }
+
+    mut list<int> slots ← empty
+
+    for exclusive tensor_names.length() let idx {
+        let string name ← tensor_names.get(idx) coalesce ""
+        let td.DirectoryEntry ? ← td.lookup(dir, variant bundle.MemberRole.Drafter, name)
+        slots.append(idx)
+    }
+
+    return slots
+}
+
+# Construct a coupled DrafterContext from TapStore, target session, and
+# drafter-role TensorDirectory descriptors.
+@ public
+fn construct_coupled_context<size C, size W, size KVD, size D>(list<int> token_history, residual.TapStore<size D> store, string tap_name, session.SessionState<size C, size W, size KVD> sess, td.TensorDirectory dir, list<string> drafter_tensors, speculative.AdaptiveBudget budget) → speculative.DrafterContext ⇥ VerifyError {
+    let list<f32> tap_buf ← populate_tap_buffer<size D>(store, tap_name)
+    let list<int> views ← backbone_views_from_session<size C, size W, size KVD>(sess)
+    let list<int> drafter_slots ← drafter_slots_from_directory(dir, drafter_tensors)
+    return speculative.construct_drafter_context(token_history, tap_buf, views, drafter_slots, budget)
+}
+
+fn has_feature_tapped_inputs(speculative.DrafterContext ctx) → bool {
+    return ctx.target_tap_buffer.length() ≥ 1 and ctx.shared_backbone_views.length() ≥ 1
+}
+
+fn has_standalone_inputs(speculative.DrafterContext ctx) → bool {
+    return ctx.drafter_session_state.length() ≥ 1
+}
+
+fn validate_mode_context(string mode, speculative.DrafterContext ctx) → void ⇥ VerifyError {
+    if mode ≡ "context_lookup" then return
+
+    for from ctx.shared_backbone_views let slot {
+        require slot ≥ 0 throw variant InvalidConfig { message = "backbone view slot must be non-negative" }
+    }
+
+    for from ctx.drafter_session_state let slot {
+        require slot ≥ 0 throw variant InvalidConfig { message = "drafter session slot must be non-negative" }
+    }
+
+    if mode ≡ "feature_tapped" {
+        require ctx.target_tap_buffer.length() ≥ 1 throw variant InvalidConfig { message = "feature_tapped mode requires non-empty target_tap_buffer" }
+
+        require ctx.shared_backbone_views.length() ≥ 1 throw variant InvalidConfig { message = "feature_tapped mode requires non-empty shared_backbone_views" }
+
+        return
+    }
+
+    if mode ≡ "standalone_draft" {
+        require ctx.drafter_session_state.length() ≥ 1 throw variant InvalidConfig { message = "standalone_draft mode requires non-empty drafter_session_state" }
+
+        return
+    }
+
+    if mode ≡ "pld_then_mtp" {
+        require has_feature_tapped_inputs(ctx) or has_standalone_inputs(ctx) throw variant InvalidConfig { message = "pld_then_mtp mode requires valid coupled MTP drafter inputs" }
+
+        return
+    }
+
+    throw variant ModeNotImplemented { message = "the § acceleration mode is not runnable on the verify route yet"(mode) }
+}
+
+# -------------------------------------------------------------------------
 # The coordinator loop.
 # -------------------------------------------------------------------------
 
-# Run one accelerated greedy generation over a transactional session.
-#
-# Parity contract with decoder.generate (Eog stop): the emitted stream is
-# token-for-token the Disabled baseline's stream on the same model and
-# config, and the session's committed KV rows are exactly the rows a
-# sequential Disabled replay of the same stream would write. The stop
-# policy is Eog (the baseline default); a token past the first EOG id is
-# never emitted, and an EOG token's own row is never written (the baseline
-# stops before consuming it).
+# Run one accelerated greedy generation over a transactional session using
+# the supplied coupled DrafterContext and drafter model.
 @ public
-fn verify_generate<size C, size W, size KVD>(config.GenerationConfig g, list<int> prompt_ids, decode.Decoder m, mut session.SessionState<size C, size W, size KVD> sess) → VerifyRun ⇥ VerifyError {
+fn verify_generate_coupled<size C, size W, size KVD>(config.GenerationConfig g, list<int> prompt_ids, decode.Decoder m, decode.Decoder drafter, speculative.DrafterContext initial_ctx, mut session.SessionState<size C, size W, size KVD> sess) → VerifyRun ⇥ VerifyError {
     let string mode ← config.acceleration_mode_name(g.acceleration.mode)
 
     if mode ≡ "disabled" {
         throw variant InvalidConfig { message = "the verify route needs an enabled acceleration policy; the Disabled baseline is decoder.generate" }
     }
 
-    if mode ≢ "context_lookup" {
-        throw variant ModeNotImplemented { message = "the § acceleration mode is not runnable on the verify route yet"(mode) }
-    }
-
     # Greedy admission: rejects a sampled config (or a mismatched policy)
     # through the conversion before any model, provider, or session call.
     let speculative.AdmissionResult ? ← speculative.admit_greedy(g.acceleration, g)
+
+    validate_mode_context(mode, initial_ctx)
 
     require prompt_ids.length() ≥ 1 throw variant InvalidConfig { message = "needs at least one prompt token" }
 
@@ -236,12 +346,16 @@ fn verify_generate<size C, size W, size KVD>(config.GenerationConfig g, list<int
 
     require prompt_ids.length() ≤ m.context throw variant InvalidConfig { message = "prompt length does not fit context" }
 
+    require drafter.vocabulary ≡ m.vocabulary throw variant InvalidConfig { message = "drafter vocabulary must match target vocabulary" }
+
+    require drafter.context ≥ g.context throw variant InvalidConfig { message = "drafter context must cover the generation context" }
+
     require g.context ≤ C throw variant InvalidConfig { message = "session capacity must cover the generation context" }
 
     let sampling.Config drawn ← config.config(g)
     mut random.Seed rng ← config.seed(g)
 
-    mut speculative.DrafterContext ctx ← speculative.construct_pld_context(empty, speculative.budget_from_policy(g.acceleration))
+    mut speculative.DrafterContext ctx ← speculative.construct_drafter_context(empty, initial_ctx.target_tap_buffer, initial_ctx.shared_backbone_views, initial_ctx.drafter_session_state, speculative.budget_from_policy(g.acceleration))
 
     mut VerifyStats stats ← default_stats()
     mut list<int> tokens ← empty
@@ -259,15 +373,14 @@ fn verify_generate<size C, size W, size KVD>(config.GenerationConfig g, list<int
     # position = the count of consumed tokens = the index the next
     # consumed token occupies. The loop gate mirrors the baseline's
     # cursor (`prompt + emitted < context`): a token at the final context
-    # slot is emitted but never consumed, exactly as decoder.generate
-    # stops before decoding it.
+    # slot is emitted but never consumed, as in decoder.generate.
     mut int position ← prompt_ids.length()
     mut int emitted ← 0
     mut bool finished ← false
 
     while emitted ≺ g.max_tokens and prompt_ids.length() + emitted ≺ g.context and not finished {
         let int depth ← speculative.next_depth(ctx.adaptive_budget)
-        let speculative.ProviderResult result ← draft_round(prompt_ids, ctx.token_history, depth, g)
+        let speculative.ProviderResult result ← draft_round_mode(mode, prompt_ids, ctx, position, g, drawn, drafter)
 
         if speculative.is_no_draft(result) {
             # Zero-tax degeneracy: one plain target step, exactly the
@@ -291,6 +404,8 @@ fn verify_generate<size C, size W, size KVD>(config.GenerationConfig g, list<int
             else {
                 finished ← true
             }
+
+            ctx ← speculative.construct_drafter_context(history, ctx.target_tap_buffer, ctx.shared_backbone_views, ctx.drafter_session_state, ctx.adaptive_budget)
         }
         else {
             # Verify path: branch, accept the matching candidate prefix,
@@ -397,7 +512,7 @@ fn verify_generate<size C, size W, size KVD>(config.GenerationConfig g, list<int
             stats.accepted_total ← stats.accepted_total + accepted_ids.length()
 
             let speculative.AdaptiveBudget advanced ← speculative.observe_block(ctx.adaptive_budget, candidates.length(), accepted_ids.length())
-            ctx ← speculative.construct_pld_context(history, advanced)
+            ctx ← speculative.construct_drafter_context(history, ctx.target_tap_buffer, ctx.shared_backbone_views, ctx.drafter_session_state, advanced)
 
             # Eagerly consume the last kept token when the loop
             # continues, so the next round decides from the post-token
@@ -416,11 +531,94 @@ fn verify_generate<size C, size W, size KVD>(config.GenerationConfig g, list<int
     return VerifyRun { tokens = tokens, stats = stats }
 }
 
-# One drafter round: the PLD proposal for the current accepted history at
-# the requested depth.
-fn draft_round(list<int> prompt_ids, list<int> history, int depth, config.GenerationConfig g) → speculative.ProviderResult ⇥ VerifyError {
-    let speculative.ProviderRequest req ← speculative.construct_request(prompt_ids, history, depth, g.acceleration.min_block, g.acceleration.max_block)
-    return context_lookup.propose(req)
+# Run one accelerated greedy generation over a transactional session.
+#
+# Parity contract with decoder.generate (Eog stop): the emitted stream is
+# token-for-token the Disabled baseline's stream on the same model and
+# config, and the session's committed KV rows are exactly the rows a
+# sequential Disabled replay of the same stream would write. The stop
+# policy is Eog (the baseline default); a token past the first EOG id is
+# never emitted, and an EOG token's own row is never written (the baseline
+# stops before consuming it).
+@ public
+fn verify_generate<size C, size W, size KVD>(config.GenerationConfig g, list<int> prompt_ids, decode.Decoder m, mut session.SessionState<size C, size W, size KVD> sess) → VerifyRun ⇥ VerifyError {
+    return verify_generate_coupled<size C, size W, size KVD>(g, prompt_ids, m, m, speculative.default_context(), mut sess)
+}
+
+# Coupled MTP drafter round: reads only DrafterContext fields (token_history,
+# target_tap_buffer, shared_backbone_views, drafter_session_state) and
+# drafts up to request.block_size candidate tokens using the drafter model.
+fn draft_mtp(speculative.ProviderRequest req, list<int> prompt_ids, speculative.DrafterContext ctx, int position, sampling.Config drawn, decode.Decoder drafter, string source) → speculative.ProviderResult ⇥ VerifyError {
+    mut int cur_tok ← 0
+
+    if ctx.token_history.length() ≻ 0 {
+        cur_tok ← ctx.token_history.get(ctx.token_history.length() - 1) coalesce 0
+    }
+    elif prompt_ids.length() ≻ 0 {
+        cur_tok ← prompt_ids.get(prompt_ids.length() - 1) coalesce 0
+    }
+    else {
+        return speculative.no_draft()
+    }
+
+    mut list<int> drafted ← empty
+    mut random.Seed draft_rng ← random.construct_seed(1) ⊥ random.default()
+
+    for exclusive req.block_size let step {
+        let int draft_pos ← position - 1 + step
+
+        if draft_pos ≺ 0 or draft_pos ≥ drafter.context {
+            break
+        }
+
+        let list<f32> logits ← step_logits(cur_tok, draft_pos, drafter)
+        let sampling.Sampler pick ← sampling.sample(logits, drawn, empty, draft_rng)
+        cur_tok ← pick.token_id
+        draft_rng ← pick.seed
+        drafted.append(cur_tok)
+    }
+
+    if drafted.length() ≡ 0 {
+        return speculative.no_draft()
+    }
+
+    let int source_offset ← (source ≡ speculative.feature_tapped_source()) ✓ (ctx.shared_backbone_views.get(0) coalesce 0) ✗ (ctx.drafter_session_state.get(0) coalesce 0)
+    let speculative.CandidateProvenance prov ← speculative.construct_provenance(source, source_offset, 1)
+    return speculative.construct_candidates(req, drafted, prov)
+}
+
+# One drafter round dispatched by the admitted acceleration mode.
+# PldThenMtp attempts PLD (context_lookup.propose) first and falls back to
+# the coupled MTP drafter when PLD returns NoDraft.
+@ public
+fn draft_round_mode(string mode, list<int> prompt_ids, speculative.DrafterContext ctx, int position, config.GenerationConfig g, sampling.Config drawn, decode.Decoder drafter) → speculative.ProviderResult ⇥ VerifyError {
+    let int depth ← speculative.next_depth(ctx.adaptive_budget)
+    let speculative.ProviderRequest req ← speculative.construct_request(prompt_ids, ctx.token_history, depth, g.acceleration.min_block, g.acceleration.max_block)
+
+    if mode ≡ "context_lookup" {
+        return context_lookup.propose(req)
+    }
+
+    if mode ≡ "feature_tapped" {
+        return draft_mtp(req, prompt_ids, ctx, position, drawn, drafter, speculative.feature_tapped_source())
+    }
+
+    if mode ≡ "standalone_draft" {
+        return draft_mtp(req, prompt_ids, ctx, position, drawn, drafter, speculative.standalone_draft_source())
+    }
+
+    if mode ≡ "pld_then_mtp" {
+        let speculative.ProviderResult pld_res ← context_lookup.propose(req)
+
+        if not speculative.is_no_draft(pld_res) {
+            return pld_res
+        }
+
+        let string fallback_src ← has_feature_tapped_inputs(ctx) ✓ speculative.feature_tapped_source() ✗ speculative.standalone_draft_source()
+        return draft_mtp(req, prompt_ids, ctx, position, drawn, drafter, fallback_src)
+    }
+
+    throw variant ModeNotImplemented { message = "the § acceleration mode is not runnable on the verify route yet"(mode) }
 }
 
 +++ faber test
@@ -437,8 +635,9 @@ fn draft_round(list<int> prompt_ids, list<int> history, int depth, config.Genera
 #   * the zero-tax degeneracy — a context with no usable suffix drafts
 #     nothing: every round is a plain step and the stream still equals
 #     the baseline.
-#   * the mode gate — only ContextLookup runs; Disabled and the
-#     not-yet-landed modes reject through typed VerifyError.
+#   * the mode gate — ContextLookup, FeatureTapped, StandaloneDraft, and
+#     PldThenMtp run; Disabled, sampled configs, and missing drafter
+#     inputs reject through typed VerifyError.
 #
 # The fixture model is the tiny dense decoder (vocabulary 3, context 16,
 # dimension 4) with identity attention weights; its greedy stream is what
@@ -450,7 +649,14 @@ import from "gradus:generation/decoder" decoder
 import from "gradus:decode" decode
 import from "gradus:tensor" tensor
 import from "gradus:model/schedule" let model_schedule
-import from "gradus:cache/session" session
+import from "gradus:model/residual" let residual
+import from "gradus:model/tensor_directory" let td
+import from "gradus:model/bundle"
+import from "gradus:model/artifact"
+import from "gradus:model/capsule"
+import from "gradus:cache/session"
+import from "gradus:speculative"
+import from "gradus:sampling"
 
 # ---- fixtures
 
@@ -475,6 +681,76 @@ fn target_p() → decode.Decoder {
 
 fn sched_p() → model_schedule.ExecutionSchedule {
     return model_schedule.dense_schedule(2, variant model_schedule.RopeKind.Standard, variant model_schedule.FfnKind.Dense, []) ⊥ model_schedule.ExecutionSchedule { layers = [], segments = [], steps = [], slots = [], residual = variant model_schedule.ResidualKind.Standard, taps = [] }
+}
+
+fn diverging_drafter_p() → decode.Decoder {
+    let tensor.NumericBlock table ← hold([1.0, 0.5, 0.2, (0.0 - 0.5) ↦ f32, 0.0, 1.0, 0.5, (0.0 - 0.5) ↦ f32, (0.0 - 0.5) ↦ f32, 0.0, 1.0, 0.5], [3, 4])
+    let tensor.NumericBlock proj ← hold([0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0], [4, 3])
+    let tensor.NumericBlock pb ← hold([0.0, 5.0, 0.0], [3])
+    return decode.construct_decoder(table, weights_p(), proj, pb, 0.5 ∷ f32, 3, 16, 4) ⊥ decode.default()
+}
+
+fn tapped_store_p() → residual.TapStore<size 4> {
+    let model_schedule.ExecutionSchedule s ← model_schedule.dense_schedule(2, variant model_schedule.RopeKind.Standard, variant model_schedule.FfnKind.Dense, [model_schedule.TapBuffer { name = "final_trunk", visit_id = 1 }]) ⊥ sched_p()
+    mut residual.TapStore<size 4> store ← residual.tap_store_from_schedule<size 4>(s) ⊥ residual.TapStore { slots = empty }
+    mut tensor<f32, [4]> hidden ← tf32[4] {}
+    hidden[[0]] ← 0.25 ∷ f32
+    hidden[[1]] ← 0.5 ∷ f32
+    hidden[[2]] ← 0.75 ∷ f32
+    hidden[[3]] ← 1.0 ∷ f32
+    let bool ? ← residual.capture_if_tapped<size 4>(mut store, 1, hidden) ⊥ false
+    return store
+}
+
+fn id_hex(string ch, int len) → artifact.ContentIdentity {
+    mut string hex ← ""
+    for exclusive 64 let ? {
+        hex ← hex + ch
+    }
+    return artifact.ContentIdentity { algorithm = "sha-256", digest = hex, length = len }
+}
+
+fn drafter_directory_p() → td.TensorDirectory {
+    let artifact.ContentIdentity bb_id ← id_hex("1", 4096)
+    let artifact.ContentIdentity dr_id ← id_hex("2", 2048)
+    let bundle.ModelBundle fallback_b ← bundle.ModelBundle { schema = "", primary_container = variant bundle.ContainerKind.Safetensors, backbone_shards = [], drafter = null, vision = null, config = null, quant_config = null, shard_index = null, tokenizer = null, shard_map = variant bundle.ShardMapping.Unindexed { shard_count = 0 } }
+    let bundle.ModelBundle b ← bundle.safetensors_unindexed([bb_id], null, null, null, dr_id, null) ⊥ fallback_b
+    let capsule.SafetensorsManifest bb_m ← capsule.SafetensorsManifest { format = "safetensors", version = "1.0.0", artifact_length = 4096, data_length = 2048, metadata = [], tensors = [
+        capsule.SafetensorsTensorDescriptor { name = "model.embed_tokens.weight", dtype = "F32", shape = [3, 4], start = 0, end = 1024, elements = 12 }
+    ] }
+    let capsule.SafetensorsManifest dr_m ← capsule.SafetensorsManifest { format = "safetensors", version = "1.0.0", artifact_length = 2048, data_length = 1024, metadata = [], tensors = [
+        capsule.SafetensorsTensorDescriptor { name = "drafter.nextn.proj.weight", dtype = "F32", shape = [4, 3], start = 0, end = 1024, elements = 12 }
+    ] }
+    return td.build(b, [
+        variant td.ShardSource.SafetensorsSource { role = variant bundle.MemberRole.Backbone, shard_index = 0, manifest = bb_m },
+        variant td.ShardSource.SafetensorsSource { role = variant bundle.MemberRole.Drafter, shard_index = 0, manifest = dr_m }
+    ], [], []) ⊥ td.TensorDirectory { bundle = fallback_b, entries = [] }
+}
+
+fn coupled_ctx_p(session.SessionState<16, 1, 4> sess, config.AccelerationPolicy policy) → speculative.DrafterContext {
+    let speculative.AdaptiveBudget budget ← speculative.budget_from_policy(policy) ⊥ speculative.default_budget()
+    return draft_verify.construct_coupled_context<size 16, size 1, size 4, size 4>(empty, tapped_store_p(), "final_trunk", sess, drafter_directory_p(), ["drafter.nextn.proj.weight"], budget) ⊥ speculative.default_context()
+}
+
+fn mode_generation(config.AccelerationMode mode, list<int> eog_ids, int max_tokens) → config.GenerationConfig {
+    let config.AccelerationPolicy policy ← config.construct_acceleration("1.1.0", mode, 1, 8, 1, 8) ⊥ config.default_acceleration()
+    return config.construct_generation_with_policy(16, 8, max_tokens, 7, 0.0 ∷ f32, 0, 1.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32, eog_ids, policy) ⊥ config.default()
+}
+
+fn coupled_detail(config.GenerationConfig g, list<int> prompt, speculative.DrafterContext ctx) → string {
+    mut session.SessionState<16, 1, 4> sess ← sess_p()
+    let _ outcome ← trap {
+        let draft_verify.VerifyRun ? ← draft_verify.verify_generate_coupled<size 16, size 1, size 4>(g, prompt, target_p(), target_p(), ctx, mut sess)
+        return "ok"
+    }
+    match outcome {
+        case returned let ? {
+            return "ok"
+        }
+        case thrown let err {
+            return err.message
+        }
+    }
 }
 
 fn sess_p() → session.SessionState<16, 1, 4> {
@@ -715,24 +991,151 @@ describe "SD6-U3 — draft-and-verify coordinator" {
             case thrown let ? { assert false }
         }
     }
-    test "only ContextLookup runs: Disabled and unlanded modes reject typed" {
+    test "mode gate: Disabled, sampled, and missing/invalid drafter inputs reject typed" {
         assert run_detail(baseline_generation(empty, 4), [1, 2]) ≡ "the verify route needs an enabled acceleration policy; the Disabled baseline is decoder.generate"
 
-        let config.AccelerationPolicy tapped ← config.construct_acceleration("1.1.0", config.acceleration_feature_tapped(), 1, 8, 1, 8) ⊥ config.default_acceleration()
-        let config.GenerationConfig tapped_cfg ← config.construct_generation_with_policy(16, 8, 4, 7, 0.0 ∷ f32, 0, 1.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32, empty, tapped) ⊥ config.default()
-        assert run_detail(tapped_cfg, [1, 2]) ≡ "the feature_tapped acceleration mode is not runnable on the verify route yet"
+        let config.GenerationConfig tapped_cfg ← mode_generation(config.acceleration_feature_tapped(), empty, 4)
+        assert run_detail(tapped_cfg, [1, 2]) ≡ "feature_tapped mode requires non-empty target_tap_buffer"
 
-        let config.AccelerationPolicy composite ← config.construct_acceleration("1.1.0", config.acceleration_pld_then_mtp(), 1, 8, 1, 8) ⊥ config.default_acceleration()
-        let config.GenerationConfig composite_cfg ← config.construct_generation_with_policy(16, 8, 4, 7, 0.0 ∷ f32, 0, 1.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32, empty, composite) ⊥ config.default()
-        assert run_detail(composite_cfg, [1, 2]) ≡ "the pld_then_mtp acceleration mode is not runnable on the verify route yet"
+        let config.GenerationConfig composite_cfg ← mode_generation(config.acceleration_pld_then_mtp(), empty, 4)
+        assert run_detail(composite_cfg, [1, 2]) ≡ "pld_then_mtp mode requires valid coupled MTP drafter inputs"
 
-        let config.AccelerationPolicy standalone ← config.construct_acceleration("1.1.0", config.acceleration_standalone_draft(), 1, 8, 1, 8) ⊥ config.default_acceleration()
-        let config.GenerationConfig standalone_cfg ← config.construct_generation_with_policy(16, 8, 4, 7, 0.0 ∷ f32, 0, 1.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32, empty, standalone) ⊥ config.default()
-        assert run_detail(standalone_cfg, [1, 2]) ≡ "the standalone_draft acceleration mode is not runnable on the verify route yet"
+        let config.GenerationConfig standalone_cfg ← mode_generation(config.acceleration_standalone_draft(), empty, 4)
+        assert run_detail(standalone_cfg, [1, 2]) ≡ "standalone_draft mode requires non-empty drafter_session_state"
+
+        let _ trap_bad_inputs ← trap {
+            let speculative.AdaptiveBudget b ← speculative.budget_from_policy(tapped_cfg.acceleration)
+            let speculative.DrafterContext no_views ← speculative.construct_drafter_context(empty, [0.5 ∷ f32], empty, empty, b)
+            assert coupled_detail(tapped_cfg, [1, 2], no_views) ≡ "feature_tapped mode requires non-empty shared_backbone_views"
+
+            let model_schedule.ExecutionSchedule s ← model_schedule.dense_schedule(2, variant model_schedule.RopeKind.Standard, variant model_schedule.FfnKind.Dense, [model_schedule.TapBuffer { name = "final_trunk", visit_id = 1 }])
+            let residual.TapStore<size 4> uncaptured ← residual.tap_store_from_schedule<size 4>(s)
+            let _ missing_tap ← trap {
+                let list<f32> ? ← draft_verify.populate_tap_buffer<size 4>(uncaptured, "final_trunk")
+                assert false
+            }
+            match missing_tap {
+                case thrown let err {
+                    assert err.message ≡ "tap 'final_trunk' has not been captured"
+                }
+                case returned let ? {
+                    assert false
+                }
+            }
+        }
+        match trap_bad_inputs {
+            case returned let ? { }
+            case thrown let ? { assert false }
+        }
     }
     test "a sampled config rejects on the coordinator channel" {
         let config.AccelerationPolicy policy ← config.construct_acceleration("1.1.0", config.acceleration_context_lookup(), 1, 8, 1, 8) ⊥ config.default_acceleration()
         let config.GenerationConfig sampled ← config.construct_generation_with_policy(16, 8, 4, 7, 0.8 ∷ f32, 0, 1.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32, empty, policy) ⊥ config.default()
         assert run_detail(sampled, [1, 2]) ≡ "sampled acceleration is not supported"
+
+        let config.AccelerationPolicy ft_pol ← config.construct_acceleration("1.1.0", config.acceleration_feature_tapped(), 1, 8, 1, 8) ⊥ config.default_acceleration()
+        let config.GenerationConfig ft_sampled ← config.construct_generation_with_policy(16, 8, 4, 7, 0.8 ∷ f32, 0, 1.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32, empty, ft_pol) ⊥ config.default()
+        assert coupled_detail(ft_sampled, [1, 2], coupled_ctx_p(sess_p(), ft_pol)) ≡ "sampled acceleration is not supported"
+    }
+    test "FeatureTapped, StandaloneDraft, and PldThenMtp stay greedy-exact with bit-for-bit SessionState parity" {
+        let _ trap_mtp_parity ← trap {
+            let list<int> prompt_a ← [0, 1, 2]
+            let list<int> prompt_b ← [0, 0, 0, 0]
+            let config.GenerationConfig base ← baseline_generation(empty, 6)
+            let list<int> baseline_a ← decoder.generate(base, prompt_a, target_p()) ⊥ empty
+            let list<int> baseline_b ← decoder.generate(base, prompt_b, target_p()) ⊥ empty
+
+            # FeatureTapped with matching drafter and diverging drafter
+            let config.GenerationConfig ft_cfg ← mode_generation(config.acceleration_feature_tapped(), empty, 6)
+            mut session.SessionState<16, 1, 4> ft_sess_match ← sess_p()
+            let speculative.DrafterContext ft_ctx ← coupled_ctx_p(ft_sess_match, ft_cfg.acceleration)
+            let speculative.DrafterContext ft_snapshot ← ft_ctx
+            let draft_verify.VerifyRun ft_match ← draft_verify.verify_generate_coupled<size 16, size 1, size 4>(ft_cfg, prompt_a, target_p(), target_p(), ft_ctx, mut ft_sess_match)
+            assert ft_match.tokens ≡ baseline_a
+            assert sessions_agree(ft_sess_match, replay_reference(consumed_of(prompt_a, ft_match.tokens)))
+            assert ft_sess_match.txn_depth ≡ 0
+            assert ft_match.stats.verify_rounds ≥ 1
+            assert ft_match.stats.accepted_total ≥ 1
+            assert speculative.context_equal(ft_ctx, ft_snapshot)
+
+            mut session.SessionState<16, 1, 4> ft_sess_div ← sess_p()
+            let draft_verify.VerifyRun ft_div ← draft_verify.verify_generate_coupled<size 16, size 1, size 4>(ft_cfg, prompt_b, target_p(), diverging_drafter_p(), ft_ctx, mut ft_sess_div)
+            assert ft_div.tokens ≡ baseline_b
+            assert sessions_agree(ft_sess_div, replay_reference(consumed_of(prompt_b, ft_div.tokens)))
+            assert ft_sess_div.txn_depth ≡ 0
+
+            # StandaloneDraft (drafter_session_state only, empty tap/backbone views)
+            let config.GenerationConfig sd_cfg ← mode_generation(config.acceleration_standalone_draft(), empty, 6)
+            mut session.SessionState<16, 1, 4> sd_sess ← sess_p()
+            let speculative.AdaptiveBudget sd_budget ← speculative.budget_from_policy(sd_cfg.acceleration)
+            let list<int> dr_slots ← draft_verify.drafter_slots_from_directory(drafter_directory_p(), ["drafter.nextn.proj.weight"])
+            let speculative.DrafterContext sd_ctx ← speculative.construct_drafter_context(empty, empty, empty, dr_slots, sd_budget)
+            let speculative.DrafterContext sd_snapshot ← sd_ctx
+            let draft_verify.VerifyRun sd_match ← draft_verify.verify_generate_coupled<size 16, size 1, size 4>(sd_cfg, prompt_a, target_p(), target_p(), sd_ctx, mut sd_sess)
+            assert sd_match.tokens ≡ baseline_a
+            assert sessions_agree(sd_sess, replay_reference(consumed_of(prompt_a, sd_match.tokens)))
+            assert sd_sess.txn_depth ≡ 0
+            assert sd_match.stats.verify_rounds ≥ 1
+            assert sd_match.stats.accepted_total ≥ 1
+            assert speculative.context_equal(sd_ctx, sd_snapshot)
+
+            mut session.SessionState<16, 1, 4> sd_sess_div ← sess_p()
+            let draft_verify.VerifyRun sd_run ← draft_verify.verify_generate_coupled<size 16, size 1, size 4>(sd_cfg, prompt_a, target_p(), diverging_drafter_p(), sd_ctx, mut sd_sess_div)
+            assert sd_run.tokens ≡ baseline_a
+            assert sessions_agree(sd_sess_div, replay_reference(consumed_of(prompt_a, sd_run.tokens)))
+            assert sd_sess_div.txn_depth ≡ 0
+            assert sd_run.stats.verify_rounds ≥ 1
+
+            # PldThenMtp on both suffix-match and no-suffix-match prompts
+            let config.GenerationConfig comp_cfg ← mode_generation(config.acceleration_pld_then_mtp(), empty, 6)
+            mut session.SessionState<16, 1, 4> comp_sess_a ← sess_p()
+            let speculative.DrafterContext comp_ctx ← coupled_ctx_p(comp_sess_a, comp_cfg.acceleration)
+            let draft_verify.VerifyRun comp_run_a ← draft_verify.verify_generate_coupled<size 16, size 1, size 4>(comp_cfg, prompt_a, target_p(), target_p(), comp_ctx, mut comp_sess_a)
+            assert comp_run_a.tokens ≡ baseline_a
+            assert sessions_agree(comp_sess_a, replay_reference(consumed_of(prompt_a, comp_run_a.tokens)))
+            assert comp_sess_a.txn_depth ≡ 0
+            assert comp_run_a.stats.accepted_total ≥ 1
+
+            mut session.SessionState<16, 1, 4> comp_sess_b ← sess_p()
+            let draft_verify.VerifyRun comp_run_b ← draft_verify.verify_generate_coupled<size 16, size 1, size 4>(comp_cfg, prompt_b, target_p(), diverging_drafter_p(), comp_ctx, mut comp_sess_b)
+            assert comp_run_b.tokens ≡ baseline_b
+            assert sessions_agree(comp_sess_b, replay_reference(consumed_of(prompt_b, comp_run_b.tokens)))
+            assert comp_sess_b.txn_depth ≡ 0
+        }
+        match trap_mtp_parity {
+            case returned let ? { }
+            case thrown let ? { assert false }
+        }
+    }
+    test "PldThenMtp uses PLD on suffix-match rounds and falls back to MTP on no-suffix-match rounds" {
+        let _ trap_pld_fallback ← trap {
+            let config.GenerationConfig comp_cfg ← mode_generation(config.acceleration_pld_then_mtp(), empty, 4)
+            let sampling.Config drawn ← config.config(comp_cfg)
+            let speculative.DrafterContext ctx ← coupled_ctx_p(sess_p(), comp_cfg.acceleration)
+
+            # No suffix match on [0, 1, 2] -> PLD returns NoDraft, falls back to MTP (feature_tapped)
+            let speculative.ProviderResult no_match_res ← draft_verify.draft_round_mode("pld_then_mtp", [0, 1, 2], ctx, 3, comp_cfg, drawn, target_p())
+            assert not speculative.is_no_draft(no_match_res)
+            assert speculative.candidate_provenance(no_match_res).source ≡ "feature_tapped"
+
+            # Suffix match on [0, 0, 0, 0] -> PLD succeeds, returns context_lookup
+            let speculative.ProviderResult match_res ← draft_verify.draft_round_mode("pld_then_mtp", [0, 0, 0, 0], ctx, 4, comp_cfg, drawn, target_p())
+            assert not speculative.is_no_draft(match_res)
+            assert speculative.candidate_provenance(match_res).source ≡ "context_lookup"
+
+            # End-to-end on a 1-token no-suffix-match prompt [0, 1, 2]:
+            # ContextLookup alone would take 1 plain_step; PldThenMtp falls back to MTP (verify_rounds == 1, plain_steps == 0)
+            let config.GenerationConfig one_tok_cfg ← mode_generation(config.acceleration_pld_then_mtp(), empty, 1)
+            mut session.SessionState<16, 1, 4> sess ← sess_p()
+            let draft_verify.VerifyRun run ← draft_verify.verify_generate_coupled<size 16, size 1, size 4>(one_tok_cfg, [0, 1, 2], target_p(), target_p(), ctx, mut sess)
+            assert run.stats.verify_rounds ≡ 1
+            assert run.stats.plain_steps ≡ 0
+            assert run.stats.drafted_total ≥ 1
+            assert sess.txn_depth ≡ 0
+        }
+        match trap_pld_fallback {
+            case returned let ? { }
+            case thrown let ? { assert false }
+        }
     }
 }
