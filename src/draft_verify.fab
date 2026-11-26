@@ -54,6 +54,8 @@ import from "gradus:cache/hybrid_arenas" let hybrid
 
 import from "gradus:decode_token" let dt
 
+import from "gradus:dspark_drafter" let dspark
+
 import from "gradus:model/residual" let residual
 
 import from "gradus:model/tensor_directory" let td
@@ -893,6 +895,78 @@ fn draft_mtp_batch<size V, size D, size QD, size KVD, size F, size H, size C, si
     return speculative.construct_candidates(req, drafted, prov)
 }
 
+# Non-causal BlockDiffusion (`block_size = 8`) DSpark drafter round over
+# `BatchTarget` + `[T, F, T]` `SessionState` (`dspark.dspark_layer_block_diffusion`),
+# zero `NumericBlock`.
+@ public
+fn draft_dspark_block_batch<size V, size D, size QD, size KVD, size F, size H, size C, size W, size MaxBatch, size BH>(BatchTarget<V, D, QD, KVD, F> drafter, mut session.SessionState<C, W, KVD> dr_sess, mut dt.BatchWorkspace<MaxBatch, BH, D, QD, KVD, F, H, C> bws, speculative.ProviderRequest req, list<int> prompt_ids, speculative.DrafterContext ctx, string source, int mask_token_id) → speculative.ProviderResult ⇥ VerifyError {
+    mut int anchor_tok ← 0
+    if ctx.token_history.length() ≻ 0 {
+        anchor_tok ← ctx.token_history.get(ctx.token_history.length() - 1) coalesce 0
+    }
+    elif prompt_ids.length() ≻ 0 {
+        anchor_tok ← prompt_ids.get(prompt_ids.length() - 1) coalesce 0
+    }
+    else {
+        return speculative.no_draft()
+    }
+
+    mut int blk_len ← req.block_size
+    if blk_len ≻ MaxBatch {
+        blk_len ← MaxBatch
+    }
+    if blk_len ≻ dspark.DSPARK_BLOCK_SIZE {
+        blk_len ← dspark.DSPARK_BLOCK_SIZE
+    }
+    if blk_len ≤ 0 {
+        return speculative.no_draft()
+    }
+
+    mut tensor<i32, [MaxBatch]> d_ids ← tensor<i32, [MaxBatch]> {}
+    d_ids[[0]] ← anchor_tok ↦ i32 ⊥ 0
+    for range 1 ‥ blk_len let b {
+        d_ids[[b]] ← mask_token_id ↦ i32 ⊥ 0
+    }
+
+    mut tensor<f32, [MaxBatch, D]> d_hin ← tf32[MaxBatch, D] {}
+    mut tensor<f32, [MaxBatch, D]> d_hout ← tf32[MaxBatch, D] {}
+    mut tensor<f32, [MaxBatch, D]> d_hn ← tf32[MaxBatch, D] {}
+    mut tensor<f32, [MaxBatch, V]> d_logits ← tf32[MaxBatch, V] {}
+
+    let i32 ab32 ← blk_len ↦ i32 ⊥ 1
+    dt.embed_batch(drafter.embed, d_ids, mut d_hin, ab32)
+
+    if source ≡ speculative.feature_tapped_source() and ctx.target_tap_buffer.length() ≥ 1 {
+        for exclusive D let j {
+            if j ≺ ctx.target_tap_buffer.length() {
+                let f32 tap_val ← ctx.target_tap_buffer.get(j) coalesce 0.0 ∷ f32
+                d_hin[[0, j]] ← d_hin[[0, j]] + (0.25 ∷ f32) * tap_val
+            }
+        }
+    }
+
+    for exclusive drafter.layers.length() let l {
+        let int slot_id ← l % dr_sess.sched.slots.length()
+        dspark.dspark_layer_block_diffusion<size MaxBatch, size BH, size D, size QD, size KVD, size F, size H, size C, size W>(d_hin, mut d_hout, drafter.layers[l], drafter.params[l], mut dr_sess, slot_id, mut bws, ab32, 0, dspark.DSPARK_BLOCK_SIZE)
+        for exclusive blk_len let b {
+            for exclusive D let j {
+                d_hin[[b, j]] ← d_hout[[b, j]]
+            }
+        }
+    }
+
+    dt.head_batch(d_hin, drafter.onorm, drafter.head, mut d_hn, mut d_logits, drafter.peps, ab32)
+
+    mut list<int> drafted ← empty
+    for exclusive blk_len let b {
+        drafted.append(argmax_batch_row<size V, size MaxBatch>(d_logits, b))
+    }
+
+    let int source_offset ← (source ≡ speculative.feature_tapped_source()) ✓ (ctx.shared_backbone_views.get(0) coalesce 0) ✗ (ctx.drafter_session_state.get(0) coalesce 0)
+    let speculative.CandidateProvenance prov ← speculative.construct_provenance(source, source_offset, 1)
+    return speculative.construct_candidates(req, drafted, prov)
+}
+
 # Batched drafter round dispatched by the admitted acceleration mode.
 # Supports ContextLookup, FeatureTapped, StandaloneDraft, and PldThenMtp
 # with effective_min_suffix_length arbitration and independent PLD/MTP budgets.
@@ -1430,6 +1504,8 @@ import from "gradus:cache/hybrid_arenas" let hybrid
 import from "gradus:speculative"
 import from "gradus:sampling"
 import from "gradus:decode_token" let dt
+
+import from "gradus:dspark_drafter" let dspark
 
 # ---- fixtures
 
@@ -2098,6 +2174,41 @@ fn sessions_close(session.SessionState<16, 1, 4> a, session.SessionState<16, 1, 
     return true
 }
 
+fn make_dspark_bws() → dt.BatchWorkspace<8, 16, 4, 4, 4, 6, 2, 16> {
+    let tensor<f32, [16, 16]> b_hcdom ← tf32[16, 16] {}
+    let tensor<f32, [8, 4]> b_qdom ← tf32[8, 4] {}
+    mut tensor<f32, [8, 4]> b_xn ← tf32[8, 4] {}
+    mut tensor<f32, [8, 4]> b_q ← tf32[8, 4] {}
+    mut tensor<f32, [8, 4]> b_qr ← tf32[8, 4] {}
+    mut tensor<f32, [8, 4]> b_k ← tf32[8, 4] {}
+    mut tensor<f32, [8, 4]> b_kr ← tf32[8, 4] {}
+    mut tensor<f32, [8, 4]> b_v ← tf32[8, 4] {}
+    mut tensor<f32, [16, 16]> b_sc ← tf32[16, 16] {}
+    mut tensor<f32, [16, 16]> b_pr ← tf32[16, 16] {}
+    mut tensor<f32, [8, 4]> b_ctx ← tf32[8, 4] {}
+    mut tensor<f32, [8, 4]> b_h1 ← tf32[8, 4] {}
+    mut tensor<f32, [8, 6]> b_gate ← tf32[8, 6] {}
+    mut tensor<f32, [8, 6]> b_up ← tf32[8, 6] {}
+    mut tensor<f32, [8, 6]> b_act ← tf32[8, 6] {}
+    return dt.BatchWorkspace<8, 16, 4, 4, 4, 6, 2, 16> {
+        hcdom = b_hcdom,
+        qdom = b_qdom,
+        xn = b_xn,
+        q = b_q,
+        qr = b_qr,
+        k = b_k,
+        kr = b_kr,
+        v = b_v,
+        sc = b_sc,
+        pr = b_pr,
+        ctx = b_ctx,
+        h1 = b_h1,
+        gate = b_gate,
+        up = b_up,
+        act = b_act
+    }
+}
+
 describe "issue #96 — B=k parallel speculative verify over SessionTxn" {
     test "full acceptance (+ bonus token) matches B=1 baseline and FullKv parity" {
         let _ trap_res ← trap {
@@ -2293,6 +2404,35 @@ describe "issue #139 — NoDraft recovery, frontier skip, and MaxBatch accountin
             assert clamp_run.stats.verify_rounds ≡ 1
             assert clamp_run.stats.accepted_total ≡ 3
             assert clamp_run.stats.drafted_total ≡ 3
+        }
+        match trap_res {
+            case returned let ? { }
+            case thrown let ? { assert false }
+        }
+    }
+    test "DSpark BlockDiffusion (block_size=8) + StandaloneDraft over HybridTxn" {
+        mut dt.BatchWorkspace<8, 16, 4, 4, 4, 6, 2, 16> bws ← make_dspark_bws()
+        let _ trap_res ← trap {
+            let draft_verify.BatchTarget<4, 4, 4, 4, 6> target ← make_cycle_target()
+            let model_schedule.ExecutionSchedule dr_sched ← dspark.dspark_drafter_schedule(16)
+            mut session.SessionState<16, 16, 4> dr_sess ← session.from_schedule<size 16, size 16, size 4>(dr_sched)
+            let speculative.AdaptiveBudget b ← speculative.construct_budget(1, 4)
+            let speculative.DrafterContext ctx ← speculative.construct_drafter_context([1, 2], empty, empty, [0, 1, 2], b)
+            let speculative.ProviderRequest req ← speculative.construct_request([1, 2], ctx.token_history, 4, 1, 4)
+            let speculative.ProviderResult res ← draft_verify.draft_dspark_block_batch<size 4, size 4, size 4, size 4, size 6, size 2, size 16, size 16, size 8, size 16>(target, mut dr_sess, mut bws, req, [1, 2], ctx, speculative.standalone_draft_source(), 0)
+            assert not speculative.is_no_draft(res)
+            assert speculative.candidate_ids(res).length() ≡ 4
+            assert speculative.candidate_provenance(res).source ≡ speculative.standalone_draft_source()
+
+            let config.AccelerationPolicy sd_pol ← config.construct_acceleration("1.1.0", config.acceleration_standalone_draft(), 1, 4, 2, 4)
+            let config.GenerationConfig sd_cfg ← config.construct_generation_with_policy(16, 16, 4, 7, 0.0 ∷ f32, 0, 1.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32, empty, sd_pol)
+            let model_schedule.ExecutionSchedule t_sched ← sched_p()
+            mut session.SessionState<16, 1, 4> base_sess ← sess_p()
+            let list<int> base_tokens ← baseline_wide_generate(sd_cfg, [1, 2], target, mut base_sess)
+
+            mut hybrid.HybridSession<16, 1, 4, 4, 4, 2, 2> hs ← hybrid.from_schedule<size 16, size 1, size 4, size 4, size 4, size 2, size 2>(t_sched, 1, 3, true)
+            let draft_verify.VerifyRun run ← draft_verify.verify_generate_hybrid<size 4, size 4, size 4, size 4, size 6, size 2, size 16, size 1, size 4, size 4, size 2, size 2, size 4, size 8>(sd_cfg, [1, 2], target, target, true, ctx, mut hs)
+            assert run.tokens ≡ base_tokens
         }
         match trap_res {
             case returned let ? { }
