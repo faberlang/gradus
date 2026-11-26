@@ -1,0 +1,201 @@
++++ toml
+locale = "en"
+
++++ faber
+# Resident Inkling-2-Mini-MLX-8bit + mtp.safetensors admission receipt (issue #109).
+#
+# Admits a resident Inkling-2-Mini-MLX-8bit directory
+# (default: /Users/ianzepp/ai/models/Inkling-2-Mini-MLX-8bit) over ModelBundle,
+# TensorDirectory (including Backbone -> Drafter borrow for lm_head.weight),
+# inkling_backbone_schedule, dspark_drafter_schedule, and admit_dspark_directory.
+
+import from "gradus:dspark_drafter" let dspark
+import from "gradus:model/artifact" let artifact
+import from "gradus:model/bundle" let bundle
+import from "gradus:model/capsule" let capsule
+import from "gradus:model/config" let cfg
+import from "gradus:model/safetensors" let st
+import from "gradus:model/schedule" let model_schedule
+import from "gradus:model/tensor_directory" let td
+import from "norma:fs" let fs
+import from "norma:process" let process
+
+const int INKLING_NUM_LAYERS = 24
+const int INKLING_SWA_WINDOW = 1024
+const int INKLING_LOOP_START = 6
+const int INKLING_LOOP_END = 18
+const int INKLING_LOOP_PASSES = 3
+const int INKLING_GATE_RANK = 64
+const int INKLING_UNPADDED_VOCAB = 200058
+
+fn admit_st_header(string st_path, string hex_seed) → capsule.Capsule ⇥ string {
+    mut int st_len ← 0
+    do {
+        st_len ← fs.byte_length(st_path)
+    }
+    catch err {
+        throw "inkling2_resident: cannot stat §: §"(st_path, err.path)
+    }
+
+    mut list<b8> raw_hdr ← empty
+    do {
+        let list<b8> prefix8 ← fs.read_range(st_path, 0, 8)
+        mut int hlen ← 0
+        for exclusive 8 let i {
+            let int bval ← (prefix8[i] ↦ u8) ↦ int
+            hlen ← hlen + (bval ⇐ (i * 8))
+        }
+        raw_hdr ← fs.read_range(st_path, 0, 8 + hlen)
+    }
+    catch err {
+        throw "inkling2_resident: header read failed for §"(st_path)
+    }
+
+    mut list<u8> hdr_u8 ← empty
+    for from raw_hdr let b {
+        hdr_u8.append(b ↦ u8)
+    }
+
+    mut artifact.ContentIdentity ∪ none maybe_id ← null
+    do {
+        maybe_id ← artifact.identity("sha-256", hex_seed, st_len)
+    }
+    catch err {
+        throw "inkling2_resident: identity build failed"
+    }
+    if maybe_id is none then throw "inkling2_resident: identity build failed"
+    let artifact.ContentIdentity cid ← maybe_id
+
+    mut capsule.Capsule ∪ none maybe_cap ← null
+    do {
+        maybe_cap ← st.admit_header(hdr_u8, st_len, cid)
+    }
+    catch err {
+        throw "inkling2_resident: safetensors header admission failed for §"(st_path)
+    }
+    if maybe_cap is none then throw "inkling2_resident: safetensors header admission failed for §"(st_path)
+    return maybe_cap
+}
+
+fn build_inkling_schedule() → model_schedule.ExecutionSchedule ⇥ model_schedule.ScheduleError {
+    mut list<model_schedule.LayerSpec> layers ← empty
+    for exclusive INKLING_NUM_LAYERS let l {
+        let bool is_full ← (l % 6) ≡ 5
+        let model_schedule.AttentionKind attn ← is_full ✓ variant model_schedule.AttentionKind.Full ✗ variant model_schedule.AttentionKind.SlidingWindow { window = INKLING_SWA_WINDOW }
+        layers.append(model_schedule.LayerSpec {
+            physical_layer_id = l,
+            attention = attn,
+            rope = variant model_schedule.RopeKind.RelativeBias,
+            ffn = variant model_schedule.FfnKind.MoE
+        })
+    }
+    let list<model_schedule.ScheduleSegment> segs ← [
+        variant model_schedule.ScheduleSegment.Linear { seg = model_schedule.LinearSegment { start_layer = 0, end_layer = INKLING_LOOP_START } },
+        variant model_schedule.ScheduleSegment.Looped { seg = model_schedule.LoopedSegment { start_layer = INKLING_LOOP_START, end_layer = INKLING_LOOP_END, pass_count = INKLING_LOOP_PASSES, reset_to_prelude = true, gate_rank = INKLING_GATE_RANK, is_varloop = false, max_passes = INKLING_LOOP_PASSES } },
+        variant model_schedule.ScheduleSegment.Linear { seg = model_schedule.LinearSegment { start_layer = INKLING_LOOP_END, end_layer = INKLING_NUM_LAYERS } }
+    ]
+    return model_schedule.build_schedule(layers, segs, variant model_schedule.ResidualKind.AttnRes, [model_schedule.TapBuffer { name = "tap_l5", visit_id = 5 }])
+}
+
+fn print_receipt(string model_type_str, dspark.DsparkAdmitSummary ds_sum) → void ⇥ string {
+    do {
+        let model_schedule.ExecutionSchedule bb_sched ← build_inkling_schedule()
+        let model_schedule.ExecutionSchedule dr_sched ← dspark.dspark_drafter_schedule(INKLING_SWA_WINDOW)
+        print "inkling2_resident: model_type=§ bb_slots=§ bb_visits=§ dr_slots=§ dr_ring=§ dr_full=§ mtp_fuse=§ mtp_norm=§ mtp_ctx=§ mtp_w1=§ borrowed_head=§"(model_type_str, model_schedule.slot_count(bb_sched) ↦ string, bb_sched.steps.length() ↦ string, model_schedule.slot_count(dr_sched) ↦ string, model_schedule.ring_kv_slot_count(dr_sched) ↦ string, model_schedule.full_kv_slot_count(dr_sched) ↦ string, ds_sum.has_fuse_weight ↦ string, ds_sum.has_dflare_norm ↦ string, ds_sum.has_ctx_proj ↦ string, ds_sum.has_markov_w1 ↦ string, ds_sum.has_borrowed_lm_head ↦ string)
+    }
+    catch err {
+        throw "inkling2_resident: schedule build failed: §"(err.message)
+    }
+}
+
+fn admit_resident(string model_dir) → void ⇥ string {
+    let string cfg_path ← "§/config.json"(model_dir)
+    mut list<b8> cfg_bytes ← empty
+    do {
+        cfg_bytes ← fs.read_bytes(cfg_path)
+    }
+    catch err {
+        throw "inkling2_resident: cannot read §: §"(cfg_path, err.path)
+    }
+
+    mut string model_type_str ← "inkling2_loop"
+    do {
+        let cfg.ModelConfig mc ← cfg.parse_bytes(cfg_bytes)
+        model_type_str ← mc.model_type
+    }
+    catch err {
+        model_type_str ← "inkling2_loop(config_note=§)"(err.message)
+    }
+
+    let capsule.Capsule bb_cap4 ← admit_st_header("§/model-00004-of-00004.safetensors"(model_dir), "0000000000000000000000000000000000000000000000000000000000000004")
+    let capsule.Capsule mtp_cap ← admit_st_header("§/mtp.safetensors"(model_dir), "0000000000000000000000000000000000000000000000000000000000000005")
+
+    mut artifact.ContentIdentity ∪ none maybe_cfg ← null
+    do {
+        maybe_cfg ← artifact.identity("sha-256", "1111111111111111111111111111111111111111111111111111111111111111", cfg_bytes.length())
+    }
+    catch err {
+        throw "inkling2_resident: config identity build failed"
+    }
+    if maybe_cfg is none then throw "inkling2_resident: config identity build failed"
+    let artifact.ContentIdentity cfg_id ← maybe_cfg
+
+    mut bundle.ModelBundle ∪ none maybe_b ← null
+    do {
+        maybe_b ← bundle.safetensors_unindexed([bb_cap4.identity], cfg_id, null, null, mtp_cap.identity, null)
+    }
+    catch err {
+        throw "inkling2_resident: bundle admission failed"
+    }
+    if maybe_b is none then throw "inkling2_resident: bundle admission failed"
+    let bundle.ModelBundle b ← maybe_b
+
+    match bb_cap4.manifest {
+        case capsule.Manifest.Safetensors let bb_m {
+            match mtp_cap.manifest {
+                case capsule.Manifest.Safetensors let mtp_m {
+                    mut td.TensorDirectory ∪ none maybe_dir ← null
+                    do {
+                        let list<td.ShardSource> sources ← [
+                            variant td.ShardSource.SafetensorsSource { role = variant bundle.MemberRole.Backbone, shard_index = 0, manifest = bb_m },
+                            variant td.ShardSource.SafetensorsSource { role = variant bundle.MemberRole.Drafter, shard_index = 0, manifest = mtp_m }
+                        ]
+                        maybe_dir ← td.build(b, sources, dspark.dspark_borrow_specs(INKLING_UNPADDED_VOCAB), empty)
+                    }
+                    catch err {
+                        throw "inkling2_resident: directory build failed: §"(err.message)
+                    }
+                    if maybe_dir is none then throw "inkling2_resident: directory build failed"
+                    let td.TensorDirectory dir ← maybe_dir
+
+                    mut dspark.DsparkAdmitSummary ∪ none maybe_sum ← null
+                    do {
+                        maybe_sum ← dspark.admit_dspark_directory(dir, true)
+                    }
+                    catch err {
+                        throw "inkling2_resident: drafter admit failed: §"(err.message)
+                    }
+                    if maybe_sum is none then throw "inkling2_resident: drafter admit failed"
+                    print_receipt(model_type_str, maybe_sum)
+                }
+                default {
+                    throw "inkling2_resident: unexpected non-safetensors mtp manifest"
+                }
+            }
+        }
+        default {
+            throw "inkling2_resident: unexpected non-safetensors backbone manifest"
+        }
+    }
+}
+
+main {
+    let list<string> args ← process.argv() ↦ list<string>
+    let string dir ← args.length() ≥ 2 ✓ args[1] ✗ "/Users/ianzepp/ai/models/Inkling-2-Mini-MLX-8bit"
+    do {
+        admit_resident(dir)
+    }
+    catch err {
+        print err
+    }
+}

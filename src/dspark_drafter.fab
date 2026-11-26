@@ -18,8 +18,12 @@ locale = "en"
 # device tensors compatible with Cranelift CPU and Metal KIR kernels.
 
 import from "gradus:decode_step" let ds
+import from "gradus:decode_token" let dt
 import from "gradus:cache/session" let sess_mod
+import from "gradus:cache/hybrid_arenas" let hybrid
 import from "gradus:model/schedule" let model_schedule
+import from "gradus:model/tensor_directory" let td
+import from "gradus:model/bundle" let bundle
 
 @ public
 const int DSPARK_TAP_COUNT = 4
@@ -95,14 +99,14 @@ fn fuse_and_norm<size D_TARGET, size D_DRAFT>(tensor<f32, [4, D_TARGET]> taps, t
 # ---------------------------------------------------------------------------
 
 # Build the canonical 3-slot hybrid SWA/full schedule for the DSpark drafter:
-# slots 0 and 1 are SlidingWindow (with artifact window, e.g. 1025 or 1024),
-# and slot 2 is Full KV.
+# `[T, F, T]` — slots 0 and 2 are SlidingWindow (with artifact window, e.g.
+# 1024 / 1025), and slot 1 is Full KV.
 @ public
 fn dspark_drafter_schedule(int swa_window) → model_schedule.ExecutionSchedule ⇥ model_schedule.ScheduleError {
     let list<model_schedule.AttentionKind> layer_types ← [
         variant model_schedule.AttentionKind.SlidingWindow { window = swa_window },
-        variant model_schedule.AttentionKind.SlidingWindow { window = swa_window },
-        variant model_schedule.AttentionKind.Full
+        variant model_schedule.AttentionKind.Full,
+        variant model_schedule.AttentionKind.SlidingWindow { window = swa_window }
     ]
     let list<model_schedule.RopeKind> rope_pattern ← [
         variant model_schedule.RopeKind.Standard,
@@ -374,6 +378,24 @@ kernel extract_block_row<size B, size D>(tensor<f32, [B, D]> src, i32 row_idx, m
 }
 
 @ public
+kernel write_block_row<size B, size D>(tensor<f32, [D]> src, i32 row_idx, mut tensor<f32, [B, D]> dst) → void {
+    for from src at [d] thread lane let v {
+        if row_idx ≥ 0 and row_idx ≺ B {
+            dst[[row_idx, d]] ← v
+        }
+    }
+}
+
+@ public
+kernel write_block_id<size B>(tensor<i32, [1]> tok, i32 row_idx, mut tensor<i32, [B]> dst) → void {
+    for from dst at [idx] thread lane let ? {
+        if idx ≡ row_idx {
+            dst[[idx]] ← tok[[0]]
+        }
+    }
+}
+
+@ public
 kernel slice_unpadded_vocab<size PADDED_V, size UNPADDED_V>(tensor<f32, [PADDED_V]> logits, mut tensor<f32, [UNPADDED_V]> out) → void {
     for from out at [j] thread lane let ? {
         if j ≺ PADDED_V {
@@ -397,29 +419,216 @@ fn markov_rnn_block_head<size B, size R, size D_DRAFT, size D_TARGET, size PADDE
     mut tensor<i32, [1]> tok ← tensor<i32, [1]> {}
 
     for range 0 ‥ B let b {
-        extract_block_row(h_block, b ↦ i32 ⊥ 0, mut h_row)
-        markov_rnn_step(s_cur, h_row, w_rec, w_in, b_rec, mut s_next)
+        let i32 bi ← b ↦ i32 ⊥ 0
+        do device {
+            extract_block_row(h_block, bi, mut h_row)
+            markov_rnn_step(s_cur, h_row, w_rec, w_in, b_rec, mut s_next)
+        }
         s_cur ⇇ s_next
 
-        ds.gemv(w_out, s_cur, mut proj)
-        ds.gemv(borrowed_lm_head, proj, mut raw_logits)
-        slice_unpadded_vocab(raw_logits, mut sliced)
-        ds.argmax_token(sliced, mut tok)
-
-        draft_ids[[b]] ← tok[[0]]
-        for range 0 ‥ UNPADDED_V let v {
-            logits_out[[b, v]] ← sliced[[v]]
+        do device {
+            ds.gemv(w_out, s_cur, mut proj)
+            ds.gemv(borrowed_lm_head, proj, mut raw_logits)
+            slice_unpadded_vocab(raw_logits, mut sliced)
+            ds.argmax_token(sliced, mut tok)
+            write_block_id(tok, bi, mut draft_ids)
+            write_block_row(sliced, bi, mut logits_out)
         }
     }
 
     s_final ⇇ s_cur
 }
 
+fn find_rec_slot<size RecRows, size R>(hybrid.RecurrentStateArena<size RecRows, size R> arena, int slot_id) → int ⇥ sess_mod.SessionError {
+    for exclusive arena.slot_ids.length() let i {
+        if arena.slot_ids[i] ≡ slot_id {
+            return i
+        }
+    }
+    throw variant sess_mod.SessionError.InvalidSlot { message = "slot_id not present in RecurrentStateArena" }
+}
+
+# Run the Rank-R Markov RNN over `RecurrentStateArena` + `markov_w1[PADDED_V, R]`
+# + device `slice_unpadded_vocab`, updating the recurrent arena state in place.
+@ public
+fn markov_rnn_block_head_w1<size B, size R, size D_DRAFT, size PADDED_V, size UNPADDED_V, size RecRows>(tensor<f32, [B, D_DRAFT]> h_block, mut hybrid.RecurrentStateArena<RecRows, R> rec_arena, int rec_slot_id, tensor<f32, [R, R]> w_rec, tensor<f32, [R, D_DRAFT]> w_in, tensor<f32, [R]> b_rec, tensor<f32, [PADDED_V, R]> markov_w1, mut tensor<f32, [B, UNPADDED_V]> logits_out, mut tensor<i32, [B]> draft_ids) → void ⇥ sess_mod.SessionError {
+    require RecRows ≥ 1 throw variant sess_mod.SessionError.InvalidCapacity { message = "RecurrentStateArena requires at least 1 row" }
+    let int local_idx ← find_rec_slot(rec_arena, rec_slot_id)
+    let tensor<f32, [RecRows, R]> state_mat ← rec_arena.states[local_idx]
+
+    mut tensor<f32, [R]> s_cur ← tf32[R] {}
+    do device {
+        extract_block_row<size RecRows, size R>(state_mat, 0, mut s_cur)
+    }
+
+    mut tensor<f32, [D_DRAFT]> h_row ← tf32[D_DRAFT] {}
+    mut tensor<f32, [R]> s_next ← tf32[R] {}
+    mut tensor<f32, [PADDED_V]> raw_logits ← tf32[PADDED_V] {}
+    mut tensor<f32, [UNPADDED_V]> sliced ← tf32[UNPADDED_V] {}
+    mut tensor<i32, [1]> tok ← tensor<i32, [1]> {}
+
+    for range 0 ‥ B let b {
+        let i32 bi ← b ↦ i32 ⊥ 0
+        do device {
+            extract_block_row(h_block, bi, mut h_row)
+            markov_rnn_step(s_cur, h_row, w_rec, w_in, b_rec, mut s_next)
+        }
+        s_cur ⇇ s_next
+
+        do device {
+            ds.gemv(markov_w1, s_cur, mut raw_logits)
+            slice_unpadded_vocab(raw_logits, mut sliced)
+            ds.argmax_token(sliced, mut tok)
+            write_block_id(tok, bi, mut draft_ids)
+            write_block_row(sliced, bi, mut logits_out)
+        }
+    }
+
+    mut tensor<f32, [RecRows, R]> next_state ← tf32[RecRows, R] {}
+    do device {
+        write_block_row<size RecRows, size R>(s_cur, 0, mut next_state)
+    }
+    hybrid.recurrent_update(mut rec_arena, rec_slot_id, next_state)
+}
+
+# ---------------------------------------------------------------------------
+# TensorDirectory admission & borrow (`mtp.safetensors` + standalone `dflash` GGUF)
+# ---------------------------------------------------------------------------
+
+@ public
+class DsparkAdmitSummary {
+    let bool is_gguf
+    let bool has_fuse_weight
+    let bool has_dflare_norm
+    let bool has_ctx_proj
+    let bool has_markov_w1
+    let bool has_borrowed_lm_head
+}
+
+# Construct the canonical `TensorDirectory` `BorrowSpec` list for DSpark
+# (`lm_head.weight` borrowed from Backbone into Drafter with `RowPrefix` slice).
+@ public
+fn dspark_borrow_specs(int unpadded_vocab) → list<td.BorrowSpec> {
+    return [
+        td.BorrowSpec {
+            target_role = variant bundle.MemberRole.Drafter,
+            canonical_name = "lm_head.weight",
+            source_role = variant bundle.MemberRole.Backbone,
+            source_canonical_name = "lm_head.weight",
+            view = variant td.LoadView.RowPrefix { rows = unpadded_vocab }
+        }
+    ]
+}
+
+# Validate and summarize DSpark drafter weights in a `TensorDirectory` from
+# either `mtp.safetensors` or a standalone `dflash` GGUF member under
+# `MemberRole.Drafter`, verifying borrowed `lm_head.weight` when requested.
+@ public
+fn admit_dspark_directory(td.TensorDirectory dir, bool require_borrowed_lm_head) → DsparkAdmitSummary ⇥ td.DirectoryError {
+    let bool has_hf_fuse ← td.has_tensor(dir, variant bundle.MemberRole.Drafter, "fuse_weight")
+    let bool has_gg_fuse ← td.has_tensor(dir, variant bundle.MemberRole.Drafter, "dflash.fuse_weight")
+    let bool has_fuse ← has_hf_fuse or has_gg_fuse
+
+    let bool has_hf_norm ← td.has_tensor(dir, variant bundle.MemberRole.Drafter, "layers.0.dflare_norm.weight")
+    let bool has_gg_norm ← td.has_tensor(dir, variant bundle.MemberRole.Drafter, "blk.0.dflare_norm.weight")
+    let bool has_norm ← has_hf_norm or has_gg_norm
+
+    let bool has_hf_ctx ← td.has_tensor(dir, variant bundle.MemberRole.Drafter, "layers.0.self_attn.k_proj_ctx.weight") and td.has_tensor(dir, variant bundle.MemberRole.Drafter, "layers.0.self_attn.v_proj_ctx.weight")
+    let bool has_gg_ctx ← td.has_tensor(dir, variant bundle.MemberRole.Drafter, "blk.0.attn_k_ctx.weight") and td.has_tensor(dir, variant bundle.MemberRole.Drafter, "blk.0.attn_v_ctx.weight")
+    let bool has_ctx ← has_hf_ctx or has_gg_ctx
+
+    let bool has_hf_w1 ← td.has_tensor(dir, variant bundle.MemberRole.Drafter, "markov_head.markov_w1.weight")
+    let bool has_gg_w1 ← td.has_tensor(dir, variant bundle.MemberRole.Drafter, "dflash.markov_w1.weight")
+    let bool has_w1 ← has_hf_w1 or has_gg_w1
+
+    let bool has_head ← td.has_tensor(dir, variant bundle.MemberRole.Drafter, "lm_head.weight")
+    if require_borrowed_lm_head {
+        let td.DirectoryEntry ? ← td.lookup(dir, variant bundle.MemberRole.Drafter, "lm_head.weight")
+    }
+
+    return DsparkAdmitSummary {
+        is_gguf = has_gg_fuse or has_gg_norm or has_gg_w1,
+        has_fuse_weight = has_fuse,
+        has_dflare_norm = has_norm,
+        has_ctx_proj = has_ctx,
+        has_markov_w1 = has_w1,
+        has_borrowed_lm_head = has_head
+    }
+}
+
+# ---------------------------------------------------------------------------
+# BlockDiffusion layer execution reusing `decode_token.layer_batch`
+# ---------------------------------------------------------------------------
+
+# Execute one DSpark drafter layer over a `B`-token block (`block_size = 8`,
+# non-causal `AttentionRegime.BlockDiffusion`) reusing `decode_token.layer_batch`
+# and writing back into `SessionState` (`FullKv` or `RingKv`).
+@ public
+fn dspark_layer_block_diffusion<size MaxBatch, size BH, size D, size QD, size KVD, size F, size H, size C, size W>(tensor<f32, [MaxBatch, D]> hin, mut tensor<f32, [MaxBatch, D]> hout, dt.LayerWeights<D, QD, KVD, F> lw, dt.LayerParams lp, mut sess_mod.SessionState<C, W, KVD> sess, int slot_id, mut dt.BatchWorkspace<MaxBatch, BH, D, QD, KVD, F, H, C> bws, i32 active_b, i32 pos, int block_size) → void ⇥ sess_mod.SessionError {
+    let model_schedule.ArenaKind kind ← sess_mod.slot_kind(sess, slot_id)
+    let dt.AttentionRegime regime ← variant dt.AttentionRegime.BlockDiffusion { block_size = block_size }
+
+    match kind {
+        case model_schedule.ArenaKind.FullKv {
+            let int local_idx ← sess.slot_local_index[slot_id]
+            mut dt.SlotView<C, KVD> sv ← dt.SlotView<C, KVD> {
+                kin = sess.full_kv.keys[local_idx],
+                vin = sess.full_kv.values[local_idx],
+                pos = pos
+            }
+            dt.layer_batch<size MaxBatch, size BH, size D, size QD, size KVD, size F, size H, size C>(hin, mut hout, lw, mut sv, lp, mut bws, active_b, regime)
+            let tensor<f32, [C, KVD]> out_k ← sv.kin
+            let tensor<f32, [C, KVD]> out_v ← sv.vin
+            sess.full_kv.keys[local_idx] ← out_k
+            sess.full_kv.values[local_idx] ← out_v
+        }
+        case model_schedule.ArenaKind.RingKv let ? {
+            # RingKv slots store `[W, KVD]`; project into a `[C, KVD]` SlotView
+            # when `W ≡ C` or copy active window rows for `layer_batch`.
+            let int local_idx ← sess.slot_local_index[slot_id]
+            let tensor<f32, [W, KVD]> rk ← sess.ring_kv.keys[local_idx]
+            let tensor<f32, [W, KVD]> rv ← sess.ring_kv.values[local_idx]
+            mut tensor<f32, [C, KVD]> sk ← tf32[C, KVD] {}
+            mut tensor<f32, [C, KVD]> sv_val ← tf32[C, KVD] {}
+            let int copy_rows ← W ≺ C ✓ W ✗ C
+            for exclusive copy_rows let r {
+                for exclusive KVD let j {
+                    sk[[r, j]] ← rk[[r, j]]
+                    sv_val[[r, j]] ← rv[[r, j]]
+                }
+            }
+            mut dt.SlotView<C, KVD> sv ← dt.SlotView<C, KVD> { kin = sk, vin = sv_val, pos = pos }
+            dt.layer_batch<size MaxBatch, size BH, size D, size QD, size KVD, size F, size H, size C>(hin, mut hout, lw, mut sv, lp, mut bws, active_b, regime)
+            mut tensor<f32, [W, KVD]> nk ← copy rk
+            mut tensor<f32, [W, KVD]> nv ← copy rv
+            for exclusive copy_rows let r {
+                for exclusive KVD let j {
+                    nk[[r, j]] ← sv.kin[[r, j]]
+                    nv[[r, j]] ← sv.vin[[r, j]]
+                }
+            }
+            sess.ring_kv.keys[local_idx] ← nk
+            sess.ring_kv.values[local_idx] ← nv
+        }
+        case _ {
+            throw variant sess_mod.SessionError.SlotArenaMismatch { message = "dspark_layer_block_diffusion requires FullKv or RingKv slot" }
+        }
+    }
+}
+
 +++ faber test
 
 import from "gradus:decode_step" let ds
+import from "gradus:decode_token" let dt
 import from "gradus:cache/session" let sess_mod
+import from "gradus:cache/hybrid_arenas" let hybrid
 import from "gradus:model/schedule" let model_schedule
+import from "gradus:model/tensor_directory" let td
+import from "gradus:model/bundle" let bundle
+import from "gradus:model/capsule" let capsule
+import from "gradus:model/gguf_manifest" let ggm
+import from "gradus:model/artifact" let artifact
+import from "gradus:storage" let storage
 
 fn close(f32 a, f32 b) → bool {
     let f32 diff ← (a - b).abs()
@@ -499,10 +708,13 @@ test "DSpark 3-slot hybrid SWA/full KV schedule and K_ctx/V_ctx injection" {
         ok ← false
     }
     assert ok
+    # [T, F, T]: slots 0 and 2 are ring_kv (local 0 and 1); slot 1 is full_kv (local 0)
     assert close(sess.ring_kv.keys[0][[0, 1]], 1.0)
     assert close(sess.ring_kv.values[0][[0, 1]], 4.0)
     assert close(sess.full_kv.keys[0][[0, 3]], 2.0)
     assert close(sess.full_kv.values[0][[0, 3]], 8.0)
+    assert close(sess.ring_kv.keys[1][[0, 1]], 1.0)
+    assert close(sess.ring_kv.values[1][[0, 1]], 4.0)
 }
 
 test "DSpark non-causal block diffusion attention (block_size = 8)" {
@@ -585,4 +797,272 @@ test "DSpark Rank-256 Markov RNN head + borrowed padded-vocab unembed" {
     assert draft_ids[[2]] ≡ 2
     # b=3: s=[tanh(-1), 0] -> token 3 wins strictly (-1 * -1 = +)
     assert draft_ids[[3]] ≡ 3
+}
+
+test "DSpark markov_w1[V, 256] + RecurrentStateArena + device vocab slice" {
+    let model_schedule.ExecutionSchedule sched ← dspark_drafter_schedule(1024) ⊥ model_schedule.ExecutionSchedule { layers = empty, segments = empty, steps = empty, slots = empty, residual = variant model_schedule.ResidualKind.Standard, taps = empty }
+    mut hybrid.RecurrentStateArena<1, 256> rec_arena ← hybrid.recurrent_from_schedule_with_aux<size 1, size 256>(sched, [99]) ⊥ hybrid.RecurrentStateArena<1, 256> { rows = 1, cols = 256, slot_ids = empty, states = empty, steps_written = empty, txn_depth = 0 }
+
+    mut tensor<f32, [4, 2]> h_block ← tf32[4, 2] {}
+    h_block[[0, 0]] ← 1.0
+    h_block[[1, 1]] ← 1.0
+    h_block[[2, 0]] ← 1.0
+    h_block[[2, 1]] ← 1.0
+    h_block[[3, 0]] ← -1.0
+
+    mut tensor<f32, [256, 256]> w_rec ← tf32[256, 256] {}
+    mut tensor<f32, [256, 2]> w_in ← tf32[256, 2] {}
+    mut tensor<f32, [256]> b_rec ← tf32[256] {}
+    w_in[[0, 0]] ← 1.0
+    w_in[[1, 1]] ← 1.0
+
+    mut tensor<f32, [6, 256]> markov_w1 ← tf32[6, 256] {}
+    markov_w1[[0, 0]] ← 1.0
+    markov_w1[[1, 1]] ← 1.0
+    markov_w1[[2, 0]] ← 1.0
+    markov_w1[[2, 1]] ← 1.0
+    markov_w1[[3, 0]] ← -1.0
+    # Padded rows 4..5 must be sliced off before argmax
+    markov_w1[[4, 0]] ← 100.0
+    markov_w1[[5, 1]] ← 100.0
+
+    mut tensor<f32, [4, 4]> logits_out ← tf32[4, 4] {}
+    mut tensor<i32, [4]> draft_ids ← tensor<i32, [4]> {}
+
+    mut bool ok ← true
+    do {
+        markov_rnn_block_head_w1<size 4, size 256, size 2, size 6, size 4, size 1>(h_block, mut rec_arena, 99, w_rec, w_in, b_rec, markov_w1, mut logits_out, mut draft_ids)
+    }
+    catch err {
+        ok ← false
+    }
+    assert ok
+    assert rec_arena.steps_written[0] ≡ 1
+    assert draft_ids[[0]] ≡ 0
+    assert draft_ids[[1]] ≡ 1
+    assert draft_ids[[2]] ≡ 2
+    assert draft_ids[[3]] ≡ 3
+    assert not (rec_arena.states[0][[0, 0]] ≡ (0.0 ∷ f32))
+}
+
+fn mk_st_desc(string name, string dtype, list<int> shape, int start, int end) → capsule.SafetensorsTensorDescriptor {
+    mut int elems ← 1
+    for from shape let d {
+        elems ← elems * d
+    }
+    return capsule.SafetensorsTensorDescriptor { name = name, dtype = dtype, shape = shape, start = start, end = end, elements = elems }
+}
+
+fn mk_gg_desc(string name, list<int> dims, int offset, int byte_len) → ggm.GgufTensorDescriptor {
+    mut int elems ← 1
+    for from dims let d {
+        elems ← elems * d
+    }
+    return ggm.GgufTensorDescriptor {
+        name = name,
+        shape = dims,
+        dtype_ggml = 0,
+        representation = storage.representation("ggml", "f32", "dense", 0),
+        relative_offset = offset,
+        elements = elems,
+        layout = variant ggm.GgmlLayout.Known { elements_per_block = 1, bytes_per_block = 4, byte_length = byte_len },
+        block = storage.BlockMetadata { known = true, elements_per_block = 1, bytes_per_block = 4, block_count = elems, byte_length = byte_len }
+    }
+}
+
+test "DSpark TensorDirectory admission from mtp.safetensors (borrowed lm_head) and standalone dflash GGUF" {
+    let artifact.ContentIdentity id0 ← artifact.ContentIdentity { algorithm = "sha-256", digest = "0000000000000000000000000000000000000000000000000000000000000000", length = 4096 }
+    let artifact.ContentIdentity id1 ← artifact.ContentIdentity { algorithm = "sha-256", digest = "1111111111111111111111111111111111111111111111111111111111111111", length = 4096 }
+
+    mut bool st_ok ← true
+    do {
+        let bundle.ModelBundle st_bundle ← bundle.safetensors_unindexed([id0], id0, null, null, id1, null)
+        do {
+            let capsule.SafetensorsManifest bb_m ← capsule.SafetensorsManifest {
+                format = "safetensors",
+                version = "1",
+                artifact_length = 4096,
+                data_length = 2048,
+                metadata = empty,
+                tensors = [
+                    mk_st_desc("lm_head.weight", "BF16", [201024, 2304], 0, 1024)
+                ]
+            }
+            let capsule.SafetensorsManifest dr_m ← capsule.SafetensorsManifest {
+                format = "safetensors",
+                version = "1",
+                artifact_length = 4096,
+                data_length = 2048,
+                metadata = empty,
+                tensors = [
+                    mk_st_desc("fuse_weight", "BF16", [4, 4], 0, 32),
+                    mk_st_desc("layers.0.dflare_norm.weight", "BF16", [2304], 32, 64),
+                    mk_st_desc("layers.0.self_attn.k_proj_ctx.weight", "BF16", [1024, 2304], 64, 96),
+                    mk_st_desc("layers.0.self_attn.v_proj_ctx.weight", "BF16", [1024, 2304], 96, 128),
+                    mk_st_desc("markov_head.markov_w1.weight", "BF16", [201024, 256], 128, 160)
+                ]
+            }
+            let td.TensorDirectory st_dir ← td.build(st_bundle, [
+                variant td.ShardSource.SafetensorsSource { role = variant bundle.MemberRole.Backbone, shard_index = 0, manifest = bb_m },
+                variant td.ShardSource.SafetensorsSource { role = variant bundle.MemberRole.Drafter, shard_index = 0, manifest = dr_m }
+            ], dspark_borrow_specs(200058), empty)
+            let DsparkAdmitSummary s ← admit_dspark_directory(st_dir, true)
+            assert not s.is_gguf
+            assert s.has_fuse_weight
+            assert s.has_dflare_norm
+            assert s.has_ctx_proj
+            assert s.has_markov_w1
+            assert s.has_borrowed_lm_head
+        }
+        catch err {
+            st_ok ← false
+        }
+    }
+    catch err {
+        st_ok ← false
+    }
+    assert st_ok
+
+    # 2. Standalone dflash GGUF under MemberRole.Drafter
+    let ggm.GgufManifest gg_bb ← ggm.GgufManifest {
+        identity = id0,
+        version = 3,
+        alignment = 32,
+        data_start = 128,
+        artifact_length = 4096,
+        metadata = empty,
+        tensors = [
+            mk_gg_desc("output.weight", [2304, 201024], 0, 1024)
+        ]
+    }
+    let ggm.GgufManifest gg_dr ← ggm.GgufManifest {
+        identity = id1,
+        version = 3,
+        alignment = 32,
+        data_start = 128,
+        artifact_length = 4096,
+        metadata = empty,
+        tensors = [
+            mk_gg_desc("dflash.fuse_weight", [4, 4], 0, 64),
+            mk_gg_desc("blk.0.dflare_norm.weight", [2304], 64, 128),
+            mk_gg_desc("blk.0.attn_k_ctx.weight", [2304, 1024], 128, 192),
+            mk_gg_desc("blk.0.attn_v_ctx.weight", [2304, 1024], 192, 256),
+            mk_gg_desc("dflash.markov_w1.weight", [256, 201024], 256, 320)
+        ]
+    }
+
+    mut bool gg_ok ← true
+    do {
+        let bundle.ModelBundle gg_bundle ← bundle.gguf_paired(id0, id1)
+        do {
+            let td.TensorDirectory gg_dir ← td.build(gg_bundle, [
+                variant td.ShardSource.GgufSource { role = variant bundle.MemberRole.Backbone, manifest = gg_bb },
+                variant td.ShardSource.GgufSource { role = variant bundle.MemberRole.Drafter, manifest = gg_dr }
+            ], empty, empty)
+            let DsparkAdmitSummary gs ← admit_dspark_directory(gg_dir, false)
+            assert gs.is_gguf
+            assert gs.has_fuse_weight
+            assert gs.has_dflare_norm
+            assert gs.has_ctx_proj
+            assert gs.has_markov_w1
+        }
+        catch err {
+            gg_ok ← false
+        }
+    }
+    catch err {
+        gg_ok ← false
+    }
+    assert gg_ok
+}
+
+test "DSpark reuses decode_token.layer_batch(..., BlockDiffusion) over [T, F, T] SessionState" {
+    let model_schedule.ExecutionSchedule sched ← dspark_drafter_schedule(8) ⊥ model_schedule.ExecutionSchedule { layers = empty, segments = empty, steps = empty, slots = empty, residual = variant model_schedule.ResidualKind.Standard, taps = empty }
+    mut sess_mod.SessionState<8, 8, 2> sess ← sess_mod.from_schedule<size 8, size 8, size 2>(sched) ⊥ sess_mod.SessionState<8, 8, 2> { sched = sched, full_kv = sess_mod.FullKvArena<8, 2> { capacity = 8, kv_dim = 2, slot_ids = empty, keys = empty, values = empty, lengths = empty }, ring_kv = sess_mod.RingKvArena<8, 2> { max_window = 8, kv_dim = 2, slot_ids = empty, window_sizes = empty, keys = empty, values = empty, total_written = empty }, slot_arena_kind = empty, slot_local_index = empty, slot_window_sizes = empty, slot_kv_quant = empty, txn_depth = 0 }
+
+    mut tensor<f32, [2]> eye2 ← tf32[2] {}
+    eye2[[0]] ← 1.0
+    eye2[[1]] ← 1.0
+    mut tensor<f32, [2, 2]> id2 ← tf32[2, 2] {}
+    id2[[0, 0]] ← 1.0
+    id2[[1, 1]] ← 1.0
+
+    let tensor<f32, [2]> z2 ← tf32[2] {}
+    let dt.LayerWeights<2, 2, 2, 2> lw ← dt.LayerWeights<2, 2, 2, 2> {
+        anorm = eye2,
+        wq = id2,
+        wk = id2,
+        wv = id2,
+        wo = id2,
+        fnorm = eye2,
+        wg = id2,
+        wu = id2,
+        wd = id2,
+        qkv_bias = false,
+        bq = z2,
+        bk = z2,
+        bv = z2
+    }
+    let dt.LayerParams lp ← dt.LayerParams {
+        pdh = 2,
+        pgroup = 1,
+        pspan = 2,
+        plntheta = 10.0,
+        peps = 1.0e-6,
+        pscale = 1.0,
+        prope = variant dt.RopeKind.None
+    }
+
+    let tensor<f32, [8, 8]> ws_hcdom ← tf32[8, 8] {}
+    let tensor<f32, [8, 2]> ws_qdom ← tf32[8, 2] {}
+    mut tensor<f32, [8, 2]> ws_xn ← tf32[8, 2] {}
+    mut tensor<f32, [8, 2]> ws_q ← tf32[8, 2] {}
+    mut tensor<f32, [8, 2]> ws_qr ← tf32[8, 2] {}
+    mut tensor<f32, [8, 2]> ws_k ← tf32[8, 2] {}
+    mut tensor<f32, [8, 2]> ws_kr ← tf32[8, 2] {}
+    mut tensor<f32, [8, 2]> ws_v ← tf32[8, 2] {}
+    mut tensor<f32, [8, 8]> ws_sc ← tf32[8, 8] {}
+    mut tensor<f32, [8, 8]> ws_pr ← tf32[8, 8] {}
+    mut tensor<f32, [8, 2]> ws_ctx ← tf32[8, 2] {}
+    mut tensor<f32, [8, 2]> ws_h1 ← tf32[8, 2] {}
+    mut tensor<f32, [8, 2]> ws_gate ← tf32[8, 2] {}
+    mut tensor<f32, [8, 2]> ws_up ← tf32[8, 2] {}
+    mut tensor<f32, [8, 2]> ws_act ← tf32[8, 2] {}
+
+    mut dt.BatchWorkspace<8, 8, 2, 2, 2, 2, 1, 8> bws ← dt.BatchWorkspace<8, 8, 2, 2, 2, 2, 1, 8> {
+        hcdom = ws_hcdom,
+        qdom = ws_qdom,
+        xn = ws_xn,
+        q = ws_q,
+        qr = ws_qr,
+        k = ws_k,
+        kr = ws_kr,
+        v = ws_v,
+        sc = ws_sc,
+        pr = ws_pr,
+        ctx = ws_ctx,
+        h1 = ws_h1,
+        gate = ws_gate,
+        up = ws_up,
+        act = ws_act
+    }
+
+    mut tensor<f32, [8, 2]> hin ← tf32[8, 2] {}
+    for range 0 ‥ 8 let b {
+        hin[[b, 0]] ← (b + 1) ↦ f32
+        hin[[b, 1]] ← 1.0
+    }
+    mut tensor<f32, [8, 2]> hout ← tf32[8, 2] {}
+
+    mut bool ok ← true
+    do {
+        dspark_layer_block_diffusion<size 8, size 8, size 2, size 2, size 2, size 2, size 1, size 8, size 8>(hin, mut hout, lw, lp, mut sess, 0, mut bws, 8, 0, DSPARK_BLOCK_SIZE)
+        dspark_layer_block_diffusion<size 8, size 8, size 2, size 2, size 2, size 2, size 1, size 8, size 8>(hout, mut hin, lw, lp, mut sess, 1, mut bws, 8, 0, DSPARK_BLOCK_SIZE)
+        dspark_layer_block_diffusion<size 8, size 8, size 2, size 2, size 2, size 2, size 1, size 8, size 8>(hin, mut hout, lw, lp, mut sess, 2, mut bws, 8, 0, DSPARK_BLOCK_SIZE)
+    }
+    catch err {
+        ok ← false
+    }
+    assert ok
+    assert not (hout[[0, 0]] ≡ (0.0 ∷ f32))
 }
