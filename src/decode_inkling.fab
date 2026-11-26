@@ -1,0 +1,852 @@
++++ toml
+locale = "en"
+
++++ faber
+# Inkling-2-Mini layer axes and device kernels (Slice C, issue #109).
+#
+# Public import: import from "gradus:decode_inkling" let inkling
+# Depends on: gradus:decode_step, gradus:cache/session, gradus:cache/hybrid_arenas.
+#
+# Provides:
+#   - Projected relative-position bias (W_rel projection + distance gather)
+#   - Log-position scaling tau on full-attention Q and R
+#   - Per-head L2 norm clipping on Q / K / R
+#   - Parameterless V RMSNorm
+#   - Input-dependent sink_proj + sink-augmented row softmax
+#   - Sigmoid output gate (wqkv_gate)
+#   - 4-site causal ShortConv (K, V, post_attn, post_ffn, kernel = 4) over
+#     ConvStateArena + dynamic per-head tap projections (weight_proj)
+#   - SITU softcapped gated activation (gate_cap = 4.0, up_cap = 25.0) + GELU
+#   - Final tanh logit softcap (30.0) and padded-vocab slice (201024 -> 200058)
+#   - Layer and head dispatch over SessionState + ConvStateArena
+#
+# Zero `NumericBlock` (`list<f32>`) usage: all state and weights are typed
+# device tensors compatible with Cranelift CPU and Metal KIR kernels.
+
+import from "gradus:decode_step" let ds
+import from "gradus:cache/session" let sess_mod
+import from "gradus:cache/hybrid_arenas" let hybrid
+
+@ public
+const f32 INKLING_MLP_GATE_SOFTCAP = 4.0
+
+@ public
+const f32 INKLING_MLP_UP_SOFTCAP = 25.0
+
+@ public
+const f32 INKLING_LOGIT_SOFTCAP = 30.0
+
+@ public
+const int INKLING_PADDED_VOCAB = 201024
+
+@ public
+const int INKLING_UNPADDED_VOCAB = 200058
+
+@ public
+const int INKLING_CONV_KERNEL = 4
+
+@ public
+const int INKLING_CONV_HISTORY = 3
+
+# ---------------------------------------------------------------------------
+# Relative-position bias kernels
+# ---------------------------------------------------------------------------
+
+# Project per-head relative query `r[H * D_REL]` against `w_rel[D_REL, REL_EXTENT]`
+# to produce `rel_logits[H, REL_EXTENT]`.
+@ public
+kernel rel_bias_project<size H, size HD_REL, size D_REL, size REL_EXTENT>(tensor<f32, [HD_REL]> r, tensor<f32, [D_REL, REL_EXTENT]> w_rel, mut tensor<f32, [H, REL_EXTENT]> rel_logits) → void {
+    for from rel_logits at [h, dist] thread lane let ? {
+        if h ∈ 0 … 4095 and dist ∈ 0 … 65535 and D_REL ≥ 1 and D_REL ≤ 1024 {
+            let i32 hh ← h ∧ 4095
+            let i32 dd ← dist ∧ 65535
+            let i32 rbase ← hh * D_REL
+            mut f32 acc ← 0.0
+
+            for range 0 ‥ D_REL let k {
+                acc ← acc + r[[rbase + k]] * w_rel[[k, dd]]
+            }
+
+            rel_logits[[h, dist]] ← acc
+        }
+    }
+}
+
+# Gather projected relative-position bias into full-attention scores[H, C]
+# by relative distance `dist = min(pos - c, REL_EXTENT - 1)` for `c <= pos`.
+@ public
+kernel rel_bias_gather_add<size H, size C, size REL_EXTENT>(tensor<f32, [H, REL_EXTENT]> rel_logits, mut tensor<f32, [H, C]> scores, i32 pos) → void {
+    for from scores at [h, c] thread lane let s {
+        if pos ≥ 0 and c ≤ pos and REL_EXTENT ≥ 1 {
+            mut i32 dist ← pos - c
+            if dist ≥ REL_EXTENT {
+                dist ← REL_EXTENT - 1
+            }
+            scores[[h, c]] ← s + rel_logits[[h, dist]]
+        }
+    }
+}
+
+# Gather projected relative-position bias into ring-buffer scores[H, W]
+# by relative distance `dist = min((pos - slot) % win, REL_EXTENT - 1)`.
+@ public
+kernel rel_bias_gather_add_ring<size H, size W, size REL_EXTENT>(tensor<f32, [H, REL_EXTENT]> rel_logits, mut tensor<f32, [H, W]> scores, i32 pos, i32 win) → void {
+    for from scores at [h, slot] thread lane let s {
+        if pos ≥ 0 and win ≥ 1 and slot ≺ win and slot ≤ pos and REL_EXTENT ≥ 1 {
+            mut i32 dist ← (pos - slot) % win
+            if dist ≥ REL_EXTENT {
+                dist ← REL_EXTENT - 1
+            }
+            scores[[h, slot]] ← s + rel_logits[[h, dist]]
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Log-position scaling, L2 norm clipping, parameterless V RMSNorm
+# ---------------------------------------------------------------------------
+
+# Compute log-position scale factor tau = max(1.0, ln(pos + 1) / ln(base_len)).
+@ public
+fn log_pos_tau(i32 pos, f32 base_len) → f32 {
+    if pos ≤ 0 or base_len ≤ 1.0 {
+        return 1.0
+    }
+    let f32 raw ← ((pos + 1) ↦ f32).ln() / base_len.ln()
+    if raw ≻ 1.0 {
+        return raw
+    }
+    return 1.0
+}
+
+# Scale vector by scalar `scale`: out[j] = x[j] * scale.
+@ public
+kernel scale_vec<size N>(tensor<f32, [N]> x, mut tensor<f32, [N]> out, f32 scale) → void {
+    for from x at [j] thread lane let v {
+        out[[j]] ← v * scale
+    }
+}
+
+# Log-position scaling on device: out[j] = x[j] * max(1.0, ln(pos + 1) * inv_ln_base).
+@ public
+kernel log_pos_scale<size N>(tensor<f32, [N]> x, mut tensor<f32, [N]> out, i32 pos, f32 inv_ln_base) → void {
+    for from x at [j] thread lane let v {
+        mut f32 tau ← 1.0
+        if pos ≻ 0 and inv_ln_base ≻ 0.0 {
+            let f32 raw ← ((pos + 1) ↦ f32).ln() * inv_ln_base
+            if raw ≻ 1.0 {
+                tau ← raw
+            }
+        }
+        out[[j]] ← v * tau
+    }
+}
+
+# Per-head L2 norm clipping on Q / K / R: scales each head slice of length `dh`
+# by `max_norm / norm` whenever `norm > max_norm` (and `max_norm > 0`).
+@ public
+kernel l2_norm_clip<size N>(tensor<f32, [N]> x, mut tensor<f32, [N]> out, i32 dh, f32 max_norm, f32 eps) → void {
+    for from x at [j] thread lane let v {
+        if dh ≥ 1 and dh ≤ 1024 and j ∈ 0 … 16777215 {
+            let i32 jj ← j ∧ 16777215
+            let i32 head ← (jj / dh) ∧ 4095
+            let i32 base ← head * dh
+            mut f32 sq ← 0.0
+
+            for range 0 ‥ dh let d {
+                let f32 val ← x[[base + d]]
+                sq ← sq + val * val
+            }
+
+            let f32 norm ← (sq + eps).sqrt()
+            if max_norm ≻ 0.0 and norm ≻ max_norm {
+                out[[j]] ← v * (max_norm / norm)
+            }
+            else {
+                out[[j]] ← v
+            }
+        }
+    }
+}
+
+# Parameterless per-head RMSNorm (used on V):
+# out[j] = x[j] / sqrt(mean_head(x^2) + eps).
+@ public
+kernel rmsnorm_unit<size N>(tensor<f32, [N]> x, mut tensor<f32, [N]> out, i32 dh, f32 eps) → void {
+    for from x at [j] thread lane let v {
+        if dh ≥ 1 and dh ≤ 1024 and j ∈ 0 … 16777215 {
+            let i32 jj ← j ∧ 16777215
+            let i32 head ← (jj / dh) ∧ 4095
+            let i32 base ← head * dh
+            mut f32 sq ← 0.0
+
+            for range 0 ‥ dh let d {
+                let f32 val ← x[[base + d]]
+                sq ← sq + val * val
+            }
+
+            let f32 inv_rms ← 1.0 / (sq / (dh ↦ f32) + eps).sqrt()
+            out[[j]] ← v * inv_rms
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Input-dependent sink softmax & sigmoid output gate
+# ---------------------------------------------------------------------------
+
+# Row softmax with per-head attention sink logit `sink[H]`:
+#   m = max(sink[h], max_{c < valid_cols} scores[h, c])
+#   Z = exp(sink[h] - m) + sum_{c < valid_cols} exp(scores[h, c] - m)
+#   probs[h, c] = exp(scores[h, c] - m) / Z  (0.0 for c >= valid_cols).
+@ public
+kernel row_softmax_with_sink<size H, size C>(tensor<f32, [H, C]> scores, tensor<f32, [H]> sink, mut tensor<f32, [H, C]> probs, i32 valid_cols) → void {
+    for from scores at [h, c] thread lane let s {
+        if valid_cols ≤ 0 or c ≥ valid_cols {
+            probs[[h, c]] ← 0.0
+        }
+        else {
+            mut i32 n ← valid_cols
+            if n ≻ C {
+                n ← C
+            }
+
+            mut f32 m ← sink[[h]]
+            for range 0 ‥ n let k {
+                let f32 sc ← scores[[h, k]]
+                if sc ≻ m {
+                    m ← sc
+                }
+            }
+
+            mut f32 z ← (sink[[h]] - m).exp()
+            for range 0 ‥ n let k {
+                z ← z + (scores[[h, k]] - m).exp()
+            }
+
+            probs[[h, c]] ← (s - m).exp() / z
+        }
+    }
+}
+
+# Sigmoid output gate: out[j] = ctx[j] * sigmoid(gate_logits[j]).
+@ public
+kernel sigmoid_gate<size N>(tensor<f32, [N]> ctx, tensor<f32, [N]> gate_logits, mut tensor<f32, [N]> out) → void {
+    for from ctx at [j] thread lane let v {
+        out[[j]] ← v / (1.0 + (-gate_logits[[j]]).exp())
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 4-site causal ShortConv (kernel = 4) & dynamic per-head tap projections
+# ---------------------------------------------------------------------------
+
+# Static causal ShortConv (kernel = 4) reading 3 history rows from `conv_buf`
+# at `site_idx * history_len .. site_idx * history_len + 2` plus `x_cur` at tap 3.
+@ public
+kernel shortconv4_apply<size ConvRows, size ConvCh>(tensor<f32, [ConvRows, ConvCh]> conv_buf, tensor<f32, [4, ConvCh]> conv_w, tensor<f32, [ConvCh]> x_cur, mut tensor<f32, [ConvCh]> out, i32 site_idx, i32 history_len) → void {
+    for from out at [c] thread lane let ? {
+        if site_idx ∈ 0 … 1023 and history_len ≡ 3 and site_idx * 3 + 2 ≺ ConvRows {
+            let i32 si ← site_idx ∧ 1023
+            let i32 base ← si * 3
+            let f32 acc ← conv_w[[0, c]] * conv_buf[[base, c]] + conv_w[[1, c]] * conv_buf[[base + 1, c]] + conv_w[[2, c]] * conv_buf[[base + 2, c]] + conv_w[[3, c]] * x_cur[[c]]
+            out[[c]] ← acc
+        }
+    }
+}
+
+# Dynamic per-head causal ShortConv (kernel = 4): `dyn_taps[H_KV * 4]` supplies
+# 4 tap weights per head (`dh` channels per head).
+@ public
+kernel shortconv4_dynamic_apply<size ConvRows, size ConvCh, size H_TAPS>(tensor<f32, [ConvRows, ConvCh]> conv_buf, tensor<f32, [H_TAPS]> dyn_taps, tensor<f32, [ConvCh]> x_cur, mut tensor<f32, [ConvCh]> out, i32 site_idx, i32 history_len, i32 dh) → void {
+    for from out at [c] thread lane let ? {
+        if site_idx ∈ 0 … 1023 and history_len ≡ 3 and site_idx * 3 + 2 ≺ ConvRows and dh ≥ 1 and dh ≤ 1024 and c ∈ 0 … 16777215 {
+            let i32 cc ← c ∧ 16777215
+            let i32 head ← (cc / dh) ∧ 4095
+            let i32 tbase ← head * 4
+            if tbase + 3 ≺ H_TAPS {
+                let i32 si ← site_idx ∧ 1023
+                let i32 base ← si * 3
+                let f32 acc ← dyn_taps[[tbase]] * conv_buf[[base, c]] + dyn_taps[[tbase + 1]] * conv_buf[[base + 1, c]] + dyn_taps[[tbase + 2]] * conv_buf[[base + 2, c]] + dyn_taps[[tbase + 3]] * x_cur[[c]]
+                out[[c]] ← acc
+            }
+        }
+    }
+}
+
+fn find_conv_slot<size ConvRows, size ConvCh>(hybrid.ConvStateArena<size ConvRows, size ConvCh> arena, int slot_id) → int ⇥ sess_mod.SessionError {
+    for exclusive arena.slot_ids.length() let i {
+        if arena.slot_ids[i] ≡ slot_id {
+            return i
+        }
+    }
+    throw variant sess_mod.SessionError.InvalidSlot { message = "slot_id not present in ConvStateArena" }
+}
+
+# Apply static 4-tap causal ShortConv for `site_idx` and push `x_cur` into `arena`.
+@ public
+fn shortconv4_step<size ConvRows, size ConvCh>(mut hybrid.ConvStateArena<size ConvRows, size ConvCh> arena, int slot_id, int site_idx, tensor<f32, [4, ConvCh]> conv_w, tensor<f32, [ConvCh]> x_cur, mut tensor<f32, [ConvCh]> out) → void ⇥ sess_mod.SessionError {
+    require site_idx ≥ 0 and site_idx ≺ arena.sites_per_slot throw variant sess_mod.SessionError.InvalidCapacity { message = "site_idx out of bounds for ConvStateArena" }
+    let int local_idx ← find_conv_slot(arena, slot_id)
+    shortconv4_apply(arena.buffers[local_idx], conv_w, x_cur, mut out, site_idx ↦ i32 ⊥ 0, arena.history_len ↦ i32 ⊥ 3)
+    hybrid.conv_push_row(mut arena, slot_id, site_idx, x_cur)
+}
+
+# Apply dynamic per-head 4-tap causal ShortConv for `site_idx` and push `x_cur`.
+@ public
+fn shortconv4_dynamic_step<size ConvRows, size ConvCh, size H_TAPS>(mut hybrid.ConvStateArena<size ConvRows, size ConvCh> arena, int slot_id, int site_idx, tensor<f32, [H_TAPS]> dyn_taps, tensor<f32, [ConvCh]> x_cur, mut tensor<f32, [ConvCh]> out, i32 dh) → void ⇥ sess_mod.SessionError {
+    require site_idx ≥ 0 and site_idx ≺ arena.sites_per_slot throw variant sess_mod.SessionError.InvalidCapacity { message = "site_idx out of bounds for ConvStateArena" }
+    let int local_idx ← find_conv_slot(arena, slot_id)
+    shortconv4_dynamic_apply(arena.buffers[local_idx], dyn_taps, x_cur, mut out, site_idx ↦ i32 ⊥ 0, arena.history_len ↦ i32 ⊥ 3, dh)
+    hybrid.conv_push_row(mut arena, slot_id, site_idx, x_cur)
+}
+
+# ---------------------------------------------------------------------------
+# SITU, GELU, logit softcap, and padded-vocab slice
+# ---------------------------------------------------------------------------
+
+@ public
+union MlpActivation {
+    Situ {
+        f32 gate_cap
+        f32 up_cap
+    },
+    Gelu,
+    Swiglu
+}
+
+# SITU softcapped gated activation:
+#   g = gate_cap * tanh(gate[j] / gate_cap)
+#   u = up_cap * tanh(up[j] / up_cap)
+#   out[j] = (g / (1 + exp(-g))) * u.
+@ public
+kernel situ<size F>(tensor<f32, [F]> gate, tensor<f32, [F]> up, mut tensor<f32, [F]> out, f32 gate_cap, f32 up_cap) → void {
+    for from gate at [j] thread lane let gv {
+        mut f32 g ← gv
+        if gate_cap ≻ 0.0 {
+            g ← gate_cap * (gv / gate_cap).tanh()
+        }
+        mut f32 u ← up[[j]]
+        if up_cap ≻ 0.0 {
+            u ← up_cap * (u / up_cap).tanh()
+        }
+        out[[j]] ← g / (1.0 + (-g).exp()) * u
+    }
+}
+
+# Tanh-approximation GELU:
+#   0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))).
+@ public
+kernel gelu_tanh<size F>(tensor<f32, [F]> x, mut tensor<f32, [F]> out) → void {
+    for from x at [j] thread lane let v {
+        let f32 inner ← 0.7978845608 * (v + 0.044715 * v * v * v)
+        out[[j]] ← 0.5 * v * (1.0 + inner.tanh())
+    }
+}
+
+# Gated GELU (GeGLU): out[j] = gelu_tanh(gate[j]) * up[j].
+@ public
+kernel geglu_tanh<size F>(tensor<f32, [F]> gate, tensor<f32, [F]> up, mut tensor<f32, [F]> out) → void {
+    for from gate at [j] thread lane let gv {
+        let f32 inner ← 0.7978845608 * (gv + 0.044715 * gv * gv * gv)
+        let f32 act ← 0.5 * gv * (1.0 + inner.tanh())
+        out[[j]] ← act * up[[j]]
+    }
+}
+
+# Final logit tanh softcap: out[j] = cap * tanh(logits[j] / cap).
+@ public
+kernel logit_softcap<size V>(tensor<f32, [V]> logits, mut tensor<f32, [V]> out, f32 cap) → void {
+    for from logits at [j] thread lane let v {
+        if cap ≻ 0.0 {
+            out[[j]] ← cap * (v / cap).tanh()
+        }
+        else {
+            out[[j]] ← v
+        }
+    }
+}
+
+# Padded-vocab slice (e.g. 201024 -> 200058): copies the active prefix [0 .. UNPADDED_V - 1].
+@ public
+kernel vocab_slice<size PADDED_V, size UNPADDED_V>(tensor<f32, [PADDED_V]> logits, mut tensor<f32, [UNPADDED_V]> out) → void {
+    for from out at [j] thread lane let ? {
+        if j ≺ PADDED_V {
+            out[[j]] ← logits[[j]]
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Inkling layer records and dispatch
+# ---------------------------------------------------------------------------
+
+@ public
+class InklingLayerWeights<size D, size QD, size KVD, size F, size H, size HD_REL, size D_REL, size REL_EXTENT, size H_TAPS> {
+    let tensor<f32, [D]> anorm
+    let tensor<f32, [QD, D]> wq
+    let tensor<f32, [KVD, D]> wk
+    let tensor<f32, [KVD, D]> wv
+    let tensor<f32, [D, QD]> wo
+    let tensor<f32, [QD, D]> wqkv_gate
+    let tensor<f32, [H, D]> w_sink
+    let tensor<f32, [HD_REL, D]> wr
+    let tensor<f32, [D_REL, REL_EXTENT]> w_rel
+    let tensor<f32, [H_TAPS, KVD]> k_sconv_weight_proj
+    let tensor<f32, [H_TAPS, KVD]> v_sconv_weight_proj
+    let tensor<f32, [4, D]> post_attn_conv_w
+    let tensor<f32, [4, D]> post_ffn_conv_w
+    let tensor<f32, [D]> fnorm
+    let tensor<f32, [F, D]> wg
+    let tensor<f32, [F, D]> wu
+    let tensor<f32, [D, F]> wd
+}
+
+@ public
+class InklingLayerParams {
+    let i32 pdh
+    let i32 pgroup
+    let f32 peps
+    let f32 pscale
+    let f32 qk_max_norm
+    let f32 r_max_norm
+    let f32 inv_ln_base
+    let bool is_full_attn
+    let bool use_sink
+    let bool use_rel_bias
+    let bool use_qkv_gate
+    let bool use_dynamic_kv_conv
+    let bool use_post_conv
+    let MlpActivation mlp_act
+}
+
+# Inkling attention sub-block: RMSNorm -> QKV (+ R, sink, gate) -> log-pos tau
+# (full) -> L2 norm clip -> parameterless V RMSNorm -> K/V ShortConv -> KV write ->
+# attention scores (+ rel bias) -> sink/standard softmax -> context -> sigmoid gate ->
+# Wo -> post_attn ShortConv -> residual.
+@ public
+fn inkling_attn_step<size D, size QD, size KVD, size F, size H, size HD_REL, size D_REL, size REL_EXTENT, size H_TAPS, size C, size W, size ConvRows>(tensor<f32, [D]> hin, mut tensor<f32, [D]> h1, InklingLayerWeights<D, QD, KVD, F, H, HD_REL, D_REL, REL_EXTENT, H_TAPS> lw, InklingLayerParams lp, mut sess_mod.SessionState<C, W, KVD> sess, mut hybrid.ConvStateArena<ConvRows, KVD> kv_conv, mut hybrid.ConvStateArena<ConvRows, D> post_conv, int slot_id, i32 pos) → void ⇥ sess_mod.SessionError {
+    mut tensor<f32, [D]> xn ← tf32[D] {}
+    ds.rmsnorm(hin, lw.anorm, mut xn, lp.peps)
+
+    mut tensor<f32, [QD]> q_raw ← tf32[QD] {}
+    mut tensor<f32, [KVD]> k_raw ← tf32[KVD] {}
+    mut tensor<f32, [KVD]> v_raw ← tf32[KVD] {}
+    ds.qkv_proj(lw.wq, lw.wk, lw.wv, xn, mut q_raw, mut k_raw, mut v_raw)
+
+    mut tensor<f32, [QD]> q_scaled ← tf32[QD] {}
+    if lp.is_full_attn and lp.inv_ln_base ≻ 0.0 {
+        log_pos_scale(q_raw, mut q_scaled, pos, lp.inv_ln_base)
+    }
+    else {
+        q_scaled ⇇ q_raw
+    }
+
+    mut tensor<f32, [QD]> q ← tf32[QD] {}
+    mut tensor<f32, [KVD]> k_clip ← tf32[KVD] {}
+    l2_norm_clip(q_scaled, mut q, lp.pdh, lp.qk_max_norm, lp.peps)
+    l2_norm_clip(k_raw, mut k_clip, lp.pdh, lp.qk_max_norm, lp.peps)
+
+    mut tensor<f32, [KVD]> v_normed ← tf32[KVD] {}
+    rmsnorm_unit(v_raw, mut v_normed, lp.pdh, lp.peps)
+
+    mut tensor<f32, [KVD]> k_final ← tf32[KVD] {}
+    mut tensor<f32, [KVD]> v_final ← tf32[KVD] {}
+    if lp.use_dynamic_kv_conv {
+        mut tensor<f32, [H_TAPS]> k_taps ← tf32[H_TAPS] {}
+        mut tensor<f32, [H_TAPS]> v_taps ← tf32[H_TAPS] {}
+        ds.gemv(lw.k_sconv_weight_proj, k_clip, mut k_taps)
+        ds.gemv(lw.v_sconv_weight_proj, v_normed, mut v_taps)
+        shortconv4_dynamic_step(mut kv_conv, slot_id, hybrid.SITE_CONV_K, k_taps, k_clip, mut k_final, lp.pdh)
+        shortconv4_dynamic_step(mut kv_conv, slot_id, hybrid.SITE_CONV_V, v_taps, v_normed, mut v_final, lp.pdh)
+    }
+    else {
+        k_final ⇇ k_clip
+        v_final ⇇ v_normed
+    }
+
+    sess_mod.write_kv(mut sess, slot_id, k_final, v_final, pos)
+
+    mut tensor<f32, [H, REL_EXTENT]> rel_logits ← tf32[H, REL_EXTENT] {}
+    if lp.use_rel_bias {
+        mut tensor<f32, [HD_REL]> r_raw ← tf32[HD_REL] {}
+        ds.gemv(lw.wr, xn, mut r_raw)
+        mut tensor<f32, [HD_REL]> r_scaled ← tf32[HD_REL] {}
+        if lp.is_full_attn and lp.inv_ln_base ≻ 0.0 {
+            log_pos_scale(r_raw, mut r_scaled, pos, lp.inv_ln_base)
+        }
+        else {
+            r_scaled ⇇ r_raw
+        }
+        mut tensor<f32, [HD_REL]> r_clip ← tf32[HD_REL] {}
+        l2_norm_clip(r_scaled, mut r_clip, D_REL ↦ i32 ⊥ 1, lp.r_max_norm, lp.peps)
+        rel_bias_project(r_clip, lw.w_rel, mut rel_logits)
+    }
+
+    mut tensor<f32, [H]> sink_logits ← tf32[H] {}
+    if lp.use_sink {
+        ds.gemv(lw.w_sink, xn, mut sink_logits)
+    }
+
+    mut tensor<f32, [QD]> ctx ← tf32[QD] {}
+    let tensor<f32, [QD]> qdom ← tf32[QD] {}
+
+    if lp.is_full_attn {
+        let tensor<f32, [H, C]> hcdom ← tf32[H, C] {}
+        mut tensor<f32, [H, C]> sc ← tf32[H, C] {}
+        mut tensor<f32, [H, C]> pr ← tf32[H, C] {}
+        sess_mod.score_full(sess.full_kv, slot_id, hcdom, q, mut sc, pos, lp.pgroup, lp.pdh, lp.pscale)
+        if lp.use_rel_bias {
+            rel_bias_gather_add(rel_logits, mut sc, pos)
+        }
+        if lp.use_sink {
+            row_softmax_with_sink(sc, sink_logits, mut pr, pos + 1)
+        }
+        else {
+            sess_mod.softmax_full(sc, mut pr)
+        }
+        sess_mod.context_full(sess.full_kv, slot_id, qdom, pr, mut ctx, pos, lp.pgroup, lp.pdh)
+    }
+    else {
+        let tensor<f32, [H, W]> hwdom ← tf32[H, W] {}
+        mut tensor<f32, [H, W]> sc_r ← tf32[H, W] {}
+        mut tensor<f32, [H, W]> pr_r ← tf32[H, W] {}
+        sess_mod.score_ring(sess.ring_kv, slot_id, hwdom, q, mut sc_r, pos, lp.pgroup, lp.pdh, lp.pscale)
+        let int win ← sess.slot_window_sizes[slot_id]
+        if lp.use_rel_bias {
+            rel_bias_gather_add_ring(rel_logits, mut sc_r, pos, win ↦ i32 ⊥ 1)
+        }
+        if lp.use_sink {
+            mut i32 valid ← pos + 1
+            let i32 win_i32 ← win ↦ i32 ⊥ 1
+            if valid ≻ win_i32 {
+                valid ← win_i32
+            }
+            row_softmax_with_sink(sc_r, sink_logits, mut pr_r, valid)
+        }
+        else {
+            sess_mod.softmax_ring(sc_r, mut pr_r)
+        }
+        sess_mod.context_ring(sess.ring_kv, slot_id, qdom, pr_r, mut ctx, pos, lp.pgroup, lp.pdh)
+    }
+
+    mut tensor<f32, [QD]> gated_ctx ← tf32[QD] {}
+    if lp.use_qkv_gate {
+        mut tensor<f32, [QD]> g_logits ← tf32[QD] {}
+        ds.gemv(lw.wqkv_gate, xn, mut g_logits)
+        sigmoid_gate(ctx, g_logits, mut gated_ctx)
+    }
+    else {
+        gated_ctx ⇇ ctx
+    }
+
+    mut tensor<f32, [D]> proj ← tf32[D] {}
+    ds.gemv(lw.wo, gated_ctx, mut proj)
+
+    mut tensor<f32, [D]> attn_branch ← tf32[D] {}
+    if lp.use_post_conv {
+        shortconv4_step(mut post_conv, slot_id, hybrid.SITE_CONV_POST_ATTN, lw.post_attn_conv_w, proj, mut attn_branch)
+    }
+    else {
+        attn_branch ⇇ proj
+    }
+
+    ds.residual_add(hin, attn_branch, mut h1)
+}
+
+# Inkling FFN sub-block: FFN RMSNorm -> gate/up -> SITU/GELU/SwiGLU -> Wd ->
+# post_ffn ShortConv -> residual.
+@ public
+fn inkling_ffn_step<size D, size QD, size KVD, size F, size H, size HD_REL, size D_REL, size REL_EXTENT, size H_TAPS, size ConvRows>(tensor<f32, [D]> h1, mut tensor<f32, [D]> hout, InklingLayerWeights<D, QD, KVD, F, H, HD_REL, D_REL, REL_EXTENT, H_TAPS> lw, InklingLayerParams lp, mut hybrid.ConvStateArena<ConvRows, D> post_conv, int slot_id) → void ⇥ sess_mod.SessionError {
+    mut tensor<f32, [D]> fn_in ← tf32[D] {}
+    ds.rmsnorm(h1, lw.fnorm, mut fn_in, lp.peps)
+
+    mut tensor<f32, [F]> gate ← tf32[F] {}
+    mut tensor<f32, [F]> up ← tf32[F] {}
+    ds.gate_up_proj(lw.wg, lw.wu, fn_in, mut gate, mut up)
+
+    mut tensor<f32, [F]> act ← tf32[F] {}
+    match lp.mlp_act {
+        case Situ let gate_cap, up_cap {
+            situ(gate, up, mut act, gate_cap, up_cap)
+        }
+        case Gelu {
+            geglu_tanh(gate, up, mut act)
+        }
+        case Swiglu {
+            ds.swiglu(gate, up, mut act)
+        }
+    }
+
+    mut tensor<f32, [D]> ffn_out ← tf32[D] {}
+    ds.gemv(lw.wd, act, mut ffn_out)
+
+    mut tensor<f32, [D]> ffn_branch ← tf32[D] {}
+    if lp.use_post_conv {
+        shortconv4_step(mut post_conv, slot_id, hybrid.SITE_CONV_POST_FFN, lw.post_ffn_conv_w, ffn_out, mut ffn_branch)
+    }
+    else {
+        ffn_branch ⇇ ffn_out
+    }
+
+    ds.residual_add(h1, ffn_branch, mut hout)
+}
+
+# Single-token Inkling layer step over `SessionState` and `ConvStateArena`.
+@ public
+fn inkling_layer_step<size D, size QD, size KVD, size F, size H, size HD_REL, size D_REL, size REL_EXTENT, size H_TAPS, size C, size W, size ConvRows>(tensor<f32, [D]> hin, mut tensor<f32, [D]> hout, InklingLayerWeights<D, QD, KVD, F, H, HD_REL, D_REL, REL_EXTENT, H_TAPS> lw, InklingLayerParams lp, mut sess_mod.SessionState<C, W, KVD> sess, mut hybrid.ConvStateArena<ConvRows, KVD> kv_conv, mut hybrid.ConvStateArena<ConvRows, D> post_conv, int slot_id, i32 pos) → void ⇥ sess_mod.SessionError {
+    mut tensor<f32, [D]> h1 ← tf32[D] {}
+    inkling_attn_step(hin, mut h1, lw, lp, mut sess, mut kv_conv, mut post_conv, slot_id, pos)
+    inkling_ffn_step(h1, mut hout, lw, lp, mut post_conv, slot_id)
+}
+
+# Inkling final head: RMSNorm -> padded lm_head GEMV -> tanh logit softcap ->
+# padded-vocab slice -> argmax token ID.
+@ public
+fn inkling_head_step<size D, size PADDED_V, size UNPADDED_V>(tensor<f32, [D]> hin, tensor<f32, [D]> fnorm_final, tensor<f32, [PADDED_V, D]> lm_head, mut tensor<f32, [UNPADDED_V]> logits_out, mut tensor<i32, [1]> token_id, f32 eps, f32 softcap) → void {
+    mut tensor<f32, [D]> xn ← tf32[D] {}
+    ds.rmsnorm(hin, fnorm_final, mut xn, eps)
+
+    mut tensor<f32, [PADDED_V]> raw_logits ← tf32[PADDED_V] {}
+    ds.gemv(lm_head, xn, mut raw_logits)
+
+    mut tensor<f32, [PADDED_V]> capped ← tf32[PADDED_V] {}
+    logit_softcap(raw_logits, mut capped, softcap)
+
+    vocab_slice(capped, mut logits_out)
+    ds.argmax_token(logits_out, mut token_id)
+}
+
++++ faber test
+
+import from "gradus:decode_step" let ds
+import from "gradus:cache/session" let sess_mod
+import from "gradus:cache/hybrid_arenas" let hybrid
+import from "gradus:model/schedule" let model_schedule
+
+fn close(f32 a, f32 b) → bool {
+    let f32 diff ← (a - b).abs()
+    return diff ≤ 1.0e-4 + 1.0e-4 * b.abs()
+}
+
+test "Inkling rel_bias_project and gather full/ring" {
+    mut tensor<f32, [2]> r ← tf32[2] {}
+    r[[0]] ← 1.0
+    r[[1]] ← 2.0
+
+    mut tensor<f32, [1, 3]> w_rel ← tf32[1, 3] {}
+    w_rel[[0, 0]] ← 0.5
+    w_rel[[0, 1]] ← 1.0
+    w_rel[[0, 2]] ← -0.5
+
+    mut tensor<f32, [2, 3]> rel_logits ← tf32[2, 3] {}
+    rel_bias_project(r, w_rel, mut rel_logits)
+
+    assert close(rel_logits[[0, 0]], 0.5)
+    assert close(rel_logits[[0, 1]], 1.0)
+    assert close(rel_logits[[1, 2]], -1.0)
+
+    mut tensor<f32, [2, 4]> scores ← tf32[2, 4] {}
+    scores[[0, 0]] ← 1.0
+    scores[[0, 1]] ← 2.0
+    scores[[0, 2]] ← 3.0
+    scores[[0, 3]] ← 4.0
+
+    rel_bias_gather_add(rel_logits, mut scores, 2)
+    # pos = 2: c=0 -> dist=2 (-0.5 / -1.0), c=1 -> dist=1 (1.0 / 2.0), c=2 -> dist=0 (0.5 / 1.0), c=3 -> untouched
+    assert close(scores[[0, 0]], 0.5)
+    assert close(scores[[0, 1]], 3.0)
+    assert close(scores[[0, 2]], 3.5)
+    assert close(scores[[0, 3]], 4.0)
+    assert close(scores[[1, 0]], -1.0)
+    assert close(scores[[1, 1]], 2.0)
+    assert close(scores[[1, 2]], 1.0)
+
+    mut tensor<f32, [2, 3]> ring_scores ← tf32[2, 3] {}
+    rel_bias_gather_add_ring(rel_logits, mut ring_scores, 2, 3)
+    assert close(ring_scores[[0, 2]], 0.5)
+    assert close(ring_scores[[0, 1]], 1.0)
+    assert close(ring_scores[[0, 0]], -0.5)
+}
+
+test "Inkling log_pos_scale, l2_norm_clip, and rmsnorm_unit" {
+    mut tensor<f32, [4]> q ← tf32[4] {}
+    q[[0]] ← 3.0
+    q[[1]] ← 4.0
+    q[[2]] ← 0.6
+    q[[3]] ← 0.8
+
+    mut tensor<f32, [4]> q_scaled ← tf32[4] {}
+    let f32 inv_ln ← (1.0 / 10.0.ln()) ↦ f32
+    log_pos_scale(q, mut q_scaled, 99, inv_ln)
+    # ln(100) / ln(10) = 2.0
+    assert close(q_scaled[[0]], 6.0)
+    assert close(q_scaled[[1]], 8.0)
+
+    mut tensor<f32, [4]> q_clip ← tf32[4] {}
+    l2_norm_clip(q, mut q_clip, 2, 2.5, 1.0e-12)
+    # head 0 has norm 5.0 > 2.5 -> scaled by 0.5; head 1 has norm 1.0 <= 2.5 -> unchanged
+    assert close(q_clip[[0]], 1.5)
+    assert close(q_clip[[1]], 2.0)
+    assert close(q_clip[[2]], 0.6)
+    assert close(q_clip[[3]], 0.8)
+
+    mut tensor<f32, [4]> v ← tf32[4] {}
+    v[[0]] ← 3.0
+    v[[1]] ← 4.0
+    v[[2]] ← 1.0
+    v[[3]] ← 1.0
+
+    mut tensor<f32, [4]> v_norm ← tf32[4] {}
+    rmsnorm_unit(v, mut v_norm, 2, 1.0e-12)
+    # head 0 rms = sqrt((9+16)/2) = sqrt(12.5), head 1 rms = 1.0
+    let f64 rms0 ← (12.5).sqrt()
+    assert close(v_norm[[0]], (3.0 / rms0) ↦ f32)
+    assert close(v_norm[[1]], (4.0 / rms0) ↦ f32)
+    assert close(v_norm[[2]], 1.0)
+    assert close(v_norm[[3]], 1.0)
+}
+
+test "Inkling row_softmax_with_sink and sigmoid_gate" {
+    mut tensor<f32, [2, 3]> scores ← tf32[2, 3] {}
+    scores[[0, 0]] ← 0.0
+    scores[[0, 1]] ← 0.0
+    scores[[0, 2]] ← -3.0e38
+    scores[[1, 0]] ← 1.0
+    scores[[1, 1]] ← 1.0
+    scores[[1, 2]] ← 1.0
+
+    mut tensor<f32, [2]> sink ← tf32[2] {}
+    sink[[0]] ← 0.0
+    sink[[1]] ← 1.0
+
+    mut tensor<f32, [2, 3]> probs ← tf32[2, 3] {}
+    row_softmax_with_sink(scores, sink, mut probs, 2)
+
+    # row 0: 2 valid cols + 1 sink all equal (0.0) -> each = 1/3; col 2 = 0.0
+    assert close(probs[[0, 0]], 1.0 / 3.0)
+    assert close(probs[[0, 1]], 1.0 / 3.0)
+    assert close(probs[[0, 2]], 0.0)
+    # row 1: 2 valid cols + 1 sink all equal (1.0) -> each = 1/3
+    assert close(probs[[1, 0]], 1.0 / 3.0)
+    assert close(probs[[1, 1]], 1.0 / 3.0)
+    assert close(probs[[1, 2]], 0.0)
+
+    mut tensor<f32, [2]> ctx ← tf32[2] {}
+    ctx[[0]] ← 4.0
+    ctx[[1]] ← 2.0
+
+    mut tensor<f32, [2]> gate ← tf32[2] {}
+    gate[[0]] ← 0.0
+    gate[[1]] ← 100.0
+
+    mut tensor<f32, [2]> gated ← tf32[2] {}
+    sigmoid_gate(ctx, gate, mut gated)
+    assert close(gated[[0]], 2.0)
+    assert close(gated[[1]], 2.0)
+}
+
+test "Inkling 4-site ShortConv static and dynamic over ConvStateArena" {
+    let list<model_schedule.LayerSpec> layers ← [
+        model_schedule.LayerSpec { physical_layer_id = 0, attention = variant model_schedule.AttentionKind.Full, rope = variant model_schedule.RopeKind.RelativeBias, ffn = variant model_schedule.FfnKind.Dense }
+    ]
+    let list<model_schedule.ScheduleSegment> segs ← [
+        variant model_schedule.ScheduleSegment.Linear { seg = model_schedule.LinearSegment { start_layer = 0, end_layer = 1 } }
+    ]
+    let model_schedule.ExecutionSchedule sched ← model_schedule.build_schedule(layers, segs, variant model_schedule.ResidualKind.Standard, empty) ⊥ model_schedule.ExecutionSchedule { layers = empty, segments = empty, steps = empty, slots = empty, residual = variant model_schedule.ResidualKind.Standard, taps = empty }
+
+    # 4 sites * 3 history rows = 12 rows, 4 channels (2 heads * 2 dh)
+    mut hybrid.ConvStateArena<12, 4> arena ← hybrid.conv_from_schedule<size 12, size 4>(sched, 4, 3, true) ⊥ hybrid.ConvStateArena<12, 4> { sites_per_slot = 4, history_len = 3, channels = 4, slot_ids = empty, buffers = empty, steps_written = empty }
+
+    mut tensor<f32, [4, 4]> conv_w ← tf32[4, 4] {}
+    for range 0 ‥ 4 let r {
+        let f32 wval ← ((r + 1) ↦ f32) * 0.1
+        for range 0 ‥ 4 let c {
+            conv_w[[r, c]] ← wval
+        }
+    }
+
+    mut tensor<f32, [4]> x0 ← tf32[4] {}
+    mut tensor<f32, [4]> x1 ← tf32[4] {}
+    for range 0 ‥ 4 let c {
+        x0[[c]] ← (c + 1) ↦ f32
+        x1[[c]] ← ((c + 1) * 2) ↦ f32
+    }
+
+    mut tensor<f32, [4]> out0 ← tf32[4] {}
+    mut tensor<f32, [4]> out1 ← tf32[4] {}
+
+    mut tensor<f32, [12, 4]> buf ← arena.buffers[0]
+    shortconv4_apply<size 12, size 4>(buf, conv_w, x0, mut out0, hybrid.SITE_CONV_POST_ATTN ↦ i32 ⊥ 0, 3)
+    # step 0: 0.4 * x0
+    assert close(out0[[0]], 0.4)
+    assert close(out0[[3]], 1.6)
+
+    # Populate history row 2 (newest history slot for SITE_CONV_POST_ATTN: site 2 * 3 + 2 = 8)
+    for range 0 ‥ 4 let c {
+        buf[[8, c]] ← x0[[c]]
+    }
+    shortconv4_apply<size 12, size 4>(buf, conv_w, x1, mut out1, hybrid.SITE_CONV_POST_ATTN ↦ i32 ⊥ 0, 3)
+    # step 1: 0.3 * x0 + 0.4 * x1 = 0.3*1 + 0.4*2 = 1.1 for ch 0
+    assert close(out1[[0]], 1.1)
+    assert close(out1[[3]], 4.4)
+
+    # Dynamic per-head taps on SITE_CONV_K (2 heads * 4 taps = 8)
+    mut tensor<f32, [8]> dyn_taps ← tf32[8] {}
+    dyn_taps[[2]] ← 0.5
+    dyn_taps[[3]] ← 0.5
+    dyn_taps[[6]] ← 0.25
+    dyn_taps[[7]] ← 0.75
+
+    mut tensor<f32, [4]> dout1 ← tf32[4] {}
+    for range 0 ‥ 4 let c {
+        buf[[2, c]] ← x0[[c]]
+    }
+    shortconv4_dynamic_apply<size 12, size 4, size 8>(buf, dyn_taps, x1, mut dout1, hybrid.SITE_CONV_K ↦ i32 ⊥ 0, 3, 2)
+    assert close(dout1[[0]], 1.5)
+    assert close(dout1[[2]], 5.25)
+}
+
+test "Inkling SITU, GELU, logit_softcap, and vocab_slice" {
+    mut tensor<f32, [2]> gate ← tf32[2] {}
+    gate[[0]] ← 0.0
+    gate[[1]] ← 100.0
+
+    mut tensor<f32, [2]> up ← tf32[2] {}
+    up[[0]] ← 2.0
+    up[[1]] ← 100.0
+
+    mut tensor<f32, [2]> out_situ ← tf32[2] {}
+    situ(gate, up, mut out_situ, INKLING_MLP_GATE_SOFTCAP, INKLING_MLP_UP_SOFTCAP)
+    assert close(out_situ[[0]], 0.0)
+    # At gate=100, gate_cap=4: g ~ 4.0, silu(4.0) * 25.0
+    let f64 silu4 ← 4.0 / (1.0 + (-4.0).exp())
+    let f64 u_expected ← 25.0 * 4.0.tanh()
+    assert close(out_situ[[1]], (silu4 * u_expected) ↦ f32)
+
+    mut tensor<f32, [2]> gx ← tf32[2] {}
+    gx[[0]] ← 0.0
+    gx[[1]] ← 2.0
+
+    mut tensor<f32, [2]> gout ← tf32[2] {}
+    gelu_tanh(gx, mut gout)
+    assert close(gout[[0]], 0.0)
+    assert gout[[1]] ≻ 1.9
+
+    mut tensor<f32, [4]> raw ← tf32[4] {}
+    raw[[0]] ← 0.0
+    raw[[1]] ← 300.0
+    raw[[2]] ← -300.0
+    raw[[3]] ← 15.0
+
+    mut tensor<f32, [4]> capped ← tf32[4] {}
+    logit_softcap(raw, mut capped, INKLING_LOGIT_SOFTCAP)
+    assert close(capped[[0]], 0.0)
+    assert close(capped[[1]], 30.0)
+    assert close(capped[[2]], -30.0)
+
+    mut tensor<f32, [2]> sliced ← tf32[2] {}
+    vocab_slice(capped, mut sliced)
+    assert close(sliced[[0]], 0.0)
+    assert close(sliced[[1]], 30.0)
+}

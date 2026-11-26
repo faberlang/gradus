@@ -1,0 +1,566 @@
++++ toml
+locale = "en"
+
++++ faber
+# BlockFp8 (MXFP8) — block-scaled FP8 E4M3FN with UE8M0 scales (issue #105).
+#
+# Public import: import from "gradus:quant/block_fp8" let block_fp8
+#
+# --- Contract ------------------------------------------------------------
+#
+# Rule-17 pure-Faber representation (zero compiler format tables):
+#   * Raw encoding:
+#       - `weight`: `u8` E4M3FN bytes `[Out, In]`
+#       - `scales`: `u8` UE8M0 block scales `[Out / Br, In / Bc]`
+#         (per-group `[Out, In / G]` is `Br = 1, Bc = G`)
+#   * MLX-converted encoding (Inkling L20-23):
+#       - `weight`: `u32` packed 4x E4M3FN bytes `[Out, In / 4]`
+#       - `scales`: `u8` UE8M0 block scales `[Out / Br, In / Bc]`
+#   * Dequantize: `w[r, j] = fp8_e4m3(weight[r, j]) * ue8m0(scales[r / Br, j / Bc])`
+
+import from "gradus:quant/fp_primitives" let fp
+
+@ public
+union BlockFp8Error {
+    @ shared
+    string message
+
+    BadConfig,
+    BadShape,
+    BadPack
+}
+
+@ public
+union PackKind {
+    PackU8,
+    PackU32
+}
+
+@ public
+class BlockFp8Spec {
+    let int out_features
+    let int in_features
+    let int block_rows
+    let int block_cols
+    let PackKind pack
+    let int packed_cols
+    let int scale_rows
+    let int scale_cols
+}
+
+@ public
+fn admit_spec(int out_features, int in_features, int block_rows, int block_cols, PackKind pack) → BlockFp8Spec ⇥ BlockFp8Error {
+    require out_features ≥ 1 throw variant BadShape { message = "out_features must be at least 1" }
+    require in_features ≥ 1 throw variant BadShape { message = "in_features must be at least 1" }
+    require block_rows ≥ 1 throw variant BadConfig { message = "block_rows must be at least 1" }
+    require block_cols ≥ 1 throw variant BadConfig { message = "block_cols must be at least 1" }
+    require out_features % block_rows ≡ 0 throw variant BadShape { message = "out_features must be divisible by block_rows" }
+    require in_features % block_cols ≡ 0 throw variant BadShape { message = "in_features must be divisible by block_cols" }
+
+    mut int packed_cols ← in_features
+
+    match pack {
+        case PackU8 {
+            packed_cols ← in_features
+        }
+        case PackU32 {
+            require in_features % 4 ≡ 0 throw variant BadShape { message = "in_features must be divisible by 4 for u32 packing" }
+            packed_cols ← in_features / 4
+        }
+    }
+
+    let int scale_rows ← out_features / block_rows
+    let int scale_cols ← in_features / block_cols
+    return BlockFp8Spec {
+        out_features = out_features,
+        in_features = in_features,
+        block_rows = block_rows,
+        block_cols = block_cols,
+        pack = pack,
+        packed_cols = packed_cols,
+        scale_rows = scale_rows,
+        scale_cols = scale_cols
+    }
+}
+
+@ public
+fn admit_group_spec(int out_features, int in_features, int group_size, PackKind pack) → BlockFp8Spec ⇥ BlockFp8Error {
+    return admit_spec(out_features, in_features, 1, group_size, pack)
+}
+
+# -------------------------------------------------------------------------
+# Typed host reference decode and GEMV
+# -------------------------------------------------------------------------
+
+@ public
+fn ref_dequantize_u8(BlockFp8Spec spec, list<u8> weight, list<u8> scales) → list<f32> ⇥ BlockFp8Error {
+    match spec.pack {
+        case PackU8 {
+            pass
+        }
+        default {
+            throw variant BadPack { message = "expected PackU8 spec" }
+        }
+    }
+
+    require weight.length() ≡ spec.out_features * spec.packed_cols throw variant BadShape { message = "weight length mismatch" }
+    require scales.length() ≡ spec.scale_rows * spec.scale_cols throw variant BadShape { message = "scales length mismatch" }
+
+    mut list<f32> out ← empty
+
+    for exclusive spec.out_features let r {
+        let int sr ← r / spec.block_rows
+        let int w_base ← r * spec.packed_cols
+        let int s_base ← sr * spec.scale_cols
+
+        for exclusive spec.in_features let j {
+            let int sc ← j / spec.block_cols
+            let f32 w ← fp.fp8_e4m3(weight[w_base + j])
+            let f32 s ← fp.ue8m0(scales[s_base + sc])
+            out.append(w * s)
+        }
+    }
+
+    return out
+}
+
+@ public
+fn ref_dequantize_u32(BlockFp8Spec spec, list<u32> weight, list<u8> scales) → list<f32> ⇥ BlockFp8Error {
+    match spec.pack {
+        case PackU32 {
+            pass
+        }
+        default {
+            throw variant BadPack { message = "expected PackU32 spec" }
+        }
+    }
+
+    require weight.length() ≡ spec.out_features * spec.packed_cols throw variant BadShape { message = "weight length mismatch" }
+    require scales.length() ≡ spec.scale_rows * spec.scale_cols throw variant BadShape { message = "scales length mismatch" }
+
+    mut list<f32> out ← empty
+
+    for exclusive spec.out_features let r {
+        let int sr ← r / spec.block_rows
+        let int w_base ← r * spec.packed_cols
+        let int s_base ← sr * spec.scale_cols
+
+        for exclusive spec.in_features let j {
+            let int word_idx ← j / 4
+            let int shift ← (j % 4) * 8
+            let int word ← weight[w_base + word_idx] ↦ int
+            let u8 raw_w ← ((word ⇒ shift) ∧ 255) ↦ wrapping<u8>
+            let int sc ← j / spec.block_cols
+            let f32 w ← fp.fp8_e4m3(raw_w)
+            let f32 s ← fp.ue8m0(scales[s_base + sc])
+            out.append(w * s)
+        }
+    }
+
+    return out
+}
+
+@ public
+fn ref_matvec(int out_features, int in_features, list<f32> w_dense, list<f32> x) → list<f32> ⇥ BlockFp8Error {
+    require w_dense.length() ≡ out_features * in_features throw variant BadShape { message = "dense weight length mismatch" }
+    require x.length() ≡ in_features throw variant BadShape { message = "input vector length mismatch" }
+
+    mut list<f32> y ← empty
+
+    for exclusive out_features let r {
+        mut f32 acc ← 0.0 ∷ f32
+        let int base ← r * in_features
+
+        for exclusive in_features let j {
+            acc ← acc + w_dense[base + j] * x[j]
+        }
+
+        y.append(acc)
+    }
+
+    return y
+}
+
+# -------------------------------------------------------------------------
+# Shape-generic @ kernel packed GEMV contractions (CPU + Metal)
+# -------------------------------------------------------------------------
+
+@ public
+kernel linear_matvec_u8<size Out, size In, size ScaleRows, size ScaleCols>(tensor<u8, [Out, In]> weight, tensor<u8, [ScaleRows, ScaleCols]> scales, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, i32 block_rows, i32 block_cols) → void {
+    for from y at [row] thread lane let e {
+        if block_rows ≥ 1 and block_rows ≤ 4096 and block_cols ≥ 1 and block_cols ≤ 4096 {
+            let i32 rr ← (row ↦ i32) ∧ 65535
+            let i32 sr ← (rr / block_rows) ∧ 65535
+            mut f32 acc ← 0.0 ∷ f32
+
+            for exclusive In let j {
+                let i32 ji ← (j ↦ i32) ∧ 65535
+                let i32 sc ← (ji / block_cols) ∧ 65535
+                let i32 wb ← weight[[rr, ji]] ↦ i32
+                let i32 w_sign ← (wb ⇒ 7) ∧ 1
+                let i32 w_exp ← (wb ⇒ 3) ∧ 15
+                let i32 w_mant ← wb ∧ 7
+                mut f32 w ← 0.0 ∷ f32
+
+                if w_exp ≡ 15 and w_mant ≡ 7 {
+                    w ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                }
+                else {
+                    if w_exp ≡ 0 {
+                        w ← (w_mant ↦ f32) * (0.001953125 ∷ f32)
+                    }
+                    else {
+                        mut f32 pow2 ← 0.0078125 ∷ f32
+                        if (w_exp ∧ 1) ≢ 0 {
+                            pow2 ← pow2 * (2.0 ∷ f32)
+                        }
+                        if (w_exp ∧ 2) ≢ 0 {
+                            pow2 ← pow2 * (4.0 ∷ f32)
+                        }
+                        if (w_exp ∧ 4) ≢ 0 {
+                            pow2 ← pow2 * (16.0 ∷ f32)
+                        }
+                        if (w_exp ∧ 8) ≢ 0 {
+                            pow2 ← pow2 * (256.0 ∷ f32)
+                        }
+                        let f32 frac ← (1.0 ∷ f32) + (w_mant ↦ f32) * (0.125 ∷ f32)
+                        w ← pow2 * frac
+                    }
+
+                    if w_sign ≡ 1 {
+                        w ← -w
+                    }
+                }
+
+                let i32 se ← scales[[sr, sc]] ↦ i32
+                mut f32 s ← 1.0 ∷ f32
+
+                if se ≡ 255 {
+                    s ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                }
+                elif se ≥ 127 {
+                    let i32 diff ← se - 127
+                    let f32 p1 ← 2.0 ∷ f32
+                    let f32 p2 ← p1 * p1
+                    let f32 p4 ← p2 * p2
+                    let f32 p8 ← p4 * p4
+                    let f32 p16 ← p8 * p8
+                    let f32 p32 ← p16 * p16
+                    let f32 p64 ← p32 * p32
+
+                    if (diff ∧ 1) ≢ 0 {
+                        s ← s * p1
+                    }
+                    if (diff ∧ 2) ≢ 0 {
+                        s ← s * p2
+                    }
+                    if (diff ∧ 4) ≢ 0 {
+                        s ← s * p4
+                    }
+                    if (diff ∧ 8) ≢ 0 {
+                        s ← s * p8
+                    }
+                    if (diff ∧ 16) ≢ 0 {
+                        s ← s * p16
+                    }
+                    if (diff ∧ 32) ≢ 0 {
+                        s ← s * p32
+                    }
+                    if (diff ∧ 64) ≢ 0 {
+                        s ← s * p64
+                    }
+                }
+                else {
+                    let i32 diff ← 127 - se
+                    let f32 n1 ← 0.5 ∷ f32
+                    let f32 n2 ← n1 * n1
+                    let f32 n4 ← n2 * n2
+                    let f32 n8 ← n4 * n4
+                    let f32 n16 ← n8 * n8
+                    let f32 n32 ← n16 * n16
+                    let f32 n64 ← n32 * n32
+
+                    if (diff ∧ 1) ≢ 0 {
+                        s ← s * n1
+                    }
+                    if (diff ∧ 2) ≢ 0 {
+                        s ← s * n2
+                    }
+                    if (diff ∧ 4) ≢ 0 {
+                        s ← s * n4
+                    }
+                    if (diff ∧ 8) ≢ 0 {
+                        s ← s * n8
+                    }
+                    if (diff ∧ 16) ≢ 0 {
+                        s ← s * n16
+                    }
+                    if (diff ∧ 32) ≢ 0 {
+                        s ← s * n32
+                    }
+                    if (diff ∧ 64) ≢ 0 {
+                        s ← s * n64
+                    }
+                }
+
+                acc ← acc + (w * s) * x[[ji]]
+            }
+
+            y[[row]] ← acc
+        }
+    }
+}
+
+@ public
+kernel linear_matvec_u32<size Out, size PackedIn, size ScaleRows, size ScaleCols, size In>(tensor<u32, [Out, PackedIn]> weight, tensor<u8, [ScaleRows, ScaleCols]> scales, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, i32 block_rows, i32 block_cols) → void {
+    for from y at [row] thread lane let e {
+        if block_rows ≥ 1 and block_rows ≤ 4096 and block_cols ≥ 1 and block_cols ≤ 4096 {
+            let i32 rr ← (row ↦ i32) ∧ 65535
+            let i32 sr ← (rr / block_rows) ∧ 65535
+            mut f32 acc ← 0.0 ∷ f32
+
+            for exclusive In let j {
+                let i32 ji ← (j ↦ i32) ∧ 65535
+                let i32 sc ← (ji / block_cols) ∧ 65535
+                let i32 word_idx ← (ji / 4) ∧ 65535
+                let i32 byte_lane ← ji % 4
+                let u32 w0 ← weight[[rr, word_idx]]
+                mut u32 raw_bits ← 0 ∷ u32
+
+                if byte_lane ≡ 0 {
+                    raw_bits ← w0 ∧ (255 ∷ u32)
+                }
+                elif byte_lane ≡ 1 {
+                    raw_bits ← (w0 ⇒ (8 ∷ u32)) ∧ (255 ∷ u32)
+                }
+                elif byte_lane ≡ 2 {
+                    raw_bits ← (w0 ⇒ (16 ∷ u32)) ∧ (255 ∷ u32)
+                }
+                else {
+                    raw_bits ← (w0 ⇒ (24 ∷ u32)) ∧ (255 ∷ u32)
+                }
+
+                let i32 wb ← raw_bits ↦ wrapping<i32>
+                let i32 w_sign ← (wb ⇒ 7) ∧ 1
+                let i32 w_exp ← (wb ⇒ 3) ∧ 15
+                let i32 w_mant ← wb ∧ 7
+                mut f32 w ← 0.0 ∷ f32
+
+                if w_exp ≡ 15 and w_mant ≡ 7 {
+                    w ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                }
+                else {
+                    if w_exp ≡ 0 {
+                        w ← (w_mant ↦ f32) * (0.001953125 ∷ f32)
+                    }
+                    else {
+                        mut f32 pow2 ← 0.0078125 ∷ f32
+                        if (w_exp ∧ 1) ≢ 0 {
+                            pow2 ← pow2 * (2.0 ∷ f32)
+                        }
+                        if (w_exp ∧ 2) ≢ 0 {
+                            pow2 ← pow2 * (4.0 ∷ f32)
+                        }
+                        if (w_exp ∧ 4) ≢ 0 {
+                            pow2 ← pow2 * (16.0 ∷ f32)
+                        }
+                        if (w_exp ∧ 8) ≢ 0 {
+                            pow2 ← pow2 * (256.0 ∷ f32)
+                        }
+                        let f32 frac ← (1.0 ∷ f32) + (w_mant ↦ f32) * (0.125 ∷ f32)
+                        w ← pow2 * frac
+                    }
+
+                    if w_sign ≡ 1 {
+                        w ← -w
+                    }
+                }
+
+                let i32 se ← scales[[sr, sc]] ↦ i32
+                mut f32 s ← 1.0 ∷ f32
+
+                if se ≡ 255 {
+                    s ← (0.0 ∷ f32) / (0.0 ∷ f32)
+                }
+                elif se ≥ 127 {
+                    let i32 diff ← se - 127
+                    let f32 p1 ← 2.0 ∷ f32
+                    let f32 p2 ← p1 * p1
+                    let f32 p4 ← p2 * p2
+                    let f32 p8 ← p4 * p4
+                    let f32 p16 ← p8 * p8
+                    let f32 p32 ← p16 * p16
+                    let f32 p64 ← p32 * p32
+
+                    if (diff ∧ 1) ≢ 0 {
+                        s ← s * p1
+                    }
+                    if (diff ∧ 2) ≢ 0 {
+                        s ← s * p2
+                    }
+                    if (diff ∧ 4) ≢ 0 {
+                        s ← s * p4
+                    }
+                    if (diff ∧ 8) ≢ 0 {
+                        s ← s * p8
+                    }
+                    if (diff ∧ 16) ≢ 0 {
+                        s ← s * p16
+                    }
+                    if (diff ∧ 32) ≢ 0 {
+                        s ← s * p32
+                    }
+                    if (diff ∧ 64) ≢ 0 {
+                        s ← s * p64
+                    }
+                }
+                else {
+                    let i32 diff ← 127 - se
+                    let f32 n1 ← 0.5 ∷ f32
+                    let f32 n2 ← n1 * n1
+                    let f32 n4 ← n2 * n2
+                    let f32 n8 ← n4 * n4
+                    let f32 n16 ← n8 * n8
+                    let f32 n32 ← n16 * n16
+                    let f32 n64 ← n32 * n32
+
+                    if (diff ∧ 1) ≢ 0 {
+                        s ← s * n1
+                    }
+                    if (diff ∧ 2) ≢ 0 {
+                        s ← s * n2
+                    }
+                    if (diff ∧ 4) ≢ 0 {
+                        s ← s * n4
+                    }
+                    if (diff ∧ 8) ≢ 0 {
+                        s ← s * n8
+                    }
+                    if (diff ∧ 16) ≢ 0 {
+                        s ← s * n16
+                    }
+                    if (diff ∧ 32) ≢ 0 {
+                        s ← s * n32
+                    }
+                    if (diff ∧ 64) ≢ 0 {
+                        s ← s * n64
+                    }
+                }
+
+                acc ← acc + (w * s) * x[[ji]]
+            }
+
+            y[[row]] ← acc
+        }
+    }
+}
+
++++ faber test
+import from "gradus:quant/block_fp8" let bf8
+
+fn close(f32 a, f32 b) → bool {
+    let f32 diff ← (a - b).abs()
+    let f32 tol ← (1.0e-5 ∷ f32) + (1.0e-4 ∷ f32) * b.abs()
+    return diff ≤ tol
+}
+
+fn spec_result(int o, int i, int br, int bc, bf8.PackKind p) → string {
+    do {
+        bf8.admit_spec(o, i, br, bc, p)
+        return "ok"
+    }
+    catch err {
+        return err.message
+    }
+}
+
+test "BlockFp8 spec validates shape and block divisibility fail-closed" {
+    assert spec_result(4, 16, 1, 4, variant bf8.PackKind.PackU8) ≡ "ok"
+    assert spec_result(4, 16, 2, 4, variant bf8.PackKind.PackU32) ≡ "ok"
+    assert spec_result(3, 16, 2, 4, variant bf8.PackKind.PackU8) ≡ "out_features must be divisible by block_rows"
+    assert spec_result(4, 15, 1, 4, variant bf8.PackKind.PackU8) ≡ "in_features must be divisible by block_cols"
+    assert spec_result(4, 6, 1, 3, variant bf8.PackKind.PackU32) ≡ "in_features must be divisible by 4 for u32 packing"
+}
+
+test "BlockFp8 raw u8 (MXFP8 2D block) ref decode and kernel matvec match" {
+    # Out=2, In=8, block_rows=2, block_cols=4 -> ScaleRows=1, ScaleCols=2
+    # scales: [128 (2.0), 126 (0.5)]
+    # Row 0: [0x38 (1.0), 0xBC (-1.5), 0x01 (2^-9), 0x40 (2.0), 0x38 (1.0), 0xB8 (-1.0), 0x44 (3.0), 0x80 (-0.0)]
+    # Row 1: [0xC0 (-2.0), 0x3C (1.5), 0x00 (0.0), 0x48 (4.0), 0xC4 (-3.0), 0x30 (0.5), 0x4E (7.0), 0xB0 (-0.5)]
+    let list<u8> w_list ← [
+        0x38 ∷ u8, 0xbc ∷ u8, 0x01 ∷ u8, 0x40 ∷ u8,
+        0x38 ∷ u8, 0xb8 ∷ u8, 0x44 ∷ u8, 0x80 ∷ u8,
+        0xc0 ∷ u8, 0x3c ∷ u8, 0x00 ∷ u8, 0x48 ∷ u8,
+        0xc4 ∷ u8, 0x30 ∷ u8, 0x4e ∷ u8, 0xb0 ∷ u8
+    ]
+    let list<u8> s_list ← [128 ∷ u8, 126 ∷ u8]
+    let list<f32> x_list ← [1.0, -2.0, 4.0, 0.5, -1.0, 2.0, 0.25, -3.0]
+
+    do {
+        let bf8.BlockFp8Spec spec ← bf8.admit_spec(2, 8, 2, 4, variant bf8.PackKind.PackU8)
+        let list<f32> w_dense ← bf8.ref_dequantize_u8(spec, w_list, s_list)
+        let list<f32> y_ref ← bf8.ref_matvec(2, 8, w_dense, x_list)
+
+        mut tensor<u8, [2, 8]> w_t ← tu8[2, 8] {}
+        for exclusive 2 let r {
+            for exclusive 8 let c {
+                w_t[[r, c]] ← w_list[r * 8 + c]
+            }
+        }
+        mut tensor<u8, [1, 2]> s_t ← tu8[1, 2] {}
+        s_t[[0, 0]] ← 128 ∷ u8
+        s_t[[0, 1]] ← 126 ∷ u8
+        mut tensor<f32, [8]> x_t ← tf32[8] {}
+        for exclusive 8 let j {
+            x_t[[j]] ← x_list[j]
+        }
+        mut tensor<f32, [2]> y_k ← tf32[2] {}
+
+        bf8.linear_matvec_u8(w_t, s_t, x_t, mut y_k, 2, 4)
+        assert close(y_k[[0]], y_ref[0])
+        assert close(y_k[[1]], y_ref[1])
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "BlockFp8 MLX-converted u32 (Inkling L20-23) ref decode and kernel matvec match" {
+    # Out=2, In=8, group_size=4 (Br=1, Bc=4) -> PackedIn=2 u32s, ScaleRows=2, ScaleCols=2
+    let u32 r0w0 ← 0x4001bc38 ∷ u32
+    let u32 r0w1 ← 0x8044b838 ∷ u32
+    let u32 r1w0 ← 0x48003cc0 ∷ u32
+    let u32 r1w1 ← 0xb04e30c4 ∷ u32
+    let list<u32> w_list ← [r0w0, r0w1, r1w0, r1w1]
+    let list<u8> s_list ← [128 ∷ u8, 126 ∷ u8, 127 ∷ u8, 129 ∷ u8]
+    let list<f32> x_list ← [1.0, -2.0, 4.0, 0.5, -1.0, 2.0, 0.25, -3.0]
+
+    do {
+        let bf8.BlockFp8Spec spec ← bf8.admit_group_spec(2, 8, 4, variant bf8.PackKind.PackU32)
+        let list<f32> w_dense ← bf8.ref_dequantize_u32(spec, w_list, s_list)
+        let list<f32> y_ref ← bf8.ref_matvec(2, 8, w_dense, x_list)
+
+        mut tensor<u32, [2, 2]> w_t ← tu32[2, 2] {}
+        w_t[[0, 0]] ← r0w0
+        w_t[[0, 1]] ← r0w1
+        w_t[[1, 0]] ← r1w0
+        w_t[[1, 1]] ← r1w1
+        mut tensor<u8, [2, 2]> s_t ← tu8[2, 2] {}
+        s_t[[0, 0]] ← 128 ∷ u8
+        s_t[[0, 1]] ← 126 ∷ u8
+        s_t[[1, 0]] ← 127 ∷ u8
+        s_t[[1, 1]] ← 129 ∷ u8
+        mut tensor<f32, [8]> x_t ← tf32[8] {}
+        for exclusive 8 let j {
+            x_t[[j]] ← x_list[j]
+        }
+        mut tensor<f32, [2]> y_k ← tf32[2] {}
+
+        bf8.linear_matvec_u32(w_t, s_t, x_t, mut y_k, 1, 4)
+        assert close(y_k[[0]], y_ref[0])
+        assert close(y_k[[1]], y_ref[1])
+    }
+    catch err {
+        assert false
+    }
+}

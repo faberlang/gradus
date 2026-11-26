@@ -10,17 +10,17 @@ locale = "en"
 #
 # --- Contract ------------------------------------------------------------
 #
-# Schema: serialize-schema-1.0.0 (stamped 2026-08-08, PML1-U7). One versioned
-# BYTES wire format (bytes carrier) that carries tensor / dtype / shape /
-# parameter values and round-trips them. Consumers reject unknown schema
-# versions and unknown kinds — no best-effort partial reads (capsule rule,
-# PML0-U14).
+# Schema: serialize-schema-2.0.0 (v1 stamped 2026-08-08, PML1-U7; v2 stamps
+# raw binary float data). One versioned BYTES wire format (bytes carrier)
+# that carries tensor / dtype / shape / parameter values and round-trips
+# them. Consumers reject unknown schema versions and unknown kinds — no
+# best-effort partial reads (capsule rule, PML0-U14).
 #
-# Wire format (all integers big-endian):
+# Wire format (all integer fields big-endian):
 #
 #   Header (4 bytes):
 #     [0..2)  magic  0x53 0x46        ("SF")
-#     [2]     schema 0x01             (wire schema version byte)
+#     [2]     schema 0x01 (v1, read) | 0x02 (v2, the write schema)
 #     [3]     kind   0x01 dtype | 0x02 shape | 0x03 tensor | 0x04 parameter
 #
 #   dtype payload:     tag u8   (0=f32, 1=f16, 2=i32, 3=u8 — the four
@@ -29,24 +29,33 @@ locale = "en"
 #                      rank ≤ 64; products mirror gradus:shape
 #                      numel — checked signed-int arithmetic, no policy cap)
 #   tensor payload:    tag u8 | rank u8 | rank × dim i64be |
-#                      data_len u32be | data (UTF-8 text of space-separated
-#                      float tokens, shortest round-trip form)
+#                      data_len u32be | data
 #   parameter payload: tag u8 | rank u8 | rank × dim i64be | version i64be
 #                      (≥ 1) | status u8 (0=trainable, 1=frozen) |
 #                      owner_len u32be | owner UTF-8 |
 #                      name_len u32be | name UTF-8 |
 #                      data_len u32be | data (as tensor)
 #
+#   v1 data section: UTF-8 text of space-separated float tokens, shortest
+#                   round-trip form; data_len counts text bytes.
+#   v2 data section: raw IEEE-754 f32 bits, little-endian, 4 bytes per
+#                   element (the `lista<f32> ↦ lista<b8> via Le` bulk
+#                   conversion); data_len counts data bytes (4 × numel).
+#
 # Field ordering is fixed; a deserializer must consume exactly the declared
 # payload and rejects trailing bytes. Names/owners follow the U5 identity
 # wire-safety rule ('/' reserved).
 #
-# Float payload encoding (language-surface fact): the language has no float
-# bit-reinterpretation primitive, so float data is carried as shortest
-# round-trip text tokens (Rust-style f64 display/parse: lossless both
-# ways, NaN/±Inf included). Integer fields are fixed-width binary. This is a
-# drift candidate for the NGAB1 packet fact recheck (R1) — recorded here,
-# not silently. Physical storage/bit-layout remains a host concern.
+# Float payload encoding history: v1 carried floats as shortest round-trip
+# text because the language surface had no float bit-reinterpretation
+# primitive. It now does (`x ↦ b32`, and the bulk `lista<f32> ↦
+# lista<b8> via Le` row), so v2 writes raw bits — NaN payloads, -0.0 and
+# subnormals survive exactly, and the wire carries 4 bytes per element
+# instead of ASCII text (2.5–3× smaller, no per-element parse on read).
+# v1 wires stay readable: the schema byte dispatches, and schema-1 payloads
+# parse exactly as before. Integer framing (dims, lengths, versions) stays
+# big-endian in both schemas. Physical storage/bit-layout remains a host
+# concern.
 #
 # Version rejection: a reader rejects an unknown magic, an unknown schema
 # byte (UnknownVersion), or an unknown kind byte (UnknownKind) before
@@ -56,8 +65,8 @@ locale = "en"
 #   * the schema byte IS the version gate; any change to a field layout,
 #     field encoding, or value semantics of a payload is a schema bump;
 #   * backward-compatible additions (new trailing optional fields) bump the
-#     minor schema version (1.0.0 → 1.1.0); breaking changes (reordered /
-#     renumbered / repurposed fields or tags) bump the major (1.0.0 → 2.0.0);
+#     minor schema version; breaking changes (reordered / renumbered /
+#     repurposed fields or encodings) bump the major (1.0.0 → 2.0.0);
 #   * migration is WRITE-side: a new schema produces new bytes; old bytes are
 #     never mutated in place, and a reader that does not know a schema byte
 #     rejects rather than guessing. Downgrade/admission is a package-layer
@@ -82,15 +91,19 @@ locale = "en"
 #     trust anchor, C8).
 
 # -------------------------------------------------------------------------
-# Schema and wire constants. SCHEMA_BYTE is the wire-format version gate;
-# the textual schema identity is documented in the contract header above.
+# Schema and wire constants. The schema byte is the wire-format version
+# gate: SCHEMA_V2 is the write schema (raw little-endian float bytes) and
+# SCHEMA_V1 stays readable (space-separated float text). The textual schema
+# identity is documented in the contract header above.
 # -------------------------------------------------------------------------
 
 const int MAGIC_0 = 83
 
 const int MAGIC_1 = 70
 
-const int SCHEMA_BYTE = 1
+const int SCHEMA_V1 = 1
+
+const int SCHEMA_V2 = 2
 
 const int KIND_DTYPE = 1
 
@@ -236,37 +249,36 @@ fn be8(int n) → list<u8> {
     return out
 }
 
+# Single wire byte → int (bounds are the caller's contract).
+fn wire_at(list<b8> b, int i) → int {
+    return (b.get(i) coalesce 0x00 ∷ b8) ↦ u8 ↦ int
+}
+
 # Wire header validation — returns the kind byte. Rejects unknown magic and
-# unknown schema byte (version rejection) before any payload parsing.
-fn header(list<u8> b) → int ⇥ SerializeError {
+# unknown schema byte (version rejection: v1 text and v2 raw-bits are both
+# admitted) before any payload parsing.
+fn header(list<b8> b) → int ⇥ SerializeError {
     require b.length() ≥ 4 throw variant BadWire { message = "truncated header" }
 
-    let int m0 ← b.get(0) coalesce 0 ∷ u8 ↦ int
-    let int m1 ← b.get(1) coalesce 0 ∷ u8 ↦ int
+    let int m0 ← wire_at(b, 0)
+    let int m1 ← wire_at(b, 1)
 
     reject m0 ≢ MAGIC_0 or m1 ≢ MAGIC_1 throw variant UnknownVersion { message = "unknown serialize magic" }
 
-    let int schema ← b.get(2) coalesce 0 ∷ u8 ↦ int
+    let int schema ← wire_at(b, 2)
 
-    require schema ≡ SCHEMA_BYTE throw variant UnknownVersion { message = "unknown serialize schema version" }
+    require schema ≡ SCHEMA_V1 or schema ≡ SCHEMA_V2 throw variant UnknownVersion { message = "unknown serialize schema version" }
 
-    return b.get(3) coalesce 0 ∷ u8 ↦ int
+    return wire_at(b, 3)
 }
 
-# Length-prefixed UTF-8 text read; rejects truncation and bad UTF-8.
-fn read_text(list<u8> b, int off, int len) → string ⇥ SerializeError {
+# Length-prefixed UTF-8 text read; rejects truncation and bad UTF-8. The
+# field is one slice of the wire (no byte-by-byte copy).
+fn read_text(list<b8> b, int off, int len) → string ⇥ SerializeError {
     require off + len ≤ b.length() throw variant BadWire { message = "truncated text field" }
 
-    mut list<u8> sub ← empty
-
-    for range 0 ‥ len let i {
-        sub.append(b.get(off + i) coalesce 0 ∷ u8)
-    }
-
-    let list<b8> o ↤ sub
-
     do {
-        let string s ↤ o
+        let string s ↤ b[off ‥ off + len]
         return s
     }
     catch err {
@@ -307,20 +319,10 @@ fn rank_of(list<int> shape) → int ⇥ SerializeError {
     return rank
 }
 
-# Flat float data → space-separated shortest-round-trip text.
-fn join_data(list<f32> data) → string {
-    mut string out ← ""
-
-    for range 0 ‥ data.length() let i {
-        if i ≻ 0 {
-            out ← out + " "
-        }
-
-        let f32 v ← data.get(i) coalesce 0.0
-        out ← out + (v ↦ string)
-    }
-
-    return out
+# Flat float data → raw little-endian IEEE-754 bytes (v2 data section).
+# Bit-exact bulk reinterpretation: NaN payloads, -0.0 and subnormals survive.
+fn data_bytes(list<f32> data) → list<u8> {
+    return (data ↦ list<b8> via Le) ↦ list<u8>
 }
 
 # Space-separated float text → flat data, count-checked against the
@@ -401,7 +403,7 @@ fn serialize_dtype(string dtype_name) → list<b8> ⇥ SerializeError {
     mut list<u8> buf ← empty
     buf.append(wire_byte(MAGIC_0))
     buf.append(wire_byte(MAGIC_1))
-    buf.append(wire_byte(SCHEMA_BYTE))
+    buf.append(wire_byte(SCHEMA_V2))
     buf.append(wire_byte(KIND_DTYPE))
     buf.append(wire_byte(tag))
     let list<b8> wire ↤ buf
@@ -414,7 +416,7 @@ fn serialize_shape(list<int> shape) → list<b8> ⇥ SerializeError {
     mut list<u8> buf ← empty
     buf.append(wire_byte(MAGIC_0))
     buf.append(wire_byte(MAGIC_1))
-    buf.append(wire_byte(SCHEMA_BYTE))
+    buf.append(wire_byte(SCHEMA_V2))
     buf.append(wire_byte(KIND_SHAPE))
     buf.append(wire_byte(rank))
     # Per-dim validation mirrors shape._productus during the single encode
@@ -452,15 +454,15 @@ fn serialize_tensor(list<f32> data, list<int> shape, string dtype_name) → list
 
     require data.length() ≡ expect throw variant BadData { message = "element count mismatch" }
 
-    let string data_text ← join_data(data)
-    let int data_len ← data_text.length()
+    let list<u8> payload ← data_bytes(data)
+    let int data_len ← payload.length()
 
     require data_len ≤ LENGTH_LIMIT throw variant BadData { message = "serialized data too large" }
 
     mut list<u8> buf ← empty
     buf.append(wire_byte(MAGIC_0))
     buf.append(wire_byte(MAGIC_1))
-    buf.append(wire_byte(SCHEMA_BYTE))
+    buf.append(wire_byte(SCHEMA_V2))
     buf.append(wire_byte(KIND_TENSOR))
     buf.append(wire_byte(tag))
     buf.append(wire_byte(rank))
@@ -479,9 +481,7 @@ fn serialize_tensor(list<f32> data, list<int> shape, string dtype_name) → list
         buf.append(byte)
     }
 
-    let list<u8> data_bytes ← text_bytes(data_text)
-
-    for from data_bytes let byte {
+    for from payload let byte {
         buf.append(byte)
     }
 
@@ -521,15 +521,15 @@ fn serialize_parameter(string name, string owner, string dtype_name, list<int> s
 
     require data.length() ≡ expect throw variant BadData { message = "element count mismatch" }
 
-    let string data_text ← join_data(data)
-    let int data_len ← data_text.length()
+    let list<u8> payload ← data_bytes(data)
+    let int data_len ← payload.length()
 
     require data_len ≤ LENGTH_LIMIT throw variant BadData { message = "serialized data too large" }
 
     mut list<u8> buf ← empty
     buf.append(wire_byte(MAGIC_0))
     buf.append(wire_byte(MAGIC_1))
-    buf.append(wire_byte(SCHEMA_BYTE))
+    buf.append(wire_byte(SCHEMA_V2))
     buf.append(wire_byte(KIND_PARAMETER))
     buf.append(wire_byte(tag))
     buf.append(wire_byte(rank))
@@ -579,9 +579,7 @@ fn serialize_parameter(string name, string owner, string dtype_name, list<int> s
         buf.append(byte)
     }
 
-    let list<u8> data_bytes ← text_bytes(data_text)
-
-    for from data_bytes let byte {
+    for from payload let byte {
         buf.append(byte)
     }
 
@@ -592,46 +590,44 @@ fn serialize_parameter(string name, string owner, string dtype_name, list<int> s
 # -------------------------------------------------------------------------
 # Deserialization — versioned bytes → values. Every path validates the
 # header first (version rejection), then consumes exactly the declared
-# payload and rejects trailing bytes.
+# payload and rejects trailing bytes. Reads go straight off the bytes wire:
+# no intermediate list<u8> copy, and multi-byte fields are single slices.
 # -------------------------------------------------------------------------
 
 @ public
 fn deserialize_dtype(list<b8> wire) → string ⇥ SerializeError {
-    let list<u8> b ← byte_list(wire)
-    let int kind ← header(b)
+    let int kind ← header(wire)
 
     require kind ≡ KIND_DTYPE throw variant UnknownKind { message = "unknown serialize kind" }
 
-    require b.length() ≡ 5 throw variant BadWire { message = "malformed dtype payload" }
+    require wire.length() ≡ 5 throw variant BadWire { message = "malformed dtype payload" }
 
-    let int tag ← b.get(4) coalesce 0 ∷ u8 ↦ int
+    let int tag ← wire_at(wire, 4)
     return name_from_tag(tag)
 }
 
 @ public
 fn deserialize_shape(list<b8> wire) → list<int> ⇥ SerializeError {
-    let list<u8> b ← byte_list(wire)
-    let list<b8> buf ↤ b
-    let int kind ← header(b)
+    let int kind ← header(wire)
 
     require kind ≡ KIND_SHAPE throw variant UnknownKind { message = "unknown serialize kind" }
 
-    require b.length() ≥ 5 throw variant BadWire { message = "truncated shape payload" }
+    require wire.length() ≥ 5 throw variant BadWire { message = "truncated shape payload" }
 
-    let int rank ← b.get(4) coalesce 0 ∷ u8 ↦ int
+    let int rank ← wire_at(wire, 4)
 
     require rank ≤ RANK_LIMIT throw variant BadShape { message = "rank above ceiling" }
 
-    require b.length() ≡ 5 + rank * 8 throw variant BadWire { message = "malformed shape payload" }
+    require wire.length() ≡ 5 + rank * 8 throw variant BadWire { message = "malformed shape payload" }
 
     mut list<int> out ← empty
 
     for range 0 ‥ rank let i {
-        let int lead ← b.get(5 + i * 8) coalesce 0 ∷ u8 ↦ int
+        let int lead ← wire_at(wire, 5 + i * 8)
 
         require lead ≺ 128 throw variant BadShape { message = "negative dimension" }
 
-        let int dim ← (buf[5 + i * 8 ‥ 5 + i * 8 + 8] ↦ i64 via Be) ↦ int
+        let int dim ← (wire[5 + i * 8 ‥ 5 + i * 8 + 8] ↦ i64 via Be) ↦ int
         out.append(dim)
     }
 
@@ -640,17 +636,15 @@ fn deserialize_shape(list<b8> wire) → list<int> ⇥ SerializeError {
 
 @ public
 fn deserialize_tensor(list<b8> wire) → SerializedTensor ⇥ SerializeError {
-    let list<u8> b ← byte_list(wire)
-    let list<b8> buf ↤ b
-    let int kind ← header(b)
+    let int kind ← header(wire)
 
     require kind ≡ KIND_TENSOR throw variant UnknownKind { message = "unknown serialize kind" }
 
-    require b.length() ≥ 6 throw variant BadWire { message = "truncated tensor payload" }
+    require wire.length() ≥ 6 throw variant BadWire { message = "truncated tensor payload" }
 
-    let int tag ← b.get(4) coalesce 0 ∷ u8 ↦ int
+    let int tag ← wire_at(wire, 4)
     let string dtype ← name_from_tag(tag)
-    let int rank ← b.get(5) coalesce 0 ∷ u8 ↦ int
+    let int rank ← wire_at(wire, 5)
 
     require rank ≤ RANK_LIMIT throw variant BadShape { message = "rank above ceiling" }
 
@@ -658,42 +652,57 @@ fn deserialize_tensor(list<b8> wire) → SerializedTensor ⇥ SerializeError {
     mut list<int> shape ← empty
 
     for range 0 ‥ rank let i {
-        let int lead ← b.get(dims_off + i * 8) coalesce 0 ∷ u8 ↦ int
+        let int lead ← wire_at(wire, dims_off + i * 8)
 
         require lead ≺ 128 throw variant BadShape { message = "negative dimension" }
 
-        let int dim ← (buf[dims_off + i * 8 ‥ dims_off + i * 8 + 8] ↦ i64 via Be) ↦ int
+        let int dim ← (wire[dims_off + i * 8 ‥ dims_off + i * 8 + 8] ↦ i64 via Be) ↦ int
         shape.append(dim)
     }
 
     let int data_off ← dims_off + rank * 8
 
-    require b.length() ≥ data_off + 4 throw variant BadWire { message = "truncated tensor data length" }
+    require wire.length() ≥ data_off + 4 throw variant BadWire { message = "truncated tensor data length" }
 
-    let int data_len ← (buf[data_off ‥ data_off + 4] ↦ u32 via Be) ↦ int
+    let int data_len ← (wire[data_off ‥ data_off + 4] ↦ u32 via Be) ↦ int
     let int data_start ← data_off + 4
 
-    require b.length() ≡ data_start + data_len throw variant BadWire { message = "malformed tensor payload" }
+    require wire.length() ≡ data_start + data_len throw variant BadWire { message = "malformed tensor payload" }
 
-    let string data_text ← read_text(b, data_start, data_len)
     let int expect ← numel(shape)
-    let list<f32> data ← split_data(data_text, expect)
+    mut list<f32> data ← empty
+
+    if wire_at(wire, 2) ≡ SCHEMA_V1 {
+        let string data_text ← read_text(wire, data_start, data_len)
+        data ← split_data(data_text, expect)
+    }
+    else {
+        # Division form: expect * 4 could overflow the signed carrier on a
+        # corrupt huge-dimension v2 wire; data_len is wire-bounded (u32).
+        require data_len / 4 ≡ expect and data_len % 4 ≡ 0 throw variant BadData { message = "element count mismatch in serialized data" }
+
+        do {
+            data ← wire[data_start ‥ data_start + data_len] ↦ list<f32> via Le
+        }
+        catch err {
+            throw variant BadData { message = "malformed float data" }
+        }
+    }
+
     return SerializedTensor { dtype_name = dtype, shape = shape, data = data }
 }
 
 @ public
 fn deserialize_parameter(list<b8> wire) → ParameterWire ⇥ SerializeError {
-    let list<u8> b ← byte_list(wire)
-    let list<b8> buf ↤ b
-    let int kind ← header(b)
+    let int kind ← header(wire)
 
     require kind ≡ KIND_PARAMETER throw variant UnknownKind { message = "unknown serialize kind" }
 
-    require b.length() ≥ 6 throw variant BadWire { message = "truncated parameter payload" }
+    require wire.length() ≥ 6 throw variant BadWire { message = "truncated parameter payload" }
 
-    let int tag ← b.get(4) coalesce 0 ∷ u8 ↦ int
+    let int tag ← wire_at(wire, 4)
     let string dtype ← name_from_tag(tag)
-    let int rank ← b.get(5) coalesce 0 ∷ u8 ↦ int
+    let int rank ← wire_at(wire, 5)
 
     require rank ≤ RANK_LIMIT throw variant BadShape { message = "rank above ceiling" }
 
@@ -701,27 +710,27 @@ fn deserialize_parameter(list<b8> wire) → ParameterWire ⇥ SerializeError {
     mut list<int> shape ← empty
 
     for range 0 ‥ rank let i {
-        let int lead ← b.get(dims_off + i * 8) coalesce 0 ∷ u8 ↦ int
+        let int lead ← wire_at(wire, dims_off + i * 8)
 
         require lead ≺ 128 throw variant BadShape { message = "negative dimension" }
 
-        let int dim ← (buf[dims_off + i * 8 ‥ dims_off + i * 8 + 8] ↦ i64 via Be) ↦ int
+        let int dim ← (wire[dims_off + i * 8 ‥ dims_off + i * 8 + 8] ↦ i64 via Be) ↦ int
         shape.append(dim)
     }
 
     let int version_off ← dims_off + rank * 8
 
-    require b.length() ≥ version_off + 13 throw variant BadWire { message = "truncated parameter fields" }
+    require wire.length() ≥ version_off + 13 throw variant BadWire { message = "truncated parameter fields" }
 
-    let int version_lead ← b.get(version_off) coalesce 0 ∷ u8 ↦ int
+    let int version_lead ← wire_at(wire, version_off)
 
     require version_lead ≺ 128 throw variant BadWire { message = "invalid version in serialized parameter" }
 
-    let int version ← (buf[version_off ‥ version_off + 8] ↦ i64 via Be) ↦ int
+    let int version ← (wire[version_off ‥ version_off + 8] ↦ i64 via Be) ↦ int
 
     require version ≥ 1 throw variant BadWire { message = "invalid version in serialized parameter" }
 
-    let int status ← b.get(version_off + 8) coalesce 0 ∷ u8 ↦ int
+    let int status ← wire_at(wire, version_off + 8)
     mut string status_name ← ""
 
     if status ≡ STATUS_TRAINABLE {
@@ -738,27 +747,27 @@ fn deserialize_parameter(list<b8> wire) → ParameterWire ⇥ SerializeError {
 
     let int poss_off ← version_off + 9
 
-    require b.length() ≥ poss_off + 4 throw variant BadWire { message = "truncated parameter owner" }
+    require wire.length() ≥ poss_off + 4 throw variant BadWire { message = "truncated parameter owner" }
 
-    let int owner_len ← (buf[poss_off ‥ poss_off + 4] ↦ u32 via Be) ↦ int
+    let int owner_len ← (wire[poss_off ‥ poss_off + 4] ↦ u32 via Be) ↦ int
     let int owner_start ← poss_off + 4
 
-    require b.length() ≥ owner_start + owner_len throw variant BadWire { message = "truncated parameter owner" }
+    require wire.length() ≥ owner_start + owner_len throw variant BadWire { message = "truncated parameter owner" }
 
-    let string owner ← read_text(b, owner_start, owner_len)
+    let string owner ← read_text(wire, owner_start, owner_len)
 
     require owner.length() ≢ 0 throw variant BadWire { message = "empty parameter owner" }
 
     let int name_off ← owner_start + owner_len
 
-    require b.length() ≥ name_off + 4 throw variant BadWire { message = "truncated parameter name" }
+    require wire.length() ≥ name_off + 4 throw variant BadWire { message = "truncated parameter name" }
 
-    let int name_len ← (buf[name_off ‥ name_off + 4] ↦ u32 via Be) ↦ int
+    let int name_len ← (wire[name_off ‥ name_off + 4] ↦ u32 via Be) ↦ int
     let int name_start ← name_off + 4
 
-    require b.length() ≥ name_start + name_len throw variant BadWire { message = "truncated parameter name" }
+    require wire.length() ≥ name_start + name_len throw variant BadWire { message = "truncated parameter name" }
 
-    let string name ← read_text(b, name_start, name_len)
+    let string name ← read_text(wire, name_start, name_len)
 
     require name.length() ≢ 0 throw variant BadWire { message = "empty parameter name" }
 
@@ -766,16 +775,33 @@ fn deserialize_parameter(list<b8> wire) → ParameterWire ⇥ SerializeError {
 
     let int data_off ← name_start + name_len
 
-    require b.length() ≥ data_off + 4 throw variant BadWire { message = "truncated parameter data length" }
+    require wire.length() ≥ data_off + 4 throw variant BadWire { message = "truncated parameter data length" }
 
-    let int data_len ← (buf[data_off ‥ data_off + 4] ↦ u32 via Be) ↦ int
+    let int data_len ← (wire[data_off ‥ data_off + 4] ↦ u32 via Be) ↦ int
     let int data_start ← data_off + 4
 
-    require b.length() ≡ data_start + data_len throw variant BadWire { message = "malformed parameter payload" }
+    require wire.length() ≡ data_start + data_len throw variant BadWire { message = "malformed parameter payload" }
 
-    let string data_text ← read_text(b, data_start, data_len)
     let int expect ← numel(shape)
-    let list<f32> data ← split_data(data_text, expect)
+    mut list<f32> data ← empty
+
+    if wire_at(wire, 2) ≡ SCHEMA_V1 {
+        let string data_text ← read_text(wire, data_start, data_len)
+        data ← split_data(data_text, expect)
+    }
+    else {
+        # Division form: expect * 4 could overflow the signed carrier on a
+        # corrupt huge-dimension v2 wire; data_len is wire-bounded (u32).
+        require data_len / 4 ≡ expect and data_len % 4 ≡ 0 throw variant BadData { message = "element count mismatch in serialized data" }
+
+        do {
+            data ← wire[data_start ‥ data_start + data_len] ↦ list<f32> via Le
+        }
+        catch err {
+            throw variant BadData { message = "malformed float data" }
+        }
+    }
+
     return ParameterWire { name = name, owner = owner, dtype_name = dtype, shape = shape, version = version, status_name = status_name, data = data }
 }
 
@@ -971,7 +997,7 @@ test "dtype wire is the 5-byte versioned header + tag" {
         assert w.length() ≡ 5
         assert w.get(0) coalesce 0x00 ∷ b8 ≡ 0x53 ∷ b8
         assert w.get(1) coalesce 0x00 ∷ b8 ≡ 0x46 ∷ b8
-        assert w.get(2) coalesce 0x00 ∷ b8 ≡ 0x01 ∷ b8
+        assert w.get(2) coalesce 0x00 ∷ b8 ≡ 0x02 ∷ b8
         assert w.get(3) coalesce 0x00 ∷ b8 ≡ 0x01 ∷ b8
         assert w.get(4) coalesce 0x00 ∷ b8 ≡ 0x00 ∷ b8
         let list<b8> u ← serialize.serialize_dtype("u8")
@@ -981,6 +1007,29 @@ test "dtype wire is the 5-byte versioned header + tag" {
         case returned let ? { }
         case thrown let ? { assert false }
     }
+}
+
+test "v2 tensor wires carry raw little-endian float bytes" {
+    let _ trap_result_le ← trap {
+        let list<b8> w ← serialize.serialize_tensor([1.0 ∷ f32, 2.0 ∷ f32, 3.0 ∷ f32, 4.0 ∷ f32], [2, 2], "f32")
+        # header 4 + tag 1 + rank 1 + 2 dims × 8 + length 4 + 4 raw f32
+        assert w.length() ≡ 42
+        assert w.get(2) coalesce 0x00 ∷ b8 ≡ 0x02 ∷ b8
+        # data starts at 26; 1.0f LE is 00 00 80 3f
+        assert (w.get(26) coalesce 0x00 ∷ b8) ↦ u8 ↦ int ≡ 0
+        assert (w.get(27) coalesce 0x00 ∷ b8) ↦ u8 ↦ int ≡ 0
+        assert (w.get(28) coalesce 0x00 ∷ b8) ↦ u8 ↦ int ≡ 128
+        assert (w.get(29) coalesce 0x00 ∷ b8) ↦ u8 ↦ int ≡ 63
+    }
+    match trap_result_le {
+        case returned let ? { }
+        case thrown let ? { assert false }
+    }
+}
+
+test "schema 1 text-payload wires stay readable after the v2 write switch" {
+    # Hand-built v1 tensor wire: f32, rank 1, dim 2, text "1.0 2.0".
+    assert tensor_err(bytes_of([83, 70, 1, 3, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 7, 49, 46, 48, 32, 50, 46, 48])) ≡ "f32"
 }
 
 test "shape wire is header + rank + 8-byte dims" {
@@ -1008,7 +1057,7 @@ test "serialization rejects an unknown dtype name" {
 }
 
 test "deserialization rejects an unknown schema version" {
-    assert dtype_err(bytes_of([83, 70, 2, 1, 0])) ≡ "unknown serialize schema version"
+    assert dtype_err(bytes_of([83, 70, 3, 1, 0])) ≡ "unknown serialize schema version"
     assert dtype_err(bytes_of([83, 70, 9, 1, 0])) ≡ "unknown serialize schema version"
 }
 
@@ -1078,7 +1127,7 @@ test "serialization rejects a rank above the ceiling" {
 }
 
 test "deserialization rejects an unknown schema version and kind" {
-    assert shape_err(bytes_of([83, 70, 2, 2, 0])) ≡ "unknown serialize schema version"
+    assert shape_err(bytes_of([83, 70, 3, 2, 0])) ≡ "unknown serialize schema version"
     assert shape_err(bytes_of([83, 70, 1, 9, 0])) ≡ "unknown serialize kind"
 }
 
@@ -1127,7 +1176,7 @@ test "serialization rejects an unknown dtype name and a bad shape" {
 }
 
 test "deserialization rejects an unknown schema version and kind" {
-    assert tensor_err(bytes_of([83, 70, 2, 3, 0, 1])) ≡ "unknown serialize schema version"
+    assert tensor_err(bytes_of([83, 70, 3, 3, 0, 1])) ≡ "unknown serialize schema version"
     assert tensor_err(bytes_of([83, 70, 1, 9, 0, 1])) ≡ "unknown serialize kind"
 }
 
@@ -1191,7 +1240,7 @@ test "serialization rejects a bad shape or element-count mismatch" {
 }
 
 test "deserialization rejects an unknown schema version and kind" {
-    assert parameter_err(bytes_of([83, 70, 2, 4, 0, 1])) ≡ "unknown serialize schema version"
+    assert parameter_err(bytes_of([83, 70, 3, 4, 0, 1])) ≡ "unknown serialize schema version"
     assert parameter_err(bytes_of([83, 70, 1, 9, 0, 1])) ≡ "unknown serialize kind"
 }
 
