@@ -35,6 +35,8 @@ import from "gradus:model/bundle" let bundle
 import from "gradus:model/dequant" let dequant
 import from "gradus:model/tensor_directory" let td
 import from "gradus:storage" let storage
+import from "gradus:quant/block_fp8" let bf8
+import from "gradus:quant/dual_scaled_fp4" let fp4
 import from "gradus:quant/group_affine" let ga
 
 @ public
@@ -52,6 +54,12 @@ union LinearWeightError {
     GroupAffineFailure {
         ga.GroupAffineError inner
     },
+    BlockFp8Failure {
+        bf8.BlockFp8Error inner
+    },
+    DualScaledFp4Failure {
+        fp4.DualScaledFp4Error inner
+    },
     DequantFailure {
         dequant.DequantError inner
     }
@@ -65,6 +73,16 @@ fn from_directory_error(td.DirectoryError err) → LinearWeightError {
 @ conversion
 fn from_group_affine_error(ga.GroupAffineError err) → LinearWeightError {
     return variant GroupAffineFailure { message = err.message, inner = err }
+}
+
+@ conversion
+fn from_block_fp8_error(bf8.BlockFp8Error err) → LinearWeightError {
+    return variant BlockFp8Failure { message = err.message, inner = err }
+}
+
+@ conversion
+fn from_dual_scaled_fp4_error(fp4.DualScaledFp4Error err) → LinearWeightError {
+    return variant DualScaledFp4Failure { message = err.message, inner = err }
 }
 
 @ conversion
@@ -85,7 +103,11 @@ union LinearWeightKind {
     GgmlBlockQ5_K,
     GgmlBlockQ6_K,
     GroupAffineU32,
-    GroupAffineU8
+    GroupAffineU8,
+    BlockFp8U8,
+    BlockFp8U32,
+    DualScaledFp4U8,
+    DualScaledFp4U32
 }
 
 @ public
@@ -110,6 +132,10 @@ class LinearWeight {
     let int packed_cols
     let int group_cols
     let bool has_bias
+    let int block_rows = 0
+    let int block_cols = 0
+    let string scales_dtype = "F32"
+    let bool is_modelopt = false
 }
 
 @ public
@@ -128,6 +154,42 @@ union WeightPayload {
         list<u8> weight
         list<f32> scales
         list<f32> biases
+        list<f32> bias
+    },
+    GroupAffineU32Bf16Payload {
+        list<u32> weight
+        list<bf16> scales
+        list<bf16> biases
+        list<f32> bias
+    },
+    GroupAffineU8Bf16Payload {
+        list<u8> weight
+        list<bf16> scales
+        list<bf16> biases
+        list<f32> bias
+    },
+    BlockFp8U8Payload {
+        list<u8> weight
+        list<u8> scales
+        list<f32> f32_scales
+        list<f32> bias
+    },
+    BlockFp8U32Payload {
+        list<u32> weight
+        list<u8> scales
+        list<f32> f32_scales
+        list<f32> bias
+    },
+    DualScaledFp4U8Payload {
+        list<u8> weight
+        list<u8> scales
+        f32 global_scale
+        list<f32> bias
+    },
+    DualScaledFp4U32Payload {
+        list<u32> weight
+        list<u8> scales
+        f32 global_scale
         list<f32> bias
     },
     GgmlBlockPayload {
@@ -248,8 +310,89 @@ fn dense_kind_for(string raw_dtype) → LinearWeightKind ⇥ LinearWeightError {
     }
 }
 
+class AffineGeom {
+    let int group_size
+    let int bits
+}
+
+fn apply_row_prefix_view(int raw_out, td.LoadView view) → int ⇥ LinearWeightError {
+    match view {
+        case RowPrefix let rows {
+            require rows ≥ 1 and rows ≤ raw_out throw variant BadShape { message = "RowPrefix rows (§) out of bounds for weight rows (§)"(rows ↦ string, raw_out ↦ string) }
+            return rows
+        }
+        default {
+            return raw_out
+        }
+    }
+}
+
+fn is_scalar_entry(td.DirectoryEntry entry) → bool {
+    for from entry.shape let d {
+        if d ≢ 1 {
+            return false
+        }
+    }
+    return true
+}
+
+fn affine_bits_valid(int bits, bool is_u8) → bool {
+    if is_u8 {
+        return bits ≡ 4 or bits ≡ 8
+    }
+    return bits ≡ 4 or bits ≡ 6 or bits ≡ 8
+}
+
+fn hint_allows_affine(QuantConfigHint hint) → bool {
+    if hint.mode is string {
+        let string hm ← hint.mode coalesce ""
+        return hm ≡ "affine" or hm ≡ "group_affine"
+    }
+    return true
+}
+
+fn resolve_affine_geom(int bits_per_group, bool is_u8, QuantConfigHint hint) → AffineGeom ⇥ LinearWeightError {
+    if hint_allows_affine(hint) {
+        if hint.group_size is int and hint.bits is int {
+            let int hg ← hint.group_size coalesce 0
+            let int hb ← hint.bits coalesce 0
+            if hg ≥ 1 and affine_bits_valid(hb, is_u8) and hg * hb ≡ bits_per_group {
+                return AffineGeom { group_size = hg, bits = hb }
+            }
+        }
+        elif hint.group_size is int {
+            let int hg ← hint.group_size coalesce 0
+            if hg ≥ 1 and bits_per_group % hg ≡ 0 {
+                let int b ← bits_per_group / hg
+                if affine_bits_valid(b, is_u8) {
+                    return AffineGeom { group_size = hg, bits = b }
+                }
+            }
+        }
+        elif hint.bits is int {
+            let int hb ← hint.bits coalesce 0
+            if affine_bits_valid(hb, is_u8) and bits_per_group % hb ≡ 0 {
+                return AffineGeom { group_size = bits_per_group / hb, bits = hb }
+            }
+        }
+    }
+
+    let list<int> candidates ← [64, 32, 128, 16, 256, 8, 4]
+    for from candidates let gs {
+        if bits_per_group % gs ≡ 0 {
+            let int b ← bits_per_group / gs
+            if affine_bits_valid(b, is_u8) {
+                return AffineGeom { group_size = gs, bits = b }
+            }
+        }
+    }
+
+    throw variant BadShape { message = "unable to infer valid GroupAffine group_size and bits for bits_per_group=§"(bits_per_group ↦ string) }
+}
+
 fn bind_group_affine(td.DirectoryEntry weight, td.DirectoryEntry scales, td.DirectoryEntry biases, bool has_bias, QuantConfigHint hint) → LinearWeight ⇥ LinearWeightError {
-    let int out_features ← weight.shape.get(0) coalesce 0
+    let int raw_out ← weight.shape.get(0) coalesce 0
+    let int out_features ← apply_row_prefix_view(raw_out, weight.view)
     let int packed_cols ← weight.shape.get(1) coalesce 0
     require scales.shape.length() ≡ 2 and biases.shape.length() ≡ 2 throw variant BadShape { message = "scales and biases must be rank-2" }
 
@@ -257,45 +400,151 @@ fn bind_group_affine(td.DirectoryEntry weight, td.DirectoryEntry scales, td.Dire
     let int group_cols ← scales.shape.get(1) coalesce 0
     let int b_rows ← biases.shape.get(0) coalesce 0
     let int b_cols ← biases.shape.get(1) coalesce 0
-    require s_rows ≡ out_features and b_rows ≡ out_features and b_cols ≡ group_cols and group_cols ≥ 1 throw variant BadShape { message = "scales/biases shape mismatch against weight" }
+    require (s_rows ≡ raw_out or s_rows ≡ out_features) and b_rows ≡ s_rows and b_cols ≡ group_cols and group_cols ≥ 1 throw variant BadShape { message = "scales/biases shape mismatch against weight" }
+    require scales.raw_dtype ≡ biases.raw_dtype and (scales.raw_dtype ≡ "F32" or scales.raw_dtype ≡ "BF16") throw variant UnsupportedFormat { message = "GroupAffine scales/biases dtype must match and be F32 or BF16, got §/§"(scales.raw_dtype, biases.raw_dtype) }
 
-    let int group_size ← hint.group_size coalesce 64
-    require group_size ≥ 1 throw variant BadConfig { message = "group_size must be at least 1" }
-
-    let int in_features ← group_cols * group_size
     mut int pack_width ← 32
     mut ga.PackKind pack ← variant ga.PackKind.PackU32
     mut LinearWeightKind kind ← variant LinearWeightKind.GroupAffineU32
+    mut bool is_u8 ← false
 
     if weight.raw_dtype ≡ "U32" {
         pack_width ← 32
         pack ← variant ga.PackKind.PackU32
         kind ← variant LinearWeightKind.GroupAffineU32
+        is_u8 ← false
     }
     elif weight.raw_dtype ≡ "U8" {
         pack_width ← 8
         pack ← variant ga.PackKind.PackU8
         kind ← variant LinearWeightKind.GroupAffineU8
+        is_u8 ← true
     }
     else {
         throw variant UnsupportedFormat { message = "GroupAffine weight dtype must be U32 or U8, got §"(weight.raw_dtype) }
     }
 
     let int total_bits ← packed_cols * pack_width
-    mut int bits ← 0
+    require total_bits % group_cols ≡ 0 throw variant BadShape { message = "packed GroupAffine bit width not divisible by group_cols" }
 
-    if hint.bits is int {
-        let int hb ← hint.bits coalesce 0
-        require total_bits ≡ in_features * hb throw variant BadConfig { message = "hint.bits does not match packed GroupAffine shape" }
-        bits ← hb
+    let int bits_per_group ← total_bits / group_cols
+    let AffineGeom geom ← resolve_affine_geom(bits_per_group, is_u8, hint)
+    let int in_features ← group_cols * geom.group_size
+    let ga.ScaleDtype sd ← (scales.raw_dtype ≡ "BF16") ✓ variant ga.ScaleDtype.ScaleBf16 ✗ variant ga.ScaleDtype.ScaleF32
+    let ga.GroupAffineSpec spec ← ga.admit_spec_with_scale(out_features, in_features, geom.bits, geom.group_size, pack, sd)
+    return LinearWeight { kind = kind, out_features = spec.out_features, in_features = spec.in_features, bits = spec.bits, group_size = spec.group_size, packed_cols = spec.packed_cols, group_cols = spec.group_cols, has_bias = has_bias, scales_dtype = scales.raw_dtype }
+}
+
+fn bind_dual_scaled_fp4(td.DirectoryEntry weight, td.DirectoryEntry scales, td.DirectoryEntry ∪ none maybe_global, td.DirectoryEntry ∪ none maybe_amax, td.DirectoryEntry ∪ none maybe_denom, bool has_bias) → LinearWeight ⇥ LinearWeightError {
+    let int raw_out ← weight.shape.get(0) coalesce 0
+    let int out_features ← apply_row_prefix_view(raw_out, weight.view)
+    let int packed_cols ← weight.shape.get(1) coalesce 0
+    require scales.shape.length() ≡ 2 throw variant BadShape { message = "DualScaledFp4 scales must be rank-2" }
+
+    let int s_rows ← scales.shape.get(0) coalesce 0
+    let int group_cols ← scales.shape.get(1) coalesce 0
+    require (s_rows ≡ raw_out or s_rows ≡ out_features) and group_cols ≥ 1 throw variant BadShape { message = "DualScaledFp4 scales shape mismatch against weight" }
+
+    mut bool is_modelopt ← false
+    if maybe_global is td.DirectoryEntry {
+        require is_scalar_entry(maybe_global) throw variant BadShape { message = "DualScaledFp4 global_scale must be scalar" }
+        is_modelopt ← false
+    }
+    elif maybe_amax is td.DirectoryEntry and maybe_denom is td.DirectoryEntry {
+        require is_scalar_entry(maybe_amax) and is_scalar_entry(maybe_denom) throw variant BadShape { message = "ModelOpt DualScaledFp4 amax and outer_scale_denominator must be scalar" }
+        is_modelopt ← true
     }
     else {
-        require total_bits % in_features ≡ 0 throw variant BadShape { message = "packed GroupAffine bit width not divisible by in_features" }
-        bits ← total_bits / in_features
+        throw variant BadBinding { message = "DualScaledFp4 requires global_scale or ModelOpt amax + outer_scale_denominator" }
     }
 
-    let ga.GroupAffineSpec spec ← ga.admit_spec(out_features, in_features, bits, group_size, pack)
-    return LinearWeight { kind = kind, out_features = spec.out_features, in_features = spec.in_features, bits = spec.bits, group_size = spec.group_size, packed_cols = spec.packed_cols, group_cols = spec.group_cols, has_bias = has_bias }
+    mut fp4.PackKind pack ← variant fp4.PackKind.PackU8
+    mut LinearWeightKind kind ← variant LinearWeightKind.DualScaledFp4U8
+    mut int in_features ← packed_cols * 2
+
+    if weight.raw_dtype ≡ "U8" {
+        pack ← variant fp4.PackKind.PackU8
+        kind ← variant LinearWeightKind.DualScaledFp4U8
+        in_features ← packed_cols * 2
+    }
+    elif weight.raw_dtype ≡ "U32" {
+        pack ← variant fp4.PackKind.PackU32
+        kind ← variant LinearWeightKind.DualScaledFp4U32
+        in_features ← packed_cols * 8
+    }
+    else {
+        throw variant UnsupportedFormat { message = "DualScaledFp4 weight dtype must be U8 or U32, got §"(weight.raw_dtype) }
+    }
+
+    require in_features % group_cols ≡ 0 throw variant BadShape { message = "DualScaledFp4 in_features not divisible by scale group_cols" }
+    let int group_size ← in_features / group_cols
+    let fp4.DualScaledFp4Spec spec ← fp4.admit_spec(out_features, in_features, group_size, pack)
+    return LinearWeight { kind = kind, out_features = spec.out_features, in_features = spec.in_features, bits = 4, group_size = spec.group_size, packed_cols = spec.packed_cols, group_cols = spec.group_cols, has_bias = has_bias, scales_dtype = scales.raw_dtype, is_modelopt = is_modelopt }
+}
+
+fn is_fp8_weight_dtype(string raw_dtype) → bool {
+    return raw_dtype ≡ "F8_E4M3" or raw_dtype ≡ "FP8_E4M3" or raw_dtype ≡ "E4M3"
+}
+
+fn bind_block_fp8(td.DirectoryEntry weight, td.DirectoryEntry ∪ none maybe_scales, bool has_bias) → LinearWeight ⇥ LinearWeightError {
+    let int raw_out ← weight.shape.get(0) coalesce 0
+    let int out_features ← apply_row_prefix_view(raw_out, weight.view)
+    let int packed_cols ← weight.shape.get(1) coalesce 0
+
+    mut bf8.PackKind pack ← variant bf8.PackKind.PackU8
+    mut LinearWeightKind kind ← variant LinearWeightKind.BlockFp8U8
+    mut int in_features ← packed_cols
+
+    if is_fp8_weight_dtype(weight.raw_dtype) or weight.raw_dtype ≡ "U8" {
+        pack ← variant bf8.PackKind.PackU8
+        kind ← variant LinearWeightKind.BlockFp8U8
+        in_features ← packed_cols
+    }
+    elif weight.raw_dtype ≡ "U32" {
+        pack ← variant bf8.PackKind.PackU32
+        kind ← variant LinearWeightKind.BlockFp8U32
+        in_features ← packed_cols * 4
+    }
+    else {
+        throw variant UnsupportedFormat { message = "BlockFp8 weight dtype must be F8_E4M3, U8, or U32, got §"(weight.raw_dtype) }
+    }
+
+    if maybe_scales is td.DirectoryEntry {
+        require maybe_scales.shape.length() ≡ 2 throw variant BadShape { message = "BlockFp8 scales must be rank-2" }
+        let int scale_rows ← maybe_scales.shape.get(0) coalesce 0
+        let int scale_cols ← maybe_scales.shape.get(1) coalesce 0
+        require scale_rows ≥ 1 and scale_cols ≥ 1 throw variant BadShape { message = "BlockFp8 scales must have positive extents" }
+        require maybe_scales.raw_dtype ≡ "U8" or maybe_scales.raw_dtype ≡ "F32" throw variant UnsupportedFormat { message = "BlockFp8 scales dtype must be U8 or F32, got §"(maybe_scales.raw_dtype) }
+
+        mut int row_span ← raw_out
+        if raw_out % scale_rows ≡ 0 {
+            row_span ← raw_out
+        }
+        elif out_features % scale_rows ≡ 0 {
+            row_span ← out_features
+        }
+        require row_span % scale_rows ≡ 0 throw variant BadShape { message = "BlockFp8 weight rows not divisible by scale_rows" }
+        let int block_rows ← row_span / scale_rows
+        require out_features % block_rows ≡ 0 throw variant BadShape { message = "BlockFp8 RowPrefix out_features must be divisible by block_rows" }
+        require in_features % scale_cols ≡ 0 throw variant BadShape { message = "BlockFp8 in_features not divisible by scale_cols" }
+        let int block_cols ← in_features / scale_cols
+        let bf8.BlockFp8Spec spec ← bf8.admit_spec(out_features, in_features, block_rows, block_cols, pack)
+        return LinearWeight { kind = kind, out_features = spec.out_features, in_features = spec.in_features, bits = 8, group_size = spec.block_cols, packed_cols = spec.packed_cols, group_cols = spec.scale_cols, has_bias = has_bias, block_rows = spec.block_rows, block_cols = spec.block_cols, scales_dtype = maybe_scales.raw_dtype }
+    }
+
+    require is_fp8_weight_dtype(weight.raw_dtype) throw variant BadBinding { message = "BlockFp8 U8/U32 storage requires a scales tensor" }
+    let bf8.BlockFp8Spec spec ← bf8.admit_spec(out_features, in_features, out_features, in_features, pack)
+    return LinearWeight { kind = kind, out_features = spec.out_features, in_features = spec.in_features, bits = 8, group_size = spec.block_cols, packed_cols = spec.packed_cols, group_cols = spec.scale_cols, has_bias = has_bias, block_rows = spec.block_rows, block_cols = spec.block_cols, scales_dtype = "NONE" }
+}
+
+fn resolve_scales_sibling(td.TensorDirectory dir, bundle.MemberRole role, string module_prefix, td.DirectoryEntry ∪ none sib_scales) → td.DirectoryEntry ∪ none ⇥ LinearWeightError {
+    if sib_scales is td.DirectoryEntry {
+        return sib_scales
+    }
+    if td.has_tensor(dir, role, "§.weight_scale_inv"(module_prefix)) {
+        return td.lookup(dir, role, "§.weight_scale_inv"(module_prefix))
+    }
+    return null
 }
 
 @ public
@@ -310,27 +559,41 @@ fn bind_with_config(td.TensorDirectory dir, bundle.MemberRole role, string modul
     require dim0 ≥ 1 and dim1 ≥ 1 throw variant BadShape { message = "weight shape must have positive extents" }
 
     let bool has_bias ← td.has_tensor(dir, role, "§.bias"(module_prefix))
-
-    # 1. GroupAffine: .weight + .scales + .biases (overrides stale config mode)
-    let td.DirectoryEntry ∪ none maybe_scales ← sib.scales
+    let td.DirectoryEntry ∪ none maybe_scales ← resolve_scales_sibling(dir, role, module_prefix, sib.scales)
     let td.DirectoryEntry ∪ none maybe_biases ← sib.biases
+    let td.DirectoryEntry ∪ none maybe_global ← sib.global_scale
+    let td.DirectoryEntry ∪ none maybe_amax ← sib.amax
+    let td.DirectoryEntry ∪ none maybe_denom ← sib.outer_scale_denominator
+
+    # 1. DualScaledFp4: .weight + .scales + (.global_scale | .amax + .outer_scale_denominator)
+    if maybe_scales is td.DirectoryEntry and (maybe_global is td.DirectoryEntry or (maybe_amax is td.DirectoryEntry and maybe_denom is td.DirectoryEntry)) {
+        return bind_dual_scaled_fp4(weight, maybe_scales, maybe_global, maybe_amax, maybe_denom, has_bias)
+    }
+
+    # 2. GroupAffine: .weight + .scales + .biases (overrides stale config mode)
     if maybe_scales is td.DirectoryEntry and maybe_biases is td.DirectoryEntry {
         return bind_group_affine(weight, maybe_scales, maybe_biases, has_bias, hint)
     }
 
+    # 3. BlockFp8: F8_E4M3 / FP8_E4M3 / E4M3 or U8 / U32 with scales-only sibling
+    if is_fp8_weight_dtype(weight.raw_dtype) or ((weight.raw_dtype ≡ "U8" or weight.raw_dtype ≡ "U32") and maybe_scales is td.DirectoryEntry) {
+        return bind_block_fp8(weight, maybe_scales, has_bias)
+    }
+
     # GGUF stores 2D weights in ne order [ne0 = in_features, ne1 = out_features],
     # whereas Safetensors stores PyTorch [out_features, in_features] order.
-    mut int out_features ← dim0
+    mut int raw_out ← dim0
     mut int in_features ← dim1
     match weight.container {
         case bundle.ContainerKind.Gguf {
             in_features ← dim0
-            out_features ← dim1
+            raw_out ← dim1
         }
         case bundle.ContainerKind.Safetensors {}
     }
+    let int out_features ← apply_row_prefix_view(raw_out, weight.view)
 
-    # 2. GgmlBlock: single GGML block tensor
+    # 4. GgmlBlock: single GGML block tensor
     if is_ggml_block_dtype(weight.raw_dtype) {
         let LinearWeightKind kind ← ggml_kind_for(weight.raw_dtype)
         let int block_elems ← ggml_block_elements(kind)
@@ -338,7 +601,7 @@ fn bind_with_config(td.TensorDirectory dir, bundle.MemberRole role, string modul
         return LinearWeight { kind = kind, out_features = out_features, in_features = in_features, bits = 0, group_size = 0, packed_cols = 0, group_cols = 0, has_bias = has_bias }
     }
 
-    # 3. Dense: .weight [+ .bias]
+    # 5. Dense: .weight [+ .bias]
     let LinearWeightKind kind ← dense_kind_for(weight.raw_dtype)
     return LinearWeight { kind = kind, out_features = out_features, in_features = in_features, bits = 0, group_size = 0, packed_cols = 0, group_cols = 0, has_bias = has_bias }
 }
@@ -350,15 +613,46 @@ fn bind(td.TensorDirectory dir, bundle.MemberRole role, string module_prefix) �
 
 @ public
 fn to_group_affine_spec(LinearWeight lw) → ga.GroupAffineSpec ⇥ LinearWeightError {
+    let ga.ScaleDtype sd ← (lw.scales_dtype ≡ "BF16") ✓ variant ga.ScaleDtype.ScaleBf16 ✗ variant ga.ScaleDtype.ScaleF32
     match lw.kind {
         case LinearWeightKind.GroupAffineU32 {
-            return ga.admit_spec(lw.out_features, lw.in_features, lw.bits, lw.group_size, variant ga.PackKind.PackU32)
+            return ga.admit_spec_with_scale(lw.out_features, lw.in_features, lw.bits, lw.group_size, variant ga.PackKind.PackU32, sd)
         }
         case LinearWeightKind.GroupAffineU8 {
-            return ga.admit_spec(lw.out_features, lw.in_features, lw.bits, lw.group_size, variant ga.PackKind.PackU8)
+            return ga.admit_spec_with_scale(lw.out_features, lw.in_features, lw.bits, lw.group_size, variant ga.PackKind.PackU8, sd)
         }
         default {
             throw variant UnsupportedFormat { message = "LinearWeight is not GroupAffine" }
+        }
+    }
+}
+
+@ public
+fn to_block_fp8_spec(LinearWeight lw) → bf8.BlockFp8Spec ⇥ LinearWeightError {
+    match lw.kind {
+        case LinearWeightKind.BlockFp8U8 {
+            return bf8.admit_spec(lw.out_features, lw.in_features, lw.block_rows, lw.block_cols, variant bf8.PackKind.PackU8)
+        }
+        case LinearWeightKind.BlockFp8U32 {
+            return bf8.admit_spec(lw.out_features, lw.in_features, lw.block_rows, lw.block_cols, variant bf8.PackKind.PackU32)
+        }
+        default {
+            throw variant UnsupportedFormat { message = "LinearWeight is not BlockFp8" }
+        }
+    }
+}
+
+@ public
+fn to_dual_scaled_fp4_spec(LinearWeight lw) → fp4.DualScaledFp4Spec ⇥ LinearWeightError {
+    match lw.kind {
+        case LinearWeightKind.DualScaledFp4U8 {
+            return fp4.admit_spec(lw.out_features, lw.in_features, lw.group_size, variant fp4.PackKind.PackU8)
+        }
+        case LinearWeightKind.DualScaledFp4U32 {
+            return fp4.admit_spec(lw.out_features, lw.in_features, lw.group_size, variant fp4.PackKind.PackU32)
+        }
+        default {
+            throw variant UnsupportedFormat { message = "LinearWeight is not DualScaledFp4" }
         }
     }
 }
@@ -435,7 +729,7 @@ fn unpack_u8_at(list<u8> weight, int w_base, int j, int bits) → int {
 @ public
 fn linear_matvec_group_affine_u32(ga.GroupAffineSpec spec, list<u32> weight, list<f32> scales, list<f32> biases, list<f32> bias, list<f32> x) → list<f32> ⇥ LinearWeightError {
     match spec.pack {
-        case PackU32 {}
+        case ga.PackKind.PackU32 {}
         default {
             throw variant BadBinding { message = "expected PackU32 spec" }
         }
@@ -470,7 +764,7 @@ fn linear_matvec_group_affine_u32(ga.GroupAffineSpec spec, list<u32> weight, lis
 @ public
 fn linear_matvec_group_affine_u8(ga.GroupAffineSpec spec, list<u8> weight, list<f32> scales, list<f32> biases, list<f32> bias, list<f32> x) → list<f32> ⇥ LinearWeightError {
     match spec.pack {
-        case PackU8 {}
+        case ga.PackKind.PackU8 {}
         default {
             throw variant BadBinding { message = "expected PackU8 spec" }
         }
@@ -604,6 +898,81 @@ fn linear_matvec(LinearWeight lw, WeightPayload payload, list<f32> x) → list<f
                 require bias.length() ≻ 0 throw variant BadBinding { message = "LinearWeight requires bias" }
             }
             return linear_matvec_group_affine_u8(spec, weight, scales, biases, bias, x)
+        }
+        case GroupAffineU32Bf16Payload let weight, scales, biases, bias {
+            let ga.GroupAffineSpec spec ← to_group_affine_spec(lw)
+            if lw.has_bias {
+                require bias.length() ≻ 0 throw variant BadBinding { message = "LinearWeight requires bias" }
+            }
+            let list<f32> w_dense ← ga.ref_dequantize_u32_bf16(spec, weight, scales, biases)
+            mut list<f32> y ← ga.ref_matvec(spec.out_features, spec.in_features, w_dense, x)
+            apply_optional_bias(mut y, bias, spec.out_features)
+            return y
+        }
+        case GroupAffineU8Bf16Payload let weight, scales, biases, bias {
+            let ga.GroupAffineSpec spec ← to_group_affine_spec(lw)
+            if lw.has_bias {
+                require bias.length() ≻ 0 throw variant BadBinding { message = "LinearWeight requires bias" }
+            }
+            let list<f32> w_dense ← ga.ref_dequantize_u8_bf16(spec, weight, scales, biases)
+            mut list<f32> y ← ga.ref_matvec(spec.out_features, spec.in_features, w_dense, x)
+            apply_optional_bias(mut y, bias, spec.out_features)
+            return y
+        }
+        case BlockFp8U8Payload let weight, scales, f32_scales, bias {
+            let bf8.BlockFp8Spec spec ← to_block_fp8_spec(lw)
+            if lw.has_bias {
+                require bias.length() ≻ 0 throw variant BadBinding { message = "LinearWeight requires bias" }
+            }
+            mut list<f32> w_dense ← empty
+            if lw.scales_dtype ≡ "NONE" {
+                w_dense ← bf8.ref_dequantize_u8_unscaled(spec.out_features, spec.in_features, weight)
+            }
+            elif lw.scales_dtype ≡ "F32" {
+                w_dense ← bf8.ref_dequantize_u8_f32(spec, weight, f32_scales)
+            }
+            else {
+                w_dense ← bf8.ref_dequantize_u8(spec, weight, scales)
+            }
+            mut list<f32> y ← bf8.ref_matvec(spec.out_features, spec.in_features, w_dense, x)
+            apply_optional_bias(mut y, bias, spec.out_features)
+            return y
+        }
+        case BlockFp8U32Payload let weight, scales, f32_scales, bias {
+            let bf8.BlockFp8Spec spec ← to_block_fp8_spec(lw)
+            if lw.has_bias {
+                require bias.length() ≻ 0 throw variant BadBinding { message = "LinearWeight requires bias" }
+            }
+            mut list<f32> w_dense ← empty
+            if lw.scales_dtype ≡ "F32" {
+                w_dense ← bf8.ref_dequantize_u32_f32(spec, weight, f32_scales)
+            }
+            else {
+                w_dense ← bf8.ref_dequantize_u32(spec, weight, scales)
+            }
+            mut list<f32> y ← bf8.ref_matvec(spec.out_features, spec.in_features, w_dense, x)
+            apply_optional_bias(mut y, bias, spec.out_features)
+            return y
+        }
+        case DualScaledFp4U8Payload let weight, scales, global_scale, bias {
+            let fp4.DualScaledFp4Spec spec ← to_dual_scaled_fp4_spec(lw)
+            if lw.has_bias {
+                require bias.length() ≻ 0 throw variant BadBinding { message = "LinearWeight requires bias" }
+            }
+            let list<f32> w_dense ← fp4.ref_dequantize_u8(spec, weight, scales, global_scale)
+            mut list<f32> y ← fp4.ref_matvec(spec.out_features, spec.in_features, w_dense, x)
+            apply_optional_bias(mut y, bias, spec.out_features)
+            return y
+        }
+        case DualScaledFp4U32Payload let weight, scales, global_scale, bias {
+            let fp4.DualScaledFp4Spec spec ← to_dual_scaled_fp4_spec(lw)
+            if lw.has_bias {
+                require bias.length() ≻ 0 throw variant BadBinding { message = "LinearWeight requires bias" }
+            }
+            let list<f32> w_dense ← fp4.ref_dequantize_u32(spec, weight, scales, global_scale)
+            mut list<f32> y ← fp4.ref_matvec(spec.out_features, spec.in_features, w_dense, x)
+            apply_optional_bias(mut y, bias, spec.out_features)
+            return y
         }
         case GgmlBlockPayload let raw_blocks, bias {
             if lw.has_bias {
@@ -751,6 +1120,143 @@ fn dispatch_group_affine_u8<size Out, size PackedIn, size Groups, size In>(Linea
     require lw.out_features ≡ Out and lw.in_features ≡ In and lw.packed_cols ≡ PackedIn and lw.group_cols ≡ Groups throw variant BadShape { message = "shape mismatch in dispatch_group_affine_u8" }
 
     ga.linear_matvec_u8<size Out, size PackedIn, size Groups, size In>(weight, scales, biases, x, mut y, lw.bits ↦ i32 ⊥ 4, lw.group_size ↦ i32 ⊥ 64)
+}
+
+@ public
+fn dispatch_group_affine_u32_bf16<size Out, size PackedIn, size Groups, size In>(LinearWeight lw, tensor<u32, [Out, PackedIn]> weight, tensor<bf16, [Out, Groups]> scales, tensor<bf16, [Out, Groups]> biases, tensor<f32, [In]> x, mut tensor<f32, [Out]> y) → void ⇥ LinearWeightError {
+    match lw.kind {
+        case GroupAffineU32 {}
+        default {
+            throw variant BadBinding { message = "expected GroupAffineU32 LinearWeight" }
+        }
+    }
+    require lw.scales_dtype ≡ "BF16" throw variant BadBinding { message = "expected BF16 scales_dtype in dispatch_group_affine_u32_bf16" }
+    require lw.out_features ≡ Out and lw.in_features ≡ In and lw.packed_cols ≡ PackedIn and lw.group_cols ≡ Groups throw variant BadShape { message = "shape mismatch in dispatch_group_affine_u32_bf16" }
+
+    ga.linear_matvec_u32_bf16<size Out, size PackedIn, size Groups, size In>(weight, scales, biases, x, mut y, lw.bits ↦ i32 ⊥ 8, lw.group_size ↦ i32 ⊥ 64)
+}
+
+@ public
+fn dispatch_group_affine_u8_bf16<size Out, size PackedIn, size Groups, size In>(LinearWeight lw, tensor<u8, [Out, PackedIn]> weight, tensor<bf16, [Out, Groups]> scales, tensor<bf16, [Out, Groups]> biases, tensor<f32, [In]> x, mut tensor<f32, [Out]> y) → void ⇥ LinearWeightError {
+    match lw.kind {
+        case GroupAffineU8 {}
+        default {
+            throw variant BadBinding { message = "expected GroupAffineU8 LinearWeight" }
+        }
+    }
+    require lw.scales_dtype ≡ "BF16" throw variant BadBinding { message = "expected BF16 scales_dtype in dispatch_group_affine_u8_bf16" }
+    require lw.out_features ≡ Out and lw.in_features ≡ In and lw.packed_cols ≡ PackedIn and lw.group_cols ≡ Groups throw variant BadShape { message = "shape mismatch in dispatch_group_affine_u8_bf16" }
+
+    ga.linear_matvec_u8_bf16<size Out, size PackedIn, size Groups, size In>(weight, scales, biases, x, mut y, lw.bits ↦ i32 ⊥ 4, lw.group_size ↦ i32 ⊥ 64)
+}
+
+@ public
+fn dispatch_block_fp8_u8<size Out, size In, size ScaleRows, size ScaleCols>(LinearWeight lw, tensor<u8, [Out, In]> weight, tensor<u8, [ScaleRows, ScaleCols]> scales, tensor<f32, [In]> x, mut tensor<f32, [Out]> y) → void ⇥ LinearWeightError {
+    match lw.kind {
+        case BlockFp8U8 {}
+        default {
+            throw variant BadBinding { message = "expected BlockFp8U8 LinearWeight" }
+        }
+    }
+    require lw.scales_dtype ≡ "U8" throw variant BadBinding { message = "expected U8 scales_dtype in dispatch_block_fp8_u8" }
+    require lw.out_features ≡ Out and lw.in_features ≡ In and lw.block_rows * ScaleRows ≡ Out and lw.block_cols * ScaleCols ≡ In throw variant BadShape { message = "shape mismatch in dispatch_block_fp8_u8" }
+
+    bf8.linear_matvec_u8<size Out, size In, size ScaleRows, size ScaleCols>(weight, scales, x, mut y, lw.block_rows ↦ i32 ⊥ 128, lw.block_cols ↦ i32 ⊥ 128)
+}
+
+@ public
+fn dispatch_block_fp8_u8_f32<size Out, size In, size ScaleRows, size ScaleCols>(LinearWeight lw, tensor<u8, [Out, In]> weight, tensor<f32, [ScaleRows, ScaleCols]> scales, tensor<f32, [In]> x, mut tensor<f32, [Out]> y) → void ⇥ LinearWeightError {
+    match lw.kind {
+        case BlockFp8U8 {}
+        default {
+            throw variant BadBinding { message = "expected BlockFp8U8 LinearWeight" }
+        }
+    }
+    require lw.scales_dtype ≡ "F32" throw variant BadBinding { message = "expected F32 scales_dtype in dispatch_block_fp8_u8_f32" }
+    require lw.out_features ≡ Out and lw.in_features ≡ In and lw.block_rows * ScaleRows ≡ Out and lw.block_cols * ScaleCols ≡ In throw variant BadShape { message = "shape mismatch in dispatch_block_fp8_u8_f32" }
+
+    bf8.linear_matvec_u8_f32_scales<size Out, size In, size ScaleRows, size ScaleCols>(weight, scales, x, mut y, lw.block_rows ↦ i32 ⊥ 128, lw.block_cols ↦ i32 ⊥ 128)
+}
+
+@ public
+fn dispatch_block_fp8_u8_unscaled<size Out, size In>(LinearWeight lw, tensor<u8, [Out, In]> weight, tensor<f32, [In]> x, mut tensor<f32, [Out]> y) → void ⇥ LinearWeightError {
+    match lw.kind {
+        case BlockFp8U8 {}
+        default {
+            throw variant BadBinding { message = "expected BlockFp8U8 LinearWeight" }
+        }
+    }
+    require lw.scales_dtype ≡ "NONE" throw variant BadBinding { message = "expected unscaled BlockFp8U8 LinearWeight" }
+    require lw.out_features ≡ Out and lw.in_features ≡ In throw variant BadShape { message = "shape mismatch in dispatch_block_fp8_u8_unscaled" }
+
+    bf8.linear_matvec_u8_unscaled<size Out, size In>(weight, x, mut y)
+}
+
+@ public
+fn dispatch_block_fp8_u32<size Out, size PackedIn, size ScaleRows, size ScaleCols, size In>(LinearWeight lw, tensor<u32, [Out, PackedIn]> weight, tensor<u8, [ScaleRows, ScaleCols]> scales, tensor<f32, [In]> x, mut tensor<f32, [Out]> y) → void ⇥ LinearWeightError {
+    match lw.kind {
+        case BlockFp8U32 {}
+        default {
+            throw variant BadBinding { message = "expected BlockFp8U32 LinearWeight" }
+        }
+    }
+    require lw.scales_dtype ≡ "U8" throw variant BadBinding { message = "expected U8 scales_dtype in dispatch_block_fp8_u32" }
+    require lw.out_features ≡ Out and lw.in_features ≡ In and lw.packed_cols ≡ PackedIn and lw.block_rows * ScaleRows ≡ Out and lw.block_cols * ScaleCols ≡ In throw variant BadShape { message = "shape mismatch in dispatch_block_fp8_u32" }
+
+    bf8.linear_matvec_u32<size Out, size PackedIn, size ScaleRows, size ScaleCols, size In>(weight, scales, x, mut y, lw.block_rows ↦ i32 ⊥ 1, lw.block_cols ↦ i32 ⊥ 32)
+}
+
+@ public
+fn dispatch_block_fp8_u32_f32<size Out, size PackedIn, size ScaleRows, size ScaleCols, size In>(LinearWeight lw, tensor<u32, [Out, PackedIn]> weight, tensor<f32, [ScaleRows, ScaleCols]> scales, tensor<f32, [In]> x, mut tensor<f32, [Out]> y) → void ⇥ LinearWeightError {
+    match lw.kind {
+        case BlockFp8U32 {}
+        default {
+            throw variant BadBinding { message = "expected BlockFp8U32 LinearWeight" }
+        }
+    }
+    require lw.scales_dtype ≡ "F32" throw variant BadBinding { message = "expected F32 scales_dtype in dispatch_block_fp8_u32_f32" }
+    require lw.out_features ≡ Out and lw.in_features ≡ In and lw.packed_cols ≡ PackedIn and lw.block_rows * ScaleRows ≡ Out and lw.block_cols * ScaleCols ≡ In throw variant BadShape { message = "shape mismatch in dispatch_block_fp8_u32_f32" }
+
+    bf8.linear_matvec_u32_f32_scales<size Out, size PackedIn, size ScaleRows, size ScaleCols, size In>(weight, scales, x, mut y, lw.block_rows ↦ i32 ⊥ 1, lw.block_cols ↦ i32 ⊥ 32)
+}
+
+@ public
+fn dispatch_dual_scaled_fp4_u8<size Out, size PackedIn, size Groups, size In>(LinearWeight lw, tensor<u8, [Out, PackedIn]> weight, tensor<u8, [Out, Groups]> scales, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, f32 global_scale) → void ⇥ LinearWeightError {
+    match lw.kind {
+        case DualScaledFp4U8 {}
+        default {
+            throw variant BadBinding { message = "expected DualScaledFp4U8 LinearWeight" }
+        }
+    }
+    require lw.out_features ≡ Out and lw.in_features ≡ In and lw.packed_cols ≡ PackedIn and lw.group_cols ≡ Groups throw variant BadShape { message = "shape mismatch in dispatch_dual_scaled_fp4_u8" }
+
+    fp4.linear_matvec_u8<size Out, size PackedIn, size Groups, size In>(weight, scales, x, mut y, global_scale, lw.group_size ↦ i32 ⊥ 16)
+}
+
+@ public
+fn dispatch_dual_scaled_fp4_modelopt_u8<size Out, size PackedIn, size Groups, size In>(LinearWeight lw, tensor<u8, [Out, PackedIn]> weight, tensor<u8, [Out, Groups]> scales, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, f32 amax, f32 outer_scale_denominator) → void ⇥ LinearWeightError {
+    match lw.kind {
+        case DualScaledFp4U8 {}
+        default {
+            throw variant BadBinding { message = "expected DualScaledFp4U8 LinearWeight" }
+        }
+    }
+    require lw.out_features ≡ Out and lw.in_features ≡ In and lw.packed_cols ≡ PackedIn and lw.group_cols ≡ Groups throw variant BadShape { message = "shape mismatch in dispatch_dual_scaled_fp4_modelopt_u8" }
+
+    fp4.linear_matvec_modelopt_u8<size Out, size PackedIn, size Groups, size In>(weight, scales, x, mut y, amax, outer_scale_denominator, lw.group_size ↦ i32 ⊥ 16)
+}
+
+@ public
+fn dispatch_dual_scaled_fp4_u32<size Out, size PackedIn, size Groups, size In>(LinearWeight lw, tensor<u32, [Out, PackedIn]> weight, tensor<u8, [Out, Groups]> scales, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, f32 global_scale) → void ⇥ LinearWeightError {
+    match lw.kind {
+        case DualScaledFp4U32 {}
+        default {
+            throw variant BadBinding { message = "expected DualScaledFp4U32 LinearWeight" }
+        }
+    }
+    require lw.out_features ≡ Out and lw.in_features ≡ In and lw.packed_cols ≡ PackedIn and lw.group_cols ≡ Groups throw variant BadShape { message = "shape mismatch in dispatch_dual_scaled_fp4_u32" }
+
+    fp4.linear_matvec_u32<size Out, size PackedIn, size Groups, size In>(weight, scales, x, mut y, global_scale, lw.group_size ↦ i32 ⊥ 16)
 }
 
 @ public
@@ -1631,6 +2137,147 @@ fn dispatch_group_affine_u8_matmul<size B, size Out, size PackedIn, size Groups,
 }
 
 @ public
+fn dispatch_group_affine_u32_bf16_matmul<size B, size Out, size PackedIn, size Groups, size In>(LinearWeight lw, tensor<u32, [Out, PackedIn]> weight, tensor<bf16, [Out, Groups]> scales, tensor<bf16, [Out, Groups]> biases, tensor<f32, [B, In]> x, mut tensor<f32, [B, Out]> y) → void ⇥ LinearWeightError {
+    match lw.kind {
+        case GroupAffineU32 {}
+        default {
+            throw variant BadBinding { message = "expected GroupAffineU32 LinearWeight" }
+        }
+    }
+    require lw.scales_dtype ≡ "BF16" throw variant BadBinding { message = "expected BF16 scales_dtype in dispatch_group_affine_u32_bf16_matmul" }
+    require lw.out_features ≡ Out and lw.in_features ≡ In and lw.packed_cols ≡ PackedIn and lw.group_cols ≡ Groups throw variant BadShape { message = "shape mismatch in dispatch_group_affine_u32_bf16_matmul" }
+    require lw.bits ≡ 4 or lw.bits ≡ 6 or lw.bits ≡ 8 throw variant BadConfig { message = "invalid bits in dispatch_group_affine_u32_bf16_matmul" }
+    require lw.group_size ≥ 1 and lw.group_size ≤ 4096 throw variant BadConfig { message = "group_size out of range in dispatch_group_affine_u32_bf16_matmul" }
+
+    ga.linear_matmul_u32_bf16<size B, size Out, size PackedIn, size Groups, size In>(weight, scales, biases, x, mut y, lw.bits ↦ i32 ⊥ 8, lw.group_size ↦ i32 ⊥ 64)
+}
+
+@ public
+fn dispatch_group_affine_u8_bf16_matmul<size B, size Out, size PackedIn, size Groups, size In>(LinearWeight lw, tensor<u8, [Out, PackedIn]> weight, tensor<bf16, [Out, Groups]> scales, tensor<bf16, [Out, Groups]> biases, tensor<f32, [B, In]> x, mut tensor<f32, [B, Out]> y) → void ⇥ LinearWeightError {
+    match lw.kind {
+        case GroupAffineU8 {}
+        default {
+            throw variant BadBinding { message = "expected GroupAffineU8 LinearWeight" }
+        }
+    }
+    require lw.scales_dtype ≡ "BF16" throw variant BadBinding { message = "expected BF16 scales_dtype in dispatch_group_affine_u8_bf16_matmul" }
+    require lw.out_features ≡ Out and lw.in_features ≡ In and lw.packed_cols ≡ PackedIn and lw.group_cols ≡ Groups throw variant BadShape { message = "shape mismatch in dispatch_group_affine_u8_bf16_matmul" }
+    require lw.bits ≡ 4 or lw.bits ≡ 8 throw variant BadConfig { message = "invalid bits in dispatch_group_affine_u8_bf16_matmul" }
+    require lw.group_size ≥ 1 and lw.group_size ≤ 4096 throw variant BadConfig { message = "group_size out of range in dispatch_group_affine_u8_bf16_matmul" }
+
+    ga.linear_matmul_u8_bf16<size B, size Out, size PackedIn, size Groups, size In>(weight, scales, biases, x, mut y, lw.bits ↦ i32 ⊥ 4, lw.group_size ↦ i32 ⊥ 64)
+}
+
+@ public
+fn dispatch_block_fp8_u8_matmul<size B, size Out, size In, size ScaleRows, size ScaleCols>(LinearWeight lw, tensor<u8, [Out, In]> weight, tensor<u8, [ScaleRows, ScaleCols]> scales, tensor<f32, [B, In]> x, mut tensor<f32, [B, Out]> y) → void ⇥ LinearWeightError {
+    match lw.kind {
+        case BlockFp8U8 {}
+        default {
+            throw variant BadBinding { message = "expected BlockFp8U8 LinearWeight" }
+        }
+    }
+    require lw.scales_dtype ≡ "U8" throw variant BadBinding { message = "expected U8 scales_dtype in dispatch_block_fp8_u8_matmul" }
+    require lw.out_features ≡ Out and lw.in_features ≡ In and lw.block_rows * ScaleRows ≡ Out and lw.block_cols * ScaleCols ≡ In throw variant BadShape { message = "shape mismatch in dispatch_block_fp8_u8_matmul" }
+
+    bf8.linear_matmul_u8<size B, size Out, size In, size ScaleRows, size ScaleCols>(weight, scales, x, mut y, lw.block_rows ↦ i32 ⊥ 128, lw.block_cols ↦ i32 ⊥ 128)
+}
+
+@ public
+fn dispatch_block_fp8_u8_f32_matmul<size B, size Out, size In, size ScaleRows, size ScaleCols>(LinearWeight lw, tensor<u8, [Out, In]> weight, tensor<f32, [ScaleRows, ScaleCols]> scales, tensor<f32, [B, In]> x, mut tensor<f32, [B, Out]> y) → void ⇥ LinearWeightError {
+    match lw.kind {
+        case BlockFp8U8 {}
+        default {
+            throw variant BadBinding { message = "expected BlockFp8U8 LinearWeight" }
+        }
+    }
+    require lw.scales_dtype ≡ "F32" throw variant BadBinding { message = "expected F32 scales_dtype in dispatch_block_fp8_u8_f32_matmul" }
+    require lw.out_features ≡ Out and lw.in_features ≡ In and lw.block_rows * ScaleRows ≡ Out and lw.block_cols * ScaleCols ≡ In throw variant BadShape { message = "shape mismatch in dispatch_block_fp8_u8_f32_matmul" }
+
+    bf8.linear_matmul_u8_f32_scales<size B, size Out, size In, size ScaleRows, size ScaleCols>(weight, scales, x, mut y, lw.block_rows ↦ i32 ⊥ 128, lw.block_cols ↦ i32 ⊥ 128)
+}
+
+@ public
+fn dispatch_block_fp8_u8_unscaled_matmul<size B, size Out, size In>(LinearWeight lw, tensor<u8, [Out, In]> weight, tensor<f32, [B, In]> x, mut tensor<f32, [B, Out]> y) → void ⇥ LinearWeightError {
+    match lw.kind {
+        case BlockFp8U8 {}
+        default {
+            throw variant BadBinding { message = "expected BlockFp8U8 LinearWeight" }
+        }
+    }
+    require lw.scales_dtype ≡ "NONE" throw variant BadBinding { message = "expected unscaled BlockFp8U8 LinearWeight" }
+    require lw.out_features ≡ Out and lw.in_features ≡ In throw variant BadShape { message = "shape mismatch in dispatch_block_fp8_u8_unscaled_matmul" }
+
+    bf8.linear_matmul_u8_unscaled<size B, size Out, size In>(weight, x, mut y)
+}
+
+@ public
+fn dispatch_block_fp8_u32_matmul<size B, size Out, size PackedIn, size ScaleRows, size ScaleCols, size In>(LinearWeight lw, tensor<u32, [Out, PackedIn]> weight, tensor<u8, [ScaleRows, ScaleCols]> scales, tensor<f32, [B, In]> x, mut tensor<f32, [B, Out]> y) → void ⇥ LinearWeightError {
+    match lw.kind {
+        case BlockFp8U32 {}
+        default {
+            throw variant BadBinding { message = "expected BlockFp8U32 LinearWeight" }
+        }
+    }
+    require lw.scales_dtype ≡ "U8" throw variant BadBinding { message = "expected U8 scales_dtype in dispatch_block_fp8_u32_matmul" }
+    require lw.out_features ≡ Out and lw.in_features ≡ In and lw.packed_cols ≡ PackedIn and lw.block_rows * ScaleRows ≡ Out and lw.block_cols * ScaleCols ≡ In throw variant BadShape { message = "shape mismatch in dispatch_block_fp8_u32_matmul" }
+
+    bf8.linear_matmul_u32<size B, size Out, size PackedIn, size ScaleRows, size ScaleCols, size In>(weight, scales, x, mut y, lw.block_rows ↦ i32 ⊥ 1, lw.block_cols ↦ i32 ⊥ 32)
+}
+
+@ public
+fn dispatch_block_fp8_u32_f32_matmul<size B, size Out, size PackedIn, size ScaleRows, size ScaleCols, size In>(LinearWeight lw, tensor<u32, [Out, PackedIn]> weight, tensor<f32, [ScaleRows, ScaleCols]> scales, tensor<f32, [B, In]> x, mut tensor<f32, [B, Out]> y) → void ⇥ LinearWeightError {
+    match lw.kind {
+        case BlockFp8U32 {}
+        default {
+            throw variant BadBinding { message = "expected BlockFp8U32 LinearWeight" }
+        }
+    }
+    require lw.scales_dtype ≡ "F32" throw variant BadBinding { message = "expected F32 scales_dtype in dispatch_block_fp8_u32_f32_matmul" }
+    require lw.out_features ≡ Out and lw.in_features ≡ In and lw.packed_cols ≡ PackedIn and lw.block_rows * ScaleRows ≡ Out and lw.block_cols * ScaleCols ≡ In throw variant BadShape { message = "shape mismatch in dispatch_block_fp8_u32_f32_matmul" }
+
+    bf8.linear_matmul_u32_f32_scales<size B, size Out, size PackedIn, size ScaleRows, size ScaleCols, size In>(weight, scales, x, mut y, lw.block_rows ↦ i32 ⊥ 1, lw.block_cols ↦ i32 ⊥ 32)
+}
+
+@ public
+fn dispatch_dual_scaled_fp4_u8_matmul<size B, size Out, size PackedIn, size Groups, size In>(LinearWeight lw, tensor<u8, [Out, PackedIn]> weight, tensor<u8, [Out, Groups]> scales, tensor<f32, [B, In]> x, mut tensor<f32, [B, Out]> y, f32 global_scale) → void ⇥ LinearWeightError {
+    match lw.kind {
+        case DualScaledFp4U8 {}
+        default {
+            throw variant BadBinding { message = "expected DualScaledFp4U8 LinearWeight" }
+        }
+    }
+    require lw.out_features ≡ Out and lw.in_features ≡ In and lw.packed_cols ≡ PackedIn and lw.group_cols ≡ Groups throw variant BadShape { message = "shape mismatch in dispatch_dual_scaled_fp4_u8_matmul" }
+
+    fp4.linear_matmul_u8<size B, size Out, size PackedIn, size Groups, size In>(weight, scales, x, mut y, global_scale, lw.group_size ↦ i32 ⊥ 16)
+}
+
+@ public
+fn dispatch_dual_scaled_fp4_modelopt_u8_matmul<size B, size Out, size PackedIn, size Groups, size In>(LinearWeight lw, tensor<u8, [Out, PackedIn]> weight, tensor<u8, [Out, Groups]> scales, tensor<f32, [B, In]> x, mut tensor<f32, [B, Out]> y, f32 amax, f32 outer_scale_denominator) → void ⇥ LinearWeightError {
+    match lw.kind {
+        case DualScaledFp4U8 {}
+        default {
+            throw variant BadBinding { message = "expected DualScaledFp4U8 LinearWeight" }
+        }
+    }
+    require lw.out_features ≡ Out and lw.in_features ≡ In and lw.packed_cols ≡ PackedIn and lw.group_cols ≡ Groups throw variant BadShape { message = "shape mismatch in dispatch_dual_scaled_fp4_modelopt_u8_matmul" }
+
+    fp4.linear_matmul_modelopt_u8<size B, size Out, size PackedIn, size Groups, size In>(weight, scales, x, mut y, amax, outer_scale_denominator, lw.group_size ↦ i32 ⊥ 16)
+}
+
+@ public
+fn dispatch_dual_scaled_fp4_u32_matmul<size B, size Out, size PackedIn, size Groups, size In>(LinearWeight lw, tensor<u32, [Out, PackedIn]> weight, tensor<u8, [Out, Groups]> scales, tensor<f32, [B, In]> x, mut tensor<f32, [B, Out]> y, f32 global_scale) → void ⇥ LinearWeightError {
+    match lw.kind {
+        case DualScaledFp4U32 {}
+        default {
+            throw variant BadBinding { message = "expected DualScaledFp4U32 LinearWeight" }
+        }
+    }
+    require lw.out_features ≡ Out and lw.in_features ≡ In and lw.packed_cols ≡ PackedIn and lw.group_cols ≡ Groups throw variant BadShape { message = "shape mismatch in dispatch_dual_scaled_fp4_u32_matmul" }
+
+    fp4.linear_matmul_u32<size B, size Out, size PackedIn, size Groups, size In>(weight, scales, x, mut y, global_scale, lw.group_size ↦ i32 ⊥ 16)
+}
+
+@ public
 kernel ggml_q8_0_matmul<size B, size Out, size Blocks, size RowBytes, size In>(tensor<u8, [Out, RowBytes]> raw_blocks, tensor<f32, [B, In]> x, mut tensor<f32, [B, Out]> y) → void {
     for from y at [b_idx, row] thread lane let e {
         let i32 row_block_limit ← RowBytes / 34
@@ -2466,6 +3113,17 @@ fn build_dir(bundle.ModelBundle b, capsule.SafetensorsManifest m) → td.TensorD
     }
 }
 
+fn build_dir_with_views(bundle.ModelBundle b, capsule.SafetensorsManifest m, list<td.ViewSpec> views) → td.TensorDirectory ∪ none {
+    do {
+        return td.build(b, [
+            variant td.ShardSource.SafetensorsSource { role = variant bundle.MemberRole.Backbone, shard_index = 0, manifest = m }
+        ], [], views)
+    }
+    catch err {
+        return null
+    }
+}
+
 fn close(f32 a, f32 b) → bool {
     let f32 diff ← (a - b).abs()
     let f32 tol ← (1.0e-5 ∷ f32) + (1.0e-4 ∷ f32) * b.abs()
@@ -2680,6 +3338,42 @@ test "LinearWeight kernel dispatchers match across Dense, GroupAffine, and Q8_0"
 
         lw.dispatch_ggml_q8_0<size 1, size 1, size 34, size 32>(lw_q8, tw_q8, tx32, mut ty_q8)
         assert close(ty_q8[[0]], 16.0)
+
+        # GroupAffine BF16 scales/biases, BlockFp8, and DualScaledFp4 matvec dispatch
+        let lw.LinearWeight lw_ga32_bf16 ← lw.LinearWeight { kind = variant lw.LinearWeightKind.GroupAffineU32, out_features = 1, in_features = 4, bits = 8, group_size = 2, packed_cols = 1, group_cols = 2, has_bias = false, scales_dtype = "BF16" }
+        mut tensor<bf16, [1, 2]> ts_bf16 ← tbf16[1, 2] {}
+        ts_bf16[[0, 0]] ← (0.5 ∷ f32) ↦ bf16
+        ts_bf16[[0, 1]] ← (2.0 ∷ f32) ↦ bf16
+        mut tensor<bf16, [1, 2]> tbi_bf16 ← tbf16[1, 2] {}
+        tbi_bf16[[0, 0]] ← (-1.0 ∷ f32) ↦ bf16
+        tbi_bf16[[0, 1]] ← (0.25 ∷ f32) ↦ bf16
+        mut tensor<f32, [1]> ty_ga32_bf16 ← tf32[1] {}
+        lw.dispatch_group_affine_u32_bf16<size 1, size 1, size 2, size 4>(lw_ga32_bf16, tw_u32, ts_bf16, tbi_bf16, tx4, mut ty_ga32_bf16)
+        assert close(ty_ga32_bf16[[0]], 16.125)
+
+        let lw.LinearWeight lw_bf8_u8 ← lw.LinearWeight { kind = variant lw.LinearWeightKind.BlockFp8U8, out_features = 1, in_features = 4, bits = 8, group_size = 2, packed_cols = 4, group_cols = 2, has_bias = false, block_rows = 1, block_cols = 2, scales_dtype = "U8" }
+        mut tensor<u8, [1, 4]> tw_fp8_u8 ← tu8[1, 4] {}
+        tw_fp8_u8[[0, 0]] ← 0x38 ∷ u8
+        tw_fp8_u8[[0, 1]] ← 0x40 ∷ u8
+        tw_fp8_u8[[0, 2]] ← 0x3c ∷ u8
+        tw_fp8_u8[[0, 3]] ← 0x00 ∷ u8
+        mut tensor<u8, [1, 2]> ts_fp8_u8 ← tu8[1, 2] {}
+        ts_fp8_u8[[0, 0]] ← 127 ∷ u8
+        ts_fp8_u8[[0, 1]] ← 128 ∷ u8
+        mut tensor<f32, [1]> ty_fp8 ← tf32[1] {}
+        lw.dispatch_block_fp8_u8<size 1, size 4, size 1, size 2>(lw_bf8_u8, tw_fp8_u8, ts_fp8_u8, tx4, mut ty_fp8)
+        assert close(ty_fp8[[0]], 6.0)
+
+        let lw.LinearWeight lw_fp4_u8 ← lw.LinearWeight { kind = variant lw.LinearWeightKind.DualScaledFp4U8, out_features = 1, in_features = 4, bits = 4, group_size = 2, packed_cols = 2, group_cols = 2, has_bias = false }
+        mut tensor<u8, [1, 2]> tw_fp4_u8 ← tu8[1, 2] {}
+        tw_fp4_u8[[0, 0]] ← 0x22 ∷ u8
+        tw_fp4_u8[[0, 1]] ← 0x44 ∷ u8
+        mut tensor<u8, [1, 2]> ts_fp4 ← tu8[1, 2] {}
+        ts_fp4[[0, 0]] ← 0x38 ∷ u8
+        ts_fp4[[0, 1]] ← 0x40 ∷ u8
+        mut tensor<f32, [1]> ty_fp4 ← tf32[1] {}
+        lw.dispatch_dual_scaled_fp4_modelopt_u8<size 1, size 2, size 2, size 4>(lw_fp4_u8, tw_fp4_u8, ts_fp4, tx4, mut ty_fp4, 6.0 ∷ f32, 12.0 ∷ f32)
+        assert close(ty_fp4[[0]], 7.0)
     }
     catch err {
         assert false
@@ -3430,4 +4124,179 @@ test "LinearWeight dense and GGML device kernels handle rows above 65536 without
     lw.ggml_q6_k_matmul<size 1, size 65540, size 1, size 210, size 256>(g_q6k, x256_m, mut gy_mat)
     assert close(dy_vec[[1]], 4352.0 ∷ f32) and close(dy_vec[[65537]], 8704.0 ∷ f32)
     assert close(gy_mat[[0, 1]], 4352.0 ∷ f32) and close(gy_mat[[0, 65537]], 8704.0 ∷ f32)
+}
+
+test "LinearWeight honors RowPrefix, overrides stale config hints, and binds native bf16 + BlockFp8 + DualScaledFp4" {
+    let artifact.ContentIdentity bb_id ← id_with("e", 16384)
+    let bundle.ModelBundle b ← mk_unindexed([bb_id])
+    let capsule.SafetensorsManifest m ← st_manifest(16384, 10240, [
+        st_desc("model.embed_tokens.weight", "U32", [201024, 144], 0, 1024, 256),
+        st_desc("model.embed_tokens.scales", "BF16", [201024, 9], 1024, 1536, 256),
+        st_desc("model.embed_tokens.biases", "BF16", [201024, 9], 1536, 2048, 256),
+        st_desc("lm_head.weight", "BF16", [201024, 576], 2048, 3072, 256),
+        st_desc("model.layers.0.self_attn.q_proj.weight", "U32", [576, 72], 3072, 4096, 256),
+        st_desc("model.layers.0.self_attn.q_proj.scales", "F8_E4M3", [576, 36], 4096, 4608, 256),
+        st_desc("model.layers.0.self_attn.q_proj.global_scale", "F32", [], 4608, 4612, 1),
+        st_desc("model.layers.0.self_attn.k_proj.weight", "U8", [576, 288], 4612, 5124, 256),
+        st_desc("model.layers.0.self_attn.k_proj.scales", "U8", [576, 36], 5124, 5636, 256),
+        st_desc("model.layers.0.self_attn.k_proj.weight_scale_2", "F32", [], 5636, 5640, 1),
+        st_desc("model.layers.0.self_attn.v_proj.weight", "U32", [576, 144], 5640, 6152, 256),
+        st_desc("model.layers.0.self_attn.v_proj.scales", "U8", [576, 18], 6152, 6664, 256),
+        st_desc("model.layers.0.self_attn.o_proj.weight", "F8_E4M3", [576, 576], 6664, 7176, 256),
+        st_desc("model.layers.0.self_attn.o_proj.weight_scale_inv", "F32", [9, 9], 7176, 7284, 81),
+        st_desc("model.layers.1.self_attn.q_proj.weight", "F8_E4M3", [128, 256], 7284, 7412, 256)
+    ])
+
+    let td.TensorDirectory ∪ none maybe_dir ← build_dir_with_views(b, m, [
+        td.ViewSpec { role = variant bundle.MemberRole.Backbone, canonical_name = "model.embed_tokens.weight", view = variant td.LoadView.RowPrefix { rows = 200058 } },
+        td.ViewSpec { role = variant bundle.MemberRole.Backbone, canonical_name = "lm_head.weight", view = variant td.LoadView.RowPrefix { rows = 200058 } }
+    ])
+    assert maybe_dir is td.TensorDirectory
+    if maybe_dir is td.TensorDirectory {
+      do {
+        # Directory-first: stale Inkling nvfp4 group_size=16 bits=4 hint overridden by resident U32 GroupAffine 8-bit group_size=64 + BF16 scales + RowPrefix
+        let lw.QuantConfigHint stale_nvfp4 ← lw.QuantConfigHint { mode = "nvfp4", bits = 4, group_size = 16 }
+        let lw.LinearWeight emb ← lw.bind_with_config(maybe_dir, variant bundle.MemberRole.Backbone, "model.embed_tokens", stale_nvfp4)
+        assert emb.kind ≡ variant lw.LinearWeightKind.GroupAffineU32
+        assert emb.out_features ≡ 200058
+        assert emb.in_features ≡ 576
+        assert emb.bits ≡ 8
+        assert emb.group_size ≡ 64
+        assert emb.scales_dtype ≡ "BF16"
+
+        let lw.LinearWeight head ← lw.bind_with_config(maybe_dir, variant bundle.MemberRole.Backbone, "lm_head", stale_nvfp4)
+        assert head.kind ≡ variant lw.LinearWeightKind.DenseBf16
+        assert head.out_features ≡ 200058
+        assert head.in_features ≡ 576
+
+        # MLX DualScaledFp4 U32 with 0-D global_scale
+        let lw.LinearWeight l_fp4_u32 ← lw.bind_with_config(maybe_dir, variant bundle.MemberRole.Backbone, "model.layers.0.self_attn.q_proj", lw.default_hint())
+        assert l_fp4_u32.kind ≡ variant lw.LinearWeightKind.DualScaledFp4U32
+        assert l_fp4_u32.out_features ≡ 576
+        assert l_fp4_u32.in_features ≡ 576
+        assert l_fp4_u32.group_size ≡ 16
+        assert l_fp4_u32.is_modelopt ≡ false
+
+        # ModelOpt DualScaledFp4 U8 (via weight_scale_2 alias -> global_scale)
+        let lw.LinearWeight l_fp4_u8 ← lw.bind(maybe_dir, variant bundle.MemberRole.Backbone, "model.layers.0.self_attn.k_proj")
+        assert l_fp4_u8.kind ≡ variant lw.LinearWeightKind.DualScaledFp4U8
+        assert l_fp4_u8.out_features ≡ 576
+        assert l_fp4_u8.in_features ≡ 576
+        assert l_fp4_u8.group_size ≡ 16
+
+        # MLX MXFP8 U32 + U8 scales (no biases, no global_scale)
+        let lw.LinearWeight l_fp8_u32 ← lw.bind(maybe_dir, variant bundle.MemberRole.Backbone, "model.layers.0.self_attn.v_proj")
+        assert l_fp8_u32.kind ≡ variant lw.LinearWeightKind.BlockFp8U32
+        assert l_fp8_u32.out_features ≡ 576
+        assert l_fp8_u32.in_features ≡ 576
+        assert l_fp8_u32.block_rows ≡ 1
+        assert l_fp8_u32.block_cols ≡ 32
+        assert l_fp8_u32.scales_dtype ≡ "U8"
+
+        # 2D F8_E4M3 with F32 block scales [9, 9] -> (64, 64)
+        let lw.LinearWeight l_fp8_f32 ← lw.bind(maybe_dir, variant bundle.MemberRole.Backbone, "model.layers.0.self_attn.o_proj")
+        assert l_fp8_f32.kind ≡ variant lw.LinearWeightKind.BlockFp8U8
+        assert l_fp8_f32.block_rows ≡ 64
+        assert l_fp8_f32.block_cols ≡ 64
+        assert l_fp8_f32.scales_dtype ≡ "F32"
+
+        # Unscaled F8_E4M3
+        let lw.LinearWeight l_fp8_unscaled ← lw.bind(maybe_dir, variant bundle.MemberRole.Backbone, "model.layers.1.self_attn.q_proj")
+        assert l_fp8_unscaled.kind ≡ variant lw.LinearWeightKind.BlockFp8U8
+        assert l_fp8_unscaled.scales_dtype ≡ "NONE"
+        assert l_fp8_unscaled.out_features ≡ 128
+        assert l_fp8_unscaled.in_features ≡ 256
+      }
+      catch err {
+        assert false
+      }
+    }
+}
+
+test "LinearWeight host linear_matvec matches GroupAffine BF16, BlockFp8, ModelOpt NVFP4, and MLX NVFP4" {
+    let list<f32> x4 ← [1.0, -1.0, 2.0, 0.5]
+    let list<f32> x8 ← [1.0, -1.0, 2.0, 0.5, 0.0, 0.0, 0.0, 0.0]
+    let list<f32> no_bias ← empty
+
+    do {
+        # GroupAffine U32 & U8 with native bf16 scales/biases
+        let lw.LinearWeight lw_ga32_bf16 ← lw.LinearWeight { kind = variant lw.LinearWeightKind.GroupAffineU32, out_features = 1, in_features = 4, bits = 8, group_size = 2, packed_cols = 1, group_cols = 2, has_bias = false, scales_dtype = "BF16" }
+        let lw.LinearWeight lw_ga8_bf16 ← lw.LinearWeight { kind = variant lw.LinearWeightKind.GroupAffineU8, out_features = 1, in_features = 4, bits = 4, group_size = 2, packed_cols = 2, group_cols = 2, has_bias = false, scales_dtype = "BF16" }
+        let list<bf16> bf_s ← [(0.5 ∷ f32) ↦ bf16, (2.0 ∷ f32) ↦ bf16]
+        let list<bf16> bf_b ← [(-1.0 ∷ f32) ↦ bf16, (0.25 ∷ f32) ↦ bf16]
+        let list<f32> y32 ← lw.linear_matvec(lw_ga32_bf16, variant lw.WeightPayload.GroupAffineU32Bf16Payload { weight = [0x04030201 ∷ u32], scales = bf_s, biases = bf_b, bias = no_bias }, x4)
+        let list<f32> y8 ← lw.linear_matvec(lw_ga8_bf16, variant lw.WeightPayload.GroupAffineU8Bf16Payload { weight = [0x21 ∷ u8, 0x43 ∷ u8], scales = bf_s, biases = bf_b, bias = no_bias }, x4)
+        assert close(y32[0], 16.125)
+        assert close(y8[0], 16.125)
+
+        # BlockFp8 host eval (UE8M0 U8, F32 U8, unscaled U8, UE8M0 U32)
+        let lw.LinearWeight lw_bf8_u8 ← lw.LinearWeight { kind = variant lw.LinearWeightKind.BlockFp8U8, out_features = 1, in_features = 4, bits = 8, group_size = 2, packed_cols = 4, group_cols = 2, has_bias = false, block_rows = 1, block_cols = 2, scales_dtype = "U8" }
+        let lw.LinearWeight lw_bf8_f32 ← lw.LinearWeight { kind = variant lw.LinearWeightKind.BlockFp8U8, out_features = 1, in_features = 4, bits = 8, group_size = 2, packed_cols = 4, group_cols = 2, has_bias = false, block_rows = 1, block_cols = 2, scales_dtype = "F32" }
+        let lw.LinearWeight lw_bf8_none ← lw.LinearWeight { kind = variant lw.LinearWeightKind.BlockFp8U8, out_features = 1, in_features = 4, bits = 8, group_size = 4, packed_cols = 4, group_cols = 1, has_bias = false, block_rows = 1, block_cols = 4, scales_dtype = "NONE" }
+        let lw.LinearWeight lw_bf8_u32 ← lw.LinearWeight { kind = variant lw.LinearWeightKind.BlockFp8U32, out_features = 1, in_features = 4, bits = 8, group_size = 2, packed_cols = 1, group_cols = 2, has_bias = false, block_rows = 1, block_cols = 2, scales_dtype = "U8" }
+
+        let list<u8> w8_fp8 ← [0x38 ∷ u8, 0x40 ∷ u8, 0x3c ∷ u8, 0x00 ∷ u8]
+        let list<f32> y_f8_u8 ← lw.linear_matvec(lw_bf8_u8, variant lw.WeightPayload.BlockFp8U8Payload { weight = w8_fp8, scales = [127 ∷ u8, 128 ∷ u8], f32_scales = [], bias = no_bias }, x4)
+        let list<f32> y_f8_f32 ← lw.linear_matvec(lw_bf8_f32, variant lw.WeightPayload.BlockFp8U8Payload { weight = w8_fp8, scales = [], f32_scales = [1.0, 2.0], bias = no_bias }, x4)
+        let list<f32> y_f8_none ← lw.linear_matvec(lw_bf8_none, variant lw.WeightPayload.BlockFp8U8Payload { weight = w8_fp8, scales = [], f32_scales = [], bias = no_bias }, x4)
+        let list<f32> y_f8_u32 ← lw.linear_matvec(lw_bf8_u32, variant lw.WeightPayload.BlockFp8U32Payload { weight = [0x003c4038 ∷ u32], scales = [127 ∷ u8, 128 ∷ u8], f32_scales = [], bias = no_bias }, x4)
+        assert close(y_f8_u8[0], 5.0)
+        assert close(y_f8_f32[0], 5.0)
+        assert close(y_f8_none[0], 2.0)
+        assert close(y_f8_u32[0], 5.0)
+
+        # DualScaledFp4 host eval (U8 and U32)
+        let lw.LinearWeight lw_fp4_u8 ← lw.LinearWeight { kind = variant lw.LinearWeightKind.DualScaledFp4U8, out_features = 1, in_features = 4, bits = 4, group_size = 2, packed_cols = 2, group_cols = 2, has_bias = false }
+        let lw.LinearWeight lw_fp4_u32 ← lw.LinearWeight { kind = variant lw.LinearWeightKind.DualScaledFp4U32, out_features = 1, in_features = 8, bits = 4, group_size = 4, packed_cols = 1, group_cols = 2, has_bias = false }
+        let list<f32> y_p4_u8 ← lw.linear_matvec(lw_fp4_u8, variant lw.WeightPayload.DualScaledFp4U8Payload { weight = [0x22 ∷ u8, 0x44 ∷ u8], scales = [0x38 ∷ u8, 0x40 ∷ u8], global_scale = 0.5 ∷ f32, bias = no_bias }, x4)
+        let list<f32> y_p4_u32 ← lw.linear_matvec(lw_fp4_u32, variant lw.WeightPayload.DualScaledFp4U32Payload { weight = [0x00004422 ∷ u32], scales = [0x38 ∷ u8, 0x38 ∷ u8], global_scale = 0.5 ∷ f32, bias = no_bias }, x8)
+        assert close(y_p4_u8[0], 5.0)
+        assert close(y_p4_u32[0], 2.5)
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "LinearWeight binds ModelOpt amax + outer_scale_denominator explicitly and rejects invalid RowPrefix" {
+    let artifact.ContentIdentity bb_id ← id_with("f", 4096)
+    let bundle.ModelBundle b ← mk_unindexed([bb_id])
+    let capsule.SafetensorsManifest m ← st_manifest(4096, 1024, [
+        st_desc("model.layers.0.mlp.gate_proj.weight", "U8", [8, 16], 0, 128, 128),
+        st_desc("model.layers.0.mlp.gate_proj.scales", "F8_E4M3", [8, 2], 128, 144, 16),
+        st_desc("model.layers.0.mlp.gate_proj._amax", "F32", [], 144, 148, 1),
+        st_desc("model.layers.0.mlp.gate_proj._outer_scale_denominator", "F32", [1], 148, 152, 1),
+        st_desc("model.layers.0.mlp.up_proj.weight", "BF16", [10, 4], 152, 232, 40)
+    ])
+
+    let td.TensorDirectory ∪ none bad_dir ← build_dir_with_views(b, m, [
+        td.ViewSpec { role = variant bundle.MemberRole.Backbone, canonical_name = "model.layers.0.mlp.up_proj.weight", view = variant td.LoadView.RowPrefix { rows = 12 } }
+    ])
+    assert bad_dir is td.TensorDirectory
+    if bad_dir is td.TensorDirectory {
+      mut bool rejected ← false
+      do {
+        let lw.LinearWeight ignored ← lw.bind(bad_dir, variant bundle.MemberRole.Backbone, "model.layers.0.mlp.up_proj")
+      }
+      catch err {
+        rejected ← true
+      }
+      assert rejected
+    }
+
+    let td.TensorDirectory ∪ none ok_dir ← build_dir(b, m)
+    assert ok_dir is td.TensorDirectory
+    if ok_dir is td.TensorDirectory {
+      do {
+        let lw.LinearWeight w ← lw.bind(ok_dir, variant bundle.MemberRole.Backbone, "model.layers.0.mlp.gate_proj")
+        assert w.kind ≡ variant lw.LinearWeightKind.DualScaledFp4U8
+        assert w.is_modelopt ≡ true
+        assert w.out_features ≡ 8
+        assert w.in_features ≡ 32
+        assert w.group_size ≡ 16
+      }
+      catch err {
+        assert false
+      }
+    }
 }

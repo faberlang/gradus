@@ -38,6 +38,12 @@ union PackKind {
 }
 
 @ public
+union ScaleDtype {
+    ScaleF32,
+    ScaleBf16
+}
+
+@ public
 class GroupAffineSpec {
     let int out_features
     let int in_features
@@ -46,10 +52,11 @@ class GroupAffineSpec {
     let PackKind pack
     let int packed_cols
     let int group_cols
+    let ScaleDtype scale_dtype
 }
 
 @ public
-fn admit_spec(int out_features, int in_features, int bits, int group_size, PackKind pack) → GroupAffineSpec ⇥ GroupAffineError {
+fn admit_spec_with_scale(int out_features, int in_features, int bits, int group_size, PackKind pack, ScaleDtype scale_dtype) → GroupAffineSpec ⇥ GroupAffineError {
     require out_features ≥ 1 throw variant BadShape { message = "out_features must be at least 1" }
 
     require in_features ≥ 1 throw variant BadShape { message = "in_features must be at least 1" }
@@ -79,7 +86,12 @@ fn admit_spec(int out_features, int in_features, int bits, int group_size, PackK
 
     let int packed_cols ← total_bits / pack_width
     let int group_cols ← in_features / group_size
-    return GroupAffineSpec { out_features = out_features, in_features = in_features, bits = bits, group_size = group_size, pack = pack, packed_cols = packed_cols, group_cols = group_cols }
+    return GroupAffineSpec { out_features = out_features, in_features = in_features, bits = bits, group_size = group_size, pack = pack, packed_cols = packed_cols, group_cols = group_cols, scale_dtype = scale_dtype }
+}
+
+@ public
+fn admit_spec(int out_features, int in_features, int bits, int group_size, PackKind pack) → GroupAffineSpec ⇥ GroupAffineError {
+    return admit_spec_with_scale(out_features, in_features, bits, group_size, pack, variant ScaleDtype.ScaleF32)
 }
 
 # -------------------------------------------------------------------------
@@ -121,8 +133,17 @@ fn unpack_u8_q(list<u8> row_bytes, int j, int bits) → int {
     return (b ⇒ shift) % 16
 }
 
-@ public
-fn ref_dequantize_u32(GroupAffineSpec spec, list<u32> weight, list<f32> scales, list<f32> biases) → list<f32> ⇥ GroupAffineError {
+fn bf16_list_to_f32(list<bf16> items) → list<f32> {
+    mut list<f32> out ← empty
+
+    for from items let v {
+        out.append(v ↦ f32)
+    }
+
+    return out
+}
+
+fn dequantize_u32_with_f32_scales(GroupAffineSpec spec, list<u32> weight, list<f32> scales, list<f32> biases) → list<f32> ⇥ GroupAffineError {
     match spec.pack {
         case PackU32 {
             pass
@@ -162,8 +183,7 @@ fn ref_dequantize_u32(GroupAffineSpec spec, list<u32> weight, list<f32> scales, 
     return out
 }
 
-@ public
-fn ref_dequantize_u8(GroupAffineSpec spec, list<u8> weight, list<f32> scales, list<f32> biases) → list<f32> ⇥ GroupAffineError {
+fn dequantize_u8_with_f32_scales(GroupAffineSpec spec, list<u8> weight, list<f32> scales, list<f32> biases) → list<f32> ⇥ GroupAffineError {
     match spec.pack {
         case PackU8 {
             pass
@@ -201,6 +221,26 @@ fn ref_dequantize_u8(GroupAffineSpec spec, list<u8> weight, list<f32> scales, li
     }
 
     return out
+}
+
+@ public
+fn ref_dequantize_u32(GroupAffineSpec spec, list<u32> weight, list<f32> scales, list<f32> biases) → list<f32> ⇥ GroupAffineError {
+    return dequantize_u32_with_f32_scales(spec, weight, scales, biases)
+}
+
+@ public
+fn ref_dequantize_u32_bf16(GroupAffineSpec spec, list<u32> weight, list<bf16> scales, list<bf16> biases) → list<f32> ⇥ GroupAffineError {
+    return dequantize_u32_with_f32_scales(spec, weight, bf16_list_to_f32(scales), bf16_list_to_f32(biases))
+}
+
+@ public
+fn ref_dequantize_u8(GroupAffineSpec spec, list<u8> weight, list<f32> scales, list<f32> biases) → list<f32> ⇥ GroupAffineError {
+    return dequantize_u8_with_f32_scales(spec, weight, scales, biases)
+}
+
+@ public
+fn ref_dequantize_u8_bf16(GroupAffineSpec spec, list<u8> weight, list<bf16> scales, list<bf16> biases) → list<f32> ⇥ GroupAffineError {
+    return dequantize_u8_with_f32_scales(spec, weight, bf16_list_to_f32(scales), bf16_list_to_f32(biases))
 }
 
 @ public
@@ -569,6 +609,318 @@ kernel linear_matmul_u8<size B, size Out, size PackedIn, size Groups, size In>(t
     }
 }
 
+@ public
+kernel linear_matvec_u32_bf16<size Out, size PackedIn, size Groups, size In>(tensor<u32, [Out, PackedIn]> weight, tensor<bf16, [Out, Groups]> scales, tensor<bf16, [Out, Groups]> biases, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, i32 bits, i32 group_size) → void {
+    for from y at [row] thread lane let e {
+        if group_size ≥ 1 and group_size ≤ 4096 and bits ≥ 4 and bits ≤ 8 {
+            mut f32 acc ← 0.0 ∷ f32
+
+            for exclusive In let j {
+                let i32 g ← j / group_size
+                let f32 s ← scales[[row, g]] ↦ f32
+                let f32 b ← biases[[row, g]] ↦ f32
+                let i64 bit_pos ← j * bits
+                let i64 word_idx ← bit_pos / 32
+                let i64 shift ← bit_pos % 32
+                let u32 w0 ← weight[[row, word_idx]]
+                mut u32 q ← 0 ∷ u32
+
+                if bits ≡ 8 {
+                    if shift ≡ 0 {
+                        q ← w0 ∧ (255 ∷ u32)
+                    }
+                    elif shift ≡ 8 {
+                        q ← (w0 ⇒ (8 ∷ u32)) ∧ (255 ∷ u32)
+                    }
+                    elif shift ≡ 16 {
+                        q ← (w0 ⇒ (16 ∷ u32)) ∧ (255 ∷ u32)
+                    }
+                    else {
+                        q ← (w0 ⇒ (24 ∷ u32)) ∧ (255 ∷ u32)
+                    }
+                }
+                elif bits ≡ 4 {
+                    if shift ≡ 0 {
+                        q ← w0 ∧ (15 ∷ u32)
+                    }
+                    elif shift ≡ 4 {
+                        q ← (w0 ⇒ (4 ∷ u32)) ∧ (15 ∷ u32)
+                    }
+                    elif shift ≡ 8 {
+                        q ← (w0 ⇒ (8 ∷ u32)) ∧ (15 ∷ u32)
+                    }
+                    elif shift ≡ 12 {
+                        q ← (w0 ⇒ (12 ∷ u32)) ∧ (15 ∷ u32)
+                    }
+                    elif shift ≡ 16 {
+                        q ← (w0 ⇒ (16 ∷ u32)) ∧ (15 ∷ u32)
+                    }
+                    elif shift ≡ 20 {
+                        q ← (w0 ⇒ (20 ∷ u32)) ∧ (15 ∷ u32)
+                    }
+                    elif shift ≡ 24 {
+                        q ← (w0 ⇒ (24 ∷ u32)) ∧ (15 ∷ u32)
+                    }
+                    else {
+                        q ← (w0 ⇒ (28 ∷ u32)) ∧ (15 ∷ u32)
+                    }
+                }
+                else {
+                    if shift ≡ 0 {
+                        q ← w0 ∧ (63 ∷ u32)
+                    }
+                    elif shift ≡ 2 {
+                        q ← (w0 ⇒ (2 ∷ u32)) ∧ (63 ∷ u32)
+                    }
+                    elif shift ≡ 4 {
+                        q ← (w0 ⇒ (4 ∷ u32)) ∧ (63 ∷ u32)
+                    }
+                    elif shift ≡ 6 {
+                        q ← (w0 ⇒ (6 ∷ u32)) ∧ (63 ∷ u32)
+                    }
+                    elif shift ≡ 8 {
+                        q ← (w0 ⇒ (8 ∷ u32)) ∧ (63 ∷ u32)
+                    }
+                    elif shift ≡ 10 {
+                        q ← (w0 ⇒ (10 ∷ u32)) ∧ (63 ∷ u32)
+                    }
+                    elif shift ≡ 12 {
+                        q ← (w0 ⇒ (12 ∷ u32)) ∧ (63 ∷ u32)
+                    }
+                    elif shift ≡ 14 {
+                        q ← (w0 ⇒ (14 ∷ u32)) ∧ (63 ∷ u32)
+                    }
+                    elif shift ≡ 16 {
+                        q ← (w0 ⇒ (16 ∷ u32)) ∧ (63 ∷ u32)
+                    }
+                    elif shift ≡ 18 {
+                        q ← (w0 ⇒ (18 ∷ u32)) ∧ (63 ∷ u32)
+                    }
+                    elif shift ≡ 20 {
+                        q ← (w0 ⇒ (20 ∷ u32)) ∧ (63 ∷ u32)
+                    }
+                    elif shift ≡ 22 {
+                        q ← (w0 ⇒ (22 ∷ u32)) ∧ (63 ∷ u32)
+                    }
+                    elif shift ≡ 24 {
+                        q ← (w0 ⇒ (24 ∷ u32)) ∧ (63 ∷ u32)
+                    }
+                    elif shift ≡ 26 {
+                        q ← (w0 ⇒ (26 ∷ u32)) ∧ (63 ∷ u32)
+                    }
+                    elif shift ≡ 28 {
+                        let u32 w1 ← weight[[row, word_idx + 1]]
+                        let u32 lo ← w0 ⇒ (28 ∷ u32)
+                        let u32 hi ← (w1 ∧ (3 ∷ u32)) * (16 ∷ u32)
+                        q ← lo + hi
+                    }
+                    else {
+                        let u32 w1 ← weight[[row, word_idx + 1]]
+                        let u32 lo ← w0 ⇒ (30 ∷ u32)
+                        let u32 hi ← (w1 ∧ (15 ∷ u32)) * (4 ∷ u32)
+                        q ← lo + hi
+                    }
+                }
+
+                let f32 w ← (q ↦ f32) * s + b
+                acc ← acc + w * x[[j]]
+            }
+
+            y[[row]] ← acc
+        }
+    }
+}
+
+@ public
+kernel linear_matvec_u8_bf16<size Out, size PackedIn, size Groups, size In>(tensor<u8, [Out, PackedIn]> weight, tensor<bf16, [Out, Groups]> scales, tensor<bf16, [Out, Groups]> biases, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, i32 bits, i32 group_size) → void {
+    for from y at [row] thread lane let e {
+        if group_size ≥ 1 and group_size ≤ 4096 {
+            mut f32 acc ← 0.0 ∷ f32
+
+            for exclusive In let j {
+                let i32 g ← j / group_size
+                let f32 s ← scales[[row, g]] ↦ f32
+                let f32 b ← biases[[row, g]] ↦ f32
+                mut u8 q ← 0 ∷ u8
+
+                if bits ≡ 8 {
+                    q ← weight[[row, j]]
+                }
+                else {
+                    let u8 packed ← weight[[row, j / 2]]
+                    if j % 2 ≡ 0 {
+                        q ← packed ∧ (15 ∷ u8)
+                    }
+                    else {
+                        q ← (packed ⇒ (4 ∷ u8)) ∧ (15 ∷ u8)
+                    }
+                }
+
+                let f32 w ← (q ↦ f32) * s + b
+                acc ← acc + w * x[[j]]
+            }
+
+            y[[row]] ← acc
+        }
+    }
+}
+
+@ public
+kernel linear_matmul_u32_bf16<size B, size Out, size PackedIn, size Groups, size In>(tensor<u32, [Out, PackedIn]> weight, tensor<bf16, [Out, Groups]> scales, tensor<bf16, [Out, Groups]> biases, tensor<f32, [B, In]> x, mut tensor<f32, [B, Out]> y, i32 bits, i32 group_size) → void {
+    for from y at [b_idx, row] thread lane let e {
+        if group_size ≥ 1 and group_size ≤ 4096 and bits ≥ 4 and bits ≤ 8 {
+            mut f32 acc ← 0.0 ∷ f32
+
+            for exclusive In let j {
+                let i32 g ← j / group_size
+                let f32 s ← scales[[row, g]] ↦ f32
+                let f32 b ← biases[[row, g]] ↦ f32
+                let i64 bit_pos ← j * bits
+                let i64 word_idx ← bit_pos / 32
+                let i64 shift ← bit_pos % 32
+                let u32 w0 ← weight[[row, word_idx]]
+                mut u32 q ← 0 ∷ u32
+
+                if bits ≡ 8 {
+                    if shift ≡ 0 {
+                        q ← w0 ∧ (255 ∷ u32)
+                    }
+                    elif shift ≡ 8 {
+                        q ← (w0 ⇒ (8 ∷ u32)) ∧ (255 ∷ u32)
+                    }
+                    elif shift ≡ 16 {
+                        q ← (w0 ⇒ (16 ∷ u32)) ∧ (255 ∷ u32)
+                    }
+                    else {
+                        q ← (w0 ⇒ (24 ∷ u32)) ∧ (255 ∷ u32)
+                    }
+                }
+                elif bits ≡ 4 {
+                    if shift ≡ 0 {
+                        q ← w0 ∧ (15 ∷ u32)
+                    }
+                    elif shift ≡ 4 {
+                        q ← (w0 ⇒ (4 ∷ u32)) ∧ (15 ∷ u32)
+                    }
+                    elif shift ≡ 8 {
+                        q ← (w0 ⇒ (8 ∷ u32)) ∧ (15 ∷ u32)
+                    }
+                    elif shift ≡ 12 {
+                        q ← (w0 ⇒ (12 ∷ u32)) ∧ (15 ∷ u32)
+                    }
+                    elif shift ≡ 16 {
+                        q ← (w0 ⇒ (16 ∷ u32)) ∧ (15 ∷ u32)
+                    }
+                    elif shift ≡ 20 {
+                        q ← (w0 ⇒ (20 ∷ u32)) ∧ (15 ∷ u32)
+                    }
+                    elif shift ≡ 24 {
+                        q ← (w0 ⇒ (24 ∷ u32)) ∧ (15 ∷ u32)
+                    }
+                    else {
+                        q ← (w0 ⇒ (28 ∷ u32)) ∧ (15 ∷ u32)
+                    }
+                }
+                else {
+                    if shift ≡ 0 {
+                        q ← w0 ∧ (63 ∷ u32)
+                    }
+                    elif shift ≡ 2 {
+                        q ← (w0 ⇒ (2 ∷ u32)) ∧ (63 ∷ u32)
+                    }
+                    elif shift ≡ 4 {
+                        q ← (w0 ⇒ (4 ∷ u32)) ∧ (63 ∷ u32)
+                    }
+                    elif shift ≡ 6 {
+                        q ← (w0 ⇒ (6 ∷ u32)) ∧ (63 ∷ u32)
+                    }
+                    elif shift ≡ 8 {
+                        q ← (w0 ⇒ (8 ∷ u32)) ∧ (63 ∷ u32)
+                    }
+                    elif shift ≡ 10 {
+                        q ← (w0 ⇒ (10 ∷ u32)) ∧ (63 ∷ u32)
+                    }
+                    elif shift ≡ 12 {
+                        q ← (w0 ⇒ (12 ∷ u32)) ∧ (63 ∷ u32)
+                    }
+                    elif shift ≡ 14 {
+                        q ← (w0 ⇒ (14 ∷ u32)) ∧ (63 ∷ u32)
+                    }
+                    elif shift ≡ 16 {
+                        q ← (w0 ⇒ (16 ∷ u32)) ∧ (63 ∷ u32)
+                    }
+                    elif shift ≡ 18 {
+                        q ← (w0 ⇒ (18 ∷ u32)) ∧ (63 ∷ u32)
+                    }
+                    elif shift ≡ 20 {
+                        q ← (w0 ⇒ (20 ∷ u32)) ∧ (63 ∷ u32)
+                    }
+                    elif shift ≡ 22 {
+                        q ← (w0 ⇒ (22 ∷ u32)) ∧ (63 ∷ u32)
+                    }
+                    elif shift ≡ 24 {
+                        q ← (w0 ⇒ (24 ∷ u32)) ∧ (63 ∷ u32)
+                    }
+                    elif shift ≡ 26 {
+                        q ← (w0 ⇒ (26 ∷ u32)) ∧ (63 ∷ u32)
+                    }
+                    elif shift ≡ 28 {
+                        let u32 w1 ← weight[[row, word_idx + 1]]
+                        let u32 lo ← w0 ⇒ (28 ∷ u32)
+                        let u32 hi ← (w1 ∧ (3 ∷ u32)) * (16 ∷ u32)
+                        q ← lo + hi
+                    }
+                    else {
+                        let u32 w1 ← weight[[row, word_idx + 1]]
+                        let u32 lo ← w0 ⇒ (30 ∷ u32)
+                        let u32 hi ← (w1 ∧ (15 ∷ u32)) * (4 ∷ u32)
+                        q ← lo + hi
+                    }
+                }
+
+                let f32 w ← (q ↦ f32) * s + b
+                acc ← acc + w * x[[b_idx, j]]
+            }
+
+            y[[b_idx, row]] ← acc
+        }
+    }
+}
+
+@ public
+kernel linear_matmul_u8_bf16<size B, size Out, size PackedIn, size Groups, size In>(tensor<u8, [Out, PackedIn]> weight, tensor<bf16, [Out, Groups]> scales, tensor<bf16, [Out, Groups]> biases, tensor<f32, [B, In]> x, mut tensor<f32, [B, Out]> y, i32 bits, i32 group_size) → void {
+    for from y at [b_idx, row] thread lane let e {
+        if group_size ≥ 1 and group_size ≤ 4096 {
+            mut f32 acc ← 0.0 ∷ f32
+
+            for exclusive In let j {
+                let i32 g ← j / group_size
+                let f32 s ← scales[[row, g]] ↦ f32
+                let f32 b ← biases[[row, g]] ↦ f32
+                mut u8 q ← 0 ∷ u8
+
+                if bits ≡ 8 {
+                    q ← weight[[row, j]]
+                }
+                else {
+                    let u8 packed ← weight[[row, j / 2]]
+                    if j % 2 ≡ 0 {
+                        q ← packed ∧ (15 ∷ u8)
+                    }
+                    else {
+                        q ← (packed ⇒ (4 ∷ u8)) ∧ (15 ∷ u8)
+                    }
+                }
+
+                let f32 w ← (q ↦ f32) * s + b
+                acc ← acc + w * x[[b_idx, j]]
+            }
+
+            y[[b_idx, row]] ← acc
+        }
+    }
+}
+
 +++ faber test
 import from "gradus:quant/group_affine" ga
 
@@ -875,4 +1227,93 @@ test "GroupAffine kernels handle rows above 65536 without aliasing" {
     assert close(y_mm_u8[[0, 65537]], 20.0 ∷ f32)
     assert close(y_mm_u8[[1, 1]], 4.0 ∷ f32)
     assert close(y_mm_u8[[1, 65537]], 40.0 ∷ f32)
+
+    mut tensor<bf16, [65540, 1]> scales_bf16 ← tbf16[65540, 1] {}
+    scales_bf16[[1, 0]] ← (1.0 ∷ f32) ↦ bf16
+    scales_bf16[[65537, 0]] ← (2.0 ∷ f32) ↦ bf16
+
+    mut tensor<bf16, [65540, 1]> biases_bf16 ← tbf16[65540, 1] {}
+    biases_bf16[[1, 0]] ← (0.0 ∷ f32) ↦ bf16
+    biases_bf16[[65537, 0]] ← (1.0 ∷ f32) ↦ bf16
+
+    mut tensor<f32, [65540]> y_mv_u32_bf16 ← tf32[65540] {}
+    mut tensor<f32, [65540]> y_mv_u8_bf16 ← tf32[65540] {}
+    mut tensor<f32, [2, 65540]> y_mm_u32_bf16 ← tf32[2, 65540] {}
+    mut tensor<f32, [2, 65540]> y_mm_u8_bf16 ← tf32[2, 65540] {}
+
+    ga.linear_matvec_u32_bf16(w_u32, scales_bf16, biases_bf16, x_vec, mut y_mv_u32_bf16, 4, 4)
+    ga.linear_matvec_u8_bf16(w_u8, scales_bf16, biases_bf16, x_vec, mut y_mv_u8_bf16, 4, 4)
+    ga.linear_matmul_u32_bf16(w_u32, scales_bf16, biases_bf16, x_mat, mut y_mm_u32_bf16, 4, 4)
+    ga.linear_matmul_u8_bf16(w_u8, scales_bf16, biases_bf16, x_mat, mut y_mm_u8_bf16, 4, 4)
+
+    assert close(y_mv_u32_bf16[[0]], 0.0 ∷ f32)
+    assert close(y_mv_u32_bf16[[1]], 2.0 ∷ f32)
+    assert close(y_mv_u32_bf16[[65537]], 20.0 ∷ f32)
+
+    assert close(y_mv_u8_bf16[[0]], 0.0 ∷ f32)
+    assert close(y_mv_u8_bf16[[1]], 2.0 ∷ f32)
+    assert close(y_mv_u8_bf16[[65537]], 20.0 ∷ f32)
+
+    assert close(y_mm_u32_bf16[[0, 1]], 2.0 ∷ f32)
+    assert close(y_mm_u32_bf16[[0, 65537]], 20.0 ∷ f32)
+    assert close(y_mm_u32_bf16[[1, 1]], 4.0 ∷ f32)
+    assert close(y_mm_u32_bf16[[1, 65537]], 40.0 ∷ f32)
+
+    assert close(y_mm_u8_bf16[[0, 1]], 2.0 ∷ f32)
+    assert close(y_mm_u8_bf16[[0, 65537]], 20.0 ∷ f32)
+    assert close(y_mm_u8_bf16[[1, 1]], 4.0 ∷ f32)
+    assert close(y_mm_u8_bf16[[1, 65537]], 40.0 ∷ f32)
+}
+
+test "GroupAffine native bf16 scales and biases ref decode and matmul match" {
+    let list<bf16> s_u32_bf16 ← [(0.5 ∷ f32) ↦ bf16, (2.0 ∷ f32) ↦ bf16, (0.25 ∷ f32) ↦ bf16, (-0.5 ∷ f32) ↦ bf16]
+    let list<bf16> b_u32_bf16 ← [(-1.0 ∷ f32) ↦ bf16, (0.25 ∷ f32) ↦ bf16, (0.0 ∷ f32) ↦ bf16, (1.0 ∷ f32) ↦ bf16]
+    let list<u32> w_u32 ← [0x04030201 ∷ u32, 0x08070605 ∷ u32, 0x1e140a00 ∷ u32, 0x014080ff ∷ u32]
+    let list<f32> s_u32_f32 ← [0.5, 2.0, 0.25, -0.5]
+    let list<f32> b_u32_f32 ← [-1.0, 0.25, 0.0, 1.0]
+    let list<f32> x_u32 ← [1.0, -2.0, 0.5, 4.0, -1.0, 2.0, -0.5, 3.0, 0.5, 1.0, -1.0, 2.0, 0.25, -0.5, 1.5, -1.0]
+
+    let list<u8> w_u8 ← [0x21 ∷ u8, 0x43 ∷ u8, 0xf0 ∷ u8, 0x7a ∷ u8]
+    let list<bf16> s_u8_bf16 ← [(0.5 ∷ f32) ↦ bf16, (-0.25 ∷ f32) ↦ bf16]
+    let list<bf16> b_u8_bf16 ← [(-1.5 ∷ f32) ↦ bf16, (2.0 ∷ f32) ↦ bf16]
+    let list<f32> s_u8_f32 ← [0.5, -0.25]
+    let list<f32> b_u8_f32 ← [-1.5, 2.0]
+    let list<f32> x_u8 ← [1.0, -2.0, 0.5, 4.0, -1.0, 0.5, 2.0, -3.0]
+
+    do {
+        let ga.GroupAffineSpec spec_u32 ← ga.admit_spec_with_scale(2, 8, 8, 4, variant ga.PackKind.PackU32, variant ga.ScaleDtype.ScaleBf16)
+        match spec_u32.scale_dtype {
+            case ScaleBf16 {
+                pass
+            }
+            default {
+                assert false
+            }
+        }
+        let list<f32> w_bf16 ← ga.ref_dequantize_u32_bf16(spec_u32, w_u32, s_u32_bf16, b_u32_bf16)
+        let list<f32> w_f32 ← ga.ref_dequantize_u32(spec_u32, w_u32, s_u32_f32, b_u32_f32)
+        for exclusive w_bf16.length() let i {
+            assert close(w_bf16[i], w_f32[i])
+        }
+        let list<f32> y_bf16 ← ga.ref_matmul(2, 2, 8, w_bf16, x_u32)
+        let list<f32> y_f32 ← ga.ref_matmul(2, 2, 8, w_f32, x_u32)
+        for exclusive y_bf16.length() let i {
+            assert close(y_bf16[i], y_f32[i])
+        }
+
+        let ga.GroupAffineSpec spec_u8 ← ga.admit_spec_with_scale(2, 4, 4, 4, variant ga.PackKind.PackU8, variant ga.ScaleDtype.ScaleBf16)
+        let list<f32> wu8_bf16 ← ga.ref_dequantize_u8_bf16(spec_u8, w_u8, s_u8_bf16, b_u8_bf16)
+        let list<f32> wu8_f32 ← ga.ref_dequantize_u8(spec_u8, w_u8, s_u8_f32, b_u8_f32)
+        for exclusive wu8_bf16.length() let i {
+            assert close(wu8_bf16[i], wu8_f32[i])
+        }
+        let list<f32> yu8_bf16 ← ga.ref_matmul(2, 2, 4, wu8_bf16, x_u8)
+        let list<f32> yu8_f32 ← ga.ref_matmul(2, 2, 4, wu8_f32, x_u8)
+        for exclusive yu8_bf16.length() let i {
+            assert close(yu8_bf16[i], yu8_f32[i])
+        }
+    }
+    catch err {
+        assert false
+    }
 }
