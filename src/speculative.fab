@@ -55,8 +55,10 @@ locale = "en"
 
 import from "gradus:generation/config" let generation
 
-# The sole admitted candidate source for this campaign.
+# Admitted candidate sources.
 const string SOURCE_CONTEXT_LOOKUP = "context_lookup"
+const string SOURCE_FEATURE_TAPPED = "feature_tapped"
+const string SOURCE_STANDALONE_DRAFT = "standalone_draft"
 
 # -------------------------------------------------------------------------
 # SpeculativeError — typed vocabulary of the candidate-provider seam.
@@ -160,7 +162,9 @@ fn admission_kind(AdmissionResult a) → string {
 # the dense baseline, and establish branch creation only after that proof.
 @ public
 fn admit_greedy(generation.AccelerationPolicy policy, generation.GenerationConfig g) → AdmissionResult ⇥ SpeculativeError {
-    require generation.acceleration_mode_name(policy.mode) ≡ "context_lookup" throw variant PolicyDisabled { message = "acceleration policy is disabled" }
+    let string mode_name ← generation.acceleration_mode_name(policy.mode)
+
+    require mode_name ≢ "disabled" throw variant PolicyDisabled { message = "acceleration policy is disabled" }
 
     require generation.acceleration_equal(policy, g.acceleration) throw variant PolicyMismatch { message = "acceleration policy does not match generation config" }
 
@@ -282,9 +286,8 @@ fn observe_block(AdaptiveBudget b, int drafted, int accepted) → AdaptiveBudget
 # MTP drafter (feature-tapped DSpark/DFlash, standalone NextN) additionally
 # reads the target tap buffer (the last accepted hidden state), the shared
 # backbone views (arena slot references into the target backbone), and its
-# own session state (the drafter's arena slot map); those fields stay
-# empty until the feature-tap seam lands, and no provider may read them
-# today.
+# own session state (the drafter's arena slot map); coupled MTP providers
+# read these fields when non-empty while PLD keeps them empty.
 @ public
 class DrafterContext {
     mut list<int> token_history
@@ -423,6 +426,20 @@ fn context_lookup_source() → string {
 }
 
 @ public
+fn feature_tapped_source() → string {
+    return SOURCE_FEATURE_TAPPED
+}
+
+@ public
+fn standalone_draft_source() → string {
+    return SOURCE_STANDALONE_DRAFT
+}
+
+fn is_admitted_source(string source) → bool {
+    return source ≡ SOURCE_CONTEXT_LOOKUP or source ≡ SOURCE_FEATURE_TAPPED or source ≡ SOURCE_STANDALONE_DRAFT
+}
+
+@ public
 fn provenance_equal(CandidateProvenance a, CandidateProvenance b) → bool {
     if a.source ≢ b.source then return false
 
@@ -435,7 +452,7 @@ fn provenance_equal(CandidateProvenance a, CandidateProvenance b) → bool {
 
 @ public
 fn construct_provenance(string source, int source_offset, int match_length) → CandidateProvenance ⇥ SpeculativeError {
-    require source ≡ SOURCE_CONTEXT_LOOKUP throw variant InvalidProvenance { message = "unknown candidate source" }
+    require is_admitted_source(source) throw variant InvalidProvenance { message = "unknown candidate source" }
 
     require source_offset ≥ 0 throw variant InvalidProvenance { message = "source offset must be non-negative" }
 
@@ -546,7 +563,7 @@ fn construct_candidates(ProviderRequest request, list<int> ids, CandidateProvena
         require t ≥ 0 throw variant MalformedResult { message = "candidate token id must be non-negative" }
     }
 
-    require provenance.source ≡ SOURCE_CONTEXT_LOOKUP throw variant InvalidProvenance { message = "unknown candidate source" }
+    require is_admitted_source(provenance.source) throw variant InvalidProvenance { message = "unknown candidate source" }
 
     return variant Candidates { ids = ids, provenance = provenance }
 }
@@ -563,8 +580,8 @@ fn construct_candidates(ProviderRequest request, list<int> ids, CandidateProvena
 #     through typed SpeculativeError.
 #   * a ProviderResult is candidate ids + provenance, or a typed
 #     no-draft (no-candidate); empty lookup is not an error.
-#   * provenance admits only the context_lookup source; unknown source,
-#     negative offset, and zero match length reject.
+#   * provenance admits context_lookup, feature_tapped, and standalone_draft
+#     sources; unknown source, negative offset, and zero match length reject.
 #   * the greedy oracle returns the accepted prefix and first divergence,
 #     with -1 denoting no divergence.
 #   * the enabled-policy admission gate admits only greedy configs and
@@ -760,6 +777,22 @@ describe "SD0-U3 — candidate-provider seam" {
         assert provenance_detail(speculative.context_lookup_source(), -1, 2) ≡ "source offset must be non-negative"
         assert provenance_detail(speculative.context_lookup_source(), 0, 0) ≡ "match length must be at least one"
     }
+    test "coupled MTP provenance sources (feature_tapped and standalone_draft) are admitted" {
+        let _ trap_result_mtp_prov ← trap {
+            let speculative.ProviderRequest req ← request_p()
+            let speculative.CandidateProvenance ft ← speculative.construct_provenance(speculative.feature_tapped_source(), 0, 1)
+            let speculative.ProviderResult r_ft ← speculative.construct_candidates(req, [21, 22], ft)
+            assert speculative.candidate_provenance(r_ft).source ≡ "feature_tapped"
+
+            let speculative.CandidateProvenance sd ← speculative.construct_provenance(speculative.standalone_draft_source(), 1, 1)
+            let speculative.ProviderResult r_sd ← speculative.construct_candidates(req, [23], sd)
+            assert speculative.candidate_provenance(r_sd).source ≡ "standalone_draft"
+        }
+        match trap_result_mtp_prov {
+            case returned let ? { }
+            case thrown let ? { assert false }
+        }
+    }
     test "candidate_provenance on a no-draft result is a typed reject" {
         let _ outcome ← trap {
 
@@ -864,6 +897,25 @@ describe "SD0-U4 — greedy acceptance and sampled admission" {
     }
     test "a greedy context lookup request is admitted" {
         assert admission_detail(lookup_policy_p(), config_with_sampling(0.0 ∷ f32, 0, 1.0 ∷ f32, 0.0 ∷ f32)) ≡ "admitted-greedy"
+    }
+    test "greedy feature_tapped, standalone_draft, and pld_then_mtp policies are admitted and reject sampled configs" {
+        let config.AccelerationPolicy ft_pol ← config.construct_acceleration("1.1.0", config.acceleration_feature_tapped(), 2, 8, 2, 8) ⊥ config.default_acceleration()
+        let config.GenerationConfig ft_greedy ← config.construct_generation_with_policy(1024, 1, 128, 42, 0.0 ∷ f32, 0, 1.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32, [0, 2], ft_pol) ⊥ config.default()
+        let config.GenerationConfig ft_sampled ← config.construct_generation_with_policy(1024, 1, 128, 42, 0.8 ∷ f32, 0, 1.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32, [0, 2], ft_pol) ⊥ config.default()
+        assert admission_detail(ft_pol, ft_greedy) ≡ "admitted-greedy"
+        assert admission_detail(ft_pol, ft_sampled) ≡ "sampled acceleration is not supported"
+
+        let config.AccelerationPolicy sd_pol ← config.construct_acceleration("1.1.0", config.acceleration_standalone_draft(), 2, 8, 2, 8) ⊥ config.default_acceleration()
+        let config.GenerationConfig sd_greedy ← config.construct_generation_with_policy(1024, 1, 128, 42, 0.0 ∷ f32, 0, 1.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32, [0, 2], sd_pol) ⊥ config.default()
+        let config.GenerationConfig sd_sampled ← config.construct_generation_with_policy(1024, 1, 128, 42, 0.0 ∷ f32, 4, 1.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32, [0, 2], sd_pol) ⊥ config.default()
+        assert admission_detail(sd_pol, sd_greedy) ≡ "admitted-greedy"
+        assert admission_detail(sd_pol, sd_sampled) ≡ "sampled acceleration is not supported"
+
+        let config.AccelerationPolicy comp_pol ← config.construct_acceleration("1.1.0", config.acceleration_pld_then_mtp(), 2, 8, 2, 8) ⊥ config.default_acceleration()
+        let config.GenerationConfig comp_greedy ← config.construct_generation_with_policy(1024, 1, 128, 42, 0.0 ∷ f32, 0, 1.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32, [0, 2], comp_pol) ⊥ config.default()
+        let config.GenerationConfig comp_sampled ← config.construct_generation_with_policy(1024, 1, 128, 42, 0.0 ∷ f32, 0, 0.9 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32, [0, 2], comp_pol) ⊥ config.default()
+        assert admission_detail(comp_pol, comp_greedy) ≡ "admitted-greedy"
+        assert admission_detail(comp_pol, comp_sampled) ≡ "sampled acceleration is not supported"
     }
     test "every active sampling knob returns the same typed reject" {
         let config.AccelerationPolicy policy ← lookup_policy_p()

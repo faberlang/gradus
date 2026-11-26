@@ -51,8 +51,8 @@ union Q4_1Error {
 }
 
 fn is_nan_half_bits(int bits) → bool {
-    if (bits ⇒ 10) % 32 ≡ 31 {
-        if bits % 1024 ≢ 0 {
+    if (bits ⇒ 10) ∧ 31 ≡ 31 {
+        if bits ∧ 1023 ≢ 0 {
             return true
         }
     }
@@ -60,62 +60,77 @@ fn is_nan_half_bits(int bits) → bool {
 }
 
 # Weight `k` (0 ≤ k < 32) of block `b` as f32: `q * f32(d) + f32(m)`.
+# Nibbles come off the byte with `∧ 15` / `⇒ 4` (a byte shifted right by 4 is
+# already a nibble, so no mask is needed there).
 @ public
 fn decode(Q4_1 b, i32 k) → f32 {
     let int idx ← k ↦ int
     mut int q ← 0
 
     if idx ≺ 16 {
-        q ← (b.qs[idx] ↦ int) % 16
+        q ← (b.qs[idx] ↦ int) ∧ 15
     }
     else {
-        q ← ((b.qs[idx - 16] ↦ int) ⇒ 4) % 16
+        q ← (b.qs[idx - 16] ↦ int) ⇒ 4
     }
 
     return (q ↦ f32) * (b.d ↦ f32) + (b.m ↦ f32)
 }
 
 # One block from its 20 on-disk bytes (scale `d`, min `m`, then 16 packed
-# nibble bytes).
+# nibble bytes). Each header u16 is decoded once and reused for the NaN gate
+# and the f16 field; the payload is sliced straight to its sized list (one
+# copy).
 @ public
 fn from_bytes(list<u8> raw) → Q4_1 ⇥ Q4_1Error {
     if raw.length() ≢ Q4_1_BYTES {
         throw variant BadBlock { message = "Q4_1 block byte length mismatch" }
     }
 
-    let list<b8> buf ↤ raw
-    let int d_bits ← (buf[0 ‥ 2] ↦ u16 via Le) ↦ int
-    let int m_bits ← (buf[2 ‥ 4] ↦ u16 via Le) ↦ int
+    let list<b8> hdr ↤ raw[0 ‥ 4]
+    let u16 d_bits ← hdr[0 ‥ 2] ↦ u16 via Le
+    let u16 m_bits ← hdr[2 ‥ 4] ↦ u16 via Le
 
-    if is_nan_half_bits(d_bits) {
+    if is_nan_half_bits(d_bits ↦ int) {
         throw variant BadScale { message = "NaN half scale in Q4_1 block" }
     }
 
-    if is_nan_half_bits(m_bits) {
+    if is_nan_half_bits(m_bits ↦ int) {
         throw variant BadScale { message = "NaN half min in Q4_1 block" }
     }
 
-    let f16 d ← ((buf[0 ‥ 2] ↦ u16 via Le) ↦ b16) ↦ f16
-    let f16 m ← ((buf[2 ‥ 4] ↦ u16 via Le) ↦ b16) ↦ f16
-    let list<u8> quants ← buf[4 ‥ 20] ↦ list<u8>
+    let f16 d ← (d_bits ↦ b16) ↦ f16
+    let f16 m ← (m_bits ↦ b16) ↦ f16
 
     do {
-        return Q4_1 { d = d, m = m, qs = quants ↦ list<u8, size 16> }
+        let list<u8, size 16> quants ← raw[4 ‥ 20] ↦ list<u8, size 16>
+        return Q4_1 { d = d, m = m, qs = quants }
     }
     catch err {
         throw variant BadBlock { message = "Q4_1 block byte length mismatch" }
     }
 }
 
-# The 32 weights of one block from its 20 bytes (`from_bytes`, then `decode`
-# for every `k`).
+# The 32 weights of one block from its 20 bytes: `from_bytes`, then one
+# 16-iteration pass. Each nibble byte is read once and yields its low weight
+# at `j` and its high weight at `j + 16`; the f32 scale and min are hoisted
+# out of the loop (elements 0..15 are the low nibbles, 16..31 the high
+# nibbles).
 @ public
 fn decode_block(list<u8> raw) → list<f32> ⇥ Q4_1Error {
     let Q4_1 b ← from_bytes(raw)
-    mut list<f32> y ← empty
+    let f32 d ← b.d ↦ f32
+    let f32 m ← b.m ↦ f32
 
-    for range 0 ‥ Q4_1_ELEMENTS let k {
-        y.append(decode(b, k ↦ i32 ⊥ 0))
+    mut list<f32> y ← empty
+    for exclusive Q4_1_ELEMENTS let k {
+        y.append(0.0 ∷ f32)
+    }
+
+    for exclusive 16 let j {
+        let int byte ← b.qs[j] ↦ int
+        y[j] ← ((byte ∧ 15) ↦ f32) * d + m
+        y[j + 16] ← ((byte ⇒ 4) ↦ f32) * d + m
     }
 
     return y
@@ -254,6 +269,22 @@ test "Q4_1 genus decode equals host dequant on every golden block" {
         assert y.length() ≡ 32
         for range 0 ‥ 32 let j {
             assert bits_of(y[j]) ≡ h[j]
+        }
+    }
+}
+
+test "Q4_1 decode_block equals the per-element decode on every golden block" {
+    for exclusive 5 let i {
+        let list<f32> y ← weights(bytes_of(GOLDEN_BLOCKS[i]))
+        do {
+            let list<f32> whole ← q4_1.decode_block(bytes_of(GOLDEN_BLOCKS[i]))
+            assert whole.length() ≡ 32
+            for exclusive 32 let j {
+                assert bits_of(whole[j]) ≡ bits_of(y[j])
+            }
+        }
+        catch err {
+            assert false
         }
     }
 }

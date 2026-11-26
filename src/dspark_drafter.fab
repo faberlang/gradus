@@ -1,0 +1,586 @@
++++ toml
+locale = "en"
+
++++ faber
+# DSpark / DFlash coupled MTP drafter model (Slice D, issue #109).
+#
+# Public import: import from "gradus:dspark_drafter" let dspark
+# Depends on: gradus:decode_step, gradus:cache/session, gradus:model/schedule.
+#
+# Provides:
+#   - `fuse_weight[4, 4]` softmax mix of 4 tapped backbone feature vectors + `dflare_norm`
+#   - `K_ctx` / `V_ctx` injection into the drafter's 3-slot hybrid SWA/full KV
+#     (`SessionState` with `FullKvArena` + `RingKvArena`, artifact window e.g. 1025 / 1024)
+#   - Non-causal block diffusion step over `[anchor, mask_1 .. mask_{k-1}]` (`block_size = 8`)
+#   - Rank-256 Markov RNN head + borrowed padded-vocab unembed projection
+#
+# Zero `NumericBlock` (`list<f32>`) usage: all state and weights are typed
+# device tensors compatible with Cranelift CPU and Metal KIR kernels.
+
+import from "gradus:decode_step" let ds
+import from "gradus:cache/session" let sess_mod
+import from "gradus:model/schedule" let model_schedule
+
+@ public
+const int DSPARK_TAP_COUNT = 4
+
+@ public
+const int DSPARK_BLOCK_SIZE = 8
+
+@ public
+const int DSPARK_MARKOV_RANK = 256
+
+@ public
+const int DSPARK_SLOT_COUNT = 3
+
+# ---------------------------------------------------------------------------
+# Feature-tap fusion (`fuse_weight[4, 4]` softmax mix) + `dflare_norm`
+# ---------------------------------------------------------------------------
+
+# Softmax mix of 4 tapped backbone feature vectors `taps[4, D]` using row
+# `mix_row` of `fuse_weight[4, 4]`.
+@ public
+kernel fuse_taps_softmax<size D>(tensor<f32, [4, D]> taps, tensor<f32, [4, 4]> fuse_weight, i32 mix_row, mut tensor<f32, [D]> out) → void {
+    for from out at [d] thread lane let ? {
+        if mix_row ∈ 0 … 3 {
+            let i32 mr ← mix_row ∧ 3
+            let f32 w0 ← fuse_weight[[mr, 0]]
+            let f32 w1 ← fuse_weight[[mr, 1]]
+            let f32 w2 ← fuse_weight[[mr, 2]]
+            let f32 w3 ← fuse_weight[[mr, 3]]
+
+            mut f32 m ← w0
+            if w1 ≻ m {
+                m ← w1
+            }
+            if w2 ≻ m {
+                m ← w2
+            }
+            if w3 ≻ m {
+                m ← w3
+            }
+
+            let f32 e0 ← (w0 - m).exp()
+            let f32 e1 ← (w1 - m).exp()
+            let f32 e2 ← (w2 - m).exp()
+            let f32 e3 ← (w3 - m).exp()
+            let f32 z ← e0 + e1 + e2 + e3
+
+            out[[d]] ← (e0 * taps[[0, d]] + e1 * taps[[1, d]] + e2 * taps[[2, d]] + e3 * taps[[3, d]]) / z
+        }
+    }
+}
+
+# Apply `dflare_norm` (RMSNorm) to the fused backbone feature vector.
+@ public
+fn dflare_norm_step<size D>(tensor<f32, [D]> fused, tensor<f32, [D]> dflare_norm_w, mut tensor<f32, [D]> out, f32 eps) → void {
+    ds.rmsnorm(fused, dflare_norm_w, mut out, eps)
+}
+
+# Fuse 4 tapped backbone feature vectors, apply `dflare_norm`, and project to
+# the drafter hidden dimension `D_DRAFT`.
+@ public
+fn fuse_and_norm<size D_TARGET, size D_DRAFT>(tensor<f32, [4, D_TARGET]> taps, tensor<f32, [4, 4]> fuse_weight, i32 mix_row, tensor<f32, [D_TARGET]> dflare_norm_w, tensor<f32, [D_DRAFT, D_TARGET]> fc_proj, mut tensor<f32, [D_DRAFT]> out, f32 eps) → void {
+    mut tensor<f32, [D_TARGET]> fused ← tf32[D_TARGET] {}
+    mut tensor<f32, [D_TARGET]> normed ← tf32[D_TARGET] {}
+    fuse_taps_softmax(taps, fuse_weight, mix_row, mut fused)
+    dflare_norm_step(fused, dflare_norm_w, mut normed, eps)
+    ds.gemv(fc_proj, normed, mut out)
+}
+
+# ---------------------------------------------------------------------------
+# 3-slot hybrid SWA/full KV schedule + K_ctx / V_ctx injection
+# ---------------------------------------------------------------------------
+
+# Build the canonical 3-slot hybrid SWA/full schedule for the DSpark drafter:
+# slots 0 and 1 are SlidingWindow (with artifact window, e.g. 1025 or 1024),
+# and slot 2 is Full KV.
+@ public
+fn dspark_drafter_schedule(int swa_window) → model_schedule.ExecutionSchedule ⇥ model_schedule.ScheduleError {
+    let list<model_schedule.AttentionKind> layer_types ← [
+        variant model_schedule.AttentionKind.SlidingWindow { window = swa_window },
+        variant model_schedule.AttentionKind.SlidingWindow { window = swa_window },
+        variant model_schedule.AttentionKind.Full
+    ]
+    let list<model_schedule.RopeKind> rope_pattern ← [
+        variant model_schedule.RopeKind.Standard,
+        variant model_schedule.RopeKind.Standard,
+        variant model_schedule.RopeKind.Standard
+    ]
+    return model_schedule.patterned_schedule(layer_types, rope_pattern, 0, empty)
+}
+
+# Project `ctx_feat` into `K_ctx`/`V_ctx` and inject into `sess` at `(slot_id, pos)`.
+@ public
+fn inject_ctx_kv<size C, size W, size KVD, size D_DRAFT>(tensor<f32, [D_DRAFT]> ctx_feat, tensor<f32, [KVD, D_DRAFT]> wk_ctx, tensor<f32, [KVD, D_DRAFT]> wv_ctx, mut sess_mod.SessionState<C, W, KVD> sess, int slot_id, i32 pos) → void ⇥ sess_mod.SessionError {
+    mut tensor<f32, [KVD]> k_ctx ← tf32[KVD] {}
+    mut tensor<f32, [KVD]> v_ctx ← tf32[KVD] {}
+    ds.gemv(wk_ctx, ctx_feat, mut k_ctx)
+    ds.gemv(wv_ctx, ctx_feat, mut v_ctx)
+    sess_mod.write_kv(mut sess, slot_id, k_ctx, v_ctx, pos)
+}
+
+# Inject pre-projected `k_ctx`/`v_ctx` directly into `sess` at `(slot_id, pos)`.
+@ public
+fn inject_ctx_kv_direct<size C, size W, size KVD>(tensor<f32, [KVD]> k_ctx, tensor<f32, [KVD]> v_ctx, mut sess_mod.SessionState<C, W, KVD> sess, int slot_id, i32 pos) → void ⇥ sess_mod.SessionError {
+    sess_mod.write_kv(mut sess, slot_id, k_ctx, v_ctx, pos)
+}
+
+# ---------------------------------------------------------------------------
+# Non-causal block diffusion kernels (`block_size = 8`)
+# ---------------------------------------------------------------------------
+
+# Non-causal block attention scores over Full KV cache `[C, KVD]` + current
+# block `[B, KVD]` (`BH = B * num_heads`, `C_TOTAL >= cache_len + B`). Every token `b`
+# in the block attends to all cached tokens `[0 .. cache_len - 1]` and all block tokens `[0 .. B - 1]`.
+@ public
+kernel block_attn_scores_full<size B, size BH, size C_TOTAL, size C, size QD, size KVD>(tensor<f32, [BH, C_TOTAL]> dom, tensor<f32, [B, QD]> q_block, tensor<f32, [C, KVD]> k_cache, tensor<f32, [B, KVD]> k_block, mut tensor<f32, [BH, C_TOTAL]> scores, i32 num_heads, i32 cache_len, i32 group, i32 dh, f32 scale) → void {
+    let i32 b_len ← B ↦ i32 ⊥ 0
+    let i32 c_cap ← C ↦ i32 ⊥ 0
+    for from dom at [bh, c] thread lane let ? {
+        if cache_len ≺ 0 or c ≥ cache_len + b_len {
+            scores[[bh, c]] ← -3.0e38
+        }
+        elif num_heads ≥ 1 and num_heads ≤ 4096 and group ≻ 0 and group ≤ 128 and dh ≥ 1 and dh ≤ 960 and bh ∈ 0 … 65535 and c ∈ 0 … 16777215 {
+            let i32 bhi ← bh ∧ 65535
+            let i32 bb ← (bhi / num_heads) ∧ 255
+            let i32 hh ← (bhi % num_heads) ∧ 4095
+            let i32 cc ← c ∧ 16777215
+            let i32 qbase ← hh * dh
+            let i32 kbase ← hh / group * dh
+            mut f32 acc ← 0.0
+
+            if cc ≺ cache_len {
+                if cc ≺ c_cap {
+                    for range 0 ‥ dh let kk {
+                        acc ← acc + q_block[[bb, qbase + kk]] * k_cache[[cc, kbase + kk]]
+                    }
+                    scores[[bh, c]] ← acc * scale
+                }
+                else {
+                    scores[[bh, c]] ← -3.0e38
+                }
+            }
+            else {
+                let i32 b2 ← (cc - cache_len) ∧ 255
+                for range 0 ‥ dh let kk {
+                    acc ← acc + q_block[[bb, qbase + kk]] * k_block[[b2, kbase + kk]]
+                }
+                scores[[bh, c]] ← acc * scale
+            }
+        }
+    }
+}
+
+# Non-causal block attention scores over Ring KV cache `[W, KVD]` + current
+# block `[B, KVD]` (`BH = B * num_heads`, `W_TOTAL >= ring_valid + B`).
+@ public
+kernel block_attn_scores_ring<size B, size BH, size W_TOTAL, size W, size QD, size KVD>(tensor<f32, [BH, W_TOTAL]> dom, tensor<f32, [B, QD]> q_block, tensor<f32, [W, KVD]> k_ring, tensor<f32, [B, KVD]> k_block, mut tensor<f32, [BH, W_TOTAL]> scores, i32 num_heads, i32 ring_valid, i32 group, i32 dh, f32 scale) → void {
+    let i32 b_len ← B ↦ i32 ⊥ 0
+    let i32 w_cap ← W ↦ i32 ⊥ 0
+    for from dom at [bh, c] thread lane let ? {
+        if ring_valid ≺ 0 or c ≥ ring_valid + b_len {
+            scores[[bh, c]] ← -3.0e38
+        }
+        elif num_heads ≥ 1 and num_heads ≤ 4096 and group ≻ 0 and group ≤ 128 and dh ≥ 1 and dh ≤ 960 and bh ∈ 0 … 65535 and c ∈ 0 … 16777215 {
+            let i32 bhi ← bh ∧ 65535
+            let i32 bb ← (bhi / num_heads) ∧ 255
+            let i32 hh ← (bhi % num_heads) ∧ 4095
+            let i32 cc ← c ∧ 16777215
+            let i32 qbase ← hh * dh
+            let i32 kbase ← hh / group * dh
+            mut f32 acc ← 0.0
+
+            if cc ≺ ring_valid {
+                if cc ≺ w_cap {
+                    for range 0 ‥ dh let kk {
+                        acc ← acc + q_block[[bb, qbase + kk]] * k_ring[[cc, kbase + kk]]
+                    }
+                    scores[[bh, c]] ← acc * scale
+                }
+                else {
+                    scores[[bh, c]] ← -3.0e38
+                }
+            }
+            else {
+                let i32 b2 ← (cc - ring_valid) ∧ 255
+                for range 0 ‥ dh let kk {
+                    acc ← acc + q_block[[bb, qbase + kk]] * k_block[[b2, kbase + kk]]
+                }
+                scores[[bh, c]] ← acc * scale
+            }
+        }
+    }
+}
+
+# Block row softmax in one parallel tiled launch: probs[bh, :] = softmax(scores[bh, :]).
+@ public
+kernel block_row_softmax<size BH, size C_TOTAL>(tensor<f32, [BH, C_TOTAL]> scores, mut tensor<f32, [BH, C_TOTAL]> probs) → void {
+    probs ⇇ scores.softmax()
+}
+
+# Non-causal block attention context over Full KV cache `[C, KVD]` + `[B, KVD]`.
+@ public
+kernel block_attn_context_full<size B, size BH, size C_TOTAL, size C, size QD, size KVD>(tensor<f32, [B, QD]> dom, tensor<f32, [BH, C_TOTAL]> probs, tensor<f32, [C, KVD]> v_cache, tensor<f32, [B, KVD]> v_block, mut tensor<f32, [B, QD]> ctx_block, i32 num_heads, i32 cache_len, i32 group, i32 dh) → void {
+    let i32 b_len ← B ↦ i32 ⊥ 0
+    let i32 c_cap ← C ↦ i32 ⊥ 0
+    let i32 c_tot ← C_TOTAL ↦ i32 ⊥ 0
+    for from dom at [b, j] thread lane let ? {
+        if num_heads ≥ 1 and num_heads ≤ 4096 and group ≻ 0 and group ≤ 128 and dh ≥ 1 and dh ≤ 960 and cache_len ≥ 0 and b ∈ 0 … 255 and j ∈ 0 … 16777215 {
+            let i32 bb ← b ∧ 255
+            let i32 jj ← j ∧ 16777215
+            let i32 h ← (jj / dh) ∧ 4095
+            let i32 d ← jj % dh
+            let i32 bh ← bb * num_heads + h
+            let i32 vcol ← h / group * dh + d
+            mut i32 n_cache ← cache_len
+            if n_cache ≻ c_cap {
+                n_cache ← c_cap
+            }
+            mut f32 acc ← 0.0
+
+            if bh ≺ BH {
+                for range 0 ‥ n_cache let c {
+                    acc ← acc + probs[[bh, c]] * v_cache[[c, vcol]]
+                }
+                for range 0 ‥ b_len let b2 {
+                    let i32 c2 ← cache_len + b2
+                    if c2 ≺ c_tot {
+                        acc ← acc + probs[[bh, c2]] * v_block[[b2, vcol]]
+                    }
+                }
+            }
+
+            ctx_block[[b, j]] ← acc
+        }
+    }
+}
+
+# Non-causal block attention context over Ring KV cache `[W, KVD]` + `[B, KVD]`.
+@ public
+kernel block_attn_context_ring<size B, size BH, size W_TOTAL, size W, size QD, size KVD>(tensor<f32, [B, QD]> dom, tensor<f32, [BH, W_TOTAL]> probs, tensor<f32, [W, KVD]> v_ring, tensor<f32, [B, KVD]> v_block, mut tensor<f32, [B, QD]> ctx_block, i32 num_heads, i32 ring_valid, i32 group, i32 dh) → void {
+    let i32 b_len ← B ↦ i32 ⊥ 0
+    let i32 w_cap ← W ↦ i32 ⊥ 0
+    let i32 w_tot ← W_TOTAL ↦ i32 ⊥ 0
+    for from dom at [b, j] thread lane let ? {
+        if num_heads ≥ 1 and num_heads ≤ 4096 and group ≻ 0 and group ≤ 128 and dh ≥ 1 and dh ≤ 960 and ring_valid ≥ 0 and b ∈ 0 … 255 and j ∈ 0 … 16777215 {
+            let i32 bb ← b ∧ 255
+            let i32 jj ← j ∧ 16777215
+            let i32 h ← (jj / dh) ∧ 4095
+            let i32 d ← jj % dh
+            let i32 bh ← bb * num_heads + h
+            let i32 vcol ← h / group * dh + d
+            mut i32 n_ring ← ring_valid
+            if n_ring ≻ w_cap {
+                n_ring ← w_cap
+            }
+            mut f32 acc ← 0.0
+
+            if bh ≺ BH {
+                for range 0 ‥ n_ring let c {
+                    acc ← acc + probs[[bh, c]] * v_ring[[c, vcol]]
+                }
+                for range 0 ‥ b_len let b2 {
+                    let i32 c2 ← ring_valid + b2
+                    if c2 ≺ w_tot {
+                        acc ← acc + probs[[bh, c2]] * v_block[[b2, vcol]]
+                    }
+                }
+            }
+
+            ctx_block[[b, j]] ← acc
+        }
+    }
+}
+
+# Batched RMSNorm over block `[B, D]`.
+@ public
+kernel block_rmsnorm<size B, size D>(tensor<f32, [B, D]> x, tensor<f32, [D]> w, mut tensor<f32, [B, D]> out, f32 eps) → void {
+    for from x at [b, d] thread lane let v {
+        if D ≥ 1 {
+            mut f32 sq ← 0.0
+            for range 0 ‥ D let k {
+                let f32 xk ← x[[b, k]]
+                sq ← sq + xk * xk
+            }
+            let f32 inv_rms ← 1.0 / (sq / (D ↦ f32) + eps).sqrt()
+            out[[b, d]] ← v * inv_rms * w[[d]]
+        }
+    }
+}
+
+# Batched linear projection over block: y[b, n] = sum_k w[n, k] * x[b, k].
+@ public
+kernel block_linear<size B, size N, size K>(tensor<f32, [N, K]> w, tensor<f32, [B, K]> x, mut tensor<f32, [B, N]> y) → void {
+    for from y at [b, n] thread lane let ? {
+        mut f32 acc ← 0.0
+        for range 0 ‥ K let k {
+            acc ← acc + w[[n, k]] * x[[b, k]]
+        }
+        y[[b, n]] ← acc
+    }
+}
+
+# Batched residual add over block: out[b, d] = a[b, d] + b[b, d].
+@ public
+kernel block_residual_add<size B, size D>(tensor<f32, [B, D]> a, tensor<f32, [B, D]> b, mut tensor<f32, [B, D]> out) → void {
+    for from a at [row, d] thread lane let av {
+        out[[row, d]] ← av + b[[row, d]]
+    }
+}
+
+# Batched SwiGLU over block: out[b, f] = silu(g[b, f]) * u[b, f].
+@ public
+kernel block_swiglu<size B, size F>(tensor<f32, [B, F]> g, tensor<f32, [B, F]> u, mut tensor<f32, [B, F]> out) → void {
+    for from g at [b, f] thread lane let gv {
+        out[[b, f]] ← gv / (1.0 + (-gv).exp()) * u[[b, f]]
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Rank-256 Markov RNN head + borrowed padded-vocab unembed projection
+# ---------------------------------------------------------------------------
+
+# Single recurrent step of the rank-R (e.g. 256) Markov RNN head:
+#   s_next[r] = tanh(b_rec[r] + sum_j w_rec[r, j] * s_prev[j] + sum_d w_in[r, d] * h_cur[d]).
+@ public
+kernel markov_rnn_step<size R, size D_DRAFT>(tensor<f32, [R]> s_prev, tensor<f32, [D_DRAFT]> h_cur, tensor<f32, [R, R]> w_rec, tensor<f32, [R, D_DRAFT]> w_in, tensor<f32, [R]> b_rec, mut tensor<f32, [R]> s_next) → void {
+    let i32 r_len ← R ↦ i32 ⊥ 0
+    let i32 d_len ← D_DRAFT ↦ i32 ⊥ 0
+    for from s_next at [r] thread lane let ? {
+        if r ∈ 0 … 4095 {
+            let i32 rr ← r ∧ 4095
+            mut f32 acc ← b_rec[[rr]]
+            for range 0 ‥ r_len let j {
+                acc ← acc + w_rec[[rr, j]] * s_prev[[j]]
+            }
+            for range 0 ‥ d_len let d {
+                acc ← acc + w_in[[rr, d]] * h_cur[[d]]
+            }
+            s_next[[r]] ← acc.tanh()
+        }
+    }
+}
+
+@ public
+kernel extract_block_row<size B, size D>(tensor<f32, [B, D]> src, i32 row_idx, mut tensor<f32, [D]> dst) → void {
+    for from dst at [d] thread lane let ? {
+        if row_idx ≥ 0 and row_idx ≺ B {
+            dst[[d]] ← src[[row_idx, d]]
+        }
+    }
+}
+
+@ public
+kernel slice_unpadded_vocab<size PADDED_V, size UNPADDED_V>(tensor<f32, [PADDED_V]> logits, mut tensor<f32, [UNPADDED_V]> out) → void {
+    for from out at [j] thread lane let ? {
+        if j ≺ PADDED_V {
+            out[[j]] ← logits[[j]]
+        }
+    }
+}
+
+# Run the Rank-R Markov RNN across all B block positions and emit unpadded
+# logits + argmax draft token IDs using the target's borrowed padded `lm_head`.
+@ public
+fn markov_rnn_block_head<size B, size R, size D_DRAFT, size D_TARGET, size PADDED_V, size UNPADDED_V>(tensor<f32, [B, D_DRAFT]> h_block, tensor<f32, [R]> s_init, tensor<f32, [R, R]> w_rec, tensor<f32, [R, D_DRAFT]> w_in, tensor<f32, [R]> b_rec, tensor<f32, [D_TARGET, R]> w_out, tensor<f32, [PADDED_V, D_TARGET]> borrowed_lm_head, mut tensor<f32, [R]> s_final, mut tensor<f32, [B, UNPADDED_V]> logits_out, mut tensor<i32, [B]> draft_ids) → void {
+    mut tensor<f32, [R]> s_cur ← tf32[R] {}
+    s_cur ⇇ s_init
+
+    mut tensor<f32, [D_DRAFT]> h_row ← tf32[D_DRAFT] {}
+    mut tensor<f32, [R]> s_next ← tf32[R] {}
+    mut tensor<f32, [D_TARGET]> proj ← tf32[D_TARGET] {}
+    mut tensor<f32, [PADDED_V]> raw_logits ← tf32[PADDED_V] {}
+    mut tensor<f32, [UNPADDED_V]> sliced ← tf32[UNPADDED_V] {}
+    mut tensor<i32, [1]> tok ← tensor<i32, [1]> {}
+
+    for range 0 ‥ B let b {
+        extract_block_row(h_block, b ↦ i32 ⊥ 0, mut h_row)
+        markov_rnn_step(s_cur, h_row, w_rec, w_in, b_rec, mut s_next)
+        s_cur ⇇ s_next
+
+        ds.gemv(w_out, s_cur, mut proj)
+        ds.gemv(borrowed_lm_head, proj, mut raw_logits)
+        slice_unpadded_vocab(raw_logits, mut sliced)
+        ds.argmax_token(sliced, mut tok)
+
+        draft_ids[[b]] ← tok[[0]]
+        for range 0 ‥ UNPADDED_V let v {
+            logits_out[[b, v]] ← sliced[[v]]
+        }
+    }
+
+    s_final ⇇ s_cur
+}
+
++++ faber test
+
+import from "gradus:decode_step" let ds
+import from "gradus:cache/session" let sess_mod
+import from "gradus:model/schedule" let model_schedule
+
+fn close(f32 a, f32 b) → bool {
+    let f32 diff ← (a - b).abs()
+    return diff ≤ 1.0e-4 + 1.0e-4 * b.abs()
+}
+
+test "DSpark fuse_weight softmax mix and dflare_norm" {
+    mut tensor<f32, [4, 3]> taps ← tf32[4, 3] {}
+    for range 0 ‥ 4 let t {
+        for range 0 ‥ 3 let d {
+            taps[[t, d]] ← ((t + 1) * (d + 1)) ↦ f32
+        }
+    }
+
+    mut tensor<f32, [4, 4]> fuse_weight ← tf32[4, 4] {}
+    # Row 0: equal weights -> uniform 0.25 mix across all 4 taps
+    # Row 1: dominant weight on tap 2
+    fuse_weight[[1, 0]] ← -100.0
+    fuse_weight[[1, 1]] ← -100.0
+    fuse_weight[[1, 2]] ← 10.0
+    fuse_weight[[1, 3]] ← -100.0
+
+    mut tensor<f32, [3]> out0 ← tf32[3] {}
+    fuse_taps_softmax(taps, fuse_weight, 0, mut out0)
+    # avg of 1, 2, 3, 4 is 2.5 -> out0[d] = 2.5 * (d + 1)
+    assert close(out0[[0]], 2.5)
+    assert close(out0[[1]], 5.0)
+    assert close(out0[[2]], 7.5)
+
+    mut tensor<f32, [3]> out1 ← tf32[3] {}
+    fuse_taps_softmax(taps, fuse_weight, 1, mut out1)
+    # tap 2 -> 3 * (d + 1)
+    assert close(out1[[0]], 3.0)
+    assert close(out1[[1]], 6.0)
+    assert close(out1[[2]], 9.0)
+
+    mut tensor<f32, [3]> norm_w ← tf32[3] {}
+    norm_w[[0]] ← 1.0
+    norm_w[[1]] ← 1.0
+    norm_w[[2]] ← 1.0
+    mut tensor<f32, [3]> normed ← tf32[3] {}
+    dflare_norm_step(out1, norm_w, mut normed, 1.0e-6)
+    # rms([3, 6, 9]) = sqrt((9 + 36 + 81) / 3) = sqrt(42)
+    let f64 rms ← (42.0).sqrt()
+    assert close(normed[[0]], (3.0 / rms) ↦ f32)
+    assert close(normed[[1]], (6.0 / rms) ↦ f32)
+    assert close(normed[[2]], (9.0 / rms) ↦ f32)
+}
+
+test "DSpark 3-slot hybrid SWA/full KV schedule and K_ctx/V_ctx injection" {
+    let model_schedule.ExecutionSchedule sched ← dspark_drafter_schedule(1025) ⊥ model_schedule.ExecutionSchedule { layers = empty, segments = empty, steps = empty, slots = empty, residual = variant model_schedule.ResidualKind.Standard, taps = empty }
+    assert model_schedule.slot_count(sched) ≡ 3
+    assert model_schedule.ring_kv_slot_count(sched) ≡ 2
+    assert model_schedule.full_kv_slot_count(sched) ≡ 1
+
+    mut sess_mod.SessionState<16, 1025, 4> sess ← sess_mod.from_schedule<size 16, size 1025, size 4>(sched) ⊥ sess_mod.SessionState<16, 1025, 4> { sched = sched, full_kv = sess_mod.FullKvArena<16, 4> { capacity = 16, kv_dim = 4, slot_ids = empty, keys = empty, values = empty, lengths = empty }, ring_kv = sess_mod.RingKvArena<1025, 4> { max_window = 1025, kv_dim = 4, slot_ids = empty, window_sizes = empty, keys = empty, values = empty, total_written = empty }, slot_arena_kind = empty, slot_local_index = empty, slot_window_sizes = empty, slot_kv_quant = empty, txn_depth = 0 }
+
+    mut tensor<f32, [4]> ctx_feat ← tf32[4] {}
+    ctx_feat[[0]] ← 1.0
+    ctx_feat[[1]] ← 2.0
+    ctx_feat[[2]] ← 3.0
+    ctx_feat[[3]] ← 4.0
+
+    mut tensor<f32, [4, 4]> wk_ctx ← tf32[4, 4] {}
+    mut tensor<f32, [4, 4]> wv_ctx ← tf32[4, 4] {}
+    for range 0 ‥ 4 let i {
+        wk_ctx[[i, i]] ← 0.5
+        wv_ctx[[i, i]] ← 2.0
+    }
+
+    mut bool ok ← true
+    do {
+        inject_ctx_kv(ctx_feat, wk_ctx, wv_ctx, mut sess, 0, 0)
+        inject_ctx_kv(ctx_feat, wk_ctx, wv_ctx, mut sess, 1, 0)
+        inject_ctx_kv(ctx_feat, wk_ctx, wv_ctx, mut sess, 2, 0)
+    } catch err {
+        ok ← false
+    }
+    assert ok
+    assert close(sess.ring_kv.keys[0][[0, 1]], 1.0)
+    assert close(sess.ring_kv.values[0][[0, 1]], 4.0)
+    assert close(sess.full_kv.keys[0][[0, 3]], 2.0)
+    assert close(sess.full_kv.values[0][[0, 3]], 8.0)
+}
+
+test "DSpark non-causal block diffusion attention (block_size = 8)" {
+    # B=8, H=1 -> BH=8, C_TOTAL=12 (cache_len=2 + B=8 <= 12), C=4, QD=2, KVD=2
+    mut tensor<f32, [8, 12]> dom ← tf32[8, 12] {}
+    mut tensor<f32, [8, 12]> scores ← tf32[8, 12] {}
+    mut tensor<f32, [8, 12]> probs ← tf32[8, 12] {}
+    mut tensor<f32, [8, 2]> q_block ← tf32[8, 2] {}
+    mut tensor<f32, [4, 2]> k_cache ← tf32[4, 2] {}
+    mut tensor<f32, [4, 2]> v_cache ← tf32[4, 2] {}
+    mut tensor<f32, [8, 2]> k_block ← tf32[8, 2] {}
+    mut tensor<f32, [8, 2]> v_block ← tf32[8, 2] {}
+    mut tensor<f32, [8, 2]> ctx_dom ← tf32[8, 2] {}
+    mut tensor<f32, [8, 2]> ctx_out ← tf32[8, 2] {}
+
+    for range 0 ‥ 8 let b {
+        q_block[[b, 0]] ← 1.0
+        q_block[[b, 1]] ← 0.0
+        k_block[[b, 0]] ← 0.0
+        v_block[[b, 0]] ← (b + 2) ↦ f32
+    }
+    k_cache[[0, 0]] ← 0.0
+    k_cache[[1, 0]] ← 0.0
+    v_cache[[0, 0]] ← 0.0
+    v_cache[[1, 0]] ← 1.0
+
+    block_attn_scores_full(dom, q_block, k_cache, k_block, mut scores, 1, 2, 1, 2, 1.0)
+    # 2 cache rows + 8 block rows = 10 valid cols with score 0.0 -> uniform 0.1 each
+    block_row_softmax(scores, mut probs)
+    block_attn_context_full(ctx_dom, probs, v_cache, v_block, mut ctx_out, 1, 2, 1, 2)
+
+    # mean of 0..9 is 4.5, identical for every block position b (non-causal within block)
+    assert close(probs[[0, 9]], 0.1)
+    assert close(probs[[0, 10]], 0.0)
+    assert close(ctx_out[[0, 0]], 4.5)
+    assert close(ctx_out[[7, 0]], 4.5)
+}
+
+test "DSpark Rank-256 Markov RNN head + borrowed padded-vocab unembed" {
+    # Use B=4, R=256, D_DRAFT=2, D_TARGET=2, PADDED_V=6, UNPADDED_V=4
+    mut tensor<f32, [4, 2]> h_block ← tf32[4, 2] {}
+    h_block[[0, 0]] ← 1.0
+    h_block[[1, 1]] ← 1.0
+    h_block[[2, 0]] ← 1.0
+    h_block[[2, 1]] ← 1.0
+    h_block[[3, 0]] ← -1.0
+
+    mut tensor<f32, [256]> s_init ← tf32[256] {}
+    mut tensor<f32, [256, 256]> w_rec ← tf32[256, 256] {}
+    mut tensor<f32, [256, 2]> w_in ← tf32[256, 2] {}
+    mut tensor<f32, [256]> b_rec ← tf32[256] {}
+    w_in[[0, 0]] ← 1.0
+    w_in[[1, 1]] ← 1.0
+
+    mut tensor<f32, [2, 256]> w_out ← tf32[2, 256] {}
+    w_out[[0, 0]] ← 1.0
+    w_out[[1, 1]] ← 1.0
+
+    mut tensor<f32, [6, 2]> borrowed_lm_head ← tf32[6, 2] {}
+    borrowed_lm_head[[0, 0]] ← 1.0
+    borrowed_lm_head[[1, 1]] ← 1.0
+    borrowed_lm_head[[2, 0]] ← 1.0
+    borrowed_lm_head[[2, 1]] ← 1.0
+    borrowed_lm_head[[3, 0]] ← -1.0
+    # Padded rows 4..5 have huge logits that must be sliced off before argmax
+    borrowed_lm_head[[4, 0]] ← 100.0
+    borrowed_lm_head[[5, 1]] ← 100.0
+
+    mut tensor<f32, [256]> s_final ← tf32[256] {}
+    mut tensor<f32, [4, 4]> logits_out ← tf32[4, 4] {}
+    mut tensor<i32, [4]> draft_ids ← tensor<i32, [4]> {}
+
+    markov_rnn_block_head(h_block, s_init, w_rec, w_in, b_rec, w_out, borrowed_lm_head, mut s_final, mut logits_out, mut draft_ids)
+
+    # b=0: s=[tanh(1), 0] -> proj=[tanh(1), 0] -> token 0 or 2 (equal max, lowest index 0)
+    assert draft_ids[[0]] ≡ 0
+    # b=1: s=[0, tanh(1)] -> token 1 or 2 (equal max, lowest index 1)
+    assert draft_ids[[1]] ≡ 1
+    # b=2: s=[tanh(1), tanh(1)] -> token 2 wins strictly (sum of both)
+    assert draft_ids[[2]] ≡ 2
+    # b=3: s=[tanh(-1), 0] -> token 3 wins strictly (-1 * -1 = +)
+    assert draft_ids[[3]] ≡ 3
+}

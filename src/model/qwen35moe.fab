@@ -17,7 +17,10 @@ locale = "en"
 # `qwen35moe.*` key that shadows a required fact. Tokenizer facts are frozen
 # as identity only; tokenizer execution is GGUF-A2's unit.
 
+import from "gradus:model/bundle"
+import from "gradus:model/config" let cfg
 import from "gradus:model/gguf_manifest"
+import from "gradus:model/tensor_directory"
 
 const int METADATA_PIN = 55
 
@@ -989,6 +992,264 @@ fn admit(gguf_manifest.GgufCorpus corpus, string expected_digest, int expected_l
     return Qwen35moeAdmission { config = c, summary = s }
 }
 
+# -------------------------------------------------------------------------
+# TensorDirectory + admitted metadata path (no hardcoded 55/753/41 pins).
+# Supports both 41-block Qwen3.5 (nextn = 1) and 40-block Qwen3.6-35B-A3B
+# (nextn = 0) across Safetensors and GGUF TensorDirectories.
+# -------------------------------------------------------------------------
+
+fn opt_gguf_number(gguf_manifest.GgufManifest m, string key, int fallback) → int {
+    do {
+        return gguf_manifest.number(m, key)
+    }
+    catch err {
+        return fallback
+    }
+}
+
+fn req_gguf_number(gguf_manifest.GgufManifest m, string key) → int ⇥ Qwen35moeConfigError {
+    do {
+        return gguf_manifest.number(m, key)
+    }
+    catch err {
+        throw variant DivergentMetadata { key = key, message = "qwen35moe metadata missing or invalid at §"(key) }
+    }
+}
+
+fn opt_gguf_f32(gguf_manifest.GgufManifest m, string key, f32 fallback) → f32 {
+    do {
+        let gguf_manifest.GgufMetadata meta ← gguf_manifest.metadata(m, key)
+        if meta.dtype ≡ GGUF_FLOAT32 and meta.payload_wire.length() ≥ 4 {
+            return meta.payload_wire[0 ‥ 4] ↦ f32 via Le
+        }
+        return fallback
+    }
+    catch err {
+        return fallback
+    }
+}
+
+@ public
+fn config_from_gguf(gguf_manifest.GgufManifest m) → Qwen35moeConfig ⇥ Qwen35moeConfigError {
+    let string arch ← require_text(m, "general.architecture", "qwen35moe")
+    let int file_type ← opt_gguf_number(m, "general.file_type", 0)
+    let int quantization_version ← opt_gguf_number(m, "general.quantization_version", 2)
+    let int block_count ← req_gguf_number(m, "qwen35moe.block_count")
+    require block_count ≥ 1 throw variant DivergentMetadata { key = "qwen35moe.block_count", message = "qwen35moe.block_count must be positive" }
+
+    let int context_length ← opt_gguf_number(m, "qwen35moe.context_length", 262144)
+    let int embedding_length ← req_gguf_number(m, "qwen35moe.embedding_length")
+    let int head_count ← req_gguf_number(m, "qwen35moe.attention.head_count")
+    let int head_count_kv ← req_gguf_number(m, "qwen35moe.attention.head_count_kv")
+    let int key_length ← opt_gguf_number(m, "qwen35moe.attention.key_length", embedding_length / head_count)
+    let int value_length ← opt_gguf_number(m, "qwen35moe.attention.value_length", key_length)
+    let f32 rms_norm_epsilon ← opt_gguf_f32(m, "qwen35moe.attention.layer_norm_rms_epsilon", 1.0e-6 ∷ f32)
+    let f32 freq_base ← opt_gguf_f32(m, "qwen35moe.rope.freq_base", 10000000.0 ∷ f32)
+    let int rope_dimension_count ← opt_gguf_number(m, "qwen35moe.rope.dimension_count", 64)
+
+    mut list<int> rope_sections ← empty
+    do {
+        rope_sections ← gguf_manifest.numbers(m, "qwen35moe.rope.dimension_sections")
+    }
+    catch err {
+        rope_sections ← [11, 11, 10, 0]
+    }
+
+    let int expert_count ← opt_gguf_number(m, "qwen35moe.expert_count", 256)
+    let int expert_used_count ← opt_gguf_number(m, "qwen35moe.expert_used_count", 8)
+    let int expert_ffn_length ← opt_gguf_number(m, "qwen35moe.expert_feed_forward_length", 512)
+    let int shared_ffn_length ← opt_gguf_number(m, "qwen35moe.expert_shared_feed_forward_length", 512)
+    let int conv_kernel ← opt_gguf_number(m, "qwen35moe.ssm.conv_kernel", 4)
+    let int state_size ← opt_gguf_number(m, "qwen35moe.ssm.state_size", 128)
+    let int group_count ← opt_gguf_number(m, "qwen35moe.ssm.group_count", 16)
+    let int gradus_temporis ← opt_gguf_number(m, "qwen35moe.ssm.time_step_rank", 32)
+    let int inner_size ← opt_gguf_number(m, "qwen35moe.ssm.inner_size", 4096)
+    let int full_attention_interval ← opt_gguf_number(m, "qwen35moe.full_attention_interval", 4)
+    let int nextn_predict_layers ← opt_gguf_number(m, "qwen35moe.nextn_predict_layers", 0)
+    require nextn_predict_layers ≥ 0 and nextn_predict_layers ≺ block_count throw variant DivergentMetadata { key = "qwen35moe.nextn_predict_layers", message = "qwen35moe.nextn_predict_layers out of range" }
+
+    return Qwen35moeConfig { architecture = arch, file_type = file_type, quantization_version = quantization_version, block_count = block_count, context_length = context_length, embedding_length = embedding_length, head_count = head_count, head_count_kv = head_count_kv, key_length = key_length, value_length = value_length, rms_norm_epsilon = rms_norm_epsilon, freq_base = freq_base, rope_dimension_count = rope_dimension_count, rope_sections = rope_sections, expert_count = expert_count, expert_used_count = expert_used_count, expert_ffn_length = expert_ffn_length, shared_ffn_length = shared_ffn_length, conv_kernel = conv_kernel, state_size = state_size, group_count = group_count, gradus_temporis = gradus_temporis, inner_size = inner_size, full_attention_interval = full_attention_interval, nextn_predict_layers = nextn_predict_layers, tokenizer_model = "gpt2", tokenizer_pre = "qwen35", token_count = 0, token_type_count = 0, merge_count = 0, eos_token_id = 0, padding_token_id = 0, bos_token_id = 0, add_bos_token = false }
+}
+
+@ public
+fn config_from_directory(cfg.ModelConfig mc, tensor_directory.TensorDirectory dir) → Qwen35moeConfig ⇥ Qwen35moeConfigError {
+    require mc.num_hidden_layers ≥ 1 throw variant DivergentMetadata { key = "num_hidden_layers", message = "num_hidden_layers must be positive" }
+    require mc.hidden_size ≥ 1 throw variant DivergentMetadata { key = "hidden_size", message = "hidden_size must be positive" }
+    require mc.num_attention_heads ≥ 1 throw variant DivergentMetadata { key = "num_attention_heads", message = "num_attention_heads must be positive" }
+    require mc.num_key_value_heads ≥ 1 throw variant DivergentMetadata { key = "num_key_value_heads", message = "num_key_value_heads must be positive" }
+
+    let int last_idx ← mc.num_hidden_layers - 1
+    let string last_s ← last_idx ↦ string
+    let bool has_nextn ← tensor_directory.has_tensor(dir, variant bundle.MemberRole.Backbone, "mtp.fc.weight") or tensor_directory.has_tensor(dir, variant bundle.MemberRole.Backbone, "model.layers.§.eh_proj.weight"(last_s)) or tensor_directory.has_tensor(dir, variant bundle.MemberRole.Backbone, "blk.§.nextn.enorm.weight"(last_s))
+    let int nextn_predict_layers ← has_nextn ✓ 1 ✗ 0
+
+    mut int vocab ← mc.vocab_size
+    do {
+        let tensor_directory.DirectoryEntry emb ← tensor_directory.lookup_backbone(dir, "model.embed_tokens.weight")
+        if emb.shape.length() ≥ 2 {
+            vocab ← emb.shape[0]
+        }
+    }
+    catch err {
+        pass
+    }
+
+    let list<int> rope_sections ← mc.rope_dimension_sections.length() ≻ 0 ✓ mc.rope_dimension_sections ✗ [11, 11, 10, 0]
+    mut int rope_dim ← 0
+    for from rope_sections let s {
+        rope_dim ← rope_dim + s
+    }
+    if rope_dim ≡ 0 {
+        rope_dim ← 64
+    }
+
+    return Qwen35moeConfig { architecture = mc.model_type, file_type = 0, quantization_version = 2, block_count = mc.num_hidden_layers, context_length = mc.max_position_embeddings, embedding_length = mc.hidden_size, head_count = mc.num_attention_heads, head_count_kv = mc.num_key_value_heads, key_length = mc.head_dim, value_length = mc.head_dim, rms_norm_epsilon = mc.rms_norm_eps, freq_base = mc.rope_theta, rope_dimension_count = rope_dim, rope_sections = rope_sections, expert_count = mc.num_local_experts coalesce 256, expert_used_count = mc.num_experts_per_tok coalesce 8, expert_ffn_length = mc.intermediate_size, shared_ffn_length = mc.intermediate_size, conv_kernel = mc.ssm_conv_kernel coalesce 4, state_size = mc.ssm_state_size coalesce 128, group_count = mc.ssm_group_count coalesce 16, gradus_temporis = mc.ssm_time_step_rank coalesce 32, inner_size = mc.ssm_inner_size coalesce 4096, full_attention_interval = mc.full_attention_interval coalesce 4, nextn_predict_layers = nextn_predict_layers, tokenizer_model = "gpt2", tokenizer_pre = "qwen35", token_count = vocab, token_type_count = vocab, merge_count = 0, eos_token_id = 0, padding_token_id = 0, bos_token_id = 0, add_bos_token = false }
+}
+
+fn dir_digits(string s) → bool {
+    if s.length() ≡ 0 then return false
+    for from s let c {
+        if not "0123456789".contains(c ↦ string) then return false
+    }
+    return true
+}
+
+fn dir_find_dot(string s, int start) → int {
+    for range start ‥ s.length() let i {
+        if s.slice(i, i + 1) ≡ "." then return i
+    }
+    return -1
+}
+
+fn parse_layer_index(string name, string prefix, int block_count) → int ⇥ Qwen35moeTensorError {
+    let int p_len ← prefix.length()
+    let int dot ← dir_find_dot(name, p_len)
+    require dot ≻ p_len throw variant DivergentName { name = name }
+    let string d ← name.slice(p_len, dot)
+    require dir_digits(d) throw variant DivergentName { name = name }
+
+    mut int idx ← -1
+    do {
+        idx ← d ↦ int
+    }
+    catch err {
+        throw variant DivergentName { name = name }
+    }
+
+    require idx ≥ 0 and idx ≺ block_count throw variant DivergentName { name = name }
+    return idx
+}
+
+@ public
+fn resolve_in_directory(tensor_directory.TensorDirectory dir, Qwen35moeConfig c, string name) → tensor_directory.DirectoryEntry ⇥ Qwen35moeTensorError {
+    if name.length() ≻ 13 and name.slice(0, 13) ≡ "model.layers." {
+        parse_layer_index(name, "model.layers.", c.block_count)
+    }
+    elif name.length() ≻ 4 and name.slice(0, 4) ≡ "blk." {
+        parse_layer_index(name, "blk.", c.block_count)
+    }
+
+    do {
+        return tensor_directory.lookup_backbone(dir, name)
+    }
+    catch err {
+        if not name.contains(".weight") {
+            do {
+                return tensor_directory.lookup_backbone(dir, "§.weight"(name))
+            }
+            catch err2 {
+                throw variant DivergentName { name = name }
+            }
+        }
+        throw variant DivergentName { name = name }
+    }
+}
+
+fn dir_require_any(tensor_directory.TensorDirectory dir, list<string> candidates) → tensor_directory.DirectoryEntry ⇥ Qwen35moeTensorError {
+    for from candidates let cand {
+        do {
+            return tensor_directory.lookup_backbone(dir, cand)
+        }
+        catch err {
+            pass
+        }
+    }
+
+    let string first ← candidates.length() ≻ 0 ✓ candidates[0] ✗ ""
+    throw variant DivergentName { name = first }
+}
+
+fn tally_storage(mut QwenTensorSummary s, tensor_directory.DirectoryEntry e) {
+    if e.raw_dtype ≡ "F32" {
+        s.storage_f32 ↑
+    }
+    elif e.raw_dtype ≡ "Q8_0" {
+        s.storage_q8_0 ↑
+    }
+    elif e.raw_dtype ≡ "Q4_K" {
+        s.storage_q4_k ↑
+    }
+    elif e.raw_dtype ≡ "Q5_K" {
+        s.storage_q5_k ↑
+    }
+    elif e.raw_dtype ≡ "Q6_K" {
+        s.storage_q6_k ↑
+    }
+    elif e.raw_dtype ≡ "BF16" {
+        s.storage_bf16 ↑
+    }
+
+    if e.shape.length() ≥ 3 {
+        s.expert_rank3 ↑
+    }
+}
+
+@ public
+fn admit_in_directory(Qwen35moeConfig c, tensor_directory.TensorDirectory dir) → QwenTensorSummary ⇥ Qwen35moeTensorError {
+    require c.block_count ≥ 1 throw variant Qwen35moeTensorError.DivergentCount { message = "block_count must be positive" }
+    require c.nextn_predict_layers ≥ 0 and c.nextn_predict_layers ≺ c.block_count throw variant Qwen35moeTensorError.DivergentCount { message = "nextn_predict_layers out of range" }
+    require c.full_attention_interval ≥ 1 throw variant Qwen35moeTensorError.DivergentCount { message = "full_attention_interval must be positive" }
+
+    let int trunk_blocks ← c.block_count - c.nextn_predict_layers
+    mut QwenTensorSummary summary ← QwenTensorSummary { total = 0, globals = 0, hybrid = 0, full_attention = 0, nextn = 0, storage_f32 = 0, storage_q8_0 = 0, storage_q4_k = 0, storage_q5_k = 0, storage_q6_k = 0, storage_bf16 = 0, expert_rank3 = 0 }
+
+    dir_require_any(dir, ["model.embed_tokens.weight", "token_embd.weight"])
+    summary.globals ↑
+    dir_require_any(dir, ["model.norm.weight", "output_norm.weight"])
+    summary.globals ↑
+    if tensor_directory.has_tensor(dir, variant bundle.MemberRole.Backbone, "lm_head.weight") or tensor_directory.has_tensor(dir, variant bundle.MemberRole.Backbone, "output.weight") {
+        summary.globals ↑
+    }
+
+    for range 0 ‥ c.block_count let b {
+        let string bs ← b ↦ string
+        if b ≥ trunk_blocks {
+            dir_require_any(dir, ["model.layers.§.input_layernorm.weight"(bs), "blk.§.attn_norm.weight"(bs), "blk.§.nextn.enorm.weight"(bs)])
+            summary.nextn ↑
+        }
+        elif (b + 1) % c.full_attention_interval ≡ 0 {
+            dir_require_any(dir, ["model.layers.§.input_layernorm.weight"(bs), "blk.§.attn_norm.weight"(bs)])
+            dir_require_any(dir, ["model.layers.§.self_attn.q_proj.weight"(bs), "blk.§.attn_q.weight"(bs)])
+            dir_require_any(dir, ["model.layers.§.post_attention_layernorm.weight"(bs), "blk.§.ffn_norm.weight"(bs), "blk.§.post_attention_norm.weight"(bs)])
+            summary.full_attention ↑
+        }
+        else {
+            dir_require_any(dir, ["model.layers.§.input_layernorm.weight"(bs), "blk.§.attn_norm.weight"(bs)])
+            dir_require_any(dir, ["model.layers.§.linear_attn.in_proj_qkv.weight"(bs), "model.layers.§.linear_attn.in_proj.weight"(bs), "blk.§.attn_qkv.weight"(bs)])
+            dir_require_any(dir, ["model.layers.§.post_attention_layernorm.weight"(bs), "blk.§.ffn_norm.weight"(bs), "blk.§.post_attention_norm.weight"(bs)])
+            summary.hybrid ↑
+        }
+    }
+
+    let list<tensor_directory.DirectoryEntry> bb_entries ← tensor_directory.entries_for_role(dir, variant bundle.MemberRole.Backbone)
+    summary.total ← bb_entries.length()
+    for from bb_entries let e {
+        tally_storage(mut summary, e)
+    }
+
+    return summary
+}
+
 +++ faber test
 # MODEL-01-M3 qwen35moe configuration genus and metadata freeze (MODEL-01
 # chain). Pins the frozen configuration rows from the delivery authority:
@@ -1000,7 +1261,10 @@ fn admit(gguf_manifest.GgufCorpus corpus, string expected_digest, int expected_l
 
 import from "gradus:model/artifact" artifact
 
-import from "gradus:model/gguf_manifest" gguf_manifest
+import from "gradus:model/bundle"
+import from "gradus:model/config" let cfg
+import from "gradus:model/gguf_manifest"
+import from "gradus:model/tensor_directory" let tensor_directory
 
 import from "gradus:model/qwen35moe" qwen35moe
 
@@ -1909,5 +2173,115 @@ test "M5 cross-reference divergences surface through the admission entry" skip "
     {
         let gguf_manifest.GgufCorpus corpus ← tensor_corpus(canonical_fragments(false, false, false, false, false, true, false, 41), 753)
         assert admission_result(corpus, F_DIGEST, corpus.artifact_length) ≡ "qwen35moe cross-reference dimension divergence at blk.0.attn_qkv.weight"
+    }
+}
+
+import from "gradus:model/capsule" capsule
+
+test "qwen35moe TensorDirectory admits 40-layer 0-NextN Qwen3.6-35B-A3B without 55/753/41 pins" {
+    let artifact.ContentIdentity bb_id ← artifact.ContentIdentity { algorithm = "sha-256", digest = F_DIGEST, length = 1048576 }
+    mut list<capsule.SafetensorsTensorDescriptor> descs ← empty
+    mut int off ← 0
+
+    descs.append(capsule.SafetensorsTensorDescriptor { name = "model.embed_tokens.weight", dtype = "BF16", shape = [248320, 2048], start = off, end = off + 64, elements = 508559360 })
+    off ← off + 64
+    descs.append(capsule.SafetensorsTensorDescriptor { name = "model.norm.weight", dtype = "BF16", shape = [2048], start = off, end = off + 64, elements = 2048 })
+    off ← off + 64
+    descs.append(capsule.SafetensorsTensorDescriptor { name = "lm_head.weight", dtype = "BF16", shape = [248320, 2048], start = off, end = off + 64, elements = 508559360 })
+    off ← off + 64
+
+    for range 0 ‥ 40 let layer_idx {
+        let string ls ← layer_idx ↦ string
+        descs.append(capsule.SafetensorsTensorDescriptor { name = "model.layers.§.input_layernorm.weight"(ls), dtype = "BF16", shape = [2048], start = off, end = off + 32, elements = 2048 })
+        off ← off + 32
+        if (layer_idx + 1) % 4 ≡ 0 {
+            descs.append(capsule.SafetensorsTensorDescriptor { name = "model.layers.§.self_attn.q_proj.weight"(ls), dtype = "BF16", shape = [4096, 2048], start = off, end = off + 32, elements = 8388608 })
+            off ← off + 32
+        }
+        else {
+            descs.append(capsule.SafetensorsTensorDescriptor { name = "model.layers.§.linear_attn.in_proj_qkv.weight"(ls), dtype = "BF16", shape = [8192, 2048], start = off, end = off + 32, elements = 16777216 })
+            off ← off + 32
+        }
+        descs.append(capsule.SafetensorsTensorDescriptor { name = "model.layers.§.post_attention_layernorm.weight"(ls), dtype = "BF16", shape = [2048], start = off, end = off + 32, elements = 2048 })
+        off ← off + 32
+    }
+
+    let capsule.SafetensorsManifest sm ← capsule.SafetensorsManifest { format = "safetensors", version = "1.0.0", artifact_length = 1048576, data_length = off, metadata = [], tensors = descs }
+
+    do {
+        let bundle.ModelBundle b ← bundle.safetensors_unindexed([bb_id], null, null, null, null, null)
+        do {
+            let tensor_directory.TensorDirectory dir ← tensor_directory.build(b, [
+                variant tensor_directory.ShardSource.SafetensorsSource { role = variant bundle.MemberRole.Backbone, shard_index = 0, manifest = sm }
+            ], [], [])
+            do {
+                let cfg.ModelConfig mc ← cfg.parse_json("{\"model_type\": \"qwen35moe\", \"hidden_size\": 2048, \"num_hidden_layers\": 40, \"num_attention_heads\": 16, \"num_key_value_heads\": 2, \"head_dim\": 256, \"intermediate_size\": 512, \"vocab_size\": 248320, \"full_attention_interval\": 4, \"num_local_experts\": 256, \"num_experts_per_tok\": 8, \"rope_dimension_sections\": [11, 11, 10, 0]}")
+                do {
+                    let qwen35moe.Qwen35moeConfig qc ← qwen35moe.config_from_directory(mc, dir)
+                    assert qc.block_count ≡ 40
+                    assert qc.nextn_predict_layers ≡ 0
+                    assert qc.token_count ≡ 248320
+
+                    do {
+                        let qwen35moe.QwenTensorSummary summary ← qwen35moe.admit_in_directory(qc, dir)
+                        assert summary.hybrid ≡ 30
+                        assert summary.full_attention ≡ 10
+                        assert summary.nextn ≡ 0
+                        assert summary.globals ≡ 3
+                        assert summary.total ≡ 123
+                    }
+                    catch err {
+                        assert false
+                    }
+
+                    do {
+                        let tensor_directory.DirectoryEntry l39 ← qwen35moe.resolve_in_directory(dir, qc, "model.layers.39.self_attn.q_proj.weight")
+                        assert l39.raw_dtype ≡ "BF16"
+                    }
+                    catch err {
+                        assert false
+                    }
+
+                    # Layer 40 is out of range for 40-layer Qwen3.6-35B-A3B
+                    mut bool caught_oob ← false
+                    do {
+                        qwen35moe.resolve_in_directory(dir, qc, "model.layers.40.input_layernorm.weight")
+                    }
+                    catch err {
+                        caught_oob ← true
+                    }
+                    assert caught_oob
+                }
+                catch err {
+                    assert false
+                }
+            }
+            catch err {
+                assert false
+            }
+        }
+        catch err {
+            assert false
+        }
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "qwen35moe config_from_gguf reads 40-layer 0-NextN metadata without 55/41 pins" {
+    let gguf_manifest.GgufCorpus corpus ← corpus_mutatum(40, false, 2048, false, false)
+    do {
+        let gguf_manifest.GgufManifest m ← gguf_manifest.parse(corpus)
+        do {
+            let qwen35moe.Qwen35moeConfig qc ← qwen35moe.config_from_gguf(m)
+            assert qc.block_count ≡ 40
+        }
+        catch err {
+            assert false
+        }
+    }
+    catch err {
+        assert false
     }
 }
