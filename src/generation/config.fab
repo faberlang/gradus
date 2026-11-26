@@ -34,21 +34,31 @@ union GenerationError {
 }
 
 # --- wire schema ----------------------------------------------------------
-# Schema 1.2.0 carries the explicit model/artifact EOG id list and one
-# AccelerationPolicy segment. Older wires are rejected: there is no safe
+# Schema 1.3.0 carries the explicit model/artifact EOG id list and one
+# AccelerationPolicy segment (mode, block bounds, and adaptive depth bounds;
+# policy 1.1.0). Older wires are rejected: there is no safe
 # tokenizer-independent EOG fallback.
-const string SCHEMA_VERSION = "1.2.0"
+const string SCHEMA_VERSION = "1.3.0"
 
-const string POLICY_VERSION = "1.0.0"
+const string POLICY_VERSION = "1.1.0"
+
+# The measured adaptive-depth envelope: pinning depth above this range
+# regressed decode on the reference hardware (design measurement, M5 Max);
+# the policy refuses depth bounds outside it.
+const int MAX_ADAPTIVE_DEPTH = 8
 
 # --- acceleration policy -------------------------------------------------
-# The policy records mode and block bounds; lookup and candidate execution
-# remain outside this configuration module.
+# The policy records mode, block bounds, and the rolling-acceptance depth
+# bounds the draft-and-verify controller moves within; lookup and candidate
+# execution remain outside this configuration module.
 
 @ public
 union AccelerationMode {
     Disabled,
-    ContextLookup
+    ContextLookup,
+    FeatureTapped,
+    StandaloneDraft,
+    PldThenMtp
 }
 
 @ public
@@ -62,6 +72,21 @@ fn acceleration_context_lookup() → AccelerationMode {
 }
 
 @ public
+fn acceleration_feature_tapped() → AccelerationMode {
+    return variant FeatureTapped
+}
+
+@ public
+fn acceleration_standalone_draft() → AccelerationMode {
+    return variant StandaloneDraft
+}
+
+@ public
+fn acceleration_pld_then_mtp() → AccelerationMode {
+    return variant PldThenMtp
+}
+
+@ public
 fn acceleration_mode_name(AccelerationMode m) → string {
     match m {
         case Disabled {
@@ -70,6 +95,15 @@ fn acceleration_mode_name(AccelerationMode m) → string {
         case ContextLookup {
             return "context_lookup"
         }
+        case FeatureTapped {
+            return "feature_tapped"
+        }
+        case StandaloneDraft {
+            return "standalone_draft"
+        }
+        case PldThenMtp {
+            return "pld_then_mtp"
+        }
     }
 }
 
@@ -77,6 +111,12 @@ fn acceleration_mode_from_name(string s) → AccelerationMode ⇥ GenerationErro
     if s ≡ "disabled" then return variant Disabled
 
     if s ≡ "context_lookup" then return variant ContextLookup
+
+    if s ≡ "feature_tapped" then return variant FeatureTapped
+
+    if s ≡ "standalone_draft" then return variant StandaloneDraft
+
+    if s ≡ "pld_then_mtp" then return variant PldThenMtp
 
     throw variant BadWire { message = "unknown acceleration mode" }
 }
@@ -87,10 +127,12 @@ class AccelerationPolicy {
     mut AccelerationMode mode
     mut int min_block
     mut int max_block
+    mut int min_depth
+    mut int max_depth
 }
 
 @ public
-fn construct_acceleration(string version, AccelerationMode mode, int min_block, int max_block) → AccelerationPolicy ⇥ GenerationError {
+fn construct_acceleration(string version, AccelerationMode mode, int min_block, int max_block, int min_depth, int max_depth) → AccelerationPolicy ⇥ GenerationError {
     require version ≡ POLICY_VERSION throw variant UnknownVersion { message = "unknown acceleration policy version" }
 
     require min_block ≥ 1 throw variant InvalidConfig { message = "acceleration block size must be at least one" }
@@ -99,12 +141,24 @@ fn construct_acceleration(string version, AccelerationMode mode, int min_block, 
 
     require min_block ≤ max_block throw variant InvalidConfig { message = "acceleration block size minimum must not exceed the maximum" }
 
-    return AccelerationPolicy { version = version, mode = mode, min_block = min_block, max_block = max_block }
+    require min_depth ≥ 1 throw variant InvalidConfig { message = "adaptive depth must be at least one" }
+
+    require max_depth ≥ 1 throw variant InvalidConfig { message = "adaptive depth must be at least one" }
+
+    require min_depth ≤ max_depth throw variant InvalidConfig { message = "adaptive depth minimum must not exceed the maximum" }
+
+    require max_depth ≤ MAX_ADAPTIVE_DEPTH throw variant InvalidConfig { message = "adaptive depth must not exceed the measured envelope of §"(MAX_ADAPTIVE_DEPTH ↦ string) }
+
+    require min_block ≤ min_depth throw variant InvalidConfig { message = "adaptive depth bounds must lie inside the block bounds" }
+
+    require max_depth ≤ max_block throw variant InvalidConfig { message = "adaptive depth bounds must lie inside the block bounds" }
+
+    return AccelerationPolicy { version = version, mode = mode, min_block = min_block, max_block = max_block, min_depth = min_depth, max_depth = max_depth }
 }
 
 @ public
 fn default_acceleration() → AccelerationPolicy {
-    return AccelerationPolicy { version = "", mode = variant Disabled, min_block = 0, max_block = 0 }
+    return AccelerationPolicy { version = "", mode = variant Disabled, min_block = 0, max_block = 0, min_depth = 1, max_depth = MAX_ADAPTIVE_DEPTH }
 }
 
 @ public
@@ -116,6 +170,10 @@ fn acceleration_equal(AccelerationPolicy a, AccelerationPolicy b) → bool {
     if a.min_block ≢ b.min_block then return false
 
     if a.max_block ≢ b.max_block then return false
+
+    if a.min_depth ≢ b.min_depth then return false
+
+    if a.max_depth ≢ b.max_depth then return false
 
     return true
 }
@@ -208,13 +266,13 @@ fn construct_generation_with_policy(int context, int max_prompt, int max_tokens,
         require id ≥ 0 throw variant InvalidConfig { message = "EOG token id must be non-negative" }
     }
 
-    let AccelerationPolicy checked ← construct_acceleration(acceleration.version, acceleration.mode, acceleration.min_block, acceleration.max_block)
+    let AccelerationPolicy checked ← construct_acceleration(acceleration.version, acceleration.mode, acceleration.min_block, acceleration.max_block, acceleration.min_depth, acceleration.max_depth)
     return GenerationConfig { context = context, max_prompt = max_prompt, max_tokens = max_tokens, seed = seed, temperature = temperature, top_k = top_k, top_p = top_p, min_p = min_p, repetition_penalty = repetition_penalty, eog_ids = eog_ids, acceleration = checked }
 }
 
 @ public
 fn construct_generation(int context, int max_prompt, int max_tokens, int seed, f32 temperature, int top_k, f32 top_p, f32 min_p, f32 repetition_penalty, list<int> eog_ids) → GenerationConfig ⇥ GenerationError {
-    let AccelerationPolicy disabled ← construct_acceleration(POLICY_VERSION, variant Disabled, 1, 1)
+    let AccelerationPolicy disabled ← construct_acceleration(POLICY_VERSION, variant Disabled, 1, MAX_ADAPTIVE_DEPTH, 1, MAX_ADAPTIVE_DEPTH)
     return construct_generation_with_policy(context, max_prompt, max_tokens, seed, temperature, top_k, top_p, min_p, repetition_penalty, eog_ids, disabled)
 }
 
@@ -319,7 +377,7 @@ fn whiten_seed(int seed) → int {
 # --- versioned configuration wire ---------------------------------------
 
 fn serialize_acceleration(AccelerationPolicy p) → string {
-    return "§:§:§:§"(p.version, acceleration_mode_name(p.mode), p.min_block ↦ string, p.max_block ↦ string)
+    return "§:§:§:§:§:§"(p.version, acceleration_mode_name(p.mode), p.min_block ↦ string, p.max_block ↦ string, p.min_depth ↦ string, p.max_depth ↦ string)
 }
 
 fn serialize_eog(list<int> eog_ids) → string {
@@ -388,13 +446,15 @@ fn wire_f32(string text, string detail) → f32 ⇥ GenerationError {
 fn deserialize_acceleration(string segment) → AccelerationPolicy ⇥ GenerationError {
     let list<string> bits ← segment.split(":")
 
-    require bits.length() ≡ 4 throw variant BadWire { message = "malformed acceleration policy" }
+    require bits.length() ≡ 6 throw variant BadWire { message = "malformed acceleration policy" }
 
     let string version ← bits.get(0) coalesce ""
     let AccelerationMode mode ← acceleration_mode_from_name(bits.get(1) coalesce "")
     let int min_block ← wire_int(bits.get(2) coalesce "", "malformed acceleration block size in generation wire")
     let int max_block ← wire_int(bits.get(3) coalesce "", "malformed acceleration block size in generation wire")
-    return construct_acceleration(version, mode, min_block, max_block)
+    let int min_depth ← wire_int(bits.get(4) coalesce "", "malformed adaptive depth in generation wire")
+    let int max_depth ← wire_int(bits.get(5) coalesce "", "malformed adaptive depth in generation wire")
+    return construct_acceleration(version, mode, min_block, max_block, min_depth, max_depth)
 }
 
 fn deserialize_eog(string wire) → list<int> ⇥ GenerationError {
