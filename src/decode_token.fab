@@ -302,6 +302,146 @@ fn argmax_host<size V>(tensor<f32, [V]> logits) → int {
     return best
 }
 
+# ---------------------------------------------------------------------------
+# Regime-aware batched path (B = 1, B = k verify/diffusion, B = C prefill)
+# ---------------------------------------------------------------------------
+# Attention masking regime for `layer_batch`:
+#   - `Causal`: token b at `pos + b` attends to `[0 .. pos + b]`.
+#   - `BlockDiffusion`: non-causal within each `block_size` block (e.g. 8 for
+#     DSpark/DFlash) plus the causal prefix `[0 .. pos)`.
+@ public
+union AttentionRegime {
+    Causal,
+    BlockDiffusion {
+        i32 block_size
+    }
+}
+
+# Maximum static batch row capacity supported by `matmul_nt_batch` and
+# `attn_context_batch` (`b ∈ 0 … 16383`).
+@ public
+const int MAX_BATCH_ROWS = 16384
+
+# Pre-allocated batched workspace shared across layers and regimes.
+# `MaxBatch` is the static row capacity (`1 ≤ MaxBatch ≤ MAX_BATCH_ROWS`);
+# `BH = MaxBatch * H`.
+@ public
+class BatchWorkspace<size MaxBatch, size BH, size D, size QD, size KVD, size F, size H, size C> {
+    let tensor<f32, [BH, C]> hcdom
+    let tensor<f32, [MaxBatch, QD]> qdom
+    mut tensor<f32, [MaxBatch, D]> xn
+    mut tensor<f32, [MaxBatch, QD]> q
+    mut tensor<f32, [MaxBatch, QD]> qr
+    mut tensor<f32, [MaxBatch, KVD]> k
+    mut tensor<f32, [MaxBatch, KVD]> kr
+    mut tensor<f32, [MaxBatch, KVD]> v
+    mut tensor<f32, [BH, C]> sc
+    mut tensor<f32, [BH, C]> pr
+    mut tensor<f32, [MaxBatch, QD]> ctx
+    mut tensor<f32, [MaxBatch, D]> h1
+    mut tensor<f32, [MaxBatch, F]> gate
+    mut tensor<f32, [MaxBatch, F]> up
+    mut tensor<f32, [MaxBatch, F]> act
+}
+
+# Prime every scratch tensor written by `layer_batch` and `head_batch`.
+@ public
+fn prime_batch_workspace<size MaxBatch, size BH, size D, size QD, size KVD, size F, size H, size C>(BatchWorkspace<MaxBatch, BH, D, QD, KVD, F, H, C> ws, mut tensor<f32, [1]> sink) → void {
+    assert MaxBatch ≥ 1 and MaxBatch ≤ MAX_BATCH_ROWS
+    ds.prime2(ws.xn, mut sink)
+    ds.prime2(ws.q, mut sink)
+    ds.prime2(ws.qr, mut sink)
+    ds.prime2(ws.k, mut sink)
+    ds.prime2(ws.kr, mut sink)
+    ds.prime2(ws.v, mut sink)
+    ds.prime2(ws.sc, mut sink)
+    ds.prime2(ws.pr, mut sink)
+    ds.prime2(ws.ctx, mut sink)
+    ds.prime2(ws.h1, mut sink)
+    ds.prime2(ws.gate, mut sink)
+    ds.prime2(ws.up, mut sink)
+    ds.prime2(ws.act, mut sink)
+}
+
+# One batched layer over `active_b <= MaxBatch` tokens starting at `sv.pos`.
+# Dispatches `B = 1` scalar decode, `B = k` causal verify or non-causal block
+# diffusion, and `B = C` chunked prefill over the same `LayerWeights`/`LayerParams`/`SlotView`.
+@ public
+fn layer_batch<size MaxBatch, size BH, size D, size QD, size KVD, size F, size H, size C>(tensor<f32, [MaxBatch, D]> hin, mut tensor<f32, [MaxBatch, D]> hout, LayerWeights<D, QD, KVD, F> lw, mut SlotView<C, KVD> sv, LayerParams lp, mut BatchWorkspace<MaxBatch, BH, D, QD, KVD, F, H, C> ws, i32 active_b, AttentionRegime regime) → void {
+    assert MaxBatch ≥ 1 and MaxBatch ≤ MAX_BATCH_ROWS
+    assert (active_b ↦ int) ≥ 1 and (active_b ↦ int) ≤ MaxBatch
+    let i32 tpos ← sv.pos
+    let i32 heads ← H ↦ i32 ⊥ 1
+    mut i32 blk_size ← 1
+
+    match regime {
+        case AttentionRegime.Causal {
+            blk_size ← 1
+        }
+        case AttentionRegime.BlockDiffusion let bsz {
+            blk_size ← bsz
+            if blk_size ≺ 1 {
+                blk_size ← 1
+            }
+        }
+    }
+
+    ds.rmsnorm_batch(hin, lw.anorm, mut ws.xn, lp.peps)
+    ds.qkv_proj_batch(lw.wq, lw.wk, lw.wv, ws.xn, mut ws.q, mut ws.k, mut ws.v, active_b)
+
+    if lw.qkv_bias {
+        ds.add_bias_batch(lw.bq, mut ws.q, active_b)
+        ds.add_bias_batch(lw.bk, mut ws.k, active_b)
+        ds.add_bias_batch(lw.bv, mut ws.v, active_b)
+    }
+
+    match lp.prope {
+        case RopeKind.None {
+            ds.kv_write_kv_batch(ws.k, ws.v, mut sv.kin, mut sv.vin, tpos, active_b)
+            ds.attn_scores_batch(ws.hcdom, ws.q, sv.kin, mut ws.sc, tpos, heads, lp.pgroup, lp.pdh, lp.pscale, active_b, blk_size)
+        }
+        case RopeKind.Half {
+            ds.rope_half_batch(ws.q, mut ws.qr, tpos, lp.pspan, lp.plntheta, active_b)
+            ds.rope_half_batch(ws.k, mut ws.kr, tpos, lp.pspan, lp.plntheta, active_b)
+            ds.kv_write_kv_batch(ws.kr, ws.v, mut sv.kin, mut sv.vin, tpos, active_b)
+            ds.attn_scores_batch(ws.hcdom, ws.qr, sv.kin, mut ws.sc, tpos, heads, lp.pgroup, lp.pdh, lp.pscale, active_b, blk_size)
+        }
+        case RopeKind.Pairs {
+            ds.rope_pairs_batch(ws.q, mut ws.qr, tpos, lp.pspan, lp.plntheta, active_b)
+            ds.rope_pairs_batch(ws.k, mut ws.kr, tpos, lp.pspan, lp.plntheta, active_b)
+            ds.kv_write_kv_batch(ws.kr, ws.v, mut sv.kin, mut sv.vin, tpos, active_b)
+            ds.attn_scores_batch(ws.hcdom, ws.qr, sv.kin, mut ws.sc, tpos, heads, lp.pgroup, lp.pdh, lp.pscale, active_b, blk_size)
+        }
+    }
+
+    ds.row_softmax(ws.sc, mut ws.pr)
+    ds.attn_context_batch(ws.qdom, ws.pr, sv.vin, mut ws.ctx, tpos, heads, lp.pgroup, lp.pdh, active_b, blk_size)
+    ds.matmul_nt_batch(lw.wo, ws.ctx, mut ws.xn, active_b, QD ↦ i32 ⊥ 1)
+    ds.residual_add_batch(hin, ws.xn, mut ws.h1, active_b)
+    ds.rmsnorm_batch(ws.h1, lw.fnorm, mut ws.xn, lp.peps)
+    ds.gate_up_proj_batch(lw.wg, lw.wu, ws.xn, mut ws.gate, mut ws.up, active_b)
+    ds.swiglu_batch(ws.gate, ws.up, mut ws.act, active_b)
+    ds.matmul_nt_batch(lw.wd, ws.act, mut ws.xn, active_b, F ↦ i32 ⊥ 1)
+    ds.residual_add_batch(ws.h1, ws.xn, mut hout, active_b)
+}
+
+# Batched embedding gather: hidden[b, :] <- embed[ids[b], :] for b < active_b.
+@ public
+fn embed_batch<size V, size MaxBatch, size D>(tensor<f32, [V, D]> embed, tensor<i32, [MaxBatch]> ids, mut tensor<f32, [MaxBatch, D]> hidden, i32 active_b) → void {
+    assert MaxBatch ≥ 1 and MaxBatch ≤ MAX_BATCH_ROWS
+    assert (active_b ↦ int) ≥ 1 and (active_b ↦ int) ≤ MaxBatch
+    ds.gather_batch(embed, ids, mut hidden, active_b)
+}
+
+# Batched logits[b, V] = head @ rmsnorm(hidden[b, :]) for b < active_b.
+@ public
+fn head_batch<size V, size MaxBatch, size D>(tensor<f32, [MaxBatch, D]> hidden, tensor<f32, [D]> onorm, tensor<f32, [V, D]> head, mut tensor<f32, [MaxBatch, D]> hn, mut tensor<f32, [MaxBatch, V]> logits, f32 peps, i32 active_b) → void {
+    assert MaxBatch ≥ 1 and MaxBatch ≤ MAX_BATCH_ROWS
+    assert (active_b ↦ int) ≥ 1 and (active_b ↦ int) ≤ MaxBatch
+    ds.rmsnorm_batch(hidden, onorm, mut hn, peps)
+    ds.matmul_nt_batch(head, hn, mut logits, active_b, D ↦ i32 ⊥ 1)
+}
+
 +++ faber test
 # Co-located package test for decode_token.fab. Runs through KIR on CPU and Metal.
 
@@ -370,5 +510,44 @@ test "decode_token head_wide takes a projection distinct from the embedding (unt
     # logit r = head[r] . 1 = head[[r, 1]] = r + 1
     assert close(lg[[0]], 1.0)
     assert close(lg[[4]], 5.0)
+}
+
+test "decode_token embed_batch and head_batch match embed_wide and head_wide" {
+    mut tensor<f32, [5, 4]> tab ← tf32[5, 4] {}
+    for range 0‥5 let r {
+        for range 0‥4 let c {
+            tab[[r, c]] ← ((r * 2 + c + 1) ↦ f32) * 0.25
+        }
+    }
+    mut tensor<i32, [4]> ids ← tensor<i32, [4]> {}
+    ids[[0]] ← 1
+    ids[[1]] ← 3
+    ids[[2]] ← 0
+    mut tensor<f32, [4, 4]> hidden ← tf32[4, 4] {}
+    embed_batch(tab, ids, mut hidden, 3)
+
+    mut tensor<f32, [4]> onorm ← tf32[4] {}
+    for range 0‥4 let j {
+        onorm[[j]] ← 1.0
+    }
+    mut tensor<f32, [4, 4]> hn ← tf32[4, 4] {}
+    mut tensor<f32, [4, 5]> logits ← tf32[4, 5] {}
+    head_batch(hidden, onorm, tab, mut hn, mut logits, 0.00001, 3)
+
+    for range 0‥3 let b {
+        mut tensor<i32, [1]> id1 ← tensor<i32, [1]> {}
+        id1[[0]] ← ids[[b]]
+        mut tensor<f32, [4]> h1 ← tf32[4] {}
+        mut tensor<f32, [4]> hn1 ← tf32[4] {}
+        mut tensor<f32, [5]> lg1 ← tf32[5] {}
+        embed_wide(tab, id1, mut h1)
+        head_wide(h1, onorm, tab, mut hn1, mut lg1, 0.00001)
+        for range 0‥4 let c {
+            assert close(hidden[[b, c]], h1[[c]])
+        }
+        for range 0‥5 let v {
+            assert close(logits[[b, v]], lg1[[v]])
+        }
+    }
 }
 

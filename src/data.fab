@@ -153,11 +153,7 @@ fn batch(list<int> ids, int batch_size) → list<list<int>> ⇥ DataError {
             stop ← n
         }
 
-        mut list<int> chunk ← empty
-
-        for range start ‥ stop let k {
-            chunk.append(source.get(k) coalesce 0)
-        }
+        let list<int> chunk ← source[start ‥ stop]
 
         out.append(chunk)
         start ← stop
@@ -206,6 +202,14 @@ class SupervisedSampler {
     let int seed
     let int epoch
     let int position
+    # Hot-path caches (constructor defaults, never on the wire): the
+    # precomputed corpus digest and the shuffled order for the cached epoch,
+    # reshuffled only at epoch rollover. Absent (0 / empty) on hand-built
+    # and wire-loaded states — the first step pays the exact compare once.
+    mut int corpus_hash = 0
+    mut bool corpus_hash_ready = false
+    mut list<int> order_cache = empty
+    mut int order_epoch = -1
 }
 
 # One ordered sequence identity format serves both LM document corpora and
@@ -231,6 +235,40 @@ fn data_identity(list<list<int>> sequences) → string {
     }
 
     return identity
+}
+
+# Streaming digest over the same ordered (length, token) domain data_identity
+# renders: O(total tokens), fixed-size accumulator, no string allocation. A
+# digest, not an identity — data_identity stays the contract surface; the
+# hash only guards the hot-path corpus checks (a collision would admit a
+# changed corpus with probability about 2^-63). The mix is xorshift-style on
+# the wrapping<i64> ring (the random.fab precedent: wrapping keeps the
+# 64-bit state without overflow concerns), masked into the non-negative
+# range (the shuffle MASK_63 precedent).
+const int HASH_OFFSET = 88172645463325252
+
+fn hash_mix(int h, int v) → int {
+    mut wrapping<i64> x ← (h ⊻ v) ↦ wrapping<i64>
+    x ← x ⊻ x ⇐ 13
+    x ← x ⊻ x ⇒ 7
+    x ← x ⊻ x ⇐ 17
+    return (x ↦ int) ∧ MASK_63
+}
+
+fn data_hash(list<list<int>> sequences) → int {
+    mut int h ← HASH_OFFSET
+    let list<int> empty_ints ← empty
+
+    for exclusive sequences.length() let i {
+        let list<int> sequence ← sequences.get(i) coalesce empty_ints
+        h ← hash_mix(h, sequence.length())
+
+        for exclusive sequence.length() let j {
+            h ← hash_mix(h, sequence.get(j) coalesce 0)
+        }
+    }
+
+    return h
 }
 
 # Shared modulus split returns positions, preserving input order in each side.
@@ -356,7 +394,7 @@ fn supervised_indices_identity(list<int> indices) → string {
 
 @ public
 fn supervised_sampler_start(list<int> train_set, random.Seed seed) → SupervisedSampler {
-    return SupervisedSampler { corpus = supervised_indices_identity(train_set), seed = seed.status, epoch = 0, position = 0 }
+    return SupervisedSampler { corpus = supervised_indices_identity(train_set), seed = seed.status, epoch = 0, position = 0, corpus_hash = data_hash([train_set]), corpus_hash_ready = true }
 }
 
 # One versioned, # separated wire format and parser serve LM cursors and
@@ -463,9 +501,42 @@ class SupervisedStep {
     let SupervisedSampler state
 }
 
+# Shared tail of supervised_sampler_step: slice one batch out of the epoch
+# order and pair it with the advanced sampler state (which caches the order
+# it used).
+fn supervised_sampler_emit(SupervisedSet set, list<int> train_set, list<int> order, int position, int batch_size, string corpus, int seed_status, int epoch, int corpus_hash) → SupervisedStep ∪ none ⇥ DataError {
+    mut int stop ← position + batch_size
+
+    if stop ≻ train_set.length() {
+        stop ← train_set.length()
+    }
+
+    let list<int> selected ← order[position ‥ stop]
+
+    let list<Batch> batches ← supervised_batches(set, selected, batch_size)
+    let Batch next_batch ← batches.get(0) coalesce Batch { x = tensor.default(), y = tensor.default() }
+    let SupervisedSampler next_state ← SupervisedSampler { corpus = corpus, seed = seed_status, epoch = epoch, position = stop, corpus_hash = corpus_hash, corpus_hash_ready = true, order_cache = order, order_epoch = epoch }
+    return SupervisedStep { batch = next_batch, state = next_state }
+}
+
 @ public
 fn supervised_sampler_step(SupervisedSet set, list<int> train_set, int batch_size, SupervisedSampler state) → SupervisedStep ∪ none ⇥ DataError {
-    if state.corpus ≢ supervised_indices_identity(train_set) or batch_size ≤ 0 or train_set.length() ≡ 0 then return null
+    if batch_size ≤ 0 or train_set.length() ≡ 0 then return null
+
+    # Corpus identity: the precomputed streaming digest when the state
+    # carries one (sampler-start states and every state this function
+    # returns); the exact data_identity compare otherwise — hand-built or
+    # wire-loaded states pay it once.
+    mut int corpus_hash ← state.corpus_hash
+
+    if state.corpus_hash_ready {
+        if data_hash([train_set]) ≢ corpus_hash then return null
+    }
+    else {
+        if state.corpus ≢ supervised_indices_identity(train_set) then return null
+
+        corpus_hash ← data_hash([train_set])
+    }
 
     mut int epoch ← state.epoch
     mut int position ← state.position
@@ -484,23 +555,15 @@ fn supervised_sampler_step(SupervisedSet set, list<int> train_set, int batch_siz
         return null
     }
 
+    # Shuffled epoch order, cached in the sampler state: an epoch's order
+    # depends only on (seed, epoch), so the corpus is reshuffled exactly at
+    # epoch rollover and every batch within the epoch reuses the cache.
+    if state.order_epoch ≡ epoch and state.order_cache.length() ≡ train_set.length() {
+        return supervised_sampler_emit(set, train_set, state.order_cache, position, batch_size, state.corpus, state.seed, epoch, corpus_hash)
+    }
+
     let Shuffled shuffled ← epoch_order(train_set, seed)
-    mut int stop ← position + batch_size
-
-    if stop ≻ train_set.length() {
-        stop ← train_set.length()
-    }
-
-    mut list<int> selected ← empty
-
-    for range position ‥ stop let i {
-        selected.append(shuffled.payload.get(i) coalesce (-1))
-    }
-
-    let list<Batch> batches ← supervised_batches(set, selected, batch_size)
-    let Batch next_batch ← batches.get(0) coalesce Batch { x = tensor.default(), y = tensor.default() }
-    let SupervisedSampler next_state ← SupervisedSampler { corpus = state.corpus, seed = state.seed, epoch = epoch, position = stop }
-    return SupervisedStep { batch = next_batch, state = next_state }
+    return supervised_sampler_emit(set, train_set, shuffled.payload, position, batch_size, state.corpus, state.seed, epoch, corpus_hash)
 }
 
 @ public
@@ -642,6 +705,12 @@ fn lm_windows(list<int> tokens, int length, int document) → list<LmWindow> ⇥
 class LmSplit {
     let list<list<int>> training
     let list<list<int>> validation
+    # Original-corpus document index sets: filled by lm_split_documents so
+    # cursor scans test membership in O(1) instead of deep list equality.
+    # Empty (the constructor default) on hand-built splits — the cursor then
+    # derives membership by content matching, the legacy rule.
+    mut set<int> training_indices = empty
+    mut set<int> validation_indices = empty
 }
 
 @ public
@@ -665,7 +734,7 @@ fn lm_split_documents(list<list<int>> documents, int validation_modulus) → LmS
         validation.append(documents.get(i) coalesce empty_ints)
     }
 
-    return LmSplit { training = training, validation = validation }
+    return LmSplit { training = training, validation = validation, training_indices = split.training_positions ↦ set<int>, validation_indices = split.held_out_positions ↦ set<int> }
 }
 
 # -------------------------------------------------------------------------
@@ -683,6 +752,11 @@ class LmCursor {
     let string split
     let int document
     let int window
+    # Precomputed corpus digest cache (constructor default, never on the
+    # wire): a cursor that has been through one locate carries it, so later
+    # locates compare the digest instead of rebuilding the identity string.
+    mut int corpus_hash = 0
+    mut bool corpus_hash_ready = false
 }
 
 @ public
@@ -727,45 +801,106 @@ fn lm_cursor_contains(list<list<int>> documents, list<int> document) → bool {
     return false
 }
 
-# Resolve a possibly initial or stale cursor to the next selected window's
-# canonical original-document index and within-document window index. An
-# exhausted cursor (a document below the initial -1) resolves to none, which
-# is how a traversal reports the end of its split.
-fn lm_cursor_locate(list<list<int>> documents, LmSplit split, LmCursor cursor, int length) → LmCursor ∪ none {
-    if cursor.corpus ≢ lm_corpus_identity(documents) then return null
-
-    if length ≤ 0 or cursor.document ≺ -1 or cursor.window ≺ 0 then return null
-
-    mut list<list<int>> selected ← empty
-
-    if cursor.split ≡ "training" {
-        selected ← split.training
+# Original-corpus index set for one split side. Splits built by
+# lm_split_documents carry the stored set; hand-built splits (empty set,
+# non-empty side) derive it once per call by content matching — the legacy
+# containment rule, duplicate contents included.
+fn lm_side_indices(list<list<int>> documents, list<list<int>> side, set<int> stored) → set<int> {
+    if stored.length() ≢ 0 or side.length() ≡ 0 {
+        return stored
     }
-    elif cursor.split ≡ "validation" {
-        selected ← split.validation
-    }
-    else then return null
 
-    for range 0 ‥ documents.length() let i {
-        if i ≥ cursor.document {
-            let list<int> empty_ints ← empty
+    let list<int> empty_ints ← empty
+    mut set<int> derived ← empty
+
+    for exclusive documents.length() let i {
+        if lm_cursor_contains(side, documents.get(i) coalesce empty_ints) {
+            derived.add(i)
+        }
+    }
+
+    return derived
+}
+
+# Index set for a named split side; none when the side name is unknown.
+fn lm_split_indices(list<list<int>> documents, LmSplit split, string side_name) → set<int> ∪ none {
+    if side_name ≡ "training" {
+        return lm_side_indices(documents, split.training, split.training_indices)
+    }
+
+    if side_name ≡ "validation" {
+        return lm_side_indices(documents, split.validation, split.validation_indices)
+    }
+
+    return null
+}
+
+# Shared forward scan: the next selected window at or after
+# (first_document, first_window), starting the walk at `start` (never below
+# zero). The window offset applies only when the scan lands on first_document
+# itself, so an initial cursor (document -1) resolves with window 0. A window
+# at or past its document's window count skips to the next selected
+# document.
+fn lm_cursor_resolve(list<list<int>> documents, set<int> indices, string corpus, string split, int first_document, int first_window, int start, int length, int corpus_hash) → LmCursor ∪ none {
+    let list<int> empty_ints ← empty
+
+    if start ≥ documents.length() then return null
+
+    for exclusive documents.length() - start let k {
+        let int i ← start + k
+
+        if indices.has(i) {
             let list<int> document ← documents.get(i) coalesce empty_ints
 
-            if lm_cursor_contains(selected, document) and document.length() ≻ 0 {
+            if document.length() ≻ 0 {
                 mut int window ← 0
 
-                if i ≡ cursor.document {
-                    window ← cursor.window
+                if i ≡ first_document {
+                    window ← first_window
                 }
 
                 let int window_count ← (document.length() - 1) / length + 1
 
-                if window ≺ window_count then return LmCursor { corpus = cursor.corpus, split = cursor.split, document = i, window = window }
+                if window ≺ window_count then return LmCursor { corpus = corpus, split = split, document = i, window = window, corpus_hash = corpus_hash, corpus_hash_ready = true }
             }
         }
     }
 
     return null
+}
+
+# Resolve a possibly initial or stale cursor to the next selected window's
+# canonical original-document index and within-document window index. An
+# exhausted cursor (a document below the initial -1) resolves to none, which
+# is how a traversal reports the end of its split.
+fn lm_cursor_locate(list<list<int>> documents, LmSplit split, LmCursor cursor, int length) → LmCursor ∪ none {
+    let int corpus_hash ← data_hash(documents)
+
+    if cursor.corpus_hash_ready {
+        if corpus_hash ≢ cursor.corpus_hash then return null
+    }
+    else {
+        if cursor.corpus ≢ lm_corpus_identity(documents) then return null
+    }
+
+    if length ≤ 0 or cursor.document ≺ -1 or cursor.window ≺ 0 then return null
+
+    let set<int> no_indices ← empty
+    let _ indices_value ← lm_split_indices(documents, split, cursor.split)
+
+    if indices_value is none then return null
+
+    let set<int> indices ← indices_value coalesce no_indices
+
+    # The scan starts at the cursor's own document (never below the initial
+    # -1), not at document 0.
+    mut int start ← cursor.document
+
+    if start ≺ 0 {
+        start ← 0
+    }
+
+    return lm_cursor_resolve(documents, indices, cursor.corpus, cursor.split, cursor.document, cursor.window, start, length, corpus_hash)
 }
 
 fn lm_cursor_window_at(list<int> tokens, int length, int document, int window) → LmWindow {
@@ -818,7 +953,25 @@ fn lm_cursor_advance(list<list<int>> documents, LmSplit split, LmCursor cursor, 
     if location_value is none then return null
 
     let LmCursor location ← location_value coalesce LmCursor { corpus = "", split = "", document = -1, window = 0 }
-    return lm_cursor_locate(documents, split, LmCursor { corpus = location.corpus, split = location.split, document = location.document, window = location.window + 1 }, length)
+    let list<int> empty_ints ← empty
+    let list<int> document ← documents.get(location.document) coalesce empty_ints
+
+    # Step within the located document first; only a rollover past its last
+    # window scans forward — the duplicate full locate of the old
+    # implementation is gone.
+    let int window_count ← (document.length() - 1) / length + 1
+
+    if location.window + 1 ≺ window_count {
+        return LmCursor { corpus = location.corpus, split = location.split, document = location.document, window = location.window + 1, corpus_hash = location.corpus_hash, corpus_hash_ready = location.corpus_hash_ready }
+    }
+
+    let set<int> no_indices ← empty
+    let _ indices_value ← lm_split_indices(documents, split, location.split)
+
+    if indices_value is none then return null
+
+    let set<int> indices ← indices_value coalesce no_indices
+    return lm_cursor_resolve(documents, indices, location.corpus, location.split, location.document + 1, 0, location.document + 1, length, location.corpus_hash)
 }
 
 # The wire's exhausted position: a document index below the initial -1, so a
@@ -833,7 +986,7 @@ const int LM_CURSOR_EXHAUSTED = -2
 # exhaustion instead of replaying the window it already consumed.
 @ public
 fn lm_cursor_finish(LmCursor cursor) → LmCursor {
-    return LmCursor { corpus = cursor.corpus, split = cursor.split, document = LM_CURSOR_EXHAUSTED, window = 0 }
+    return LmCursor { corpus = cursor.corpus, split = cursor.split, document = LM_CURSOR_EXHAUSTED, window = 0, corpus_hash = cursor.corpus_hash, corpus_hash_ready = cursor.corpus_hash_ready }
 }
 
 # -------------------------------------------------------------------------
