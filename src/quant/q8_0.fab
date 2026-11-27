@@ -105,7 +105,7 @@ fn from_bytes(list<u8> raw) → Q8_0 ⇥ Q8_0Error {
 
     let u16 bits ← raw[0 ‥ 2] ↦ u16 via le ⊥ 0 ∷ u16
 
-    if ((bits ↦ int) ⇒ 10) ∧ 31 ≡ 31 {
+    if (bits ↦ int) ⇒ 10 ∧ 31 ≡ 31 {
         if (bits ↦ int) ∧ 1023 ≢ 0 {
             throw variant BadScale { message = "NaN half scale in Q8_0 block" }
         }
@@ -113,10 +113,11 @@ fn from_bytes(list<u8> raw) → Q8_0 ⇥ Q8_0Error {
 
     let f16 d ← (bits ↦ b16) ↦ f16
     mut list<i8> quants ← empty
+
     for range 0 ‥ Q8_0_ELEMENTS let k {
         let int b ← raw[2 + k] ↦ int
         let int signed ← b ≥ 128 ✓ b - 256 ✗ b
-        quants.append((signed ↦ i8 ⊥ (0 ∷ i8)))
+        quants.append(signed ↦ i8 ⊥ 0 ∷ i8)
     }
 
     # The length gate above makes this conversion total; the handler keeps
@@ -144,6 +145,20 @@ fn decode_block(list<u8> raw) → list<f32> ⇥ Q8_0Error {
     }
 
     return y
+}
+
+# Device decoder over `tensor<Q8_0, [N]>`: one lane per block reads `d` and
+# `qs` directly in place with zero per-lane block copy, writing all 32
+# weights per block to `[b, 0..31]`.
+@ public
+kernel decode_tensor<size N>(tensor<Q8_0, [N]> blocks, mut tensor<f32, [N, 32]> output) → void {
+    for from blocks at [b] thread lane let blk {
+        let f32 d ← blk.d ↦ f32
+
+        for exclusive 32 let k {
+            output[[b, k]] ← (blk.qs[k] ↦ f32) * d
+        }
+    }
 }
 
 +++ faber test
@@ -420,4 +435,55 @@ test "NaN half scale is refused by name" {
 test "infinite half scale is data, not an error" {
     # 0x7c00 = +inf; the loader admits it (only NaN is malformed).
     assert block_result(filled_block(0, 124, 1)) ≡ "ok"
+}
+
+test "decode_tensor matches golden bit patterns and host dequant bit for bit across all 7 blocks" {
+    mut list<u8> all_raw ← empty
+
+    for range 0 ‥ 7 let i {
+        all_raw.extend(bytes_of(GOLDEN_BLOCKS[i]))
+    }
+
+    let list<b8> all_bytes ↤ all_raw
+
+    do {
+        let tensor<q8_0.Q8_0, [7]> blocks ← all_bytes ↦ tensor<q8_0.Q8_0, [7]> via le
+        mut tensor<f32, [7, 32]> out ← tf32[7, 32] {}
+        q8_0.decode_tensor(blocks, mut out)
+
+        for range 0 ‥ 7 let i {
+            let list<int> h ← host_bits(bytes_of(GOLDEN_BLOCKS[i]))
+            assert h.length() ≡ 32
+
+            for range 0 ‥ 32 let j {
+                let int got ← bits_of(out[[i, j]])
+                assert got ≡ GOLDEN_BITS[i][j]
+                assert got ≡ h[j]
+            }
+        }
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "decode_tensor preserves signed extremes, subnormal half scale, and IEEE-754 negative zero sign bits" {
+    mut list<u8> raw ← copy filled_block(255, 123, 128)
+    raw.extend(filled_block(1, 0, 127))
+    raw.extend(filled_block(0, 128, 127))
+    let list<b8> buf ↤ raw
+
+    do {
+        let tensor<q8_0.Q8_0, [3]> blocks ← buf ↦ tensor<q8_0.Q8_0, [3]> via le
+        mut tensor<f32, [3, 32]> out ← tf32[3, 32] {}
+        q8_0.decode_tensor(blocks, mut out)
+
+        assert out[[0, 0]] ≡ (-128.0 * 65504.0) ↦ f32
+        assert out[[0, 31]] ≡ (-128.0 * 65504.0) ↦ f32
+        assert bits_of(out[[1, 0]]) ≡ 0x36fe0000
+        assert bits_of(out[[2, 0]]) ≡ 0x80000000
+    }
+    catch err {
+        assert false
+    }
 }
