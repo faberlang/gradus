@@ -21,10 +21,10 @@ locale = "en"
 # Rule 17: the format lives in Gradus. `decode` reads the fields in place
 # and copies no block or field list.
 #
-# `Q5_0`, `decode`, and `from_bytes` are `@ public` (file_interface exports
-# `list<T, size N>`), and `decode_block` stays `@ public` as a host helper.
-# Device/Metal execution over `tensor<Q5_0, [N]>` remains blocked on compiler
-# record-tensor lowering (`f16` / array record fields in KIR and device bridge).
+# `Q5_0`, `decode`, `from_bytes`, and `decode_tensor` are `@ public`
+# (file_interface exports `list<T, size N>`), and `decode_block` stays
+# `@ public` as a host helper. `decode_tensor` reads `Q5_0` block fields
+# directly in place over `tensor<Q5_0, [N]>` on CPU and Metal KIR.
 
 # Elements per block.
 @ public
@@ -64,7 +64,7 @@ fn decode(Q5_0 b, i32 k) → f32 {
     let int j ← ki ≺ 16 ✓ ki ✗ ki - 16
     let int byte ← b.qs[j] ↦ int
     let int qh_byte ← b.qh[ki ⇒ 3] ↦ int
-    let int xh ← ((qh_byte ⇒ (ki ∧ 7)) ∧ 1) * 16
+    let int xh ← (qh_byte ⇒ (ki ∧ 7) ∧ 1) * 16
     let int nib ← ki ≺ 16 ✓ byte ∧ 15 ✗ byte ⇒ 4
     let int x ← (nib ∨ xh) - 16
     return (x ↦ f32) * (b.d ↦ f32)
@@ -81,7 +81,7 @@ fn from_bytes(list<u8> raw) → Q5_0 ⇥ Q5_0Error {
 
     let u16 bits ← raw[0 ‥ 2] ↦ u16 via le ⊥ 0 ∷ u16
 
-    if ((bits ↦ int) ⇒ 10) ∧ 31 ≡ 31 {
+    if (bits ↦ int) ⇒ 10 ∧ 31 ≡ 31 {
         if (bits ↦ int) ∧ 1023 ≢ 0 {
             throw variant BadScale { message = "NaN half scale in Q5_0 block" }
         }
@@ -111,19 +111,68 @@ fn decode_block(list<u8> raw) → list<f32> ⇥ Q5_0Error {
     let u32 qh ← b.qh[0 ‥ 4] ↦ u32 via le ⊥ 0 ∷ u32
 
     mut list<f32> y ← empty
+
     for exclusive Q5_0_ELEMENTS let k {
         y.append(0.0 ∷ f32)
     }
 
     for exclusive 16 let j {
         let int byte ← b.qs[j] ↦ int
-        let int lo ← ((byte ∧ 15) ∨ ((((qh ⇒ j) ∧ 1) ↦ int) * 16)) - 16
-        let int hi ← ((byte ⇒ 4) ∨ ((((qh ⇒ (j + 16)) ∧ 1) ↦ int) * 16)) - 16
+        let int lo ← (byte ∧ 15 ∨ ((qh ⇒ j ∧ 1) ↦ int) * 16) - 16
+        let int hi ← (byte ⇒ 4 ∨ ((qh ⇒ j + 16 ∧ 1) ↦ int) * 16) - 16
         y[j] ← (lo ↦ f32) * d
         y[j + 16] ← (hi ↦ f32) * d
     }
 
     return y
+}
+
+# Device decoder over `tensor<Q5_0, [N]>`: one lane per block reads `d`,
+# `qh`, and `qs` directly in place with zero per-lane block copy, writing
+# the 16 low-nibble weights to `[b, 0..15]` and 16 high-nibble weights to
+# `[b, 16..31]`.
+@ public
+kernel decode_tensor<size N>(tensor<Q5_0, [N]> blocks, mut tensor<f32, [N, 32]> output) → void {
+    for from blocks at [b] thread lane let blk {
+        let f32 d ← blk.d ↦ f32
+
+        for exclusive 16 let j {
+            let i32 qbyte ← blk.qs[j] ↦ i32
+            let i32 qh_lo_b ← blk.qh[j / 8] ↦ i32
+            let i32 qh_hi_b ← blk.qh[(j + 16) / 8] ↦ i32
+            let i32 bit ← j % 8
+            mut i32 pow ← 128
+
+            if bit ≡ 0 {
+                pow ← 1
+            }
+            elif bit ≡ 1 {
+                pow ← 2
+            }
+            elif bit ≡ 2 {
+                pow ← 4
+            }
+            elif bit ≡ 3 {
+                pow ← 8
+            }
+            elif bit ≡ 4 {
+                pow ← 16
+            }
+            elif bit ≡ 5 {
+                pow ← 32
+            }
+            elif bit ≡ 6 {
+                pow ← 64
+            }
+
+            let i32 qh_lo ← qh_lo_b / pow % 2
+            let i32 qh_hi ← qh_hi_b / pow % 2
+            let i32 lo ← qbyte % 16 + qh_lo * 16 - 16
+            let i32 hi ← qbyte / 16 + qh_hi * 16 - 16
+            output[[b, j]] ← (lo ↦ f32) * d
+            output[[b, j + 16]] ← (hi ↦ f32) * d
+        }
+    }
 }
 
 +++ faber test
@@ -358,4 +407,64 @@ test "negative zero scale preserves IEEE-754 sign bits" {
     assert bits_of(y[0]) ≡ 0x80000000
     assert bits_of(y[1]) ≡ 0x00000000
     assert bits_of(y[16]) ≡ 0x80000000
+}
+
+test "decode_tensor matches golden bit patterns and host dequant bit for bit across all 7 blocks" {
+    mut list<u8> all_raw ← empty
+
+    for range 0 ‥ 7 let i {
+        all_raw.extend(bytes_of(GOLDEN_BLOCKS[i]))
+    }
+
+    let list<b8> all_bytes ↤ all_raw
+
+    do {
+        let tensor<q5_0.Q5_0, [7]> blocks ← all_bytes ↦ tensor<q5_0.Q5_0, [7]> via le
+        mut tensor<f32, [7, 32]> out ← tf32[7, 32] {}
+        q5_0.decode_tensor(blocks, mut out)
+
+        for range 0 ‥ 7 let i {
+            let list<int> h ← host_bits(bytes_of(GOLDEN_BLOCKS[i]))
+            assert h.length() ≡ 32
+
+            for range 0 ‥ 32 let j {
+                let int got ← bits_of(out[[i, j]])
+                assert got ≡ GOLDEN_BITS[i][j]
+                assert got ≡ h[j]
+            }
+        }
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "decode_tensor covers nibble/qh branches and preserves IEEE-754 negative zero sign bits" {
+    mut list<u8> raw ← copy branch_block()
+    mut list<int> neg_zero ← [0, 128, 1, 0, 1, 0, 16, 15]
+
+    for range 0 ‥ 14 let i {
+        neg_zero.append(0)
+    }
+
+    raw.extend(bytes_of(neg_zero))
+    let list<b8> buf ↤ raw
+
+    do {
+        let tensor<q5_0.Q5_0, [2]> blocks ← buf ↦ tensor<q5_0.Q5_0, [2]> via le
+        mut tensor<f32, [2, 32]> out ← tf32[2, 32] {}
+        q5_0.decode_tensor(blocks, mut out)
+
+        assert out[[0, 0]] ≡ 0.0 ∷ f32
+        assert out[[0, 1]] ≡ -1.0 ∷ f32
+        assert out[[0, 16]] ≡ 1.0 ∷ f32
+        assert out[[0, 17]] ≡ -16.0 ∷ f32
+        assert out[[0, 2]] ≡ -16.0 ∷ f32
+        assert bits_of(out[[1, 0]]) ≡ 0x80000000
+        assert bits_of(out[[1, 1]]) ≡ 0x00000000
+        assert bits_of(out[[1, 16]]) ≡ 0x80000000
+    }
+    catch err {
+        assert false
+    }
 }

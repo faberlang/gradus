@@ -441,13 +441,17 @@ Generation configuration, sampling projection, serialized config, cursor limits,
 
 ## gradus:gradient
 
-Gradient records and the forward/companion gradient wrapper surface.
+Gradient records, GT05 microbatch accumulation/fresh-step lifecycle, and the forward/companion gradient wrapper surface.
 
 **Source**: `src/gradient.fab`
 
+**Decision on `Gradient` / `Gradients` (GT05 / #24)**: `Gradient` and `Gradients` are retained as the per-slot and per-bundle gradient carriers because `gradus:optimize.step` (`src/optimize.fab`) and the forward-backward wrapper contracts (`gradients_simple_loss`, `gradients_masked_mean`) consume them until GT06 (#22) migrates `optimize` to pure record-in/record-out updates. The GT05 lifecycle (`GradientSet`) composes directly with `Gradient`/`Gradients` and `parameter.Registry`.
+
 ### Public types
 
-- `union GradientError` — UnknownGradient, GradientVersion
+- `union GradientError` — UnknownGradient, GradientVersion, ShapeMismatch, DtypeMismatch, FrozenSlot, MissingSlot, ExtraSlot, InvalidValidCount, LifecycleError, ParameterFailure, TensorFailure
+- `union SlotStatus` — Missing, Disconnected, Populated
+- `union LifecyclePhase` — Accumulating, Normalised, Consumed, Reset
 - `class Gradient`
   - fields: string owner, string name, int version, tensor.NumericBlock payload
   - methods:
@@ -460,14 +464,45 @@ Gradient records and the forward/companion gradient wrapper surface.
   - methods:
     - `fn count() → int`
     - `fn find(string owner, string name) → Gradient ⇥ GradientError`
+- `class GradientSlot`
+  - fields: string owner, string name, dtype.DType slot_dtype, list<int> shape, int version, list<f32> data, SlotStatus status, int contributions
+- `class GradientSet`
+  - fields: int step_id, LifecyclePhase phase, int total_valid_count, list<GradientSlot> slots
+  - methods:
+    - `fn count() → int`
+    - `fn step() → int`
+    - `fn valid_count() → int`
+    - `fn is_accumulating() → bool`
+    - `fn is_normalised() → bool`
+    - `fn is_consumed() → bool`
+    - `fn is_reset() → bool`
+    - `fn slot(string owner, string name) → GradientSlot ⇥ GradientError`
+    - `fn status_of(string owner, string name) → string ⇥ GradientError`
 
 ### Public functions
 
 - `fn message(GradientError e) → string`
+- `fn slot_status_name(SlotStatus s) → string`
+- `fn lifecycle_phase_name(LifecyclePhase p) → string`
 - `fn construct(string name, string owner, int version, tensor.NumericBlock payload) → Gradient ⇥ GradientError`
 - `fn default() → Gradient`
 - `fn construct_gradients(list<Gradient> gradients) → Gradients`
 - `fn obsolete(Gradient g, int current_version) → bool`
+- `fn zero(parameter.Registry model) → GradientSet ⇥ GradientError`
+- `fn zero_step(parameter.Registry model, int step_id) → GradientSet ⇥ GradientError`
+- `fn mark_disconnected(GradientSet gs, parameter.Registry model, string owner, string name) → GradientSet ⇥ GradientError`
+- `fn accumulate(GradientSet acc, parameter.Registry model, Gradients batch, int valid_count) → GradientSet ⇥ GradientError`
+- `fn accumulate_sets(GradientSet a, GradientSet b) → GradientSet ⇥ GradientError`
+- `fn normalise(GradientSet g, int valid) → GradientSet ⇥ GradientError`
+- `fn consume(GradientSet g, parameter.Registry model) → tuple<GradientSet, Gradients> ⇥ GradientError`
+- `fn reset(GradientSet g) → GradientSet`
+- `fn next_step(GradientSet g, parameter.Registry model) → GradientSet ⇥ GradientError`
+- `fn zero_tensor_1d<size N>() → tensor<f32, [N]>`
+- `fn zero_tensor_2d<size R, size C>() → tensor<f32, [R, C]>`
+- `fn accumulate_tensor_1d<size N>(tensor<f32, [N]> a, tensor<f32, [N]> b) → tensor<f32, [N]>`
+- `fn accumulate_tensor_2d<size R, size C>(tensor<f32, [R, C]> a, tensor<f32, [R, C]> b) → tensor<f32, [R, C]>`
+- `fn normalise_tensor_1d<size N>(tensor<f32, [N]> g, i32 valid_count) → tensor<f32, [N]> ⇥ GradientError`
+- `fn normalise_tensor_2d<size R, size C>(tensor<f32, [R, C]> g, i32 valid_count) → tensor<f32, [R, C]> ⇥ GradientError`
 - `fn nil() → void`
 - `fn simple_loss<size R, size C>(tensor<f32, [R, C]> x, tensor<f32, [R, C]> w) → f32`
 - `fn gradients_simple_loss<size R, size C>(tensor<f32, [R, C]> x, tensor<f32, [R, C]> w, f32 upstream, string name, string owner, int version) → Gradients ⇥ GradientError`

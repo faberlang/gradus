@@ -140,7 +140,7 @@ kernel rope_pairs<size N>(tensor<f32, [N]> rpx, mut tensor<f32, [N]> rpo, i32 rp
 kernel rope_table<size P>(mut tensor<f32, [P]> rtcos, mut tensor<f32, [P]> rtsin, i32 rtpos, f32 rtlntheta) → void {
     let i32 span ← P ↦ i32 ⊥ 1
 
-    for from rtcos at [p] thread lane let ? {
+    for from rtcos at [p] thread lane {
         if span ≻ 0 and span ≤ 960 {
             let f32 freq ← (-(p ↦ f32) / (span ↦ f32) * rtlntheta).exp()
             let f32 ang ← (rtpos ↦ f32) * freq
@@ -241,6 +241,7 @@ kernel rope_half_qk_kv_write<size QD, size KVD, size C>(tensor<f32, [QD]> rhx, t
 
             if jj ≺ hf {
                 rho[[j]] ← v * c - rhx[[base + jj + hf]] * s
+
                 if j ≺ KVD and rhpos ≥ 0 and rhpos ≺ C {
                     kwkc[[rhpos, j]] ← rhk[[j]] * c - rhk[[base + jj + hf]] * s
                     kwvc[[rhpos, j]] ← rhv[[j]]
@@ -248,6 +249,7 @@ kernel rope_half_qk_kv_write<size QD, size KVD, size C>(tensor<f32, [QD]> rhx, t
             }
             else {
                 rho[[j]] ← rhx[[base + jj - hf]] * s + v * c
+
                 if j ≺ KVD and rhpos ≥ 0 and rhpos ≺ C {
                     kwkc[[rhpos, j]] ← rhk[[base + jj - hf]] * s + rhk[[j]] * c
                     kwvc[[rhpos, j]] ← rhv[[j]]
@@ -272,6 +274,7 @@ kernel rope_pairs_qk_kv_write<size QD, size KVD, size C>(tensor<f32, [QD]> rpx, 
 
             if jj % 2 ≡ 0 {
                 rpo[[j]] ← v * c - rpx[[j + 1]] * s
+
                 if j ≺ KVD and rppos ≥ 0 and rppos ≺ C {
                     kwkc[[rppos, j]] ← rpk[[j]] * c - rpk[[j + 1]] * s
                     kwvc[[rppos, j]] ← rpv[[j]]
@@ -279,6 +282,7 @@ kernel rope_pairs_qk_kv_write<size QD, size KVD, size C>(tensor<f32, [QD]> rpx, 
             }
             else {
                 rpo[[j]] ← rpx[[j - 1]] * s + v * c
+
                 if j ≺ KVD and rppos ≥ 0 and rppos ≺ C {
                     kwkc[[rppos, j]] ← rpk[[j - 1]] * s + rpk[[j]] * c
                     kwvc[[rppos, j]] ← rpv[[j]]
@@ -396,6 +400,127 @@ kernel attn_scores<size H, size C, size QD, size KVD>(tensor<f32, [H, C]> asdom,
 @ public
 kernel row_softmax<size H, size C>(tensor<f32, [H, C]> rsi, mut tensor<f32, [H, C]> rso) → void {
     rso ⇇ rsi.softmax()
+}
+
+# Prefix-bounded O(active_cols) two-pass online row softmax over `0 .. active_cols`,
+# writing 0.0 for masked columns `c >= active_cols` without computing `exp()` on
+# inactive KV capacity slots.
+@ public
+kernel row_softmax_prefix<size H, size C>(tensor<f32, [H]> rshdom, tensor<f32, [H, C]> rsi, mut tensor<f32, [H, C]> rso, i32 active_cols) → void {
+    let i32 c_len ← C ↦ i32 ⊥ 0
+
+    for from rshdom at [h] thread lane {
+        if c_len ∈ 1 … 16777215 and h ∈ 0 … 4095 {
+            mut i32 n ← active_cols
+
+            if n ≻ c_len {
+                n ← c_len
+            }
+
+            if n ≤ 0 {
+                for range 0 ‥ c_len let c {
+                    rso[[h, c]] ← 0.0
+                }
+            }
+            else {
+                mut f32 m ← rsi[[h, 0]]
+                mut f32 z ← 1.0
+
+                for range 1 ‥ n let k {
+                    let f32 sk ← rsi[[h, k]]
+
+                    if sk ≻ m {
+                        z ← z * (m - sk).exp() + 1.0
+                        m ← sk
+                    }
+                    else {
+                        z ← z + (sk - m).exp()
+                    }
+                }
+
+                let f32 inv_z ← 1.0 / z
+
+                for range 0 ‥ n let c {
+                    rso[[h, c]] ← (rsi[[h, c]] - m).exp() * inv_z
+                }
+
+                for range n ‥ c_len let c {
+                    rso[[h, c]] ← 0.0
+                }
+            }
+        }
+    }
+}
+
+# Dispatch `row_softmax` when all `C` columns are active and `row_softmax_prefix`
+# when only a prefix `active_cols < C` is active.
+@ public
+fn row_softmax_active<size H, size C>(tensor<f32, [H]> rshdom, tensor<f32, [H, C]> rsi, mut tensor<f32, [H, C]> rso, i32 active_cols) → void {
+    if (active_cols ↦ int) ≥ C {
+        row_softmax(rsi, mut rso)
+    }
+    else {
+        row_softmax_prefix(rshdom, rsi, mut rso, active_cols)
+    }
+}
+
+# Batched prefix-bounded O(active) two-pass online row softmax over `[BH, C]`,
+# matching `attn_scores_batch` / `attn_scores_ring_batch` causal/block-diffusion
+# active column limits per row `b = bh / heads` and zeroing inactive columns/rows.
+@ public
+kernel row_softmax_prefix_batch<size BH, size C>(tensor<f32, [BH]> rshdom, tensor<f32, [BH, C]> rsi, mut tensor<f32, [BH, C]> rso, i32 active_pos, i32 active_b, i32 heads, i32 blk_size, i32 limit_cols) → void {
+    let i32 c_len ← C ↦ i32 ⊥ 0
+
+    for from rshdom at [bh] thread lane {
+        if c_len ∈ 1 … 16777215 and bh ∈ 0 … 16777215 {
+            mut i32 n ← 0
+
+            if active_pos ≥ 0 and heads ∈ 1 … 4096 and blk_size ∈ 1 … 16383 and limit_cols ≥ 1 and active_b ∈ 1 … 16383 {
+                let i32 b ← bh / heads
+
+                if b ≺ active_b and b ∈ 0 … 16383 {
+                    let i32 blk ← b / blk_size
+                    let i32 next_b ← (blk + 1) * blk_size
+                    let i32 bend ← next_b ≻ active_b ✓ active_b ✗ next_b
+                    let i32 raw_n ← active_pos + bend
+                    let i32 capped ← raw_n ≻ limit_cols ✓ limit_cols ✗ raw_n
+                    n ← capped ≻ c_len ✓ c_len ✗ capped
+                }
+            }
+
+            if n ≤ 0 {
+                for range 0 ‥ c_len let c {
+                    rso[[bh, c]] ← 0.0
+                }
+            }
+            else {
+                mut f32 m ← rsi[[bh, 0]]
+                mut f32 z ← 1.0
+
+                for range 1 ‥ n let k {
+                    let f32 sk ← rsi[[bh, k]]
+
+                    if sk ≻ m {
+                        z ← z * (m - sk).exp() + 1.0
+                        m ← sk
+                    }
+                    else {
+                        z ← z + (sk - m).exp()
+                    }
+                }
+
+                let f32 inv_z ← 1.0 / z
+
+                for range 0 ‥ n let c {
+                    rso[[bh, c]] ← (rsi[[bh, c]] - m).exp() * inv_z
+                }
+
+                for range n ‥ c_len let c {
+                    rso[[bh, c]] ← 0.0
+                }
+            }
+        }
+    }
 }
 
 # GQA decode context (direct form for small cache capacity):
@@ -557,9 +682,7 @@ kernel add_bias<size N>(tensor<f32, [N]> abias, mut tensor<f32, [N]> abinto) →
 # Equal maxima keep the lowest index.
 @ public
 kernel argmax_token<size V>(tensor<f32, [V]> atx, mut tensor<i32, [1]> atid) → void {
-    atid[0] ← reduce via argmax from atx at [i] thread lane let v {
-        return v
-    } coalesce 0
+    atid[0] ← (reduce via argmax from atx at [i] thread lane let v ∴ v) coalesce 0
 }
 
 # Chunked top-M: lane `p` of `[P]` scans chunk `p` once (`O(V)` global reads)
@@ -568,7 +691,7 @@ kernel argmax_token<size V>(tensor<f32, [V]> atx, mut tensor<i32, [1]> atid) →
 # trailing slots with `-3.4028235e38` and sentinel index `-1`.
 @ public
 kernel topm_chunks<size P, size V, size M>(tensor<f32, [P]> tmdom, tensor<f32, [V]> tmx, mut tensor<f32, [P, M]> tmval, mut tensor<i32, [P, M]> tmidx, i32 tmchunk) → void {
-    for from tmdom at [p] thread lane let ? {
+    for from tmdom at [p] thread lane {
         let i32 mlen ← M
 
         if tmchunk ≥ 1 and mlen ≥ 1 and mlen ≤ 1023 and p ∈ 0 … 16383 {
@@ -600,7 +723,7 @@ kernel topm_chunks<size P, size V, size M>(tensor<f32, [P]> tmdom, tensor<f32, [
                             let i32 bi ← best_i[[rr]]
                             let f32 bv ← best_v[[rr]]
 
-                            if cur_i ≥ 0 and (bi ≺ 0 or cur_v ≻ bv or (cur_v ≡ bv and cur_i ≺ bi)) {
+                            if cur_i ≥ 0 and (bi ≺ 0 or cur_v ≻ bv or cur_v ≡ bv and cur_i ≺ bi) {
                                 best_v[[rr]] ← cur_v
                                 best_i[[rr]] ← cur_i
                                 cur_v ← bv
@@ -787,7 +910,7 @@ kernel rope_pairs_batch<size B, size N>(tensor<f32, [B, N]> rpx, mut tensor<f32,
 kernel rope_table_batch<size B, size P>(mut tensor<f32, [B, P]> rtcos, mut tensor<f32, [B, P]> rtsin, i32 rttpos, f32 rtlntheta, i32 rtactive) → void {
     let i32 span ← P ↦ i32 ⊥ 1
 
-    for from rtcos at [b, p] thread lane let ? {
+    for from rtcos at [b, p] thread lane {
         if b ≺ rtactive and span ≻ 0 and span ≤ 960 {
             let f32 freq ← (-(p ↦ f32) / (span ↦ f32) * rtlntheta).exp()
             let f32 ang ← ((rttpos + b) ↦ f32) * freq
@@ -938,7 +1061,7 @@ kernel attn_context_batch<size B, size QD, size BH, size C, size KVD>(tensor<f32
 # keeping score/prob scratch O(TileB * H * C) instead of O(MaxBatch * H * C).
 @ public
 kernel attn_scores_query_tile<size B, size TileBH, size C, size QD, size KVD>(tensor<f32, [TileBH, C]> asdom, tensor<f32, [B, QD]> asq, tensor<f32, [C, KVD]> askc, mut tensor<f32, [TileBH, C]> assc, i32 aspos, i32 asheads, i32 asgroup, i32 asdh, f32 asscale, i32 asactive, i32 asblk, i32 qstart, i32 qcount) → void {
-    for from asdom at [bh, c] thread lane let ? {
+    for from asdom at [bh, c] thread lane {
         if aspos ≺ 0 or asheads ≺ 1 or asheads ≻ 4096 or asgroup ≺ 1 or asgroup ≻ 128 or asdh ≺ 1 or asdh ≻ 960 or asblk ≺ 1 or qstart ≺ 0 or qcount ≺ 1 or bh ∉ 0 … 16777215 or c ∉ 0 … 16777215 {
             assc[[bh, c]] ← -3.0e38
         }
@@ -981,9 +1104,10 @@ kernel attn_scores_query_tile<size B, size TileBH, size C, size QD, size KVD>(te
 # writes `acctx[qstart + qb, j]` for `qb < qcount` and `qstart + qb < acactive`.
 @ public
 kernel attn_context_query_tile<size B, size TileB, size QD, size TileBH, size C, size KVD>(tensor<f32, [TileB, QD]> actiledom, tensor<f32, [TileBH, C]> acp, tensor<f32, [C, KVD]> acvc, mut tensor<f32, [B, QD]> acctx, i32 acpos, i32 acheads, i32 acgroup, i32 acdh, i32 acactive, i32 acblk, i32 qstart, i32 qcount) → void {
-    for from actiledom at [qb, j] thread lane let ? {
+    for from actiledom at [qb, j] thread lane {
         if qb ≺ qcount and qstart ≥ 0 and acpos ≥ 0 and acpos ≺ C and acheads ≥ 1 and acheads ≤ 4096 and acgroup ≥ 1 and acgroup ≤ 128 and acdh ≥ 1 and acdh ≤ 960 and acblk ≥ 1 and qb ∈ 0 … 16383 {
             let i32 b ← qstart + qb
+
             if b ≺ acactive and b ≺ B and b ∈ 0 … 16383 {
                 let i32 dh ← acdh
                 let i32 h ← j / dh

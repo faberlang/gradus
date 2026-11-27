@@ -51,11 +51,10 @@ union Q4_1Error {
 }
 
 fn is_nan_half_bits(int bits) → bool {
-    if (bits ⇒ 10) ∧ 31 ≡ 31 {
-        if bits ∧ 1023 ≢ 0 {
-            return true
-        }
+    if bits ⇒ 10 ∧ 31 ≡ 31 {
+        if bits ∧ 1023 ≢ 0 then return true
     }
+
     return false
 }
 
@@ -122,6 +121,7 @@ fn decode_block(list<u8> raw) → list<f32> ⇥ Q4_1Error {
     let f32 m ← b.m ↦ f32
 
     mut list<f32> y ← empty
+
     for exclusive Q4_1_ELEMENTS let k {
         y.append(0.0 ∷ f32)
     }
@@ -133,6 +133,26 @@ fn decode_block(list<u8> raw) → list<f32> ⇥ Q4_1Error {
     }
 
     return y
+}
+
+# Device decoder over `tensor<Q4_1, [N]>`: one lane per block reads `d`,
+# `m`, and `qs` directly in place with zero per-lane block copy, writing
+# the 16 low-nibble weights to `[b, 0..15]` and 16 high-nibble weights to
+# `[b, 16..31]`.
+@ public
+kernel decode_tensor<size N>(tensor<Q4_1, [N]> blocks, mut tensor<f32, [N, 32]> output) → void {
+    for from blocks at [b] thread lane let blk {
+        let f32 d ← blk.d ↦ f32
+        let f32 m ← blk.m ↦ f32
+
+        for exclusive 16 let j {
+            let i32 byte ← blk.qs[j] ↦ i32
+            let i32 lo ← byte % 16
+            let i32 hi ← byte / 16
+            output[[b, j]] ← (lo ↦ f32) * d + m
+            output[[b, j + 16]] ← (hi ↦ f32) * d + m
+        }
+    }
 }
 
 +++ faber test
@@ -308,4 +328,58 @@ test "Q4_1 NaN half scale and NaN half min are refused" {
     assert block_result(filled_block(0, 60, 0, 126, 0)) ≡ "NaN half min in Q4_1 block"
     assert block_result(filled_block(0, 60, 1, 124, 0)) ≡ "NaN half min in Q4_1 block"
     assert block_result(filled_block(0, 124, 0, 60, 0)) ≡ "ok"
+}
+
+test "Q4_1 decode_tensor matches golden bit patterns and host dequant bit for bit across all 5 blocks" {
+    mut list<u8> all_raw ← empty
+
+    for range 0 ‥ 5 let i {
+        all_raw.extend(bytes_of(GOLDEN_BLOCKS[i]))
+    }
+
+    let list<b8> all_bytes ↤ all_raw
+
+    do {
+        let tensor<q4_1.Q4_1, [5]> blocks ← all_bytes ↦ tensor<q4_1.Q4_1, [5]> via le
+        mut tensor<f32, [5, 32]> out ← tf32[5, 32] {}
+        q4_1.decode_tensor(blocks, mut out)
+
+        for range 0 ‥ 5 let i {
+            let list<int> h ← host_bits(bytes_of(GOLDEN_BLOCKS[i]))
+            assert h.length() ≡ 32
+
+            for range 0 ‥ 32 let j {
+                let int got ← bits_of(out[[i, j]])
+                assert got ≡ GOLDEN_BITS[i][j]
+                assert got ≡ h[j]
+            }
+        }
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "Q4_1 decode_tensor preserves negative zero min and non-uniform nibble lanes" {
+    mut list<u8> raw ← copy filled_block(0, 60, 0, 128, 0x21)
+    raw.extend(filled_block(0, 192, 0, 60, 0xf0))
+    raw.extend(filled_block(0, 188, 0, 128, 0x10))
+    let list<b8> buf ↤ raw
+
+    do {
+        let tensor<q4_1.Q4_1, [3]> blocks ← buf ↦ tensor<q4_1.Q4_1, [3]> via le
+        mut tensor<f32, [3, 32]> out ← tf32[3, 32] {}
+        q4_1.decode_tensor(blocks, mut out)
+
+        assert out[[0, 0]] ≡ 1.0 ∷ f32
+        assert out[[0, 16]] ≡ 2.0 ∷ f32
+        assert out[[1, 0]] ≡ 1.0 ∷ f32
+        assert out[[1, 16]] ≡ -29.0 ∷ f32
+        assert bits_of(out[[2, 0]]) ≡ bits_of(-0.0 ∷ f32)
+        assert bits_of(out[[2, 0]]) ≢ bits_of(0.0 ∷ f32)
+        assert out[[2, 16]] ≡ -1.0 ∷ f32
+    }
+    catch err {
+        assert false
+    }
 }

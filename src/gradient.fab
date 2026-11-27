@@ -66,7 +66,22 @@ locale = "en"
 # check/run divergence remains an E8 residual, so gradient-value identity
 # is explicitly deferred to a runtime-evidence gate
 # (auditor-owned faber test path; oracle pins recorded in gradient.proba).
+import from "gradus:dtype"
+
+import from "gradus:parameter"
+
 import from "gradus:tensor"
+
+# --- GT05 decision on Gradient / Gradients -------------------------------
+# `Gradient` and `Gradients` are retained as the per-slot and per-bundle
+# gradient carriers because `gradus:optimize.step` (`src/optimize.fab`) and
+# the forward-backward wrapper contracts (`gradients_simple_loss`,
+# `gradients_masked_mean`) consume them until GT06 (#22) migrates
+# `optimize` to pure record-in/record-out updates. The GT05 microbatch
+# accumulation and fresh-step lifecycle (`GradientSet`: `zero`,
+# `accumulate`, `accumulate_sets`, `normalise`, `consume`, `reset`,
+# `next_step`, `mark_disconnected`) composes with `Gradient`/`Gradients`
+# and `parameter.Registry`.
 
 # --- GradientError: typed vocabulary of the gradient-call contract -------
 @ public
@@ -77,9 +92,24 @@ union GradientError {
     UnknownGradient,
     GradientVersion,
     InvalidMask,
+    ShapeMismatch,
+    DtypeMismatch,
+    FrozenSlot,
+    MissingSlot,
+    ExtraSlot,
+    InvalidValidCount,
+    LifecycleError,
+    ParameterFailure {
+        parameter.ParameterError inner
+    },
     TensorFailure {
         tensor.TensorError inner
     }
+}
+
+@ conversion
+fn from_parameter_error(parameter.ParameterError err) → GradientError {
+    return variant ParameterFailure { message = err.message, inner = err }
 }
 
 @ conversion
@@ -161,6 +191,562 @@ fn construct_gradients(list<Gradient> gradients) → Gradients {
 @ public
 fn obsolete(Gradient g, int current_version) → bool {
     return g.version ≢ current_version
+}
+
+# --- GT05 gradient-record lifecycle -------------------------------------
+# Microbatch accumulation, tied-weight deduplication, frozen-slot exclusion,
+# missing-vs-disconnected tracking, and fresh-step consumption guards.
+
+@ public
+union SlotStatus {
+    Missing,
+    Disconnected,
+    Populated
+}
+
+@ public
+fn slot_status_name(SlotStatus s) → string {
+    match s {
+        case Missing {
+            return "missing"
+        }
+        case Disconnected {
+            return "disconnected"
+        }
+        case Populated {
+            return "populated"
+        }
+    }
+}
+
+@ public
+union LifecyclePhase {
+    Accumulating,
+    Normalised,
+    Consumed,
+    Reset
+}
+
+@ public
+fn lifecycle_phase_name(LifecyclePhase p) → string {
+    match p {
+        case Accumulating {
+            return "accumulating"
+        }
+        case Normalised {
+            return "normalised"
+        }
+        case Consumed {
+            return "consumed"
+        }
+        case Reset {
+            return "reset"
+        }
+    }
+}
+
+@ public
+class GradientSlot {
+    mut string owner
+    mut string name
+    mut dtype.DType slot_dtype
+    mut list<int> shape
+    mut int version
+    mut list<f32> data
+    mut SlotStatus status
+    mut int contributions
+}
+
+@ public
+class GradientSet {
+    mut int step_id
+    mut LifecyclePhase phase
+    mut int total_valid_count
+    mut list<GradientSlot> slots
+
+    fn count() → int {
+        return self.slots.length()
+    }
+
+    fn step() → int {
+        return self.step_id
+    }
+
+    fn valid_count() → int {
+        return self.total_valid_count
+    }
+
+    fn is_accumulating() → bool {
+        match self.phase {
+            case Accumulating {
+                return true
+            }
+            case _ {
+                return false
+            }
+        }
+    }
+
+    fn is_normalised() → bool {
+        match self.phase {
+            case Normalised {
+                return true
+            }
+            case _ {
+                return false
+            }
+        }
+    }
+
+    fn is_consumed() → bool {
+        match self.phase {
+            case Consumed {
+                return true
+            }
+            case _ {
+                return false
+            }
+        }
+    }
+
+    fn is_reset() → bool {
+        match self.phase {
+            case Reset {
+                return true
+            }
+            case _ {
+                return false
+            }
+        }
+    }
+
+    fn slot(string owner, string name) → GradientSlot ⇥ GradientError {
+        require self.is_accumulating() or self.is_normalised() throw variant LifecycleError { message = "gradient set is no longer readable (consumed or reset)" }
+
+        for from self.slots let s {
+            if s.owner ≡ owner and s.name ≡ name then return s
+        }
+
+        throw variant UnknownGradient { message = "no gradient slot for that parameter identity" }
+    }
+
+    fn status_of(string owner, string name) → string ⇥ GradientError {
+        let GradientSlot s ← self.slot(owner, name)
+        return slot_status_name(s.status)
+    }
+}
+
+fn slot_key(string owner, string name) → string {
+    return "§\u{00}§"(owner, name)
+}
+
+fn zero_f32_list(int n) → list<f32> {
+    mut list<f32> out ← empty
+
+    for exclusive n {
+        out.append(0.0 ∷ f32)
+    }
+
+    return out
+}
+
+fn copy_f32_list(list<f32> src) → list<f32> {
+    mut list<f32> out ← empty
+
+    for from src let v {
+        out.append(v)
+    }
+
+    return out
+}
+
+fn copy_int_list(list<int> src) → list<int> {
+    mut list<int> out ← empty
+
+    for from src let v {
+        out.append(v)
+    }
+
+    return out
+}
+
+fn clone_slot(GradientSlot s) → GradientSlot {
+    return GradientSlot { owner = s.owner, name = s.name, slot_dtype = s.slot_dtype, shape = copy_int_list(s.shape), version = s.version, data = copy_f32_list(s.data), status = s.status, contributions = s.contributions }
+}
+
+fn build_slot_index(list<GradientSlot> slots) → map<string, int> {
+    mut map<string, int> idx ← empty
+    mut int i ← 0
+
+    for from slots let s {
+        idx.put(slot_key(s.owner, s.name), i)
+        i ← i + 1
+    }
+
+    return idx
+}
+
+fn status_is_missing(SlotStatus s) → bool {
+    match s {
+        case Missing {
+            return true
+        }
+        case _ {
+            return false
+        }
+    }
+}
+
+fn status_is_disconnected(SlotStatus s) → bool {
+    match s {
+        case Disconnected {
+            return true
+        }
+        case _ {
+            return false
+        }
+    }
+}
+
+fn status_is_populated(SlotStatus s) → bool {
+    match s {
+        case Populated {
+            return true
+        }
+        case _ {
+            return false
+        }
+    }
+}
+
+fn resolve_registry_param(parameter.Registry model, string owner, string name) → parameter.Parameter ⇥ GradientError {
+    do {
+        return model.find(owner, name)
+    }
+    catch err {
+        throw variant ExtraSlot { message = "gradient slot is not registered in model: §/§"(owner, name) }
+    }
+}
+
+fn validate_slots_match_model(GradientSet gs, parameter.Registry model) → void ⇥ GradientError {
+    let list<parameter.Parameter> trainables ← model.trainable()
+
+    require gs.slots.length() ≡ trainables.length() throw variant MissingSlot { message = "gradient set slot count does not match model trainable parameters" }
+
+    for from gs.slots let s {
+        let parameter.Parameter p ← resolve_registry_param(model, s.owner, s.name)
+
+        reject parameter.is_frozen(p) throw variant FrozenSlot { message = "frozen parameter cannot hold a gradient slot" }
+
+        reject p.version() ≢ s.version throw variant GradientVersion { message = "stale gradient set: parameter mutated since zero" }
+
+        require dtype.eq(p.identity.dtype, s.slot_dtype) throw variant DtypeMismatch { message = "parameter dtype changed since gradient zero" }
+
+        require p.shape() ≡ s.shape throw variant ShapeMismatch { message = "parameter shape changed since gradient zero" }
+    }
+}
+
+# Initialize a fresh accumulating GradientSet for step 1 over all canonical
+# trainable parameters in `model`. Frozen parameters are excluded; tied
+# parameters yield one canonical slot.
+@ public
+fn zero(parameter.Registry model) → GradientSet ⇥ GradientError {
+    return zero_step(model, 1)
+}
+
+# Initialize a fresh accumulating GradientSet for `step_id` (≥ 1) over all
+# canonical trainable parameters in `model`.
+@ public
+fn zero_step(parameter.Registry model, int step_id) → GradientSet ⇥ GradientError {
+    require step_id ≥ 1 throw variant GradientVersion { message = "invalid gradient step id" }
+
+    mut list<GradientSlot> slots ← empty
+
+    for from model.trainable() let p {
+        slots.append(GradientSlot { owner = p.owner(), name = p.name(), slot_dtype = p.identity.dtype, shape = copy_int_list(p.shape()), version = p.version(), data = zero_f32_list(p.numel()), status = variant Missing, contributions = 0 })
+    }
+
+    return GradientSet { step_id = step_id, phase = variant Accumulating, total_valid_count = 0, slots = slots }
+}
+
+# Mark an untouched trainable parameter (or tied alias) as intentionally
+# disconnected for this step (zero gradient, distinct from Missing).
+@ public
+fn mark_disconnected(GradientSet gs, parameter.Registry model, string owner, string name) → GradientSet ⇥ GradientError {
+    require gs.is_accumulating() throw variant LifecycleError { message = "cannot mark disconnected outside accumulating phase" }
+
+    let parameter.Parameter p ← resolve_registry_param(model, owner, name)
+
+    reject parameter.is_frozen(p) throw variant FrozenSlot { message = "frozen parameter cannot hold a gradient slot" }
+
+    let map<string, int> idx ← build_slot_index(gs.slots)
+    let int pos ← idx.get(slot_key(p.owner(), p.name())) coalesce (-1)
+
+    require pos ≥ 0 throw variant MissingSlot { message = "parameter missing from gradient set" }
+
+    let GradientSlot cur ← gs.slots[pos]
+
+    reject p.version() ≢ cur.version throw variant GradientVersion { message = "stale gradient set: parameter mutated since zero" }
+
+    require dtype.eq(p.identity.dtype, cur.slot_dtype) throw variant DtypeMismatch { message = "gradient slot dtype mismatch" }
+
+    require p.shape() ≡ cur.shape throw variant ShapeMismatch { message = "gradient slot shape mismatch" }
+
+    reject status_is_populated(cur.status) throw variant LifecycleError { message = "cannot mark an already populated slot as disconnected" }
+
+    mut list<GradientSlot> next_slots ← empty
+
+    for range 0 ‥ gs.slots.length() let i {
+        mut GradientSlot cloned ← clone_slot(gs.slots[i])
+
+        if i ≡ pos {
+            cloned.status ← variant Disconnected
+        }
+
+        next_slots.append(cloned)
+    }
+
+    return GradientSet { step_id = gs.step_id, phase = variant Accumulating, total_valid_count = gs.total_valid_count, slots = next_slots }
+}
+
+# Accumulate one microbatch `batch` (with `valid_count` active examples)
+# into `acc`. Validates all slots against `model` BEFORE producing the new
+# state. Tied aliases resolve to their canonical slot and sum deterministically.
+# Non-disconnected trainable slots missing from `batch` fail with MissingSlot.
+@ public
+fn accumulate(GradientSet acc, parameter.Registry model, Gradients batch, int valid_count) → GradientSet ⇥ GradientError {
+    require acc.is_accumulating() throw variant LifecycleError { message = "cannot accumulate into a non-accumulating gradient set" }
+
+    require valid_count ≥ 0 throw variant InvalidValidCount { message = "valid count must be non-negative" }
+
+    validate_slots_match_model(acc, model)
+
+    let map<string, int> idx ← build_slot_index(acc.slots)
+    mut list<int> target_slots ← empty
+    mut set<int> covered_slots ← empty
+
+    for from batch.gradients let g {
+        let parameter.Parameter p ← resolve_registry_param(model, g.owner, g.name)
+
+        reject parameter.is_frozen(p) throw variant FrozenSlot { message = "cannot accumulate gradient for frozen parameter" }
+
+        let int pos ← idx.get(slot_key(p.owner(), p.name())) coalesce (-1)
+
+        require pos ≥ 0 throw variant MissingSlot { message = "canonical trainable slot missing from gradient set" }
+
+        let GradientSlot slot ← acc.slots[pos]
+
+        reject obsolete(g, slot.version) throw variant GradientVersion { message = "stale gradient: version does not match active step" }
+
+        require dtype.eq(g.payload.dtype, slot.slot_dtype) throw variant DtypeMismatch { message = "gradient dtype does not match parameter slot" }
+
+        require g.payload.shape ≡ slot.shape and g.payload.data.length() ≡ slot.data.length() throw variant ShapeMismatch { message = "gradient shape does not match parameter slot" }
+
+        target_slots.append(pos)
+        covered_slots.add(pos)
+    }
+
+    for range 0 ‥ acc.slots.length() let pos {
+        if not (pos ∈ covered_slots) and not status_is_disconnected(acc.slots[pos].status) {
+            throw variant MissingSlot { message = "missing gradient for trainable parameter: §/§"(acc.slots[pos].owner, acc.slots[pos].name) }
+        }
+    }
+
+    mut list<GradientSlot> next_slots ← empty
+
+    for from acc.slots let s {
+        next_slots.append(clone_slot(s))
+    }
+
+    mut int bi ← 0
+
+    for from batch.gradients let g {
+        let int pos ← target_slots[bi]
+        mut GradientSlot slot ← next_slots[pos]
+        let int n ← slot.data.length()
+
+        for exclusive n let k {
+            slot.data[k] ← slot.data[k] + g.payload.data[k]
+        }
+
+        slot.status ← variant Populated
+        slot.contributions ← slot.contributions + 1
+        bi ← bi + 1
+    }
+
+    return GradientSet { step_id = acc.step_id, phase = variant Accumulating, total_valid_count = acc.total_valid_count + valid_count, slots = next_slots }
+}
+
+# Combine two accumulating GradientSets from the same step and schema.
+@ public
+fn accumulate_sets(GradientSet a, GradientSet b) → GradientSet ⇥ GradientError {
+    require a.is_accumulating() and b.is_accumulating() throw variant LifecycleError { message = "both gradient sets must be in accumulating phase" }
+
+    require a.step_id ≡ b.step_id throw variant LifecycleError { message = "cannot accumulate gradient sets from different steps" }
+
+    require a.slots.length() ≡ b.slots.length() throw variant MissingSlot { message = "gradient sets have different slot counts" }
+
+    let map<string, int> b_idx ← build_slot_index(b.slots)
+    mut list<int> b_order ← empty
+
+    for from a.slots let sa {
+        let int pos ← b_idx.get(slot_key(sa.owner, sa.name)) coalesce (-1)
+
+        require pos ≥ 0 throw variant ExtraSlot { message = "gradient set slot missing in second accumulator" }
+
+        let GradientSlot sb ← b.slots[pos]
+
+        reject sa.version ≢ sb.version throw variant GradientVersion { message = "gradient version mismatch across accumulators" }
+
+        require dtype.eq(sa.slot_dtype, sb.slot_dtype) throw variant DtypeMismatch { message = "gradient dtype mismatch across accumulators" }
+
+        require sa.shape ≡ sb.shape and sa.data.length() ≡ sb.data.length() throw variant ShapeMismatch { message = "gradient shape mismatch across accumulators" }
+
+        b_order.append(pos)
+    }
+
+    mut list<GradientSlot> next_slots ← empty
+
+    for range 0 ‥ a.slots.length() let i {
+        let GradientSlot sa ← a.slots[i]
+        let GradientSlot sb ← b.slots[b_order[i]]
+        mut GradientSlot merged ← clone_slot(sa)
+
+        for exclusive merged.data.length() let k {
+            merged.data[k] ← sa.data[k] + sb.data[k]
+        }
+
+        if status_is_populated(sa.status) or status_is_populated(sb.status) {
+            merged.status ← variant Populated
+        }
+        elif status_is_disconnected(sa.status) and status_is_disconnected(sb.status) {
+            merged.status ← variant Disconnected
+        }
+        elif status_is_disconnected(sa.status) and status_is_missing(sb.status) {
+            merged.status ← variant Disconnected
+        }
+        elif status_is_missing(sa.status) and status_is_disconnected(sb.status) {
+            merged.status ← variant Disconnected
+        }
+        else {
+            merged.status ← variant Missing
+        }
+
+        merged.contributions ← sa.contributions + sb.contributions
+        next_slots.append(merged)
+    }
+
+    return GradientSet { step_id = a.step_id, phase = variant Accumulating, total_valid_count = a.total_valid_count + b.total_valid_count, slots = next_slots }
+}
+
+# Normalise accumulated gradients by `valid` (must be > 0). Fails closed on
+# any slot still in Missing status while preserving Disconnected zero slots.
+@ public
+fn normalise(GradientSet g, int valid) → GradientSet ⇥ GradientError {
+    require g.is_accumulating() throw variant LifecycleError { message = "can only normalise an accumulating gradient set" }
+
+    require valid ≻ 0 throw variant InvalidValidCount { message = "normalisation valid count must be positive" }
+
+    for from g.slots let s {
+        reject status_is_missing(s.status) throw variant MissingSlot { message = "missing gradient for trainable parameter: §/§"(s.owner, s.name) }
+    }
+
+    let f32 inv ← 1.0 ∷ f32 / (valid ↦ f32)
+    mut list<GradientSlot> next_slots ← empty
+
+    for from g.slots let s {
+        mut GradientSlot out_s ← clone_slot(s)
+
+        if status_is_populated(s.status) {
+            for exclusive out_s.data.length() let k {
+                out_s.data[k] ← out_s.data[k] * inv
+            }
+        }
+        else {
+            for exclusive out_s.data.length() let k {
+                out_s.data[k] ← 0.0 ∷ f32
+            }
+        }
+
+        next_slots.append(out_s)
+    }
+
+    return GradientSet { step_id = g.step_id, phase = variant Normalised, total_valid_count = valid, slots = next_slots }
+}
+
+# Consume a normalised GradientSet once, returning the Consumed set and the
+# normalised Gradients bundle. Fails closed if already consumed, reset, or
+# unnormalised, or if `model` mutated before consumption.
+@ public
+fn consume(GradientSet g, parameter.Registry model) → tuple<GradientSet, Gradients> ⇥ GradientError {
+    require g.is_normalised() throw variant LifecycleError { message = "gradient set must be normalised and unconsumed before consume" }
+
+    validate_slots_match_model(g, model)
+
+    mut list<Gradient> out_list ← empty
+
+    for from g.slots let s {
+        let tensor.NumericBlock nb ← tensor.construct_f32(copy_f32_list(s.data), copy_int_list(s.shape))
+        let Gradient rec ← construct(s.name, s.owner, s.version, nb)
+        out_list.append(rec)
+    }
+
+    let GradientSet consumed ← GradientSet { step_id = g.step_id, phase = variant Consumed, total_valid_count = g.total_valid_count, slots = empty }
+    return tuple<GradientSet, Gradients> [consumed, construct_gradients(out_list)]
+}
+
+# Explicitly reset/invalidate a GradientSet so step N+1 cannot read or
+# consume step N's gradients.
+@ public
+fn reset(GradientSet g) → GradientSet {
+    return GradientSet { step_id = g.step_id, phase = variant Reset, total_valid_count = 0, slots = empty }
+}
+
+# Start a fresh GradientSet for step `g.step_id + 1`. Requires `g` to be
+# consumed or reset so active step gradients are not silently dropped.
+@ public
+fn next_step(GradientSet g, parameter.Registry model) → GradientSet ⇥ GradientError {
+    require g.is_consumed() or g.is_reset() throw variant LifecycleError { message = "must consume or reset current step before starting next step" }
+
+    return zero_step(model, g.step_id + 1)
+}
+
+# --- Typed-tensor accumulation helpers (for record-shaped train folds) ---
+
+@ public
+fn zero_tensor_1d<size N>() → tensor<f32, [N]> {
+    return tf32[N] {}
+}
+
+@ public
+fn zero_tensor_2d<size R, size C>() → tensor<f32, [R, C]> {
+    return tf32[R, C] {}
+}
+
+@ public
+fn accumulate_tensor_1d<size N>(tensor<f32, [N]> a, tensor<f32, [N]> b) → tensor<f32, [N]> {
+    return a + b
+}
+
+@ public
+fn accumulate_tensor_2d<size R, size C>(tensor<f32, [R, C]> a, tensor<f32, [R, C]> b) → tensor<f32, [R, C]> {
+    return a + b
+}
+
+@ public
+fn normalise_tensor_1d<size N>(tensor<f32, [N]> g, i32 valid_count) → tensor<f32, [N]> ⇥ GradientError {
+    require valid_count ≻ 0 throw variant InvalidValidCount { message = "normalisation valid count must be positive" }
+
+    let f32 inv ← 1.0 ∷ f32 / (valid_count ↦ f32)
+    return g * inv
+}
+
+@ public
+fn normalise_tensor_2d<size R, size C>(tensor<f32, [R, C]> g, i32 valid_count) → tensor<f32, [R, C]> ⇥ GradientError {
+    require valid_count ≻ 0 throw variant InvalidValidCount { message = "normalisation valid count must be positive" }
+
+    let f32 inv ← 1.0 ∷ f32 / (valid_count ↦ f32)
+    return g * inv
 }
 
 # --- Companion ABI nil ---------------------------------------------------
@@ -301,16 +887,18 @@ fn cross_entropy_logits_value_gradient<size N, size C>(tensor<f32, [N, C]> logit
 
 # Masked next-token cross entropy forward + logits gradient (issue #21 / GT20).
 # Uses `valid_count` (count of included rows) as the mean denominator rather than
-# padded row count N, and zeroes ignored rows of the logits gradient via `row_mask`.
+# padded row count N, and zeroes ignored rows in both loss and logits gradient
+# via `row_mask`.
 @ public
 fn cross_entropy_masked_logits_value_gradient<size N, size C>(tensor<f32, [N, C]> logits, tensor<f32, [N, C]> masked_one_hot, tensor<f32, [N, C]> row_mask, f32 valid_count, f32 upstream) → tuple<f32, tensor<f32, [N, C]>> ⇥ GradientError {
     require valid_count ≻ 0.0 ∷ f32 throw variant InvalidMask { message = "masked cross entropy requires at least one valid target" }
 
     let tensor<f32, [N, C]> probs ← logits.softmax()
+    let tensor<f32, [N, C]> active_targets ← masked_one_hot ⊙ row_mask
     let f32 inv_valid ← 1.0 ∷ f32 / valid_count
     let f32 eps ← 0.0000001 ∷ f32
-    let f32 value ← -(masked_one_hot ⊙ (probs + eps).ln()).sum() * inv_valid
-    let tensor<f32, [N, C]> grad ← ((probs - masked_one_hot) ⊙ row_mask) * (upstream * inv_valid)
+    let f32 value ← -(active_targets ⊙ (probs + eps).ln()).sum() * inv_valid
+    let tensor<f32, [N, C]> grad ← ((probs - active_targets) ⊙ row_mask) * (upstream * inv_valid)
     return tuple<f32, tensor<f32, [N, C]>> [value, grad]
 }
 
@@ -319,9 +907,10 @@ fn cross_entropy_masked_logits_value_gradient<size N, size C>(tensor<f32, [N, C]
 @ public
 fn cross_entropy_masked_logits_sum_gradient<size N, size C>(tensor<f32, [N, C]> logits, tensor<f32, [N, C]> masked_one_hot, tensor<f32, [N, C]> row_mask, f32 upstream) → tuple<f32, tensor<f32, [N, C]>> {
     let tensor<f32, [N, C]> probs ← logits.softmax()
+    let tensor<f32, [N, C]> active_targets ← masked_one_hot ⊙ row_mask
     let f32 eps ← 0.0000001 ∷ f32
-    let f32 loss_sum ← -(masked_one_hot ⊙ (probs + eps).ln()).sum()
-    let tensor<f32, [N, C]> grad_sum ← ((probs - masked_one_hot) ⊙ row_mask) * upstream
+    let f32 loss_sum ← -(active_targets ⊙ (probs + eps).ln()).sum()
+    let tensor<f32, [N, C]> grad_sum ← ((probs - active_targets) ⊙ row_mask) * upstream
     return tuple<f32, tensor<f32, [N, C]>> [loss_sum, grad_sum]
 }
 
@@ -371,6 +960,8 @@ fn cross_entropy_masked_logits_sum_gradient<size N, size C>(tensor<f32, [N, C]> 
 # compile-level proof; no runtime value identity is claimed here.
 
 import from "gradus:gradient" gradient
+
+import from "gradus:parameter" parameter
 
 import from "gradus:tensor" tensor
 
@@ -628,6 +1219,36 @@ test "cross_entropy_masked_logits_value_gradient stays finite on extreme logits 
     assert combined_mean.approx(1.407606 ∷ f32, CROSS_ENTROPY_GRAD_TOLERANCE)
 }
 
+test "cross_entropy_masked_logits_value_gradient masks non-zero ignored targets and rejects zero valid count" {
+    do {
+        let _ padded_logits ← [[0.5, 1.5, 2.5], [10.0, 0.0, 5.0], [2.5, 1.5, 0.5]] ↦ tf32[3, 3]
+        let _ unzeroed_targets ← [[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]] ↦ tf32[3, 3]
+        let _ row_mask ← [[1.0, 1.0, 1.0], [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]] ↦ tf32[3, 3]
+        let _ masked_vg ← gradient.cross_entropy_masked_logits_value_gradient<size 3, size 3>(padded_logits, unzeroed_targets, row_mask, 2.0 ∷ f32, 1.0 ∷ f32)
+        let [masked_val, masked_grad] ← masked_vg
+        assert masked_val.approx(1.407606 ∷ f32, CROSS_ENTROPY_GRAD_TOLERANCE)
+        let list<f32> mg ↤ masked_grad
+        assert mg[3] ≡ 0.0 ∷ f32
+        assert mg[4] ≡ 0.0 ∷ f32
+        assert mg[5] ≡ 0.0 ∷ f32
+    }
+    catch err {
+        assert err.message ≡ "unexpected masked ce failure"
+    }
+
+    mut string zero_msg ← ""
+    do {
+        let _ logits ← [[0.5, 1.5, 2.5]] ↦ tf32[1, 3]
+        let _ targets ← [[0.0, 1.0, 0.0]] ↦ tf32[1, 3]
+        let _ zero_mask ← [[0.0, 0.0, 0.0]] ↦ tf32[1, 3]
+        let _ ? ← gradient.cross_entropy_masked_logits_value_gradient<size 1, size 3>(logits, targets, zero_mask, 0.0 ∷ f32, 1.0 ∷ f32)
+    }
+    catch err {
+        zero_msg ← err.message
+    }
+    assert zero_msg ≡ "masked cross entropy requires at least one valid target"
+}
+
 # Masked CruxEntropia gradients are not implemented: its current VJP uses
 # every row and divides by N. A mask-aware VJP must scale included rows by
 # valid_count and return exact zero for ignored rows before padded/unpadded
@@ -683,6 +1304,297 @@ test "masked oracle payload packages as a rank-1 gradient record" {
         assert not gradient.obsolete(g, 1)
     }
     match trap_result_1 {
+        case returned let ? { }
+        case thrown let ? { assert false }
+    }
+}
+
+# ---- GT05 gradient-record lifecycle tests ------------------------------
+
+fn make_param(string owner, string name, list<int> shape, list<f32> data) → parameter.Parameter {
+    return parameter.construct(name, owner, "f32", shape, data) ⊥ parameter.default()
+}
+
+fn make_frozen_param(string owner, string name, list<int> shape, list<f32> data) → parameter.Parameter {
+    return parameter.construct_frozen(name, owner, "f32", shape, data) ⊥ parameter.default()
+}
+
+fn make_grad(string owner, string name, int version, list<int> shape, list<f32> data) → gradient.Gradient {
+    return gradient.construct(name, owner, version, hold(data, shape)) ⊥ gradient.default()
+}
+
+fn build_reg(list<parameter.Parameter> params) → parameter.Registry {
+    return parameter.from_parameters(params) ⊥ parameter.empty_registry()
+}
+
+fn close_f32(f32 a, f32 b) → bool {
+    return (a - b).abs() ≺ (0.00001 ∷ f32)
+}
+
+test "GT05 zero excludes frozen parameters and deduplicates tied weights" {
+    let _ r ← trap {
+        let parameter.Parameter w ← make_param("model", "embed", [2], [1.0, 2.0])
+        let parameter.Parameter head ← make_param("model", "lm_head", [2], [1.0, 2.0])
+        let parameter.Parameter scale ← make_frozen_param("model", "frozen_scale", [2], [1.0, 1.0])
+        let parameter.Registry base ← build_reg([w, head, scale])
+        let parameter.Registry reg ← base.tie("model", "embed", "model", "lm_head")
+        let gradient.GradientSet gs ← gradient.zero(reg)
+        assert gs.count() ≡ 1
+        assert gs.step() ≡ 1
+        assert gs.is_accumulating()
+        assert gs.status_of("model", "embed") ≡ "missing"
+    }
+    match r {
+        case returned let ? { }
+        case thrown let ? { assert false }
+    }
+}
+
+test "GT05 unequal valid-count microbatches normalise to exact full-batch gradient" {
+    let _ r ← trap {
+        let parameter.Parameter w ← make_param("model", "w", [3], [1.0, 2.0, 3.0])
+        let parameter.Registry reg ← build_reg([w])
+
+        # Microbatch 1 (valid_count = 2) sum = [2.0, 4.0, 6.0]
+        # Microbatch 2 (valid_count = 5) sum = [12.0, 3.0, 1.0]
+        # Combined sum over 7 valid items = [14.0, 7.0, 7.0] -> mean [2.0, 1.0, 1.0]
+        let gradient.Gradients mb1 ← gradient.construct_gradients([make_grad("model", "w", 1, [3], [2.0, 4.0, 6.0])])
+        let gradient.Gradients mb2 ← gradient.construct_gradients([make_grad("model", "w", 1, [3], [12.0, 3.0, 1.0])])
+
+        mut gradient.GradientSet acc ← gradient.zero(reg)
+        acc ← gradient.accumulate(acc, reg, mb1, 2)
+        acc ← gradient.accumulate(acc, reg, mb2, 5)
+        assert acc.valid_count() ≡ 7
+        assert acc.status_of("model", "w") ≡ "populated"
+
+        let gradient.GradientSet norm ← gradient.normalise(acc, acc.valid_count())
+        assert norm.is_normalised()
+        let tuple<gradient.GradientSet, gradient.Gradients> res ← gradient.consume(norm, reg)
+        let [consumed, bundle] ← res
+        assert consumed.is_consumed()
+
+        let gradient.Gradient gw ← bundle.find("model", "w")
+        assert close_f32(gw.payload.data[0], 2.0 ∷ f32)
+        assert close_f32(gw.payload.data[1], 1.0 ∷ f32)
+        assert close_f32(gw.payload.data[2], 1.0 ∷ f32)
+    }
+    match r {
+        case returned let ? { }
+        case thrown let ? { assert false }
+    }
+}
+
+test "GT05 tied weight used twice yields one summed slot and matches accumulate_sets" {
+    let _ r ← trap {
+        let parameter.Parameter emb ← make_param("model", "embed", [2], [1.0, 1.0])
+        let parameter.Parameter head ← make_param("model", "lm_head", [2], [1.0, 1.0])
+        let parameter.Registry reg ← build_reg([emb, head]).tie("model", "embed", "model", "lm_head")
+
+        # Both canonical "embed" and tied alias "lm_head" contribute in one batch
+        let gradient.Gradient g_emb ← make_grad("model", "embed", 1, [2], [1.5, 2.5])
+        let gradient.Gradient g_head ← make_grad("model", "lm_head", 1, [2], [2.5, 5.5])
+        let gradient.Gradients batch ← gradient.construct_gradients([g_emb, g_head])
+
+        let gradient.GradientSet acc ← gradient.accumulate(gradient.zero(reg), reg, batch, 4)
+        assert acc.count() ≡ 1
+        let gradient.GradientSlot slot ← acc.slot("model", "embed")
+        assert slot.contributions ≡ 2
+        assert close_f32(slot.data[0], 4.0 ∷ f32)
+        assert close_f32(slot.data[1], 8.0 ∷ f32)
+
+        # Combining two independent microbatch GradientSets with accumulate_sets
+        let gradient.GradientSet a ← gradient.accumulate(gradient.zero(reg), reg, gradient.construct_gradients([g_emb]), 1)
+        let gradient.GradientSet b ← gradient.accumulate(gradient.zero(reg), reg, gradient.construct_gradients([g_head]), 3)
+        let gradient.GradientSet merged ← gradient.accumulate_sets(a, b)
+        let gradient.GradientSet norm ← gradient.normalise(merged, 4)
+        let [?, out] ← gradient.consume(norm, reg)
+        let gradient.Gradient got ← out.find("model", "embed")
+        assert close_f32(got.payload.data[0], 1.0 ∷ f32)
+        assert close_f32(got.payload.data[1], 2.0 ∷ f32)
+    }
+    match r {
+        case returned let ? { }
+        case thrown let ? { assert false }
+    }
+}
+
+test "GT05 missing slot is distinct from disconnected zero slot" {
+    let _ r ← trap {
+        let parameter.Parameter w1 ← make_param("model", "w1", [2], [1.0, 2.0])
+        let parameter.Parameter w2 ← make_param("model", "w2", [2], [3.0, 4.0])
+        let parameter.Registry reg ← build_reg([w1, w2])
+
+        # Omitting w2 without mark_disconnected fails normalise with MissingSlot
+        let gradient.Gradients only_w1 ← gradient.construct_gradients([make_grad("model", "w1", 1, [2], [4.0, 6.0])])
+        mut string missing_err ← ""
+        do {
+            let gradient.GradientSet gs ← gradient.zero(reg)
+            let gradient.GradientSet ? ← gradient.accumulate(gs, reg, only_w1, 2)
+        }
+        catch err {
+            missing_err ← err.message
+        }
+        assert missing_err ≡ "missing gradient for trainable parameter: model/w2"
+
+        # Explicitly marking w2 disconnected succeeds and produces exact zero gradient
+        mut gradient.GradientSet gs2 ← gradient.zero(reg)
+        gs2 ← gradient.mark_disconnected(gs2, reg, "model", "w2")
+        assert gs2.status_of("model", "w1") ≡ "missing"
+        assert gs2.status_of("model", "w2") ≡ "disconnected"
+
+        gs2 ← gradient.accumulate(gs2, reg, only_w1, 2)
+        assert gs2.status_of("model", "w1") ≡ "populated"
+        assert gs2.status_of("model", "w2") ≡ "disconnected"
+
+        let [?, out] ← gradient.consume(gradient.normalise(gs2, 2), reg)
+        let gradient.Gradient gw1 ← out.find("model", "w1")
+        let gradient.Gradient gw2 ← out.find("model", "w2")
+        assert close_f32(gw1.payload.data[0], 2.0 ∷ f32)
+        assert gw2.payload.data[0] ≡ (0.0 ∷ f32)
+        assert gw2.payload.data[1] ≡ (0.0 ∷ f32)
+    }
+    match r {
+        case returned let ? { }
+        case thrown let ? { assert false }
+    }
+}
+
+test "GT05 stale, incompatible, frozen, and extra slots fail closed before state change" {
+    let _ r ← trap {
+        let parameter.Parameter w ← make_param("model", "w", [2], [1.0, 2.0])
+        let parameter.Parameter fz ← make_frozen_param("model", "fz", [2], [1.0, 1.0])
+        let parameter.Registry reg ← build_reg([w, fz])
+        let gradient.GradientSet base ← gradient.zero(reg)
+
+        # Stale version
+        mut string stale_msg ← ""
+        do {
+            let gradient.Gradients stale ← gradient.construct_gradients([make_grad("model", "w", 2, [2], [1.0, 1.0])])
+            let gradient.GradientSet ? ← gradient.accumulate(base, reg, stale, 1)
+        }
+        catch err {
+            stale_msg ← err.message
+        }
+        assert stale_msg ≡ "stale gradient: version does not match active step"
+
+        # Shape mismatch
+        mut string shape_msg ← ""
+        do {
+            let gradient.Gradients bad_shape ← gradient.construct_gradients([make_grad("model", "w", 1, [3], [1.0, 1.0, 1.0])])
+            let gradient.GradientSet ? ← gradient.accumulate(base, reg, bad_shape, 1)
+        }
+        catch err {
+            shape_msg ← err.message
+        }
+        assert shape_msg ≡ "gradient shape does not match parameter slot"
+
+        # Frozen slot rejected
+        mut string frozen_msg ← ""
+        do {
+            let gradient.Gradients has_frozen ← gradient.construct_gradients([
+                make_grad("model", "w", 1, [2], [1.0, 1.0]),
+                make_grad("model", "fz", 1, [2], [1.0, 1.0])
+            ])
+            let gradient.GradientSet ? ← gradient.accumulate(base, reg, has_frozen, 1)
+        }
+        catch err {
+            frozen_msg ← err.message
+        }
+        assert frozen_msg ≡ "cannot accumulate gradient for frozen parameter"
+
+        # Extra slot rejected
+        mut string extra_msg ← ""
+        do {
+            let gradient.Gradients has_extra ← gradient.construct_gradients([
+                make_grad("model", "w", 1, [2], [1.0, 1.0]),
+                make_grad("model", "ghost", 1, [2], [1.0, 1.0])
+            ])
+            let gradient.GradientSet ? ← gradient.accumulate(base, reg, has_extra, 1)
+        }
+        catch err {
+            extra_msg ← err.message
+        }
+        assert extra_msg ≡ "gradient slot is not registered in model: model/ghost"
+
+        # Original `base` remains untouched and still valid
+        assert base.valid_count() ≡ 0
+        assert base.status_of("model", "w") ≡ "missing"
+    }
+    match r {
+        case returned let ? { }
+        case thrown let ? { assert false }
+    }
+}
+
+test "GT05 consumed and reset gradient sets cannot be read or consumed twice across steps" {
+    let _ r ← trap {
+        let parameter.Parameter w ← make_param("model", "w", [2], [1.0, 2.0])
+        let parameter.Registry reg ← build_reg([w])
+        let gradient.Gradients batch ← gradient.construct_gradients([make_grad("model", "w", 1, [2], [2.0, 4.0])])
+
+        let gradient.GradientSet norm ← gradient.normalise(gradient.accumulate(gradient.zero(reg), reg, batch, 2), 2)
+        let [consumed, ?] ← gradient.consume(norm, reg)
+        assert consumed.is_consumed()
+
+        # Double consume fails
+        mut string double_msg ← ""
+        do {
+            let [?, ?] ← gradient.consume(consumed, reg)
+        }
+        catch err {
+            double_msg ← err.message
+        }
+        assert double_msg ≡ "gradient set must be normalised and unconsumed before consume"
+
+        # Reading a slot after consume fails
+        mut string read_msg ← ""
+        do {
+            let gradient.GradientSlot ? ← consumed.slot("model", "w")
+        }
+        catch err {
+            read_msg ← err.message
+        }
+        assert read_msg ≡ "gradient set is no longer readable (consumed or reset)"
+
+        # Reset gradient set cannot be normalised or consumed
+        let gradient.GradientSet rst ← gradient.reset(gradient.zero(reg))
+        assert rst.is_reset()
+        mut string rst_msg ← ""
+        do {
+            let gradient.GradientSet ? ← gradient.normalise(rst, 1)
+        }
+        catch err {
+            rst_msg ← err.message
+        }
+        assert rst_msg ≡ "can only normalise an accumulating gradient set"
+
+        # Fresh step advances step_id cleanly
+        let parameter.Registry reg2 ← reg.replace("model", "w", [0.5, 1.5], 1)
+        let gradient.GradientSet step2 ← gradient.next_step(consumed, reg2)
+        assert step2.step() ≡ 2
+        assert step2.is_accumulating()
+        let gradient.GradientSlot s2 ← step2.slot("model", "w")
+        assert s2.version ≡ 2
+    }
+    match r {
+        case returned let ? { }
+        case thrown let ? { assert false }
+    }
+}
+
+test "GT05 typed-tensor zero, accumulate, normalise helpers match full-batch mean" {
+    let _ r ← trap {
+        let tensor<f32, [2]> mb1 ← [2.0, 4.0] ↦ tf32[2]
+        let tensor<f32, [2]> mb2 ← [4.0, 8.0] ↦ tf32[2]
+        mut tensor<f32, [2]> acc ← gradient.zero_tensor_1d<size 2>()
+        acc ← gradient.accumulate_tensor_1d<size 2>(acc, mb1)
+        acc ← gradient.accumulate_tensor_1d<size 2>(acc, mb2)
+        let tensor<f32, [2]> out ← gradient.normalise_tensor_1d<size 2>(acc, 3)
+        let list<f32> flat ↤ out
+        assert close_f32(flat[0], 2.0 ∷ f32)
+        assert close_f32(flat[1], 4.0 ∷ f32)
+    }
+    match r {
         case returned let ? { }
         case thrown let ? { assert false }
     }

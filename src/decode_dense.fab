@@ -1,0 +1,667 @@
++++ toml
+locale = "en"
+
++++ faber
+# Metadata-driven typed F32 whole-model decode driver (issue #28 / GPU G01).
+#
+# Public import: import from "gradus:decode_dense" decode_dense
+# Depends on: gradus:cache/session, gradus:decode_step, gradus:decode_token,
+#   gradus:model/bundle, gradus:model/config, gradus:model/gguf_manifest,
+#   gradus:model/schedule, gradus:model/tensor_directory.
+#
+# --- Contract ------------------------------------------------------------
+#
+# Drives whole-model F32 greedy decode over the record-typed `decode_token`
+# contract (`LayerWeights`, `SlotView`, `LayerParams`, `Workspace`) and
+# `SessionState` (`FullKvArena`) with zero hardcoded model dimensions and
+# zero `NumericBlock` allocations on the hot path:
+#   1. Admit `DenseModelSpec` from either `cfg.ModelConfig` +
+#      `td.TensorDirectory` or `gguf_manifest.GgufManifest` +
+#      `td.TensorDirectory`, validating every required F32 tensor shape.
+#   2. Build `model_schedule.ExecutionSchedule` (`LinearSegment`) and
+#      allocate `sess_mod.SessionState<C, size 1, KVD>` + `dt.Workspace`.
+#   3. Hold per-layer typed `list<tensor<f32, [...]>>` in `DenseLayerBank`,
+#      assemble `dt.LayerWeights` and `dt.SlotView` per layer inside the
+#      whole-model loop (`embed_wide` → `layer_wide_table` × L →
+#      `head_wide` → `argmax_token`) on both CPU and Metal.
+#
+# Re-test note on list-of-runtime-extent-tensors host-call limit:
+#   Passing `list<dt.LayerWeights<...>>` directly across a generic host call
+#   is still declined by Cranelift (`field of a non-genus` when projecting
+#   fields from a generic-class element loaded out of a `list`), whereas
+#   `list<tensor<f32, [R, C]>>` fields inside a typed container (`DenseLayerBank`
+#   and `SessionState.full_kv`) cross generic host calls cleanly on CPU and
+#   Metal, letting the entire multi-layer loop live in `gradus:decode_dense`.
+
+import from "gradus:cache/session" let sess_mod
+import from "gradus:decode_step" let ds
+import from "gradus:decode_token" let dt
+import from "gradus:model/bundle" let bundle
+import from "gradus:model/config" let cfg
+import from "gradus:model/gguf_manifest" let gguf_manifest
+import from "gradus:model/schedule" let model_schedule
+import from "gradus:model/tensor_directory" let td
+
+@ public
+union DenseDecodeError {
+    @ shared
+    string message
+
+    BadConfig {
+        cfg.ConfigError inner
+    },
+    BadManifest {
+        gguf_manifest.GgufManifestError inner
+    },
+    BadDirectory {
+        td.DirectoryError inner
+    },
+    BadSchedule {
+        model_schedule.ScheduleError inner
+    },
+    BadSession {
+        sess_mod.SessionError inner
+    },
+    BadShape,
+    UnsupportedDtype,
+    MissingTensor,
+    BadPosition
+}
+
+@ conversion
+fn from_config_error(cfg.ConfigError err) → DenseDecodeError {
+    return variant BadConfig { message = err.message, inner = err }
+}
+
+@ conversion
+fn from_manifest_error(gguf_manifest.GgufManifestError err) → DenseDecodeError {
+    return variant BadManifest { message = err.message, inner = err }
+}
+
+@ conversion
+fn from_directory_error(td.DirectoryError err) → DenseDecodeError {
+    return variant BadDirectory { message = err.message, inner = err }
+}
+
+@ conversion
+fn from_schedule_error(model_schedule.ScheduleError err) → DenseDecodeError {
+    return variant BadSchedule { message = err.message, inner = err }
+}
+
+@ conversion
+fn from_session_error(sess_mod.SessionError err) → DenseDecodeError {
+    return variant BadSession { message = err.message, inner = err }
+}
+
+@ public
+class DenseModelSpec {
+    let string model_type
+    let int num_layers
+    let int hidden_size
+    let int num_attention_heads
+    let int num_kv_heads
+    let int head_dim
+    let int q_dim
+    let int kv_dim
+    let int intermediate_size
+    let int vocab_size
+    let int max_position_embeddings
+    let f32 rms_norm_eps
+    let f32 rope_theta
+    let bool tie_word_embeddings
+    let bool has_qkv_bias
+    let dt.RopeKind rope_kind
+}
+
+@ public
+class DenseHeadWeights<size V, size D> {
+    let tensor<f32, [V, D]> embed
+    let tensor<f32, [D]> onorm
+    let bool tied_lm_head
+    let tensor<f32, [V, D]> lm_head
+}
+
+@ public
+class DenseLayerBank<size D, size QD, size KVD, size F> {
+    let list<tensor<f32, [D]>> anorms
+    let list<tensor<f32, [QD, D]>> wqs
+    let list<tensor<f32, [KVD, D]>> wks
+    let list<tensor<f32, [KVD, D]>> wvs
+    let list<tensor<f32, [D, QD]>> wos
+    let list<tensor<f32, [D]>> fnorms
+    let list<tensor<f32, [F, D]>> wgs
+    let list<tensor<f32, [F, D]>> wus
+    let list<tensor<f32, [D, F]>> wds
+    let list<tensor<f32, [QD]>> bqs
+    let list<tensor<f32, [KVD]>> bks
+    let list<tensor<f32, [KVD]>> bvs
+}
+
+fn is_f32_dtype(string raw) → bool {
+    return raw ≡ "F32" or raw ≡ "f32"
+}
+
+fn lookup_backbone_entry(td.TensorDirectory dir, string name) → td.DirectoryEntry ⇥ DenseDecodeError {
+    mut td.DirectoryEntry ∪ none hit ← null
+
+    do {
+        hit ← td.lookup_backbone(dir, name)
+    }
+    catch err {
+        throw variant MissingTensor { message = "missing backbone tensor: §"(name) }
+    }
+
+    if hit is none then throw variant MissingTensor { message = "missing backbone tensor: §"(name) }
+
+    return hit
+}
+
+fn is_gguf_entry(td.DirectoryEntry e) → bool {
+    match e.container {
+        case bundle.ContainerKind.Gguf {
+            return true
+        }
+        case _ {
+            return false
+        }
+    }
+}
+
+fn check_matrix_shape(td.DirectoryEntry e, int rows, int cols) → bool {
+    if e.shape.length() ≢ 2 then return false
+
+    if is_gguf_entry(e) {
+        return e.shape[0] ≡ cols and e.shape[1] ≡ rows
+    }
+
+    return e.shape[0] ≡ rows and e.shape[1] ≡ cols
+}
+
+fn require_f32_vector(td.TensorDirectory dir, string name, int length) → void ⇥ DenseDecodeError {
+    let td.DirectoryEntry e ← lookup_backbone_entry(dir, name)
+
+    require is_f32_dtype(e.raw_dtype) throw variant UnsupportedDtype { message = "tensor § must be F32, got §"(name, e.raw_dtype) }
+
+    require e.shape.length() ≡ 1 and e.shape[0] ≡ length throw variant BadShape { message = "tensor § expected 1D length §"(name, length ↦ string) }
+}
+
+fn require_f32_matrix(td.TensorDirectory dir, string name, int rows, int cols) → void ⇥ DenseDecodeError {
+    let td.DirectoryEntry e ← lookup_backbone_entry(dir, name)
+
+    require is_f32_dtype(e.raw_dtype) throw variant UnsupportedDtype { message = "tensor § must be F32, got §"(name, e.raw_dtype) }
+
+    require check_matrix_shape(e, rows, cols) throw variant BadShape { message = "tensor § expected [§, §]"(name, rows ↦ string, cols ↦ string) }
+}
+
+fn validate_directory_tensors(DenseModelSpec spec, td.TensorDirectory dir) → void ⇥ DenseDecodeError {
+    require_f32_matrix(dir, "model.embed_tokens.weight", spec.vocab_size, spec.hidden_size)
+    require_f32_vector(dir, "model.norm.weight", spec.hidden_size)
+
+    if not spec.tie_word_embeddings {
+        require_f32_matrix(dir, "lm_head.weight", spec.vocab_size, spec.hidden_size)
+    }
+
+    for exclusive spec.num_layers let l {
+        let string prefix ← "model.layers.§"(l ↦ string)
+        require_f32_vector(dir, "§.input_layernorm.weight"(prefix), spec.hidden_size)
+        require_f32_matrix(dir, "§.self_attn.q_proj.weight"(prefix), spec.q_dim, spec.hidden_size)
+        require_f32_matrix(dir, "§.self_attn.k_proj.weight"(prefix), spec.kv_dim, spec.hidden_size)
+        require_f32_matrix(dir, "§.self_attn.v_proj.weight"(prefix), spec.kv_dim, spec.hidden_size)
+        require_f32_matrix(dir, "§.self_attn.o_proj.weight"(prefix), spec.hidden_size, spec.q_dim)
+        require_f32_vector(dir, "§.post_attention_layernorm.weight"(prefix), spec.hidden_size)
+        require_f32_matrix(dir, "§.mlp.gate_proj.weight"(prefix), spec.intermediate_size, spec.hidden_size)
+        require_f32_matrix(dir, "§.mlp.up_proj.weight"(prefix), spec.intermediate_size, spec.hidden_size)
+        require_f32_matrix(dir, "§.mlp.down_proj.weight"(prefix), spec.hidden_size, spec.intermediate_size)
+
+        if spec.has_qkv_bias {
+            require_f32_vector(dir, "§.self_attn.q_proj.bias"(prefix), spec.q_dim)
+            require_f32_vector(dir, "§.self_attn.k_proj.bias"(prefix), spec.kv_dim)
+            require_f32_vector(dir, "§.self_attn.v_proj.bias"(prefix), spec.kv_dim)
+        }
+    }
+}
+
+fn default_rope_kind(string model_type) → dt.RopeKind {
+    if model_type ≡ "llama" then return variant dt.RopeKind.Pairs
+
+    return variant dt.RopeKind.Half
+}
+
+fn gguf_float32_meta(gguf_manifest.GgufManifest m, string key) → f32 ⇥ DenseDecodeError {
+    let gguf_manifest.GgufMetadata entry ← gguf_manifest.metadata(m, key)
+
+    require entry.dtype ≡ 6 throw variant BadShape { message = "expected GGUF float32 metadata for §"(key) }
+
+    let list<b8> raw ← entry.payload_wire
+
+    require raw.length() ≡ 4 throw variant BadShape { message = "malformed GGUF float32 payload for §"(key) }
+
+    let u32 b0 ← (raw[0] ↦ u8) ↦ u32 ⊥ (0 ∷ u32)
+    let u32 b1 ← (raw[1] ↦ u8) ↦ u32 ⊥ (0 ∷ u32)
+    let u32 b2 ← (raw[2] ↦ u8) ↦ u32 ⊥ (0 ∷ u32)
+    let u32 b3 ← (raw[3] ↦ u8) ↦ u32 ⊥ (0 ∷ u32)
+    let u32 bits ← b0 ∨ (b1 ⇐ (8 ∷ u32)) ∨ (b2 ⇐ (16 ∷ u32)) ∨ (b3 ⇐ (24 ∷ u32))
+    return (bits ↦ b32) ↦ f32
+}
+
+# Admit a validated F32 DenseModelSpec from `ModelConfig` + `TensorDirectory`
+# without any hardcoded architecture dimensions.
+@ public
+fn admit_spec_from_config(cfg.ModelConfig mc, td.TensorDirectory dir) → DenseModelSpec ⇥ DenseDecodeError {
+    return admit_spec_from_config_with_rope(mc, dir, default_rope_kind(mc.model_type))
+}
+
+@ public
+fn admit_spec_from_config_with_rope(cfg.ModelConfig mc, td.TensorDirectory dir, dt.RopeKind rope_kind) → DenseModelSpec ⇥ DenseDecodeError {
+    require mc.num_hidden_layers ≻ 0 and mc.hidden_size ≻ 0 and mc.num_attention_heads ≻ 0 and mc.num_key_value_heads ≻ 0 and mc.head_dim ≻ 0 and mc.intermediate_size ≻ 0 and mc.vocab_size ≻ 0 throw variant BadShape { message = "model config dimensions must be positive" }
+
+    require mc.num_attention_heads % mc.num_key_value_heads ≡ 0 throw variant BadShape { message = "num_attention_heads must be divisible by num_key_value_heads" }
+
+    let int q_dim ← mc.num_attention_heads * mc.head_dim
+    let int kv_dim ← mc.num_key_value_heads * mc.head_dim
+    let bool has_bias_tensor ← td.has_tensor(dir, variant bundle.MemberRole.Backbone, "model.layers.0.self_attn.q_proj.bias")
+    let bool has_qkv_bias ← (mc.qkv_bias coalesce false) or (mc.attention_bias coalesce false) or has_bias_tensor
+
+    let DenseModelSpec spec ← DenseModelSpec {
+        model_type = mc.model_type,
+        num_layers = mc.num_hidden_layers,
+        hidden_size = mc.hidden_size,
+        num_attention_heads = mc.num_attention_heads,
+        num_kv_heads = mc.num_key_value_heads,
+        head_dim = mc.head_dim,
+        q_dim = q_dim,
+        kv_dim = kv_dim,
+        intermediate_size = mc.intermediate_size,
+        vocab_size = mc.vocab_size,
+        max_position_embeddings = mc.max_position_embeddings,
+        rms_norm_eps = mc.rms_norm_eps,
+        rope_theta = mc.rope_theta,
+        tie_word_embeddings = mc.tie_word_embeddings,
+        has_qkv_bias = has_qkv_bias,
+        rope_kind = rope_kind
+    }
+    validate_directory_tensors(spec, dir)
+    return spec
+}
+
+# Admit a validated F32 DenseModelSpec from `GgufManifest` + `TensorDirectory`
+# without any hardcoded architecture dimensions.
+@ public
+fn admit_spec_from_gguf(gguf_manifest.GgufManifest m, td.TensorDirectory dir) → DenseModelSpec ⇥ DenseDecodeError {
+    let string arch ← gguf_manifest.text(m, "general.architecture")
+    let int num_layers ← gguf_manifest.number(m, "§.block_count"(arch))
+    let int hidden_size ← gguf_manifest.number(m, "§.embedding_length"(arch))
+    let int heads ← gguf_manifest.number(m, "§.attention.head_count"(arch))
+    let int kv_heads ← gguf_manifest.number(m, "§.attention.head_count_kv"(arch))
+    let int intermediate_size ← gguf_manifest.number(m, "§.feed_forward_length"(arch))
+
+    require num_layers ≻ 0 and hidden_size ≻ 0 and heads ≻ 0 and kv_heads ≻ 0 and intermediate_size ≻ 0 throw variant BadShape { message = "GGUF architecture dimensions must be positive" }
+
+    require heads % kv_heads ≡ 0 throw variant BadShape { message = "GGUF head_count must be divisible by head_count_kv" }
+
+    let int head_dim ← hidden_size / heads
+    let int q_dim ← heads * head_dim
+    let int kv_dim ← kv_heads * head_dim
+
+    mut int ctx_len ← 2048
+    do {
+        ctx_len ← gguf_manifest.number(m, "§.context_length"(arch))
+    }
+    catch err {
+    }
+
+    mut f32 eps ← 0.00001 ∷ f32
+    do {
+        eps ← gguf_float32_meta(m, "§.attention.layer_norm_rms_epsilon"(arch))
+    }
+    catch err {
+    }
+
+    mut f32 theta ← (arch ≡ "qwen2") ✓ (1000000.0 ∷ f32) ✗ (10000.0 ∷ f32)
+    do {
+        theta ← gguf_float32_meta(m, "§.rope.freq_base"(arch))
+    }
+    catch err {
+    }
+
+    let td.DirectoryEntry emb ← lookup_backbone_entry(dir, "model.embed_tokens.weight")
+
+    require emb.shape.length() ≡ 2 throw variant BadShape { message = "embedding tensor must be rank 2" }
+
+    let int vocab_size ← is_gguf_entry(emb) ✓ emb.shape[1] ✗ emb.shape[0]
+    let bool tied ← not td.has_tensor(dir, variant bundle.MemberRole.Backbone, "lm_head.weight")
+    let bool has_bias ← td.has_tensor(dir, variant bundle.MemberRole.Backbone, "model.layers.0.self_attn.q_proj.bias")
+
+    let DenseModelSpec spec ← DenseModelSpec {
+        model_type = arch,
+        num_layers = num_layers,
+        hidden_size = hidden_size,
+        num_attention_heads = heads,
+        num_kv_heads = kv_heads,
+        head_dim = head_dim,
+        q_dim = q_dim,
+        kv_dim = kv_dim,
+        intermediate_size = intermediate_size,
+        vocab_size = vocab_size,
+        max_position_embeddings = ctx_len,
+        rms_norm_eps = eps,
+        rope_theta = theta,
+        tie_word_embeddings = tied,
+        has_qkv_bias = has_bias,
+        rope_kind = default_rope_kind(arch)
+    }
+    validate_directory_tensors(spec, dir)
+    return spec
+}
+
+fn schedule_rope_kind(dt.RopeKind kind) → model_schedule.RopeKind {
+    match kind {
+        case dt.RopeKind.None {
+            return variant model_schedule.RopeKind.None
+        }
+        case dt.RopeKind.Half {
+            return variant model_schedule.RopeKind.Standard
+        }
+        case dt.RopeKind.Pairs {
+            return variant model_schedule.RopeKind.Standard
+        }
+    }
+}
+
+@ public
+fn build_schedule(DenseModelSpec spec) → model_schedule.ExecutionSchedule ⇥ DenseDecodeError {
+    return model_schedule.dense_schedule(spec.num_layers, schedule_rope_kind(spec.rope_kind), variant model_schedule.FfnKind.Dense, empty)
+}
+
+@ public
+fn layer_params(DenseModelSpec spec) → dt.LayerParams {
+    let i32 dh ← spec.head_dim ↦ i32 ⊥ 1
+    let i32 span ← dh / 2
+    let i32 group ← (spec.num_attention_heads / spec.num_kv_heads) ↦ i32 ⊥ 1
+    let f32 scale ← 1.0 ∷ f32 / (√(dh ↦ f32))
+    let f32 lntheta ← spec.rope_theta.ln()
+
+    return dt.LayerParams {
+        pdh = dh,
+        pspan = span,
+        pgroup = group,
+        prope = spec.rope_kind,
+        peps = spec.rms_norm_eps,
+        plntheta = lntheta,
+        pscale = scale
+    }
+}
+
+@ public
+fn make_head_weights<size V, size D>(tensor<f32, [V, D]> embed, tensor<f32, [D]> onorm, bool tied_lm_head, tensor<f32, [V, D]> lm_head) → DenseHeadWeights<V, D> {
+    return DenseHeadWeights<V, D> {
+        embed = embed,
+        onorm = onorm,
+        tied_lm_head = tied_lm_head,
+        lm_head = lm_head
+    }
+}
+
+@ public
+fn make_layer_bank<size D, size QD, size KVD, size F>(list<tensor<f32, [D]>> anorms, list<tensor<f32, [QD, D]>> wqs, list<tensor<f32, [KVD, D]>> wks, list<tensor<f32, [KVD, D]>> wvs, list<tensor<f32, [D, QD]>> wos, list<tensor<f32, [D]>> fnorms, list<tensor<f32, [F, D]>> wgs, list<tensor<f32, [F, D]>> wus, list<tensor<f32, [D, F]>> wds, list<tensor<f32, [QD]>> bqs, list<tensor<f32, [KVD]>> bks, list<tensor<f32, [KVD]>> bvs) → DenseLayerBank<D, QD, KVD, F> {
+    return DenseLayerBank<D, QD, KVD, F> {
+        anorms = anorms,
+        wqs = wqs,
+        wks = wks,
+        wvs = wvs,
+        wos = wos,
+        fnorms = fnorms,
+        wgs = wgs,
+        wus = wus,
+        wds = wds,
+        bqs = bqs,
+        bks = bks,
+        bvs = bvs
+    }
+}
+
+@ public
+fn make_session<size C, size W, size KVD>(model_schedule.ExecutionSchedule sched) → sess_mod.SessionState<C, W, KVD> ⇥ DenseDecodeError {
+    return sess_mod.from_schedule<size C, size W, size KVD>(sched)
+}
+
+@ public
+fn session_valid_count<size C, size W, size KVD>(sess_mod.SessionState<C, W, KVD> session, int slot) → int ⇥ DenseDecodeError {
+    return sess_mod.slot_valid_span(session, slot).valid_count
+}
+
+@ public
+fn make_workspace<size D, size QD, size KVD, size F, size H, size C, size P>(DenseModelSpec spec, mut tensor<f32, [1]> sink) → dt.Workspace<D, QD, KVD, F, H, C, P> ⇥ DenseDecodeError {
+    require spec.hidden_size ≡ (D ↦ int) throw variant BadShape { message = "workspace D mismatch" }
+    require spec.q_dim ≡ (QD ↦ int) throw variant BadShape { message = "workspace QD mismatch" }
+    require spec.kv_dim ≡ (KVD ↦ int) throw variant BadShape { message = "workspace KVD mismatch" }
+    require spec.intermediate_size ≡ (F ↦ int) throw variant BadShape { message = "workspace F mismatch" }
+    require spec.num_attention_heads ≡ (H ↦ int) throw variant BadShape { message = "workspace H mismatch" }
+
+    let tensor<f32, [H, C]> hcdom ← tf32[H, C] {}
+    let tensor<f32, [P, QD]> cpdom ← tf32[P, QD] {}
+    let tensor<f32, [QD]> qdom ← tf32[QD] {}
+    mut tensor<f32, [D]> xn ← tf32[D] {}
+    mut tensor<f32, [QD]> q ← tf32[QD] {}
+    mut tensor<f32, [QD]> qr ← tf32[QD] {}
+    mut tensor<f32, [KVD]> k ← tf32[KVD] {}
+    mut tensor<f32, [KVD]> kr ← tf32[KVD] {}
+    mut tensor<f32, [KVD]> v ← tf32[KVD] {}
+    mut tensor<f32, [H, C]> sc ← tf32[H, C] {}
+    mut tensor<f32, [H, C]> pr ← tf32[H, C] {}
+    mut tensor<f32, [P, QD]> cp ← tf32[P, QD] {}
+    mut tensor<f32, [QD]> ctx ← tf32[QD] {}
+    mut tensor<f32, [D]> h1 ← tf32[D] {}
+    mut tensor<f32, [F]> gate ← tf32[F] {}
+    mut tensor<f32, [F]> up ← tf32[F] {}
+    mut tensor<f32, [F]> act ← tf32[F] {}
+
+    mut dt.Workspace<D, QD, KVD, F, H, C, P> ws ← dt.Workspace<D, QD, KVD, F, H, C, P> {
+        hcdom = hcdom,
+        cpdom = cpdom,
+        qdom = qdom,
+        xn = xn,
+        q = q,
+        qr = qr,
+        k = k,
+        kr = kr,
+        v = v,
+        sc = sc,
+        pr = pr,
+        cp = cp,
+        ctx = ctx,
+        h1 = h1,
+        gate = gate,
+        up = up,
+        act = act
+    }
+    dt.prime_workspace<size D, size QD, size KVD, size F, size H, size C, size P>(ws, mut sink)
+    return ws
+}
+
+fn apply_qkv_and_bias<size D, size QD, size KVD>(tensor<f32, [D]> hin, tensor<f32, [D]> anorm, tensor<f32, [QD, D]> wq, tensor<f32, [KVD, D]> wk, tensor<f32, [KVD, D]> wv, bool has_bias, tensor<f32, [QD]> bq, tensor<f32, [KVD]> bk, tensor<f32, [KVD]> bv, f32 eps, mut tensor<f32, [D]> xn, mut tensor<f32, [QD]> q, mut tensor<f32, [KVD]> k, mut tensor<f32, [KVD]> v) → void {
+    do device {
+        ds.rmsnorm(hin, anorm, mut xn, eps)
+        ds.qkv_proj(wq, wk, wv, xn, mut q, mut k, mut v)
+    }
+
+    if has_bias {
+        do device {
+            ds.add_bias(bq, mut q)
+            ds.add_bias(bk, mut k)
+            ds.add_bias(bv, mut v)
+        }
+    }
+}
+
+fn apply_ffn_residual<size D, size F>(tensor<f32, [D]> h1, tensor<f32, [D]> fnorm, tensor<f32, [F, D]> wg, tensor<f32, [F, D]> wu, tensor<f32, [D, F]> wd, f32 eps, mut tensor<f32, [D]> xn, mut tensor<f32, [F]> gate, mut tensor<f32, [F]> up, mut tensor<f32, [F]> act, mut tensor<f32, [D]> hout) → void {
+    do device {
+        ds.rmsnorm(h1, fnorm, mut xn, eps)
+        ds.gate_up_proj(wg, wu, xn, mut gate, mut up)
+        ds.swiglu(gate, up, mut act)
+        ds.gemv(wd, act, mut xn)
+        ds.residual_add(h1, xn, mut hout)
+    }
+}
+
+# Forward one token across all layers using precomputed RoPE tables,
+# DenseLayerBank weights, and SessionState FullKvArena, writing logits[V].
+@ public
+fn forward_token_logits<size V, size D, size QD, size KVD, size F, size H, size C, size W, size P, size Span>(DenseModelSpec spec, DenseHeadWeights<V, D> head, DenseLayerBank<D, QD, KVD, F> bank, mut sess_mod.SessionState<C, W, KVD> session, dt.Workspace<D, QD, KVD, F, H, C, P> ws, mut tensor<f32, [Span]> rtcos, mut tensor<f32, [Span]> rtsin, int token_id, int pos, mut tensor<f32, [V]> logits) → void ⇥ DenseDecodeError {
+    let int n ← spec.num_layers
+    require bank.anorms.length() ≡ n and bank.wqs.length() ≡ n and bank.wks.length() ≡ n and bank.wvs.length() ≡ n and bank.wos.length() ≡ n and bank.fnorms.length() ≡ n and bank.wgs.length() ≡ n and bank.wus.length() ≡ n and bank.wds.length() ≡ n throw variant BadShape { message = "layer weight bank length mismatch" }
+    if spec.has_qkv_bias {
+        require bank.bqs.length() ≡ n and bank.bks.length() ≡ n and bank.bvs.length() ≡ n throw variant BadShape { message = "QKV bias bank length mismatch" }
+    }
+    require session.slot_arena_kind.length() ≡ n throw variant BadShape { message = "session slot count mismatch" }
+    require token_id ≥ 0 and token_id ≺ (V ↦ int) throw variant BadPosition { message = "token id out of vocab range" }
+    require pos ≥ 0 and pos ≺ (C ↦ int) throw variant BadPosition { message = "position out of cache capacity" }
+    require (Span ↦ int) ≡ spec.head_dim / 2 throw variant BadShape { message = "RoPE span must equal head_dim / 2" }
+
+    let dt.LayerParams lp ← layer_params(spec)
+    mut tensor<i32, [1]> ids ← tensor<i32, [1]> {}
+    ids[0] ← token_id ↦ i32 ⊥ 0
+
+    mut tensor<f32, [D]> h_a ← tf32[D] {}
+    mut tensor<f32, [D]> h_b ← tf32[D] {}
+    dt.embed_wide<size V, size D>(head.embed, ids, mut h_a)
+
+    let i32 tpos ← pos ↦ i32 ⊥ 0
+    ds.rope_table<size Span>(mut rtcos, mut rtsin, tpos, lp.plntheta)
+
+    let tensor<f32, [H, C]> hcdom ← tf32[H, C] {}
+    let tensor<f32, [H]> hdom ← tf32[H] {}
+    let tensor<f32, [P, QD]> cpdom ← tf32[P, QD] {}
+    let tensor<f32, [QD]> qdom ← tf32[QD] {}
+    mut tensor<f32, [D]> xn ← tf32[D] {}
+    mut tensor<f32, [QD]> q ← tf32[QD] {}
+    mut tensor<f32, [QD]> qr ← tf32[QD] {}
+    mut tensor<f32, [KVD]> k ← tf32[KVD] {}
+    mut tensor<f32, [KVD]> kr ← tf32[KVD] {}
+    mut tensor<f32, [KVD]> v ← tf32[KVD] {}
+    mut tensor<f32, [H, C]> sc ← tf32[H, C] {}
+    mut tensor<f32, [H, C]> pr ← tf32[H, C] {}
+    mut tensor<f32, [P, QD]> cp ← tf32[P, QD] {}
+    mut tensor<f32, [QD]> ctx ← tf32[QD] {}
+    mut tensor<f32, [D]> h1 ← tf32[D] {}
+    mut tensor<f32, [F]> gate ← tf32[F] {}
+    mut tensor<f32, [F]> up ← tf32[F] {}
+    mut tensor<f32, [F]> act ← tf32[F] {}
+
+    let f32 eps ← lp.peps
+    let i32 group ← lp.pgroup
+    let i32 dh ← lp.pdh
+    let f32 scale ← lp.pscale
+    let tensor<f32, [QD]> zero_bq ← tf32[QD] {}
+    let tensor<f32, [KVD]> zero_bkv ← tf32[KVD] {}
+
+    for exclusive n let l {
+        let tensor<f32, [D]> anorm ← bank.anorms[l]
+        let tensor<f32, [QD, D]> wq ← bank.wqs[l]
+        let tensor<f32, [KVD, D]> wk ← bank.wks[l]
+        let tensor<f32, [KVD, D]> wv ← bank.wvs[l]
+        let tensor<f32, [D, QD]> wo ← bank.wos[l]
+        let tensor<f32, [D]> fnorm ← bank.fnorms[l]
+        let tensor<f32, [F, D]> wg ← bank.wgs[l]
+        let tensor<f32, [F, D]> wu ← bank.wus[l]
+        let tensor<f32, [D, F]> wd ← bank.wds[l]
+        let tensor<f32, [QD]> bq ← spec.has_qkv_bias ✓ bank.bqs[l] ✗ zero_bq
+        let tensor<f32, [KVD]> bk ← spec.has_qkv_bias ✓ bank.bks[l] ✗ zero_bkv
+        let tensor<f32, [KVD]> bv ← spec.has_qkv_bias ✓ bank.bvs[l] ✗ zero_bkv
+
+        if l % 2 ≡ 0 {
+            apply_qkv_and_bias<size D, size QD, size KVD>(h_a, anorm, wq, wk, wv, spec.has_qkv_bias, bq, bk, bv, eps, mut xn, mut q, mut k, mut v)
+        }
+        else {
+            apply_qkv_and_bias<size D, size QD, size KVD>(h_b, anorm, wq, wk, wv, spec.has_qkv_bias, bq, bk, bv, eps, mut xn, mut q, mut k, mut v)
+        }
+
+        match lp.prope {
+            case dt.RopeKind.None {
+                sess_mod.write_kv(mut session, l, k, v, tpos)
+                sess_mod.score_full(session.full_kv, l, hcdom, q, mut sc, tpos, group, dh, scale)
+            }
+            case dt.RopeKind.Half {
+                do device {
+                    ds.rope_half_table(q, rtcos, rtsin, mut qr)
+                    ds.rope_half_table(k, rtcos, rtsin, mut kr)
+                }
+                sess_mod.write_kv(mut session, l, kr, v, tpos)
+                sess_mod.score_full(session.full_kv, l, hcdom, qr, mut sc, tpos, group, dh, scale)
+            }
+            case dt.RopeKind.Pairs {
+                do device {
+                    ds.rope_pairs_table(q, rtcos, rtsin, mut qr)
+                    ds.rope_pairs_table(k, rtcos, rtsin, mut kr)
+                }
+                sess_mod.write_kv(mut session, l, kr, v, tpos)
+                sess_mod.score_full(session.full_kv, l, hcdom, qr, mut sc, tpos, group, dh, scale)
+            }
+        }
+
+        sess_mod.softmax_full_prefix(hdom, sc, mut pr, tpos + 1)
+        sess_mod.context_full(session.full_kv, l, qdom, pr, mut ctx, tpos, group, dh)
+
+        if l % 2 ≡ 0 {
+            do device {
+                ds.gemv(wo, ctx, mut xn)
+                ds.residual_add(h_a, xn, mut h1)
+            }
+            apply_ffn_residual<size D, size F>(h1, fnorm, wg, wu, wd, eps, mut xn, mut gate, mut up, mut act, mut h_b)
+        }
+        else {
+            do device {
+                ds.gemv(wo, ctx, mut xn)
+                ds.residual_add(h_b, xn, mut h1)
+            }
+            apply_ffn_residual<size D, size F>(h1, fnorm, wg, wu, wd, eps, mut xn, mut gate, mut up, mut act, mut h_a)
+        }
+    }
+
+    let tensor<f32, [D]> final_h ← (n % 2 ≡ 1) ✓ h_b ✗ h_a
+    if head.tied_lm_head {
+        dt.head_wide<size V, size D>(final_h, head.onorm, head.embed, mut xn, mut logits, lp.peps)
+    }
+    else {
+        dt.head_wide<size V, size D>(final_h, head.onorm, head.lm_head, mut xn, mut logits, lp.peps)
+    }
+}
+
+# Run one token step and return greedy next token id on device via argmax_token.
+@ public
+fn step_token<size V, size D, size QD, size KVD, size F, size H, size C, size W, size P, size Span>(DenseModelSpec spec, DenseHeadWeights<V, D> head, DenseLayerBank<D, QD, KVD, F> bank, mut sess_mod.SessionState<C, W, KVD> session, dt.Workspace<D, QD, KVD, F, H, C, P> ws, mut tensor<f32, [Span]> rtcos, mut tensor<f32, [Span]> rtsin, int token_id, int pos, mut tensor<f32, [V]> logits) → int ⇥ DenseDecodeError {
+    forward_token_logits<size V, size D, size QD, size KVD, size F, size H, size C, size W, size P, size Span>(spec, head, bank, mut session, ws, mut rtcos, mut rtsin, token_id, pos, mut logits)
+    return dt.argmax_token<size V>(logits)
+}
+
+# Prefill prompt tokens sequentially and generate `max_new_tokens` greedy tokens.
+@ public
+fn generate_greedy<size V, size D, size QD, size KVD, size F, size H, size C, size W, size P, size Span>(DenseModelSpec spec, DenseHeadWeights<V, D> head, DenseLayerBank<D, QD, KVD, F> bank, mut sess_mod.SessionState<C, W, KVD> session, dt.Workspace<D, QD, KVD, F, H, C, P> ws, mut tensor<f32, [Span]> rtcos, mut tensor<f32, [Span]> rtsin, list<int> prompt_ids, int max_new_tokens) → list<int> ⇥ DenseDecodeError {
+    require prompt_ids.length() ≻ 0 throw variant BadPosition { message = "prompt must be non-empty" }
+    require max_new_tokens ≥ 0 throw variant BadPosition { message = "max_new_tokens must be non-negative" }
+    require prompt_ids.length() + max_new_tokens ≤ (C ↦ int) throw variant BadPosition { message = "prompt plus generation exceeds cache capacity" }
+
+    mut tensor<f32, [V]> logits ← tf32[V] {}
+    mut int next_tok ← 0
+    mut int pos ← 0
+
+    for from prompt_ids let tok {
+        next_tok ← step_token<size V, size D, size QD, size KVD, size F, size H, size C, size W, size P, size Span>(spec, head, bank, mut session, ws, mut rtcos, mut rtsin, tok, pos, mut logits)
+        pos ← pos + 1
+    }
+
+    mut list<int> generated ← empty
+
+    if max_new_tokens ≡ 0 then return generated
+
+    generated.append(next_tok)
+    mut int cur_tok ← next_tok
+
+    for exclusive (max_new_tokens - 1) let ? {
+        cur_tok ← step_token<size V, size D, size QD, size KVD, size F, size H, size C, size W, size P, size Span>(spec, head, bank, mut session, ws, mut rtcos, mut rtsin, cur_tok, pos, mut logits)
+        generated.append(cur_tok)
+        pos ← pos + 1
+    }
+
+    return generated
+}
