@@ -560,9 +560,13 @@ fn patterned_from_config_with_mlp_only(cfg.ModelConfig c, int leading_dense_bloc
         attn_list.append(attn)
 
         mut bool is_linear_ssm ← false
+        mut bool is_full_attn ← false
         match attn {
             case LinearSsm {
                 is_linear_ssm ← true
+            }
+            case Full {
+                is_full_attn ← true
             }
             default {
                 pass
@@ -584,6 +588,9 @@ fn patterned_from_config_with_mlp_only(cfg.ModelConfig c, int leading_dense_bloc
         }
         else {
             if is_linear_ssm {
+                rope_list.append(variant None)
+            }
+            elif c.model_type ≡ "flint" and is_full_attn {
                 rope_list.append(variant None)
             }
             elif has_sections {
@@ -684,15 +691,12 @@ fn from_model_config(cfg.ModelConfig c, list<TapBuffer> taps) → ExecutionSched
     }
 
     if c.layer_types.length() ≥ 1 {
+        mut int ld ← 0
         if c.leading_dense_block_count is int {
-            let int ld ← c.leading_dense_block_count coalesce 0
+            ld ← c.leading_dense_block_count coalesce 0
             require ld ≥ 0 throw variant InvalidConfig { message = "ModelConfig leading_dense_block_count must be non-negative" }
-            return patterned_from_config(c, ld, taps)
         }
-        if c.mlp_only_layers.length() ≥ 1 {
-            return patterned_from_config_with_mlp_only(c, 0, c.mlp_only_layers, taps)
-        }
-        return patterned_from_config(c, 0, taps)
+        return patterned_from_config_with_mlp_only(c, ld, c.mlp_only_layers, taps)
     }
 
     if c.model_type ≡ "flint" {
@@ -1223,6 +1227,72 @@ test "ModelConfig -> ExecutionSchedule builders cover Dense, Qwen3.6, Flint, and
         assert sched.slot_count(s_custom) ≡ 14
         assert sched.full_kv_slot_count(s_custom) ≡ 3
         assert sched.ring_kv_slot_count(s_custom) ≡ 11
+
+        # Flint without explicit rope_pattern defaults to inverted RoPE + honors mlp_only_layers
+        let cfg.ModelConfig flint_inv_cfg ← must_parse_cfg("{\"model_type\": \"flint\", \"hidden_size\": 256, \"num_hidden_layers\": 4, \"num_attention_heads\": 4, \"num_key_value_heads\": 2, \"intermediate_size\": 512, \"vocab_size\": 1024, \"sliding_window\": 513, \"mlp_only_layers\": [0, 1], \"layer_types\": [\"full_attention\", \"sliding_attention\", \"sliding_attention\", \"full_attention\"]}")
+        let sched.ExecutionSchedule s_flint_inv ← sched.from_model_config(flint_inv_cfg, empty)
+        let sched.ExecutionStep fi0 ← sched.step_at(s_flint_inv, 0)
+        let sched.ExecutionStep fi1 ← sched.step_at(s_flint_inv, 1)
+        let sched.ExecutionStep fi2 ← sched.step_at(s_flint_inv, 2)
+        match fi0.rope {
+            case None { assert true }
+            default { assert false }
+        }
+        match fi1.rope {
+            case sched.RopeKind.Standard { assert true }
+            default { assert false }
+        }
+        match fi0.ffn {
+            case Dense { assert true }
+            default { assert false }
+        }
+        match fi2.ffn {
+            case MoE { assert true }
+            default { assert false }
+        }
+
+        # Flint with BOTH leading_dense_block_count and mlp_only_layers preserves both Dense masks
+        let cfg.ModelConfig flint_both_cfg ← must_parse_cfg("{\"model_type\": \"flint\", \"hidden_size\": 256, \"num_hidden_layers\": 4, \"num_attention_heads\": 4, \"num_key_value_heads\": 2, \"intermediate_size\": 512, \"vocab_size\": 1024, \"sliding_window\": 513, \"leading_dense_block_count\": 1, \"mlp_only_layers\": [2], \"layer_types\": [\"full_attention\", \"sliding_attention\", \"sliding_attention\", \"full_attention\"]}")
+        let sched.ExecutionSchedule s_flint_both ← sched.from_model_config(flint_both_cfg, empty)
+        let sched.ExecutionStep fb0 ← sched.step_at(s_flint_both, 0)
+        let sched.ExecutionStep fb1 ← sched.step_at(s_flint_both, 1)
+        let sched.ExecutionStep fb2 ← sched.step_at(s_flint_both, 2)
+        let sched.ExecutionStep fb3 ← sched.step_at(s_flint_both, 3)
+        match fb0.ffn {
+            case Dense { assert true }
+            default { assert false }
+        }
+        match fb1.ffn {
+            case MoE { assert true }
+            default { assert false }
+        }
+        match fb2.ffn {
+            case Dense { assert true }
+            default { assert false }
+        }
+        match fb3.ffn {
+            case MoE { assert true }
+            default { assert false }
+        }
+
+        # Qwen3.6 layer_types path preserves None on linear_attention and Sectional on full_attention
+        let cfg.ModelConfig q36_lt_cfg ← must_parse_cfg("{\"model_type\": \"qwen35moe\", \"hidden_size\": 256, \"num_hidden_layers\": 4, \"num_attention_heads\": 4, \"num_key_value_heads\": 2, \"intermediate_size\": 512, \"vocab_size\": 1024, \"layer_types\": [\"linear_attention\", \"linear_attention\", \"linear_attention\", \"full_attention\"], \"rope_dimension_sections\": [11, 11, 10, 0]}")
+        let sched.ExecutionSchedule s_q36_lt ← sched.from_model_config(q36_lt_cfg, empty)
+        assert sched.recurrent_ssm_slot_count(s_q36_lt) ≡ 3
+        assert sched.full_kv_slot_count(s_q36_lt) ≡ 1
+        assert sched.total_conv_sites(s_q36_lt) ≡ 3
+        let sched.ExecutionStep ql0 ← sched.step_at(s_q36_lt, 0)
+        let sched.ExecutionStep ql3 ← sched.step_at(s_q36_lt, 3)
+        match ql0.rope {
+            case None { assert true }
+            default { assert false }
+        }
+        match ql3.rope {
+            case Sectional let secs {
+                assert secs.length() ≡ 4 and secs[0] ≡ 11
+            }
+            default { assert false }
+        }
     }
     catch err {
         assert false
