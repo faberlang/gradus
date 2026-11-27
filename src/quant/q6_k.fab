@@ -30,14 +30,10 @@ locale = "en"
 # Rule 17: the format lives in Gradus. `decode` reads the fields in place
 # and copies no block or field list.
 #
-# `Q6_K`, `decode`, and `from_bytes` are `@ public` (file_interface exports
-# `list<T, size N>`), and `decode_block` stays `@ public` as a host helper.
-# Device/Metal execution over `tensor<Q6_K, [N]>` remains blocked on compiler
-# record-tensor lowering: `raw ↦ tensor<Q6_K, [N]> via Le` passes `faber check`,
-# but `--device cpu` and `--target metal-text` fail closed with
-# `PKG001:E_DEVICE_UNSUPPORTED` ("lane kernel form not lowered to KIR: a cell of
-# type Struct(DefId(...))", same as #25 / PR #41), and calling `decode` inside a
-# `thread lane` loop hits `SEM010:filum_independence_unproven`.
+# `Q6_K`, `decode`, `from_bytes`, and `decode_tensor` are `@ public`
+# (file_interface exports `list<T, size N>`), and `decode_block` stays
+# `@ public` as a host helper. `decode_tensor` reads `Q6_K` block fields
+# directly in place over `tensor<Q6_K, [N]>` on CPU and Metal KIR.
 
 # Elements per block.
 @ public
@@ -77,11 +73,11 @@ fn decode(Q6_K b, i32 k) → f32 {
     let int within ← ki % 128
     let int quad ← within / 32
     let int l ← within % 32
-    let int ql_idx ← n * 64 + (quad % 2) * 32 + l
+    let int ql_idx ← n * 64 + quad % 2 * 32 + l
     let int ql_byte ← b.ql[ql_idx] ↦ int
     let int qh_byte ← b.qh[n * 32 + l] ↦ int
     let int nib ← quad ≺ 2 ✓ ql_byte % 16 ✗ (ql_byte ⇒ 4) % 16
-    let int hi ← ((qh_byte ⇒ quad * 2) % 4) * 16
+    let int hi ← (qh_byte ⇒ quad * 2) % 4 * 16
     let int q ← (nib ∨ hi) - 32
     let f32 sc ← b.scales[n * 8 + l / 16 + quad * 2] ↦ f32
     return (b.d ↦ f32) * sc * (q ↦ f32)
@@ -111,16 +107,11 @@ fn from_bytes(list<u8> raw) → Q6_K ⇥ Q6_KError {
     for range 0 ‥ 16 let i {
         let int b ← raw[192 + i] ↦ int
         let int signed ← b ≥ 128 ✓ b - 256 ✗ b
-        scales_raw.append(signed ↦ i8 ⊥ (0 ∷ i8))
+        scales_raw.append(signed ↦ i8 ⊥ 0 ∷ i8)
     }
 
     do {
-        return Q6_K {
-            ql = ql_raw ↦ list<u8, size 128>,
-            qh = qh_raw ↦ list<u8, size 64>,
-            scales = scales_raw ↦ list<i8, size 16>,
-            d = d
-        }
+        return Q6_K { ql = ql_raw ↦ list<u8, size 128>, qh = qh_raw ↦ list<u8, size 64>, scales = scales_raw ↦ list<i8, size 16>, d = d }
     }
     catch err {
         throw variant BadBlock { message = "Q6_K block byte length mismatch" }
@@ -138,6 +129,42 @@ fn decode_block(list<u8> raw) → list<f32> ⇥ Q6_KError {
     }
 
     return y
+}
+
+# Device decoder over `tensor<Q6_K, [N]>`: one lane per block reads `d`,
+# `scales`, `qh`, and `ql` directly in place with zero per-lane block copy,
+# writing all 256 weights per block in left-associative `(d * sc) * q` order.
+@ public
+kernel decode_tensor<size N>(tensor<Q6_K, [N]> blocks, mut tensor<f32, [N, 256]> output) → void {
+    for from blocks at [b] thread lane let blk {
+        let f32 d ← blk.d ↦ f32
+
+        for exclusive 2 let n {
+            let i32 sc_base ← n * 8
+            let i32 ql_off ← n * 64
+            let i32 qh_off ← n * 32
+
+            for exclusive 32 let l {
+                let i32 idx ← l / 16
+                let i32 ql_lo ← blk.ql[ql_off + l] ↦ i32
+                let i32 ql_hi ← blk.ql[ql_off + l + 32] ↦ i32
+                let i32 qh ← blk.qh[qh_off + l] ↦ i32
+                let i32 q1 ← ql_lo % 16 + qh % 4 * 16 - 32
+                let i32 q2 ← ql_hi % 16 + qh / 4 % 4 * 16 - 32
+                let i32 q3 ← ql_lo / 16 + qh / 16 % 4 * 16 - 32
+                let i32 q4 ← ql_hi / 16 + qh / 64 * 16 - 32
+                let f32 sc0 ← blk.scales[sc_base + idx] ↦ f32
+                let f32 sc2 ← blk.scales[sc_base + idx + 2] ↦ f32
+                let f32 sc4 ← blk.scales[sc_base + idx + 4] ↦ f32
+                let f32 sc6 ← blk.scales[sc_base + idx + 6] ↦ f32
+                let i32 base ← n * 128 + l
+                output[[b, base]] ← d * sc0 * (q1 ↦ f32)
+                output[[b, base + 32]] ← d * sc2 * (q2 ↦ f32)
+                output[[b, base + 64]] ← d * sc4 * (q3 ↦ f32)
+                output[[b, base + 96]] ← d * sc6 * (q4 ↦ f32)
+            }
+        }
+    }
 }
 
 +++ faber test
@@ -422,4 +449,71 @@ test "negative zero scale preserves IEEE-754 sign bits" {
     assert bits_of(y[0]) ≡ 0x00000000
     assert bits_of(y[64]) ≡ 0x80000000
     assert bits_of(y[16]) ≡ 0x80000000
+}
+
+test "decode_tensor matches golden bit patterns and host dequant bit for bit across all 7 blocks" {
+    mut list<u8> all_raw ← empty
+
+    for range 0 ‥ 7 let i {
+        all_raw.extend(bytes_of(GOLDEN_BLOCKS[i]))
+    }
+
+    let list<b8> all_bytes ↤ all_raw
+
+    do {
+        let tensor<q6_k.Q6_K, [7]> blocks ← all_bytes ↦ tensor<q6_k.Q6_K, [7]> via le
+        mut tensor<f32, [7, 256]> out ← tf32[7, 256] {}
+        q6_k.decode_tensor(blocks, mut out)
+
+        for range 0 ‥ 7 let i {
+            let list<int> h ← host_bits(bytes_of(GOLDEN_BLOCKS[i]))
+            assert h.length() ≡ 256
+
+            for range 0 ‥ 256 let j {
+                let int got ← bits_of(out[[i, j]])
+                assert got ≡ GOLDEN_BITS[i][j]
+                assert got ≡ h[j]
+            }
+        }
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "decode_tensor covers quadrant packing branches, signed i8 scales, and negative zero sign bits" {
+    mut list<u8> raw ← copy branch_block()
+    mut list<u8> neg_zero ← copy branch_block()
+    neg_zero[208] ← 0 ↦ u8
+    neg_zero[209] ← 128 ↦ u8
+
+    for from neg_zero let b {
+        raw.append(b)
+    }
+
+    let list<b8> buf ↤ raw
+
+    do {
+        let tensor<q6_k.Q6_K, [2]> blocks ← buf ↦ tensor<q6_k.Q6_K, [2]> via le
+        mut tensor<f32, [2, 256]> out ← tf32[2, 256] {}
+        q6_k.decode_tensor(blocks, mut out)
+
+        assert out[[0, 0]] ≡ -54.0 ∷ f32
+        assert out[[0, 32]] ≡ -16.0 ∷ f32
+        assert out[[0, 64]] ≡ 10.0 ∷ f32
+        assert out[[0, 96]] ≡ 57.0 ∷ f32
+        assert out[[0, 16]] ≡ 96.0 ∷ f32
+        assert out[[0, 48]] ≡ -155.0 ∷ f32
+        assert out[[0, 80]] ≡ 64.0 ∷ f32
+        assert out[[0, 112]] ≡ 68.0 ∷ f32
+        assert out[[0, 128]] ≡ -31.0 ∷ f32
+        assert out[[0, 144]] ≡ -64.0 ∷ f32
+
+        assert bits_of(out[[1, 0]]) ≡ 0x00000000
+        assert bits_of(out[[1, 64]]) ≡ 0x80000000
+        assert bits_of(out[[1, 16]]) ≡ 0x80000000
+    }
+    catch err {
+        assert false
+    }
 }
