@@ -137,6 +137,8 @@ const f32 ROUTER_WEIGHT_FLOOR = 0.00006103515625 ∷ f32
 # are bit-identical (issue #79: this walk replaces the column/row carrier
 # copies around math.matmul).
 fn gemv_list(tensor.NumericBlock weight, list<f32> x, int in_dim, int out_dim) → list<f32> ⇥ MoeError {
+    require in_dim ≥ 0 and out_dim ≥ 0 throw variant BadShape { message = "projection dimensions must be non-negative" }
+
     require weight.data.length() ≡ out_dim * in_dim throw variant BadShape { message = "projection weight window has the wrong length" }
 
     require x.length() ≡ in_dim throw variant BadShape { message = "projection input has the wrong length" }
@@ -144,10 +146,11 @@ fn gemv_list(tensor.NumericBlock weight, list<f32> x, int in_dim, int out_dim) �
     mut list<f32> out ← empty
 
     for range 0 ‥ out_dim let o {
+        let int row_base ← o * in_dim
         mut f32 sum ← 0.0 ∷ f32
 
         for range 0 ‥ in_dim let i {
-            sum ← sum + (weight.data.get(o * in_dim + i) coalesce 0.0 ∷ f32) * (x.get(i) coalesce 0.0 ∷ f32)
+            sum ← sum + weight.data[row_base + i] * x[i]
         }
 
         out.append(sum)
@@ -173,22 +176,27 @@ fn silu_scalar(f32 v) → f32 {
 fn expert_rows(tensor.NumericBlock gate_w, tensor.NumericBlock up_w, tensor.NumericBlock down_w, list<f32> x, int ffn_length, MoeConfig cfg) → list<f32> ⇥ MoeError {
     let int embd ← cfg.embedding_length
 
+    require ffn_length ≥ 1 and embd ≥ 1 throw variant BadShape { message = "expert dimensions must be positive" }
+
+    require down_w.data.length() ≡ embd * ffn_length throw variant BadShape { message = "down projection weight window has the wrong length" }
+
     let list<f32> gate ← gemv_list(gate_w, x, embd, ffn_length)
     let list<f32> up ← gemv_list(up_w, x, embd, ffn_length)
 
     mut list<f32> hidden ← empty
 
     for range 0 ‥ ffn_length let f {
-        hidden.append(silu_scalar(gate.get(f) coalesce 0.0 ∷ f32) * (up.get(f) coalesce 0.0 ∷ f32))
+        hidden.append(silu_scalar(gate[f]) * up[f])
     }
 
     mut list<f32> out ← empty
 
     for range 0 ‥ embd let e {
+        let int row_base ← e * ffn_length
         mut f32 sum ← 0.0 ∷ f32
 
         for range 0 ‥ ffn_length let f {
-            sum ← sum + (hidden.get(f) coalesce 0.0 ∷ f32) * (down_w.data.get(e * ffn_length + f) coalesce 0.0 ∷ f32)
+            sum ← sum + hidden[f] * down_w.data[row_base + f]
         }
 
         out.append(sum)
@@ -206,17 +214,17 @@ fn softmax(list<f32> logits) → list<f32> ⇥ MoeError {
 
     # The list reduction has no shaped iterable contract; this scan also
     # preserves the list-index form used by the router's later selections.
-    mut f32 maximum ← logits.get(0) coalesce 0.0 ∷ f32
+    mut f32 maximum ← logits[0]
 
     for range 1 ‥ logits.length() let i {
-        let f32 value ← logits.get(i) coalesce 0.0 ∷ f32
+        let f32 value ← logits[i]
 
         if value ≻ maximum {
             maximum ← value
         }
     }
 
-    mut list<f32> exponents ← empty
+    mut list<f32> probabilities ← empty
     mut f32 total ← 0.0 ∷ f32
 
     for from logits let value {
@@ -224,16 +232,14 @@ fn softmax(list<f32> logits) → list<f32> ⇥ MoeError {
 
         require dtype.finite(exponent) throw variant NonFinite { message = "router softmax produced a non-finite value" }
 
-        exponents.append(exponent)
+        probabilities.append(exponent)
         total ← total + exponent
     }
 
     require dtype.finite(total) and total ≻ 0.0 throw variant NonFinite { message = "router softmax normalizer is non-finite" }
 
-    mut list<f32> probabilities ← empty
-
-    for from exponents let exponent {
-        probabilities.append(exponent / total)
+    for range 0 ‥ probabilities.length() let i {
+        probabilities[i] ← probabilities[i] / total
     }
 
     return probabilities
@@ -250,8 +256,8 @@ fn best_index(list<f32> probabilities, list<int> selected) → int {
                 best ← i
             }
             else {
-                let f32 candidate ← probabilities.get(i) coalesce 0.0 ∷ f32
-                let f32 incumbent ← probabilities.get(best) coalesce 0.0 ∷ f32
+                let f32 candidate ← probabilities[i]
+                let f32 incumbent ← probabilities[best]
 
                 if candidate ≻ incumbent or candidate ≡ incumbent and i ≺ best {
                     best ← i
@@ -276,7 +282,7 @@ fn selection_from(list<f32> logits, list<f32> probabilities, MoeConfig cfg) → 
         require index ≥ 0 throw variant BadConfig { message = "router selection index is unavailable" }
 
         indices.append(index)
-        let f32 probability ← probabilities.get(index) coalesce 0.0 ∷ f32
+        let f32 probability ← probabilities[index]
         selected_probabilities.append(probability)
         selected_total ← selected_total + probability
     }
@@ -311,8 +317,8 @@ fn next_slot(list<int> selected, list<int> consumed) → int ⇥ MoeError {
                 slot ← j
             }
             else {
-                let int candidate ← selected.get(j) coalesce (-1)
-                let int incumbent ← selected.get(slot) coalesce (-1)
+                let int candidate ← selected[j]
+                let int incumbent ← selected[slot]
 
                 if candidate ≺ incumbent {
                     slot ← j
@@ -443,6 +449,30 @@ fn prepare_moe_layer((string, int, int) → tensor.NumericBlock ⇥ MoeError sou
     return MoeLayerWeights { router = router, gate_exps = gates, up_exps = ups, down_exps = downs, gate_shexp = gate_shexp, up_shexp = up_shexp, down_shexp = down_shexp, gate_inp_shexp = gate_inp_shexp }
 }
 
+fn accumulate_expert_into(mut list<f32> moe_acc, list<f32> expert_row, f32 weight, int embd) → void {
+    for range 0 ‥ embd let d {
+        moe_acc[d] ← moe_acc[d] + expert_row[d] * weight
+    }
+}
+
+fn combine_moe_output(list<f32> moe_acc, list<f32> shexp_row, f32 gate, int embd) → tensor.NumericBlock ⇥ MoeError {
+    mut list<f32> combined ← empty
+
+    for range 0 ‥ embd let d {
+        combined.append(moe_acc[d] + shexp_row[d] * gate)
+    }
+
+    let tensor.NumericBlock result ← tensor.stage_f32([embd], combined)
+
+    require result.valid() throw variant BadShape { message = "FFN output carrier is invalid" }
+
+    require result.shape ≡ ([embd] ↦ list<int>) throw variant BadShape { message = "FFN output carrier has the wrong shape" }
+
+    require finite_tensor(result) throw variant NonFinite { message = "FFN output contains a non-finite value" }
+
+    return result
+}
+
 @ public
 fn ffn_moe(tensor.NumericBlock x, int layer, (string, int, int) → tensor.NumericBlock ⇥ MoeError source, MoeConfig cfg) → tensor.NumericBlock ⇥ MoeError {
     # --- config + input (fail closed) -------------------------------------
@@ -485,8 +515,8 @@ fn ffn_moe(tensor.NumericBlock x, int layer, (string, int, int) → tensor.Numer
     for range 0 ‥ cfg.expert_used_count {
         let int slot ← next_slot(selected, consumed)
         consumed.append(slot)
-        let int expert ← selected.get(slot) coalesce 0
-        let f32 weight ← selection.weights.get(slot) coalesce 0.0 ∷ f32
+        let int expert ← selected[slot]
+        let f32 weight ← selection.weights[slot]
         let int start ← expert * expert_length
         let tensor.NumericBlock gate_window ← window(source, prefix + ".ffn_gate_exps", start, expert_length, [cfg.expert_ffn_length, cfg.embedding_length])
         let tensor.NumericBlock up_window ← window(source, prefix + ".ffn_up_exps", start, expert_length, [cfg.expert_ffn_length, cfg.embedding_length])
@@ -497,31 +527,11 @@ fn ffn_moe(tensor.NumericBlock x, int layer, (string, int, int) → tensor.Numer
             require dtype.finite(value) throw variant NonFinite { message = "expert output contains a non-finite value" }
         }
 
-        mut list<f32> accumulated ← empty
-
-        for range 0 ‥ cfg.embedding_length let d {
-            accumulated.append((moe_acc.get(d) coalesce 0.0 ∷ f32) + (expert_row.get(d) coalesce 0.0 ∷ f32) * weight)
-        }
-
-        moe_acc ← accumulated
+        accumulate_expert_into(mut moe_acc, expert_row, weight, cfg.embedding_length)
     }
 
     # --- combine + fail-closed output -------------------------------------
-    mut list<f32> combined ← empty
-
-    for range 0 ‥ cfg.embedding_length let d {
-        combined.append((moe_acc.get(d) coalesce 0.0 ∷ f32) + (shexp_row.get(d) coalesce 0.0 ∷ f32) * gate)
-    }
-
-    let tensor.NumericBlock result ← tensor.stage_f32([cfg.embedding_length], combined)
-
-    require result.valid() throw variant BadShape { message = "FFN output carrier is invalid" }
-
-    require result.shape ≡ ([cfg.embedding_length] ↦ list<int>) throw variant BadShape { message = "FFN output carrier has the wrong shape" }
-
-    require finite_tensor(result) throw variant NonFinite { message = "FFN output contains a non-finite value" }
-
-    return result
+    return combine_moe_output(moe_acc, shexp_row, gate, cfg.embedding_length)
 }
 
 # Lean prepared form (the decode route): the full routed MoE FFN layer over
@@ -535,6 +545,8 @@ fn ffn_moe_prepared(tensor.NumericBlock x, MoeLayerWeights weights, MoeConfig cf
     validate_config(cfg)
 
     validate_input(x, cfg)
+
+    require weights.gate_exps.length() ≡ cfg.expert_count and weights.up_exps.length() ≡ cfg.expert_count and weights.down_exps.length() ≡ cfg.expert_count throw variant BadShape { message = "prepared expert weight count mismatch" }
 
     # --- router selection over the prepared router weights ----------------
     let list<f32> logits ← gemv_list(weights.router, x.data, cfg.embedding_length, cfg.expert_count)
@@ -569,42 +581,22 @@ fn ffn_moe_prepared(tensor.NumericBlock x, MoeLayerWeights weights, MoeConfig cf
     for range 0 ‥ cfg.expert_used_count {
         let int slot ← next_slot(selected, consumed)
         consumed.append(slot)
-        let int expert ← selected.get(slot) coalesce 0
-        let f32 weight ← selection.weights.get(slot) coalesce 0.0 ∷ f32
-        let tensor.NumericBlock gate_window ← weights.gate_exps.get(expert) coalesce tensor.default()
-        let tensor.NumericBlock up_window ← weights.up_exps.get(expert) coalesce tensor.default()
-        let tensor.NumericBlock down_window ← weights.down_exps.get(expert) coalesce tensor.default()
+        let int expert ← selected[slot]
+        let f32 weight ← selection.weights[slot]
+        let tensor.NumericBlock gate_window ← weights.gate_exps[expert]
+        let tensor.NumericBlock up_window ← weights.up_exps[expert]
+        let tensor.NumericBlock down_window ← weights.down_exps[expert]
         let list<f32> expert_row ← expert_rows(gate_window, up_window, down_window, x.data, cfg.expert_ffn_length, cfg)
 
         for from expert_row let value {
             require dtype.finite(value) throw variant NonFinite { message = "expert output contains a non-finite value" }
         }
 
-        mut list<f32> accumulated ← empty
-
-        for range 0 ‥ cfg.embedding_length let d {
-            accumulated.append((moe_acc.get(d) coalesce 0.0 ∷ f32) + (expert_row.get(d) coalesce 0.0 ∷ f32) * weight)
-        }
-
-        moe_acc ← accumulated
+        accumulate_expert_into(mut moe_acc, expert_row, weight, cfg.embedding_length)
     }
 
     # --- combine + fail-closed output -------------------------------------
-    mut list<f32> combined ← empty
-
-    for range 0 ‥ cfg.embedding_length let d {
-        combined.append((moe_acc.get(d) coalesce 0.0 ∷ f32) + (shexp_row.get(d) coalesce 0.0 ∷ f32) * gate)
-    }
-
-    let tensor.NumericBlock result ← tensor.stage_f32([cfg.embedding_length], combined)
-
-    require result.valid() throw variant BadShape { message = "FFN output carrier is invalid" }
-
-    require result.shape ≡ ([cfg.embedding_length] ↦ list<int>) throw variant BadShape { message = "FFN output carrier has the wrong shape" }
-
-    require finite_tensor(result) throw variant NonFinite { message = "FFN output contains a non-finite value" }
-
-    return result
+    return combine_moe_output(moe_acc, shexp_row, gate, cfg.embedding_length)
 }
 
 +++ faber test
