@@ -82,6 +82,41 @@ fn prepare_full_attention((string, int, int) → list<f32> ⇥ schedule.Qwen35mo
     return FullAttentionWeights {attn_norm = attn_norm, wq = wq, wk = wk, wv = wv, q_norm = q_norm, k_norm = k_norm, wo = wo}
 }
 
+# RMSNorm + RoPE over one head slice in a flat projection output, sharing a
+# single pre-allocated `head_buf` and the per-token `rope_angles` table.
+fn norm_and_rope_head(list<f32> src, int src_base, list<f32> norm_w, list<f32> rope_angles, int head_dim, int rope_dims, f32 eps, bool capture, mut list<f32> head_buf, mut list<f32> normed_out, mut list<f32> rope_out) → void {
+    mut f32 sum ← 0.0
+    for range 0‥head_dim let d {
+        let f32 v ← src[src_base + d]
+        sum ← sum + v * v
+    }
+    let f32 scale ← 1.0 / (√ (sum / (head_dim ↦ f32) + eps))
+    for range 0‥head_dim let d {
+        let f32 nv ← src[src_base + d] * scale * norm_w[d]
+        head_buf[d] ← nv
+        if capture {
+            normed_out.append(nv)
+        }
+    }
+    let int half ← rope_dims / 2
+    for range 0‥head_dim let i {
+        if i ≺ half {
+            let f32 x0 ← head_buf[i]
+            let f32 x1 ← head_buf[i + half]
+            rope_out.append(x0 * rope_angles[i * 2] - x1 * rope_angles[i * 2 + 1])
+        }
+        elif i ≺ rope_dims {
+            let int pair ← i - half
+            let f32 x0 ← head_buf[pair]
+            let f32 x1 ← head_buf[pair + half]
+            rope_out.append(x0 * rope_angles[pair * 2 + 1] + x1 * rope_angles[pair * 2])
+        }
+        else {
+            rope_out.append(head_buf[i])
+        }
+    }
+}
+
 # Run one full-attention layer over T input rows [T][2048] starting at
 # absolute position start_pos: attn_norm -> joint Q/gate projection ->
 # per-head Q RMSNorm -> K/V projections with per-kv-head K RMSNorm ->
@@ -100,8 +135,11 @@ fn full_attention_core<size C, size W, size KVD>(list<f32> x_rows, mut sess_mod.
     let int head_dim ← c.key_length
     let int q_width ← heads * head_dim
     let int kv_width ← kv_heads * head_dim
+    let int rope_dims ← c.rope_dimension_count
     # --- window gates (fail closed) ---------------------------------------
     require tokens ≥ 1 and x_rows.length() ≡ tokens * c.embedding_length throw variant BadShape {message = "full attention input rows must be [T][embedding]"}
+    require embd ≥ 1 and heads ≥ 1 and kv_heads ≥ 1 and head_dim ≥ 1 and heads % kv_heads ≡ 0 throw variant BadShape {message = "invalid full attention head geometry"}
+    require rope_dims ≥ 2 and rope_dims % 2 ≡ 0 and rope_dims ≤ head_dim throw variant BadShape {message = "invalid rope dimensions"}
     require sess.txn_depth ≡ 0 throw variant BadState {message = "kv session has an open transaction"}
     require slot_id ≥ 0 and slot_id ≺ sess.slot_arena_kind.length() throw variant BadState {message = "kv slot_id out of range"}
     require sess.slot_arena_kind[slot_id] ≡ 0 throw variant BadState {message = "slot is not a FullKv arena"}
@@ -120,19 +158,10 @@ fn full_attention_core<size C, size W, size KVD>(list<f32> x_rows, mut sess_mod.
     let list<f32> q_norm ← weights.q_norm
     let list<f32> k_norm ← weights.k_norm
     let list<f32> wo ← weights.wo
+    require attn_norm.length() ≡ embd and q_norm.length() ≡ head_dim and k_norm.length() ≡ head_dim throw variant BadShape {message = "full attention norm weight length mismatch"}
 
     # --- attn_norm + projections ------------------------------------------
-    mut list<f32> normed_rows ← empty
-    for range 0‥tokens let t {
-        mut list<f32> row ← empty
-        for range 0‥embd let d {
-            row.append(x_rows.get(t * embd + d) coalesce 0.0)
-        }
-        let list<f32> normed ← session.rms_norm_row(row, attn_norm, c.rms_norm_epsilon)
-        for from normed let v {
-            normed_rows.append(v)
-        }
-    }
+    let list<f32> normed_rows ← session.rms_norm_rows(x_rows, attn_norm, embd, tokens, c.rms_norm_epsilon)
     let list<f32> q_full_rows ← session.project_rows(wq, normed_rows, embd, 2 * q_width, tokens)
     let list<f32> k_rows ← session.project_rows(wk, normed_rows, embd, kv_width, tokens)
     let list<f32> v_rows ← session.project_rows(wv, normed_rows, embd, kv_width, tokens)
@@ -147,36 +176,29 @@ fn full_attention_core<size C, size W, size KVD>(list<f32> x_rows, mut sess_mod.
     mut list<f32> v_heads ← empty
     mut list<f32> q_normed_rows ← empty
     mut list<f32> k_normed_rows ← empty
+    mut list<f32> head_buf ← empty
+    for range 0‥head_dim {
+        head_buf.append(0.0 ∷ f32)
+    }
     for range 0‥tokens let t {
-        let list<f32> rope_angles ← session.rope_table(c.freq_base, c.rope_dimension_count, start_pos + t)
+        let list<f32> rope_angles ← session.rope_table(c.freq_base, rope_dims, start_pos + t)
+        let int q_tbase ← t * 2 * q_width
         for range 0‥heads let h {
-            mut list<f32> qhead ← empty
+            let int q_base ← q_tbase + h * 2 * head_dim
+            norm_and_rope_head(q_full_rows, q_base, q_norm, rope_angles, head_dim, rope_dims, c.rms_norm_epsilon, capture, mut head_buf, mut q_normed_rows, mut q_heads)
+            let int g_base ← q_base + head_dim
             for range 0‥head_dim let d {
-                qhead.append(q_full_rows.get(t * 2 * q_width + h * 2 * head_dim + d) coalesce 0.0)
-            }
-            let list<f32> normed ← session.rms_norm_row(qhead, q_norm, c.rms_norm_epsilon)
-            let list<f32> turned ← session.rope_head_table(normed, rope_angles, c.rope_dimension_count, head_dim)
-            if capture {
-                q_normed_rows.extend(normed)
-            }
-            q_heads.extend(turned)
-            for range 0‥head_dim let d {
-                gate_rows.append(q_full_rows.get(t * 2 * q_width + h * 2 * head_dim + head_dim + d) coalesce 0.0)
+                gate_rows.append(q_full_rows[g_base + d])
             }
         }
+        let int kv_tbase ← t * kv_width
         for range 0‥kv_heads let g {
-            mut list<f32> khead ← empty
-            for range 0‥head_dim let d {
-                khead.append(k_rows.get(t * kv_width + g * head_dim + d) coalesce 0.0)
-            }
-            let list<f32> normed ← session.rms_norm_row(khead, k_norm, c.rms_norm_epsilon)
-            let list<f32> turned ← session.rope_head_table(normed, rope_angles, c.rope_dimension_count, head_dim)
+            let int kv_base ← kv_tbase + g * head_dim
+            norm_and_rope_head(k_rows, kv_base, k_norm, rope_angles, head_dim, rope_dims, c.rms_norm_epsilon, capture, mut head_buf, mut k_normed_rows, mut k_heads)
             if capture {
-                k_normed_rows.extend(normed)
-            }
-            k_heads.extend(turned)
-            for range 0‥head_dim let d {
-                v_heads.append(v_rows.get(t * kv_width + g * head_dim + d) coalesce 0.0 ∷ f32)
+                for range 0‥head_dim let d {
+                    v_heads.append(v_rows[kv_base + d])
+                }
             }
         }
     }
@@ -185,9 +207,10 @@ fn full_attention_core<size C, size W, size KVD>(list<f32> x_rows, mut sess_mod.
     mut tensor<f32, [C, KVD]> keys ← sess.full_kv.keys[local_idx]
     mut tensor<f32, [C, KVD]> values ← sess.full_kv.values[local_idx]
     for range 0‥tokens let t {
+        let int t_off ← t * kv_width
         for range 0‥kv_width let c_idx {
-            keys[[start_pos + t, c_idx]] ← k_heads[t * kv_width + c_idx]
-            values[[start_pos + t, c_idx]] ← v_heads[t * kv_width + c_idx]
+            keys[[start_pos + t, c_idx]] ← k_heads[t_off + c_idx]
+            values[[start_pos + t, c_idx]] ← v_rows[t_off + c_idx]
         }
     }
     sess.full_kv.keys[local_idx] ← keys
@@ -206,14 +229,17 @@ fn full_attention_core<size C, size W, size KVD>(list<f32> x_rows, mut sess_mod.
     mut list<f32> softmax_rows ← empty
     for range 0‥tokens let t {
         let int attend ← start_pos + t + 1
+        let int qt_base ← t * q_width
         for range 0‥heads let h {
             let int kvh ← h / heads_per_kv
+            let int q_base ← qt_base + h * head_dim
+            let int kv_base ← kvh * head_dim
             mut list<f32> scores ← empty
             mut f32 maximum ← 0.0
             for range 0‥attend let i {
                 mut f32 dot ← 0.0
                 for range 0‥head_dim let d {
-                    dot ← dot + (q_heads.get(t * q_width + h * head_dim + d) coalesce 0.0) * ro_keys[[i, kvh * head_dim + d]]
+                    dot ← dot + q_heads[q_base + d] * ro_keys[[i, kv_base + d]]
                 }
                 let f32 score ← dot * kq_scale
                 if i ≡ 0 or score ≻ maximum {
@@ -221,21 +247,19 @@ fn full_attention_core<size C, size W, size KVD>(list<f32> x_rows, mut sess_mod.
                 }
                 scores.append(score)
             }
-            mut list<f32> exponents ← empty
             mut f32 total ← 0.0
             for range 0‥attend let i {
-                let f32 e ← ((scores.get(i) coalesce 0.0) - maximum).exp()
-                exponents.append(e)
+                let f32 e ← (scores[i] - maximum).exp()
+                scores[i] ← e
                 total ← total + e
             }
             require total ≻ 0.0 throw variant schedule.Qwen35moeStateError.NonFinite {message = "attention softmax normalizer collapsed"}
-            mut list<f32> norm_weights ← empty
             for range 0‥attend let i {
-                norm_weights.append((exponents.get(i) coalesce 0.0) / total)
+                scores[i] ← scores[i] / total
             }
             if capture {
                 for range 0‥attend let i {
-                    softmax_rows.append(norm_weights.get(i) coalesce 0.0)
+                    softmax_rows.append(scores[i])
                 }
                 for range attend‥kv_len {
                     softmax_rows.append(0.0)
@@ -244,7 +268,7 @@ fn full_attention_core<size C, size W, size KVD>(list<f32> x_rows, mut sess_mod.
             for range 0‥head_dim let d {
                 mut f32 sum ← 0.0
                 for range 0‥attend let i {
-                    sum ← sum + (norm_weights.get(i) coalesce 0.0) * ro_values[[i, kvh * head_dim + d]]
+                    sum ← sum + scores[i] * ro_values[[i, kv_base + d]]
                 }
                 pregate_rows.append(sum)
             }
@@ -254,14 +278,14 @@ fn full_attention_core<size C, size W, size KVD>(list<f32> x_rows, mut sess_mod.
     # --- sigmoid gate, output projection, residual add --------------------
     mut list<f32> gated_rows ← empty
     for range 0‥tokens * q_width let i {
-        gated_rows.append((pregate_rows.get(i) coalesce 0.0) * session.sigmoid(gate_rows.get(i) coalesce 0.0))
+        gated_rows.append(pregate_rows[i] * session.sigmoid(gate_rows[i]))
     }
     let list<f32> projected ← session.project_rows(wo, gated_rows, q_width, embd, tokens)
     mut list<f32> out_rows ← empty
     for range 0‥tokens * embd let i {
-        let f32 v ← projected.get(i) coalesce 0.0 ∷ f32
+        let f32 v ← projected[i]
         require dtype.finite(v) throw variant schedule.Qwen35moeStateError.NonFinite {message = "full attention output is non-finite"}
-        out_rows.append(v + (x_rows.get(i) coalesce 0.0 ∷ f32))
+        out_rows.append(v + x_rows[i])
     }
     if not capture {
         # Lean decode route: no diagnostic trace buffers are allocated

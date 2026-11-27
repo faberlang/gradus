@@ -96,33 +96,28 @@ fn find_arena_slot(list<int> slot_ids, int slot_id, string label) → int ⇥ sc
     throw variant BadState {message = "§ slot_id § not found in arena"(label, slot_id ↦ string)}
 }
 
-# One head, one token: decay -> delta -> outer update -> output read, in
-# the comparator's exact stage order.
-fn delta_step(list<f32> span, list<f32> q, list<f32> k, list<f32> v, f32 decay, f32 beta, int dim) → tuple<updated: list<f32>, out: list<f32>> ⇥ schedule.Qwen35moeStateError {
-    mut list<f32> decayed ← empty
-    for from span let cell {
-        decayed.append(cell * decay)
-    }
-    let f32 scale ← 1.0 / (√ (dim ↦ f32))
-    mut list<f32> updated ← empty
-    mut list<f32> out ← empty
+# One head, one token directly over a RecurrentStateArena tensor:
+# decay -> delta -> outer update -> output read, in the comparator's exact
+# stage order and float arithmetic, without copying the head matrix out.
+fn delta_step_head<size RecRows, size RecCols>(mut tensor<f32, [RecRows, RecCols]> state, int row_base, list<f32> q, int q_base, list<f32> k, int k_base, list<f32> v, int v_base, f32 decay, f32 beta, int dim, f32 scale, mut list<f32> row_dec, mut list<f32> out) → void ⇥ schedule.Qwen35moeStateError {
     for range 0‥dim let j {
-        mut f32 sum ← 0.0
-        let int row ← j * dim
+        let int r ← row_base + j
+        mut f32 sum ← 0.0 ∷ f32
         for range 0‥dim let i {
-            sum ← sum + (decayed.get(row + i) coalesce 0.0) * (k.get(i) coalesce 0.0)
+            let f32 dec ← state[[r, i]] * decay
+            row_dec[i] ← dec
+            sum ← sum + dec * k[k_base + i]
         }
-        let f32 d ← ((v.get(j) coalesce 0.0) - sum) * beta
-        mut f32 read ← 0.0
+        let f32 d ← (v[v_base + j] - sum) * beta
+        mut f32 read ← 0.0 ∷ f32
         for range 0‥dim let i {
-            let f32 cell ← (decayed.get(row + i) coalesce 0.0) + (k.get(i) coalesce 0.0) * d
-            updated.append(cell)
-            read ← read + cell * (q.get(i) coalesce 0.0)
+            let f32 cell ← row_dec[i] + k[k_base + i] * d
+            state[[r, i]] ← cell
+            read ← read + cell * q[q_base + i]
         }
         require dtype.finite(read) throw variant schedule.Qwen35moeStateError.NonFinite {message = "gated delta net output is non-finite"}
         out.append(read * scale)
     }
-    return tuple<updated: list<f32>, out: list<f32>> [updated, out]
 }
 
 # Advance one head of a RecurrentStateArena slot by one token.
@@ -136,23 +131,16 @@ fn delta_step_slot<size RecRows, size RecCols>(mut hybrid.RecurrentStateArena<si
     require head ≥ 0 and head ≺ heads throw variant BadState {message = "recurrent head index outside the state"}
     require q.length() ≡ dim and k.length() ≡ dim and v.length() ≡ dim throw variant BadShape {message = "delta rule rows must match the state dim"}
     mut tensor<f32, [RecRows, RecCols]> state ← arena.states[r_idx]
-    let int row_base ← head * dim
-    mut list<f32> head_cells ← empty
-    for range 0‥dim let j {
-        for range 0‥dim let i {
-            head_cells.append(state[[row_base + j, i]])
-        }
+    let f32 scale ← 1.0 / (√ (dim ↦ f32))
+    mut list<f32> row_dec ← empty
+    for range 0‥dim {
+        row_dec.append(0.0 ∷ f32)
     }
-    let tuple<updated: list<f32>, out: list<f32>> step ← delta_step(head_cells, q, k, v, g.exp(), beta, dim)
-    let list<f32> advanced ← step.updated
-    for range 0‥dim let j {
-        for range 0‥dim let i {
-            state[[row_base + j, i]] ← advanced[j * dim + i]
-        }
-    }
+    mut list<f32> out ← empty
+    delta_step_head<size RecRows, size RecCols>(mut state, head * dim, q, 0, k, 0, v, 0, g.exp(), beta, dim, scale, mut row_dec, mut out)
     arena.states[r_idx] ← state
     arena.steps_written[r_idx] ← arena.steps_written[r_idx] + 1
-    return step.out
+    return out
 }
 
 # Read one head of a RecurrentStateArena slot against a query row (no update).
@@ -171,7 +159,7 @@ fn recurrent_readout_slot<size RecRows, size RecCols>(hybrid.RecurrentStateArena
     for range 0‥dim let j {
         mut f32 sum ← 0.0 ∷ f32
         for range 0‥dim let i {
-            sum ← sum + state[[row_base + j, i]] * (q.get(i) coalesce 0.0 ∷ f32)
+            sum ← sum + state[[row_base + j, i]] * q[i]
         }
         out.append(sum * scale)
     }
@@ -194,7 +182,10 @@ fn linear_attention_core<size ConvRows, size ConvCh, size RecRows, size RecCols>
     let int value_dim ← c.state_size
     let int head_v_dim ← c.inner_size / value_heads
     let int conv_hist ← c.conv_kernel - 1
+    let int group_heads ← c.group_count
+    let f32 l2_eps ← c.rms_norm_epsilon
 
+    require embd ≥ 1 and value_heads ≥ 1 and group_heads ≥ 1 and key_dim ≥ 1 and head_v_dim ≡ key_dim and value_dim ≡ key_dim and c.conv_kernel ≥ 2 throw variant BadShape {message = "invalid linear attention dimensions"}
     require conv_arena.txn_depth ≡ 0 and rec_arena.txn_depth ≡ 0 throw variant BadState {message = "hybrid arena has an open transaction"}
     require conv_arena.channels ≡ conv_channels and ConvCh ≡ conv_channels throw variant BadShape {message = "conv arena channel width mismatch"}
     require conv_arena.history_len ≡ conv_hist and conv_hist ≥ 1 and conv_hist ≤ ConvRows throw variant BadShape {message = "conv arena history_len mismatch"}
@@ -213,179 +204,214 @@ fn linear_attention_core<size ConvRows, size ConvCh, size RecRows, size RecCols>
     let list<f32> walpha ← weights.walpha
     let list<f32> ssm_norm ← weights.ssm_norm
     let list<f32> wout ← weights.wout
+    require attn_norm.length() ≡ embd and conv_weight.length() ≡ conv_channels * c.conv_kernel and dt_bias.length() ≡ value_heads and a_row.length() ≡ value_heads and ssm_norm.length() ≡ head_v_dim throw variant BadShape {message = "linear attention weight window has the wrong length"}
 
     mut list<f32> out_rows ← empty
 
     # --- attn_norm + projections over the whole window --------------------
-    mut list<f32> normed_rows ← empty
-    for range 0‥tokens let t {
-        mut list<f32> row ← empty
-        for range 0‥embd let d {
-            row.append(x_rows.get(t * embd + d) coalesce 0.0)
-        }
-        let list<f32> normed ← session.rms_norm_row(row, attn_norm, c.rms_norm_epsilon)
-        for from normed let v {
-            normed_rows.append(v)
-        }
-    }
+    let list<f32> normed_rows ← session.rms_norm_rows(x_rows, attn_norm, embd, tokens, c.rms_norm_epsilon)
     let list<f32> qkv_rows ← session.project_rows(wqkv, normed_rows, embd, conv_channels, tokens)
     let list<f32> z_rows ← session.project_rows(wgate, normed_rows, embd, c.inner_size, tokens)
     let list<f32> beta_rows ← session.project_rows(wbeta, normed_rows, embd, value_heads, tokens)
     let list<f32> alpha_rows ← session.project_rows(walpha, normed_rows, embd, value_heads, tokens)
     mut list<f32> beta_sigmoid_rows ← empty
-    for range 0‥tokens let t {
-        for range 0‥value_heads let h {
-            beta_sigmoid_rows.append(session.sigmoid(beta_rows.get(t * value_heads + h) coalesce 0.0))
-        }
-    }
     mut list<f32> gate_rows ← empty
     for range 0‥tokens let t {
+        let int hbase ← t * value_heads
         for range 0‥value_heads let h {
-            let f32 alpha ← alpha_rows.get(t * value_heads + h) coalesce 0.0
-            let f32 bias ← dt_bias.get(h) coalesce 0.0
-            let f32 a ← a_row.get(h) coalesce 0.0
-            gate_rows.append(session.softplus(alpha + bias) * a)
+            beta_sigmoid_rows.append(session.sigmoid(beta_rows[hbase + h]))
+            gate_rows.append(session.softplus(alpha_rows[hbase + h] + dt_bias[h]) * a_row[h])
         }
     }
 
     # --- causal depthwise conv (ConvStateArena) ----------------------------
-    # input = conv state rows ++ qkv rows; output[t][ch] is the 4-tap
-    # causal dot then SiLU. The advanced state is the last conv_kernel - 1
-    # rows of the input.
+    # When capture is false, read directly from conv_buf ++ qkv_rows and
+    # advance conv_buf in place without allocating conv_input.
     mut tensor<f32, [ConvRows, ConvCh]> conv_buf ← conv_arena.buffers[c_idx]
     mut list<f32> conv_input ← empty
-    for range 0‥conv_hist let r {
-        for range 0‥conv_channels let ch {
-            conv_input.append(conv_buf[[r, ch]])
-        }
-    }
-    for from qkv_rows let v {
-        conv_input.append(v)
-    }
     mut list<f32> conv_out ← empty
-    for range 0‥tokens let t {
-        for range 0‥conv_channels let ch {
-            mut f32 sum ← 0.0
-            for range 0‥c.conv_kernel let tap {
-                sum ← sum + (conv_input.get((t + tap) * conv_channels + ch) coalesce 0.0) * (conv_weight.get(ch * c.conv_kernel + tap) coalesce 0.0)
+    if capture {
+        for range 0‥conv_hist let r {
+            for range 0‥conv_channels let ch {
+                conv_input.append(conv_buf[[r, ch]])
             }
-            conv_out.append(session.silu(sum))
+        }
+        for from qkv_rows let v {
+            conv_input.append(v)
+        }
+        for range 0‥tokens let t {
+            for range 0‥conv_channels let ch {
+                let int w_base ← ch * c.conv_kernel
+                mut f32 sum ← 0.0
+                for range 0‥c.conv_kernel let tap {
+                    sum ← sum + conv_input[(t + tap) * conv_channels + ch] * conv_weight[w_base + tap]
+                }
+                conv_out.append(session.silu(sum))
+            }
+        }
+        for range 0‥conv_hist let r {
+            let int src_row ← (tokens + r) * conv_channels
+            for range 0‥conv_channels let ch {
+                conv_buf[[r, ch]] ← conv_input[src_row + ch]
+            }
         }
     }
-    for range 0‥conv_hist let r {
-        for range 0‥conv_channels let ch {
-            conv_buf[[r, ch]] ← conv_input.get((tokens + r) * conv_channels + ch) coalesce 0.0
+    else {
+        for range 0‥tokens let t {
+            for range 0‥conv_channels let ch {
+                let int w_base ← ch * c.conv_kernel
+                mut f32 sum ← 0.0
+                for range 0‥c.conv_kernel let tap {
+                    let int row ← t + tap
+                    mut f32 inp ← 0.0
+                    if row ≺ conv_hist {
+                        inp ← conv_buf[[row, ch]]
+                    }
+                    else {
+                        inp ← qkv_rows[(row - conv_hist) * conv_channels + ch]
+                    }
+                    sum ← sum + inp * conv_weight[w_base + tap]
+                }
+                conv_out.append(session.silu(sum))
+            }
+        }
+        for range 0‥conv_hist let r {
+            let int row ← tokens + r
+            if row ≺ conv_hist {
+                for range 0‥conv_channels let ch {
+                    conv_buf[[r, ch]] ← conv_buf[[row, ch]]
+                }
+            }
+            else {
+                let int q_base ← (row - conv_hist) * conv_channels
+                for range 0‥conv_channels let ch {
+                    conv_buf[[r, ch]] ← qkv_rows[q_base + ch]
+                }
+            }
         }
     }
     conv_arena.buffers[c_idx] ← conv_buf
     conv_arena.steps_written[c_idx] ← conv_arena.steps_written[c_idx] + tokens
 
-    # --- head views: L2-normed q/k repeated to value heads ----------------
-    # q/k per group head, v per value head.
+    # --- head views: L2-normed q/k (repeated when traced) -----------------
     mut list<f32> q_rows ← empty
     mut list<f32> k_rows ← empty
     mut list<f32> v_rows ← empty
-    let int group_heads ← c.group_count
-    let f32 l2_eps ← c.rms_norm_epsilon
+    mut list<f32> q_group ← empty
+    mut list<f32> k_group ← empty
+    mut list<f32> q_scales ← empty
+    mut list<f32> k_scales ← empty
+    for range 0‥group_heads {
+        q_scales.append(0.0 ∷ f32)
+        k_scales.append(0.0 ∷ f32)
+    }
     for range 0‥tokens let t {
         let int tbase ← t * conv_channels
-        # L2 norm each group head of q and k, then repeat to value heads.
-        mut list<list<f32>> q_normed_heads ← empty
-        mut list<list<f32>> k_normed_heads ← empty
+        let int k_offset ← tbase + group_heads * key_dim
         for range 0‥group_heads let h {
-            mut list<f32> qhead ← empty
-            mut list<f32> khead ← empty
+            let int q_off ← tbase + h * key_dim
+            let int k_off ← k_offset + h * key_dim
+            mut f32 qsum ← 0.0
+            mut f32 ksum ← 0.0
             for range 0‥key_dim let d {
-                qhead.append(conv_out.get(tbase + h * key_dim + d) coalesce 0.0)
-                khead.append(conv_out.get(tbase + group_heads * key_dim + h * key_dim + d) coalesce 0.0)
+                let f32 qv ← conv_out[q_off + d]
+                let f32 kv ← conv_out[k_off + d]
+                qsum ← qsum + qv * qv
+                ksum ← ksum + kv * kv
             }
-            let list<f32> qnormed ← session.l2_norm_row(qhead, l2_eps)
-            let list<f32> knormed ← session.l2_norm_row(khead, l2_eps)
-            q_normed_heads.append(qnormed)
-            k_normed_heads.append(knormed)
+            let f32 qnorm ← √ qsum
+            let f32 knorm ← √ ksum
+            q_scales[h] ← qnorm ≺ l2_eps ✓ (1.0 / l2_eps) ✗ (1.0 / qnorm)
+            k_scales[h] ← knorm ≺ l2_eps ✓ (1.0 / l2_eps) ✗ (1.0 / knorm)
         }
-        for range 0‥value_heads let h {
-            let int src_head ← h % group_heads
-            let list<f32> qsrc ← q_normed_heads.get(src_head) coalesce session.empty_f32_row()
-            let list<f32> ksrc ← k_normed_heads.get(src_head) coalesce session.empty_f32_row()
-            for range 0‥key_dim let d {
-                q_rows.append(qsrc.get(d) coalesce 0.0)
-                k_rows.append(ksrc.get(d) coalesce 0.0)
-                v_rows.append(conv_out.get(tbase + 2 * group_heads * key_dim + h * head_v_dim + d) coalesce 0.0)
+        if capture {
+            let int v_offset ← tbase + 2 * group_heads * key_dim
+            for range 0‥value_heads let h {
+                let int src_head ← h % group_heads
+                let int q_off ← tbase + src_head * key_dim
+                let int k_off ← k_offset + src_head * key_dim
+                let int v_off ← v_offset + h * head_v_dim
+                let f32 qs ← q_scales[src_head]
+                let f32 ks ← k_scales[src_head]
+                for range 0‥key_dim let d {
+                    q_rows.append(conv_out[q_off + d] * qs)
+                    k_rows.append(conv_out[k_off + d] * ks)
+                    v_rows.append(conv_out[v_off + d])
+                }
+            }
+        }
+        else {
+            for range 0‥group_heads let h {
+                let int q_off ← tbase + h * key_dim
+                let int k_off ← k_offset + h * key_dim
+                let f32 qs ← q_scales[h]
+                let f32 ks ← k_scales[h]
+                for range 0‥key_dim let d {
+                    q_group.append(conv_out[q_off + d] * qs)
+                    k_group.append(conv_out[k_off + d] * ks)
+                }
             }
         }
     }
 
-    # --- delta recurrence: heads outer, tokens sequential -----------------
-    # The fused kernel's order; the recurrent state advances across the
-    # window in RecurrentStateArena.
+    # --- delta recurrence: tokens outer, heads inner ----------------------
+    # Each head's state is independent, so token-outer iteration updates
+    # RecurrentStateArena directly and emits core_token_major without
+    # temporary head copies or post-pass transposition.
     mut tensor<f32, [RecRows, RecCols]> rec_state ← rec_arena.states[r_idx]
-    mut list<f32> core_rows ← empty
-    for range 0‥value_heads let h {
-        let int row_base ← h * value_dim
-        mut list<f32> head_cells ← empty
-        for range 0‥value_dim let j {
-            for range 0‥key_dim let i {
-                head_cells.append(rec_state[[row_base + j, i]])
+    let f32 rec_scale ← 1.0 / (√ (key_dim ↦ f32))
+    mut list<f32> row_dec ← empty
+    for range 0‥key_dim {
+        row_dec.append(0.0 ∷ f32)
+    }
+    mut list<f32> core_token_major ← empty
+    for range 0‥tokens let t {
+        let int h_idx_base ← t * value_heads
+        let int v_conv_base ← t * conv_channels + 2 * group_heads * key_dim
+        let int g_base ← t * group_heads * key_dim
+        for range 0‥value_heads let h {
+            let f32 beta ← beta_sigmoid_rows[h_idx_base + h]
+            let f32 decay ← (gate_rows[h_idx_base + h]).exp()
+            let int row_base ← h * value_dim
+            if capture {
+                let int qkv_base ← (h_idx_base + h) * key_dim
+                delta_step_head<size RecRows, size RecCols>(mut rec_state, row_base, q_rows, qkv_base, k_rows, qkv_base, v_rows, qkv_base, decay, beta, key_dim, rec_scale, mut row_dec, mut core_token_major)
             }
-        }
-        for range 0‥tokens let t {
-            mut list<f32> qhead ← empty
-            mut list<f32> khead ← empty
-            mut list<f32> vhead ← empty
-            for range 0‥key_dim let d {
-                qhead.append(q_rows.get(t * value_heads * key_dim + h * key_dim + d) coalesce 0.0)
-                khead.append(k_rows.get(t * value_heads * key_dim + h * key_dim + d) coalesce 0.0)
-                vhead.append(v_rows.get(t * value_heads * key_dim + h * key_dim + d) coalesce 0.0)
-            }
-            let f32 beta ← beta_sigmoid_rows.get(t * value_heads + h) coalesce 0.0
-            let f32 g ← gate_rows.get(t * value_heads + h) coalesce 0.0
-            let tuple<updated: list<f32>, out: list<f32>> step ← delta_step(head_cells, qhead, khead, vhead, g.exp(), beta, key_dim)
-            let list<f32> advanced ← step.updated
-            let list<f32> core ← step.out
-            head_cells ← advanced
-            for from core let v {
-                core_rows.append(v)
-            }
-        }
-        for range 0‥value_dim let j {
-            for range 0‥key_dim let i {
-                rec_state[[row_base + j, i]] ← head_cells[j * key_dim + i]
+            else {
+                let int src_head ← h % group_heads
+                let int qk_base ← g_base + src_head * key_dim
+                let int v_base ← v_conv_base + h * head_v_dim
+                delta_step_head<size RecRows, size RecCols>(mut rec_state, row_base, q_group, qk_base, k_group, qk_base, conv_out, v_base, decay, beta, key_dim, rec_scale, mut row_dec, mut core_token_major)
             }
         }
     }
     rec_arena.states[r_idx] ← rec_state
     rec_arena.steps_written[r_idx] ← rec_arena.steps_written[r_idx] + tokens
-    # core_rows were appended head-major; re-index to token-major for the
-    # trace and the gated norm.
-    mut list<f32> core_token_major ← empty
-    for range 0‥tokens let t {
-        for range 0‥value_heads let h {
-            for range 0‥key_dim let d {
-                core_token_major.append(core_rows.get(h * tokens * key_dim + t * key_dim + d) coalesce 0.0)
-            }
-        }
-    }
 
     # --- z-gated RMSNorm, output projection, residual add -----------------
     mut list<f32> final_rows ← empty
     for range 0‥tokens let t {
+        let int t_cbase ← t * value_heads * head_v_dim
+        let int t_zbase ← t * c.inner_size
         for range 0‥value_heads let h {
-            mut list<f32> head_out ← empty
+            let int c_base ← t_cbase + h * head_v_dim
+            let int z_base ← t_zbase + h * head_v_dim
+            mut f32 sum ← 0.0
             for range 0‥head_v_dim let d {
-                head_out.append(core_token_major.get(t * value_heads * head_v_dim + h * head_v_dim + d) coalesce 0.0)
+                let f32 v ← core_token_major[c_base + d]
+                sum ← sum + v * v
             }
-            let list<f32> normed ← session.rms_norm_row(head_out, ssm_norm, c.rms_norm_epsilon)
+            let f32 scale ← 1.0 / (√ (sum / (head_v_dim ↦ f32) + c.rms_norm_epsilon))
             for range 0‥head_v_dim let d {
-                final_rows.append((normed.get(d) coalesce 0.0) * session.silu(z_rows.get(t * c.inner_size + h * head_v_dim + d) coalesce 0.0))
+                final_rows.append((core_token_major[c_base + d] * scale * ssm_norm[d]) * session.silu(z_rows[z_base + d]))
             }
         }
     }
     let list<f32> projected ← session.project_rows(wout, final_rows, c.inner_size, embd, tokens)
     for range 0‥tokens * embd let i {
-        let f32 v ← projected.get(i) coalesce 0.0 ∷ f32
+        let f32 v ← projected[i]
         require dtype.finite(v) throw variant schedule.Qwen35moeStateError.NonFinite {message = "linear attention output is non-finite"}
-        out_rows.append(v + (x_rows.get(i) coalesce 0.0 ∷ f32))
+        out_rows.append(v + x_rows[i])
     }
     if not capture {
         # Lean decode route: no diagnostic trace buffers are allocated
