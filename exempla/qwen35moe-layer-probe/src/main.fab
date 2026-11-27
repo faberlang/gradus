@@ -34,7 +34,9 @@ import from "gradus:model/tensor_payload" tensor_payload
 
 import from "gradus:model/tensor_view" tensor_view
 
-import from "gradus:tensor" tensor
+import from "gradus:cache/session" sess_mod
+
+import from "gradus:cache/hybrid_arenas" hybrid
 
 import from "norma:fs" fs
 
@@ -188,16 +190,7 @@ fn materialize_window(tensor_view.TensorView v, int start, int length, (int, int
     }
 }
 
-fn construct_carrier(list<f32> y, list<int> shape) → tensor.NumericBlock ⇥ ProbeError {
-    do {
-        return tensor.construct(y, shape)
-    }
-    catch err {
-        throw variant ProbeWindow {message = "carrier construction failed"}
-    }
-}
-
-fn weight_window(string via, int total, gguf_manifest.GgufManifest m, string base) → tensor.NumericBlock ⇥ schedule.Qwen35moeStateError {
+fn weight_window(string via, int total, gguf_manifest.GgufManifest m, string base) → list<f32> ⇥ schedule.Qwen35moeStateError {
     let (int, int) → list<b8> ⇥ gguf_manifest.GgufManifestError reader ← (int begin, int span) → list<b8> ⇥ gguf_manifest.GgufManifestError ∴ checked_range(via, total, begin, span)
     do {
         let tuple<start: int, span: int> limit ← payload_window(m, tensor_gguf_name(base))
@@ -210,9 +203,7 @@ fn weight_window(string via, int total, gguf_manifest.GgufManifest m, string bas
         let tensor_view.TensorView v ← bind_view(m, p)
         let list<int> shape ← carrier_shape(base)
         let int length ← shape.reduce((int length, int d) ∴ length * d, 1)
-        let list<f32> y ← materialize_window(v, 0, length, reader)
-        let tensor.NumericBlock carrier ← construct_carrier(y, shape)
-        return carrier
+        return materialize_window(v, 0, length, reader)
     }
     catch err {
         throw variant BadWindow {message = "weight window failed: §"(err.message)}
@@ -447,6 +438,28 @@ fn compare_conv(string label, list<f32> mine, list<f32> dump, int rows, f32 delt
 
 # --- session threading across both phases + incremental replay + reset -----
 
+fn conv_slot_cells(hybrid.ConvStateArena<3, 8192> arena, int slot) → list<f32> {
+    let tensor<f32, [3, 8192]> buf ← arena.buffers[slot]
+    mut list<f32> out ← empty
+    for range 0‥3 let r {
+        for range 0‥8192 let ch {
+            out.append(buf[[r, ch]])
+        }
+    }
+    return out
+}
+
+fn rec_slot_cells(hybrid.RecurrentStateArena<4096, 128> arena, int slot) → list<f32> {
+    let tensor<f32, [4096, 128]> st ← arena.states[slot]
+    mut list<f32> out ← empty
+    for range 0‥4096 let r {
+        for range 0‥128 let c {
+            out.append(st[[r, c]])
+        }
+    }
+    return out
+}
+
 # One phase's verdict plus the threaded session state it leaves behind.
 # Single-variant union: nested list<list<f32>> fields do not parse in genus
 # field position (PARSE030), so the variant + accessor shape stays.
@@ -454,17 +467,11 @@ union PhaseOutcome {
     Result {
         string verdict
         f32 worst
-        list<session.ConvState> conv
-        list<session.RecurrentState> recurrent
-        list<session.KeyValueState> kv
         list<list<f32>> outputs
     }
 }
 
-fn run_phase(string via, int total, gguf_manifest.GgufManifest m, string dump_dir, int phase, int tokens, int start_pos, qwen35moe.Qwen35moeConfig cfg, schedule.Qwen35moeSchedule sched, list<session.ConvState> conv_in, list<session.RecurrentState> recurrent_in, list<session.KeyValueState> kv_in) → PhaseOutcome ⇥ ProbeError {
-    mut list<session.ConvState> convs ← empty
-    mut list<session.RecurrentState> recs ← empty
-    mut list<session.KeyValueState> kvs ← empty
+fn run_phase(string via, int total, gguf_manifest.GgufManifest m, string dump_dir, int phase, int tokens, int start_pos, qwen35moe.Qwen35moeConfig cfg, schedule.Qwen35moeSchedule sched, mut session.HybridSession<16, 1, 512, 3, 8192, 4096, 128> hs) → PhaseOutcome ⇥ ProbeError {
     mut list<list<f32>> outputs ← empty
     mut f32 worst ← 0.0
     mut int passes ← 0
@@ -473,11 +480,11 @@ fn run_phase(string via, int total, gguf_manifest.GgufManifest m, string dump_di
         let int kind ← sched.kinds.get(layer) coalesce -1
         if kind ≡ 0 {
             let int slot ← schedule.linear_index(sched, layer)
-            let session.ConvState conv_cur ← conv_in.get(slot) coalesce session.ConvState {channels = empty, kernel = 3, channels_count = 8192}
-            let session.RecurrentState rec_cur ← recurrent_in.get(slot) coalesce session.RecurrentState {cells = empty, value_heads = 32, key_dim = 128, value_dim = 128}
-            let linear_attn.LinearAttentionOutcome outcome ← linear_attn.linear_attention(x_rows, layer, conv_cur, rec_cur, (string name, int start, int length) → tensor.NumericBlock ⇥ schedule.Qwen35moeStateError ∴ weight_window(via, total, m, name), cfg)
-            convs.append(outcome.conv)
-            recs.append(outcome.recurrent)
+            mut hybrid.ConvStateArena<3, 8192> conv ← hs.arenas.conv
+            mut hybrid.RecurrentStateArena<4096, 128> rec ← hs.arenas.recurrent
+            let linear_attn.LinearAttentionOutcome outcome ← linear_attn.linear_attention<size 3, size 8192, size 4096, size 128>(x_rows, layer, mut conv, mut rec, layer, (string name, int start, int length) → list<f32> ⇥ schedule.Qwen35moeStateError ∴ weight_window(via, total, m, name), cfg)
+            hs.arenas.conv ← conv
+            hs.arenas.recurrent ← rec
             outputs.append(outcome.out)
             # --- tensor comparisons for this layer ---------------------------------
             let tuple<verdict: string, worst: f32> c1 ← compare_window("§ attn_norm"(layer), outcome.trace.normed, read_f32_file(dump_path(dump_dir, phase, "attn_norm-§"(layer)), 2048 * tokens), tokens, 2048, DELTA, worst)
@@ -493,24 +500,23 @@ fn run_phase(string via, int total, gguf_manifest.GgufManifest m, string dump_di
             let tuple<verdict: string, worst: f32> c11 ← compare_heads("§ core_out"(layer), outcome.trace.core_out, read_f32_file(dump_path(dump_dir, phase, "attn_output-§"(layer)), 128 * 32 * tokens), tokens, 32, 128, DELTA, c10.worst)
             let tuple<verdict: string, worst: f32> c12 ← compare_window("§ final_output"(layer), outcome.trace.final_output, read_f32_file(dump_path(dump_dir, phase, "final_output-§"(layer)), 4096 * tokens), tokens, 4096, DELTA, c11.worst)
             let tuple<verdict: string, worst: f32> c13 ← compare_window("§ attn_residual"(layer), outcome.out, read_f32_file(dump_path(dump_dir, phase, "attn_residual-§"(layer)), 2048 * tokens), tokens, 2048, DELTA, c12.worst)
-            let tuple<verdict: string, worst: f32> c14 ← compare_state("§ new_state"(layer), outcome.recurrent.cells, read_f32_file(dump_path(dump_dir, phase, "new_state-§"(layer)), 128 * 128 * 32), 32, 128, DELTA, c13.worst)
-            let tuple<verdict: string, worst: f32> c15 ← compare_conv("§ conv_state_last"(layer), outcome.conv.channels, read_f32_file(dump_path(dump_dir, phase, "conv_state_last-§"(layer)), 3 * 8192), 3, DELTA, c14.worst)
+            let tuple<verdict: string, worst: f32> c14 ← compare_state("§ new_state"(layer), rec_slot_cells(hs.arenas.recurrent, slot), read_f32_file(dump_path(dump_dir, phase, "new_state-§"(layer)), 128 * 128 * 32), 32, 128, DELTA, c13.worst)
+            let tuple<verdict: string, worst: f32> c15 ← compare_conv("§ conv_state_last"(layer), conv_slot_cells(hs.arenas.conv, slot), read_f32_file(dump_path(dump_dir, phase, "conv_state_last-§"(layer)), 3 * 8192), 3, DELTA, c14.worst)
             worst ← c15.worst
             if (c1.verdict ≢ "none") or (c15.verdict ≢ "none") {
                 mut string which ← c1.verdict
                 if which ≡ "none" {
                     which ← c15.verdict
                 }
-                return variant Result {verdict = "FAIL layer=§ first-divergence=§"(layer, which), worst = worst, conv = convs, recurrent = recs, kv = kvs, outputs = outputs}
+                return variant Result {verdict = "FAIL layer=§ first-divergence=§"(layer, which), worst = worst, outputs = outputs}
             }
             passes ↑
             print "PASS phase=§ layer=§ kind=linear max-dev=§"(phase, layer, worst)
         }
         else {
-            let int slot ← schedule.attention_index(sched, layer)
-            let session.KeyValueState kv_cur ← kv_in.get(slot) coalesce session.KeyValueState {keys = empty, values = empty, kv_heads = 2, key_dim = 256, value_dim = 256, capacity = 262144, length = 0}
-            let full_attn.FullAttentionOutcome outcome ← full_attn.full_attention(x_rows, layer, kv_cur, start_pos, (string name, int start, int length) → tensor.NumericBlock ⇥ schedule.Qwen35moeStateError ∴ weight_window(via, total, m, name), cfg)
-            kvs.append(outcome.kv)
+            mut sess_mod.SessionState<16, 1, 512> kv ← hs.arenas.kv
+            let full_attn.FullAttentionOutcome outcome ← full_attn.full_attention<size 16, size 1, size 512>(x_rows, layer, mut kv, layer, start_pos, (string name, int start, int length) → list<f32> ⇥ schedule.Qwen35moeStateError ∴ weight_window(via, total, m, name), cfg)
+            hs.arenas.kv ← kv
             outputs.append(outcome.out)
             # --- tensor comparisons for this layer ---------------------------------
             let tuple<verdict: string, worst: f32> c1 ← compare_window("§ attn_norm"(layer), outcome.trace.normed, read_f32_file(dump_path(dump_dir, phase, "attn_norm-§"(layer)), 2048 * tokens), tokens, 2048, DELTA, worst)
@@ -526,32 +532,20 @@ fn run_phase(string via, int total, gguf_manifest.GgufManifest m, string dump_di
                 if which ≡ "none" {
                     which ← c7.verdict
                 }
-                return variant Result {verdict = "FAIL layer=§ first-divergence=§"(layer, which), worst = worst, conv = convs, recurrent = recs, kv = kvs, outputs = outputs}
+                return variant Result {verdict = "FAIL layer=§ first-divergence=§"(layer, which), worst = worst, outputs = outputs}
             }
             passes ↑
             print "PASS phase=§ layer=§ kind=attention max-dev=§"(phase, layer, worst)
         }
     }
-    return variant Result {verdict = "PASS layers=§"(passes), worst = worst, conv = convs, recurrent = recs, kv = kvs, outputs = outputs}
+    return variant Result {verdict = "PASS layers=§"(passes), worst = worst, outputs = outputs}
 }
 
 # Incremental replay: feed the prefill window one token at a time through
 # the same per-layer state machinery and check exact equality of every
 # per-token output row against the batched pass (F5), then verify the
 # terminal states match (equality is exact: identical op order).
-fn replay_prefill(string via, int total, gguf_manifest.GgufManifest m, string dump_dir, qwen35moe.Qwen35moeConfig cfg, schedule.Qwen35moeSchedule sched, list<session.ConvState> conv_in, list<session.RecurrentState> recurrent_in, list<session.KeyValueState> kv_in, list<list<f32>> batched_outputs) → string ⇥ ProbeError {
-    mut list<session.ConvState> convs ← empty
-    for from conv_in let c {
-        convs.append(c)
-    }
-    mut list<session.RecurrentState> recs ← empty
-    for from recurrent_in let r {
-        recs.append(r)
-    }
-    mut list<session.KeyValueState> kvs ← empty
-    for from kv_in let k {
-        kvs.append(k)
-    }
+fn replay_prefill(string via, int total, gguf_manifest.GgufManifest m, string dump_dir, qwen35moe.Qwen35moeConfig cfg, schedule.Qwen35moeSchedule sched, mut session.HybridSession<16, 1, 512, 3, 8192, 4096, 128> hs, list<list<f32>> batched_outputs) → string ⇥ ProbeError {
     for range 0‥PREFILL_TOKENS let t {
         for range 0‥40 let layer {
             mut list<f32> one_row ← empty
@@ -561,30 +555,11 @@ fn replay_prefill(string via, int total, gguf_manifest.GgufManifest m, string du
             }
             let int kind ← sched.kinds.get(layer) coalesce -1
             if kind ≡ 0 {
-                let int slot ← schedule.linear_index(sched, layer)
-                let session.ConvState conv_cur ← convs.get(slot) coalesce session.ConvState {channels = empty, kernel = 3, channels_count = 8192}
-                let session.RecurrentState rec_cur ← recs.get(slot) coalesce session.RecurrentState {cells = empty, value_heads = 32, key_dim = 128, value_dim = 128}
-                let linear_attn.LinearAttentionOutcome outcome ← linear_attn.linear_attention_step(one_row, layer, conv_cur, rec_cur, (string name, int start, int length) → tensor.NumericBlock ⇥ schedule.Qwen35moeStateError ∴ weight_window(via, total, m, name), cfg)
-                mut list<session.ConvState> next_convs ← empty
-                for range 0‥convs.length() let ci {
-                    if ci ≡ slot {
-                        next_convs.append(outcome.conv)
-                    }
-                    else {
-                        next_convs.append(convs.get(ci) coalesce session.ConvState {channels = empty, kernel = 3, channels_count = 8192})
-                    }
-                }
-                convs ← next_convs
-                mut list<session.RecurrentState> next_recs ← empty
-                for range 0‥recs.length() let ri {
-                    if ri ≡ slot {
-                        next_recs.append(outcome.recurrent)
-                    }
-                    else {
-                        next_recs.append(recs.get(ri) coalesce session.RecurrentState {cells = empty, value_heads = 32, key_dim = 128, value_dim = 128})
-                    }
-                }
-                recs ← next_recs
+                mut hybrid.ConvStateArena<3, 8192> conv ← hs.arenas.conv
+                mut hybrid.RecurrentStateArena<4096, 128> rec ← hs.arenas.recurrent
+                let linear_attn.LinearAttentionOutcome outcome ← linear_attn.linear_attention_step<size 3, size 8192, size 4096, size 128>(one_row, layer, mut conv, mut rec, layer, (string name, int start, int length) → list<f32> ⇥ schedule.Qwen35moeStateError ∴ weight_window(via, total, m, name), cfg)
+                hs.arenas.conv ← conv
+                hs.arenas.recurrent ← rec
                 # the step output row must equal the batched row exactly
                 let list<f32> batch_row ← batched_outputs.get(layer) coalesce empty_row_f32()
                 for range 0‥2048 let d {
@@ -596,19 +571,9 @@ fn replay_prefill(string via, int total, gguf_manifest.GgufManifest m, string du
                 }
             }
             else {
-                let int slot ← schedule.attention_index(sched, layer)
-                let session.KeyValueState kv_cur ← kvs.get(slot) coalesce session.KeyValueState {keys = empty, values = empty, kv_heads = 2, key_dim = 256, value_dim = 256, capacity = 262144, length = 0}
-                let full_attn.FullAttentionOutcome outcome ← full_attn.full_attention_step(one_row, layer, kv_cur, t, (string name, int start, int length) → tensor.NumericBlock ⇥ schedule.Qwen35moeStateError ∴ weight_window(via, total, m, name), cfg)
-                mut list<session.KeyValueState> next_kvs ← empty
-                for range 0‥kvs.length() let ki {
-                    if ki ≡ slot {
-                        next_kvs.append(outcome.kv)
-                    }
-                    else {
-                        next_kvs.append(kvs.get(ki) coalesce session.KeyValueState {keys = empty, values = empty, kv_heads = 2, key_dim = 256, value_dim = 256, capacity = 262144, length = 0})
-                    }
-                }
-                kvs ← next_kvs
+                mut sess_mod.SessionState<16, 1, 512> kv ← hs.arenas.kv
+                let full_attn.FullAttentionOutcome outcome ← full_attn.full_attention_step<size 16, size 1, size 512>(one_row, layer, mut kv, layer, t, (string name, int start, int length) → list<f32> ⇥ schedule.Qwen35moeStateError ∴ weight_window(via, total, m, name), cfg)
+                hs.arenas.kv ← kv
                 let list<f32> batch_row ← batched_outputs.get(layer) coalesce empty_row_f32()
                 for range 0‥2048 let d {
                     let f32 a ← outcome.out.get(d) coalesce 1.0 ∷ f32
@@ -646,52 +611,27 @@ main {
         let string dump_dir ← args.get(3) coalesce ""
 
         # --- fresh session ------------------------------------------------------
-        mut list<session.ConvState> convs ← empty
-        for range 0‥sched.linear_layers {
-            convs.append(fresh_conv(admission.config))
-        }
-        mut list<session.RecurrentState> recs ← empty
-        for range 0‥sched.linear_layers {
-            recs.append(session.fresh_recurrent_state(admission.config))
-        }
-        mut list<session.KeyValueState> kvs ← empty
-        for range 0‥sched.full_layers {
-            kvs.append(fresh_kv(admission.config, admission.config.context_length))
-        }
+        mut session.HybridSession<16, 1, 512, 3, 8192, 4096, 128> hs ← new_probe_session(admission.config)
 
         # --- phase 0: prefill batch over the pinned window ----------------------
-        let PhaseOutcome phase0 ← run_phase(via, total, manifest, dump_dir, 0, PREFILL_TOKENS, 0, admission.config, sched, convs, recs, kvs)
+        let PhaseOutcome phase0 ← run_phase(via, total, manifest, dump_dir, 0, PREFILL_TOKENS, 0, admission.config, sched, mut hs)
         print "PHASE0 §"(phase_verdict(phase0))
         if not phase_verdict(phase0).starts_with("PASS") {
             process.exit_process(1)
         }
-        convs ← phase_conv(phase0)
-        recs ← phase_recurrent(phase0)
-        kvs ← phase_kv(phase0)
 
         # --- reset/replay determinism (F5) ---------------------------------------
         # fresh session, one token at a time, exact equality against the batched
         # per-layer outputs
-        mut list<session.ConvState> reset_convs ← empty
-        for range 0‥sched.linear_layers {
-            reset_convs.append(fresh_conv(admission.config))
-        }
-        mut list<session.RecurrentState> reset_recs ← empty
-        for range 0‥sched.linear_layers {
-            reset_recs.append(session.fresh_recurrent_state(admission.config))
-        }
-        mut list<session.KeyValueState> reset_kvs ← empty
-        for range 0‥sched.full_layers {
-            reset_kvs.append(fresh_kv(admission.config, admission.config.context_length))
-        }
-        let string replay ← replay_prefill(via, total, manifest, dump_dir, admission.config, sched, reset_convs, reset_recs, reset_kvs, phase_outputs(phase0))
+        mut session.HybridSession<16, 1, 512, 3, 8192, 4096, 128> reset_hs ← reset_probe_session(hs)
+        let string replay ← replay_prefill(via, total, manifest, dump_dir, admission.config, sched, mut reset_hs, phase_outputs(phase0))
         print "REPLAY §"(replay)
         if replay ≢ "none" {
             process.exit_process(1)
         }
 
         # --- phase 1: one-token incremental decode -------------------------------
-        let PhaseOutcome phase1 ← run_phase(via, total, manifest, dump_dir, 1, 1, PREFILL_TOKENS, admission.config, sched, convs, recs, kvs)
+        let PhaseOutcome phase1 ← run_phase(via, total, manifest, dump_dir, 1, 1, PREFILL_TOKENS, admission.config, sched, mut hs)
         print "PHASE1 §"(phase_verdict(phase1))
         if not phase_verdict(phase1).starts_with("PASS") {
             process.exit_process(1)
@@ -703,6 +643,24 @@ main {
     catch err {
         print "error: §"(err.message)
         process.exit_process(1)
+    }
+}
+
+fn new_probe_session(qwen35moe.Qwen35moeConfig c) → session.HybridSession<16, 1, 512, 3, 8192, 4096, 128> ⇥ ProbeError {
+    do {
+        return session.fresh_session<size 16, size 1, size 512, size 3, size 8192, size 4096, size 128>(c)
+    }
+    catch err {
+        throw variant ProbeWindow {message = err.message}
+    }
+}
+
+fn reset_probe_session(session.HybridSession<16, 1, 512, 3, 8192, 4096, 128> hs) → session.HybridSession<16, 1, 512, 3, 8192, 4096, 128> ⇥ ProbeError {
+    do {
+        return session.reset_session(hs)
+    }
+    catch err {
+        throw variant ProbeWindow {message = err.message}
     }
 }
 
@@ -728,29 +686,9 @@ fn empty_row_f32() → list<f32> {
     return empty
 }
 
-# These two cross into main's untyped do/catch, where the conversion table
-# does not apply — the raw state error needs the ProbeError-typed wrapper.
-fn fresh_conv(qwen35moe.Qwen35moeConfig c) → session.ConvState ⇥ ProbeError {
-    do {
-        return session.fresh_conv_state(c)
-    }
-    catch err {
-        throw variant ProbeWindow {message = err.message}
-    }
-}
-
-fn fresh_kv(qwen35moe.Qwen35moeConfig c, int capacity) → session.KeyValueState ⇥ ProbeError {
-    do {
-        return session.fresh_kv_state(c, capacity)
-    }
-    catch err {
-        throw variant ProbeWindow {message = err.message}
-    }
-}
-
 fn phase_verdict(PhaseOutcome p) → string {
     match p {
-        case Result let verdict, worst, conv, recurrent, kv, outputs {
+        case Result let verdict, worst, outputs {
             return verdict
         }
     }
@@ -758,39 +696,15 @@ fn phase_verdict(PhaseOutcome p) → string {
 
 fn phase_worst(PhaseOutcome p) → f32 {
     match p {
-        case Result let verdict, worst, conv, recurrent, kv, outputs {
+        case Result let verdict, worst, outputs {
             return worst
-        }
-    }
-}
-
-fn phase_conv(PhaseOutcome p) → list<session.ConvState> {
-    match p {
-        case Result let verdict, worst, conv, recurrent, kv, outputs {
-            return conv
-        }
-    }
-}
-
-fn phase_recurrent(PhaseOutcome p) → list<session.RecurrentState> {
-    match p {
-        case Result let verdict, worst, conv, recurrent, kv, outputs {
-            return recurrent
-        }
-    }
-}
-
-fn phase_kv(PhaseOutcome p) → list<session.KeyValueState> {
-    match p {
-        case Result let verdict, worst, conv, recurrent, kv, outputs {
-            return kv
         }
     }
 }
 
 fn phase_outputs(PhaseOutcome p) → list<list<f32>> {
     match p {
-        case Result let verdict, worst, conv, recurrent, kv, outputs {
+        case Result let verdict, worst, outputs {
             return outputs
         }
     }

@@ -889,22 +889,20 @@ sin/cos/sqrt) so proba can pin it without host intrinsics.
 - `union LayerKind` — LinearAttention, FullAttention, Nextn
 - `class Qwen35moeSchedule`
   - methods: `fn trunk_layers() → int`, `fn linear_layers() → int`, `fn full_layers() → int`, `fn nextn_layers() → int`, `fn kinds() → list<int>`
-- `class ConvState`
-  - fields: list<f32> channels, int kernel, int channels_count
-- `class RecurrentState`
-  - fields: list<f32> cells, int value_heads, int key_dim, int value_dim
-- `class KeyValueState`
-  - fields: list<f32> keys, list<f32> values, int kv_heads, int key_dim, int value_dim, int capacity, int length
 - `class HybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols>`
   - fields: Qwen35moeSchedule schedule, hybrid.HybridSession<C, W, KVD, ConvRows, ConvCh, RecRows, RecCols> arenas, int generation, string model, string model_version, string execution_config, string tokenizer, string state_types, string dtype
 - `class LinearAttentionTrace`
   - fields: list<f32> normed, qkv_mixed, gate_proj, beta_sigmoid, gate, conv_input, conv_output, q_conv, k_conv, v_conv, core_out, final_output
 - `class LinearAttentionOutcome`
-  - fields: LinearAttentionTrace trace, list<f32> out, ConvState conv, RecurrentState recurrent
+  - fields: LinearAttentionTrace trace, list<f32> out
+- `class LinearAttentionWeights`
+  - fields: list<f32> attn_norm, wqkv, wgate, conv_weight, dt_bias, a_row, wbeta, walpha, ssm_norm, wout
 - `class FullAttentionTrace`
   - fields: list<f32> normed, q_full, q_normed, k_normed, gate, q_rope, k_rope, v, softmax, pregate, gated
 - `class FullAttentionOutcome`
-  - fields: FullAttentionTrace trace, list<f32> out, KeyValueState kv
+  - fields: FullAttentionTrace trace, list<f32> out
+- `class FullAttentionWeights`
+  - fields: list<f32> attn_norm, wq, wk, wv, q_norm, k_norm, wo
 
 ### Public functions
 
@@ -917,12 +915,7 @@ sin/cos/sqrt) so proba can pin it without host intrinsics.
 - `fn linear_index(Qwen35moeSchedule s, int block) → int ⇥ Qwen35moeStateError`
 - `fn attention_index(Qwen35moeSchedule s, int block) → int ⇥ Qwen35moeStateError`
 - `fn validate_schedule(gguf_manifest.GgufManifest m, Qwen35moeSchedule s, qwen35moe.Qwen35moeConfig c) → bool ⇥ Qwen35moeStateError`
-- `fn fresh_conv_state(qwen35moe.Qwen35moeConfig c) → ConvState ⇥ Qwen35moeStateError`
-- `fn fresh_recurrent_state(qwen35moe.Qwen35moeConfig c) → RecurrentState`
-- `fn fresh_kv_state(qwen35moe.Qwen35moeConfig c, int capacity) → KeyValueState ⇥ Qwen35moeStateError`
-- `fn conv_equal(ConvState a, ConvState b) → bool`
-- `fn recurrent_equal(RecurrentState a, RecurrentState b) → bool`
-- `fn kv_equal(KeyValueState a, KeyValueState b) → bool`
+- `fn to_execution_schedule(Qwen35moeSchedule s, list<int> dimension_sections) → model_schedule.ExecutionSchedule ⇥ Qwen35moeStateError`
 - `fn conv_arena_equal<size ConvRows, size ConvCh>(hybrid.ConvStateArena<ConvRows, ConvCh> a, hybrid.ConvStateArena<ConvRows, ConvCh> b) → bool`
 - `fn recurrent_arena_equal<size RecRows, size RecCols>(hybrid.RecurrentStateArena<RecRows, RecCols> a, hybrid.RecurrentStateArena<RecRows, RecCols> b) → bool`
 - `fn session_kv_equal<size C, size W, size KVD>(sess_mod.SessionState<C, W, KVD> a, sess_mod.SessionState<C, W, KVD> b) → bool`
@@ -932,12 +925,12 @@ sin/cos/sqrt) so proba can pin it without host intrinsics.
 - `fn session_identity_key<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols>(HybridSession<C, W, KVD, ConvRows, ConvCh, RecRows, RecCols> s) → string`
 - `fn deserialize_session_identity<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols>(string wire) → HybridSession<C, W, KVD, ConvRows, ConvCh, RecRows, RecCols> ⇥ Qwen35moeStateError`
 - `fn rope_head(list<f32> head, int dims, int pairs, f32 base, list<int> sections, int pos, int pass_through) → list<f32> ⇥ Qwen35moeStateError`
-- `fn recurrent_update(RecurrentState s, list<f32> q, list<f32> k, list<f32> v, f32 g, f32 beta, int head) → RecurrentState ⇥ Qwen35moeStateError`
-- `fn recurrent_output(RecurrentState s, list<f32> q, int head) → list<f32> ⇥ Qwen35moeStateError`
-- `fn linear_attention(list<f32> x_rows, int layer, ConvState conv_in, RecurrentState recurrent_in, (string, int, int) → tensor.NumericBlock ⇥ Qwen35moeStateError source, qwen35moe.Qwen35moeConfig c) → LinearAttentionOutcome ⇥ Qwen35moeStateError`
-- `fn linear_attention_step(list<f32> x_row, int layer, ConvState conv_in, RecurrentState recurrent_in, (string, int, int) → tensor.NumericBlock ⇥ Qwen35moeStateError source, qwen35moe.Qwen35moeConfig c) → LinearAttentionOutcome ⇥ Qwen35moeStateError`
-- `fn full_attention(list<f32> x_rows, int layer, KeyValueState kv_in, int start_pos, (string, int, int) → tensor.NumericBlock ⇥ Qwen35moeStateError source, qwen35moe.Qwen35moeConfig c) → FullAttentionOutcome ⇥ Qwen35moeStateError`
-- `fn full_attention_step(list<f32> x_row, int layer, KeyValueState kv_in, int pos, (string, int, int) → tensor.NumericBlock ⇥ Qwen35moeStateError source, qwen35moe.Qwen35moeConfig c) → FullAttentionOutcome ⇥ Qwen35moeStateError`
+- `fn delta_step_slot<size RecRows, size RecCols>(mut hybrid.RecurrentStateArena<RecRows, RecCols> arena, int slot_id, list<f32> q, list<f32> k, list<f32> v, f32 g, f32 beta, int head) → list<f32> ⇥ Qwen35moeStateError`
+- `fn recurrent_readout_slot<size RecRows, size RecCols>(hybrid.RecurrentStateArena<RecRows, RecCols> arena, int slot_id, list<f32> q, int head) → list<f32> ⇥ Qwen35moeStateError`
+- `fn linear_attention<size ConvRows, size ConvCh, size RecRows, size RecCols>(list<f32> x_rows, int layer, mut hybrid.ConvStateArena<ConvRows, ConvCh> conv_arena, mut hybrid.RecurrentStateArena<RecRows, RecCols> rec_arena, int slot_id, (string, int, int) → list<f32> ⇥ Qwen35moeStateError source, qwen35moe.Qwen35moeConfig c) → LinearAttentionOutcome ⇥ Qwen35moeStateError`
+- `fn linear_attention_step<size ConvRows, size ConvCh, size RecRows, size RecCols>(list<f32> x_row, int layer, mut hybrid.ConvStateArena<ConvRows, ConvCh> conv_arena, mut hybrid.RecurrentStateArena<RecRows, RecCols> rec_arena, int slot_id, (string, int, int) → list<f32> ⇥ Qwen35moeStateError source, qwen35moe.Qwen35moeConfig c) → LinearAttentionOutcome ⇥ Qwen35moeStateError`
+- `fn full_attention<size C, size W, size KVD>(list<f32> x_rows, int layer, mut sess_mod.SessionState<C, W, KVD> sess, int slot_id, int start_pos, (string, int, int) → list<f32> ⇥ Qwen35moeStateError source, qwen35moe.Qwen35moeConfig c) → FullAttentionOutcome ⇥ Qwen35moeStateError`
+- `fn full_attention_step<size C, size W, size KVD>(list<f32> x_row, int layer, mut sess_mod.SessionState<C, W, KVD> sess, int slot_id, int pos, (string, int, int) → list<f32> ⇥ Qwen35moeStateError source, qwen35moe.Qwen35moeConfig c) → FullAttentionOutcome ⇥ Qwen35moeStateError`
 
 ## gradus:model/safetensors
 
@@ -1159,11 +1152,13 @@ Canonical prepared identity, typed prepared state, and wire v2 arena round-tripp
 
 ### Public types
 
-- `union PreparedStateError` — EmptyField, ReservedCharacter, InvalidDigest, BadWire, UnknownVersion, PayloadMismatch, Incompatible, NoMatch
+- `union PreparedStateError` — BadWire, UnknownVersion, InvalidIdentity, PayloadMismatch
 - `class PreparedIdentity`
 - `class DeclaredStateSlot`
 - `class PreparedState`
 - `class AttachResult`
+- `class PreparedSessionState<size C, size W, size KVD>`
+- `class PreparedHybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols>`
 
 ### Public functions
 
@@ -1182,10 +1177,14 @@ Canonical prepared identity, typed prepared state, and wire v2 arena round-tripp
 - `fn bind_payload(PreparedState s, PreparedIdentity request) → PreparedState ⇥ PreparedStateError`
 - `fn attach(list<PreparedState> candidates, PreparedIdentity request) → AttachResult ⇥ PreparedStateError`
 - `fn continue_state(PreparedState s, list<int> suffix, list<kv.KVCache> next_layers) → PreparedState ⇥ PreparedStateError`
-- `fn serialize_session_state<size C, size W, size KVD>(PreparedIdentity ident, model_schedule.ExecutionSchedule sched, sess_mod.SessionState<C, W, KVD> sess) → string ⇥ PreparedStateError`
-- `fn deserialize_session_state<size C, size W, size KVD>(string wire, model_schedule.ExecutionSchedule sched) → tuple<identity: PreparedIdentity, session: sess_mod.SessionState<C, W, KVD>> ⇥ PreparedStateError`
-- `fn serialize_hybrid_session<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols>(PreparedIdentity ident, model_schedule.ExecutionSchedule sched, hybrid.HybridSession<C, W, KVD, ConvRows, ConvCh, RecRows, RecCols> hs) → string ⇥ PreparedStateError`
-- `fn deserialize_hybrid_session<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols>(string wire, model_schedule.ExecutionSchedule sched, int sites_per_slot, int history_len, bool conv_all_slots) → tuple<identity: PreparedIdentity, session: hybrid.HybridSession<C, W, KVD, ConvRows, ConvCh, RecRows, RecCols>> ⇥ PreparedStateError`
+- `fn serialize_session_state<size C, size W, size KVD>(PreparedIdentity ident, sess_mod.SessionState<C, W, KVD> s) → list<b8> ⇥ PreparedStateError`
+- `fn deserialize_session_state<size C, size W, size KVD>(list<b8> wire) → PreparedSessionState<C, W, KVD> ⇥ PreparedStateError`
+- `fn serialize_hybrid_session<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols>(PreparedIdentity ident, hybrid.HybridSession<C, W, KVD, ConvRows, ConvCh, RecRows, RecCols> hs) → list<b8> ⇥ PreparedStateError`
+- `fn deserialize_hybrid_session<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols>(list<b8> wire) → PreparedHybridSession<C, W, KVD, ConvRows, ConvCh, RecRows, RecCols> ⇥ PreparedStateError`
+- `fn bind_session_state<size C, size W, size KVD>(PreparedSessionState<C, W, KVD> s, PreparedIdentity request) → PreparedSessionState<C, W, KVD> ⇥ PreparedStateError`
+- `fn deserialize_session_state_bound<size C, size W, size KVD>(list<b8> wire, PreparedIdentity expected) → PreparedSessionState<C, W, KVD> ⇥ PreparedStateError`
+- `fn bind_hybrid_session<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols>(PreparedHybridSession<C, W, KVD, ConvRows, ConvCh, RecRows, RecCols> s, PreparedIdentity request) → PreparedHybridSession<C, W, KVD, ConvRows, ConvCh, RecRows, RecCols> ⇥ PreparedStateError`
+- `fn deserialize_hybrid_session_bound<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols>(list<b8> wire, PreparedIdentity expected) → PreparedHybridSession<C, W, KVD, ConvRows, ConvCh, RecRows, RecCols> ⇥ PreparedStateError`
 
 ## gradus:sampling
 
