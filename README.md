@@ -283,20 +283,32 @@ the library home in [Install](#install).
 faber.toml     library provider metadata for faber package resolution
 cista.toml     package identity + version (for the separate package-store tool)
 src/           public `gradus:*` Faber modules (`name.fab` + co-located `name.proba`)
+tests/         package tests run by `faber test`
 exempla/       instructional demos for gradus types
+bench/         benchmark package and baselines (internal)
 scripta/       source-library checks (internal)
 fixtures/      test corpus (internal)
 docs/          quickstart, policy, module map, API reference, planning history
+AGENTS.md      instructions for agents working in this repository
 ```
 
 Internal vs product paths: [`docs/internal-surfaces.md`](docs/internal-surfaces.md).
 
 ## Checks
 
+The same four checks CI runs, from the repository root, with a library home that holds this checkout as
+`gradus/`:
+
 ```bash
-./scripta/check-source
-./scripta/check-compile
+./scripta/check-source                        # source rules
+LIBRARY_HOME=<library home> ./scripta/check-compile   # the library and its exempla compile
+faber test .                                  # package tests
+python3 scripta/check-corpus                  # speculative-decode corpus rows
 ```
+
+CI (`.github/workflows/ci.yml`) runs them on every push to `main`, every pull request from a branch of this
+repository, and nightly, against the newest faber built from radix `main`. It runs on self-hosted macOS
+runners: a pull request from a fork never runs there.
 
 ## License
 
