@@ -314,7 +314,6 @@ class StageOutcome {
 fn try_stage_eog_prefix(config.GenerationConfig g, dense.DenseStep verified, list<int> verify_block, int eog_stop_at, mut DenseLoopState loop) → bool {
     let list<int> base_lengths ← layer_lengths(loop.state)
     let decoder.GenerationCursor start_cursor ← copy loop.cursor
-    mut bool ok ← true
 
     do {
         let list<kv.KVCache> committed ← commit_dense_block(base_lengths, verified, verify_block, eog_stop_at)
@@ -323,10 +322,6 @@ fn try_stage_eog_prefix(config.GenerationConfig g, dense.DenseStep verified, lis
         loop.cursor ← eog_cursor
     }
     catch err {
-        ok ← false
-    }
-
-    if not ok {
         return false
     }
 
@@ -343,22 +338,16 @@ fn try_stage_eog_prefix(config.GenerationConfig g, dense.DenseStep verified, lis
 fn try_stage_non_eog_prefix(config.GenerationConfig g, DenseEngine engine, decoder.StopPolicy stop, sampling.Config drawn, random.Seed step_rng, dense.DenseStep verified, list<int> verify_block, int accepted_count, mut DenseLoopState loop) → StageOutcome {
     let list<int> base_lengths ← layer_lengths(loop.state)
     let decoder.GenerationCursor start_cursor ← copy loop.cursor
-    mut int next_tok ← 0
-    mut bool ok ← true
+    let int next_tok
 
     do {
-        let int nt ← target_row_token(verified.logits, accepted_count - 1, engine.architecture.vocab, drawn, step_rng, g, stop)
+        next_tok ← target_row_token(verified.logits, accepted_count - 1, engine.architecture.vocab, drawn, step_rng, g, stop)
         let list<kv.KVCache> committed ← commit_dense_block(base_lengths, verified, verify_block, accepted_count)
         let decoder.GenerationCursor staged_cursor ← advance_n(g, start_cursor, accepted_count)
-        next_tok ← nt
         loop.state ← committed
         loop.cursor ← staged_cursor
     }
     catch err {
-        ok ← false
-    }
-
-    if not ok {
         return StageOutcome { ok = false, next_token = 0 }
     }
 
@@ -452,72 +441,67 @@ fn generate_dense_with_stop(config.GenerationConfig g, list<int> prompt_ids, Den
                         verify_block.append(candidate_ids.get(i) coalesce (-1))
                     }
 
-                    mut dense.DenseStep verified ← dense.default_step()
-                    mut bool attempt_ok ← true
+                    let dense.DenseStep verified
 
                     do {
                         verified ← dense.decode_block(engine.architecture, source, verify_block, engine.epsilon, engine.scale, engine.rope_dim, engine.rope, loop.state)
                     }
                     catch err {
-                        attempt_ok ← false
+                        rng ← first_seed
+                        consume_emitted_token(g, engine, source, stop, first_target, mut loop)
+                        continue
                     }
 
-                    if not attempt_ok {
+                    mut int accepted_count ← 1
+                    mut int eog_stop_at ← 0 - 1
+                    mut bool verify_ok ← true
+
+                    do {
+                        for exclusive (verify_count - 1) let row {
+                            let int cand_next ← verify_block.get(row + 1) coalesce (-1)
+                            let int pred_next ← target_row_token(verified.logits, row, engine.architecture.vocab, drawn, rng, g, stop)
+
+                            if pred_next ≢ cand_next {
+                                break
+                            }
+
+                            accepted_count ← accepted_count + 1
+
+                            if decoder.stops_on_eog(stop) and decoder.is_eog(g, cand_next) {
+                                eog_stop_at ← row + 1
+                                break
+                            }
+                        }
+                    }
+                    catch err {
+                        verify_ok ← false
+                    }
+
+                    if not verify_ok {
                         rng ← first_seed
                         consume_emitted_token(g, engine, source, stop, first_target, mut loop)
                     }
-                    else {
-                        mut int accepted_count ← 1
-                        mut int eog_stop_at ← 0 - 1
-                        mut bool verify_ok ← true
+                    elif eog_stop_at ≥ 0 {
+                        let bool eog_ok ← try_stage_eog_prefix(g, verified, verify_block, eog_stop_at, mut loop)
 
-                        do {
-                            for exclusive (verify_count - 1) let row {
-                                let int cand_next ← verify_block.get(row + 1) coalesce (-1)
-                                let int pred_next ← target_row_token(verified.logits, row, engine.architecture.vocab, drawn, rng, g, stop)
-
-                                if pred_next ≢ cand_next {
-                                    break
-                                }
-
-                                accepted_count ← accepted_count + 1
-
-                                if decoder.stops_on_eog(stop) and decoder.is_eog(g, cand_next) {
-                                    eog_stop_at ← row + 1
-                                    break
-                                }
-                            }
-                        }
-                        catch err {
-                            verify_ok ← false
-                        }
-
-                        if not verify_ok {
+                        if not eog_ok {
                             rng ← first_seed
                             consume_emitted_token(g, engine, source, stop, first_target, mut loop)
                         }
-                        elif eog_stop_at ≥ 0 {
-                            let bool eog_ok ← try_stage_eog_prefix(g, verified, verify_block, eog_stop_at, mut loop)
+                    }
+                    else {
+                        # Row `accepted_count - 1` of `verified.logits` predicts the
+                        # token right after `verify_block[accepted_count - 1]`:
+                        # corrective when `accepted_count < verify_count`, or bonus
+                        # when `accepted_count == verify_count`.
+                        let StageOutcome stage ← try_stage_non_eog_prefix(g, engine, stop, drawn, rng, verified, verify_block, accepted_count, mut loop)
 
-                            if not eog_ok {
-                                rng ← first_seed
-                                consume_emitted_token(g, engine, source, stop, first_target, mut loop)
-                            }
+                        if not stage.ok {
+                            rng ← first_seed
+                            consume_emitted_token(g, engine, source, stop, first_target, mut loop)
                         }
                         else {
-                            # Row `accepted_count - 1` of `verified.logits` predicts the
-                            # token right after `verify_block[accepted_count - 1]`:
-                            # corrective when `accepted_count < verify_count`, or bonus
-                            # when `accepted_count == verify_count`.
-                            let StageOutcome stage ← try_stage_non_eog_prefix(g, engine, stop, drawn, rng, verified, verify_block, accepted_count, mut loop)
-
-                            if not stage.ok {
-                                rng ← first_seed
-                                consume_emitted_token(g, engine, source, stop, first_target, mut loop)
-                            }
-                            else {
-                                consume_emitted_token(g, engine, source, stop, stage.next_token, mut loop)
-                            }
+                            consume_emitted_token(g, engine, source, stop, stage.next_token, mut loop)
                         }
                     }
                 }
