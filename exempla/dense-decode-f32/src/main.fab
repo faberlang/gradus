@@ -1,0 +1,362 @@
++++ toml
+locale = "en"
+
++++ faber
+# Metadata-driven typed F32 whole-model decode on resident SmolLM2-360M-Instruct-f32.gguf
+# (issue #28 / GPU G01).
+#
+# Admits `DenseModelSpec` from GGUF metadata + `TensorDirectory` via
+# `gradus:decode_dense`, allocates `ExecutionSchedule`, `LayerParams`, and
+# `Workspace`, binds typed F32 tensors from disk, primes device buffers, and
+# runs greedy decode over `gradus:decode_token` (`embed_wide`,
+# `layer_wide_table`, `head_wide`) + `gradus:decode_step` (`argmax_token`) on
+# both Metal and CPU.
+
+import from "gradus:decode_dense" let dd
+import from "gradus:decode_step" let ds
+import from "gradus:decode_token" let dt
+import from "gradus:model/artifact" let artifact
+import from "gradus:model/bundle" let bundle
+import from "gradus:model/gguf_manifest" let gguf_manifest
+import from "gradus:model/schedule" let model_schedule
+import from "gradus:model/tensor_directory" let td
+import from "gradus:tokenizer/bpe" let bpe
+import from "norma:fs" let fs
+import from "norma:process" let process
+import from "norma:time" let time
+
+const size RES_V = 49152
+const size RES_D = 960
+const size RES_QD = 960
+const size RES_KVD = 320
+const size RES_F = 2560
+const size RES_H = 15
+const size RES_C = 128
+const size RES_P = 32
+const size RES_SPAN = 32
+const int MAX_GEN = 64
+
+type RW = dt.LayerWeights<size 960, size 960, size 320, size 2560>
+type RS = dt.SlotView<size 128, size 320>
+type RWS = dt.Workspace<size 960, size 960, size 320, size 2560, size 15, size 128, size 32>
+
+fn default_gguf_path() → string {
+    let string ∪ none env_path ← process.read_env("SMOL_F32_GGUF")
+    if env_path is string then return env_path
+    let string ∪ none home ← process.read_env("HOME")
+    if home is string then return "§/ai/models/SmolLM2-360M-Instruct-f32.gguf"(home)
+    return "/Users/ianzepp/ai/models/SmolLM2-360M-Instruct-f32.gguf"
+}
+
+fn read_gguf_range(string path, int total, int start, int length) → list<b8> ⇥ gguf_manifest.GgufManifestError {
+    if start ≺ 0 or length ≺ 0 or start + length ≻ total {
+        throw variant gguf_manifest.GgufManifestError.BadSource { message = "range out of bounds" }
+    }
+    do {
+        return fs.read_range(path, start, length)
+    }
+    catch err {
+        throw variant gguf_manifest.GgufManifestError.BadSource { message = "fs.read_range failed" }
+    }
+}
+
+fn le_f32(list<b8> raw, int off) → f32 {
+    let u32 b0 ← (raw[off] ↦ u8) ↦ u32 ⊥ (0 ∷ u32)
+    let u32 b1 ← (raw[off + 1] ↦ u8) ↦ u32 ⊥ (0 ∷ u32)
+    let u32 b2 ← (raw[off + 2] ↦ u8) ↦ u32 ⊥ (0 ∷ u32)
+    let u32 b3 ← (raw[off + 3] ↦ u8) ↦ u32 ⊥ (0 ∷ u32)
+    let u32 bits ← b0 ∨ (b1 ⇐ (8 ∷ u32)) ∨ (b2 ⇐ (16 ∷ u32)) ∨ (b3 ⇐ (24 ∷ u32))
+    return (bits ↦ b32) ↦ f32
+}
+
+fn read_tensor_bytes(string path, td.TensorDirectory dir, string name, int expected_bytes) → list<b8> ⇥ string {
+    mut td.DirectoryEntry ∪ none maybe_e ← null
+    do {
+        maybe_e ← td.lookup_backbone(dir, name)
+    }
+    catch err {
+        throw "lookup_backbone failed for §"(name)
+    }
+    if maybe_e is none then throw "missing tensor §"(name)
+    let td.DirectoryEntry e ← maybe_e
+    if e.byte_length ≢ expected_bytes {
+        throw "byte length mismatch for §: expected § got §"(name, expected_bytes ↦ string, e.byte_length ↦ string)
+    }
+    mut list<b8> bytes ← empty
+    do {
+        bytes ← fs.read_range(path, e.byte_offset, e.byte_length)
+    }
+    catch err {
+        throw "read_range failed for §"(name)
+    }
+    if bytes.length() ≢ expected_bytes {
+        throw "short read for §"(name)
+    }
+    return bytes
+}
+
+fn load_f32_1d<size N>(string path, td.TensorDirectory dir, string name) → tensor<f32, [N]> ⇥ string {
+    let list<b8> raw ← read_tensor_bytes(path, dir, name, (N ↦ int) * 4)
+    mut tensor<f32, [N]> out ← tf32[N] {}
+    for exclusive N let i {
+        out[[i]] ← le_f32(raw, i * 4)
+    }
+    return out
+}
+
+fn load_f32_2d<size R, size C>(string path, td.TensorDirectory dir, string name) → tensor<f32, [R, C]> ⇥ string {
+    let int cols ← C ↦ int
+    let list<b8> raw ← read_tensor_bytes(path, dir, name, (R ↦ int) * cols * 4)
+    mut tensor<f32, [R, C]> out ← tf32[R, C] {}
+    for exclusive R let r {
+        let int row_base ← r * cols * 4
+        for exclusive C let c {
+            out[[r, c]] ← le_f32(raw, row_base + c * 4)
+        }
+    }
+    return out
+}
+
+fn load_layer(string path, td.TensorDirectory dir, int layer_idx) → RW ⇥ string {
+    let string base ← "model.layers.§"(layer_idx ↦ string)
+    let tensor<f32, [RES_D]> anorm ← load_f32_1d<size RES_D>(path, dir, "§.input_layernorm.weight"(base))
+    let tensor<f32, [RES_QD, RES_D]> wq ← load_f32_2d<size RES_QD, size RES_D>(path, dir, "§.self_attn.q_proj.weight"(base))
+    let tensor<f32, [RES_KVD, RES_D]> wk ← load_f32_2d<size RES_KVD, size RES_D>(path, dir, "§.self_attn.k_proj.weight"(base))
+    let tensor<f32, [RES_KVD, RES_D]> wv ← load_f32_2d<size RES_KVD, size RES_D>(path, dir, "§.self_attn.v_proj.weight"(base))
+    let tensor<f32, [RES_D, RES_QD]> wo ← load_f32_2d<size RES_D, size RES_QD>(path, dir, "§.self_attn.o_proj.weight"(base))
+    let tensor<f32, [RES_D]> fnorm ← load_f32_1d<size RES_D>(path, dir, "§.post_attention_layernorm.weight"(base))
+    let tensor<f32, [RES_F, RES_D]> wg ← load_f32_2d<size RES_F, size RES_D>(path, dir, "§.mlp.gate_proj.weight"(base))
+    let tensor<f32, [RES_F, RES_D]> wu ← load_f32_2d<size RES_F, size RES_D>(path, dir, "§.mlp.up_proj.weight"(base))
+    let tensor<f32, [RES_D, RES_F]> wd ← load_f32_2d<size RES_D, size RES_F>(path, dir, "§.mlp.down_proj.weight"(base))
+    return dt.LayerWeights<size 960, size 960, size 320, size 2560> {
+        anorm = anorm, wq = wq, wk = wk, wv = wv, wo = wo,
+        fnorm = fnorm, wg = wg, wu = wu, wd = wd
+    }
+}
+
+fn join_ints(list<int> vals) → string {
+    mut string out ← "["
+    for exclusive vals.length() let i {
+        if i ≻ 0 {
+            out ← out + ", "
+        }
+        out ← out + (vals[i] ↦ string)
+    }
+    return out + "]"
+}
+
+fn run_resident(string path) → void ⇥ string {
+    mut int total ← 0
+    do {
+        total ← fs.byte_length(path)
+    }
+    catch err {
+        throw "cannot stat GGUF artifact §"(path)
+    }
+
+    let int t_load0 ← time.monotonic()
+
+    mut artifact.ContentIdentity ∪ none maybe_id ← null
+    do {
+        maybe_id ← artifact.identity("sha-256", "0000000000000000000000000000000000000000000000000000000000000000", total)
+    }
+    catch err {
+        throw "identity creation failed"
+    }
+    if maybe_id is none then throw "identity creation failed"
+    let artifact.ContentIdentity ident ← maybe_id
+
+    mut gguf_manifest.GgufManifest ∪ none maybe_gm ← null
+    do {
+        maybe_gm ← gguf_manifest.inspect((int s, int n) → list<b8> ⇥ gguf_manifest.GgufManifestError ∴ read_gguf_range(path, total, s, n), total, ident)
+    }
+    catch err {
+        throw "gguf_manifest.inspect failed: §"(err.message)
+    }
+    if maybe_gm is none then throw "gguf_manifest.inspect returned null"
+    let gguf_manifest.GgufManifest gm ← maybe_gm
+
+    mut bundle.ModelBundle ∪ none maybe_bun ← null
+    do {
+        maybe_bun ← bundle.gguf_single(ident)
+    }
+    catch err {
+        throw "bundle.gguf_single failed"
+    }
+    if maybe_bun is none then throw "bundle.gguf_single returned null"
+    let bundle.ModelBundle bun ← maybe_bun
+
+    mut td.TensorDirectory ∪ none maybe_dir ← null
+    do {
+        let td.ShardSource src ← variant td.ShardSource.GgufSource { role = variant bundle.MemberRole.Backbone, manifest = gm }
+        maybe_dir ← td.build(bun, [src], empty, empty)
+    }
+    catch err {
+        throw "td.build failed"
+    }
+    if maybe_dir is none then throw "td.build returned null"
+    let td.TensorDirectory dir ← maybe_dir
+
+    mut list<dd.DenseModelSpec> specs ← empty
+    mut list<model_schedule.ExecutionSchedule> scheds ← empty
+    do {
+        let dd.DenseModelSpec sp ← dd.admit_spec_from_gguf(gm, dir)
+        specs.append(sp)
+        scheds.append(dd.build_schedule(sp))
+    }
+    catch err {
+        throw "decode_dense admission failed: §"(err.message)
+    }
+    let dd.DenseModelSpec spec ← specs[0]
+    let model_schedule.ExecutionSchedule sched ← scheds[0]
+
+    print "spec arch=§0 layers=§1 hidden=§2 heads=§3 kv_heads=§4 head_dim=§5 ffn=§6 vocab=§7 tied=§8 sched_layers=§9"(
+        spec.model_type,
+        spec.num_layers ↦ string,
+        spec.hidden_size ↦ string,
+        spec.num_attention_heads ↦ string,
+        spec.num_kv_heads ↦ string,
+        spec.head_dim ↦ string,
+        spec.intermediate_size ↦ string,
+        spec.vocab_size ↦ string,
+        spec.tie_word_embeddings ↦ string,
+        sched.layers.length() ↦ string
+    )
+
+    if spec.hidden_size ≢ (RES_D ↦ int) or spec.num_layers ≢ 32 or spec.q_dim ≢ (RES_QD ↦ int) or spec.kv_dim ≢ (RES_KVD ↦ int) or spec.intermediate_size ≢ (RES_F ↦ int) or spec.vocab_size ≢ (RES_V ↦ int) or spec.num_attention_heads ≢ (RES_H ↦ int) {
+        throw "admitted spec extents do not match SmolLM2-360M kernel carrier"
+    }
+
+    mut bpe.Tokenizer ∪ none maybe_tok ← null
+    mut list<int> prompt_ids ← empty
+    do {
+        let bpe.Tokenizer bt ← bpe.build(gm)
+        maybe_tok ← bt
+        prompt_ids ← bpe.encode_prompt(bt, "The capital of France is")
+    }
+    catch err {
+        throw "bpe tokenizer setup failed"
+    }
+    if maybe_tok is none then throw "bpe tokenizer build failed"
+    let bpe.Tokenizer tok ← maybe_tok
+    print "prompt_ids=§"(join_ints(prompt_ids))
+
+    if prompt_ids.length() + MAX_GEN ≻ (RES_C ↦ int) {
+        throw "prompt plus MAX_GEN exceeds RES_C"
+    }
+
+    let tensor<f32, [RES_V, RES_D]> embed ← load_f32_2d<size RES_V, size RES_D>(path, dir, "model.embed_tokens.weight")
+    let tensor<f32, [RES_D]> onorm ← load_f32_1d<size RES_D>(path, dir, "model.norm.weight")
+
+    mut list<RW> layers ← empty
+    for exclusive spec.num_layers let l {
+        layers.append(load_layer(path, dir, l))
+    }
+
+    mut tensor<f32, [1]> sink ← tf32[1] {}
+    mut list<RWS> wss ← empty
+    do {
+        wss.append(dd.make_workspace<size RES_D, size RES_QD, size RES_KVD, size RES_F, size RES_H, size RES_C, size RES_P>(spec, mut sink))
+    }
+    catch err {
+        throw "make_workspace failed: §"(err.message)
+    }
+    mut RWS ws ← wss[0]
+
+    mut list<RS> svs ← empty
+    for exclusive spec.num_layers let ? {
+        let tensor<f32, [RES_C, RES_KVD]> kc ← tf32[RES_C, RES_KVD] {}
+        let tensor<f32, [RES_C, RES_KVD]> vc ← tf32[RES_C, RES_KVD] {}
+        ds.prime2(kc, mut sink)
+        ds.prime2(vc, mut sink)
+        svs.append(dt.SlotView<size 128, size 320> { kin = kc, vin = vc, pos = 0 })
+    }
+
+    let dt.LayerParams lp ← dd.layer_params(spec)
+    mut tensor<i32, [1]> ids ← ti32[1] {}
+    mut tensor<f32, [RES_V]> logits ← tf32[RES_V] {}
+    mut tensor<f32, [RES_D]> h_a ← tf32[RES_D] {}
+    mut tensor<f32, [RES_D]> h_b ← tf32[RES_D] {}
+    mut tensor<f32, [RES_SPAN]> rtcos ← tf32[RES_SPAN] {}
+    mut tensor<f32, [RES_SPAN]> rtsin ← tf32[RES_SPAN] {}
+
+    ds.prime1(h_a, mut sink)
+    ds.prime1(h_b, mut sink)
+    ds.prime1(rtcos, mut sink)
+    ds.prime1(rtsin, mut sink)
+    ds.prime1(logits, mut sink)
+
+    let int load_ms ← (time.monotonic() - t_load0) / 1000000
+    print "load_ms=§"(load_ms ↦ string)
+
+    let int t_dec0 ← time.monotonic()
+    let int n_layers ← spec.num_layers
+    let int total_steps ← prompt_ids.length() + MAX_GEN - 1
+    mut list<int> gen_ids ← empty
+    mut int next_tok ← 0
+
+    for exclusive total_steps let step {
+        let int tok_in ← step ≺ prompt_ids.length() ✓ prompt_ids[step] ✗ next_tok
+        ids[0] ← tok_in ↦ i32 ⊥ 0
+        dt.embed_wide(embed, ids, mut h_a)
+
+        let i32 tpos ← step ↦ i32 ⊥ 0
+        ds.rope_table(mut rtcos, mut rtsin, tpos, lp.plntheta)
+
+        for exclusive n_layers let ll {
+            let RW ly ← layers[ll]
+            mut RS sv ← svs[ll]
+            sv.pos ← tpos
+            if ll % 2 ≡ 0 {
+                dt.layer_wide_table(h_a, mut h_b, ly, mut sv, lp, rtcos, rtsin, mut ws)
+            }
+            else {
+                dt.layer_wide_table(h_b, mut h_a, ly, mut sv, lp, rtcos, rtsin, mut ws)
+            }
+        }
+
+        let tensor<f32, [RES_D]> final_h ← (n_layers % 2 ≡ 1) ✓ h_b ✗ h_a
+        dt.head_wide(final_h, onorm, embed, mut ws.xn, mut logits, lp.peps)
+        ds.argmax_token(logits, mut ids)
+        next_tok ← ids[[0]] ↦ int
+
+        if step ≡ prompt_ids.length() - 1 {
+            mut string s8 ← "["
+            for exclusive 8 let k {
+                if k ≻ 0 {
+                    s8 ← s8 + ", "
+                }
+                s8 ← s8 + (logits[[k]] ↦ string)
+            }
+            s8 ← s8 + "]"
+            print "first_step_top1=§0 logit=§1 head8=§2"(next_tok ↦ string, logits[[next_tok]] ↦ string, s8)
+        }
+
+        if step ≥ prompt_ids.length() - 1 {
+            gen_ids.append(next_tok)
+        }
+    }
+
+    let int decode_ms ← (time.monotonic() - t_dec0) / 1000000
+    print "decode_ms=§0 steps=§1 gen_ids=§2"(decode_ms ↦ string, total_steps ↦ string, join_ints(gen_ids))
+
+    do {
+        let string txt ← bpe.decode(tok, gen_ids)
+        print "decoded=§"(txt)
+    }
+    catch err {
+        throw "bpe.decode failed"
+    }
+}
+
+main {
+    let list<string> args ← process.argv() ↦ list<string>
+    let string path ← args.length() ≥ 2 ✓ args[1] ✗ default_gguf_path()
+    do {
+        run_resident(path)
+    }
+    catch err {
+        print "error: §"(err)
+        process.exit_process(1)
+    }
+}

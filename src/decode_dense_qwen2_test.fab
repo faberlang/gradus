@@ -1,0 +1,226 @@
++++ toml
+locale = "en"
+
++++ faber
+# Qwen2 untied biased 3-layer test for gradus:decode_dense (issue #28).
+
+import from "gradus:cache/session" let sess_mod
+import from "gradus:decode_dense" let dd
+import from "gradus:decode_token" let dt
+import from "gradus:model/artifact" let artifact
+import from "gradus:model/bundle" let bundle
+import from "gradus:model/capsule" let capsule
+import from "gradus:model/config" let cfg
+import from "gradus:model/schedule" let model_schedule
+import from "gradus:model/tensor_directory" let td
+
+fn st_desc(string name, string dtype, list<int> shape, int start, int end, int elems) → capsule.SafetensorsTensorDescriptor {
+    return capsule.SafetensorsTensorDescriptor {
+        name = name,
+        dtype = dtype,
+        shape = shape,
+        start = start,
+        end = end,
+        elements = elems
+    }
+}
+
+fn add_layer_descs(mut list<capsule.SafetensorsTensorDescriptor> out, int l, int d, int qd, int kvd, int f) → void {
+    let string p ← "model.layers.§"(l ↦ string)
+    out.append(st_desc("§.input_layernorm.weight"(p), "F32", [d], 0, d * 4, d))
+    out.append(st_desc("§.self_attn.q_proj.weight"(p), "F32", [qd, d], 0, qd * d * 4, qd * d))
+    out.append(st_desc("§.self_attn.k_proj.weight"(p), "F32", [kvd, d], 0, kvd * d * 4, kvd * d))
+    out.append(st_desc("§.self_attn.v_proj.weight"(p), "F32", [kvd, d], 0, kvd * d * 4, kvd * d))
+    out.append(st_desc("§.self_attn.o_proj.weight"(p), "F32", [d, qd], 0, d * qd * 4, d * qd))
+    out.append(st_desc("§.post_attention_layernorm.weight"(p), "F32", [d], 0, d * 4, d))
+    out.append(st_desc("§.mlp.gate_proj.weight"(p), "F32", [f, d], 0, f * d * 4, f * d))
+    out.append(st_desc("§.mlp.up_proj.weight"(p), "F32", [f, d], 0, f * d * 4, f * d))
+    out.append(st_desc("§.mlp.down_proj.weight"(p), "F32", [d, f], 0, d * f * 4, d * f))
+    out.append(st_desc("§.self_attn.q_proj.bias"(p), "F32", [qd], 0, qd * 4, qd))
+    out.append(st_desc("§.self_attn.k_proj.bias"(p), "F32", [kvd], 0, kvd * 4, kvd))
+    out.append(st_desc("§.self_attn.v_proj.bias"(p), "F32", [kvd], 0, kvd * 4, kvd))
+}
+
+fn build_qwen2_dir(int layers, int v, int d, int qd, int kvd, int f) → td.TensorDirectory ∪ none {
+    mut list<capsule.SafetensorsTensorDescriptor> tensors ← empty
+    tensors.append(st_desc("model.embed_tokens.weight", "F32", [v, d], 0, v * d * 4, v * d))
+    tensors.append(st_desc("model.norm.weight", "F32", [d], 0, d * 4, d))
+    tensors.append(st_desc("lm_head.weight", "F32", [v, d], 0, v * d * 4, v * d))
+
+    for exclusive layers let l {
+        add_layer_descs(mut tensors, l, d, qd, kvd, f)
+    }
+
+    let int big_bytes ← 1048576
+    let capsule.SafetensorsManifest sm ← capsule.SafetensorsManifest {
+        format = "safetensors",
+        version = "1.0.0",
+        artifact_length = big_bytes,
+        data_length = big_bytes - 72,
+        metadata = [],
+        tensors = tensors
+    }
+
+    mut artifact.ContentIdentity ∪ none maybe_id ← null
+    do {
+        maybe_id ← artifact.identity("sha-256", "0000000000000000000000000000000000000000000000000000000000000000", big_bytes)
+    }
+    catch err {
+        return null
+    }
+    if maybe_id is none then return null
+    let artifact.ContentIdentity sid ← maybe_id
+
+    mut bundle.ModelBundle ∪ none maybe_b ← null
+    do {
+        maybe_b ← bundle.safetensors_unindexed([sid], null, null, null, null, null)
+    }
+    catch err {
+        return null
+    }
+    if maybe_b is none then return null
+    let bundle.ModelBundle b ← maybe_b
+
+    do {
+        let td.ShardSource src ← variant td.ShardSource.SafetensorsSource { role = variant bundle.MemberRole.Backbone, shard_index = 0, manifest = sm }
+        return td.build(b, [src], [], [])
+    }
+    catch err {
+        return null
+    }
+}
+
+fn parse_config_opt(string json_txt) → cfg.ModelConfig ∪ none {
+    do {
+        return cfg.parse_json(json_txt)
+    }
+    catch err {
+        return null
+    }
+}
+
+fn synth_val(int r, int c, int salt) → f32 {
+    return (((r * 13 + c * 7 + salt * 5) % 19 - 9) ↦ f32) * 0.03 ∷ f32
+}
+
+fn fill_vec<size N>(mut tensor<f32, [N]> dst, f32 base_val, int salt) → void {
+    for exclusive N let i {
+        dst[[i]] ← base_val + synth_val(i, 0, salt)
+    }
+}
+
+fn fill_mat<size R, size C>(mut tensor<f32, [R, C]> dst, int salt) → void {
+    for exclusive R let r {
+        for exclusive C let c {
+            dst[[r, c]] ← synth_val(r, c, salt)
+        }
+    }
+}
+
+@ public
+fn check_qwen2_untied_biased_decode() → bool {
+    let string json_txt ← «{"model_type":"qwen2","hidden_size":6,"num_hidden_layers":3,"num_attention_heads":3,"num_key_value_heads":1,"head_dim":2,"intermediate_size":8,"vocab_size":7,"max_position_embeddings":8,"rms_norm_eps":0.00001,"rope_theta":1000000.0,"tie_word_embeddings":false,"qkv_bias":true}»
+    let cfg.ModelConfig ∪ none maybe_mc ← parse_config_opt(json_txt)
+    if maybe_mc is none then return false
+    let cfg.ModelConfig mc ← maybe_mc
+
+    let td.TensorDirectory ∪ none maybe_dir ← build_qwen2_dir(3, 7, 6, 6, 2, 8)
+    if maybe_dir is none then return false
+    let td.TensorDirectory dir ← maybe_dir
+
+    do {
+        let dd.DenseModelSpec spec ← dd.admit_spec_from_config(mc, dir)
+        let model_schedule.ExecutionSchedule sched ← dd.build_schedule(spec)
+
+        if sched.layers.length() ≢ 3 or not spec.has_qkv_bias or spec.tie_word_embeddings then return false
+
+        mut tensor<f32, [7, 6]> embed ← tf32[7, 6] {}
+        mut tensor<f32, [7, 6]> lm_head ← tf32[7, 6] {}
+        mut tensor<f32, [6]> onorm ← tf32[6] {}
+        fill_mat<size 7, size 6>(mut embed, 31)
+        fill_mat<size 7, size 6>(mut lm_head, 41)
+        fill_vec<size 6>(mut onorm, 1.0 ∷ f32, 32)
+        let dd.DenseHeadWeights<size 7, size 6> head ← dd.make_head_weights<size 7, size 6>(embed, onorm, false, lm_head)
+
+        mut list<tensor<f32, [6]>> anorms ← empty
+        mut list<tensor<f32, [6, 6]>> wqs ← empty
+        mut list<tensor<f32, [2, 6]>> wks ← empty
+        mut list<tensor<f32, [2, 6]>> wvs ← empty
+        mut list<tensor<f32, [6, 6]>> wos ← empty
+        mut list<tensor<f32, [6]>> fnorms ← empty
+        mut list<tensor<f32, [8, 6]>> wgs ← empty
+        mut list<tensor<f32, [8, 6]>> wus ← empty
+        mut list<tensor<f32, [6, 8]>> wds ← empty
+        mut list<tensor<f32, [6]>> bqs ← empty
+        mut list<tensor<f32, [2]>> bks ← empty
+        mut list<tensor<f32, [2]>> bvs ← empty
+
+        for exclusive 3 let l {
+            let int salt ← (l + 1) * 10
+            mut tensor<f32, [6]> anorm ← tf32[6] {}
+            mut tensor<f32, [6, 6]> wq ← tf32[6, 6] {}
+            mut tensor<f32, [2, 6]> wk ← tf32[2, 6] {}
+            mut tensor<f32, [2, 6]> wv ← tf32[2, 6] {}
+            mut tensor<f32, [6, 6]> wo ← tf32[6, 6] {}
+            mut tensor<f32, [6]> fnorm ← tf32[6] {}
+            mut tensor<f32, [8, 6]> wg ← tf32[8, 6] {}
+            mut tensor<f32, [8, 6]> wu ← tf32[8, 6] {}
+            mut tensor<f32, [6, 8]> wd ← tf32[6, 8] {}
+            mut tensor<f32, [6]> bq ← tf32[6] {}
+            mut tensor<f32, [2]> bk ← tf32[2] {}
+            mut tensor<f32, [2]> bv ← tf32[2] {}
+            fill_vec<size 6>(mut anorm, 1.0 ∷ f32, salt + 1)
+            fill_mat<size 6, size 6>(mut wq, salt + 2)
+            fill_mat<size 2, size 6>(mut wk, salt + 3)
+            fill_mat<size 2, size 6>(mut wv, salt + 4)
+            fill_mat<size 6, size 6>(mut wo, salt + 5)
+            fill_vec<size 6>(mut fnorm, 1.0 ∷ f32, salt + 6)
+            fill_mat<size 8, size 6>(mut wg, salt + 7)
+            fill_mat<size 8, size 6>(mut wu, salt + 8)
+            fill_mat<size 6, size 8>(mut wd, salt + 9)
+            fill_vec<size 6>(mut bq, 0.05 ∷ f32, salt + 10)
+            fill_vec<size 2>(mut bk, -0.04 ∷ f32, salt + 11)
+            fill_vec<size 2>(mut bv, 0.03 ∷ f32, salt + 12)
+            anorms.append(anorm)
+            wqs.append(wq)
+            wks.append(wk)
+            wvs.append(wv)
+            wos.append(wo)
+            fnorms.append(fnorm)
+            wgs.append(wg)
+            wus.append(wu)
+            wds.append(wd)
+            bqs.append(bq)
+            bks.append(bk)
+            bvs.append(bv)
+        }
+
+        let dd.DenseLayerBank<size 6, size 6, size 2, size 8> bank ← dd.make_layer_bank<size 6, size 6, size 2, size 8>(anorms, wqs, wks, wvs, wos, fnorms, wgs, wus, wds, bqs, bks, bvs)
+
+        mut tensor<f32, [1]> sink ← tf32[1] {}
+        mut sess_mod.SessionState<size 8, size 1, size 2> session ← dd.make_session<size 8, size 1, size 2>(sched)
+        mut dt.Workspace<size 6, size 6, size 2, size 8, size 3, size 8, size 2> ws ← dd.make_workspace<size 6, size 6, size 2, size 8, size 3, size 8, size 2>(spec, mut sink)
+        mut tensor<f32, [1]> rtcos ← tf32[1] {}
+        mut tensor<f32, [1]> rtsin ← tf32[1] {}
+
+        let list<int> gen ← dd.generate_greedy<size 7, size 6, size 6, size 2, size 8, size 3, size 8, size 1, size 2, size 1>(spec, head, bank, mut session, ws, mut rtcos, mut rtsin, [0, 2, 4], 2)
+
+        if gen.length() ≢ 2 then return false
+
+        for from gen let tok {
+            if tok ≺ 0 or tok ≥ 7 then return false
+        }
+
+        return dd.session_valid_count<size 8, size 1, size 2>(session, 0) ≡ 4 and dd.session_valid_count<size 8, size 1, size 2>(session, 2) ≡ 4
+    }
+    catch err {
+        return false
+    }
+}
+
++++ faber test
+import from "gradus:decode_dense_qwen2_test" let dqt
+
+test "decode_dense drives untied biased 3-layer qwen2-style config through same driver" {
+    assert dqt.check_qwen2_untied_biased_decode()
+}
