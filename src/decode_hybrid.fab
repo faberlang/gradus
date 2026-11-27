@@ -27,10 +27,9 @@ class FlintAttnWeights<size D, size QD, size KVD, size DH, size H> {
     let tensor<f32, [KVD, D]> wk
     let tensor<f32, [KVD, D]> wv
     let tensor<f32, [D, QD]> wo
-    let bool has_qk_norm
-    let tensor<f32, [DH]> q_norm
-    let tensor<f32, [DH]> k_norm
-    let bool has_sink
+    let tensor<f32, [DH]> ∪ none q_norm = null
+    let tensor<f32, [DH]> ∪ none k_norm = null
+    let bool has_sink = false
     let tensor<f32, [H]> softmax_sink
 }
 
@@ -65,12 +64,10 @@ class MoeFfnWeights<size D, size E, size EF, size ED, size FE, size FS> {
     let tensor<f32, [EF, D]> wg
     let tensor<f32, [EF, D]> wu
     let tensor<f32, [ED, FE]> wd
-    let bool has_shared
-    let tensor<f32, [FS, D]> shared_wg
-    let tensor<f32, [FS, D]> shared_wu
-    let tensor<f32, [D, FS]> shared_wd
-    let bool has_shared_gate
-    let tensor<f32, [1, D]> shared_gate_w
+    let tensor<f32, [FS, D]> ∪ none shared_wg = null
+    let tensor<f32, [FS, D]> ∪ none shared_wu = null
+    let tensor<f32, [D, FS]> ∪ none shared_wd = null
+    let tensor<f32, [1, D]> ∪ none shared_gate_w = null
     let bool use_sigmoid_routing = false
 }
 
@@ -82,9 +79,8 @@ class Qwen36FullAttnWeights<size D, size TwoQD, size QD, size KVD, size DH, size
     let tensor<f32, [KVD, D]> wk
     let tensor<f32, [KVD, D]> wv
     let tensor<f32, [D, QD]> wo
-    let bool has_qk_norm
-    let tensor<f32, [DH]> q_norm
-    let tensor<f32, [DH]> k_norm
+    let tensor<f32, [DH]> ∪ none q_norm = null
+    let tensor<f32, [DH]> ∪ none k_norm = null
 }
 
 # Gated DeltaNet + ShortConv weights for Slice B (Qwen3.6) linear-attention layers.
@@ -130,7 +126,14 @@ fn flint_attn_step<size D, size QD, size KVD, size DH, size H, size C, size W>(t
     mut tensor<f32, [KVD]> kn ← tf32[KVD] {}
     mut tensor<f32, [H]> q_inv ← tf32[H] {}
     mut tensor<f32, [H]> k_inv ← tf32[H] {}
-    stages.norm_qk_heads<size H, size H, size QD, size KVD, size DH>(q, k, aw.q_norm, aw.k_norm, mut qn, mut kn, mut q_inv, mut k_inv, aw.has_qk_norm, ap.eps)
+    if aw.q_norm not is none and aw.k_norm not is none {
+        let tensor<f32, [DH]> qn_w ← aw.q_norm
+        let tensor<f32, [DH]> kn_w ← aw.k_norm
+        stages.norm_qk_heads<size H, size H, size QD, size KVD, size DH>(q, k, qn_w, kn_w, mut qn, mut kn, mut q_inv, mut k_inv, ap.eps)
+    }
+    else {
+        stages.copy_qk_heads<size QD, size KVD>(q, k, mut qn, mut kn)
+    }
 
     mut tensor<f32, [QD]> qr ← tf32[QD] {}
     mut tensor<f32, [KVD]> kr ← tf32[KVD] {}
@@ -153,14 +156,45 @@ fn dense_ffn_step<size D, size F>(tensor<f32, [D]> h1, mut tensor<f32, [D]> hout
 # Routed + optional shared MoE FFN step.
 @ public
 fn moe_ffn_step<size D, size E, size EF, size ED, size K, size FE, size FS>(tensor<f32, [D]> h1, mut tensor<f32, [D]> hout, MoeFfnWeights<D, E, EF, ED, FE, FS> mw, mut tensor<i32, [K]> top_idx, f32 eps) → void {
-    stages.moe_ffn_stage(h1, mut hout, mw.fnorm, mw.router, mw.wg, mw.wu, mw.wd, mw.has_shared, mw.shared_wg, mw.shared_wu, mw.shared_wd, mw.has_shared_gate, mw.shared_gate_w, mut top_idx, eps, mw.use_sigmoid_routing)
+    mut tensor<f32, [D]> fnx ← tf32[D] {}
+    mut tensor<f32, [D]> moe_out ← tf32[D] {}
+    stages.moe_routed_core(h1, mw.fnorm, mw.router, mw.wg, mw.wu, mw.wd, mut fnx, mut moe_out, mut top_idx, eps, mw.use_sigmoid_routing)
+
+    if mw.shared_wg not is none and mw.shared_wu not is none and mw.shared_wd not is none {
+        let tensor<f32, [FS, D]> swg ← mw.shared_wg
+        let tensor<f32, [FS, D]> swu ← mw.shared_wu
+        let tensor<f32, [D, FS]> swd ← mw.shared_wd
+        mut tensor<f32, [D]> s_out ← tf32[D] {}
+        mut tensor<f32, [D]> ffn_out ← tf32[D] {}
+        stages.moe_shared_ffn_proj(fnx, swg, swu, swd, mut s_out)
+        if mw.shared_gate_w not is none {
+            let tensor<f32, [1, D]> sgw ← mw.shared_gate_w
+            mut tensor<f32, [1]> s_gate_logit ← tf32[1] {}
+            do device {
+                ds.gemv(sgw, fnx, mut s_gate_logit)
+                dhk.sigmoid_gate_add(moe_out, s_out, s_gate_logit, mut ffn_out)
+                ds.residual_add(h1, ffn_out, mut hout)
+            }
+        }
+        else {
+            do device {
+                ds.residual_add(moe_out, s_out, mut ffn_out)
+                ds.residual_add(h1, ffn_out, mut hout)
+            }
+        }
+    }
+    else {
+        do device {
+            ds.residual_add(h1, moe_out, mut hout)
+        }
+    }
 }
 
 # Slice B0 full layer step: attention + dense FFN (when `is_dense`) or MoE FFN.
 @ public
 fn flint_layer_step<size D, size QD, size KVD, size DH, size H, size C, size W, size F, size E, size EF, size ED, size K, size FE, size FS>(tensor<f32, [D]> hin, mut tensor<f32, [D]> hout, FlintAttnWeights<D, QD, KVD, DH, H> aw, FlintAttnParams ap, mut sess_mod.SessionState<C, W, KVD> sess, int slot_id, i32 pos, bool is_dense, DenseFfnWeights<D, F> dfw, MoeFfnWeights<D, E, EF, ED, FE, FS> mfw, mut tensor<i32, [K]> top_idx) → void ⇥ sess_mod.SessionError {
     mut tensor<f32, [D]> h1 ← tf32[D] {}
-    flint_attn_step(hin, mut h1, aw, ap, mut sess, slot_id, pos)
+    flint_attn_step<size D, size QD, size KVD, size DH, size H, size C, size W>(hin, mut h1, aw, ap, mut sess, slot_id, pos)
 
     if is_dense {
         dense_ffn_step(h1, mut hout, dfw, ap.eps)
@@ -193,7 +227,14 @@ fn qwen36_full_attn_step<size D, size TwoQD, size QD, size KVD, size DH, size H,
     mut tensor<f32, [KVD]> kn ← tf32[KVD] {}
     mut tensor<f32, [H]> q_inv ← tf32[H] {}
     mut tensor<f32, [H]> k_inv ← tf32[H] {}
-    stages.norm_qk_heads<size H, size H, size QD, size KVD, size DH>(q, k, aw.q_norm, aw.k_norm, mut qn, mut kn, mut q_inv, mut k_inv, aw.has_qk_norm, ap.eps)
+    if aw.q_norm not is none and aw.k_norm not is none {
+        let tensor<f32, [DH]> qn_w ← aw.q_norm
+        let tensor<f32, [DH]> kn_w ← aw.k_norm
+        stages.norm_qk_heads<size H, size H, size QD, size KVD, size DH>(q, k, qn_w, kn_w, mut qn, mut kn, mut q_inv, mut k_inv, ap.eps)
+    }
+    else {
+        stages.copy_qk_heads<size QD, size KVD>(q, k, mut qn, mut kn)
+    }
 
     mut tensor<f32, [QD]> qr ← tf32[QD] {}
     mut tensor<f32, [KVD]> kr ← tf32[KVD] {}
@@ -330,7 +371,6 @@ test "decode_hybrid flint_attn_step dispatches RingKvArena and FullKvArena with 
             wk = wk,
             wv = wv,
             wo = wo,
-            has_qk_norm = true,
             q_norm = qn,
             k_norm = kn,
             has_sink = true,
@@ -395,12 +435,11 @@ test "decode_hybrid flint_layer_step supports leading dense FFN and routed+share
         wv[[0, 0]] ← 1.0
         mut tensor<f32, [2, 4]> wo ← tf32[2, 4] {}
         wo[[0, 0]] ← 1.0
-        mut tensor<f32, [2]> sink ← tf32[2] {}
 
+        mut tensor<f32, [2]> zsink ← tf32[2] {}
         let dh.FlintAttnWeights<2, 4, 2, 2, 2> aw ← dh.FlintAttnWeights<2, 4, 2, 2, 2> {
             anorm = ones2, wq = wq, wk = wk, wv = wv, wo = wo,
-            has_qk_norm = false, q_norm = ones2, k_norm = ones2,
-            has_sink = false, softmax_sink = sink
+            softmax_sink = zsink
         }
         let dh.FlintAttnParams ap ← dh.FlintAttnParams {
             dh = 2, span = 1, group = 2, rope = variant dt.RopeKind.None,
@@ -428,15 +467,15 @@ test "decode_hybrid flint_layer_step supports leading dense FFN and routed+share
         mut tensor<f32, [1, 2]> sgw ← tf32[1, 2] {}
         let dh.MoeFfnWeights<2, 2, 4, 4, 2, 2> mfw ← dh.MoeFfnWeights<2, 2, 4, 4, 2, 2> {
             fnorm = ones2, router = router, wg = e_wg, wu = e_wu, wd = e_wd,
-            has_shared = true, shared_wg = df_wg, shared_wu = df_wu, shared_wd = df_wd,
-            has_shared_gate = true, shared_gate_w = sgw
+            shared_wg = df_wg, shared_wu = df_wu, shared_wd = df_wd,
+            shared_gate_w = sgw
         }
 
         mut tensor<f32, [2]> out_dense ← tf32[2] {}
         mut tensor<f32, [2]> out_moe ← tf32[2] {}
         mut tensor<i32, [1]> top_idx ← tensor<i32, [1]> {}
-        dh.flint_layer_step(hin, mut out_dense, aw, ap, mut sess, 1, 0, true, dfw, mfw, mut top_idx)
-        dh.flint_layer_step(hin, mut out_moe, aw, ap, mut sess, 1, 1, false, dfw, mfw, mut top_idx)
+        dh.flint_layer_step<size 2, size 4, size 2, size 2, size 2, size 8, size 5, size 2, size 2, size 4, size 4, size 1, size 2, size 2>(hin, mut out_dense, aw, ap, mut sess, 1, 0, true, dfw, mfw, mut top_idx)
+        dh.flint_layer_step<size 2, size 4, size 2, size 2, size 2, size 8, size 5, size 2, size 2, size 4, size 4, size 1, size 2, size 2>(hin, mut out_moe, aw, ap, mut sess, 1, 1, false, dfw, mfw, mut top_idx)
 
         assert out_dense[[0]] ≻ 1.0
         assert out_moe[[0]] ≻ 1.0
@@ -561,7 +600,7 @@ test "decode_hybrid qwen36_full_attn_step applies sectional RoPE and writes Full
 
         let dh.Qwen36FullAttnWeights<4, 8, 4, 4, 4, 1> aw ← dh.Qwen36FullAttnWeights<4, 8, 4, 4, 4, 1> {
             anorm = ones4, wq = wq_2qd, wk = eye4, wv = eye4, wo = eye4,
-            has_qk_norm = true, q_norm = ones4, k_norm = ones4
+            q_norm = ones4, k_norm = ones4
         }
         let dh.FlintAttnParams ap ← dh.FlintAttnParams {
             dh = 4, span = 1, group = 1, rope = variant dt.RopeKind.Half,
@@ -611,18 +650,14 @@ test "decode_hybrid Flint sigmoid MoE routing matches sigmoid/sum vs softmax" {
     mut tensor<f32, [4, 2]> wd ← tf32[4, 2] {}
     wd[[0, 0]] ← 1.0
     wd[[2, 0]] ← 3.0
-    mut tensor<f32, [2, 2]> sw ← tf32[2, 2] {}
-    mut tensor<f32, [1, 2]> sgw ← tf32[1, 2] {}
 
     let dh.MoeFfnWeights<2, 2, 4, 4, 2, 2> mw_sig ← dh.MoeFfnWeights<2, 2, 4, 4, 2, 2> {
         fnorm = ones2, router = router, wg = wg, wu = wu, wd = wd,
-        has_shared = false, shared_wg = sw, shared_wu = sw, shared_wd = sw,
-        has_shared_gate = false, shared_gate_w = sgw, use_sigmoid_routing = true
+        use_sigmoid_routing = true
     }
     let dh.MoeFfnWeights<2, 2, 4, 4, 2, 2> mw_soft ← dh.MoeFfnWeights<2, 2, 4, 4, 2, 2> {
         fnorm = ones2, router = router, wg = wg, wu = wu, wd = wd,
-        has_shared = false, shared_wg = sw, shared_wu = sw, shared_wd = sw,
-        has_shared_gate = false, shared_gate_w = sgw, use_sigmoid_routing = false
+        use_sigmoid_routing = false
     }
 
     mut tensor<i32, [2]> top_idx ← ti32[2] {}
