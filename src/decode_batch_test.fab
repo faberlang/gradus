@@ -1,0 +1,230 @@
++++ toml
+locale = "en"
+
++++ faber test
+import from "gradus:decode_hybrid" let dh
+import from "gradus:decode_token" let dt
+import from "gradus:cache/session" let sess_mod
+import from "gradus:model/schedule" let model_schedule
+
+fn close(f32 a, f32 b) → bool {
+    return (a - b).abs() ≺ 0.0001
+}
+
+fn mk_flint_sched() → model_schedule.ExecutionSchedule {
+    let list<model_schedule.AttentionKind> attns ← [
+        variant model_schedule.AttentionKind.SlidingWindow { window = 5 },
+        variant model_schedule.AttentionKind.Full
+    ]
+    let list<model_schedule.RopeKind> ropes ← [
+        variant model_schedule.RopeKind.Standard,
+        variant model_schedule.RopeKind.None
+    ]
+    do {
+        return model_schedule.patterned_schedule(attns, ropes, 2, [])
+    }
+    catch err {
+        assert false
+        return model_schedule.ExecutionSchedule { layers = [], segments = [], steps = [], slots = [], residual = variant model_schedule.ResidualKind.Standard, taps = [] }
+    }
+}
+
+test "decode_batch_test flint_layer_batch_step B=3 prefill matches sequential B=1 over RingKv and FullKv" {
+    let model_schedule.ExecutionSchedule sched ← mk_flint_sched()
+    do {
+        mut sess_mod.SessionState<8, 5, 2> sess_seq ← sess_mod.from_schedule<size 8, size 5, size 2>(sched)
+        mut sess_mod.SessionState<8, 5, 2> sess_bat ← sess_mod.from_schedule<size 8, size 5, size 2>(sched)
+
+        mut tensor<f32, [2]> ones2 ← tf32[2] {}
+        ones2[[0]] ← 1.0
+        ones2[[1]] ← 1.0
+        mut tensor<f32, [4, 2]> wq ← tf32[4, 2] {}
+        wq[[0, 0]] ← 1.0
+        wq[[2, 1]] ← 1.0
+        mut tensor<f32, [2, 2]> wk ← tf32[2, 2] {}
+        wk[[0, 0]] ← 0.5
+        wk[[1, 1]] ← 1.0
+        mut tensor<f32, [2, 2]> wv ← tf32[2, 2] {}
+        wv[[0, 0]] ← 1.0
+        wv[[1, 1]] ← 0.75
+        mut tensor<f32, [2, 4]> wo ← tf32[2, 4] {}
+        wo[[0, 0]] ← 1.0
+        wo[[1, 3]] ← 1.0
+        mut tensor<f32, [2]> sink ← tf32[2] {}
+        sink[[0]] ← 0.25
+        sink[[1]] ← -0.5
+
+        let dh.FlintAttnWeights<2, 4, 2, 2, 2> aw ← dh.FlintAttnWeights<2, 4, 2, 2, 2> {
+            anorm = ones2, wq = wq, wk = wk, wv = wv, wo = wo,
+            has_qk_norm = true, q_norm = ones2, k_norm = ones2,
+            has_sink = true, softmax_sink = sink
+        }
+        let dh.FlintAttnParams ap_swa ← dh.FlintAttnParams {
+            dh = 2, span = 1, group = 2, rope = variant dt.RopeKind.Half,
+            eps = 0.00001, lntheta = 10.0, scale = 0.70710677
+        }
+        let dh.FlintAttnParams ap_full ← dh.FlintAttnParams {
+            dh = 2, span = 1, group = 2, rope = variant dt.RopeKind.None,
+            eps = 0.00001, lntheta = 0.0, scale = 0.70710677
+        }
+
+        mut tensor<f32, [2, 2]> df_wg ← tf32[2, 2] {}
+        df_wg[[0, 0]] ← 0.5
+        df_wg[[1, 1]] ← 1.0
+        mut tensor<f32, [2, 2]> df_wu ← tf32[2, 2] {}
+        df_wu[[0, 0]] ← 1.0
+        df_wu[[1, 1]] ← 0.5
+        mut tensor<f32, [2, 2]> df_wd ← tf32[2, 2] {}
+        df_wd[[0, 0]] ← 0.75
+        df_wd[[1, 1]] ← 1.0
+        let dh.DenseFfnWeights<2, 2> dfw ← dh.DenseFfnWeights<2, 2> {
+            fnorm = ones2, wg = df_wg, wu = df_wu, wd = df_wd
+        }
+
+        mut tensor<f32, [2, 2]> router ← tf32[2, 2] {}
+        router[[0, 0]] ← 1.0
+        router[[1, 1]] ← 1.5
+        mut tensor<f32, [4, 2]> e_wg ← tf32[4, 2] {}
+        e_wg[[0, 0]] ← 0.5
+        e_wg[[2, 1]] ← 1.0
+        mut tensor<f32, [4, 2]> e_wu ← tf32[4, 2] {}
+        e_wu[[0, 0]] ← 1.0
+        e_wu[[2, 1]] ← 0.5
+        mut tensor<f32, [4, 2]> e_wd ← tf32[4, 2] {}
+        e_wd[[0, 0]] ← 1.0
+        e_wd[[2, 0]] ← 2.0
+        mut tensor<f32, [1, 2]> sgw ← tf32[1, 2] {}
+        let dh.MoeFfnWeights<2, 2, 4, 4, 2, 2> mfw ← dh.MoeFfnWeights<2, 2, 4, 4, 2, 2> {
+            fnorm = ones2, router = router, wg = e_wg, wu = e_wu, wd = e_wd,
+            has_shared = true, shared_wg = df_wg, shared_wu = df_wu, shared_wd = df_wd,
+            has_shared_gate = false, shared_gate_w = sgw, use_sigmoid_routing = true
+        }
+
+        mut tensor<f32, [3, 2]> hin_b ← tf32[3, 2] {}
+        hin_b[[0, 0]] ← 1.0
+        hin_b[[0, 1]] ← 0.5
+        hin_b[[1, 0]] ← -0.5
+        hin_b[[1, 1]] ← 1.25
+        hin_b[[2, 0]] ← 0.75
+        hin_b[[2, 1]] ← -1.0
+
+        mut tensor<f32, [3, 2]> hmid_b ← tf32[3, 2] {}
+        mut tensor<f32, [3, 2]> hout_b ← tf32[3, 2] {}
+        let tensor<f32, [6]> bhdom1d ← tf32[6] {}
+        mut tensor<f32, [3, 1]> k_inv_b ← tf32[3, 1] {}
+        mut tensor<f32, [6, 2]> expert_act ← tf32[6, 2] {}
+        mut tensor<i32, [3, 2]> top_b ← ti32[3, 2] {}
+        # Layer 0: RingKv(5) + Half RoPE + QK-norm + sink + Dense FFN
+        dh.flint_layer_batch_step(hin_b, mut hmid_b, aw, ap_swa, mut sess_bat, 0, 0, true, dfw, mfw, bhdom1d, mut k_inv_b, mut expert_act, mut top_b, 3)
+        # Layer 1: FullKv + No RoPE + QK-norm + sink + Sigmoid MoE + Shared FFN
+        dh.flint_layer_batch_step(hmid_b, mut hout_b, aw, ap_full, mut sess_bat, 1, 0, false, dfw, mfw, bhdom1d, mut k_inv_b, mut expert_act, mut top_b, 3)
+
+        mut tensor<f32, [2]> hin_1 ← tf32[2] {}
+        mut tensor<f32, [2]> hmid_1 ← tf32[2] {}
+        mut tensor<f32, [2]> hout_1 ← tf32[2] {}
+        mut tensor<i32, [2]> top_1 ← ti32[2] {}
+        for range 0‥3 let p {
+            hin_1[[0]] ← hin_b[[p, 0]]
+            hin_1[[1]] ← hin_b[[p, 1]]
+            let i32 p32 ← p ↦ i32 ⊥ 0
+            dh.flint_layer_step(hin_1, mut hmid_1, aw, ap_swa, mut sess_seq, 0, p32, true, dfw, mfw, mut top_1)
+            dh.flint_layer_step(hmid_1, mut hout_1, aw, ap_full, mut sess_seq, 1, p32, false, dfw, mfw, mut top_1)
+            assert close(hout_b[[p, 0]], hout_1[[0]])
+            assert close(hout_b[[p, 1]], hout_1[[1]])
+        }
+        assert sess_bat.ring_kv.total_written[0] ≡ 3
+        assert sess_bat.full_kv.lengths[0] ≡ 3
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "decode_batch_test qwen36_full_layer_batch_step B=3 prefill matches sequential B=1" {
+    let model_schedule.ExecutionSchedule sched ← mk_flint_sched()
+    do {
+        mut sess_mod.SessionState<8, 5, 2> sess_seq ← sess_mod.from_schedule<size 8, size 5, size 2>(sched)
+        mut sess_mod.SessionState<8, 5, 2> sess_bat ← sess_mod.from_schedule<size 8, size 5, size 2>(sched)
+
+        mut tensor<f32, [2]> ones2 ← tf32[2] {}
+        ones2[[0]] ← 1.0
+        ones2[[1]] ← 1.0
+        mut tensor<f32, [8, 2]> wq_2qd ← tf32[8, 2] {}
+        wq_2qd[[0, 0]] ← 1.0
+        wq_2qd[[1, 1]] ← 1.0
+        wq_2qd[[2, 0]] ← 1.5
+        wq_2qd[[4, 0]] ← -0.5
+        wq_2qd[[6, 1]] ← 0.75
+        mut tensor<f32, [2, 2]> wk_eye ← tf32[2, 2] {}
+        wk_eye[[0, 0]] ← 1.0
+        wk_eye[[1, 1]] ← 1.0
+        mut tensor<f32, [2, 4]> wo_p ← tf32[2, 4] {}
+        wo_p[[0, 0]] ← 1.0
+        wo_p[[1, 3]] ← 1.0
+
+        let dh.Qwen36FullAttnWeights<2, 8, 4, 2, 2, 2> aw ← dh.Qwen36FullAttnWeights<2, 8, 4, 2, 2, 2> {
+            anorm = ones2, wq = wq_2qd, wk = wk_eye, wv = wk_eye, wo = wo_p,
+            has_qk_norm = true, q_norm = ones2, k_norm = ones2
+        }
+        let dh.FlintAttnParams ap ← dh.FlintAttnParams {
+            dh = 2, span = 1, group = 2, rope = variant dt.RopeKind.Half,
+            eps = 0.00001, lntheta = 0.0, scale = 0.70710677
+        }
+        mut tensor<i32, [4]> sections ← ti32[4] {}
+        sections[[0]] ← 1
+
+        mut tensor<f32, [2, 2]> router ← tf32[2, 2] {}
+        router[[0, 0]] ← 1.0
+        router[[1, 1]] ← 2.0
+        mut tensor<f32, [4, 2]> mwg ← tf32[4, 2] {}
+        mwg[[0, 0]] ← 0.5
+        mwg[[2, 1]] ← 1.0
+        mut tensor<f32, [4, 2]> mwu ← tf32[4, 2] {}
+        mwu[[0, 0]] ← 1.0
+        mwu[[2, 1]] ← 0.5
+        mut tensor<f32, [4, 2]> mwd ← tf32[4, 2] {}
+        mwd[[0, 0]] ← 1.0
+        mwd[[2, 1]] ← 2.0
+        mut tensor<f32, [2, 2]> sw ← tf32[2, 2] {}
+        sw[[0, 0]] ← 0.5
+        mut tensor<f32, [1, 2]> sgw ← tf32[1, 2] {}
+        sgw[[0, 0]] ← 1.0
+        let dh.MoeFfnWeights<2, 2, 4, 4, 2, 2> mfw ← dh.MoeFfnWeights<2, 2, 4, 4, 2, 2> {
+            fnorm = ones2, router = router, wg = mwg, wu = mwu, wd = mwd,
+            has_shared = true, shared_wg = sw, shared_wu = sw, shared_wd = sw,
+            has_shared_gate = true, shared_gate_w = sgw, use_sigmoid_routing = false
+        }
+
+        mut tensor<f32, [3, 2]> hin_b ← tf32[3, 2] {}
+        hin_b[[0, 0]] ← 1.0
+        hin_b[[0, 1]] ← 0.5
+        hin_b[[1, 0]] ← -0.5
+        hin_b[[1, 1]] ← 1.25
+        hin_b[[2, 0]] ← 0.75
+        hin_b[[2, 1]] ← -1.0
+        mut tensor<f32, [3, 2]> hout_b ← tf32[3, 2] {}
+        let tensor<f32, [6]> bhdom1d ← tf32[6] {}
+        mut tensor<f32, [3, 1]> k_inv_b ← tf32[3, 1] {}
+        mut tensor<f32, [6, 2]> expert_act ← tf32[6, 2] {}
+        mut tensor<i32, [3, 2]> top_b ← ti32[3, 2] {}
+        dh.qwen36_full_layer_batch_step<size 3, size 6, size 2, size 8, size 4, size 2, size 2, size 2, size 1, size 8, size 5, size 2, size 4, size 4, size 2, size 6, size 2, size 2>(hin_b, mut hout_b, aw, ap, sections, mut sess_bat, 1, 0, mfw, bhdom1d, mut k_inv_b, mut expert_act, mut top_b, 3)
+
+        mut tensor<f32, [2]> hin_1 ← tf32[2] {}
+        mut tensor<f32, [2]> h1_1 ← tf32[2] {}
+        mut tensor<f32, [2]> hout_1 ← tf32[2] {}
+        mut tensor<i32, [2]> top_1 ← ti32[2] {}
+        for range 0‥3 let p {
+            hin_1[[0]] ← hin_b[[p, 0]]
+            hin_1[[1]] ← hin_b[[p, 1]]
+            let i32 p32 ← p ↦ i32 ⊥ 0
+            dh.qwen36_full_attn_step(hin_1, mut h1_1, aw, ap, sections, mut sess_seq, 1, p32)
+            dh.moe_ffn_step(h1_1, mut hout_1, mfw, mut top_1, ap.eps)
+            assert close(hout_b[[p, 0]], hout_1[[0]])
+            assert close(hout_b[[p, 1]], hout_1[[1]])
+        }
+        assert sess_bat.full_kv.lengths[0] ≡ 3
+    }
+    catch err {
+        assert false
+    }
+}

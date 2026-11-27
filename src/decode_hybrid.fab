@@ -18,6 +18,52 @@ import from "gradus:decode_stages" let stages
 import from "gradus:decode_token" let dt
 import from "gradus:cache/session" let sess_mod
 import from "gradus:cache/hybrid_arenas" let hybrid
+import from "gradus:model/schedule" let model_schedule
+import from "gradus:model/linear_weight" let lw_mod
+import from "gradus:model/expert_bank" let eb
+
+@ public
+union HybridError {
+    @ shared
+    string message
+
+    StageFailure {
+        stages.StageError inner
+    },
+    LinearWeightFailure {
+        lw_mod.LinearWeightError inner
+    },
+    ExpertBankFailure {
+        eb.ExpertBankError inner
+    },
+    SessionFailure {
+        sess_mod.SessionError inner
+    }
+}
+
+@ public
+@ conversion
+fn from_stage_error(stages.StageError err) → HybridError {
+    return variant StageFailure { message = err.message, inner = err }
+}
+
+@ public
+@ conversion
+fn from_linear_weight_error(lw_mod.LinearWeightError err) → HybridError {
+    return variant LinearWeightFailure { message = err.message, inner = err }
+}
+
+@ public
+@ conversion
+fn from_expert_bank_error(eb.ExpertBankError err) → HybridError {
+    return variant ExpertBankFailure { message = err.message, inner = err }
+}
+
+@ public
+@ conversion
+fn from_session_error(sess_mod.SessionError err) → HybridError {
+    return variant SessionFailure { message = err.message, inner = err }
+}
 
 # Attention weights for Slice B0 (Flint) and Slice B (Qwen3.6) full-attention layers.
 @ public
@@ -221,6 +267,376 @@ fn qwen36_linear_attn_step<size D, size ConvCh, size RecRows, size VH, size K, s
 @ public
 fn qwen36_linear_attn_hybrid_step<size C, size W, size KVD, size D, size ConvCh, size RecRows, size VH, size K, size RecCols, size ConvRows>(tensor<f32, [D]> hin, mut tensor<f32, [D]> hout, LinearAttnWeights<D, ConvCh, RecRows, VH, K, RecCols> lw, LinearAttnParams lp, mut hybrid.HybridSession<C, W, KVD, ConvRows, ConvCh, RecRows, RecCols> hs, int slot_id) → void ⇥ sess_mod.SessionError {
     stages.deltanet_hybrid_stage(hin, mut hout, lw.anorm, lw.wqkv, lw.wgate, lw.conv_w, lw.dt_bias, lw.a_row, lw.wbeta, lw.walpha, lw.ssm_norm, lw.wout, lp.group_heads, lp.key_dim, lp.eps, lp.site_idx, lp.history_len, mut hs, slot_id)
+}
+
+# ---------------------------------------------------------------------------
+# Seam-5 Quantized & Schedule-Driven Layer Orchestrators (Flint INT4 & Qwen3.6)
+# ---------------------------------------------------------------------------
+
+# Quantized GroupAffineU8 + BF16 scales/biases attention weights (Flint INT4 MLX).
+@ public
+class FlintGaU8Bf16AttnWeights<size D, size QD, size KVD, size DH, size H, size PD, size GD, size PQD, size GQD> {
+    let tensor<f32, [D]> anorm
+    let lw_mod.LinearWeight wq_desc
+    let tensor<u8, [QD, PD]> wq_w
+    let tensor<bf16, [QD, GD]> wq_s
+    let tensor<bf16, [QD, GD]> wq_b
+    let lw_mod.LinearWeight wk_desc
+    let tensor<u8, [KVD, PD]> wk_w
+    let tensor<bf16, [KVD, GD]> wk_s
+    let tensor<bf16, [KVD, GD]> wk_b
+    let lw_mod.LinearWeight wv_desc
+    let tensor<u8, [KVD, PD]> wv_w
+    let tensor<bf16, [KVD, GD]> wv_s
+    let tensor<bf16, [KVD, GD]> wv_b
+    let lw_mod.LinearWeight wo_desc
+    let tensor<u8, [D, PQD]> wo_w
+    let tensor<bf16, [D, GQD]> wo_s
+    let tensor<bf16, [D, GQD]> wo_b
+    let bool has_qk_norm
+    let tensor<f32, [DH]> q_norm
+    let tensor<f32, [DH]> k_norm
+    let bool has_sink
+    let tensor<f32, [H]> softmax_sink
+}
+
+# Quantized GroupAffineU8 + BF16 scales/biases dense SwiGLU FFN weights (Flint leading layers).
+@ public
+class FlintGaU8Bf16DenseFfnWeights<size D, size F, size PD, size GD, size PF, size GF> {
+    let tensor<f32, [D]> fnorm
+    let lw_mod.LinearWeight wg_desc
+    let tensor<u8, [F, PD]> wg_w
+    let tensor<bf16, [F, GD]> wg_s
+    let tensor<bf16, [F, GD]> wg_b
+    let lw_mod.LinearWeight wu_desc
+    let tensor<u8, [F, PD]> wu_w
+    let tensor<bf16, [F, GD]> wu_s
+    let tensor<bf16, [F, GD]> wu_b
+    let lw_mod.LinearWeight wd_desc
+    let tensor<u8, [D, PF]> wd_w
+    let tensor<bf16, [D, GF]> wd_s
+    let tensor<bf16, [D, GF]> wd_b
+}
+
+# Quantized GroupAffineU8 + BF16 scales/biases ExpertBank MoE weights (Flint layers 2..48).
+@ public
+class FlintGaU8Bf16MoeFfnWeights<size D, size E, size FE, size PD, size GD, size PFE, size GFE, size FS> {
+    let eb.ExpertBank bank
+    let eb.BankedMatrixSpec gate_spec
+    let eb.BankedMatrixSpec up_spec
+    let eb.BankedMatrixSpec down_spec
+    let tensor<f32, [D]> fnorm
+    let tensor<f32, [E, D]> router
+    let tensor<u8, [E, FE, PD]> wg_w
+    let tensor<bf16, [E, FE, GD]> wg_s
+    let tensor<bf16, [E, FE, GD]> wg_b
+    let tensor<u8, [E, FE, PD]> wu_w
+    let tensor<bf16, [E, FE, GD]> wu_s
+    let tensor<bf16, [E, FE, GD]> wu_b
+    let tensor<u8, [E, D, PFE]> wd_w
+    let tensor<bf16, [E, D, GFE]> wd_s
+    let tensor<bf16, [E, D, GFE]> wd_b
+    let bool has_shared
+    let tensor<f32, [FS, D]> shared_wg
+    let tensor<f32, [FS, D]> shared_wu
+    let tensor<f32, [D, FS]> shared_wd
+    let bool has_shared_gate
+    let tensor<f32, [1, D]> shared_gate_w
+    let bool use_sigmoid_routing = true
+}
+
+# Quantized GGML Q4_K full-attention weights for Qwen3.6 (`2*QD` interleaved Q+gate).
+@ public
+class Qwen36Q4KFullAttnWeights<size D, size TwoQD, size QD, size KVD, size DH, size RowBytesD, size RowBytesQD> {
+    let tensor<f32, [D]> anorm
+    let lw_mod.LinearWeight wq_desc
+    let tensor<u8, [TwoQD, RowBytesD]> wq_blocks
+    let lw_mod.LinearWeight wk_desc
+    let tensor<u8, [KVD, RowBytesD]> wk_blocks
+    let lw_mod.LinearWeight wv_desc
+    let tensor<u8, [KVD, RowBytesD]> wv_blocks
+    let lw_mod.LinearWeight wo_desc
+    let tensor<u8, [D, RowBytesQD]> wo_blocks
+    let bool has_qk_norm
+    let tensor<f32, [DH]> q_norm
+    let tensor<f32, [DH]> k_norm
+}
+
+# Quantized GGML Q4_K ExpertBank MoE weights for Qwen3.6 (routed + shared expert + gate).
+@ public
+class Qwen36Q4KMoeFfnWeights<size D, size E, size FE, size RowBytesD, size RowBytesFE, size FS> {
+    let eb.ExpertBank bank
+    let eb.BankedMatrixSpec gate_spec
+    let eb.BankedMatrixSpec up_spec
+    let eb.BankedMatrixSpec down_spec
+    let tensor<f32, [D]> fnorm
+    let tensor<f32, [E, D]> router
+    let tensor<u8, [E, FE, RowBytesD]> wg_blocks
+    let tensor<u8, [E, FE, RowBytesD]> wu_blocks
+    let tensor<u8, [E, D, RowBytesFE]> wd_blocks
+    let bool has_shared
+    let tensor<f32, [FS, D]> shared_wg
+    let tensor<f32, [FS, D]> shared_wu
+    let tensor<f32, [D, FS]> shared_wd
+    let bool has_shared_gate
+    let tensor<f32, [1, D]> shared_gate_w
+    let bool use_sigmoid_routing = false
+}
+
+fn rope_kind_for_step(model_schedule.RopeKind rk, dt.RopeKind default_std) → dt.RopeKind {
+    match rk {
+        case model_schedule.RopeKind.None {
+            return variant dt.RopeKind.None
+        }
+        default {
+            return default_std
+        }
+    }
+}
+
+# Schedule-driven Flint INT4 (`GroupAffineU8` + `BF16` scales/biases) layer step over
+# `ExecutionStep`, `SessionState` (`RingKv(513)` / `FullKv`), `LinearWeight`, `ExpertBank`,
+# and `res.StandardCarrier`.
+@ public
+fn flint_layer_step_ga_u8_bf16<size D, size QD, size KVD, size DH, size H, size KVH, size PD, size GD, size PQD, size GQD, size C, size W, size F, size PF, size GF, size E, size K, size FE, size PFE, size GFE, size FS>(model_schedule.ExecutionStep step, tensor<f32, [D]> hin, mut tensor<f32, [D]> hout, FlintGaU8Bf16AttnWeights<D, QD, KVD, DH, H, PD, GD, PQD, GQD> aw, FlintAttnParams ap, mut sess_mod.SessionState<C, W, KVD> sess, i32 pos, FlintGaU8Bf16DenseFfnWeights<D, F, PD, GD, PF, GF> dfw, FlintGaU8Bf16MoeFfnWeights<D, E, FE, PD, GD, PFE, GFE, FS> mfw, mut tensor<f32, [KVH]> k_inv, mut tensor<i32, [K]> top_idx) → void ⇥ HybridError {
+    mut tensor<f32, [D]> xn ← tf32[D] {}
+    mut tensor<f32, [QD]> q ← tf32[QD] {}
+    mut tensor<f32, [KVD]> k ← tf32[KVD] {}
+    mut tensor<f32, [KVD]> v ← tf32[KVD] {}
+    stages.norm_rmsnorm<size D>(hin, aw.anorm, mut xn, ap.eps)
+    stages.linear_project_group_affine_u8_bf16<size QD, size PD, size GD, size D>(aw.wq_desc, aw.wq_w, aw.wq_s, aw.wq_b, xn, mut q)
+    stages.linear_project_group_affine_u8_bf16<size KVD, size PD, size GD, size D>(aw.wk_desc, aw.wk_w, aw.wk_s, aw.wk_b, xn, mut k)
+    stages.linear_project_group_affine_u8_bf16<size KVD, size PD, size GD, size D>(aw.wv_desc, aw.wv_w, aw.wv_s, aw.wv_b, xn, mut v)
+
+    mut tensor<f32, [QD]> qn ← tf32[QD] {}
+    mut tensor<f32, [KVD]> kn ← tf32[KVD] {}
+    mut tensor<f32, [H]> q_inv ← tf32[H] {}
+    stages.norm_qk_heads<size H, size KVH, size QD, size KVD, size DH>(q, k, aw.q_norm, aw.k_norm, mut qn, mut kn, mut q_inv, mut k_inv, aw.has_qk_norm, ap.eps)
+
+    mut tensor<f32, [QD]> qr ← tf32[QD] {}
+    mut tensor<f32, [KVD]> kr ← tf32[KVD] {}
+    mut tensor<f32, [QD]> ctx ← tf32[QD] {}
+    let dt.RopeKind rk ← rope_kind_for_step(step.rope, ap.rope)
+    stages.attn_rope_and_session<size QD, size KVD, size H, size C, size W>(qn, kn, v, mut qr, mut kr, rk, pos, ap.span, ap.lntheta, ap.group, ap.dh, ap.scale, aw.has_sink, aw.softmax_sink, mut sess, step.slot_id, mut ctx)
+
+    mut tensor<f32, [D]> ao ← tf32[D] {}
+    mut tensor<f32, [D]> h1 ← tf32[D] {}
+    stages.linear_project_group_affine_u8_bf16<size D, size PQD, size GQD, size QD>(aw.wo_desc, aw.wo_w, aw.wo_s, aw.wo_b, ctx, mut ao)
+    do device {
+        ds.residual_add(hin, ao, mut h1)
+    }
+
+    match step.ffn {
+        case model_schedule.FfnKind.Dense {
+            stages.dense_ffn_ga_u8_bf16_stage<size D, size F, size PD, size GD, size PF, size GF>(h1, mut hout, dfw.fnorm, dfw.wg_desc, dfw.wg_w, dfw.wg_s, dfw.wg_b, dfw.wu_desc, dfw.wu_w, dfw.wu_s, dfw.wu_b, dfw.wd_desc, dfw.wd_w, dfw.wd_s, dfw.wd_b, ap.eps)
+        }
+        case model_schedule.FfnKind.MoE {
+            stages.moe_expert_bank_ga_u8_bf16_ffn_stage<size D, size E, size K, size FE, size PD, size GD, size PFE, size GFE, size FS>(mfw.bank, mfw.gate_spec, mfw.up_spec, mfw.down_spec, h1, mut hout, mfw.fnorm, mfw.router, mfw.wg_w, mfw.wg_s, mfw.wg_b, mfw.wu_w, mfw.wu_s, mfw.wu_b, mfw.wd_w, mfw.wd_s, mfw.wd_b, mfw.has_shared, mfw.shared_wg, mfw.shared_wu, mfw.shared_wd, mfw.has_shared_gate, mfw.shared_gate_w, mut top_idx, ap.eps, mfw.use_sigmoid_routing)
+        }
+    }
+}
+
+# Batched (B = 1, B = k, B = C prefill) Flint layer step over SessionState.
+@ public
+fn flint_layer_batch_step<size B, size BH, size D, size QD, size KVD, size DH, size H, size KVH, size C, size W, size F, size E, size EF, size ED, size K, size BK, size FE, size FS>(tensor<f32, [B, D]> hin, mut tensor<f32, [B, D]> hout, FlintAttnWeights<D, QD, KVD, DH, H> aw, FlintAttnParams ap, mut sess_mod.SessionState<C, W, KVD> sess, int slot_id, i32 pos, bool is_dense, DenseFfnWeights<D, F> dfw, MoeFfnWeights<D, E, EF, ED, FE, FS> mfw, tensor<f32, [BH]> bhdom1d, mut tensor<f32, [B, KVH]> k_inv, mut tensor<f32, [BK, FE]> expert_act, mut tensor<i32, [B, K]> top_idx, i32 active_b) → void ⇥ sess_mod.SessionError {
+    mut tensor<f32, [B, D]> xn ← tf32[B, D] {}
+    mut tensor<f32, [B, QD]> q ← tf32[B, QD] {}
+    mut tensor<f32, [B, KVD]> k ← tf32[B, KVD] {}
+    mut tensor<f32, [B, KVD]> v ← tf32[B, KVD] {}
+    let i32 dlen ← D ↦ i32 ⊥ 1
+    let bool full_batch ← (active_b ↦ int) ≡ B
+
+    do device {
+        ds.rmsnorm_batch(hin, aw.anorm, mut xn, ap.eps)
+        if full_batch {
+            ds.qkv_proj_batch_gemm(aw.wq, aw.wk, aw.wv, xn, mut q, mut k, mut v)
+        }
+        else {
+            ds.matmul_nt_batch(aw.wq, xn, mut q, active_b, dlen)
+            ds.matmul_nt_batch(aw.wk, xn, mut k, active_b, dlen)
+            ds.matmul_nt_batch(aw.wv, xn, mut v, active_b, dlen)
+        }
+    }
+
+    mut tensor<f32, [B, QD]> qn ← tf32[B, QD] {}
+    mut tensor<f32, [B, KVD]> kn ← tf32[B, KVD] {}
+    mut tensor<f32, [B, H]> q_inv ← tf32[B, H] {}
+    stages.norm_qk_heads_batch<size B, size H, size KVH, size QD, size KVD, size DH>(q, k, aw.q_norm, aw.k_norm, mut qn, mut kn, mut q_inv, mut k_inv, aw.has_qk_norm, ap.eps, active_b)
+
+    mut tensor<f32, [B, QD]> qr ← tf32[B, QD] {}
+    mut tensor<f32, [B, KVD]> kr ← tf32[B, KVD] {}
+    do device {
+        match ap.rope {
+            case dt.RopeKind.None {
+                qr ⇇ qn
+                kr ⇇ kn
+            }
+            case dt.RopeKind.Half {
+                ds.rope_half_batch(qn, mut qr, pos, ap.span, ap.lntheta, active_b)
+                ds.rope_half_batch(kn, mut kr, pos, ap.span, ap.lntheta, active_b)
+            }
+            case dt.RopeKind.Pairs {
+                ds.rope_pairs_batch(qn, mut qr, pos, ap.span, ap.lntheta, active_b)
+                ds.rope_pairs_batch(kn, mut kr, pos, ap.span, ap.lntheta, active_b)
+            }
+        }
+    }
+
+    mut tensor<f32, [B, QD]> ctx ← tf32[B, QD] {}
+    stages.attn_session_batch<size B, size BH, size QD, size KVD, size H, size C, size W>(qr, kr, v, pos, ap.group, ap.dh, ap.scale, aw.has_sink, aw.softmax_sink, bhdom1d, mut sess, slot_id, mut ctx, active_b)
+
+    mut tensor<f32, [B, D]> ao ← tf32[B, D] {}
+    mut tensor<f32, [B, D]> h1 ← tf32[B, D] {}
+    let i32 qdlen ← QD ↦ i32 ⊥ 1
+    do device {
+        if full_batch {
+            ds.matmul_nt_gemm(aw.wo, ctx, mut ao)
+        }
+        else {
+            ds.matmul_nt_batch(aw.wo, ctx, mut ao, active_b, qdlen)
+        }
+        ds.residual_add_batch(hin, ao, mut h1, active_b)
+    }
+
+    if is_dense {
+        stages.dense_ffn_batch_stage<size B, size D, size F>(h1, mut hout, dfw.fnorm, dfw.wg, dfw.wu, dfw.wd, ap.eps, active_b)
+    }
+    else {
+        stages.moe_ffn_batch_stage<size B, size D, size E, size EF, size ED, size K, size BK, size FE, size FS>(h1, mut hout, mfw.fnorm, mfw.router, mfw.wg, mfw.wu, mfw.wd, mfw.has_shared, mfw.shared_wg, mfw.shared_wu, mfw.shared_wd, mfw.has_shared_gate, mfw.shared_gate_w, mut top_idx, mut expert_act, ap.eps, mfw.use_sigmoid_routing, active_b)
+    }
+}
+
+# Schedule-driven Qwen3.6 F32 layer step over HybridSession + ExpertBank.
+@ public
+fn qwen36_hybrid_layer_step<size C, size W, size KVD, size D, size ConvCh, size RecRows, size VH, size K_conv, size RecCols, size ConvRows, size TwoQD, size QD, size DH, size H, size E, size EF, size ED, size TopK, size FE, size FS>(model_schedule.ExecutionStep step, tensor<f32, [D]> hin, mut tensor<f32, [D]> hout, Qwen36FullAttnWeights<D, TwoQD, QD, KVD, DH, H> faw, FlintAttnParams ap, tensor<i32, [4]> sections, LinearAttnWeights<D, ConvCh, RecRows, VH, K_conv, RecCols> law, LinearAttnParams lp, eb.ExpertBank bank, tensor<f32, [D]> fnorm, tensor<f32, [E, D]> router, tensor<f32, [EF, D]> wg, tensor<f32, [EF, D]> wu, tensor<f32, [ED, FE]> wd, bool has_shared, tensor<f32, [FS, D]> shared_wg, tensor<f32, [FS, D]> shared_wu, tensor<f32, [D, FS]> shared_wd, bool has_shared_gate, tensor<f32, [1, D]> shared_gate_w, mut hybrid.HybridSession<C, W, KVD, ConvRows, ConvCh, RecRows, RecCols> hs, i32 pos, mut tensor<i32, [TopK]> top_idx) → void ⇥ HybridError {
+    mut tensor<f32, [D]> h1 ← tf32[D] {}
+    let model_schedule.ArenaKind kind ← sess_mod.slot_kind(hs.kv, step.slot_id)
+
+    match kind {
+        case model_schedule.ArenaKind.RecurrentSsm {
+            stages.deltanet_hybrid_stage(hin, mut h1, law.anorm, law.wqkv, law.wgate, law.conv_w, law.dt_bias, law.a_row, law.wbeta, law.walpha, law.ssm_norm, law.wout, lp.group_heads, lp.key_dim, lp.eps, lp.site_idx, lp.history_len, mut hs, step.slot_id)
+        }
+        case model_schedule.ArenaKind.FullKv {
+            qwen36_full_attn_step(hin, mut h1, faw, ap, sections, mut hs.kv, step.slot_id, pos)
+        }
+        default {
+            throw variant SessionFailure { message = "qwen36_hybrid_layer_step requires RecurrentSsm or FullKv slot", inner = variant sess_mod.SessionError.SlotArenaMismatch { message = "unsupported slot arena for Qwen3.6 layer" } }
+        }
+    }
+
+    stages.moe_expert_bank_ffn_stage<size D, size E, size EF, size ED, size TopK, size FE, size FS>(bank, h1, mut hout, fnorm, router, wg, wu, wd, has_shared, shared_wg, shared_wu, shared_wd, has_shared_gate, shared_gate_w, mut top_idx, ap.eps, false)
+}
+
+# Schedule-driven Qwen3.6 quantized GGML Q4_K layer step over HybridSession, LinearWeight,
+# and ExpertBank (routed Q4_K + shared expert + sigmoid shared gate).
+@ public
+fn qwen36_layer_step_q4_k<size C, size W, size KVD, size D, size ConvCh, size RecRows, size VH, size K_conv, size RecCols, size ConvRows, size TwoQD, size QD, size DH, size H, size KVH, size RowBytesD, size RowBytesQD, size RowBytesFE, size E, size TopK, size FE, size FS>(model_schedule.ExecutionStep step, tensor<f32, [D]> hin, mut tensor<f32, [D]> hout, Qwen36Q4KFullAttnWeights<D, TwoQD, QD, KVD, DH, RowBytesD, RowBytesQD> faw, FlintAttnParams ap, tensor<i32, [4]> sections, LinearAttnWeights<D, ConvCh, RecRows, VH, K_conv, RecCols> law, LinearAttnParams lp, Qwen36Q4KMoeFfnWeights<D, E, FE, RowBytesD, RowBytesFE, FS> mfw, mut hybrid.HybridSession<C, W, KVD, ConvRows, ConvCh, RecRows, RecCols> hs, i32 pos, mut tensor<f32, [KVH]> k_inv, mut tensor<i32, [TopK]> top_idx) → void ⇥ HybridError {
+    mut tensor<f32, [D]> h1 ← tf32[D] {}
+    let model_schedule.ArenaKind kind ← sess_mod.slot_kind(hs.kv, step.slot_id)
+
+    match kind {
+        case model_schedule.ArenaKind.RecurrentSsm {
+            stages.deltanet_hybrid_stage(hin, mut h1, law.anorm, law.wqkv, law.wgate, law.conv_w, law.dt_bias, law.a_row, law.wbeta, law.walpha, law.ssm_norm, law.wout, lp.group_heads, lp.key_dim, lp.eps, lp.site_idx, lp.history_len, mut hs, step.slot_id)
+        }
+        case model_schedule.ArenaKind.FullKv {
+            mut tensor<f32, [D]> xn ← tf32[D] {}
+            mut tensor<f32, [TwoQD]> q_full ← tf32[TwoQD] {}
+            mut tensor<f32, [QD]> q ← tf32[QD] {}
+            mut tensor<f32, [QD]> q_gate ← tf32[QD] {}
+            mut tensor<f32, [KVD]> k ← tf32[KVD] {}
+            mut tensor<f32, [KVD]> v ← tf32[KVD] {}
+            stages.norm_rmsnorm<size D>(hin, faw.anorm, mut xn, ap.eps)
+            stages.linear_project_ggml_q4_k<size TwoQD, size RowBytesD, size D>(faw.wq_desc, faw.wq_blocks, xn, mut q_full)
+            stages.linear_project_ggml_q4_k<size KVD, size RowBytesD, size D>(faw.wk_desc, faw.wk_blocks, xn, mut k)
+            stages.linear_project_ggml_q4_k<size KVD, size RowBytesD, size D>(faw.wv_desc, faw.wv_blocks, xn, mut v)
+            do device {
+                dhk.split_q_gate_interleaved(q_full, mut q, mut q_gate, ap.dh)
+            }
+            mut tensor<f32, [QD]> qn ← tf32[QD] {}
+            mut tensor<f32, [KVD]> kn ← tf32[KVD] {}
+            mut tensor<f32, [H]> q_inv ← tf32[H] {}
+            stages.norm_qk_heads<size H, size KVH, size QD, size KVD, size DH>(q, k, faw.q_norm, faw.k_norm, mut qn, mut kn, mut q_inv, mut k_inv, faw.has_qk_norm, ap.eps)
+            mut tensor<f32, [QD]> qr ← tf32[QD] {}
+            mut tensor<f32, [KVD]> kr ← tf32[KVD] {}
+            mut tensor<f32, [QD]> ctx ← tf32[QD] {}
+            stages.attn_sectional_and_session<size QD, size KVD, size H, size C, size W>(qn, kn, v, mut qr, mut kr, pos, ap.dh, sections, ap.lntheta, ap.group, ap.scale, mut hs.kv, step.slot_id, mut ctx)
+            mut tensor<f32, [QD]> gated_ctx ← tf32[QD] {}
+            mut tensor<f32, [D]> ao ← tf32[D] {}
+            do device {
+                dhk.sigmoid_mul(ctx, q_gate, mut gated_ctx)
+            }
+            stages.linear_project_ggml_q4_k<size D, size RowBytesQD, size QD>(faw.wo_desc, faw.wo_blocks, gated_ctx, mut ao)
+            do device {
+                ds.residual_add(hin, ao, mut h1)
+            }
+        }
+        default {
+            throw variant SessionFailure { message = "qwen36_layer_step_q4_k requires RecurrentSsm or FullKv slot", inner = variant sess_mod.SessionError.SlotArenaMismatch { message = "unsupported slot arena for Qwen3.6 layer" } }
+        }
+    }
+
+    stages.moe_expert_bank_ggml_q4_k_shared_ffn_stage<size D, size E, size TopK, size FE, size RowBytesD, size RowBytesFE, size FS>(mfw.bank, mfw.gate_spec, mfw.up_spec, mfw.down_spec, h1, mut hout, mfw.fnorm, mfw.router, mfw.wg_blocks, mfw.wu_blocks, mfw.wd_blocks, mfw.has_shared, mfw.shared_wg, mfw.shared_wu, mfw.shared_wd, mfw.has_shared_gate, mfw.shared_gate_w, mut top_idx, ap.eps, mfw.use_sigmoid_routing)
+}
+
+# Batched (B = 1, B = k, B = C prefill) Qwen3.6 full-attention + MoE layer step over SessionState.
+@ public
+fn qwen36_full_layer_batch_step<size B, size BH, size D, size TwoQD, size QD, size KVD, size DH, size H, size KVH, size C, size W, size E, size EF, size ED, size K, size BK, size FE, size FS>(tensor<f32, [B, D]> hin, mut tensor<f32, [B, D]> hout, Qwen36FullAttnWeights<D, TwoQD, QD, KVD, DH, H> aw, FlintAttnParams ap, tensor<i32, [4]> sections, mut sess_mod.SessionState<C, W, KVD> sess, int slot_id, i32 pos, MoeFfnWeights<D, E, EF, ED, FE, FS> mfw, tensor<f32, [BH]> bhdom1d, mut tensor<f32, [B, KVH]> k_inv, mut tensor<f32, [BK, FE]> expert_act, mut tensor<i32, [B, K]> top_idx, i32 active_b) → void ⇥ sess_mod.SessionError {
+    mut tensor<f32, [B, D]> xn ← tf32[B, D] {}
+    mut tensor<f32, [B, TwoQD]> q_full ← tf32[B, TwoQD] {}
+    mut tensor<f32, [B, QD]> q ← tf32[B, QD] {}
+    mut tensor<f32, [B, QD]> q_gate ← tf32[B, QD] {}
+    mut tensor<f32, [B, KVD]> k ← tf32[B, KVD] {}
+    mut tensor<f32, [B, KVD]> v ← tf32[B, KVD] {}
+    let i32 dlen ← D ↦ i32 ⊥ 1
+    let bool full_batch ← (active_b ↦ int) ≡ B
+
+    do device {
+        ds.rmsnorm_batch(hin, aw.anorm, mut xn, ap.eps)
+        if full_batch {
+            ds.matmul_nt_gemm(aw.wq, xn, mut q_full)
+            ds.matmul_nt_gemm(aw.wk, xn, mut k)
+            ds.matmul_nt_gemm(aw.wv, xn, mut v)
+        }
+        else {
+            ds.matmul_nt_batch(aw.wq, xn, mut q_full, active_b, dlen)
+            ds.matmul_nt_batch(aw.wk, xn, mut k, active_b, dlen)
+            ds.matmul_nt_batch(aw.wv, xn, mut v, active_b, dlen)
+        }
+        dhk.split_q_gate_interleaved_batch(q_full, mut q, mut q_gate, ap.dh, active_b)
+    }
+
+    mut tensor<f32, [B, QD]> qn ← tf32[B, QD] {}
+    mut tensor<f32, [B, KVD]> kn ← tf32[B, KVD] {}
+    mut tensor<f32, [B, H]> q_inv ← tf32[B, H] {}
+    stages.norm_qk_heads_batch<size B, size H, size KVH, size QD, size KVD, size DH>(q, k, aw.q_norm, aw.k_norm, mut qn, mut kn, mut q_inv, mut k_inv, aw.has_qk_norm, ap.eps, active_b)
+
+    mut tensor<f32, [B, QD]> qr ← tf32[B, QD] {}
+    mut tensor<f32, [B, KVD]> kr ← tf32[B, KVD] {}
+    do device {
+        dhk.rope_sectional_batch(qn, mut qr, pos, ap.dh, sections, ap.lntheta, active_b)
+        dhk.rope_sectional_batch(kn, mut kr, pos, ap.dh, sections, ap.lntheta, active_b)
+    }
+
+    mut tensor<f32, [B, QD]> ctx ← tf32[B, QD] {}
+    let tensor<f32, [H]> no_sink ← tf32[H] {}
+    stages.attn_session_batch<size B, size BH, size QD, size KVD, size H, size C, size W>(qr, kr, v, pos, ap.group, ap.dh, ap.scale, false, no_sink, bhdom1d, mut sess, slot_id, mut ctx, active_b)
+
+    mut tensor<f32, [B, QD]> gated_ctx ← tf32[B, QD] {}
+    mut tensor<f32, [B, D]> ao ← tf32[B, D] {}
+    mut tensor<f32, [B, D]> h1 ← tf32[B, D] {}
+    let i32 qdlen ← QD ↦ i32 ⊥ 1
+    do device {
+        dhk.sigmoid_mul_batch(ctx, q_gate, mut gated_ctx, active_b)
+        if full_batch {
+            ds.matmul_nt_gemm(aw.wo, gated_ctx, mut ao)
+        }
+        else {
+            ds.matmul_nt_batch(aw.wo, gated_ctx, mut ao, active_b, qdlen)
+        }
+        ds.residual_add_batch(hin, ao, mut h1, active_b)
+    }
+
+    stages.moe_ffn_batch_stage<size B, size D, size E, size EF, size ED, size K, size BK, size FE, size FS>(h1, mut hout, mfw.fnorm, mfw.router, mfw.wg, mfw.wu, mfw.wd, mfw.has_shared, mfw.shared_wg, mfw.shared_wu, mfw.shared_wd, mfw.has_shared_gate, mfw.shared_gate_w, mut top_idx, mut expert_act, ap.eps, mfw.use_sigmoid_routing, active_b)
 }
 
 +++ faber test
@@ -429,7 +845,7 @@ test "decode_hybrid flint_layer_step supports leading dense FFN and routed+share
         let dh.MoeFfnWeights<2, 2, 4, 4, 2, 2> mfw ← dh.MoeFfnWeights<2, 2, 4, 4, 2, 2> {
             fnorm = ones2, router = router, wg = e_wg, wu = e_wu, wd = e_wd,
             has_shared = true, shared_wg = df_wg, shared_wu = df_wu, shared_wd = df_wd,
-            has_shared_gate = true, shared_gate_w = sgw
+            has_shared_gate = true, shared_gate_w = sgw, use_sigmoid_routing = true
         }
 
         mut tensor<f32, [2]> out_dense ← tf32[2] {}

@@ -1,0 +1,347 @@
++++ toml
+locale = "en"
+
++++ faber test
+import from "gradus:decode_hybrid" let dh
+import from "gradus:decode_stages" let stages
+import from "gradus:decode_token" let dt
+import from "gradus:cache/session" let sess_mod
+import from "gradus:cache/hybrid_arenas" let hybrid
+import from "gradus:model/config" let cfg
+import from "gradus:model/schedule" let model_schedule
+import from "gradus:model/linear_weight" let lw_mod
+import from "gradus:model/expert_bank" let eb
+import from "gradus:model/residual" let res
+
+fn append_q4k_block(mut list<u8> dst, int d_lo, int d_hi, int m_lo, int m_hi, int scale_seed, int q_seed) → void {
+    dst.append((d_lo % 256) ↦ u8 ⊥ (0 ∷ u8))
+    dst.append((d_hi % 256) ↦ u8 ⊥ (0 ∷ u8))
+    dst.append((m_lo % 256) ↦ u8 ⊥ (0 ∷ u8))
+    dst.append((m_hi % 256) ↦ u8 ⊥ (0 ∷ u8))
+    for exclusive 12 let sb_idx {
+        dst.append(((sb_idx * 29 + scale_seed) % 256) ↦ u8 ⊥ (0 ∷ u8))
+    }
+    for exclusive 128 let qb_idx {
+        dst.append(((qb_idx * 19 + q_seed) % 256) ↦ u8 ⊥ (0 ∷ u8))
+    }
+}
+
+fn must_sched(string json) → model_schedule.ExecutionSchedule {
+    mut list<cfg.ModelConfig> mcs ← empty
+    do {
+        mcs.append(cfg.parse_json(json))
+    }
+    catch err {
+        assert false
+    }
+    assert mcs.length() ≡ 1
+    do {
+        return model_schedule.from_model_config(mcs[0], empty)
+    }
+    catch err {
+        assert false
+    }
+    return model_schedule.ExecutionSchedule { layers = [], segments = [], steps = [], slots = [], residual = variant model_schedule.ResidualKind.Standard, taps = [] }
+}
+
+test "decode_hybrid_test end-to-end Flint INT4 GroupAffineU8Bf16 schedule-driven dense + sigmoid MoE" {
+    let string flint_json ← «{"model_type": "flint", "hidden_size": 4, "num_hidden_layers": 2, "num_attention_heads": 2, "num_key_value_heads": 2, "head_dim": 2, "intermediate_size": 4, "moe_intermediate_size": 4, "shared_expert_intermediate_size": 4, "vocab_size": 32, "sliding_window": 513, "layer_types": ["sliding_attention", "full_attention"], "mlp_only_layers": [0], "num_local_experts": 2, "num_experts_per_tok": 2}»
+    let model_schedule.ExecutionSchedule sched ← must_sched(flint_json)
+
+    let lw_mod.LinearWeight w_4x4 ← lw_mod.LinearWeight {
+        kind = variant lw_mod.LinearWeightKind.GroupAffineU8,
+        out_features = 4, in_features = 4, bits = 4, group_size = 4,
+        packed_cols = 2, group_cols = 1, has_bias = false, scales_dtype = "BF16"
+    }
+    mut tensor<u8, [4, 2]> w4_u8 ← tu8[4, 2] {}
+    mut tensor<bf16, [4, 1]> s4_bf ← tbf16[4, 1] {}
+    mut tensor<bf16, [4, 1]> b4_bf ← tbf16[4, 1] {}
+    for range 0‥4 let r {
+        w4_u8[[r, 0]] ← 0x11 ∷ u8
+        w4_u8[[r, 1]] ← 0x11 ∷ u8
+        s4_bf[[r, 0]] ← 1.0 ∷ bf16
+    }
+    mut tensor<f32, [4]> ones4 ← tf32[4] {}
+    for range 0‥4 let i {
+        ones4[[i]] ← 1.0
+    }
+    mut tensor<f32, [2]> ones2 ← tf32[2] {}
+    ones2[[0]] ← 1.0
+    ones2[[1]] ← 1.0
+    mut tensor<f32, [2]> sink ← tf32[2] {}
+
+    let dh.FlintGaU8Bf16AttnWeights<4, 4, 4, 2, 2, 2, 1, 2, 1> aw ← dh.FlintGaU8Bf16AttnWeights<4, 4, 4, 2, 2, 2, 1, 2, 1> {
+        anorm = ones4,
+        wq_desc = w_4x4, wq_w = w4_u8, wq_s = s4_bf, wq_b = b4_bf,
+        wk_desc = w_4x4, wk_w = w4_u8, wk_s = s4_bf, wk_b = b4_bf,
+        wv_desc = w_4x4, wv_w = w4_u8, wv_s = s4_bf, wv_b = b4_bf,
+        wo_desc = w_4x4, wo_w = w4_u8, wo_s = s4_bf, wo_b = b4_bf,
+        has_qk_norm = true, q_norm = ones2, k_norm = ones2,
+        has_sink = true, softmax_sink = sink
+    }
+    let dh.FlintAttnParams ap ← dh.FlintAttnParams {
+        dh = 2, span = 1, group = 1, rope = variant dt.RopeKind.Half,
+        eps = 0.00001, lntheta = 10.0, scale = 0.70710677
+    }
+    let dh.FlintGaU8Bf16DenseFfnWeights<4, 4, 2, 1, 2, 1> dfw ← dh.FlintGaU8Bf16DenseFfnWeights<4, 4, 2, 1, 2, 1> {
+        fnorm = ones4,
+        wg_desc = w_4x4, wg_w = w4_u8, wg_s = s4_bf, wg_b = b4_bf,
+        wu_desc = w_4x4, wu_w = w4_u8, wu_s = s4_bf, wu_b = b4_bf,
+        wd_desc = w_4x4, wd_w = w4_u8, wd_s = s4_bf, wd_b = b4_bf
+    }
+    let eb.BankedMatrixSpec sp ← eb.BankedMatrixSpec {
+        kind = variant eb.ExpertWeightKind.GroupAffineU8,
+        expert_count = 2, out_features = 4, in_features = 4,
+        bits = 4, group_size = 4, packed_cols = 2, group_cols = 1,
+        scales_dtype = "BF16"
+    }
+    let eb.ExpertBank bank ← eb.ExpertBank {
+        expert_count = 2, hidden_size = 4, intermediate_size = 4,
+        layout = variant eb.ExpertBankLayout.SplitGateUp { gate = sp, up = sp, down = sp },
+        has_router_bias = false, shared_expert_count = 2
+    }
+    mut tensor<f32, [2, 4]> router ← tf32[2, 4] {}
+    router[[1, 0]] ← 2.0
+    mut tensor<u8, [2, 4, 2]> ew ← tu8[2, 4, 2] {}
+    mut tensor<bf16, [2, 4, 1]> es ← tbf16[2, 4, 1] {}
+    mut tensor<bf16, [2, 4, 1]> ebi ← tbf16[2, 4, 1] {}
+    for range 0‥2 let e {
+        for range 0‥4 let r {
+            ew[[e, r, 0]] ← 0x11 ∷ u8
+            ew[[e, r, 1]] ← 0x11 ∷ u8
+            es[[e, r, 0]] ← 1.0 ∷ bf16
+        }
+    }
+    mut tensor<f32, [4, 4]> sw ← tf32[4, 4] {}
+    sw[[0, 0]] ← 0.5
+    mut tensor<f32, [1, 4]> sgw ← tf32[1, 4] {}
+    let dh.FlintGaU8Bf16MoeFfnWeights<4, 2, 4, 2, 1, 2, 1, 4> mfw ← dh.FlintGaU8Bf16MoeFfnWeights<4, 2, 4, 2, 1, 2, 1, 4> {
+        bank = bank, gate_spec = sp, up_spec = sp, down_spec = sp,
+        fnorm = ones4, router = router,
+        wg_w = ew, wg_s = es, wg_b = ebi,
+        wu_w = ew, wu_s = es, wu_b = ebi,
+        wd_w = ew, wd_s = es, wd_b = ebi,
+        has_shared = true, shared_wg = sw, shared_wu = sw, shared_wd = sw,
+        has_shared_gate = false, shared_gate_w = sgw, use_sigmoid_routing = true
+    }
+
+    mut list<model_schedule.ExecutionStep> steps ← empty
+    do {
+        steps.append(model_schedule.step_at(sched, 0))
+        steps.append(model_schedule.step_at(sched, 1))
+    }
+    catch err {
+        assert false
+    }
+    mut list<sess_mod.SessionState<8, 513, 4>> sess_box ← empty
+    do {
+        sess_box.append(sess_mod.from_schedule<size 8, size 513, size 4>(sched))
+    }
+    catch err {
+        assert false
+    }
+    mut list<res.StandardCarrier<size 1, size 4>> car_box ← empty
+    do {
+        car_box.append(res.init_standard<size 4>(ones4))
+    }
+    catch err {
+        assert false
+    }
+    mut sess_mod.SessionState<8, 513, 4> sess ← sess_box[0]
+    mut res.StandardCarrier<size 1, size 4> carrier ← car_box[0]
+    mut tensor<f32, [4]> h_mid ← tf32[4] {}
+    mut tensor<f32, [4]> h_out ← tf32[4] {}
+    mut tensor<f32, [2]> k_inv ← tf32[2] {}
+    mut tensor<i32, [2]> top_idx ← ti32[2] {}
+    let tensor<f32, [4]> h_step0 ← res.standard_hidden_1d<size 4>(carrier)
+    do {
+        dh.flint_layer_step_ga_u8_bf16<size 4, size 4, size 4, size 2, size 2, size 2, size 2, size 1, size 2, size 1, size 8, size 513, size 4, size 2, size 1, size 2, size 2, size 4, size 2, size 1, size 4>(steps[0], h_step0, mut h_mid, aw, ap, mut sess, 0, dfw, mfw, mut k_inv, mut top_idx)
+        dh.flint_layer_step_ga_u8_bf16<size 4, size 4, size 4, size 2, size 2, size 2, size 2, size 1, size 2, size 1, size 8, size 513, size 4, size 2, size 1, size 2, size 2, size 4, size 2, size 1, size 4>(steps[1], h_mid, mut h_out, aw, ap, mut sess, 0, dfw, mfw, mut k_inv, mut top_idx)
+    }
+    catch err {
+        assert false
+    }
+    do {
+        carrier ← res.init_standard<size 4>(h_out)
+    }
+    catch err {
+        assert false
+    }
+
+    assert sess.ring_kv.total_written[0] ≡ 1
+    assert sess.full_kv.lengths[0] ≡ 1
+    let tensor<f32, [4]> final_h ← res.standard_hidden_1d<size 4>(carrier)
+    assert final_h[[0]] ≻ 2.0
+}
+
+test "decode_hybrid_test end-to-end Qwen3.6 Q4_K + HybridSession + StandardCarrier schedule-driven layers" {
+    let string q36_json ← «{"model_type": "qwen35moe", "hidden_size": 256, "num_hidden_layers": 2, "num_attention_heads": 1, "num_key_value_heads": 1, "head_dim": 256, "intermediate_size": 256, "moe_intermediate_size": 256, "shared_expert_intermediate_size": 256, "vocab_size": 32, "full_attention_interval": 2, "rope_dimension_sections": [11, 11, 10, 0], "num_local_experts": 2, "num_experts_per_tok": 2}»
+    let model_schedule.ExecutionSchedule sched ← must_sched(q36_json)
+    assert model_schedule.recurrent_ssm_slot_count(sched) ≡ 1
+    assert model_schedule.full_kv_slot_count(sched) ≡ 1
+
+    mut tensor<f32, [256]> hin ← tf32[256] {}
+    mut tensor<f32, [256]> ones256 ← tf32[256] {}
+    for exclusive 256 let j {
+        hin[[j]] ← (((j % 5) - 2) ↦ f32) * 0.125 ∷ f32 + 0.0625 ∷ f32
+        ones256[[j]] ← 1.0
+    }
+
+    # Q4_K weights: D=256 (144 bytes/row), TwoQD=512, QD=256, KVD=256, E=2, FE=256
+    let lw_mod.LinearWeight lw_512 ← lw_mod.LinearWeight {
+        kind = variant lw_mod.LinearWeightKind.GgmlBlockQ4_K,
+        out_features = 512, in_features = 256, bits = 0, group_size = 0,
+        packed_cols = 0, group_cols = 0, has_bias = false
+    }
+    let lw_mod.LinearWeight lw_256 ← lw_mod.LinearWeight {
+        kind = variant lw_mod.LinearWeightKind.GgmlBlockQ4_K,
+        out_features = 256, in_features = 256, bits = 0, group_size = 0,
+        packed_cols = 0, group_cols = 0, has_bias = false
+    }
+    mut list<u8> q_bytes ← empty
+    mut tensor<u8, [512, 144]> wq_blocks ← tu8[512, 144] {}
+    mut list<u8> kv_bytes ← empty
+    mut tensor<u8, [256, 144]> wkv_blocks ← tu8[256, 144] {}
+    for exclusive 256 let r {
+        let int off ← kv_bytes.length()
+        append_q4k_block(mut kv_bytes, 0x00, 0x1c, 0x00, 0x18, r + 3, r + 7)
+        for exclusive 144 let bi {
+            wkv_blocks[[r, bi]] ← kv_bytes[off + bi]
+        }
+    }
+    for exclusive 512 let r {
+        let int off ← q_bytes.length()
+        append_q4k_block(mut q_bytes, 0x00, 0x1c, 0x00, 0x18, r + 5, r + 11)
+        for exclusive 144 let bi {
+            wq_blocks[[r, bi]] ← q_bytes[off + bi]
+        }
+    }
+    let dh.Qwen36Q4KFullAttnWeights<256, 512, 256, 256, 256, 144, 144> faw ← dh.Qwen36Q4KFullAttnWeights<256, 512, 256, 256, 256, 144, 144> {
+        anorm = ones256,
+        wq_desc = lw_512, wq_blocks = wq_blocks,
+        wk_desc = lw_256, wk_blocks = wkv_blocks,
+        wv_desc = lw_256, wv_blocks = wkv_blocks,
+        wo_desc = lw_256, wo_blocks = wkv_blocks,
+        has_qk_norm = true, q_norm = ones256, k_norm = ones256
+    }
+    let dh.FlintAttnParams ap ← dh.FlintAttnParams {
+        dh = 256, span = 32, group = 1, rope = variant dt.RopeKind.Half,
+        eps = 0.00001, lntheta = 10.0, scale = 0.0625
+    }
+    mut tensor<i32, [4]> sections ← ti32[4] {}
+    sections[[0]] ← 11
+    sections[[1]] ← 11
+    sections[[2]] ← 10
+    sections[[3]] ← 0
+
+    # Linear-attn weights (D=256, ConvCh=768, RecRows=256, VH=256, K=4, RecCols=1)
+    mut tensor<f32, [768, 256]> wqkv ← tf32[768, 256] {}
+    mut tensor<f32, [256, 256]> eye256 ← tf32[256, 256] {}
+    mut tensor<f32, [768, 4]> conv_w ← tf32[768, 4] {}
+    for exclusive 256 let i {
+        eye256[[i, i]] ← 1.0
+        wqkv[[i, i]] ← 1.0
+        wqkv[[256 + i, i]] ← 1.0
+        wqkv[[512 + i, i]] ← 1.0
+        conv_w[[i, 3]] ← 1.0
+        conv_w[[256 + i, 3]] ← 1.0
+        conv_w[[512 + i, 3]] ← 1.0
+    }
+    mut tensor<f32, [256]> dt_bias ← tf32[256] {}
+    mut tensor<f32, [256]> a_row ← tf32[256] {}
+    for exclusive 256 let i {
+        a_row[[i]] ← -1.0
+    }
+    mut tensor<f32, [256, 256]> wba ← tf32[256, 256] {}
+    mut tensor<f32, [1]> ssm_norm ← tf32[1] {}
+    ssm_norm[[0]] ← 1.0
+    let dh.LinearAttnWeights<256, 768, 256, 256, 4, 1> law ← dh.LinearAttnWeights<256, 768, 256, 256, 4, 1> {
+        anorm = ones256, wqkv = wqkv, wgate = eye256, conv_w = conv_w,
+        dt_bias = dt_bias, a_row = a_row, wbeta = wba, walpha = wba,
+        ssm_norm = ssm_norm, wout = eye256
+    }
+    let dh.LinearAttnParams lp ← dh.LinearAttnParams {
+        group_heads = 256, key_dim = 1, eps = 0.00001, site_idx = 0, history_len = 3
+    }
+
+    let eb.BankedMatrixSpec sp ← eb.BankedMatrixSpec {
+        kind = variant eb.ExpertWeightKind.GgmlBlockQ4_K,
+        expert_count = 2, out_features = 256, in_features = 256,
+        bits = 4, group_size = 32, packed_cols = 0, group_cols = 0
+    }
+    let eb.ExpertBank bank ← eb.ExpertBank {
+        expert_count = 2, hidden_size = 256, intermediate_size = 256,
+        layout = variant eb.ExpertBankLayout.SplitGateUp { gate = sp, up = sp, down = sp },
+        has_router_bias = false, shared_expert_count = 1
+    }
+    mut tensor<u8, [2, 256, 144]> e_blocks ← tu8[2, 256, 144] {}
+    for exclusive 2 let e {
+        for exclusive 256 let r {
+            for exclusive 144 let bi {
+                e_blocks[[e, r, bi]] ← wkv_blocks[[r, bi]]
+            }
+        }
+    }
+    mut tensor<f32, [2, 256]> router ← tf32[2, 256] {}
+    router[[1, 0]] ← 2.0
+    mut tensor<f32, [256, 256]> sw ← tf32[256, 256] {}
+    sw[[0, 0]] ← 0.5
+    mut tensor<f32, [1, 256]> sgw ← tf32[1, 256] {}
+    sgw[[0, 0]] ← 1.0
+    let dh.Qwen36Q4KMoeFfnWeights<256, 2, 256, 144, 144, 256> mfw ← dh.Qwen36Q4KMoeFfnWeights<256, 2, 256, 144, 144, 256> {
+        bank = bank, gate_spec = sp, up_spec = sp, down_spec = sp,
+        fnorm = ones256, router = router,
+        wg_blocks = e_blocks, wu_blocks = e_blocks, wd_blocks = e_blocks,
+        has_shared = true, shared_wg = sw, shared_wu = sw, shared_wd = sw,
+        has_shared_gate = true, shared_gate_w = sgw, use_sigmoid_routing = false
+    }
+
+    mut list<model_schedule.ExecutionStep> steps ← empty
+    do {
+        steps.append(model_schedule.step_at(sched, 0))
+        steps.append(model_schedule.step_at(sched, 1))
+    }
+    catch err {
+        assert false
+    }
+    mut list<hybrid.HybridSession<4, 1, 256, 3, 768, 256, 1>> hs_box ← empty
+    do {
+        hs_box.append(hybrid.from_schedule<size 4, size 1, size 256, size 3, size 768, size 256, size 1>(sched, 1, 3, false))
+    }
+    catch err {
+        assert false
+    }
+    mut list<res.StandardCarrier<size 1, size 256>> car_box ← empty
+    do {
+        car_box.append(res.init_standard<size 256>(hin))
+    }
+    catch err {
+        assert false
+    }
+    mut hybrid.HybridSession<4, 1, 256, 3, 768, 256, 1> hs ← hs_box[0]
+    mut res.StandardCarrier<size 1, size 256> carrier ← car_box[0]
+    mut tensor<f32, [256]> h_mid ← tf32[256] {}
+    mut tensor<f32, [256]> h_out ← tf32[256] {}
+    mut tensor<f32, [1]> k_inv ← tf32[1] {}
+    mut tensor<i32, [2]> top_idx ← ti32[2] {}
+    let tensor<f32, [256]> h_step0 ← res.standard_hidden_1d<size 256>(carrier)
+    do {
+        dh.qwen36_layer_step_q4_k<size 4, size 1, size 256, size 256, size 768, size 256, size 256, size 4, size 1, size 3, size 512, size 256, size 256, size 1, size 1, size 144, size 144, size 144, size 2, size 2, size 256, size 256>(steps[0], h_step0, mut h_mid, faw, ap, sections, law, lp, mfw, mut hs, 0, mut k_inv, mut top_idx)
+        dh.qwen36_layer_step_q4_k<size 4, size 1, size 256, size 256, size 768, size 256, size 256, size 4, size 1, size 3, size 512, size 256, size 256, size 1, size 1, size 144, size 144, size 144, size 2, size 2, size 256, size 256>(steps[1], h_mid, mut h_out, faw, ap, sections, law, lp, mfw, mut hs, 0, mut k_inv, mut top_idx)
+    }
+    catch err {
+        assert false
+    }
+    do {
+        carrier ← res.init_standard<size 256>(h_out)
+    }
+    catch err {
+        assert false
+    }
+
+    assert hs.conv.steps_written[0] ≡ 1
+    assert hs.recurrent.steps_written[0] ≡ 1
+    assert hs.kv.full_kv.lengths[0] ≡ 1
+    let tensor<f32, [256]> final_h ← res.standard_hidden_1d<size 256>(carrier)
+    assert final_h[[0]] ≡ final_h[[0]]
+}
