@@ -12,6 +12,7 @@ import from "gradus:model/schedule" let model_schedule
 import from "gradus:model/linear_weight" let lw_mod
 import from "gradus:model/expert_bank" let eb
 import from "gradus:model/residual" let res
+import from "gradus:model/dequant" let dq
 
 fn append_q4k_block(mut list<u8> dst, int d_lo, int d_hi, int m_lo, int m_hi, int scale_seed, int q_seed) → void {
     dst.append((d_lo % 256) ↦ u8 ⊥ (0 ∷ u8))
@@ -343,5 +344,77 @@ test "decode_hybrid_test end-to-end Qwen3.6 Q4_K + HybridSession + StandardCarri
     assert hs.recurrent.steps_written[0] ≡ 1
     assert hs.kv.full_kv.lengths[0] ≡ 1
     let tensor<f32, [256]> final_h ← res.standard_hidden_1d<size 256>(carrier)
-    assert final_h[[0]] ≡ final_h[[0]]
+
+    # F32 reference path over dequantized Q4_K weights via qwen36_hybrid_layer_step
+    let _ q4k_rep ← dq.representation_for(12)
+    mut tensor<f32, [512, 256]> wq_f32 ← tf32[512, 256] {}
+    mut tensor<f32, [256, 256]> wkv_f32 ← tf32[256, 256] {}
+    mut tensor<f32, [512, 256]> ew_f32 ← tf32[512, 256] {}
+    do {
+        for exclusive 512 let r {
+            mut list<u8> blk ← empty
+            for exclusive 144 let bi {
+                blk.append(wq_blocks[[r, bi]])
+            }
+            let list<f32> row_vals ← dq.decode_block_u8(q4k_rep, blk)
+            for exclusive 256 let c {
+                wq_f32[[r, c]] ← row_vals[c]
+            }
+        }
+        for exclusive 256 let r {
+            mut list<u8> blk ← empty
+            for exclusive 144 let bi {
+                blk.append(wkv_blocks[[r, bi]])
+            }
+            let list<f32> row_vals ← dq.decode_block_u8(q4k_rep, blk)
+            for exclusive 256 let c {
+                let f32 val ← row_vals[c]
+                wkv_f32[[r, c]] ← val
+                ew_f32[[r, c]] ← val
+                ew_f32[[256 + r, c]] ← val
+            }
+        }
+    }
+    catch err {
+        assert false
+    }
+
+    let dh.Qwen36FullAttnWeights<256, 512, 256, 256, 256, 1> faw_ref ← dh.Qwen36FullAttnWeights<256, 512, 256, 256, 256, 1> {
+        anorm = ones256, wq = wq_f32, wk = wkv_f32, wv = wkv_f32, wo = wkv_f32,
+        has_qk_norm = true, q_norm = ones256, k_norm = ones256
+    }
+    let eb.BankedMatrixSpec sp_f32 ← eb.BankedMatrixSpec {
+        kind = variant eb.ExpertWeightKind.DenseF32,
+        expert_count = 2, out_features = 256, in_features = 256,
+        bits = 0, group_size = 0, packed_cols = 0, group_cols = 0
+    }
+    let eb.ExpertBank bank_f32 ← eb.ExpertBank {
+        expert_count = 2, hidden_size = 256, intermediate_size = 256,
+        layout = variant eb.ExpertBankLayout.SplitGateUp { gate = sp_f32, up = sp_f32, down = sp_f32 },
+        has_router_bias = false, shared_expert_count = 1
+    }
+    mut tensor<f32, [256]> h_mid_ref ← tf32[256] {}
+    mut tensor<f32, [256]> h_out_ref ← tf32[256] {}
+    mut tensor<i32, [2]> top_idx_ref ← ti32[2] {}
+    mut list<hybrid.HybridSession<4, 1, 256, 3, 768, 256, 1>> hs_ref_box ← empty
+    do {
+        hs_ref_box.append(hybrid.from_schedule<size 4, size 1, size 256, size 3, size 768, size 256, size 1>(sched, 1, 3, false))
+    }
+    catch err {
+        assert false
+    }
+    mut hybrid.HybridSession<4, 1, 256, 3, 768, 256, 1> hs_ref ← hs_ref_box[0]
+    do {
+        dh.qwen36_hybrid_layer_step<size 4, size 1, size 256, size 256, size 768, size 256, size 256, size 4, size 1, size 3, size 512, size 256, size 256, size 1, size 2, size 512, size 512, size 2, size 256, size 256>(steps[0], h_step0, mut h_mid_ref, faw_ref, ap, sections, law, lp, bank_f32, ones256, router, ew_f32, ew_f32, ew_f32, true, sw, sw, sw, true, sgw, mut hs_ref, 0, mut top_idx_ref)
+        dh.qwen36_hybrid_layer_step<size 4, size 1, size 256, size 256, size 768, size 256, size 256, size 4, size 1, size 3, size 512, size 256, size 256, size 1, size 2, size 512, size 512, size 2, size 256, size 256>(steps[1], h_mid_ref, mut h_out_ref, faw_ref, ap, sections, law, lp, bank_f32, ones256, router, ew_f32, ew_f32, ew_f32, true, sw, sw, sw, true, sgw, mut hs_ref, 0, mut top_idx_ref)
+    }
+    catch err {
+        assert false
+    }
+
+    assert (final_h[[0]] - h_step0[[0]]).abs() ≻ (0.0001 ∷ f32)
+    for exclusive 256 let j {
+        let f32 tol ← (0.0001 ∷ f32) * h_out_ref[[j]].abs() + (0.001 ∷ f32)
+        assert (final_h[[j]] - h_out_ref[[j]]).abs() ≺ tol
+    }
 }
