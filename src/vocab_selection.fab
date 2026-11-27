@@ -1,0 +1,651 @@
++++ toml
+locale = "en"
+
++++ faber
+# On-device vocabulary selection with bounded readback (gradus #27, GPU G05).
+#
+# Public import: import from "gradus:vocab_selection" vs
+# Depends on: gradus:decode_step, gradus:dtype, gradus:random, gradus:sampling.
+#
+# Composes device-side logit preparation (repetition penalty + EOG mask),
+# greedy `argmax_token` (4-byte readback), chunked `topm_chunks` candidate
+# extraction (at most `P * M` pairs read back, e.g. 256 * 16 = 4096), an
+# exactness gate proving whether omitted tokens can affect the filtered
+# distribution, and full-logits fallback to `sampling.sample` only when the
+# chunk window is not exact.
+#
+# Oracle: `gradus:sampling` (`sampling.sample` and `sampling.sample_candidates`)
+# retains the authoritative sampling pipeline order, first-index tie rules,
+# and `Seed` RNG advancement.
+
+import from "gradus:decode_step" let ds
+
+import from "gradus:dtype"
+
+import from "gradus:random"
+
+import from "gradus:sampling"
+
+# Default chunk count and per-chunk candidate depth (256 * 16 = 4096 pairs).
+@ public
+const int DEFAULT_CHUNKS = 256
+
+@ public
+const int DEFAULT_TOP_M = 16
+
+# Finite negative logit used to suppress EOG tokens under IgnoreEos while
+# keeping logits within the sampler's finite-value gate.
+@ public
+const f32 EOG_MASK_LOGIT = (-1000000000.0) ∷ f32
+
+# Exact f32 underflow threshold: exp(-104.0) == 0.0 in IEEE-754 binary32.
+const f32 EXP_ZERO_THRESHOLD = (-104.0) ∷ f32
+
+# Result of on-device vocabulary selection, including explicit readback
+# counters and exactness/fallback flags so callers and tests can verify the
+# bounded transfer contract.
+@ public
+class SelectionResult {
+    mut int token_id
+    mut random.Seed seed
+    mut int readback_floats
+    mut int readback_ints
+    mut bool exact
+    mut bool used_fallback
+}
+
+# Pre-selection device pass: applies repetition penalty over `history[0..active_h)`
+# (matching `sampling.repetition_penalty` order, including repeated history ids)
+# and masks `eog_ids[0..active_e)` to `EOG_MASK_LOGIT` without touching the host.
+@ public
+kernel prepare_logits<size V, size H, size E>(tensor<f32, [V]> logits, tensor<i32, [H]> history, tensor<i32, [E]> eog_ids, mut tensor<f32, [V]> output, f32 penalty, i32 active_h, i32 active_e) → void {
+    for from logits at [idx] thread lane let raw {
+        mut f32 w ← raw
+
+        if active_h ≻ 0 and penalty ≇ 1.0 {
+            for exclusive H let hi {
+                if hi ≺ active_h and history[[hi]] ≡ idx {
+                    if w ≻ 0.0 {
+                        w ← w / penalty
+                    }
+                    else {
+                        w ← w * penalty
+                    }
+                }
+            }
+        }
+
+        if active_e ≻ 0 {
+            for exclusive E let ei {
+                if ei ≺ active_e and eog_ids[[ei]] ≡ idx {
+                    w ← -1000000000.0
+                }
+            }
+        }
+
+        output[[idx]] ← w
+    }
+}
+
+# Validate history indices against [0, vocab) on host before device launch.
+fn require_history_range(list<int> history, int vocab) → void ⇥ sampling.SamplingError {
+    for from history let t {
+        require t ≥ 0 and t ≺ vocab throw variant sampling.SamplingError.InvalidHistory { message = "history token out of vocabulary range" }
+    }
+}
+
+# Copy a list of token ids into a rank-1 i32 tensor of static capacity `Cap`.
+fn fill_id_tensor<size Cap>(list<int> ids, int count) → tensor<i32, [Cap]> {
+    mut tensor<i32, [Cap]> out ← tensor<i32, [Cap]> {}
+
+    for exclusive count let i {
+        out[[i]] ← ids[i] ↦ i32 ⊥ 0
+    }
+
+    return out
+}
+
+# Read back the full logit row only on the fallback path.
+fn read_full_logits<size V>(tensor<f32, [V]> logits) → list<f32> {
+    mut list<f32> out ← empty
+
+    for exclusive V let i {
+        out.append(logits[[i]])
+    }
+
+    return out
+}
+
+class CandidatePair {
+    mut int id
+    mut f32 val
+}
+
+# Sort candidate pairs by descending value, breaking ties to the lowest id.
+fn sort_candidates_desc(mut list<CandidatePair> pairs) → void {
+    let int n ← pairs.length()
+
+    for range 1 ‥ n let i {
+        let CandidatePair key ← pairs[i]
+        mut int j ← i - 1
+
+        while j ≥ 0 {
+            let CandidatePair cur ← pairs[j]
+            let bool after ← cur.val ≺ key.val or (cur.val ≡ key.val and cur.id ≻ key.id)
+
+            if after {
+                pairs[j + 1] ← cur
+                j ← j - 1
+            }
+            else {
+                break
+            }
+        }
+
+        pairs[j + 1] ← key
+    }
+}
+
+# Sort candidate pairs by ascending vocabulary id (required by `sampling.sample_candidates`).
+fn sort_candidates_asc_id(mut list<CandidatePair> pairs) → void {
+    let int n ← pairs.length()
+
+    for range 1 ‥ n let i {
+        let CandidatePair key ← pairs[i]
+        mut int j ← i - 1
+
+        while j ≥ 0 and pairs[j].id ≻ key.id {
+            pairs[j + 1] ← pairs[j]
+            j ← j - 1
+        }
+
+        pairs[j + 1] ← key
+    }
+}
+
+class ChunkBounds {
+    mut bool has_truncated
+    mut bool has_drop_bound
+    mut f32 drop_max_v
+    mut int drop_best_i
+    mut bool has_missing_chunk
+    mut f32 global_max
+    mut bool has_max
+}
+
+class ChunkScan {
+    mut list<CandidatePair> pairs
+    mut bool exact
+}
+
+fn evaluate_exactness(list<CandidatePair> pairs, ChunkBounds bounds, sampling.Config cfg, int vocab) → bool {
+    if bounds.has_missing_chunk or not bounds.has_max then return false
+
+    if not bounds.has_truncated then return true
+
+    if not bounds.has_drop_bound then return false
+
+    if cfg.top_k ≻ 0 and cfg.top_k ≺ vocab {
+        if pairs.length() ≺ cfg.top_k then return false
+
+        mut list<CandidatePair> ranked ← copy pairs
+        sort_candidates_desc(mut ranked)
+        let CandidatePair kth ← ranked[cfg.top_k - 1]
+        return kth.val ≻ bounds.drop_max_v or (kth.val ≡ bounds.drop_max_v and kth.id ≺ bounds.drop_best_i)
+    }
+
+    # Without top_k, omitted tokens still contribute to full-vocab softmax
+    # unless exp((drop_max_v - global_max) / temperature) underflows to 0.0.
+    let f32 scaled_gap ← (bounds.drop_max_v - bounds.global_max) / cfg.temperature
+    return scaled_gap ≤ EXP_ZERO_THRESHOLD
+}
+
+fn scan_chunk_candidates<size P, size M>(tensor<f32, [P, M]> tmval, tensor<i32, [P, M]> tmidx, int vocab, int chunk, sampling.Config cfg) → ChunkScan ⇥ sampling.SamplingError {
+    mut list<CandidatePair> pairs ← empty
+    mut ChunkBounds bounds ← ChunkBounds {
+        has_truncated = false,
+        has_drop_bound = false,
+        drop_max_v = 0.0 ∷ f32,
+        drop_best_i = 0,
+        has_missing_chunk = false,
+        global_max = 0.0 ∷ f32,
+        has_max = false
+    }
+
+    for exclusive P let p {
+        let int start ← p * chunk
+        mut int stop ← start + chunk
+
+        if stop ≻ vocab {
+            stop ← vocab
+        }
+
+        let int chunk_len ← start ≺ stop ✓ stop - start ✗ 0
+        mut int first_idx ← -1
+
+        for exclusive M let m {
+            let f32 v ← tmval[[p, m]]
+            let i32 raw_idx ← tmidx[[p, m]]
+            let int idx ← raw_idx ↦ int
+
+            if m ≡ 0 {
+                first_idx ← idx
+            }
+
+            if idx ≥ 0 {
+                require dtype.finite(v) throw variant sampling.SamplingError.InvalidLogits { message = "logits must be finite" }
+
+                pairs.append(CandidatePair { id = idx, val = v })
+
+                if not bounds.has_max or v ≻ bounds.global_max {
+                    bounds.global_max ← v
+                    bounds.has_max ← true
+                }
+            }
+        }
+
+        if chunk_len ≻ 0 and first_idx ≺ 0 {
+            bounds.has_missing_chunk ← true
+        }
+
+        if chunk_len ≻ M {
+            bounds.has_truncated ← true
+            let i32 raw_tail_idx ← tmidx[[p, M - 1]]
+            let int tail_idx ← raw_tail_idx ↦ int
+            let f32 tail_val ← tmval[[p, M - 1]]
+
+            if tail_idx ≥ 0 {
+                if not bounds.has_drop_bound or tail_val ≻ bounds.drop_max_v or (tail_val ≡ bounds.drop_max_v and tail_idx ≺ bounds.drop_best_i) {
+                    bounds.drop_max_v ← tail_val
+                    bounds.drop_best_i ← tail_idx
+                    bounds.has_drop_bound ← true
+                }
+            }
+            else {
+                bounds.has_missing_chunk ← true
+            }
+        }
+    }
+
+    return ChunkScan { pairs = pairs, exact = evaluate_exactness(pairs, bounds, cfg, vocab) }
+}
+
+fn fallback_host_sample<size V>(tensor<f32, [V]> logits, sampling.Config cfg, list<int> history, random.Seed seed, list<int> eog_ids, bool apply_eog, bool greedy, int extra_floats, int extra_ints) → SelectionResult ⇥ sampling.SamplingError {
+    mut list<f32> full ← read_full_logits(logits)
+
+    if apply_eog {
+        for from eog_ids let eid {
+            if eid ≥ 0 and eid ≺ V {
+                full[eid] ← EOG_MASK_LOGIT
+            }
+        }
+    }
+
+    let list<int> hist_arg ← greedy ✓ empty ✗ history
+    let sampling.Sampler r ← sampling.sample(full, cfg, hist_arg, seed)
+    return SelectionResult { token_id = r.token_id, seed = r.seed, readback_floats = extra_floats + V, readback_ints = extra_ints, exact = false, used_fallback = true }
+}
+
+fn dispatch_topm<size P, size V, size M>(tensor<f32, [P]> dom, tensor<f32, [V]> logits, mut tensor<f32, [P, M]> tmval, mut tensor<i32, [P, M]> tmidx, i32 chunk_i32) → void {
+    ds.topm_chunks(dom, logits, mut tmval, mut tmidx, chunk_i32)
+}
+
+fn dispatch_argmax<size V>(tensor<f32, [V]> logits) → int {
+    mut tensor<i32, [1]> id_out ← tensor<i32, [1]> {}
+    ds.argmax_token(logits, mut id_out)
+    return id_out[0] ↦ int
+}
+
+fn sample_exact_candidates(list<CandidatePair> pairs, sampling.Config cfg, random.Seed seed, int readback_count) → SelectionResult ⇥ sampling.SamplingError {
+    mut list<CandidatePair> asc ← copy pairs
+    sort_candidates_asc_id(mut asc)
+    mut list<f32> vals ← empty
+    mut list<int> ids ← empty
+
+    for from asc let pair {
+        vals.append(pair.val)
+        ids.append(pair.id)
+    }
+
+    let sampling.Sampler r ← sampling.sample_candidates(vals, ids, cfg, empty, seed)
+    return SelectionResult { token_id = r.token_id, seed = r.seed, readback_floats = readback_count, readback_ints = readback_count, exact = true, used_fallback = false }
+}
+
+# Core selection driver parameterized on caller-supplied chunk scratch buffers
+# so `P`, `V`, and `M` are inferred directly from tensor arguments.
+@ public
+fn select_with_buffers<size P, size V, size M>(tensor<f32, [V]> logits, sampling.Config cfg, list<int> history, random.Seed seed, list<int> eog_ids, bool suppress_eog, tensor<f32, [P]> dom, mut tensor<f32, [P, M]> tmval, mut tensor<i32, [P, M]> tmidx) → SelectionResult ⇥ sampling.SamplingError {
+    require V ≥ 1 throw variant sampling.SamplingError.InvalidLogits { message = "logits must be non-empty" }
+    require P ≥ 1 and P ≤ 16384 throw variant sampling.SamplingError.InvalidConfig { message = "chunk count out of range" }
+    require M ≥ 1 and M ≤ 1023 throw variant sampling.SamplingError.InvalidConfig { message = "top-M depth out of range" }
+
+    let bool greedy ← cfg.temperature ≤ 0.0
+    let bool apply_penalty ← not greedy and history.length() ≻ 0 and cfg.repetition_penalty ≇ (1.0 ∷ f32)
+    let bool apply_eog ← suppress_eog and eog_ids.length() ≻ 0
+
+    if not greedy {
+        require_history_range(history, V)
+    }
+
+    mut tensor<f32, [V]> work ← tf32[V] {}
+    mut bool using_work ← false
+
+    if apply_penalty or apply_eog {
+        let int nh ← apply_penalty ✓ history.length() ✗ 0
+        let int ne ← apply_eog ✓ eog_ids.length() ✗ 0
+
+        if nh ≤ 4096 and ne ≤ 64 {
+            let tensor<i32, [4096]> h_buf ← fill_id_tensor<size 4096>(history, nh)
+            let tensor<i32, [64]> e_buf ← fill_id_tensor<size 64>(eog_ids, ne)
+            prepare_logits(logits, h_buf, e_buf, mut work, cfg.repetition_penalty, nh ↦ i32 ⊥ 0, ne ↦ i32 ⊥ 0)
+            using_work ← true
+        }
+        else {
+            return fallback_host_sample(logits, cfg, history, seed, eog_ids, apply_eog, greedy, 0, 0)
+        }
+    }
+
+    if greedy {
+        let int picked ← using_work ✓ dispatch_argmax(work) ✗ dispatch_argmax(logits)
+        return SelectionResult { token_id = picked, seed = seed, readback_floats = 0, readback_ints = 1, exact = true, used_fallback = false }
+    }
+
+    let int chunk ← (V + P - 1) / P
+    let i32 chunk_i32 ← chunk ↦ i32 ⊥ 1
+
+    if using_work {
+        dispatch_topm(dom, work, mut tmval, mut tmidx, chunk_i32)
+    }
+    else {
+        dispatch_topm(dom, logits, mut tmval, mut tmidx, chunk_i32)
+    }
+
+    let ChunkScan scan ← scan_chunk_candidates(tmval, tmidx, V, chunk, cfg)
+
+    if scan.exact {
+        return sample_exact_candidates(scan.pairs, cfg, seed, P * M)
+    }
+
+    # Exactness gate refused the window: fall back to full logits on host.
+    let tensor<f32, [V]> src ← using_work ✓ work ✗ logits
+    return fallback_host_sample(src, cfg, empty, seed, empty, false, false, P * M, P * M)
+}
+
+# On-device vocabulary selection with explicit chunk geometry `<V, P, M>`.
+#   * Greedy (`cfg.temperature <= 0.0`): uses `ds.argmax_token`, reading back
+#     only 1 `i32` (0 floats, 1 int).
+#   * Sampled (`cfg.temperature > 0.0`): uses `ds.topm_chunks`, reading back
+#     `P * M` pairs; runs `sampling.sample_candidates` when exact, and falls
+#     back to full-logits `sampling.sample` only when `port_exact` fails.
+@ public
+fn select_chunked<size V, size P, size M>(tensor<f32, [V]> logits, sampling.Config cfg, list<int> history, random.Seed seed, list<int> eog_ids, bool suppress_eog) → SelectionResult ⇥ sampling.SamplingError {
+    let tensor<f32, [P]> dom ← tf32[P] {}
+    mut tensor<f32, [P, M]> tmval ← tf32[P, M] {}
+    mut tensor<i32, [P, M]> tmidx ← tensor<i32, [P, M]> {}
+    return select_with_buffers(logits, cfg, history, seed, eog_ids, suppress_eog, dom, mut tmval, mut tmidx)
+}
+
+# Default bounded-readback vocabulary selection (`P = 256`, `M = 16`, max
+# 4096 sampled candidates or 1 greedy index).
+@ public
+fn select<size V>(tensor<f32, [V]> logits, sampling.Config cfg, list<int> history, random.Seed seed, list<int> eog_ids, bool suppress_eog) → SelectionResult ⇥ sampling.SamplingError {
+    let tensor<f32, [256]> dom ← tf32[256] {}
+    mut tensor<f32, [256, 16]> tmval ← tf32[256, 16] {}
+    mut tensor<i32, [256, 16]> tmidx ← tensor<i32, [256, 16]> {}
+    return select_with_buffers(logits, cfg, history, seed, eog_ids, suppress_eog, dom, mut tmval, mut tmidx)
+}
+
++++ faber test
+# Co-located proofs for on-device vocabulary selection (gradus #27, GPU G05).
+
+import from "gradus:vocab_selection" let vs
+
+import from "gradus:random" random
+
+import from "gradus:sampling" sampling
+
+fn cfg(f32 τ, int k, f32 p, f32 mp, f32 rep) → sampling.Config {
+    return sampling.construct_config(τ, k, p, mp, rep) ⊥ sampling.default_config()
+}
+
+fn mk_seed(int s) → random.Seed {
+    return random.construct_seed(s) ⊥ random.default()
+}
+
+fn oracle_sample(list<f32> raw, sampling.Config c, list<int> hist, random.Seed s, list<int> eogs, bool suppress) → sampling.Sampler {
+    mut list<f32> masked ← copy raw
+
+    if suppress {
+        for from eogs let eid {
+            if eid ≥ 0 and eid ≺ masked.length() {
+                masked[eid] ← vs.EOG_MASK_LOGIT
+            }
+        }
+    }
+
+    let list<int> eff_hist ← c.temperature ≤ 0.0 ✓ empty ✗ hist
+    return sampling.sample(masked, c, eff_hist, s) ⊥ sampling.Sampler { token_id = -1, seed = s }
+}
+
+fn tensor_from_list<size V>(list<f32> xs) → tensor<f32, [V]> {
+    mut tensor<f32, [V]> t ← tf32[V] {}
+
+    for exclusive V let i {
+        t[[i]] ← xs[i]
+    }
+
+    return t
+}
+
+test "greedy selection reads back only 1 index and matches ties to lowest index" {
+    let list<f32> raw ← [1.5, 3.0, 3.0, -2.0, 0.5, 1.0, 2.0, 3.0]
+    let tensor<f32, [8]> t ← tensor_from_list<size 8>(raw)
+    let random.Seed s ← mk_seed(1234567890123456789)
+    let sampling.Config c ← cfg(0.0, 0, 0.0, 0.0, 1.5)
+
+    do {
+        let vs.SelectionResult res ← vs.select(t, c, [1], s, [1], false)
+        let sampling.Sampler ref ← oracle_sample(raw, c, [1], s, [1], false)
+        assert res.token_id ≡ 1
+        assert res.token_id ≡ ref.token_id
+        assert res.seed ≡ s
+        assert res.readback_floats ≡ 0
+        assert res.readback_ints ≡ 1
+        assert res.exact
+        assert not res.used_fallback
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "greedy selection with EOG suppression masks EOG on device and still reads 1 index" {
+    let list<f32> raw ← [1.0, 5.0, 4.0, 4.0, 0.5, -1.0, 2.0, 3.0]
+    let tensor<f32, [8]> t ← tensor_from_list<size 8>(raw)
+    let random.Seed s ← mk_seed(1234567890123456789)
+    let sampling.Config c ← cfg(0.0, 0, 0.0, 0.0, 1.0)
+
+    do {
+        let vs.SelectionResult res ← vs.select(t, c, empty, s, [1], true)
+        let sampling.Sampler ref ← oracle_sample(raw, c, empty, s, [1], true)
+        assert res.token_id ≡ 2
+        assert res.token_id ≡ ref.token_id
+        assert res.readback_floats ≡ 0
+        assert res.readback_ints ≡ 1
+        assert res.exact
+        assert not res.used_fallback
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "chunked sampled selection matches sampling.sample with temperature, top-k, top-p, min-p, rep penalty, and seed repeatability" {
+    # 32 logits with 4 chunks of 8 and M=2: top-4 values are distributed across chunks
+    # so the chunk window is exact and bounded readback applies.
+    mut list<f32> raw ← empty
+
+    for exclusive 32 let i {
+        raw.append(-5.0 ∷ f32)
+    }
+
+    raw[2] ← 2.4 ∷ f32
+    raw[10] ← 3.1 ∷ f32
+    raw[18] ← 2.8 ∷ f32
+    raw[25] ← 2.9 ∷ f32
+    raw[26] ← 2.9 ∷ f32
+
+    let tensor<f32, [32]> t ← tensor_from_list<size 32>(raw)
+    let sampling.Config c ← cfg(0.85, 4, 0.9, 0.15, 1.35)
+    let list<int> hist ← [10, 10, 2]
+    let list<int> eogs ← [25]
+    let random.Seed s ← mk_seed(5428186273191027194)
+
+    do {
+        let vs.SelectionResult r1 ← vs.select_chunked<size 32, size 4, size 2>(t, c, hist, s, eogs, true)
+        let vs.SelectionResult r2 ← vs.select_chunked<size 32, size 4, size 2>(t, c, hist, s, eogs, true)
+        let sampling.Sampler ref ← oracle_sample(raw, c, hist, s, eogs, true)
+        assert r1.token_id ≡ ref.token_id
+        assert r1.seed ≡ ref.seed
+        assert r2.token_id ≡ r1.token_id
+        assert r2.seed ≡ r1.seed
+        assert r1.readback_floats ≡ 8
+        assert r1.readback_ints ≡ 8
+        assert r1.exact
+        assert not r1.used_fallback
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "near-tie logits across chunks preserve exact first-index tie ordering and oracle match" {
+    mut list<f32> raw ← empty
+
+    for exclusive 32 let i {
+        raw.append(-10.0 ∷ f32)
+    }
+
+    raw[3] ← 2.0 ∷ f32
+    raw[11] ← 2.00001 ∷ f32
+    raw[19] ← 2.0 ∷ f32
+    raw[27] ← 1.99999 ∷ f32
+
+    let tensor<f32, [32]> t ← tensor_from_list<size 32>(raw)
+    let sampling.Config c ← cfg(0.7, 3, 0.8, 0.1, 1.0)
+    let random.Seed s ← mk_seed(730019052841267308)
+
+    do {
+        let vs.SelectionResult res ← vs.select_chunked<size 32, size 4, size 2>(t, c, empty, s, empty, false)
+        let sampling.Sampler ref ← oracle_sample(raw, c, empty, s, empty, false)
+        assert res.token_id ≡ ref.token_id
+        assert res.seed ≡ ref.seed
+        assert res.exact
+        assert not res.used_fallback
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "regression port_exact fallback: concentrated top-k inside one chunk triggers fallback and matches oracle" {
+    # All top-4 logits sit inside chunk 0 [0..8), while M=2 only extracts 2 per chunk.
+    # Exactness gate must detect drop_max_v (from chunk 0) > 4th best candidate and fall back.
+    mut list<f32> raw ← empty
+
+    for exclusive 32 let i {
+        raw.append(-4.0 ∷ f32)
+    }
+
+    raw[0] ← 5.0 ∷ f32
+    raw[1] ← 4.9 ∷ f32
+    raw[2] ← 4.8 ∷ f32
+    raw[3] ← 4.7 ∷ f32
+    raw[12] ← 1.0 ∷ f32
+    raw[20] ← 0.5 ∷ f32
+
+    let tensor<f32, [32]> t ← tensor_from_list<size 32>(raw)
+    let sampling.Config c ← cfg(1.0, 4, 0.95, 0.0, 1.0)
+    let random.Seed s ← mk_seed(1234567890123456789)
+
+    do {
+        let vs.SelectionResult res ← vs.select_chunked<size 32, size 4, size 2>(t, c, empty, s, empty, false)
+        let sampling.Sampler ref ← oracle_sample(raw, c, empty, s, empty, false)
+        assert res.token_id ≡ ref.token_id
+        assert res.seed ≡ ref.seed
+        assert not res.exact
+        assert res.used_fallback
+        assert res.readback_floats ≡ 8 + 32
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "regression S-7 full-logits fallback: top_k=0 with flat tail falls back and preserves rep penalty + EOG mask" {
+    # When top_k=0 and chunks truncate non-underflowing logits, omitted tail alters full softmax Z.
+    # Fallback must read full logits WITH device rep-penalty and EOG mask intact (never double-applying history).
+    mut list<f32> raw ← empty
+
+    for exclusive 32 let i {
+        raw.append(1.0 ∷ f32)
+    }
+
+    raw[4] ← 3.0 ∷ f32
+    raw[14] ← 2.5 ∷ f32
+
+    let tensor<f32, [32]> t ← tensor_from_list<size 32>(raw)
+    let sampling.Config c ← cfg(1.0, 0, 0.9, 0.05, 1.5)
+    let list<int> hist ← [4]
+    let list<int> eogs ← [14]
+    let random.Seed s ← mk_seed(5428186273191027194)
+
+    do {
+        let vs.SelectionResult res ← vs.select_chunked<size 32, size 4, size 2>(t, c, hist, s, eogs, true)
+        let sampling.Sampler ref ← oracle_sample(raw, c, hist, s, eogs, true)
+        assert res.token_id ≡ ref.token_id
+        assert res.seed ≡ ref.seed
+        assert not res.exact
+        assert res.used_fallback
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "large vocab (49152) bounds sampled readback to 4096 candidates and greedy to 1 int" {
+    mut list<f32> raw ← empty
+
+    for exclusive 49152 let i {
+        raw.append(-20.0 ∷ f32)
+    }
+
+    raw[100] ← 4.5 ∷ f32
+    raw[12000] ← 5.0 ∷ f32
+    raw[35000] ← 4.8 ∷ f32
+    raw[49000] ← 4.2 ∷ f32
+
+    let tensor<f32, [49152]> t ← tensor_from_list<size 49152>(raw)
+    let random.Seed s ← mk_seed(730019052841267308)
+
+    do {
+        let vs.SelectionResult greedy_res ← vs.select(t, cfg(0.0, 0, 0.0, 0.0, 1.0), empty, s, empty, false)
+        assert greedy_res.token_id ≡ 12000
+        assert greedy_res.readback_floats ≡ 0
+        assert greedy_res.readback_ints ≡ 1
+        assert greedy_res.exact
+
+        let sampling.Config c_samp ← cfg(0.8, 4, 0.9, 0.1, 1.2)
+        let vs.SelectionResult samp_res ← vs.select(t, c_samp, [12000], s, [35000], true)
+        let sampling.Sampler ref ← oracle_sample(raw, c_samp, [12000], s, [35000], true)
+        assert samp_res.token_id ≡ ref.token_id
+        assert samp_res.seed ≡ ref.seed
+        assert samp_res.readback_floats ≡ 4096
+        assert samp_res.readback_ints ≡ 4096
+        assert samp_res.exact
+        assert not samp_res.used_fallback
+    }
+    catch err {
+        assert false
+    }
+}
