@@ -2,15 +2,15 @@
 locale = "en"
 
 +++ faber
-# Gated DeltaNet linear-attention path (conv + recurrent).
+# Gated DeltaNet linear-attention path (conv + recurrent) over typed arenas.
 #
 # Public import: import from "gradus:model/qwen35moe_state/linear_attn" linear_attn
-# Depends on: schedule, session, qwen35moe, tensor.
+# Depends on: schedule, session, qwen35moe, gradus:cache/hybrid_arenas, gradus:dtype.
 
 import from "gradus:model/qwen35moe_state/schedule" let schedule
 import from "gradus:model/qwen35moe_state/session" let session
 import from "gradus:model/qwen35moe" let qwen35moe
-import from "gradus:tensor" let tensor
+import from "gradus:cache/hybrid_arenas" let hybrid
 import from "gradus:dtype" let dtype
 
 # -------------------------------------------------------------------------
@@ -45,62 +45,146 @@ class LinearAttentionTrace {
 class LinearAttentionOutcome {
     mut LinearAttentionTrace trace
     mut list<f32> out
-    mut session.ConvState conv
-    mut session.RecurrentState recurrent
 }
 
 # Load-time-prepared SSM layer weights (issue #79): every weight window is
-# read, shape-checked, and finiteness-validated once here — never per
+# read, length-checked, and finiteness-validated once here — never per
 # decode token. The lean prepared entry points below consume this record
 # and touch no weight source.
 @ public
 class LinearAttentionWeights {
-    mut tensor.NumericBlock attn_norm
-    mut tensor.NumericBlock wqkv
-    mut tensor.NumericBlock wgate
-    mut tensor.NumericBlock conv_weight
-    mut tensor.NumericBlock dt_bias
-    mut tensor.NumericBlock a_row
-    mut tensor.NumericBlock wbeta
-    mut tensor.NumericBlock walpha
-    mut tensor.NumericBlock ssm_norm
-    mut tensor.NumericBlock wout
+    mut list<f32> attn_norm
+    mut list<f32> wqkv
+    mut list<f32> wgate
+    mut list<f32> conv_weight
+    mut list<f32> dt_bias
+    mut list<f32> a_row
+    mut list<f32> wbeta
+    mut list<f32> walpha
+    mut list<f32> ssm_norm
+    mut list<f32> wout
 }
 
 # Read and validate the whole SSM layer weight set once. The window order
 # matches the traced entry point's read order, so the first diverging
 # window fails with the same diagnostic either way.
 @ public
-fn prepare_linear_attention((string, int, int) → tensor.NumericBlock ⇥ schedule.Qwen35moeStateError source, int layer, qwen35moe.Qwen35moeConfig c) → LinearAttentionWeights ⇥ schedule.Qwen35moeStateError {
+fn prepare_linear_attention((string, int, int) → list<f32> ⇥ schedule.Qwen35moeStateError source, int layer, qwen35moe.Qwen35moeConfig c) → LinearAttentionWeights ⇥ schedule.Qwen35moeStateError {
     require layer ≥ 0 throw variant BadConfig {message = "layer index must be non-negative"}
     let int embd ← c.embedding_length
     let int conv_channels ← c.inner_size + 2 * c.group_count * c.state_size
     let int value_heads ← c.gradus_temporis
     let int head_v_dim ← c.inner_size / value_heads
     let string p ← session.prefix(layer)
-    let tensor.NumericBlock attn_norm ← session.window(source, p + ".attn_norm", 0, embd, [embd])
-    let tensor.NumericBlock wqkv ← session.window(source, p + ".attn_qkv", 0, conv_channels * embd, [conv_channels, embd])
-    let tensor.NumericBlock wgate ← session.window(source, p + ".attn_gate", 0, c.inner_size * embd, [c.inner_size, embd])
-    let tensor.NumericBlock conv_weight ← session.window(source, p + ".ssm_conv1d", 0, c.conv_kernel * conv_channels, [conv_channels, c.conv_kernel])
-    let tensor.NumericBlock dt_bias ← session.window(source, p + ".ssm_dt", 0, value_heads, [value_heads])
-    let tensor.NumericBlock a_row ← session.window(source, p + ".ssm_a", 0, value_heads, [value_heads])
-    let tensor.NumericBlock wbeta ← session.window(source, p + ".ssm_beta", 0, value_heads * embd, [value_heads, embd])
-    let tensor.NumericBlock walpha ← session.window(source, p + ".ssm_alpha", 0, value_heads * embd, [value_heads, embd])
-    let tensor.NumericBlock ssm_norm ← session.window(source, p + ".ssm_norm", 0, head_v_dim, [head_v_dim])
-    let tensor.NumericBlock wout ← session.window(source, p + ".ssm_out", 0, embd * c.inner_size, [embd, c.inner_size])
+    let list<f32> attn_norm ← session.window(source, p + ".attn_norm", 0, embd)
+    let list<f32> wqkv ← session.window(source, p + ".attn_qkv", 0, conv_channels * embd)
+    let list<f32> wgate ← session.window(source, p + ".attn_gate", 0, c.inner_size * embd)
+    let list<f32> conv_weight ← session.window(source, p + ".ssm_conv1d", 0, c.conv_kernel * conv_channels)
+    let list<f32> dt_bias ← session.window(source, p + ".ssm_dt", 0, value_heads)
+    let list<f32> a_row ← session.window(source, p + ".ssm_a", 0, value_heads)
+    let list<f32> wbeta ← session.window(source, p + ".ssm_beta", 0, value_heads * embd)
+    let list<f32> walpha ← session.window(source, p + ".ssm_alpha", 0, value_heads * embd)
+    let list<f32> ssm_norm ← session.window(source, p + ".ssm_norm", 0, head_v_dim)
+    let list<f32> wout ← session.window(source, p + ".ssm_out", 0, embd * c.inner_size)
     return LinearAttentionWeights {attn_norm = attn_norm, wqkv = wqkv, wgate = wgate, conv_weight = conv_weight, dt_bias = dt_bias, a_row = a_row, wbeta = wbeta, walpha = walpha, ssm_norm = ssm_norm, wout = wout}
 }
 
+fn find_arena_slot(list<int> slot_ids, int slot_id, string label) → int ⇥ schedule.Qwen35moeStateError {
+    for exclusive slot_ids.length() let i {
+        if slot_ids[i] ≡ slot_id then return i
+    }
+    throw variant BadState {message = "§ slot_id § not found in arena"(label, slot_id ↦ string)}
+}
+
+# One head, one token: decay -> delta -> outer update -> output read, in
+# the comparator's exact stage order.
+fn delta_step(list<f32> span, list<f32> q, list<f32> k, list<f32> v, f32 decay, f32 beta, int dim) → tuple<updated: list<f32>, out: list<f32>> ⇥ schedule.Qwen35moeStateError {
+    mut list<f32> decayed ← empty
+    for from span let cell {
+        decayed.append(cell * decay)
+    }
+    let f32 scale ← 1.0 / (√ (dim ↦ f32))
+    mut list<f32> updated ← empty
+    mut list<f32> out ← empty
+    for range 0‥dim let j {
+        mut f32 sum ← 0.0
+        let int row ← j * dim
+        for range 0‥dim let i {
+            sum ← sum + (decayed.get(row + i) coalesce 0.0) * (k.get(i) coalesce 0.0)
+        }
+        let f32 d ← ((v.get(j) coalesce 0.0) - sum) * beta
+        mut f32 read ← 0.0
+        for range 0‥dim let i {
+            let f32 cell ← (decayed.get(row + i) coalesce 0.0) + (k.get(i) coalesce 0.0) * d
+            updated.append(cell)
+            read ← read + cell * (q.get(i) coalesce 0.0)
+        }
+        require dtype.finite(read) throw variant schedule.Qwen35moeStateError.NonFinite {message = "gated delta net output is non-finite"}
+        out.append(read * scale)
+    }
+    return tuple<updated: list<f32>, out: list<f32>> [updated, out]
+}
+
+# Advance one head of a RecurrentStateArena slot by one token.
+@ public
+fn delta_step_slot<size RecRows, size RecCols>(mut hybrid.RecurrentStateArena<size RecRows, size RecCols> arena, int slot_id, list<f32> q, list<f32> k, list<f32> v, f32 g, f32 beta, int head) → list<f32> ⇥ schedule.Qwen35moeStateError {
+    require arena.txn_depth ≡ 0 throw variant BadState {message = "recurrent arena has an open transaction"}
+    let int r_idx ← find_arena_slot(arena.slot_ids, slot_id, "recurrent")
+    let int dim ← RecCols
+    require dim ≥ 1 and RecRows % dim ≡ 0 throw variant BadShape {message = "recurrent arena shape must be [heads * dim, dim]"}
+    let int heads ← RecRows / dim
+    require head ≥ 0 and head ≺ heads throw variant BadState {message = "recurrent head index outside the state"}
+    require q.length() ≡ dim and k.length() ≡ dim and v.length() ≡ dim throw variant BadShape {message = "delta rule rows must match the state dim"}
+    mut tensor<f32, [RecRows, RecCols]> state ← arena.states[r_idx]
+    let int row_base ← head * dim
+    mut list<f32> head_cells ← empty
+    for range 0‥dim let j {
+        for range 0‥dim let i {
+            head_cells.append(state[[row_base + j, i]])
+        }
+    }
+    let tuple<updated: list<f32>, out: list<f32>> step ← delta_step(head_cells, q, k, v, g.exp(), beta, dim)
+    let list<f32> advanced ← step.updated
+    for range 0‥dim let j {
+        for range 0‥dim let i {
+            state[[row_base + j, i]] ← advanced[j * dim + i]
+        }
+    }
+    arena.states[r_idx] ← state
+    arena.steps_written[r_idx] ← arena.steps_written[r_idx] + 1
+    return step.out
+}
+
+# Read one head of a RecurrentStateArena slot against a query row (no update).
+@ public
+fn recurrent_readout_slot<size RecRows, size RecCols>(hybrid.RecurrentStateArena<size RecRows, size RecCols> arena, int slot_id, list<f32> q, int head) → list<f32> ⇥ schedule.Qwen35moeStateError {
+    let int r_idx ← find_arena_slot(arena.slot_ids, slot_id, "recurrent")
+    let int dim ← RecCols
+    require dim ≥ 1 and RecRows % dim ≡ 0 throw variant BadShape {message = "recurrent arena shape must be [heads * dim, dim]"}
+    let int heads ← RecRows / dim
+    require head ≥ 0 and head ≺ heads throw variant BadState {message = "recurrent head index outside the state"}
+    require q.length() ≡ dim throw variant BadShape {message = "query row must match the state dim"}
+    let tensor<f32, [RecRows, RecCols]> state ← arena.states[r_idx]
+    let f32 scale ← 1.0 / (√ (dim ↦ f32))
+    let int row_base ← head * dim
+    mut list<f32> out ← empty
+    for range 0‥dim let j {
+        mut f32 sum ← 0.0 ∷ f32
+        for range 0‥dim let i {
+            sum ← sum + state[[row_base + j, i]] * (q.get(i) coalesce 0.0 ∷ f32)
+        }
+        out.append(sum * scale)
+    }
+    return out
+}
+
 # Run one SSM layer over T input rows [T][2048]: attn_norm -> qkv/z/beta/
-# alpha/gate projections -> causal depthwise conv (state-carried) -> L2
-# norms + head repeat -> the delta recurrence per head per token -> z-gated
-# RMSNorm -> output projection -> residual add. The recurrence order (heads
-# outer, tokens inner, per head sequential) mirrors the comparator's fused
-# kernel; batching over tokens and feeding tokens one at a time produce the
-# same values (F5), and the returned states are the terminal state family.
-# `capture` gates only the diagnostic trace record: the compute path and
-# every float operation are identical either way (issue #79).
-fn linear_attention_core(list<f32> x_rows, session.ConvState conv_in, session.RecurrentState recurrent_in, LinearAttentionWeights weights, qwen35moe.Qwen35moeConfig c, bool capture) → LinearAttentionOutcome ⇥ schedule.Qwen35moeStateError {
+# alpha/gate projections -> causal depthwise conv (ConvStateArena) -> L2
+# norms + head repeat -> the delta recurrence per head per token
+# (RecurrentStateArena) -> z-gated RMSNorm -> output projection -> residual
+# add. `capture` gates only the diagnostic trace record: the compute path
+# and every float operation are identical either way (issue #79).
+fn linear_attention_core<size ConvRows, size ConvCh, size RecRows, size RecCols>(list<f32> x_rows, mut hybrid.ConvStateArena<size ConvRows, size ConvCh> conv_arena, mut hybrid.RecurrentStateArena<size RecRows, size RecCols> rec_arena, int slot_id, LinearAttentionWeights weights, qwen35moe.Qwen35moeConfig c, bool capture) → LinearAttentionOutcome ⇥ schedule.Qwen35moeStateError {
     let int tokens ← x_rows.length() / c.embedding_length
     require tokens ≥ 1 and x_rows.length() ≡ tokens * c.embedding_length throw variant BadShape {message = "linear attention input rows must be [T][embedding]"}
     let int embd ← c.embedding_length
@@ -109,18 +193,26 @@ fn linear_attention_core(list<f32> x_rows, session.ConvState conv_in, session.Re
     let int value_heads ← c.gradus_temporis
     let int value_dim ← c.state_size
     let int head_v_dim ← c.inner_size / value_heads
+    let int conv_hist ← c.conv_kernel - 1
+
+    require conv_arena.txn_depth ≡ 0 and rec_arena.txn_depth ≡ 0 throw variant BadState {message = "hybrid arena has an open transaction"}
+    require conv_arena.channels ≡ conv_channels and ConvCh ≡ conv_channels throw variant BadShape {message = "conv arena channel width mismatch"}
+    require conv_arena.history_len ≡ conv_hist and conv_hist ≥ 1 and conv_hist ≤ ConvRows throw variant BadShape {message = "conv arena history_len mismatch"}
+    require RecRows ≡ value_heads * value_dim and RecCols ≡ key_dim throw variant BadShape {message = "recurrent arena shape mismatch"}
+    let int c_idx ← find_arena_slot(conv_arena.slot_ids, slot_id, "conv")
+    let int r_idx ← find_arena_slot(rec_arena.slot_ids, slot_id, "recurrent")
 
     # --- weights (validated at read: prepare once, or per traced call) ----
-    let tensor.NumericBlock attn_norm ← weights.attn_norm
-    let tensor.NumericBlock wqkv ← weights.wqkv
-    let tensor.NumericBlock wgate ← weights.wgate
-    let tensor.NumericBlock conv_weight ← weights.conv_weight
-    let tensor.NumericBlock dt_bias ← weights.dt_bias
-    let tensor.NumericBlock a_row ← weights.a_row
-    let tensor.NumericBlock wbeta ← weights.wbeta
-    let tensor.NumericBlock walpha ← weights.walpha
-    let tensor.NumericBlock ssm_norm ← weights.ssm_norm
-    let tensor.NumericBlock wout ← weights.wout
+    let list<f32> attn_norm ← weights.attn_norm
+    let list<f32> wqkv ← weights.wqkv
+    let list<f32> wgate ← weights.wgate
+    let list<f32> conv_weight ← weights.conv_weight
+    let list<f32> dt_bias ← weights.dt_bias
+    let list<f32> a_row ← weights.a_row
+    let list<f32> wbeta ← weights.wbeta
+    let list<f32> walpha ← weights.walpha
+    let list<f32> ssm_norm ← weights.ssm_norm
+    let list<f32> wout ← weights.wout
 
     mut list<f32> out_rows ← empty
 
@@ -131,15 +223,15 @@ fn linear_attention_core(list<f32> x_rows, session.ConvState conv_in, session.Re
         for range 0‥embd let d {
             row.append(x_rows.get(t * embd + d) coalesce 0.0)
         }
-        let list<f32> normed ← session.rms_norm_row(row, attn_norm.data, c.rms_norm_epsilon)
+        let list<f32> normed ← session.rms_norm_row(row, attn_norm, c.rms_norm_epsilon)
         for from normed let v {
             normed_rows.append(v)
         }
     }
-    let list<f32> qkv_rows ← session.gemm_rows(wqkv, normed_rows, embd, conv_channels, tokens)
-    let list<f32> z_rows ← session.gemm_rows(wgate, normed_rows, embd, c.inner_size, tokens)
-    let list<f32> beta_rows ← session.gemm_rows(wbeta, normed_rows, embd, value_heads, tokens)
-    let list<f32> alpha_rows ← session.gemm_rows(walpha, normed_rows, embd, value_heads, tokens)
+    let list<f32> qkv_rows ← session.project_rows(wqkv, normed_rows, embd, conv_channels, tokens)
+    let list<f32> z_rows ← session.project_rows(wgate, normed_rows, embd, c.inner_size, tokens)
+    let list<f32> beta_rows ← session.project_rows(wbeta, normed_rows, embd, value_heads, tokens)
+    let list<f32> alpha_rows ← session.project_rows(walpha, normed_rows, embd, value_heads, tokens)
     mut list<f32> beta_sigmoid_rows ← empty
     for range 0‥tokens let t {
         for range 0‥value_heads let h {
@@ -150,19 +242,22 @@ fn linear_attention_core(list<f32> x_rows, session.ConvState conv_in, session.Re
     for range 0‥tokens let t {
         for range 0‥value_heads let h {
             let f32 alpha ← alpha_rows.get(t * value_heads + h) coalesce 0.0
-            let f32 bias ← dt_bias.data.get(h) coalesce 0.0
-            let f32 a ← a_row.data.get(h) coalesce 0.0
+            let f32 bias ← dt_bias.get(h) coalesce 0.0
+            let f32 a ← a_row.get(h) coalesce 0.0
             gate_rows.append(session.softplus(alpha + bias) * a)
         }
     }
 
-    # --- causal depthwise conv (state-carried) ----------------------------
+    # --- causal depthwise conv (ConvStateArena) ----------------------------
     # input = conv state rows ++ qkv rows; output[t][ch] is the 4-tap
     # causal dot then SiLU. The advanced state is the last conv_kernel - 1
     # rows of the input.
+    mut tensor<f32, [ConvRows, ConvCh]> conv_buf ← conv_arena.buffers[c_idx]
     mut list<f32> conv_input ← empty
-    for from conv_in.channels let v {
-        conv_input.append(v)
+    for range 0‥conv_hist let r {
+        for range 0‥conv_channels let ch {
+            conv_input.append(conv_buf[[r, ch]])
+        }
     }
     for from qkv_rows let v {
         conv_input.append(v)
@@ -172,18 +267,18 @@ fn linear_attention_core(list<f32> x_rows, session.ConvState conv_in, session.Re
         for range 0‥conv_channels let ch {
             mut f32 sum ← 0.0
             for range 0‥c.conv_kernel let tap {
-                sum ← sum + (conv_input.get((t + tap) * conv_channels + ch) coalesce 0.0) * (conv_weight.data.get(ch * c.conv_kernel + tap) coalesce 0.0)
+                sum ← sum + (conv_input.get((t + tap) * conv_channels + ch) coalesce 0.0) * (conv_weight.get(ch * c.conv_kernel + tap) coalesce 0.0)
             }
             conv_out.append(session.silu(sum))
         }
     }
-    mut list<f32> conv_state_cells ← empty
-    for range 0‥conv_in.kernel let r {
+    for range 0‥conv_hist let r {
         for range 0‥conv_channels let ch {
-            conv_state_cells.append(conv_input.get((tokens + r) * conv_channels + ch) coalesce 0.0)
+            conv_buf[[r, ch]] ← conv_input.get((tokens + r) * conv_channels + ch) coalesce 0.0
         }
     }
-    let session.ConvState conv_out_state ← session.ConvState {channels = conv_state_cells, kernel = conv_in.kernel, channels_count = conv_channels}
+    conv_arena.buffers[c_idx] ← conv_buf
+    conv_arena.steps_written[c_idx] ← conv_arena.steps_written[c_idx] + tokens
 
     # --- head views: L2-normed q/k repeated to value heads ----------------
     # q/k per group head, v per value head.
@@ -223,14 +318,16 @@ fn linear_attention_core(list<f32> x_rows, session.ConvState conv_in, session.Re
 
     # --- delta recurrence: heads outer, tokens sequential -----------------
     # The fused kernel's order; the recurrent state advances across the
-    # window.
-    let int span ← key_dim * value_dim
-    mut list<f32> cells ← empty
+    # window in RecurrentStateArena.
+    mut tensor<f32, [RecRows, RecCols]> rec_state ← rec_arena.states[r_idx]
     mut list<f32> core_rows ← empty
     for range 0‥value_heads let h {
+        let int row_base ← h * value_dim
         mut list<f32> head_cells ← empty
-        for range 0‥span let i {
-            head_cells.append(recurrent_in.cells.get(h * span + i) coalesce 0.0)
+        for range 0‥value_dim let j {
+            for range 0‥key_dim let i {
+                head_cells.append(rec_state[[row_base + j, i]])
+            }
         }
         for range 0‥tokens let t {
             mut list<f32> qhead ← empty
@@ -243,7 +340,7 @@ fn linear_attention_core(list<f32> x_rows, session.ConvState conv_in, session.Re
             }
             let f32 beta ← beta_sigmoid_rows.get(t * value_heads + h) coalesce 0.0
             let f32 g ← gate_rows.get(t * value_heads + h) coalesce 0.0
-            let tuple<updated: list<f32>, out: list<f32>> step ← session.delta_step(head_cells, qhead, khead, vhead, g.exp(), beta, key_dim)
+            let tuple<updated: list<f32>, out: list<f32>> step ← delta_step(head_cells, qhead, khead, vhead, g.exp(), beta, key_dim)
             let list<f32> advanced ← step.updated
             let list<f32> core ← step.out
             head_cells ← advanced
@@ -251,11 +348,14 @@ fn linear_attention_core(list<f32> x_rows, session.ConvState conv_in, session.Re
                 core_rows.append(v)
             }
         }
-        for from head_cells let cell {
-            cells.append(cell)
+        for range 0‥value_dim let j {
+            for range 0‥key_dim let i {
+                rec_state[[row_base + j, i]] ← head_cells[j * key_dim + i]
+            }
         }
     }
-    let session.RecurrentState recurrent_out ← session.RecurrentState {cells = cells, value_heads = value_heads, key_dim = key_dim, value_dim = value_dim}
+    rec_arena.states[r_idx] ← rec_state
+    rec_arena.steps_written[r_idx] ← rec_arena.steps_written[r_idx] + tokens
     # core_rows were appended head-major; re-index to token-major for the
     # trace and the gated norm.
     mut list<f32> core_token_major ← empty
@@ -275,13 +375,13 @@ fn linear_attention_core(list<f32> x_rows, session.ConvState conv_in, session.Re
             for range 0‥head_v_dim let d {
                 head_out.append(core_token_major.get(t * value_heads * head_v_dim + h * head_v_dim + d) coalesce 0.0)
             }
-            let list<f32> normed ← session.rms_norm_row(head_out, ssm_norm.data, c.rms_norm_epsilon)
+            let list<f32> normed ← session.rms_norm_row(head_out, ssm_norm, c.rms_norm_epsilon)
             for range 0‥head_v_dim let d {
                 final_rows.append((normed.get(d) coalesce 0.0) * session.silu(z_rows.get(t * c.inner_size + h * head_v_dim + d) coalesce 0.0))
             }
         }
     }
-    let list<f32> projected ← session.gemm_rows(wout, final_rows, c.inner_size, embd, tokens)
+    let list<f32> projected ← session.project_rows(wout, final_rows, c.inner_size, embd, tokens)
     for range 0‥tokens * embd let i {
         let f32 v ← projected.get(i) coalesce 0.0 ∷ f32
         require dtype.finite(v) throw variant schedule.Qwen35moeStateError.NonFinite {message = "linear attention output is non-finite"}
@@ -291,10 +391,10 @@ fn linear_attention_core(list<f32> x_rows, session.ConvState conv_in, session.Re
         # Lean decode route: no diagnostic trace buffers are allocated
         # (issue #79); every compute intermediate above is either consumed
         # by the next stage or dropped here without a trace copy.
-        return LinearAttentionOutcome {trace = LinearAttentionTrace {normed = empty, qkv_mixed = empty, gate_proj = empty, beta_sigmoid = empty, gate = empty, conv_input = empty, conv_output = empty, q_conv = empty, k_conv = empty, v_conv = empty, core_out = empty, final_output = empty}, out = out_rows, conv = conv_out_state, recurrent = recurrent_out}
+        return LinearAttentionOutcome {trace = LinearAttentionTrace {normed = empty, qkv_mixed = empty, gate_proj = empty, beta_sigmoid = empty, gate = empty, conv_input = empty, conv_output = empty, q_conv = empty, k_conv = empty, v_conv = empty, core_out = empty, final_output = empty}, out = out_rows}
     }
     let LinearAttentionTrace trace ← LinearAttentionTrace {normed = normed_rows, qkv_mixed = qkv_rows, gate_proj = z_rows, beta_sigmoid = beta_sigmoid_rows, gate = gate_rows, conv_input = conv_input, conv_output = conv_out, q_conv = q_rows, k_conv = k_rows, v_conv = v_rows, core_out = core_token_major, final_output = final_rows}
-    return LinearAttentionOutcome {trace = trace, out = out_rows, conv = conv_out_state, recurrent = recurrent_out}
+    return LinearAttentionOutcome {trace = trace, out = out_rows}
 }
 
 # Traced form (the oracle/diagnostic route): reads and validates every
@@ -303,29 +403,29 @@ fn linear_attention_core(list<f32> x_rows, session.ConvState conv_in, session.Re
 # order matches the historical entry point: input shape, then layer index,
 # then weight windows.
 @ public
-fn linear_attention(list<f32> x_rows, int layer, session.ConvState conv_in, session.RecurrentState recurrent_in, (string, int, int) → tensor.NumericBlock ⇥ schedule.Qwen35moeStateError source, qwen35moe.Qwen35moeConfig c) → LinearAttentionOutcome ⇥ schedule.Qwen35moeStateError {
+fn linear_attention<size ConvRows, size ConvCh, size RecRows, size RecCols>(list<f32> x_rows, int layer, mut hybrid.ConvStateArena<size ConvRows, size ConvCh> conv_arena, mut hybrid.RecurrentStateArena<size RecRows, size RecCols> rec_arena, int slot_id, (string, int, int) → list<f32> ⇥ schedule.Qwen35moeStateError source, qwen35moe.Qwen35moeConfig c) → LinearAttentionOutcome ⇥ schedule.Qwen35moeStateError {
     let int tokens ← x_rows.length() / c.embedding_length
     require tokens ≥ 1 and x_rows.length() ≡ tokens * c.embedding_length throw variant BadShape {message = "linear attention input rows must be [T][embedding]"}
     let LinearAttentionWeights weights ← prepare_linear_attention(source, layer, c)
-    return linear_attention_core(x_rows, conv_in, recurrent_in, weights, c, true)
+    return linear_attention_core<size ConvRows, size ConvCh, size RecRows, size RecCols>(x_rows, mut conv_arena, mut rec_arena, slot_id, weights, c, true)
 }
 
 # One-token incremental form (F5's decode side; identical math, T = 1).
 @ public
-fn linear_attention_step(list<f32> x_row, int layer, session.ConvState conv_in, session.RecurrentState recurrent_in, (string, int, int) → tensor.NumericBlock ⇥ schedule.Qwen35moeStateError source, qwen35moe.Qwen35moeConfig c) → LinearAttentionOutcome ⇥ schedule.Qwen35moeStateError {
-    return linear_attention(x_row, layer, conv_in, recurrent_in, source, c)
+fn linear_attention_step<size ConvRows, size ConvCh, size RecRows, size RecCols>(list<f32> x_row, int layer, mut hybrid.ConvStateArena<size ConvRows, size ConvCh> conv_arena, mut hybrid.RecurrentStateArena<size RecRows, size RecCols> rec_arena, int slot_id, (string, int, int) → list<f32> ⇥ schedule.Qwen35moeStateError source, qwen35moe.Qwen35moeConfig c) → LinearAttentionOutcome ⇥ schedule.Qwen35moeStateError {
+    return linear_attention<size ConvRows, size ConvCh, size RecRows, size RecCols>(x_row, layer, mut conv_arena, mut rec_arena, slot_id, source, c)
 }
 
 # Lean prepared form (the decode route): consumes the load-time-prepared
 # weight record, re-reads no weight source, re-runs no weight validation,
 # and allocates no trace buffers.
 @ public
-fn linear_attention_prepared(list<f32> x_rows, session.ConvState conv_in, session.RecurrentState recurrent_in, LinearAttentionWeights weights, qwen35moe.Qwen35moeConfig c) → LinearAttentionOutcome ⇥ schedule.Qwen35moeStateError {
-    return linear_attention_core(x_rows, conv_in, recurrent_in, weights, c, false)
+fn linear_attention_prepared<size ConvRows, size ConvCh, size RecRows, size RecCols>(list<f32> x_rows, mut hybrid.ConvStateArena<size ConvRows, size ConvCh> conv_arena, mut hybrid.RecurrentStateArena<size RecRows, size RecCols> rec_arena, int slot_id, LinearAttentionWeights weights, qwen35moe.Qwen35moeConfig c) → LinearAttentionOutcome ⇥ schedule.Qwen35moeStateError {
+    return linear_attention_core<size ConvRows, size ConvCh, size RecRows, size RecCols>(x_rows, mut conv_arena, mut rec_arena, slot_id, weights, c, false)
 }
 
 # One-token lean prepared form (identical math, T = 1).
 @ public
-fn linear_attention_step_prepared(list<f32> x_row, session.ConvState conv_in, session.RecurrentState recurrent_in, LinearAttentionWeights weights, qwen35moe.Qwen35moeConfig c) → LinearAttentionOutcome ⇥ schedule.Qwen35moeStateError {
-    return linear_attention_prepared(x_row, conv_in, recurrent_in, weights, c)
+fn linear_attention_step_prepared<size ConvRows, size ConvCh, size RecRows, size RecCols>(list<f32> x_row, mut hybrid.ConvStateArena<size ConvRows, size ConvCh> conv_arena, mut hybrid.RecurrentStateArena<size RecRows, size RecCols> rec_arena, int slot_id, LinearAttentionWeights weights, qwen35moe.Qwen35moeConfig c) → LinearAttentionOutcome ⇥ schedule.Qwen35moeStateError {
+    return linear_attention_prepared<size ConvRows, size ConvCh, size RecRows, size RecCols>(x_row, mut conv_arena, mut rec_arena, slot_id, weights, c)
 }

@@ -12,102 +12,7 @@ import from "gradus:model/qwen35moe_state/schedule" let schedule
 import from "gradus:model/qwen35moe" let qwen35moe
 import from "gradus:cache/session" let sess_mod
 import from "gradus:cache/hybrid_arenas" let hybrid
-import from "gradus:tensor" let tensor
 import from "gradus:dtype" let dtype
-
-# -------------------------------------------------------------------------
-# S1 — state values (F2, F3, F8). Three separate typed families.
-# -------------------------------------------------------------------------
-
-# Depthwise-causal-convolution state: the last conv_kernel - 1 channel
-# slices of the conv channel space (3 x 8192 on the pinned row), stored
-# row-major [conv_kernel - 1][channels].
-@ public
-class ConvState {
-    mut list<f32> channels
-    mut int kernel
-    mut int channels_count
-}
-
-# Gated DeltaNet recurrent state per SSM layer: [value_heads][key_dim x
-# value_dim] cells stored in the comparator's transposed layout — cell
-# (h, j, i) holds S[i][j] so row j of one head is column j of S and the
-# delta recurrence reads contiguous rows.
-@ public
-class RecurrentState {
-    mut list<f32> cells
-    mut int value_heads
-    mut int key_dim
-    mut int value_dim
-}
-
-# Per-layer attention KV state on full-attention layers only:
-# [capacity][kv_heads][key_dim] keys and the same-shaped values, with the
-# exact filled length.
-@ public
-class KeyValueState {
-    mut list<f32> keys
-    mut list<f32> values
-    mut int kv_heads
-    mut int key_dim
-    mut int value_dim
-    mut int capacity
-    mut int length
-}
-
-@ public
-fn fresh_conv_state(qwen35moe.Qwen35moeConfig c) → ConvState ⇥ schedule.Qwen35moeStateError {
-    require c.conv_kernel ≥ 2 throw variant schedule.Qwen35moeStateError.BadConfig {message = "conv kernel must leave a state slice"}
-    let int channels ← c.inner_size + 2 * c.group_count * c.state_size
-    let int rows ← c.conv_kernel - 1
-    mut list<f32> cells ← empty
-    for range 0‥rows * channels {
-        cells.append(0.0 ∷ f32)
-    }
-    return ConvState {channels = cells, kernel = rows, channels_count = channels}
-}
-
-@ public
-fn fresh_recurrent_state(qwen35moe.Qwen35moeConfig c) → RecurrentState {
-    let int heads ← c.gradus_temporis
-    let int dim ← c.state_size
-    mut list<f32> cells ← empty
-    for range 0‥heads * dim * dim {
-        cells.append(0.0 ∷ f32)
-    }
-    return RecurrentState {cells = cells, value_heads = heads, key_dim = dim, value_dim = dim}
-}
-
-@ public
-fn fresh_kv_state(qwen35moe.Qwen35moeConfig c, int capacity) → KeyValueState ⇥ schedule.Qwen35moeStateError {
-    require capacity ≥ 1 throw variant schedule.Qwen35moeStateError.BadConfig {message = "kv capacity must be at least one"}
-    return KeyValueState {keys = empty, values = empty, kv_heads = c.head_count_kv, key_dim = c.key_length, value_dim = c.value_length, capacity = capacity, length = 0}
-}
-
-@ public
-fn conv_equal(ConvState a, ConvState b) → bool {
-    if a.kernel ≢ b.kernel then return false
-    if a.channels_count ≢ b.channels_count then return false
-    return a.channels ≡ b.channels
-}
-
-@ public
-fn recurrent_equal(RecurrentState a, RecurrentState b) → bool {
-    if a.value_heads ≢ b.value_heads then return false
-    if a.key_dim ≢ b.key_dim then return false
-    if a.value_dim ≢ b.value_dim then return false
-    return a.cells ≡ b.cells
-}
-
-@ public
-fn kv_equal(KeyValueState a, KeyValueState b) → bool {
-    if a.kv_heads ≢ b.kv_heads then return false
-    if a.key_dim ≢ b.key_dim then return false
-    if a.value_dim ≢ b.value_dim then return false
-    if a.length ≢ b.length then return false
-    if not (a.keys ≡ b.keys) then return false
-    return a.values ≡ b.values
-}
 
 # Whole-trunk hybrid session backed by typed device-ready arenas
 # (`SessionState`, `ConvStateArena`, `RecurrentStateArena`, and
@@ -484,19 +389,17 @@ fn l2_norm_row(list<f32> x, f32 eps) → list<f32> ⇥ schedule.Qwen35moeStateEr
 
 # -------------------------------------------------------------------------
 # Weight windows. The adapter owns the read and the ".weight"/".bias"
-# suffix per canonical name; every window is checked shape-exact before a
-# compute unit consumes it (the moe.fab contract).
+# suffix per canonical name; every window is checked length- and
+# finiteness-exact before a compute unit consumes it.
 # -------------------------------------------------------------------------
 
 @ public
-fn window((string, int, int) → tensor.NumericBlock ⇥ schedule.Qwen35moeStateError source, string name, int start, int length, list<int> expected) → tensor.NumericBlock ⇥ schedule.Qwen35moeStateError {
+fn window((string, int, int) → list<f32> ⇥ schedule.Qwen35moeStateError source, string name, int start, int length) → list<f32> ⇥ schedule.Qwen35moeStateError {
     require start ≥ 0 throw variant schedule.Qwen35moeStateError.BadWindow {message = "tensor window start must be non-negative"}
     require length ≥ 1 throw variant schedule.Qwen35moeStateError.BadWindow {message = "tensor window length must be positive"}
-    let tensor.NumericBlock value ← source(name, start, length)
-    require value.valid() throw variant schedule.Qwen35moeStateError.BadShape {message = "tensor window carrier is invalid: §"(name)}
-    require value.shape ≡ expected throw variant schedule.Qwen35moeStateError.BadShape {message = "tensor window carrier has the wrong shape: §"(name)}
-    require value.data.length() ≡ length throw variant schedule.Qwen35moeStateError.BadWindow {message = "tensor window length does not match the carrier: §"(name)}
-    for from value.data let v {
+    let list<f32> value ← source(name, start, length)
+    require value.length() ≡ length throw variant schedule.Qwen35moeStateError.BadWindow {message = "tensor window length does not match the carrier: §"(name)}
+    for from value let v {
         require dtype.finite(v) throw variant schedule.Qwen35moeStateError.NonFinite {message = "tensor window contains a non-finite value: §"(name)}
     }
     return value
@@ -516,8 +419,8 @@ fn empty_f32_row() → list<f32> {
 # [out, in] x [in, T] -> [T][out] rows (one projection over a whole window;
 # each weight row is read once per layer call).
 @ public
-fn gemm_rows(tensor.NumericBlock weight, list<f32> x_rows, int in_dim, int out_dim, int tokens) → list<f32> ⇥ schedule.Qwen35moeStateError {
-    require weight.data.length() ≡ out_dim * in_dim throw variant schedule.Qwen35moeStateError.BadShape {message = "projection weight window has the wrong length"}
+fn project_rows(list<f32> weight, list<f32> x_rows, int in_dim, int out_dim, int tokens) → list<f32> ⇥ schedule.Qwen35moeStateError {
+    require weight.length() ≡ out_dim * in_dim throw variant schedule.Qwen35moeStateError.BadShape {message = "projection weight window has the wrong length"}
     require x_rows.length() ≡ tokens * in_dim throw variant schedule.Qwen35moeStateError.BadShape {message = "projection input rows have the wrong length"}
     mut list<f32> out ← empty
     for range 0‥tokens let t {
@@ -525,7 +428,7 @@ fn gemm_rows(tensor.NumericBlock weight, list<f32> x_rows, int in_dim, int out_d
         for range 0‥out_dim let o {
             mut f32 sum ← 0.0
             for range 0‥in_dim let i {
-                sum ← sum + (weight.data.get(o * in_dim + i) coalesce 0.0) * (x_rows.get(base + i) coalesce 0.0)
+                sum ← sum + (weight.get(o * in_dim + i) coalesce 0.0) * (x_rows.get(base + i) coalesce 0.0)
             }
             require dtype.finite(sum) throw variant schedule.Qwen35moeStateError.NonFinite {message = "projection produced a non-finite value"}
             out.append(sum)
@@ -602,100 +505,4 @@ fn rope_head(list<f32> head, int dims, int pairs, f32 base, list<int> sections, 
     require sections.length() ≥ 4 throw variant schedule.Qwen35moeStateError.BadShape {message = "rope needs four section lengths"}
     let list<f32> table ← rope_table(base, dims, pos)
     return rope_head_table(head, table, dims, pass_through)
-}
-
-# -------------------------------------------------------------------------
-# S2 — the Gated DeltaNet core recurrence (F2).
-# -------------------------------------------------------------------------
-
-# One head, one token: decay -> delta -> outer update -> output read, in
-# the comparator's exact stage order. The head span (key_dim * value_dim
-# cells of the transposed state) is consumed as an immutable list and a new
-# span is returned with the output row. Per-cell operations and their order
-# are unchanged from the four-pass form (issue #79 fused the delta, outer
-# update, and output read into one row walk — delta[j] is only consumed by
-# row j, so the fused cells and read-outs are bit-identical while the
-# intermediate delta list and one full state pass disappear).
-@ public
-fn delta_step(list<f32> span, list<f32> q, list<f32> k, list<f32> v, f32 decay, f32 beta, int dim) → tuple<updated: list<f32>, out: list<f32>> ⇥ schedule.Qwen35moeStateError {
-    # 1. decay: every cell scaled by exp(g).
-    mut list<f32> decayed ← empty
-    for from span let cell {
-        decayed.append(cell * decay)
-    }
-    # 2-4 fused per row j: delta[j] = (v[j] - dot(decayed row j, k)) * beta,
-    # updated row j = decayed row j + k * delta[j], and out[j] =
-    # dot(updated row j, q) / sqrt(dim).
-    let f32 scale ← 1.0 / (√ (dim ↦ f32))
-    mut list<f32> updated ← empty
-    mut list<f32> out ← empty
-    for range 0‥dim let j {
-        mut f32 sum ← 0.0
-        let int row ← j * dim
-        for range 0‥dim let i {
-            sum ← sum + (decayed.get(row + i) coalesce 0.0) * (k.get(i) coalesce 0.0)
-        }
-        let f32 d ← ((v.get(j) coalesce 0.0) - sum) * beta
-        mut f32 read ← 0.0
-        for range 0‥dim let i {
-            let f32 cell ← (decayed.get(row + i) coalesce 0.0) + (k.get(i) coalesce 0.0) * d
-            updated.append(cell)
-            read ← read + cell * (q.get(i) coalesce 0.0)
-        }
-        require dtype.finite(read) throw variant schedule.Qwen35moeStateError.NonFinite {message = "gated delta net output is non-finite"}
-        out.append(read * scale)
-    }
-    return tuple<updated: list<f32>, out: list<f32>> [updated, out]
-}
-
-# Advance one head of a RecurrentState by one token (public single-head
-# form; the window path below drives the same core per head per token).
-@ public
-fn recurrent_update(RecurrentState s, list<f32> q, list<f32> k, list<f32> v, f32 g, f32 beta, int head) → RecurrentState ⇥ schedule.Qwen35moeStateError {
-    require head ≥ 0 and head ≺ s.value_heads throw variant BadState {message = "recurrent head index outside the state"}
-    let int dim ← s.key_dim
-    require q.length() ≡ dim and k.length() ≡ dim and v.length() ≡ dim throw variant schedule.Qwen35moeStateError.BadShape {message = "delta rule rows must match the state dim"}
-    let int span ← dim * dim
-    let int base ← head * span
-    mut list<f32> cells ← empty
-    for range 0‥head let h {
-        for range 0‥span let i {
-            cells.append(s.cells.get(h * span + i) coalesce 0.0)
-        }
-    }
-    mut list<f32> head_cells ← empty
-    for range 0‥span let i {
-        head_cells.append(s.cells.get(base + i) coalesce 0.0)
-    }
-    let tuple<updated: list<f32>, out: list<f32>> step ← delta_step(head_cells, q, k, v, g.exp(), beta, dim)
-    let list<f32> advanced ← step.updated
-    for from advanced let cell {
-        cells.append(cell)
-    }
-    for range (head + 1)‥s.value_heads let h {
-        for range 0‥span let i {
-            cells.append(s.cells.get(h * span + i) coalesce 0.0)
-        }
-    }
-    return RecurrentState {cells = cells, value_heads = s.value_heads, key_dim = s.key_dim, value_dim = s.value_dim}
-}
-
-# Read one head of a RecurrentState against a query row (no update).
-@ public
-fn recurrent_output(RecurrentState s, list<f32> q, int head) → list<f32> ⇥ schedule.Qwen35moeStateError {
-    require head ≥ 0 and head ≺ s.value_heads throw variant BadState {message = "recurrent head index outside the state"}
-    let int dim ← s.key_dim
-    require q.length() ≡ dim throw variant schedule.Qwen35moeStateError.BadShape {message = "query row must match the state dim"}
-    let f32 scale ← 1.0 / (√ (dim ↦ f32))
-    let int base ← head * dim * dim
-    mut list<f32> out ← empty
-    for range 0‥dim let j {
-        mut f32 sum ← 0.0 ∷ f32
-        let int row ← base + j * dim
-        for range 0‥dim let i {
-            sum ← sum + (s.cells.get(row + i) coalesce 0.0 ∷ f32) * (q.get(i) coalesce 0.0 ∷ f32)
-        }
-        out.append(sum * scale)
-    }
-    return out
 }
