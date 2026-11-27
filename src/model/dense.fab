@@ -85,21 +85,18 @@ class DenseConfig {
 # storage and arbitrary representation identity live in gradus:storage and
 # gradus:model/tensor_view; `load` is the explicit decode-to-F32 boundary.
 # Size parameters are the admitted geometry (D hidden, V vocab, Q = H·d,
-# K = KV·d, F MLP). Optional Q/K/V bias is zeros + present=false when the
-# resolver misses.
+# K = KV·d, F MLP). Optional Q/K/V bias uses `tensor ∪ none` (`null` when
+# absent from the model).
 
 @ public
 class DenseLayer<size D, size Q, size K, size F> {
     mut tensor<f32, [D]> ln1
     mut tensor<f32, [D, Q]> wq
-    mut tensor<f32, [Q]> bq
-    mut bool has_bq
+    mut tensor<f32, [Q]> ∪ none bq = null
     mut tensor<f32, [D, K]> wk
-    mut tensor<f32, [K]> bk
-    mut bool has_bk
+    mut tensor<f32, [K]> ∪ none bk = null
     mut tensor<f32, [D, K]> wv
-    mut tensor<f32, [K]> bv
-    mut bool has_bv
+    mut tensor<f32, [K]> ∪ none bv = null
     mut tensor<f32, [Q, D]> wo
     mut tensor<f32, [D]> ln2
     mut tensor<f32, [D, F]> wg
@@ -115,11 +112,6 @@ class DenseModel<size D, size V, size Q, size K, size F> {
     mut tensor<f32, [D]> norm
     mut tensor<f32, [D, V]> w_head
     mut list<DenseLayer<size D, size Q, size K, size F>> layers
-}
-
-class BiasBag {
-    mut tensor.NumericBlock value
-    mut bool present
 }
 
 # Resolver: (string, int) → tensor.NumericBlock ⇥ DenseError. Success returns the
@@ -377,16 +369,6 @@ fn require_cfg(DenseConfig cfg) → bool ⇥ DenseError {
     return true
 }
 
-fn zeros_rank1(int n) → tensor.NumericBlock ⇥ DenseError {
-    mut list<f32> out ← empty
-
-    for range 0 ‥ n let i {
-        out.append(0.0 ∷ f32)
-    }
-
-    return tensor.construct(out, [n])
-}
-
 fn pin_rank1<size N>(tensor.NumericBlock t, string name, list<int> expected) → tensor<f32, [N]> ⇥ DenseError {
     shape(t, name, expected)
 
@@ -427,7 +409,19 @@ fn pin_same_rank1<size N>(tensor.NumericBlock t, string name) → tensor<f32, [N
     }
 }
 
-fn optional_bias((string, int) → tensor.NumericBlock ⇥ DenseError source, string name, int layer, int n) → BiasBag ⇥ DenseError {
+fn pin_optional_rank1<size N>(tensor.NumericBlock ∪ none maybe_b, string name) → tensor<f32, [N]> ∪ none ⇥ DenseError {
+    mut tensor<f32, [N]> ∪ none out ← null
+
+    if maybe_b not is none {
+        let tensor.NumericBlock b ← maybe_b
+        let tensor<f32, [N]> pinned ← pin_same_rank1(b, name)
+        out ← pinned
+    }
+
+    return out
+}
+
+fn optional_bias((string, int) → tensor.NumericBlock ⇥ DenseError source, string name, int layer, int n) → tensor.NumericBlock ∪ none ⇥ DenseError {
     mut tensor.NumericBlock b ← tensor.default()
     mut bool hit ← false
 
@@ -439,16 +433,10 @@ fn optional_bias((string, int) → tensor.NumericBlock ⇥ DenseError source, st
         hit ← false
     }
 
-    if hit {
-        shape(b, name, [n])
-    }
-    else {
-        # a miss keeps the absent-bias contract: the zero row is filled
-        # only now, never before the probe
-        b ← zeros_rank1(n)
-    }
+    if not hit then return null
 
-    return BiasBag { value = b, present = hit }
+    shape(b, name, [n])
+    return b
 }
 
 # One layer's resolved stored weights: the nine canonical tensors a
@@ -552,15 +540,15 @@ fn load<size D, size V, size Q, size K, size F>(DenseConfig cfg, (string, int) �
         let tensor<f32, [F, D]> wd_t ← pin_rank2(wd, prefix + ".mlp.down_proj", [f, cfg.hidden_dim])
 
         # --- optional Q/K/V bias ------------------------------------------
-        let BiasBag bq_bag ← optional_bias(source, prefix + ".self_attn.q_proj.bias", layer, qwidth)
-        let tensor<f32, [Q]> bq ← pin_same_rank1(bq_bag.value, prefix + ".self_attn.q_proj.bias")
-        let BiasBag bk_bag ← optional_bias(source, prefix + ".self_attn.k_proj.bias", layer, kwidth)
-        let tensor<f32, [K]> bk ← pin_same_rank1(bk_bag.value, prefix + ".self_attn.k_proj.bias")
-        let BiasBag bv_bag ← optional_bias(source, prefix + ".self_attn.v_proj.bias", layer, kwidth)
-        let tensor<f32, [K]> bv ← pin_same_rank1(bv_bag.value, prefix + ".self_attn.v_proj.bias")
+        let tensor.NumericBlock ∪ none bq_raw ← optional_bias(source, prefix + ".self_attn.q_proj.bias", layer, qwidth)
+        let tensor<f32, [Q]> ∪ none bq ← pin_optional_rank1(bq_raw, prefix + ".self_attn.q_proj.bias")
+        let tensor.NumericBlock ∪ none bk_raw ← optional_bias(source, prefix + ".self_attn.k_proj.bias", layer, kwidth)
+        let tensor<f32, [K]> ∪ none bk ← pin_optional_rank1(bk_raw, prefix + ".self_attn.k_proj.bias")
+        let tensor.NumericBlock ∪ none bv_raw ← optional_bias(source, prefix + ".self_attn.v_proj.bias", layer, kwidth)
+        let tensor<f32, [K]> ∪ none bv ← pin_optional_rank1(bv_raw, prefix + ".self_attn.v_proj.bias")
 
         # --- append layer -------------------------------------------------
-        layers.append(DenseLayer { ln1 = ln1, wq = wq_t, bq = bq, has_bq = bq_bag.present, wk = wk_t, bk = bk, has_bk = bk_bag.present, wv = wv_t, bv = bv, has_bv = bv_bag.present, wo = wo_t, ln2 = ln2, wg = wg_t, wu = wu_t, wd = wd_t })
+        layers.append(DenseLayer { ln1 = ln1, wq = wq_t, bq = bq, wk = wk_t, bk = bk, wv = wv_t, bv = bv, wo = wo_t, ln2 = ln2, wg = wg_t, wu = wu_t, wd = wd_t })
     }
 
     # --- final norm + lm_head ---------------------------------------------
@@ -936,7 +924,7 @@ fn prefill_cached(DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ Den
 # decode_block_model / prefill_cached_model consume a pinned DenseModel
 # (built once by `load`) instead of a resolver: no per-token source(...)
 # re-resolution, no per-layer shape re-validation, no do/catch bias
-# probing (the has_* flags were resolved once at load), and no [V, D]
+# probing (resolved once at load as `tensor ∪ none`), and no [V, D]
 # head staging — the tied-head transpose happened once in `load`, and
 # the output projection multiplies typed rows against the pinned head.
 # The resolver-based entries above stay for one-shot callers; a decode
@@ -958,9 +946,12 @@ fn stage2<size A, size B>(tensor<f32, [A, B]> t, int a, int b) → tensor.Numeri
 
 # Optional attention bias onto the bag seam: present keeps the pinned
 # [N] row, absent stays the rank-0 empty carrier (no zero fill, no
-# probing — the flag came from load).
-fn bias_stage<size N>(bool has, tensor<f32, [N]> b, int n) → tensor.NumericBlock {
-    if has then return stage1(b, n)
+# probing).
+fn bias_stage<size N>(tensor<f32, [N]> ∪ none maybe_b, int n) → tensor.NumericBlock {
+    if maybe_b not is none {
+        let tensor<f32, [N]> b ← maybe_b
+        return stage1(b, n)
+    }
 
     return no_bias()
 }
@@ -1021,7 +1012,7 @@ fn cached_model_pass<size D, size V, size Q, size K, size F>(DenseModel<size D, 
         # --- staged bag views of the pinned compute weights -------------
         let list<int, size 2> fwg ← weights.wg.shape()
         let int f ← fwg.get(1) coalesce 1
-        let transformer.DenseAttentionWeights attention_weights ← transformer.DenseAttentionWeights { wq = stage2(weights.wq, hidden, qwidth), bq = bias_stage(weights.has_bq, weights.bq, qwidth), wk = stage2(weights.wk, hidden, kwidth), bk = bias_stage(weights.has_bk, weights.bk, kwidth), wv = stage2(weights.wv, hidden, kwidth), bv = bias_stage(weights.has_bv, weights.bv, kwidth), wo = stage2(weights.wo, qwidth, hidden) }
+        let transformer.DenseAttentionWeights attention_weights ← transformer.DenseAttentionWeights { wq = stage2(weights.wq, hidden, qwidth), bq = bias_stage(weights.bq, qwidth), wk = stage2(weights.wk, hidden, kwidth), bk = bias_stage(weights.bk, kwidth), wv = stage2(weights.wv, hidden, kwidth), bv = bias_stage(weights.bv, kwidth), wo = stage2(weights.wo, qwidth, hidden) }
         let transformer.DenseAttentionConfig attention_config ← transformer.DenseAttentionConfig { num_heads = cfg.heads, num_kv_heads = cfg.kv_heads, scale = scale, rope_dim = rope_dim, rope_config = rope_cfg }
         let transformer.DenseMlpWeights mlp_weights ← transformer.DenseMlpWeights { wg = stage2(weights.wg, hidden, f), bg = no_bias(), wu = stage2(weights.wu, hidden, f), bu = no_bias(), wd = stage2(weights.wd, f, hidden), bd = no_bias() }
         let transformer.DenseNormConfig norm_config ← transformer.DenseNormConfig { ln1_s = stage1(weights.ln1, hidden), ln2_s = stage1(weights.ln2, hidden), epsilon = epsilon }
@@ -1776,6 +1767,28 @@ describe "P71 — pre-loaded model decode keeps the fail-closed cache contract" 
             assert step_m_text(model, 1, 3, pref.layers) ≡ "position must equal the cache length"
             assert step_m_text(model, 1, 0, pref.layers) ≡ "position must equal the cache length"
             assert step_m_text(model, 1, 2, pref.layers) ≡ "ok"
+        }
+        catch err {
+            assert false
+        }
+    }
+    test "model load with present Q/K/V biases preserves optional bias fields and matches resolver decode_step" {
+        let dense.DenseConfig cfg ← dense.DenseConfig { layers = 2, heads = 4, kv_heads = 2, head_dim = 4, hidden_dim = 16, vocab = 8, tied = true }
+        let (string, int) → tensor.NumericBlock ⇥ dense.DenseError biased_source ← (string n, int s) → tensor.NumericBlock ⇥ dense.DenseError ∴ do {
+            if n.ends_with(".self_attn.q_proj.bias") then return tene([0.01, -0.02, 0.03, -0.04, 0.01, -0.02, 0.03, -0.04, 0.01, -0.02, 0.03, -0.04, 0.01, -0.02, 0.03, -0.04], [16])
+            if n.ends_with(".self_attn.k_proj.bias") then return tene([0.02, -0.01, 0.01, -0.02, 0.02, -0.01, 0.01, -0.02], [8])
+            if n.ends_with(".self_attn.v_proj.bias") then return tene([-0.01, 0.02, -0.03, 0.04, -0.01, 0.02, -0.03, 0.04], [8])
+            return repertor(n, s, embed(), norm_s(), w_head(), l0(), l1(), false, false)
+        }
+        do {
+            let dense.DenseModel<16, 8, 16, 8, 16> model ← dense.load<size 16, size 8, size 16, size 8, size 16>(cfg, biased_source)
+            assert model.layers[0].bq not is none
+            assert model.layers[0].bk not is none
+            assert model.layers[0].bv not is none
+            let dense.DenseStep model_step ← step_m(model, 0, 0, empty_p())
+            let dense.DenseStep ref_step ← step_p(cfg, biased_source, 0, 0, empty_p())
+            assert e2(model_step.logits, 0, 0).approx(e2(ref_step.logits, 0, 0), TOLERATIO)
+            assert e2(model_step.logits, 0, 7).approx(e2(ref_step.logits, 0, 7), TOLERATIO)
         }
         catch err {
             assert false
