@@ -195,7 +195,7 @@ fn identity_equal(Identity a, Identity b) → bool {
 
     if a.version ≢ b.version then return false
 
-    if a.dtype_name() ≢ b.dtype_name() then return false
+    if not dtype.eq(a.dtype, b.dtype) then return false
 
     if not (a.shape ≡ b.shape) then return false
 
@@ -378,7 +378,7 @@ fn find_alias_target(list<Parameter> parameters, list<string> alias) → Paramet
 }
 
 fn tie_compatible(Parameter canonical, Parameter aliased) → bool {
-    return canonical.dtype_name() ≡ aliased.dtype_name() and canonical.shape() ≡ aliased.shape() and status_is_frozen(canonical.status) ≡ status_is_frozen(aliased.status)
+    return dtype.eq(canonical.identity.dtype, aliased.identity.dtype) and canonical.shape() ≡ aliased.shape() and status_is_frozen(canonical.status) ≡ status_is_frozen(aliased.status)
 }
 
 fn parameters_without(list<Parameter> parameters, Parameter excluded) → list<Parameter> {
@@ -434,24 +434,8 @@ fn ties_aliased(list<list<string>> ties) → list<list<string>> {
     return next
 }
 
-# Identity membership over a raw slot list (the from_parameters batch
-# admission below; the Registry.contains method needs a Registry).
-fn slots_contain(list<Parameter> parameters, string owner, string name) → bool {
-    for from parameters let p {
-        if p.owner() ≡ owner and p.name() ≡ name then return true
-    }
-
-    return false
-}
-
-# Identity membership over parallel owner/name lists (the replace_all
-# batch admission — canonical identities already stripped off slots).
-fn slots_contain_named(list<string> owners, list<string> names, string owner, string name) → bool {
-    for range 0 ‥ owners.length() let i {
-        if owners.get(i) coalesce "" ≡ owner and names.get(i) coalesce "" ≡ name then return true
-    }
-
-    return false
+fn identity_key(string owner, string name) → string {
+    return "§/§"(owner, name)
 }
 
 # -------------------------------------------------------------------------
@@ -585,46 +569,71 @@ class Registry {
     # Batch replace (issue #80): swap in a list of already-updated
     # parameters (as produced by mutate / optimize.step) in ONE registry
     # rebuild — repeated replace calls rebuilt the slot list per update,
-    # making a training step O(P^2) in deep payload copies. Each entry
-    # must resolve to a registered slot (a tied alias addresses its
-    # canonical slot), must not be frozen, must carry exactly the
-    # successor version of the current slot (the mutate contract), and
-    # the batch itself must not repeat an identity. Ties pass through
-    # unchanged.
+    # making a training step O(P^2) in deep payload copies. Builds O(P)
+    # slot and alias index maps so validation and slot swaps run in
+    # O(P + U) instead of O(P^2) scans. Each entry must resolve to a
+    # registered slot (a tied alias addresses its canonical slot), must
+    # not be frozen, must carry exactly the successor version of the
+    # current slot (the mutate contract), and the batch itself must not
+    # repeat an identity. Ties pass through unchanged.
     fn replace_all(list<Parameter> updated) → Registry ⇥ ParameterError {
-        # Canonical identity per batch entry (a tied alias resolves to its
-        # canonical slot — the single replace rule); the same list is the
-        # duplicate admission and the slot-swap key.
-        mut list<string> batch_owners ← empty
-        mut list<string> batch_names ← empty
+        mut map<string, int> slot_idx ← empty
+        mut int idx ← 0
+
+        for from self.parameters let p {
+            slot_idx.put(identity_key(p.owner(), p.name()), idx)
+            idx ← idx + 1
+        }
+
+        mut map<string, int> alias_idx ← empty
+
+        for from self.ties let alias {
+            let int target_pos ← slot_idx.get(identity_key(alias.get(2) coalesce "", alias.get(3) coalesce "")) coalesce (-1)
+
+            if target_pos ≥ 0 {
+                alias_idx.put(identity_key(alias.get(0) coalesce "", alias.get(1) coalesce ""), target_pos)
+            }
+        }
+
+        mut set<string> batch_seen ← empty
+        mut list<int> target_indices ← empty
+        mut list<Parameter> normalized ← empty
 
         for from updated let u {
-            let Parameter current ← self.find(u.owner(), u.name())
+            let string key ← identity_key(u.owner(), u.name())
+            mut int resolved_pos ← slot_idx.get(key) coalesce (-1)
 
-            reject slots_contain_named(batch_owners, batch_names, current.owner(), current.name()) throw variant DuplicateName { message = "duplicate parameter identity in batch replace" }
+            if resolved_pos ≺ 0 {
+                resolved_pos ← alias_idx.get(key) coalesce (-1)
+            }
+
+            require resolved_pos ≥ 0 throw variant UnknownName { message = "no parameter with that identity" }
+
+            let Parameter current ← self.parameters.get(resolved_pos) coalesce default()
+            let string canon_key ← identity_key(current.owner(), current.name())
+
+            reject canon_key ∈ batch_seen throw variant DuplicateName { message = "duplicate parameter identity in batch replace" }
 
             reject is_frozen(current) throw variant FrozenMutation { message = "frozen parameter cannot be mutated" }
 
             reject u.version() ≢ current.version() + 1 throw variant StaleVersion { message = "stale parameter version" }
 
-            batch_owners.append(current.owner())
-            batch_names.append(current.name())
+            batch_seen.add(canon_key)
+            target_indices.append(resolved_pos)
+
+            if u.owner() ≢ current.owner() or u.name() ≢ current.name() {
+                normalized.append(Parameter { identity = Identity { name = current.name(), dtype = u.identity.dtype, shape = u.shape(), version = u.version(), owner = current.owner() }, status = u.status, payload = u.payload })
+            }
+            else {
+                normalized.append(u)
+            }
         }
 
         mut list<Parameter> next ← slots_aliased(self.parameters)
 
-        for range 0 ‥ batch_owners.length() let k {
-            let string owner ← batch_owners.get(k) coalesce ""
-            let string name ← batch_names.get(k) coalesce ""
-            let Parameter u ← updated.get(k) coalesce default()
-
-            for range 0 ‥ next.length() let i {
-                let Parameter candidate ← next.get(i) coalesce default()
-
-                if candidate.owner() ≡ owner and candidate.name() ≡ name {
-                    next[i] ← u
-                }
-            }
+        for range 0 ‥ target_indices.length() let k {
+            let int pos ← target_indices.get(k) coalesce 0
+            next[pos] ← normalized.get(k) coalesce default()
         }
 
         return Registry { parameters = next, ties = ties_aliased(self.ties) }
@@ -654,14 +663,18 @@ fn add(Registry r, Parameter p) → Registry ⇥ ParameterError {
 # Build a registry from a parameter list in one pass (issue #80): the
 # repeated add route rebuilt (and deep-copied) the accumulating slot list
 # per entry — O(P^2) over model assembly. Duplicate identities reject
-# exactly as add does; the result carries no ties.
+# in O(P) via a set keyed on (owner, name); the result carries no ties.
 @ public
 fn from_parameters(list<Parameter> parameters) → Registry ⇥ ParameterError {
     mut list<Parameter> slots ← empty
+    mut set<string> seen ← empty
 
     for from parameters let p {
-        reject slots_contain(slots, p.owner(), p.name()) throw variant DuplicateName { message = "parameter identity already registered" }
+        let string key ← identity_key(p.owner(), p.name())
 
+        reject key ∈ seen throw variant DuplicateName { message = "parameter identity already registered" }
+
+        seen.add(key)
         slots.append(p)
     }
 
@@ -1392,6 +1405,29 @@ test "replace_all rejects non-successor versions, frozen slots, and batch duplic
         assert replace_all_result(r, [w2, w2]) ≡ "duplicate parameter identity in batch replace"
     }
     match trap_result_replace_all_rejects {
+        case returned let ? { }
+        case thrown let ? { assert false }
+    }
+}
+
+test "replace_all resolves tied aliases and rejects duplicate canonical+alias updates" {
+    let _ trap_result_replace_all_tie ← trap {
+        let parameter.Parameter shared ← parameter.construct("embedding", "model", "f32", [2], [1.0, 2.0])
+        let parameter.Parameter decoder ← parameter.construct("decoder", "model", "f32", [2], [1.0, 2.0])
+        let parameter.Registry r0 ← parameter.from_parameters([shared, decoder])
+        let parameter.Registry tied ← r0.tie("model", "embedding", "model", "decoder")
+        let parameter.Parameter alias_u ← parameter.mutate(decoder, [3.0, 4.0], decoder.version())
+        let parameter.Registry updated ← tied.replace_all([alias_u])
+        let parameter.Parameter after ← updated.find("model", "embedding")
+        let parameter.Parameter after_alias ← updated.find("model", "decoder")
+        assert after.version() ≡ 2
+        assert after_alias.version() ≡ 2
+        assert get_f32(after, 0) ≡ 3.0 ∷ f32
+        assert get_f32(after_alias, 0) ≡ 3.0 ∷ f32
+        let parameter.Parameter canon_u ← parameter.mutate(shared, [5.0, 6.0], shared.version())
+        assert replace_all_result(tied, [canon_u, alias_u]) ≡ "duplicate parameter identity in batch replace"
+    }
+    match trap_result_replace_all_tie {
         case returned let ? { }
         case thrown let ? { assert false }
     }

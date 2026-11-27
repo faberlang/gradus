@@ -30,12 +30,13 @@ import from "gradus:model/qwen35moe_state/full_attn"
 # exempla/qwen35moe-layer-probe (per-layer oracle agreement).
 
 import from "gradus:model/qwen35moe" let qwen35moe
-import from "gradus:tensor" let tensor
 import from "gradus:model/qwen35moe_state/schedule" let schedule
 import from "gradus:model/qwen35moe_state/session" let session
 import from "gradus:model/qwen35moe_state/linear_attn" let linear_attn
 import from "gradus:model/qwen35moe_state/full_attn" let full_attn
 import from "gradus:model/schedule" let model_schedule
+import from "gradus:cache/session" let sess_mod
+import from "gradus:cache/hybrid_arenas" let hybrid
 
 # Synthetic configurations mirroring the frozen qwen35moe row (41 blocks)
 # and the two local 40-block rows (no NextN block), so schedule derivation
@@ -178,13 +179,11 @@ fn mid_carrier_shape(string name) → list<int> {
     return [1]
 }
 
-fn mid_window(string name, int start, int length) → tensor.NumericBlock ⇥ schedule.Qwen35moeStateError {
-    do {
-        return tensor.construct(fill(length, 7), mid_carrier_shape(name))
-    }
-    catch err {
-        throw variant BadWindow {message = "mid-row synthetic carrier failed"}
-    }
+fn mid_window(string name, int start, int length) → list<f32> ⇥ schedule.Qwen35moeStateError {
+    let list<int> shape ← mid_carrier_shape(name)
+    let int expected ← shape.reduce((int acc, int d) ∴ acc * d, 1)
+    require length ≡ expected throw variant BadWindow {message = "mid-row synthetic carrier length mismatch"}
+    return fill(length, 7)
 }
 
 fn pinned_config() → qwen35moe.Qwen35moeConfig {
@@ -193,49 +192,6 @@ fn pinned_config() → qwen35moe.Qwen35moeConfig {
 
 fn heretic_config() → qwen35moe.Qwen35moeConfig {
     return config(40, 0)
-}
-
-# Minimal config for hand-computed recurrence rows: a 1-head, 2x2-cell
-# recurrent state so the delta rule can be asserted cell by cell. All other
-# fields mirror the pinned row (fresh_recurrent_state reads only
-# gradus_temporis and state_size).
-fn small_config() → qwen35moe.Qwen35moeConfig {
-    return qwen35moe.Qwen35moeConfig {
-        architecture = "qwen35moe",
-        file_type = 15,
-        quantization_version = 2,
-        block_count = 41,
-        context_length = 262144,
-        embedding_length = 2048,
-        head_count = 16,
-        head_count_kv = 2,
-        key_length = 256,
-        value_length = 256,
-        rms_norm_epsilon = 0.000001 ∷ f32,
-        freq_base = 10000000.0 ∷ f32,
-        rope_dimension_count = 64,
-        rope_sections = [11, 11, 10, 0],
-        expert_count = 256,
-        expert_used_count = 8,
-        expert_ffn_length = 512,
-        shared_ffn_length = 512,
-        conv_kernel = 4,
-        state_size = 2,
-        group_count = 16,
-        gradus_temporis = 1,
-        inner_size = 4096,
-        full_attention_interval = 4,
-        nextn_predict_layers = 1,
-        tokenizer_model = "gpt2",
-        tokenizer_pre = "qwen35",
-        token_count = 248320,
-        token_type_count = 248320,
-        merge_count = 247587,
-        eos_token_id = 248046,
-        padding_token_id = 248055,
-        bos_token_id = 248044,
-        add_bos_token = false
-    }
 }
 
 # Deterministic synthetic weights: a fixed pseudo-random row derived from
@@ -326,13 +282,11 @@ fn length_of(string name) → int {
     return 1
 }
 
-fn synthetic_window(string name, int start, int length) → tensor.NumericBlock ⇥ schedule.Qwen35moeStateError {
-    do {
-        return tensor.construct(fill(length, 7), carrier_shape(name))
-    }
-    catch err {
-        throw variant BadWindow {message = "synthetic carrier failed"}
-    }
+fn synthetic_window(string name, int start, int length) → list<f32> ⇥ schedule.Qwen35moeStateError {
+    let list<int> shape ← carrier_shape(name)
+    let int expected ← shape.reduce((int acc, int d) ∴ acc * d, 1)
+    require length ≡ expected throw variant BadWindow {message = "synthetic carrier length mismatch"}
+    return fill(length, 7)
 }
 
 fn kind_name(schedule.Qwen35moeSchedule s, int block) → string {
@@ -418,32 +372,73 @@ test "schedule bounds fail closed" {
     }
 }
 
+fn exec_schedule(qwen35moe.Qwen35moeConfig c) → model_schedule.ExecutionSchedule ⇥ schedule.Qwen35moeStateError {
+    return schedule.to_execution_schedule(schedule.schedule(c), c.rope_sections)
+}
+
+fn test_conv<size ConvRows, size ConvCh>(model_schedule.ExecutionSchedule es) → hybrid.ConvStateArena<size ConvRows, size ConvCh> ⇥ schedule.Qwen35moeStateError {
+    do {
+        return hybrid.conv_from_schedule<size ConvRows, size ConvCh>(es, 1, 3, false)
+    }
+    catch err {
+        throw variant BadState {message = err.message}
+    }
+}
+
+fn test_rec<size RecRows, size RecCols>(model_schedule.ExecutionSchedule es) → hybrid.RecurrentStateArena<size RecRows, size RecCols> ⇥ schedule.Qwen35moeStateError {
+    do {
+        return hybrid.recurrent_from_schedule<size RecRows, size RecCols>(es)
+    }
+    catch err {
+        throw variant BadState {message = err.message}
+    }
+}
+
+fn test_rec_drafter<size RecRows, size RecCols>() → hybrid.RecurrentStateArena<size RecRows, size RecCols> ⇥ schedule.Qwen35moeStateError {
+    do {
+        return hybrid.recurrent_for_drafter<size RecRows, size RecCols>(1, 0)
+    }
+    catch err {
+        throw variant BadState {message = err.message}
+    }
+}
+
+fn test_kv<size C, size W, size KVD>(model_schedule.ExecutionSchedule es) → sess_mod.SessionState<size C, size W, size KVD> ⇥ schedule.Qwen35moeStateError {
+    do {
+        return sess_mod.from_schedule<size C, size W, size KVD>(es)
+    }
+    catch err {
+        throw variant BadState {message = err.message}
+    }
+}
+
 test "fresh state values are empty and typed per family" {
     do {
-    let qwen35moe.Qwen35moeConfig c ← pinned_config()
-    let session.ConvState conv ← session.fresh_conv_state(c)
-    assert conv.kernel ≡ 3
-    assert conv.channels_count ≡ 8192
-    assert conv.channels.length() ≡ 3 * 8192
-    for range 0‥conv.channels.length() let i {
-        assert conv.channels.get(i) coalesce 1.0 ∷ f32 ≡ 0.0 ∷ f32
-    }
-    let session.RecurrentState recurrent ← session.fresh_recurrent_state(c)
-    assert recurrent.value_heads ≡ 32
-    assert recurrent.key_dim ≡ 128
-    assert recurrent.value_dim ≡ 128
-    assert recurrent.cells.length() ≡ 32 * 128 * 128
-    for range 0‥recurrent.cells.length() let i {
-        assert recurrent.cells.get(i) coalesce 1.0 ∷ f32 ≡ 0.0 ∷ f32
-    }
-    let session.KeyValueState kv ← session.fresh_kv_state(c, 16)
-    assert kv.kv_heads ≡ 2
-    assert kv.key_dim ≡ 256
-    assert kv.value_dim ≡ 256
-    assert kv.length ≡ 0
-    assert kv.capacity ≡ 16
-    assert kv.keys.length() ≡ 0
-    assert kv.values.length() ≡ 0
+        let qwen35moe.Qwen35moeConfig c ← config(4, 0)
+        let model_schedule.ExecutionSchedule es ← exec_schedule(c)
+        let hybrid.ConvStateArena<3, 8192> conv ← test_conv<size 3, size 8192>(es)
+        assert conv.history_len ≡ 3
+        assert conv.channels ≡ 8192
+        assert conv.slot_ids.length() ≡ 3
+        for exclusive 3 let r {
+            for exclusive 8192 let ch {
+                assert conv.buffers[0][[r, ch]] ≡ 0.0 ∷ f32
+            }
+        }
+        let hybrid.RecurrentStateArena<4096, 128> recurrent ← test_rec<size 4096, size 128>(es)
+        assert recurrent.rows ≡ 32 * 128
+        assert recurrent.cols ≡ 128
+        assert recurrent.slot_ids.length() ≡ 3
+        for exclusive 16 let r {
+            for exclusive 128 let col {
+                assert recurrent.states[0][[r, col]] ≡ 0.0 ∷ f32
+            }
+        }
+        let sess_mod.SessionState<16, 1, 512> kv ← test_kv<size 16, size 1, size 512>(es)
+        assert kv.full_kv.capacity ≡ 16
+        assert kv.full_kv.kv_dim ≡ 512
+        assert kv.full_kv.lengths.length() ≡ 1
+        assert kv.full_kv.lengths[0] ≡ 0
     }
     catch err {
         assert false
@@ -452,14 +447,15 @@ test "fresh state values are empty and typed per family" {
 
 test "state families stay separate and equality is family-wise" {
     do {
-    let qwen35moe.Qwen35moeConfig c ← pinned_config()
-    let session.ConvState a ← session.fresh_conv_state(c)
-    let session.ConvState b ← session.fresh_conv_state(c)
-    assert session.conv_equal(a, b)
-    let session.RecurrentState r ← session.fresh_recurrent_state(c)
-    let session.KeyValueState kv ← session.fresh_kv_state(c, 4)
-    assert session.recurrent_equal(r, r)
-    assert session.kv_equal(kv, kv)
+        let qwen35moe.Qwen35moeConfig c ← mid_config()
+        let model_schedule.ExecutionSchedule es ← exec_schedule(c)
+        let hybrid.ConvStateArena<3, 256> ca ← test_conv<size 3, size 256>(es)
+        let hybrid.ConvStateArena<3, 256> cb ← test_conv<size 3, size 256>(es)
+        assert session.conv_arena_equal<size 3, size 256>(ca, cb)
+        let hybrid.RecurrentStateArena<128, 16> r ← test_rec<size 128, size 16>(es)
+        let sess_mod.SessionState<8, 1, 512> kv ← test_kv<size 8, size 1, size 512>(es)
+        assert session.recurrent_arena_equal<size 128, size 16>(r, r)
+        assert session.session_kv_equal<size 8, size 1, size 512>(kv, kv)
     }
     catch err {
         assert false
@@ -521,26 +517,25 @@ test "rope rotation preserves pair norms over the multi-section series" {
 }
 
 test "the delta rule core matches a hand-computed 2-cell update" {
-    let qwen35moe.Qwen35moeConfig c ← small_config()
-    let session.RecurrentState s0 ← session.fresh_recurrent_state(c)
     let list<f32> q ← [1.0 ∷ f32, 0.0 ∷ f32]
     let list<f32> k ← [0.0 ∷ f32, 1.0 ∷ f32]
     let list<f32> v ← [2.0 ∷ f32, 4.0 ∷ f32]
     do {
-    let session.RecurrentState s1 ← session.recurrent_update(s0, q, k, v, 0.0 ∷ f32, 1.0 ∷ f32, 0)
-    # Zero state, g = 0, beta = 1: delta = v, so the state becomes
-    # M[j][i] = k[i] * v[j] (cell (j, i) = S[i][j] — the comparator's
-    # transposed layout, ggml_compute_forward_gated_delta_net).
-    assert (s1.cells.get(0 * 2 + 0) coalesce 9.0 ∷ f32) ≡ 0.0 ∷ f32
-    assert (s1.cells.get(0 * 2 + 1) coalesce 9.0 ∷ f32) ≡ 2.0 ∷ f32
-    assert (s1.cells.get(1 * 2 + 0) coalesce 9.0 ∷ f32) ≡ 0.0 ∷ f32
-    assert (s1.cells.get(1 * 2 + 1) coalesce 9.0 ∷ f32) ≡ 4.0 ∷ f32
-    # Output read: out[j] = (Σ_i M[j][i] * q[i]) / sqrt(dim). With the
-    # declared q = [1, 0] the read is degenerate (k·q = 0), so exercise the
-    # row read with a q parallel to k: out = [2, 4] / sqrt(2).
-    let list<f32> out ← session.recurrent_output(s1, [0.0 ∷ f32, 1.0 ∷ f32], 0)
-    assert ((out.get(0) coalesce 9.0 ∷ f32) - 2.0 * (0.7071067811865476 ∷ f32)).abs() ≺ 0.000001 ∷ f32
-    assert ((out.get(1) coalesce 9.0 ∷ f32) - 4.0 * (0.7071067811865476 ∷ f32)).abs() ≺ 0.000001 ∷ f32
+        mut hybrid.RecurrentStateArena<2, 2> rec ← test_rec_drafter<size 2, size 2>()
+        let list<f32> ? ← linear_attn.delta_step_slot<size 2, size 2>(mut rec, 0, q, k, v, 0.0 ∷ f32, 1.0 ∷ f32, 0)
+        # Zero state, g = 0, beta = 1: delta = v, so the state becomes
+        # M[j][i] = k[i] * v[j] (cell (j, i) = S[i][j] — the comparator's
+        # transposed layout, ggml_compute_forward_gated_delta_net).
+        assert rec.states[0][[0, 0]] ≡ 0.0 ∷ f32
+        assert rec.states[0][[0, 1]] ≡ 2.0 ∷ f32
+        assert rec.states[0][[1, 0]] ≡ 0.0 ∷ f32
+        assert rec.states[0][[1, 1]] ≡ 4.0 ∷ f32
+        # Output read: out[j] = (Σ_i M[j][i] * q[i]) / sqrt(dim). With the
+        # declared q = [1, 0] the read is degenerate (k·q = 0), so exercise the
+        # row read with a q parallel to k: out = [2, 4] / sqrt(2).
+        let list<f32> out ← linear_attn.recurrent_readout_slot<size 2, size 2>(rec, 0, [0.0 ∷ f32, 1.0 ∷ f32], 0)
+        assert ((out.get(0) coalesce 9.0 ∷ f32) - 2.0 * (0.7071067811865476 ∷ f32)).abs() ≺ 0.000001 ∷ f32
+        assert ((out.get(1) coalesce 9.0 ∷ f32) - 4.0 * (0.7071067811865476 ∷ f32)).abs() ≺ 0.000001 ∷ f32
     }
     catch err {
         assert false
@@ -552,33 +547,34 @@ test "linear attention prefill equals incremental one-token steps" {
     let int embd ← mid_embd()
     let list<f32> rows ← fill(3 * embd, 11)
     do {
-    let linear_attn.LinearAttentionOutcome batch ← linear_attn.linear_attention(rows, 0, session.fresh_conv_state(c), session.fresh_recurrent_state(c), (string name, int start, int length) → tensor.NumericBlock ⇥ schedule.Qwen35moeStateError ∴ mid_window(name, start, length), c)
-    mut session.ConvState conv ← session.fresh_conv_state(c)
-    mut session.RecurrentState recurrent ← session.fresh_recurrent_state(c)
-    mut list<f32> outputs ← empty
-    for range 0‥3 let t {
-        mut list<f32> one ← empty
-        for range 0‥embd let d {
-            one.append(rows.get(t * embd + d) coalesce 0.0 ∷ f32)
+        let model_schedule.ExecutionSchedule es ← exec_schedule(c)
+        mut hybrid.ConvStateArena<3, 256> conv_batch ← test_conv<size 3, size 256>(es)
+        mut hybrid.RecurrentStateArena<128, 16> rec_batch ← test_rec<size 128, size 16>(es)
+        let linear_attn.LinearAttentionOutcome batch ← linear_attn.linear_attention<size 3, size 256, size 128, size 16>(rows, 0, mut conv_batch, mut rec_batch, 0, (string name, int start, int length) → list<f32> ⇥ schedule.Qwen35moeStateError ∴ mid_window(name, start, length), c)
+        mut hybrid.ConvStateArena<3, 256> conv ← test_conv<size 3, size 256>(es)
+        mut hybrid.RecurrentStateArena<128, 16> recurrent ← test_rec<size 128, size 16>(es)
+        mut list<f32> outputs ← empty
+        for range 0‥3 let t {
+            mut list<f32> one ← empty
+            for range 0‥embd let d {
+                one.append(rows.get(t * embd + d) coalesce 0.0 ∷ f32)
+            }
+            let linear_attn.LinearAttentionOutcome step ← linear_attn.linear_attention_step<size 3, size 256, size 128, size 16>(one, 0, mut conv, mut recurrent, 0, (string name, int start, int length) → list<f32> ⇥ schedule.Qwen35moeStateError ∴ mid_window(name, start, length), c)
+            for range 0‥embd let d {
+                outputs.append(step.out.get(d) coalesce 0.0 ∷ f32)
+            }
         }
-        let linear_attn.LinearAttentionOutcome step ← linear_attn.linear_attention_step(one, 0, conv, recurrent, (string name, int start, int length) → tensor.NumericBlock ⇥ schedule.Qwen35moeStateError ∴ mid_window(name, start, length), c)
-        conv ← step.conv
-        recurrent ← step.recurrent
-        for range 0‥embd let d {
-            outputs.append(step.out.get(d) coalesce 0.0 ∷ f32)
+        assert batch.out.length() ≡ outputs.length()
+        mut f32 worst ← 0.0 ∷ f32
+        for range 0‥outputs.length() let i {
+            let f32 d ← ((batch.out.get(i) coalesce 0.0 ∷ f32) - (outputs.get(i) coalesce 0.0 ∷ f32)).abs()
+            if d ≻ worst {
+                worst ← d
+            }
         }
-    }
-    assert batch.out.length() ≡ outputs.length()
-    mut f32 worst ← 0.0 ∷ f32
-    for range 0‥outputs.length() let i {
-        let f32 d ← ((batch.out.get(i) coalesce 0.0 ∷ f32) - (outputs.get(i) coalesce 0.0 ∷ f32)).abs()
-        if d ≻ worst {
-            worst ← d
-        }
-    }
-    assert worst ≺ 0.000001 ∷ f32
-    assert session.conv_equal(batch.conv, conv)
-    assert session.recurrent_equal(batch.recurrent, recurrent)
+        assert worst ≺ 0.000001 ∷ f32
+        assert session.conv_arena_equal<size 3, size 256>(conv_batch, conv)
+        assert session.recurrent_arena_equal<size 128, size 16>(rec_batch, recurrent)
     }
     catch err {
         assert false
@@ -589,31 +585,32 @@ test "full attention prefill equals incremental one-token steps" {
     let qwen35moe.Qwen35moeConfig c ← pinned_config()
     let list<f32> rows ← fill(3 * 2048, 13)
     do {
-    let full_attn.FullAttentionOutcome batch ← full_attn.full_attention(rows, 3, session.fresh_kv_state(c, 8), 0, (string name, int start, int length) → tensor.NumericBlock ⇥ schedule.Qwen35moeStateError ∴ synthetic_window(name, start, length), c)
-    mut session.KeyValueState kv ← session.fresh_kv_state(c, 8)
-    mut list<f32> outputs ← empty
-    for range 0‥3 let t {
-        mut list<f32> one ← empty
-        for range 0‥2048 let d {
-            one.append(rows.get(t * 2048 + d) coalesce 0.0 ∷ f32)
+        let model_schedule.ExecutionSchedule es ← exec_schedule(c)
+        mut sess_mod.SessionState<8, 1, 512> kv_batch ← test_kv<size 8, size 1, size 512>(es)
+        let full_attn.FullAttentionOutcome batch ← full_attn.full_attention<size 8, size 1, size 512>(rows, 3, mut kv_batch, 3, 0, (string name, int start, int length) → list<f32> ⇥ schedule.Qwen35moeStateError ∴ synthetic_window(name, start, length), c)
+        mut sess_mod.SessionState<8, 1, 512> kv ← test_kv<size 8, size 1, size 512>(es)
+        mut list<f32> outputs ← empty
+        for range 0‥3 let t {
+            mut list<f32> one ← empty
+            for range 0‥2048 let d {
+                one.append(rows.get(t * 2048 + d) coalesce 0.0 ∷ f32)
+            }
+            let full_attn.FullAttentionOutcome step ← full_attn.full_attention_step<size 8, size 1, size 512>(one, 3, mut kv, 3, t, (string name, int start, int length) → list<f32> ⇥ schedule.Qwen35moeStateError ∴ synthetic_window(name, start, length), c)
+            for range 0‥2048 let d {
+                outputs.append(step.out.get(d) coalesce 0.0 ∷ f32)
+            }
         }
-        let full_attn.FullAttentionOutcome step ← full_attn.full_attention_step(one, 3, kv, t, (string name, int start, int length) → tensor.NumericBlock ⇥ schedule.Qwen35moeStateError ∴ synthetic_window(name, start, length), c)
-        kv ← step.kv
-        for range 0‥2048 let d {
-            outputs.append(step.out.get(d) coalesce 0.0 ∷ f32)
+        assert batch.out.length() ≡ 3 * 2048
+        assert batch.out.length() ≡ outputs.length()
+        mut f32 worst ← 0.0 ∷ f32
+        for range 0‥outputs.length() let i {
+            let f32 d ← ((batch.out.get(i) coalesce 0.0 ∷ f32) - (outputs.get(i) coalesce 0.0 ∷ f32)).abs()
+            if d ≻ worst {
+                worst ← d
+            }
         }
-    }
-    assert batch.out.length() ≡ 3 * 2048
-    assert batch.out.length() ≡ outputs.length()
-    mut f32 worst ← 0.0 ∷ f32
-    for range 0‥outputs.length() let i {
-        let f32 d ← ((batch.out.get(i) coalesce 0.0 ∷ f32) - (outputs.get(i) coalesce 0.0 ∷ f32)).abs()
-        if d ≻ worst {
-            worst ← d
-        }
-    }
-    assert worst ≺ 0.000001 ∷ f32
-    assert session.kv_equal(batch.kv, kv)
+        assert worst ≺ 0.000001 ∷ f32
+        assert session.session_kv_equal<size 8, size 1, size 512>(kv_batch, kv)
     }
     catch err {
         assert false
@@ -625,11 +622,16 @@ test "replay is deterministic across fresh sessions" {
     let int embd ← mid_embd()
     let list<f32> rows ← fill(embd, 17)
     do {
-    let linear_attn.LinearAttentionOutcome first ← linear_attn.linear_attention_step(rows, 0, session.fresh_conv_state(c), session.fresh_recurrent_state(c), (string name, int start, int length) → tensor.NumericBlock ⇥ schedule.Qwen35moeStateError ∴ mid_window(name, start, length), c)
-    let linear_attn.LinearAttentionOutcome second ← linear_attn.linear_attention_step(rows, 0, session.fresh_conv_state(c), session.fresh_recurrent_state(c), (string name, int start, int length) → tensor.NumericBlock ⇥ schedule.Qwen35moeStateError ∴ mid_window(name, start, length), c)
-    assert first.out ≡ second.out
-    assert session.conv_equal(first.conv, second.conv)
-    assert session.recurrent_equal(first.recurrent, second.recurrent)
+        let model_schedule.ExecutionSchedule es ← exec_schedule(c)
+        mut hybrid.ConvStateArena<3, 256> conv1 ← test_conv<size 3, size 256>(es)
+        mut hybrid.RecurrentStateArena<128, 16> rec1 ← test_rec<size 128, size 16>(es)
+        let linear_attn.LinearAttentionOutcome first ← linear_attn.linear_attention_step<size 3, size 256, size 128, size 16>(rows, 0, mut conv1, mut rec1, 0, (string name, int start, int length) → list<f32> ⇥ schedule.Qwen35moeStateError ∴ mid_window(name, start, length), c)
+        mut hybrid.ConvStateArena<3, 256> conv2 ← test_conv<size 3, size 256>(es)
+        mut hybrid.RecurrentStateArena<128, 16> rec2 ← test_rec<size 128, size 16>(es)
+        let linear_attn.LinearAttentionOutcome second ← linear_attn.linear_attention_step<size 3, size 256, size 128, size 16>(rows, 0, mut conv2, mut rec2, 0, (string name, int start, int length) → list<f32> ⇥ schedule.Qwen35moeStateError ∴ mid_window(name, start, length), c)
+        assert first.out ≡ second.out
+        assert session.conv_arena_equal<size 3, size 256>(conv1, conv2)
+        assert session.recurrent_arena_equal<size 128, size 16>(rec1, rec2)
     }
     catch err {
         assert false
@@ -731,13 +733,11 @@ fn mid_full_carrier_shape(string name) → list<int> {
     return [1]
 }
 
-fn mid_full_window(string name, int start, int length) → tensor.NumericBlock ⇥ schedule.Qwen35moeStateError {
-    do {
-        return tensor.construct(fill(length, 7), mid_full_carrier_shape(name))
-    }
-    catch err {
-        throw variant BadWindow {message = "mid-row synthetic carrier failed"}
-    }
+fn mid_full_window(string name, int start, int length) → list<f32> ⇥ schedule.Qwen35moeStateError {
+    let list<int> shape ← mid_full_carrier_shape(name)
+    let int expected ← shape.reduce((int acc, int d) ∴ acc * d, 1)
+    require length ≡ expected throw variant BadWindow {message = "mid-row synthetic carrier length mismatch"}
+    return fill(length, 7)
 }
 
 # Issue #79 lean-path rows: the prepared entry points read and validate the
@@ -748,18 +748,63 @@ test "linear attention prepared matches the traced path without trace buffers" {
     let int embd ← mid_embd()
     let list<f32> rows ← fill(embd, 19)
     do {
-    let linear_attn.LinearAttentionOutcome traced ← linear_attn.linear_attention_step(rows, 0, session.fresh_conv_state(c), session.fresh_recurrent_state(c), (string name, int start, int length) → tensor.NumericBlock ⇥ schedule.Qwen35moeStateError ∴ mid_window(name, start, length), c)
-    let linear_attn.LinearAttentionWeights weights ← linear_attn.prepare_linear_attention((string name, int start, int length) → tensor.NumericBlock ⇥ schedule.Qwen35moeStateError ∴ mid_window(name, start, length), 0, c)
-    let linear_attn.LinearAttentionOutcome lean ← linear_attn.linear_attention_step_prepared(rows, session.fresh_conv_state(c), session.fresh_recurrent_state(c), weights, c)
-    assert lean.out ≡ traced.out
-    assert session.conv_equal(lean.conv, traced.conv)
-    assert session.recurrent_equal(lean.recurrent, traced.recurrent)
-    assert lean.trace.normed.length() ≡ 0
-    assert lean.trace.qkv_mixed.length() ≡ 0
-    assert lean.trace.core_out.length() ≡ 0
-    assert lean.trace.final_output.length() ≡ 0
-    assert traced.trace.normed.length() ≡ embd
-    assert traced.trace.core_out.length() ≡ 8 * 16
+        let model_schedule.ExecutionSchedule es ← exec_schedule(c)
+        mut hybrid.ConvStateArena<3, 256> conv_traced ← test_conv<size 3, size 256>(es)
+        mut hybrid.RecurrentStateArena<128, 16> rec_traced ← test_rec<size 128, size 16>(es)
+        let linear_attn.LinearAttentionOutcome traced ← linear_attn.linear_attention_step<size 3, size 256, size 128, size 16>(rows, 0, mut conv_traced, mut rec_traced, 0, (string name, int start, int length) → list<f32> ⇥ schedule.Qwen35moeStateError ∴ mid_window(name, start, length), c)
+        let linear_attn.LinearAttentionWeights weights ← linear_attn.prepare_linear_attention((string name, int start, int length) → list<f32> ⇥ schedule.Qwen35moeStateError ∴ mid_window(name, start, length), 0, c)
+        mut hybrid.ConvStateArena<3, 256> conv_lean ← test_conv<size 3, size 256>(es)
+        mut hybrid.RecurrentStateArena<128, 16> rec_lean ← test_rec<size 128, size 16>(es)
+        let linear_attn.LinearAttentionOutcome lean ← linear_attn.linear_attention_step_prepared<size 3, size 256, size 128, size 16>(rows, mut conv_lean, mut rec_lean, 0, weights, c)
+        assert lean.out ≡ traced.out
+        assert session.conv_arena_equal<size 3, size 256>(conv_lean, conv_traced)
+        assert session.recurrent_arena_equal<size 128, size 16>(rec_lean, rec_traced)
+        assert lean.trace.normed.length() ≡ 0
+        assert lean.trace.qkv_mixed.length() ≡ 0
+        assert lean.trace.core_out.length() ≡ 0
+        assert lean.trace.final_output.length() ≡ 0
+        assert traced.trace.normed.length() ≡ embd
+        assert traced.trace.core_out.length() ≡ 8 * 16
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "linear attention prepared matches traced across sub-history and full-history batches" {
+    let qwen35moe.Qwen35moeConfig c ← mid_config()
+    let int embd ← mid_embd()
+    let list<f32> batch2 ← fill(2 * embd, 31)
+    let list<f32> batch5 ← fill(5 * embd, 37)
+    let list<f32> step1 ← fill(embd, 41)
+    do {
+        let model_schedule.ExecutionSchedule es ← exec_schedule(c)
+        let linear_attn.LinearAttentionWeights weights ← linear_attn.prepare_linear_attention((string name, int start, int length) → list<f32> ⇥ schedule.Qwen35moeStateError ∴ mid_window(name, start, length), 0, c)
+
+        mut hybrid.ConvStateArena<3, 256> conv_traced ← test_conv<size 3, size 256>(es)
+        mut hybrid.RecurrentStateArena<128, 16> rec_traced ← test_rec<size 128, size 16>(es)
+        mut hybrid.ConvStateArena<3, 256> conv_lean ← test_conv<size 3, size 256>(es)
+        mut hybrid.RecurrentStateArena<128, 16> rec_lean ← test_rec<size 128, size 16>(es)
+
+        let linear_attn.LinearAttentionOutcome traced2 ← linear_attn.linear_attention<size 3, size 256, size 128, size 16>(batch2, 0, mut conv_traced, mut rec_traced, 0, (string name, int start, int length) → list<f32> ⇥ schedule.Qwen35moeStateError ∴ mid_window(name, start, length), c)
+        let linear_attn.LinearAttentionOutcome lean2 ← linear_attn.linear_attention_prepared<size 3, size 256, size 128, size 16>(batch2, mut conv_lean, mut rec_lean, 0, weights, c)
+        assert lean2.out ≡ traced2.out
+        assert session.conv_arena_equal<size 3, size 256>(conv_lean, conv_traced)
+        assert session.recurrent_arena_equal<size 128, size 16>(rec_lean, rec_traced)
+
+        let linear_attn.LinearAttentionOutcome traced5 ← linear_attn.linear_attention<size 3, size 256, size 128, size 16>(batch5, 0, mut conv_traced, mut rec_traced, 0, (string name, int start, int length) → list<f32> ⇥ schedule.Qwen35moeStateError ∴ mid_window(name, start, length), c)
+        let linear_attn.LinearAttentionOutcome lean5 ← linear_attn.linear_attention_prepared<size 3, size 256, size 128, size 16>(batch5, mut conv_lean, mut rec_lean, 0, weights, c)
+        assert lean5.out ≡ traced5.out
+        assert session.conv_arena_equal<size 3, size 256>(conv_lean, conv_traced)
+        assert session.recurrent_arena_equal<size 128, size 16>(rec_lean, rec_traced)
+
+        let linear_attn.LinearAttentionOutcome traced1 ← linear_attn.linear_attention_step<size 3, size 256, size 128, size 16>(step1, 0, mut conv_traced, mut rec_traced, 0, (string name, int start, int length) → list<f32> ⇥ schedule.Qwen35moeStateError ∴ mid_window(name, start, length), c)
+        let linear_attn.LinearAttentionOutcome lean1 ← linear_attn.linear_attention_step_prepared<size 3, size 256, size 128, size 16>(step1, mut conv_lean, mut rec_lean, 0, weights, c)
+        assert lean1.out ≡ traced1.out
+        assert lean1.trace.conv_input.length() ≡ 0
+        assert lean1.trace.q_conv.length() ≡ 0
+        assert session.conv_arena_equal<size 3, size 256>(conv_lean, conv_traced)
+        assert session.recurrent_arena_equal<size 128, size 16>(rec_lean, rec_traced)
     }
     catch err {
         assert false
@@ -770,17 +815,20 @@ test "full attention prepared matches the traced path without trace buffers" {
     let qwen35moe.Qwen35moeConfig c ← mid_full_config()
     let list<f32> rows ← fill(2 * 64, 23)
     do {
-    let full_attn.FullAttentionOutcome traced ← full_attn.full_attention(rows, 3, session.fresh_kv_state(c, 8), 0, (string name, int start, int length) → tensor.NumericBlock ⇥ schedule.Qwen35moeStateError ∴ mid_full_window(name, start, length), c)
-    let full_attn.FullAttentionWeights weights ← full_attn.prepare_full_attention((string name, int start, int length) → tensor.NumericBlock ⇥ schedule.Qwen35moeStateError ∴ mid_full_window(name, start, length), 3, c)
-    let full_attn.FullAttentionOutcome lean ← full_attn.full_attention_prepared(rows, session.fresh_kv_state(c, 8), 0, weights, c)
-    assert lean.out ≡ traced.out
-    assert session.kv_equal(lean.kv, traced.kv)
-    assert lean.trace.normed.length() ≡ 0
-    assert lean.trace.q_normed.length() ≡ 0
-    assert lean.trace.k_normed.length() ≡ 0
-    assert lean.trace.softmax.length() ≡ 0
-    assert traced.trace.softmax.length() ≡ 2 * 4 * 2
-    assert traced.trace.q_normed.length() ≡ 2 * 4 * 32
+        let model_schedule.ExecutionSchedule es ← exec_schedule(c)
+        mut sess_mod.SessionState<8, 1, 64> kv_traced ← test_kv<size 8, size 1, size 64>(es)
+        let full_attn.FullAttentionOutcome traced ← full_attn.full_attention<size 8, size 1, size 64>(rows, 3, mut kv_traced, 3, 0, (string name, int start, int length) → list<f32> ⇥ schedule.Qwen35moeStateError ∴ mid_full_window(name, start, length), c)
+        let full_attn.FullAttentionWeights weights ← full_attn.prepare_full_attention((string name, int start, int length) → list<f32> ⇥ schedule.Qwen35moeStateError ∴ mid_full_window(name, start, length), 3, c)
+        mut sess_mod.SessionState<8, 1, 64> kv_lean ← test_kv<size 8, size 1, size 64>(es)
+        let full_attn.FullAttentionOutcome lean ← full_attn.full_attention_prepared<size 8, size 1, size 64>(rows, mut kv_lean, 3, 0, weights, c)
+        assert lean.out ≡ traced.out
+        assert session.session_kv_equal<size 8, size 1, size 64>(kv_lean, kv_traced)
+        assert lean.trace.normed.length() ≡ 0
+        assert lean.trace.q_normed.length() ≡ 0
+        assert lean.trace.k_normed.length() ≡ 0
+        assert lean.trace.softmax.length() ≡ 0
+        assert traced.trace.softmax.length() ≡ 2 * 4 * 2
+        assert traced.trace.q_normed.length() ≡ 2 * 4 * 32
     }
     catch err {
         assert false

@@ -2,15 +2,15 @@
 locale = "en"
 
 +++ faber
-# Full-attention path with KV state for qwen35moe hybrid layers.
+# Full-attention path with SessionState FullKvArena for qwen35moe hybrid layers.
 #
 # Public import: import from "gradus:model/qwen35moe_state/full_attn" full_attn
-# Depends on: schedule, session, qwen35moe, tensor.
+# Depends on: schedule, session, qwen35moe, gradus:cache/session, gradus:dtype.
 
 import from "gradus:model/qwen35moe_state/schedule" let schedule
 import from "gradus:model/qwen35moe_state/session" let session
 import from "gradus:model/qwen35moe" let qwen35moe
-import from "gradus:tensor" let tensor
+import from "gradus:cache/session" let sess_mod
 import from "gradus:dtype" let dtype
 
 # -------------------------------------------------------------------------
@@ -43,29 +43,28 @@ class FullAttentionTrace {
 class FullAttentionOutcome {
     mut FullAttentionTrace trace
     mut list<f32> out
-    mut session.KeyValueState kv
 }
 
 # Load-time-prepared full-attention weights (issue #79): every weight
-# window is read, shape-checked, and finiteness-validated once here —
+# window is read, length-checked, and finiteness-validated once here —
 # never per decode token. The lean prepared entry points below consume
 # this record and touch no weight source.
 @ public
 class FullAttentionWeights {
-    mut tensor.NumericBlock attn_norm
-    mut tensor.NumericBlock wq
-    mut tensor.NumericBlock wk
-    mut tensor.NumericBlock wv
-    mut tensor.NumericBlock q_norm
-    mut tensor.NumericBlock k_norm
-    mut tensor.NumericBlock wo
+    mut list<f32> attn_norm
+    mut list<f32> wq
+    mut list<f32> wk
+    mut list<f32> wv
+    mut list<f32> q_norm
+    mut list<f32> k_norm
+    mut list<f32> wo
 }
 
 # Read and validate the whole full-attention weight set once. The window
 # order matches the traced entry point's read order, so the first
 # diverging window fails with the same diagnostic either way.
 @ public
-fn prepare_full_attention((string, int, int) → tensor.NumericBlock ⇥ schedule.Qwen35moeStateError source, int layer, qwen35moe.Qwen35moeConfig c) → FullAttentionWeights ⇥ schedule.Qwen35moeStateError {
+fn prepare_full_attention((string, int, int) → list<f32> ⇥ schedule.Qwen35moeStateError source, int layer, qwen35moe.Qwen35moeConfig c) → FullAttentionWeights ⇥ schedule.Qwen35moeStateError {
     require layer ≥ 0 throw variant BadConfig {message = "layer index must be non-negative"}
     require c.rope_sections.length() ≥ 4 throw variant BadShape {message = "rope needs four section lengths"}
     let int embd ← c.embedding_length
@@ -73,64 +72,99 @@ fn prepare_full_attention((string, int, int) → tensor.NumericBlock ⇥ schedul
     let int kv_width ← c.head_count_kv * c.key_length
     let int head_dim ← c.key_length
     let string p ← session.prefix(layer)
-    let tensor.NumericBlock attn_norm ← session.window(source, p + ".attn_norm", 0, embd, [embd])
-    let tensor.NumericBlock wq ← session.window(source, p + ".attn_q", 0, 2 * q_width * embd, [2 * q_width, embd])
-    let tensor.NumericBlock wk ← session.window(source, p + ".attn_k", 0, kv_width * embd, [kv_width, embd])
-    let tensor.NumericBlock wv ← session.window(source, p + ".attn_v", 0, kv_width * embd, [kv_width, embd])
-    let tensor.NumericBlock q_norm ← session.window(source, p + ".attn_q_norm", 0, head_dim, [head_dim])
-    let tensor.NumericBlock k_norm ← session.window(source, p + ".attn_k_norm", 0, head_dim, [head_dim])
-    let tensor.NumericBlock wo ← session.window(source, p + ".attn_output", 0, embd * q_width, [embd, q_width])
+    let list<f32> attn_norm ← session.window(source, p + ".attn_norm", 0, embd)
+    let list<f32> wq ← session.window(source, p + ".attn_q", 0, 2 * q_width * embd)
+    let list<f32> wk ← session.window(source, p + ".attn_k", 0, kv_width * embd)
+    let list<f32> wv ← session.window(source, p + ".attn_v", 0, kv_width * embd)
+    let list<f32> q_norm ← session.window(source, p + ".attn_q_norm", 0, head_dim)
+    let list<f32> k_norm ← session.window(source, p + ".attn_k_norm", 0, head_dim)
+    let list<f32> wo ← session.window(source, p + ".attn_output", 0, embd * q_width)
     return FullAttentionWeights {attn_norm = attn_norm, wq = wq, wk = wk, wv = wv, q_norm = q_norm, k_norm = k_norm, wo = wo}
+}
+
+# RMSNorm + RoPE over one head slice in a flat projection output, sharing a
+# single pre-allocated `head_buf` and the per-token `rope_angles` table.
+fn norm_and_rope_head(list<f32> src, int src_base, list<f32> norm_w, list<f32> rope_angles, int head_dim, int rope_dims, f32 eps, bool capture, mut list<f32> head_buf, mut list<f32> normed_out, mut list<f32> rope_out) → void {
+    mut f32 sum ← 0.0
+    for range 0‥head_dim let d {
+        let f32 v ← src[src_base + d]
+        sum ← sum + v * v
+    }
+    let f32 scale ← 1.0 / (√ (sum / (head_dim ↦ f32) + eps))
+    for range 0‥head_dim let d {
+        let f32 nv ← src[src_base + d] * scale * norm_w[d]
+        head_buf[d] ← nv
+        if capture {
+            normed_out.append(nv)
+        }
+    }
+    let int half ← rope_dims / 2
+    for range 0‥head_dim let i {
+        if i ≺ half {
+            let f32 x0 ← head_buf[i]
+            let f32 x1 ← head_buf[i + half]
+            rope_out.append(x0 * rope_angles[i * 2] - x1 * rope_angles[i * 2 + 1])
+        }
+        elif i ≺ rope_dims {
+            let int pair ← i - half
+            let f32 x0 ← head_buf[pair]
+            let f32 x1 ← head_buf[pair + half]
+            rope_out.append(x0 * rope_angles[pair * 2 + 1] + x1 * rope_angles[pair * 2])
+        }
+        else {
+            rope_out.append(head_buf[i])
+        }
+    }
 }
 
 # Run one full-attention layer over T input rows [T][2048] starting at
 # absolute position start_pos: attn_norm -> joint Q/gate projection ->
 # per-head Q RMSNorm -> K/V projections with per-kv-head K RMSNorm ->
 # multi-section RoPE on Q/K -> causal softmax attention over the carried KV
-# state -> sigmoid output gate -> output projection -> residual add. The KV
-# state appends exactly T positions (one per token) in order. `capture`
-# gates only the diagnostic trace buffers (including the [T][H][kv_len]
-# softmax weights): the compute path and every float operation are
-# identical either way (issue #79). The RoPE angle table is built once per
-# token and shared by every Q/K head of that token.
-fn full_attention_core(list<f32> x_rows, session.KeyValueState kv_in, int start_pos, FullAttentionWeights weights, qwen35moe.Qwen35moeConfig c, bool capture) → FullAttentionOutcome ⇥ schedule.Qwen35moeStateError {
+# arena slot -> sigmoid output gate -> output projection -> residual add.
+# The KV arena slot appends exactly T positions (one per token) in order.
+# `capture` gates only the diagnostic trace buffers (including the
+# [T][H][kv_len] softmax weights): the compute path and every float
+# operation are identical either way (issue #79). The RoPE angle table is
+# built once per token and shared by every Q/K head of that token.
+fn full_attention_core<size C, size W, size KVD>(list<f32> x_rows, mut sess_mod.SessionState<size C, size W, size KVD> sess, int slot_id, int start_pos, FullAttentionWeights weights, qwen35moe.Qwen35moeConfig c, bool capture) → FullAttentionOutcome ⇥ schedule.Qwen35moeStateError {
     let int tokens ← x_rows.length() / c.embedding_length
-    # --- window gates (fail closed) ---------------------------------------
-    require tokens ≥ 1 and x_rows.length() ≡ tokens * c.embedding_length throw variant BadShape {message = "full attention input rows must be [T][embedding]"}
-    require start_pos ≡ kv_in.length throw variant BadState {message = "positions must continue the kv state exactly"}
-    require kv_in.length + tokens ≤ kv_in.capacity throw variant BadState {message = "kv state window exceeds capacity"}
     let int embd ← c.embedding_length
     let int heads ← c.head_count
     let int kv_heads ← c.head_count_kv
     let int head_dim ← c.key_length
     let int q_width ← heads * head_dim
     let int kv_width ← kv_heads * head_dim
-    let int kv_len ← kv_in.length + tokens
+    let int rope_dims ← c.rope_dimension_count
+    # --- window gates (fail closed) ---------------------------------------
+    require tokens ≥ 1 and x_rows.length() ≡ tokens * c.embedding_length throw variant BadShape {message = "full attention input rows must be [T][embedding]"}
+    require embd ≥ 1 and heads ≥ 1 and kv_heads ≥ 1 and head_dim ≥ 1 and heads % kv_heads ≡ 0 throw variant BadShape {message = "invalid full attention head geometry"}
+    require rope_dims ≥ 2 and rope_dims % 2 ≡ 0 and rope_dims ≤ head_dim throw variant BadShape {message = "invalid rope dimensions"}
+    require sess.txn_depth ≡ 0 throw variant BadState {message = "kv session has an open transaction"}
+    require slot_id ≥ 0 and slot_id ≺ sess.slot_arena_kind.length() throw variant BadState {message = "kv slot_id out of range"}
+    require sess.slot_arena_kind[slot_id] ≡ 0 throw variant BadState {message = "slot is not a FullKv arena"}
+    let int local_idx ← sess.slot_local_index[slot_id]
+    let int kv_cur_len ← sess.full_kv.lengths[local_idx]
+    require start_pos ≡ kv_cur_len throw variant BadState {message = "positions must continue the kv state exactly"}
+    require kv_cur_len + tokens ≤ C throw variant BadState {message = "kv state window exceeds capacity"}
+    require kv_width ≡ KVD throw variant BadShape {message = "kv width must match SessionState KVD"}
+    let int kv_len ← kv_cur_len + tokens
 
     # --- weights (validated at read: prepare once, or per traced call) ----
-    let tensor.NumericBlock attn_norm ← weights.attn_norm
-    let tensor.NumericBlock wq ← weights.wq
-    let tensor.NumericBlock wk ← weights.wk
-    let tensor.NumericBlock wv ← weights.wv
-    let tensor.NumericBlock q_norm ← weights.q_norm
-    let tensor.NumericBlock k_norm ← weights.k_norm
-    let tensor.NumericBlock wo ← weights.wo
+    let list<f32> attn_norm ← weights.attn_norm
+    let list<f32> wq ← weights.wq
+    let list<f32> wk ← weights.wk
+    let list<f32> wv ← weights.wv
+    let list<f32> q_norm ← weights.q_norm
+    let list<f32> k_norm ← weights.k_norm
+    let list<f32> wo ← weights.wo
+    require attn_norm.length() ≡ embd and q_norm.length() ≡ head_dim and k_norm.length() ≡ head_dim throw variant BadShape {message = "full attention norm weight length mismatch"}
 
     # --- attn_norm + projections ------------------------------------------
-    mut list<f32> normed_rows ← empty
-    for range 0‥tokens let t {
-        mut list<f32> row ← empty
-        for range 0‥embd let d {
-            row.append(x_rows.get(t * embd + d) coalesce 0.0)
-        }
-        let list<f32> normed ← session.rms_norm_row(row, attn_norm.data, c.rms_norm_epsilon)
-        for from normed let v {
-            normed_rows.append(v)
-        }
-    }
-    let list<f32> q_full_rows ← session.gemm_rows(wq, normed_rows, embd, 2 * q_width, tokens)
-    let list<f32> k_rows ← session.gemm_rows(wk, normed_rows, embd, kv_width, tokens)
-    let list<f32> v_rows ← session.gemm_rows(wv, normed_rows, embd, kv_width, tokens)
+    let list<f32> normed_rows ← session.rms_norm_rows(x_rows, attn_norm, embd, tokens, c.rms_norm_epsilon)
+    let list<f32> q_full_rows ← session.project_rows(wq, normed_rows, embd, 2 * q_width, tokens)
+    let list<f32> k_rows ← session.project_rows(wk, normed_rows, embd, kv_width, tokens)
+    let list<f32> v_rows ← session.project_rows(wv, normed_rows, embd, kv_width, tokens)
 
     # --- per-head Q/K/V views ---------------------------------------------
     # Q head h occupies [512h, 512h + 256), its gate the next 256; K/V per
@@ -142,48 +176,49 @@ fn full_attention_core(list<f32> x_rows, session.KeyValueState kv_in, int start_
     mut list<f32> v_heads ← empty
     mut list<f32> q_normed_rows ← empty
     mut list<f32> k_normed_rows ← empty
+    mut list<f32> head_buf ← empty
+    for range 0‥head_dim {
+        head_buf.append(0.0 ∷ f32)
+    }
     for range 0‥tokens let t {
-        let list<f32> rope_angles ← session.rope_table(c.freq_base, c.rope_dimension_count, start_pos + t)
+        let list<f32> rope_angles ← session.rope_table(c.freq_base, rope_dims, start_pos + t)
+        let int q_tbase ← t * 2 * q_width
         for range 0‥heads let h {
-            mut list<f32> qhead ← empty
+            let int q_base ← q_tbase + h * 2 * head_dim
+            norm_and_rope_head(q_full_rows, q_base, q_norm, rope_angles, head_dim, rope_dims, c.rms_norm_epsilon, capture, mut head_buf, mut q_normed_rows, mut q_heads)
+            let int g_base ← q_base + head_dim
             for range 0‥head_dim let d {
-                qhead.append(q_full_rows.get(t * 2 * q_width + h * 2 * head_dim + d) coalesce 0.0)
-            }
-            let list<f32> normed ← session.rms_norm_row(qhead, q_norm.data, c.rms_norm_epsilon)
-            let list<f32> turned ← session.rope_head_table(normed, rope_angles, c.rope_dimension_count, head_dim)
-            if capture {
-                q_normed_rows.extend(normed)
-            }
-            q_heads.extend(turned)
-            for range 0‥head_dim let d {
-                gate_rows.append(q_full_rows.get(t * 2 * q_width + h * 2 * head_dim + head_dim + d) coalesce 0.0)
+                gate_rows.append(q_full_rows[g_base + d])
             }
         }
+        let int kv_tbase ← t * kv_width
         for range 0‥kv_heads let g {
-            mut list<f32> khead ← empty
-            for range 0‥head_dim let d {
-                khead.append(k_rows.get(t * kv_width + g * head_dim + d) coalesce 0.0)
-            }
-            let list<f32> normed ← session.rms_norm_row(khead, k_norm.data, c.rms_norm_epsilon)
-            let list<f32> turned ← session.rope_head_table(normed, rope_angles, c.rope_dimension_count, head_dim)
+            let int kv_base ← kv_tbase + g * head_dim
+            norm_and_rope_head(k_rows, kv_base, k_norm, rope_angles, head_dim, rope_dims, c.rms_norm_epsilon, capture, mut head_buf, mut k_normed_rows, mut k_heads)
             if capture {
-                k_normed_rows.extend(normed)
-            }
-            k_heads.extend(turned)
-            for range 0‥head_dim let d {
-                v_heads.append(v_rows.get(t * kv_width + g * head_dim + d) coalesce 0.0 ∷ f32)
+                for range 0‥head_dim let d {
+                    v_heads.append(v_rows[kv_base + d])
+                }
             }
         }
     }
 
-    # --- KV append: the T new positions join the state in order -----------
-    mut list<f32> keys ← empty
-    keys.extend(kv_in.keys)
-    keys.extend(k_heads)
-    mut list<f32> values ← empty
-    values.extend(kv_in.values)
-    values.extend(v_heads)
-    let session.KeyValueState kv_out ← session.KeyValueState {keys = keys, values = values, kv_heads = kv_heads, key_dim = kv_in.key_dim, value_dim = kv_in.value_dim, capacity = kv_in.capacity, length = kv_len}
+    # --- KV append: the T new positions join the arena slot in order ------
+    mut tensor<f32, [C, KVD]> keys ← sess.full_kv.keys[local_idx]
+    mut tensor<f32, [C, KVD]> values ← sess.full_kv.values[local_idx]
+    for range 0‥tokens let t {
+        let int t_off ← t * kv_width
+        for range 0‥kv_width let c_idx {
+            keys[[start_pos + t, c_idx]] ← k_heads[t_off + c_idx]
+            values[[start_pos + t, c_idx]] ← v_rows[t_off + c_idx]
+        }
+    }
+    sess.full_kv.keys[local_idx] ← keys
+    sess.full_kv.values[local_idx] ← values
+    sess.full_kv.lengths[local_idx] ← kv_len
+
+    let tensor<f32, [C, KVD]> ro_keys ← sess.full_kv.keys[local_idx]
+    let tensor<f32, [C, KVD]> ro_values ← sess.full_kv.values[local_idx]
 
     # --- causal softmax attention -----------------------------------------
     # Query t attends positions 0..start_pos + t with the 1/sqrt(head_dim)
@@ -194,14 +229,17 @@ fn full_attention_core(list<f32> x_rows, session.KeyValueState kv_in, int start_
     mut list<f32> softmax_rows ← empty
     for range 0‥tokens let t {
         let int attend ← start_pos + t + 1
+        let int qt_base ← t * q_width
         for range 0‥heads let h {
             let int kvh ← h / heads_per_kv
+            let int q_base ← qt_base + h * head_dim
+            let int kv_base ← kvh * head_dim
             mut list<f32> scores ← empty
             mut f32 maximum ← 0.0
             for range 0‥attend let i {
                 mut f32 dot ← 0.0
                 for range 0‥head_dim let d {
-                    dot ← dot + (q_heads.get(t * q_width + h * head_dim + d) coalesce 0.0) * (keys.get(i * kv_width + kvh * head_dim + d) coalesce 0.0)
+                    dot ← dot + q_heads[q_base + d] * ro_keys[[i, kv_base + d]]
                 }
                 let f32 score ← dot * kq_scale
                 if i ≡ 0 or score ≻ maximum {
@@ -209,21 +247,19 @@ fn full_attention_core(list<f32> x_rows, session.KeyValueState kv_in, int start_
                 }
                 scores.append(score)
             }
-            mut list<f32> exponents ← empty
             mut f32 total ← 0.0
             for range 0‥attend let i {
-                let f32 e ← ((scores.get(i) coalesce 0.0) - maximum).exp()
-                exponents.append(e)
+                let f32 e ← (scores[i] - maximum).exp()
+                scores[i] ← e
                 total ← total + e
             }
             require total ≻ 0.0 throw variant schedule.Qwen35moeStateError.NonFinite {message = "attention softmax normalizer collapsed"}
-            mut list<f32> norm_weights ← empty
             for range 0‥attend let i {
-                norm_weights.append((exponents.get(i) coalesce 0.0) / total)
+                scores[i] ← scores[i] / total
             }
             if capture {
                 for range 0‥attend let i {
-                    softmax_rows.append(norm_weights.get(i) coalesce 0.0)
+                    softmax_rows.append(scores[i])
                 }
                 for range attend‥kv_len {
                     softmax_rows.append(0.0)
@@ -232,7 +268,7 @@ fn full_attention_core(list<f32> x_rows, session.KeyValueState kv_in, int start_
             for range 0‥head_dim let d {
                 mut f32 sum ← 0.0
                 for range 0‥attend let i {
-                    sum ← sum + (norm_weights.get(i) coalesce 0.0) * (values.get(i * kv_width + kvh * head_dim + d) coalesce 0.0)
+                    sum ← sum + scores[i] * ro_values[[i, kv_base + d]]
                 }
                 pregate_rows.append(sum)
             }
@@ -242,23 +278,23 @@ fn full_attention_core(list<f32> x_rows, session.KeyValueState kv_in, int start_
     # --- sigmoid gate, output projection, residual add --------------------
     mut list<f32> gated_rows ← empty
     for range 0‥tokens * q_width let i {
-        gated_rows.append((pregate_rows.get(i) coalesce 0.0) * session.sigmoid(gate_rows.get(i) coalesce 0.0))
+        gated_rows.append(pregate_rows[i] * session.sigmoid(gate_rows[i]))
     }
-    let list<f32> projected ← session.gemm_rows(wo, gated_rows, q_width, embd, tokens)
+    let list<f32> projected ← session.project_rows(wo, gated_rows, q_width, embd, tokens)
     mut list<f32> out_rows ← empty
     for range 0‥tokens * embd let i {
-        let f32 v ← projected.get(i) coalesce 0.0 ∷ f32
+        let f32 v ← projected[i]
         require dtype.finite(v) throw variant schedule.Qwen35moeStateError.NonFinite {message = "full attention output is non-finite"}
-        out_rows.append(v + (x_rows.get(i) coalesce 0.0 ∷ f32))
+        out_rows.append(v + x_rows[i])
     }
     if not capture {
         # Lean decode route: no diagnostic trace buffers are allocated
         # (issue #79) — in particular the [T][H][kv_len] softmax weight
         # buffer and the pre-RoPE Q/K norm snapshots are skipped.
-        return FullAttentionOutcome {trace = FullAttentionTrace {normed = empty, q_full = empty, q_normed = empty, k_normed = empty, gate = empty, q_rope = empty, k_rope = empty, v = empty, softmax = empty, pregate = empty, gated = empty}, out = out_rows, kv = kv_out}
+        return FullAttentionOutcome {trace = FullAttentionTrace {normed = empty, q_full = empty, q_normed = empty, k_normed = empty, gate = empty, q_rope = empty, k_rope = empty, v = empty, softmax = empty, pregate = empty, gated = empty}, out = out_rows}
     }
     let FullAttentionTrace trace ← FullAttentionTrace {normed = normed_rows, q_full = q_full_rows, q_normed = q_normed_rows, k_normed = k_normed_rows, gate = gate_rows, q_rope = q_heads, k_rope = k_heads, v = v_heads, softmax = softmax_rows, pregate = pregate_rows, gated = gated_rows}
-    return FullAttentionOutcome {trace = trace, out = out_rows, kv = kv_out}
+    return FullAttentionOutcome {trace = trace, out = out_rows}
 }
 
 # Traced form (the oracle/diagnostic route): reads and validates every
@@ -267,33 +303,38 @@ fn full_attention_core(list<f32> x_rows, session.KeyValueState kv_in, int start_
 # order matches the historical entry point: input shape, layer index,
 # kv continuation, kv capacity, then weight windows.
 @ public
-fn full_attention(list<f32> x_rows, int layer, session.KeyValueState kv_in, int start_pos, (string, int, int) → tensor.NumericBlock ⇥ schedule.Qwen35moeStateError source, qwen35moe.Qwen35moeConfig c) → FullAttentionOutcome ⇥ schedule.Qwen35moeStateError {
+fn full_attention<size C, size W, size KVD>(list<f32> x_rows, int layer, mut sess_mod.SessionState<size C, size W, size KVD> sess, int slot_id, int start_pos, (string, int, int) → list<f32> ⇥ schedule.Qwen35moeStateError source, qwen35moe.Qwen35moeConfig c) → FullAttentionOutcome ⇥ schedule.Qwen35moeStateError {
     let int tokens ← x_rows.length() / c.embedding_length
     require tokens ≥ 1 and x_rows.length() ≡ tokens * c.embedding_length throw variant BadShape {message = "full attention input rows must be [T][embedding]"}
     require layer ≥ 0 throw variant BadConfig {message = "layer index must be non-negative"}
-    require start_pos ≡ kv_in.length throw variant BadState {message = "positions must continue the kv state exactly"}
-    require kv_in.length + tokens ≤ kv_in.capacity throw variant BadState {message = "kv state window exceeds capacity"}
+    require sess.txn_depth ≡ 0 throw variant BadState {message = "kv session has an open transaction"}
+    require slot_id ≥ 0 and slot_id ≺ sess.slot_arena_kind.length() throw variant BadState {message = "kv slot_id out of range"}
+    require sess.slot_arena_kind[slot_id] ≡ 0 throw variant BadState {message = "slot is not a FullKv arena"}
+    let int local_idx ← sess.slot_local_index[slot_id]
+    let int kv_cur_len ← sess.full_kv.lengths[local_idx]
+    require start_pos ≡ kv_cur_len throw variant BadState {message = "positions must continue the kv state exactly"}
+    require kv_cur_len + tokens ≤ C throw variant BadState {message = "kv state window exceeds capacity"}
     let FullAttentionWeights weights ← prepare_full_attention(source, layer, c)
-    return full_attention_core(x_rows, kv_in, start_pos, weights, c, true)
+    return full_attention_core<size C, size W, size KVD>(x_rows, mut sess, slot_id, start_pos, weights, c, true)
 }
 
 # One-token incremental form (F5's decode side; the KV append is exactly
 # one position).
 @ public
-fn full_attention_step(list<f32> x_row, int layer, session.KeyValueState kv_in, int pos, (string, int, int) → tensor.NumericBlock ⇥ schedule.Qwen35moeStateError source, qwen35moe.Qwen35moeConfig c) → FullAttentionOutcome ⇥ schedule.Qwen35moeStateError {
-    return full_attention(x_row, layer, kv_in, pos, source, c)
+fn full_attention_step<size C, size W, size KVD>(list<f32> x_row, int layer, mut sess_mod.SessionState<size C, size W, size KVD> sess, int slot_id, int pos, (string, int, int) → list<f32> ⇥ schedule.Qwen35moeStateError source, qwen35moe.Qwen35moeConfig c) → FullAttentionOutcome ⇥ schedule.Qwen35moeStateError {
+    return full_attention<size C, size W, size KVD>(x_row, layer, mut sess, slot_id, pos, source, c)
 }
 
 # Lean prepared form (the decode route): consumes the load-time-prepared
 # weight record, re-reads no weight source, re-runs no weight validation,
 # and allocates no trace buffers.
 @ public
-fn full_attention_prepared(list<f32> x_rows, session.KeyValueState kv_in, int start_pos, FullAttentionWeights weights, qwen35moe.Qwen35moeConfig c) → FullAttentionOutcome ⇥ schedule.Qwen35moeStateError {
-    return full_attention_core(x_rows, kv_in, start_pos, weights, c, false)
+fn full_attention_prepared<size C, size W, size KVD>(list<f32> x_rows, mut sess_mod.SessionState<size C, size W, size KVD> sess, int slot_id, int start_pos, FullAttentionWeights weights, qwen35moe.Qwen35moeConfig c) → FullAttentionOutcome ⇥ schedule.Qwen35moeStateError {
+    return full_attention_core<size C, size W, size KVD>(x_rows, mut sess, slot_id, start_pos, weights, c, false)
 }
 
 # One-token lean prepared form (the KV append is exactly one position).
 @ public
-fn full_attention_step_prepared(list<f32> x_row, session.KeyValueState kv_in, int pos, FullAttentionWeights weights, qwen35moe.Qwen35moeConfig c) → FullAttentionOutcome ⇥ schedule.Qwen35moeStateError {
-    return full_attention_prepared(x_row, kv_in, pos, weights, c)
+fn full_attention_step_prepared<size C, size W, size KVD>(list<f32> x_row, mut sess_mod.SessionState<size C, size W, size KVD> sess, int slot_id, int pos, FullAttentionWeights weights, qwen35moe.Qwen35moeConfig c) → FullAttentionOutcome ⇥ schedule.Qwen35moeStateError {
+    return full_attention_prepared<size C, size W, size KVD>(x_row, mut sess, slot_id, pos, weights, c)
 }
