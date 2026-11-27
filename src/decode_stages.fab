@@ -40,19 +40,22 @@ fn norm_rmsnorm<size D>(tensor<f32, [D]> x, tensor<f32, [D]> w, mut tensor<f32, 
 
 # O(dh) per-head Q/K RMSNorm inside a checked `do device` region.
 @ public
-fn norm_qk_heads<size H, size KVH, size QD, size KVD, size DH>(tensor<f32, [QD]> q, tensor<f32, [KVD]> k, tensor<f32, [DH]> q_norm, tensor<f32, [DH]> k_norm, mut tensor<f32, [QD]> qn, mut tensor<f32, [KVD]> kn, mut tensor<f32, [H]> q_inv, mut tensor<f32, [KVH]> k_inv, bool has_qk_norm, f32 eps) → void {
+fn norm_qk_heads<size H, size KVH, size QD, size KVD, size DH>(tensor<f32, [QD]> q, tensor<f32, [KVD]> k, tensor<f32, [DH]> q_norm, tensor<f32, [DH]> k_norm, mut tensor<f32, [QD]> qn, mut tensor<f32, [KVD]> kn, mut tensor<f32, [H]> q_inv, mut tensor<f32, [KVH]> k_inv, f32 eps) → void {
     let i32 dh ← q_norm.length() ↦ i32 ⊥ 1
     do device {
-        if has_qk_norm {
-            dhk.rmsnorm_heads_inv<size H, size QD>(q, mut q_inv, dh, eps)
-            dhk.rmsnorm_heads_apply<size H, size QD, size DH>(q, q_norm, q_inv, mut qn)
-            dhk.rmsnorm_heads_inv<size KVH, size KVD>(k, mut k_inv, dh, eps)
-            dhk.rmsnorm_heads_apply<size KVH, size KVD, size DH>(k, k_norm, k_inv, mut kn)
-        }
-        else {
-            dhk.copy_slice<size QD, size QD>(q, mut qn, 0)
-            dhk.copy_slice<size KVD, size KVD>(k, mut kn, 0)
-        }
+        dhk.rmsnorm_heads_inv<size H, size QD>(q, mut q_inv, dh, eps)
+        dhk.rmsnorm_heads_apply<size H, size QD, size DH>(q, q_norm, q_inv, mut qn)
+        dhk.rmsnorm_heads_inv<size KVH, size KVD>(k, mut k_inv, dh, eps)
+        dhk.rmsnorm_heads_apply<size KVH, size KVD, size DH>(k, k_norm, k_inv, mut kn)
+    }
+}
+
+# Pass-through Q/K copy when QK-norm is absent.
+@ public
+fn copy_qk_heads<size QD, size KVD>(tensor<f32, [QD]> q, tensor<f32, [KVD]> k, mut tensor<f32, [QD]> qn, mut tensor<f32, [KVD]> kn) → void {
+    do device {
+        dhk.copy_slice<size QD, size QD>(q, mut qn, 0)
+        dhk.copy_slice<size KVD, size KVD>(k, mut kn, 0)
     }
 }
 
@@ -282,15 +285,12 @@ fn dense_ffn_stage<size D, size F>(tensor<f32, [D]> h1, mut tensor<f32, [D]> hou
     }
 }
 
-# Routed + optional shared MoE FFN stage inside checked `do device` regions.
 @ public
-fn moe_ffn_stage<size D, size E, size EF, size ED, size K, size FE, size FS>(tensor<f32, [D]> h1, mut tensor<f32, [D]> hout, tensor<f32, [D]> fnorm, tensor<f32, [E, D]> router, tensor<f32, [EF, D]> wg, tensor<f32, [EF, D]> wu, tensor<f32, [ED, FE]> wd, bool has_shared, tensor<f32, [FS, D]> shared_wg, tensor<f32, [FS, D]> shared_wu, tensor<f32, [D, FS]> shared_wd, bool has_shared_gate, tensor<f32, [1, D]> shared_gate_w, mut tensor<i32, [K]> top_idx, f32 eps, bool use_sigmoid_routing) → void {
-    mut tensor<f32, [D]> fnx ← tf32[D] {}
+fn moe_routed_core<size D, size E, size EF, size ED, size K, size FE>(tensor<f32, [D]> h1, tensor<f32, [D]> fnorm, tensor<f32, [E, D]> router, tensor<f32, [EF, D]> wg, tensor<f32, [EF, D]> wu, tensor<f32, [ED, FE]> wd, mut tensor<f32, [D]> fnx, mut tensor<f32, [D]> moe_out, mut tensor<i32, [K]> top_idx, f32 eps, bool use_sigmoid_routing) → void {
     mut tensor<f32, [E]> r_logits ← tf32[E] {}
     mut tensor<f32, [K]> top_vals ← tf32[K] {}
     mut tensor<f32, [K]> top_weights ← tf32[K] {}
     mut tensor<f32, [K, FE]> expert_act ← tf32[K, FE] {}
-    mut tensor<f32, [D]> moe_out ← tf32[D] {}
 
     do device {
         ds.rmsnorm(h1, fnorm, mut fnx, eps)
@@ -305,43 +305,38 @@ fn moe_ffn_stage<size D, size E, size EF, size ED, size K, size FE, size FS>(ten
         dhk.moe_experts_gate_up_swiglu(wg, wu, fnx, top_idx, mut expert_act)
         dhk.moe_experts_down_accum(wd, expert_act, top_idx, top_weights, mut moe_out)
     }
+}
 
-    if has_shared {
-        mut tensor<f32, [FS]> s_gate ← tf32[FS] {}
-        mut tensor<f32, [FS]> s_up ← tf32[FS] {}
-        mut tensor<f32, [FS]> s_act ← tf32[FS] {}
-        mut tensor<f32, [D]> s_out ← tf32[D] {}
-        mut tensor<f32, [D]> ffn_out ← tf32[D] {}
-        mut tensor<f32, [1]> s_gate_logit ← tf32[1] {}
+# Shared SwiGLU FFN projection stage for MoE layers inside a checked `do device` region.
+@ public
+fn moe_shared_ffn_proj<size D, size FS>(tensor<f32, [D]> fnx, tensor<f32, [FS, D]> shared_wg, tensor<f32, [FS, D]> shared_wu, tensor<f32, [D, FS]> shared_wd, mut tensor<f32, [D]> s_out) → void {
+    mut tensor<f32, [FS]> s_gate ← tf32[FS] {}
+    mut tensor<f32, [FS]> s_up ← tf32[FS] {}
+    mut tensor<f32, [FS]> s_act ← tf32[FS] {}
 
-        do device {
-            ds.gate_up_proj(shared_wg, shared_wu, fnx, mut s_gate, mut s_up)
-            ds.swiglu(s_gate, s_up, mut s_act)
-            ds.gemv(shared_wd, s_act, mut s_out)
-
-            if has_shared_gate {
-                ds.gemv(shared_gate_w, fnx, mut s_gate_logit)
-                dhk.sigmoid_gate_add(moe_out, s_out, s_gate_logit, mut ffn_out)
-            }
-            else {
-                ds.residual_add(moe_out, s_out, mut ffn_out)
-            }
-
-            ds.residual_add(h1, ffn_out, mut hout)
-        }
-    }
-    else {
-        do device {
-            ds.residual_add(h1, moe_out, mut hout)
-        }
+    do device {
+        ds.gate_up_proj(shared_wg, shared_wu, fnx, mut s_gate, mut s_up)
+        ds.swiglu(s_gate, s_up, mut s_act)
+        ds.gemv(shared_wd, s_act, mut s_out)
     }
 }
 
-# ExpertBank-validated MoE FFN stage (Seam 2 + Seam 5).
+# Routed-only MoE FFN stage inside a checked `do device` region.
 @ public
-fn moe_expert_bank_ffn_stage<size D, size E, size EF, size ED, size K, size FE, size FS>(eb.ExpertBank bank, tensor<f32, [D]> h1, mut tensor<f32, [D]> hout, tensor<f32, [D]> fnorm, tensor<f32, [E, D]> router, tensor<f32, [EF, D]> wg, tensor<f32, [EF, D]> wu, tensor<f32, [ED, FE]> wd, bool has_shared, tensor<f32, [FS, D]> shared_wg, tensor<f32, [FS, D]> shared_wu, tensor<f32, [D, FS]> shared_wd, bool has_shared_gate, tensor<f32, [1, D]> shared_gate_w, mut tensor<i32, [K]> top_idx, f32 eps, bool use_sigmoid_routing) → void ⇥ eb.ExpertBankError {
+fn moe_ffn_routed_stage<size D, size E, size EF, size ED, size K, size FE>(tensor<f32, [D]> h1, mut tensor<f32, [D]> hout, tensor<f32, [D]> fnorm, tensor<f32, [E, D]> router, tensor<f32, [EF, D]> wg, tensor<f32, [EF, D]> wu, tensor<f32, [ED, FE]> wd, mut tensor<i32, [K]> top_idx, f32 eps, bool use_sigmoid_routing) → void {
+    mut tensor<f32, [D]> fnx ← tf32[D] {}
+    mut tensor<f32, [D]> moe_out ← tf32[D] {}
+    moe_routed_core(h1, fnorm, router, wg, wu, wd, mut fnx, mut moe_out, mut top_idx, eps, use_sigmoid_routing)
+    do device {
+        ds.residual_add(h1, moe_out, mut hout)
+    }
+}
+
+# ExpertBank-validated routed MoE FFN stage (Seam 2 + Seam 5).
+@ public
+fn moe_expert_bank_ffn_stage<size D, size E, size EF, size ED, size K, size FE>(eb.ExpertBank bank, tensor<f32, [D]> h1, mut tensor<f32, [D]> hout, tensor<f32, [D]> fnorm, tensor<f32, [E, D]> router, tensor<f32, [EF, D]> wg, tensor<f32, [EF, D]> wu, tensor<f32, [ED, FE]> wd, mut tensor<i32, [K]> top_idx, f32 eps, bool use_sigmoid_routing) → void ⇥ eb.ExpertBankError {
     require bank.expert_count ≡ E and bank.hidden_size ≡ D and bank.intermediate_size ≡ FE throw variant eb.ExpertBankError.BadShape { message = "ExpertBank extents do not match MoE stage dimensions" }
-    moe_ffn_stage(h1, mut hout, fnorm, router, wg, wu, wd, has_shared, shared_wg, shared_wu, shared_wd, has_shared_gate, shared_gate_w, mut top_idx, eps, use_sigmoid_routing)
+    moe_ffn_routed_stage(h1, mut hout, fnorm, router, wg, wu, wd, mut top_idx, eps, use_sigmoid_routing)
 }
 
 # Quantized GroupAffineU8 ExpertBank MoE FFN stage (Seam 2 + Seam 5, Flint INT4).
@@ -501,7 +496,7 @@ test "decode_stages norm_qk_heads and residual_push_1d execute on device" {
     kn_w[[0]] ← 1.0
     kn_w[[1]] ← 1.0
 
-    stages.norm_qk_heads(q, k, qn_w, kn_w, mut qn, mut kn, mut q_inv, mut k_inv, true, 0.0)
+    stages.norm_qk_heads(q, k, qn_w, kn_w, mut qn, mut kn, mut q_inv, mut k_inv, 0.0)
     assert close(qn[[0]], 0.8485281)
     assert close(qn[[1]], 2.2627417)
     assert close(qn[[2]], 1.0)
@@ -566,11 +561,10 @@ test "decode_stages dense_ffn_stage and moe_expert_bank_ffn_stage execute over E
     mut tensor<f32, [4, 2]> mwg ← tf32[4, 2] {}
     mut tensor<f32, [4, 2]> mwu ← tf32[4, 2] {}
     mut tensor<f32, [4, 2]> mwd ← tf32[4, 2] {}
-    mut tensor<f32, [1, 2]> sgw ← tf32[1, 2] {}
     mut tensor<i32, [1]> top_idx ← tensor<i32, [1]> {}
     mut tensor<f32, [2]> mhout ← tf32[2] {}
     do {
-        stages.moe_expert_bank_ffn_stage(bank, h1, mut mhout, fnorm, router, mwg, mwu, mwd, false, wg, wu, wd, false, sgw, mut top_idx, 0.00001, true)
+        stages.moe_expert_bank_ffn_stage<size 2, size 2, size 4, size 4, size 1, size 2>(bank, h1, mut mhout, fnorm, router, mwg, mwu, mwd, mut top_idx, 0.00001, true)
         assert close(mhout[[0]], 1.0)
         assert close(mhout[[1]], 1.0)
     }
