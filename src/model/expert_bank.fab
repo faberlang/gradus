@@ -442,7 +442,7 @@ fn bind_banked_group_affine(td.DirectoryEntry weight, td.DirectoryEntry scales, 
     let int b_cols ← biases.shape.get(2) coalesce 0
 
     require s_e ≡ expert_count and b_e ≡ expert_count and s_rows ≡ out_features and b_rows ≡ out_features and b_cols ≡ group_cols and group_cols ≥ 1 throw variant BadShape { message = "banked scales/biases shape mismatch against weight" }
-    require scales.raw_dtype ≡ biases.raw_dtype and (scales.raw_dtype ≡ "F32" or scales.raw_dtype ≡ "BF16") throw variant UnsupportedFormat { message = "banked scales/biases dtype must match and be F32 or BF16, got §/§"(scales.raw_dtype, biases.raw_dtype) }
+    require scales.raw_dtype ≡ biases.raw_dtype and (scales.raw_dtype ≡ "F32" or scales.raw_dtype ≡ "BF16" or scales.raw_dtype ≡ "F16") throw variant UnsupportedFormat { message = "banked scales/biases dtype must match and be F32, BF16, or F16, got §/§"(scales.raw_dtype, biases.raw_dtype) }
 
     mut int pack_width ← 32
     mut ga.PackKind ga_pack ← variant ga.PackKind.PackU32
@@ -474,7 +474,13 @@ fn bind_banked_group_affine(td.DirectoryEntry weight, td.DirectoryEntry scales, 
     let int bits_per_group ← total_bits / group_cols
     let BankedAffineGeom geom ← resolve_banked_affine_geom(bits_per_group, is_u8, hint)
     let int in_features ← group_cols * geom.group_size
-    let ga.ScaleDtype sd ← (scales.raw_dtype ≡ "BF16") ✓ variant ga.ScaleDtype.ScaleBf16 ✗ variant ga.ScaleDtype.ScaleF32
+    mut ga.ScaleDtype sd ← variant ga.ScaleDtype.ScaleF32
+    if scales.raw_dtype ≡ "BF16" {
+        sd ← variant ga.ScaleDtype.ScaleBf16
+    }
+    elif scales.raw_dtype ≡ "F16" {
+        sd ← variant ga.ScaleDtype.ScaleF16
+    }
     let ga.GroupAffineSpec spec ← ga.admit_spec_with_scale(out_features, in_features, geom.bits, geom.group_size, ga_pack, sd)
     return BankedMatrixSpec { kind = kind, expert_count = expert_count, out_features = spec.out_features, in_features = spec.in_features, bits = spec.bits, group_size = spec.group_size, packed_cols = spec.packed_cols, group_cols = spec.group_cols, block_rows = 1, block_cols = spec.group_size, pack = bank_pack, scales_dtype = scales.raw_dtype }
 }
@@ -983,6 +989,16 @@ union BankedPayload {
         list<bf16> scales
         list<bf16> biases
     },
+    GroupAffineU32F16BankPayload {
+        list<u32> weight
+        list<f16> scales
+        list<f16> biases
+    },
+    GroupAffineU8F16BankPayload {
+        list<u8> weight
+        list<f16> scales
+        list<f16> biases
+    },
     BlockFp8U8BankPayload {
         list<u8> weight
         list<u8> scales
@@ -1053,7 +1069,7 @@ fn unpack_u8_at(list<u8> weight, int w_base, int j, int bits) → int {
     return (b ⇒ shift) % 16
 }
 
-fn bf16_list_to_f32(list<bf16> items) → list<f32> {
+fn float_list_to_f32<float F>(list<F> items) → list<f32> {
     mut list<f32> out ← empty
     for from items let v {
         out.append(v ↦ f32)
@@ -1205,10 +1221,16 @@ fn ref_expert_matvec_slice(BankedMatrixSpec spec, BankedPayload payload, int exp
             return eval_ga_u8_slice(spec, weight, scales, biases, expert_idx, row_offset, row_count, x)
         }
         case GroupAffineU32Bf16BankPayload let weight, scales, biases {
-            return eval_ga_u32_slice(spec, weight, bf16_list_to_f32(scales), bf16_list_to_f32(biases), expert_idx, row_offset, row_count, x)
+            return eval_ga_u32_slice(spec, weight, float_list_to_f32<bf16>(scales), float_list_to_f32<bf16>(biases), expert_idx, row_offset, row_count, x)
         }
         case GroupAffineU8Bf16BankPayload let weight, scales, biases {
-            return eval_ga_u8_slice(spec, weight, bf16_list_to_f32(scales), bf16_list_to_f32(biases), expert_idx, row_offset, row_count, x)
+            return eval_ga_u8_slice(spec, weight, float_list_to_f32<bf16>(scales), float_list_to_f32<bf16>(biases), expert_idx, row_offset, row_count, x)
+        }
+        case GroupAffineU32F16BankPayload let weight, scales, biases {
+            return eval_ga_u32_slice(spec, weight, float_list_to_f32<f16>(scales), float_list_to_f32<f16>(biases), expert_idx, row_offset, row_count, x)
+        }
+        case GroupAffineU8F16BankPayload let weight, scales, biases {
+            return eval_ga_u8_slice(spec, weight, float_list_to_f32<f16>(scales), float_list_to_f32<f16>(biases), expert_idx, row_offset, row_count, x)
         }
         case BlockFp8U8BankPayload let weight, scales, f32_scales {
             match spec.kind {
@@ -2091,6 +2113,225 @@ kernel routed_expert_matvec_ga_u8_bf16<size E, size Out, size PackedIn, size Gro
 
 @ public
 kernel routed_expert_matmul_ga_u8_bf16<size B, size E, size Out, size PackedIn, size Groups, size In>(tensor<u8, [E, Out, PackedIn]> weight, tensor<bf16, [E, Out, Groups]> scales, tensor<bf16, [E, Out, Groups]> biases, tensor<f32, [B, In]> x, tensor<i32, [B]> expert_indices, mut tensor<f32, [B, Out]> y, i32 bits, i32 group_size) → void {
+    for from y at [bi, rr] thread lane let e {
+        let i32 ee ← expert_indices[[bi]]
+        if group_size ≥ 1 and group_size ≤ 4096 and (bits ≡ 4 or bits ≡ 8) and ee ≥ 0 and ee ≺ E and In ≤ 200000000 {
+            let i32 n_groups ← In / group_size
+            mut f32 acc ← 0.0 ∷ f32
+
+            for exclusive n_groups let g {
+                let f32 s ← scales[[ee, rr, g]] ↦ f32
+                let f32 b ← biases[[ee, rr, g]] ↦ f32
+                let i32 j_base ← g * group_size
+
+                for exclusive group_size let k {
+                    let i32 j ← j_base + k
+                    mut u8 q ← 0 ∷ u8
+                    if bits ≡ 8 {
+                        q ← weight[[ee, rr, j]]
+                    }
+                    else {
+                        let u8 packed ← weight[[ee, rr, j / 2]]
+                        if j % 2 ≡ 0 { q ← packed ∧ (15 ∷ u8) }
+                        else { q ← (packed ⇒ (4 ∷ u8)) ∧ (15 ∷ u8) }
+                    }
+                    let f32 w ← (q ↦ f32) * s + b
+                    acc ← acc + w * x[[bi, j]]
+                }
+            }
+
+            y[[bi, rr]] ← acc
+        }
+    }
+}
+
+
+@ public
+kernel routed_expert_matvec_ga_u32_f16<size E, size Out, size PackedIn, size Groups, size In>(tensor<u32, [E, Out, PackedIn]> weight, tensor<f16, [E, Out, Groups]> scales, tensor<f16, [E, Out, Groups]> biases, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, i32 expert_idx, i32 bits, i32 group_size) → void {
+    for from y at [row] thread lane let e {
+        if group_size ≥ 1 and group_size ≤ 4096 and (bits ≡ 4 or bits ≡ 6 or bits ≡ 8) and expert_idx ≥ 0 and expert_idx ≺ E and In ≤ 200000000 {
+            let i32 n_groups ← In / group_size
+            mut f32 acc ← 0.0 ∷ f32
+
+            for exclusive n_groups let g {
+                let f32 s ← scales[[expert_idx, row, g]] ↦ f32
+                let f32 b ← biases[[expert_idx, row, g]] ↦ f32
+                let i32 j_base ← g * group_size
+
+                for exclusive group_size let k {
+                    let i32 j ← j_base + k
+                    let i32 bit_pos ← j * bits
+                    let i32 word_idx ← bit_pos / 32
+                    let i32 shift ← bit_pos % 32
+                    let u32 w0 ← weight[[expert_idx, row, word_idx]]
+                    mut u32 q ← 0 ∷ u32
+
+                    if bits ≡ 8 {
+                        if shift ≡ 0 { q ← w0 ∧ (255 ∷ u32) }
+                        elif shift ≡ 8 { q ← (w0 ⇒ (8 ∷ u32)) ∧ (255 ∷ u32) }
+                        elif shift ≡ 16 { q ← (w0 ⇒ (16 ∷ u32)) ∧ (255 ∷ u32) }
+                        else { q ← (w0 ⇒ (24 ∷ u32)) ∧ (255 ∷ u32) }
+                    }
+                    elif bits ≡ 4 {
+                        if shift ≡ 0 { q ← w0 ∧ (15 ∷ u32) }
+                        elif shift ≡ 4 { q ← (w0 ⇒ (4 ∷ u32)) ∧ (15 ∷ u32) }
+                        elif shift ≡ 8 { q ← (w0 ⇒ (8 ∷ u32)) ∧ (15 ∷ u32) }
+                        elif shift ≡ 12 { q ← (w0 ⇒ (12 ∷ u32)) ∧ (15 ∷ u32) }
+                        elif shift ≡ 16 { q ← (w0 ⇒ (16 ∷ u32)) ∧ (15 ∷ u32) }
+                        elif shift ≡ 20 { q ← (w0 ⇒ (20 ∷ u32)) ∧ (15 ∷ u32) }
+                        elif shift ≡ 24 { q ← (w0 ⇒ (24 ∷ u32)) ∧ (15 ∷ u32) }
+                        else { q ← (w0 ⇒ (28 ∷ u32)) ∧ (15 ∷ u32) }
+                    }
+                    else {
+                        if shift ≡ 0 { q ← w0 ∧ (63 ∷ u32) }
+                        elif shift ≡ 2 { q ← (w0 ⇒ (2 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 4 { q ← (w0 ⇒ (4 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 6 { q ← (w0 ⇒ (6 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 8 { q ← (w0 ⇒ (8 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 10 { q ← (w0 ⇒ (10 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 12 { q ← (w0 ⇒ (12 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 14 { q ← (w0 ⇒ (14 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 16 { q ← (w0 ⇒ (16 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 18 { q ← (w0 ⇒ (18 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 20 { q ← (w0 ⇒ (20 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 22 { q ← (w0 ⇒ (22 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 24 { q ← (w0 ⇒ (24 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 26 { q ← (w0 ⇒ (26 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 28 {
+                            let u32 w1 ← weight[[expert_idx, row, word_idx + 1]]
+                            let u32 lo ← w0 ⇒ (28 ∷ u32)
+                            let u32 hi ← (w1 ∧ (3 ∷ u32)) * (16 ∷ u32)
+                            q ← lo + hi
+                        }
+                        else {
+                            let u32 w1 ← weight[[expert_idx, row, word_idx + 1]]
+                            let u32 lo ← w0 ⇒ (30 ∷ u32)
+                            let u32 hi ← (w1 ∧ (15 ∷ u32)) * (4 ∷ u32)
+                            q ← lo + hi
+                        }
+                    }
+
+                    let f32 w ← (q ↦ f32) * s + b
+                    acc ← acc + w * x[[j]]
+                }
+            }
+
+            y[[row]] ← acc
+        }
+    }
+}
+
+@ public
+kernel routed_expert_matmul_ga_u32_f16<size B, size E, size Out, size PackedIn, size Groups, size In>(tensor<u32, [E, Out, PackedIn]> weight, tensor<f16, [E, Out, Groups]> scales, tensor<f16, [E, Out, Groups]> biases, tensor<f32, [B, In]> x, tensor<i32, [B]> expert_indices, mut tensor<f32, [B, Out]> y, i32 bits, i32 group_size) → void {
+    for from y at [bi, rr] thread lane let e {
+        let i32 ee ← expert_indices[[bi]]
+        if group_size ≥ 1 and group_size ≤ 4096 and (bits ≡ 4 or bits ≡ 6 or bits ≡ 8) and ee ≥ 0 and ee ≺ E and In ≤ 200000000 {
+            let i32 n_groups ← In / group_size
+            mut f32 acc ← 0.0 ∷ f32
+
+            for exclusive n_groups let g {
+                let f32 s ← scales[[ee, rr, g]] ↦ f32
+                let f32 b ← biases[[ee, rr, g]] ↦ f32
+                let i32 j_base ← g * group_size
+
+                for exclusive group_size let k {
+                    let i32 j ← j_base + k
+                    let i32 bit_pos ← j * bits
+                    let i32 word_idx ← bit_pos / 32
+                    let i32 shift ← bit_pos % 32
+                    let u32 w0 ← weight[[ee, rr, word_idx]]
+                    mut u32 q ← 0 ∷ u32
+
+                    if bits ≡ 8 {
+                        if shift ≡ 0 { q ← w0 ∧ (255 ∷ u32) }
+                        elif shift ≡ 8 { q ← (w0 ⇒ (8 ∷ u32)) ∧ (255 ∷ u32) }
+                        elif shift ≡ 16 { q ← (w0 ⇒ (16 ∷ u32)) ∧ (255 ∷ u32) }
+                        else { q ← (w0 ⇒ (24 ∷ u32)) ∧ (255 ∷ u32) }
+                    }
+                    elif bits ≡ 4 {
+                        if shift ≡ 0 { q ← w0 ∧ (15 ∷ u32) }
+                        elif shift ≡ 4 { q ← (w0 ⇒ (4 ∷ u32)) ∧ (15 ∷ u32) }
+                        elif shift ≡ 8 { q ← (w0 ⇒ (8 ∷ u32)) ∧ (15 ∷ u32) }
+                        elif shift ≡ 12 { q ← (w0 ⇒ (12 ∷ u32)) ∧ (15 ∷ u32) }
+                        elif shift ≡ 16 { q ← (w0 ⇒ (16 ∷ u32)) ∧ (15 ∷ u32) }
+                        elif shift ≡ 20 { q ← (w0 ⇒ (20 ∷ u32)) ∧ (15 ∷ u32) }
+                        elif shift ≡ 24 { q ← (w0 ⇒ (24 ∷ u32)) ∧ (15 ∷ u32) }
+                        else { q ← (w0 ⇒ (28 ∷ u32)) ∧ (15 ∷ u32) }
+                    }
+                    else {
+                        if shift ≡ 0 { q ← w0 ∧ (63 ∷ u32) }
+                        elif shift ≡ 2 { q ← (w0 ⇒ (2 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 4 { q ← (w0 ⇒ (4 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 6 { q ← (w0 ⇒ (6 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 8 { q ← (w0 ⇒ (8 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 10 { q ← (w0 ⇒ (10 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 12 { q ← (w0 ⇒ (12 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 14 { q ← (w0 ⇒ (14 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 16 { q ← (w0 ⇒ (16 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 18 { q ← (w0 ⇒ (18 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 20 { q ← (w0 ⇒ (20 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 22 { q ← (w0 ⇒ (22 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 24 { q ← (w0 ⇒ (24 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 26 { q ← (w0 ⇒ (26 ∷ u32)) ∧ (63 ∷ u32) }
+                        elif shift ≡ 28 {
+                            let u32 w1 ← weight[[ee, rr, word_idx + 1]]
+                            let u32 lo ← w0 ⇒ (28 ∷ u32)
+                            let u32 hi ← (w1 ∧ (3 ∷ u32)) * (16 ∷ u32)
+                            q ← lo + hi
+                        }
+                        else {
+                            let u32 w1 ← weight[[ee, rr, word_idx + 1]]
+                            let u32 lo ← w0 ⇒ (30 ∷ u32)
+                            let u32 hi ← (w1 ∧ (15 ∷ u32)) * (4 ∷ u32)
+                            q ← lo + hi
+                        }
+                    }
+
+                    let f32 w ← (q ↦ f32) * s + b
+                    acc ← acc + w * x[[bi, j]]
+                }
+            }
+
+            y[[bi, rr]] ← acc
+        }
+    }
+}
+
+@ public
+kernel routed_expert_matvec_ga_u8_f16<size E, size Out, size PackedIn, size Groups, size In>(tensor<u8, [E, Out, PackedIn]> weight, tensor<f16, [E, Out, Groups]> scales, tensor<f16, [E, Out, Groups]> biases, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, i32 expert_idx, i32 bits, i32 group_size) → void {
+    for from y at [row] thread lane let e {
+        if group_size ≥ 1 and group_size ≤ 4096 and (bits ≡ 4 or bits ≡ 8) and expert_idx ≥ 0 and expert_idx ≺ E and In ≤ 200000000 {
+            let i32 n_groups ← In / group_size
+            mut f32 acc ← 0.0 ∷ f32
+
+            for exclusive n_groups let g {
+                let f32 s ← scales[[expert_idx, row, g]] ↦ f32
+                let f32 b ← biases[[expert_idx, row, g]] ↦ f32
+                let i32 j_base ← g * group_size
+
+                for exclusive group_size let k {
+                    let i32 j ← j_base + k
+                    mut u8 q ← 0 ∷ u8
+                    if bits ≡ 8 {
+                        q ← weight[[expert_idx, row, j]]
+                    }
+                    else {
+                        let u8 packed ← weight[[expert_idx, row, j / 2]]
+                        if j % 2 ≡ 0 { q ← packed ∧ (15 ∷ u8) }
+                        else { q ← (packed ⇒ (4 ∷ u8)) ∧ (15 ∷ u8) }
+                    }
+                    let f32 w ← (q ↦ f32) * s + b
+                    acc ← acc + w * x[[j]]
+                }
+            }
+
+            y[[row]] ← acc
+        }
+    }
+}
+
+@ public
+kernel routed_expert_matmul_ga_u8_f16<size B, size E, size Out, size PackedIn, size Groups, size In>(tensor<u8, [E, Out, PackedIn]> weight, tensor<f16, [E, Out, Groups]> scales, tensor<f16, [E, Out, Groups]> biases, tensor<f32, [B, In]> x, tensor<i32, [B]> expert_indices, mut tensor<f32, [B, Out]> y, i32 bits, i32 group_size) → void {
     for from y at [bi, rr] thread lane let e {
         let i32 ee ← expert_indices[[bi]]
         if group_size ≥ 1 and group_size ≤ 4096 and (bits ≡ 4 or bits ≡ 8) and ee ≥ 0 and ee ≺ E and In ≤ 200000000 {
@@ -3150,6 +3391,61 @@ fn dispatch_routed_matmul_ga_u8_bf16<size B, size E, size Out, size PackedIn, si
     routed_expert_matmul_ga_u8_bf16<size B, size E, size Out, size PackedIn, size Groups, size In>(weight, scales, biases, x, expert_indices, mut y, spec.bits ↦ i32 ⊥ 4, spec.group_size ↦ i32 ⊥ 64)
 }
 
+
+@ public
+fn dispatch_routed_matvec_ga_u32_f16<size E, size Out, size PackedIn, size Groups, size In>(BankedMatrixSpec spec, tensor<u32, [E, Out, PackedIn]> weight, tensor<f16, [E, Out, Groups]> scales, tensor<f16, [E, Out, Groups]> biases, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, int expert_idx) → void ⇥ ExpertBankError {
+    match spec.kind {
+        case GroupAffineU32 {}
+        default {
+            throw variant BadBinding { message = "expected GroupAffineU32 BankedMatrixSpec" }
+        }
+    }
+    require spec.scales_dtype ≡ "F16" throw variant BadBinding { message = "expected F16 scales_dtype in dispatch_routed_matvec_ga_u32_f16" }
+    require spec.expert_count ≡ E and spec.out_features ≡ Out and spec.in_features ≡ In and spec.packed_cols ≡ PackedIn and spec.group_cols ≡ Groups throw variant BadShape { message = "shape mismatch in dispatch_routed_matvec_ga_u32_f16" }
+    require expert_idx ≥ 0 and expert_idx ≺ E throw variant BadShape { message = "expert_idx out of bounds" }
+    routed_expert_matvec_ga_u32_f16<size E, size Out, size PackedIn, size Groups, size In>(weight, scales, biases, x, mut y, expert_idx ↦ i32 ⊥ 0, spec.bits ↦ i32 ⊥ 8, spec.group_size ↦ i32 ⊥ 64)
+}
+
+@ public
+fn dispatch_routed_matmul_ga_u32_f16<size B, size E, size Out, size PackedIn, size Groups, size In>(BankedMatrixSpec spec, tensor<u32, [E, Out, PackedIn]> weight, tensor<f16, [E, Out, Groups]> scales, tensor<f16, [E, Out, Groups]> biases, tensor<f32, [B, In]> x, tensor<i32, [B]> expert_indices, mut tensor<f32, [B, Out]> y) → void ⇥ ExpertBankError {
+    match spec.kind {
+        case GroupAffineU32 {}
+        default {
+            throw variant BadBinding { message = "expected GroupAffineU32 BankedMatrixSpec" }
+        }
+    }
+    require spec.scales_dtype ≡ "F16" throw variant BadBinding { message = "expected F16 scales_dtype in dispatch_routed_matmul_ga_u32_f16" }
+    require spec.expert_count ≡ E and spec.out_features ≡ Out and spec.in_features ≡ In and spec.packed_cols ≡ PackedIn and spec.group_cols ≡ Groups throw variant BadShape { message = "shape mismatch in dispatch_routed_matmul_ga_u32_f16" }
+    routed_expert_matmul_ga_u32_f16<size B, size E, size Out, size PackedIn, size Groups, size In>(weight, scales, biases, x, expert_indices, mut y, spec.bits ↦ i32 ⊥ 8, spec.group_size ↦ i32 ⊥ 64)
+}
+
+@ public
+fn dispatch_routed_matvec_ga_u8_f16<size E, size Out, size PackedIn, size Groups, size In>(BankedMatrixSpec spec, tensor<u8, [E, Out, PackedIn]> weight, tensor<f16, [E, Out, Groups]> scales, tensor<f16, [E, Out, Groups]> biases, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, int expert_idx) → void ⇥ ExpertBankError {
+    match spec.kind {
+        case GroupAffineU8 {}
+        default {
+            throw variant BadBinding { message = "expected GroupAffineU8 BankedMatrixSpec" }
+        }
+    }
+    require spec.scales_dtype ≡ "F16" throw variant BadBinding { message = "expected F16 scales_dtype in dispatch_routed_matvec_ga_u8_f16" }
+    require spec.expert_count ≡ E and spec.out_features ≡ Out and spec.in_features ≡ In and spec.packed_cols ≡ PackedIn and spec.group_cols ≡ Groups throw variant BadShape { message = "shape mismatch in dispatch_routed_matvec_ga_u8_f16" }
+    require expert_idx ≥ 0 and expert_idx ≺ E throw variant BadShape { message = "expert_idx out of bounds" }
+    routed_expert_matvec_ga_u8_f16<size E, size Out, size PackedIn, size Groups, size In>(weight, scales, biases, x, mut y, expert_idx ↦ i32 ⊥ 0, spec.bits ↦ i32 ⊥ 4, spec.group_size ↦ i32 ⊥ 64)
+}
+
+@ public
+fn dispatch_routed_matmul_ga_u8_f16<size B, size E, size Out, size PackedIn, size Groups, size In>(BankedMatrixSpec spec, tensor<u8, [E, Out, PackedIn]> weight, tensor<f16, [E, Out, Groups]> scales, tensor<f16, [E, Out, Groups]> biases, tensor<f32, [B, In]> x, tensor<i32, [B]> expert_indices, mut tensor<f32, [B, Out]> y) → void ⇥ ExpertBankError {
+    match spec.kind {
+        case GroupAffineU8 {}
+        default {
+            throw variant BadBinding { message = "expected GroupAffineU8 BankedMatrixSpec" }
+        }
+    }
+    require spec.scales_dtype ≡ "F16" throw variant BadBinding { message = "expected F16 scales_dtype in dispatch_routed_matmul_ga_u8_f16" }
+    require spec.expert_count ≡ E and spec.out_features ≡ Out and spec.in_features ≡ In and spec.packed_cols ≡ PackedIn and spec.group_cols ≡ Groups throw variant BadShape { message = "shape mismatch in dispatch_routed_matmul_ga_u8_f16" }
+    routed_expert_matmul_ga_u8_f16<size B, size E, size Out, size PackedIn, size Groups, size In>(weight, scales, biases, x, expert_indices, mut y, spec.bits ↦ i32 ⊥ 4, spec.group_size ↦ i32 ⊥ 64)
+}
+
 @ public
 fn dispatch_routed_matvec_block_fp8_u8<size E, size Out, size In, size ScaleRows, size ScaleCols>(BankedMatrixSpec spec, tensor<u8, [E, Out, In]> weight, tensor<u8, [E, ScaleRows, ScaleCols]> scales, tensor<f32, [In]> x, mut tensor<f32, [Out]> y, int expert_idx) → void ⇥ ExpertBankError {
     match spec.kind {
@@ -3957,6 +4253,32 @@ test "expert_bank routed_expert_matvec (B=1) and routed_expert_matmul (B=C) matc
         assert close(tyb_u8_bf[[0, 0]], ref_u8_e1[0])
         assert close(tyb_u8_bf[[1, 0]], ref_u8_e0[0])
 
+        # 5b. Native f16 GroupAffine (U32 & U8 matvec + matmul)
+        let eb.BankedMatrixSpec spec_u32_f16 ← eb.BankedMatrixSpec { kind = variant eb.ExpertWeightKind.GroupAffineU32, expert_count = 2, out_features = 1, in_features = 4, bits = 8, group_size = 2, packed_cols = 1, group_cols = 2, scales_dtype = "F16" }
+        let eb.BankedMatrixSpec spec_u8_f16 ← eb.BankedMatrixSpec { kind = variant eb.ExpertWeightKind.GroupAffineU8, expert_count = 2, out_features = 1, in_features = 4, bits = 4, group_size = 2, packed_cols = 2, group_cols = 2, scales_dtype = "F16" }
+        mut tensor<f16, [2, 1, 2]> ts_f16 ← tf16[2, 1, 2] {}
+        mut tensor<f16, [2, 1, 2]> tb_f16 ← tf16[2, 1, 2] {}
+        for exclusive 2 let ee {
+            for exclusive 2 let gg {
+                ts_f16[[ee, 0, gg]] ← s_u32[ee * 2 + gg] ↦ f16
+                tb_f16[[ee, 0, gg]] ← b_u32[ee * 2 + gg] ↦ f16
+            }
+        }
+        mut tensor<f32, [1]> ty1_u32_f16 ← tf32[1] {}
+        mut tensor<f32, [1]> ty1_u8_f16 ← tf32[1] {}
+        mut tensor<f32, [2, 1]> tyb_u32_f16 ← tf32[2, 1] {}
+        mut tensor<f32, [2, 1]> tyb_u8_f16 ← tf32[2, 1] {}
+        eb.dispatch_routed_matvec_ga_u32_f16<size 2, size 1, size 1, size 2, size 4>(spec_u32_f16, tw_u32, ts_f16, tb_f16, tx0, mut ty1_u32_f16, 1)
+        eb.dispatch_routed_matmul_ga_u32_f16<size 2, size 2, size 1, size 1, size 2, size 4>(spec_u32_f16, tw_u32, ts_f16, tb_f16, tx_batch, te_idx, mut tyb_u32_f16)
+        eb.dispatch_routed_matvec_ga_u8_f16<size 2, size 1, size 2, size 2, size 4>(spec_u8_f16, tw_u8, ts_f16, tb_f16, tx0, mut ty1_u8_f16, 1)
+        eb.dispatch_routed_matmul_ga_u8_f16<size 2, size 2, size 1, size 2, size 2, size 4>(spec_u8_f16, tw_u8, ts_f16, tb_f16, tx_batch, te_idx, mut tyb_u8_f16)
+        assert close(ty1_u32_f16[[0]], ref_u32_e1[0])
+        assert close(tyb_u32_f16[[0, 0]], ref_u32_e1[0])
+        assert close(tyb_u32_f16[[1, 0]], ref_u32_e0[0])
+        assert close(ty1_u8_f16[[0]], ref_u8_e1[0])
+        assert close(tyb_u8_f16[[0, 0]], ref_u8_e1[0])
+        assert close(tyb_u8_f16[[1, 0]], ref_u8_e0[0])
+
         # 6. BlockFp8 (U32 UE8M0 matvec + U8 F32 block scales matmul)
         let eb.BankedMatrixSpec spec_bf8_u32 ← eb.BankedMatrixSpec { kind = variant eb.ExpertWeightKind.BlockFp8, expert_count = 2, out_features = 1, in_features = 4, bits = 8, group_size = 2, packed_cols = 1, group_cols = 2, block_rows = 1, block_cols = 2, pack = variant eb.PackKind.PackU32, scales_dtype = "U8" }
         let eb.BankedMatrixSpec spec_bf8_f32 ← eb.BankedMatrixSpec { kind = variant eb.ExpertWeightKind.BlockFp8, expert_count = 2, out_features = 1, in_features = 4, bits = 8, group_size = 2, packed_cols = 4, group_cols = 2, block_rows = 1, block_cols = 2, pack = variant eb.PackKind.PackU8, scales_dtype = "F32" }
@@ -4359,6 +4681,16 @@ test "expert_bank host eval handles native bf16 GroupAffine, BlockFp8, ModelOpt 
         let list<f32> y_ga8_e0 ← eb.ref_expert_matvec(sp_ga8, variant eb.BankedPayload.GroupAffineU8Bf16BankPayload { weight = [0x21 ∷ u8, 0x43 ∷ u8, 0x13 ∷ u8, 0x24 ∷ u8], scales = bf_s, biases = bf_b }, 0, x4)
         assert close(y_ga32_e0[0], 16.125 ∷ f32)
         assert close(y_ga8_e0[0], 16.125 ∷ f32)
+
+        # Native f16 GroupAffine U32 & U8
+        let list<f16> f16_s ← [(0.5 ∷ f32) ↦ f16, (2.0 ∷ f32) ↦ f16, (1.0 ∷ f32) ↦ f16, (0.5 ∷ f32) ↦ f16]
+        let list<f16> f16_b ← [(-1.0 ∷ f32) ↦ f16, (0.25 ∷ f32) ↦ f16, (0.0 ∷ f32) ↦ f16, (-0.5 ∷ f32) ↦ f16]
+        let eb.BankedMatrixSpec sp_ga32_f16 ← eb.BankedMatrixSpec { kind = variant eb.ExpertWeightKind.GroupAffineU32, expert_count = 2, out_features = 1, in_features = 4, bits = 8, group_size = 2, packed_cols = 1, group_cols = 2, scales_dtype = "F16" }
+        let eb.BankedMatrixSpec sp_ga8_f16 ← eb.BankedMatrixSpec { kind = variant eb.ExpertWeightKind.GroupAffineU8, expert_count = 2, out_features = 1, in_features = 4, bits = 4, group_size = 2, packed_cols = 2, group_cols = 2, scales_dtype = "F16" }
+        let list<f32> y_ga32_f16_e0 ← eb.ref_expert_matvec(sp_ga32_f16, variant eb.BankedPayload.GroupAffineU32F16BankPayload { weight = [0x04030201 ∷ u32, 0x02040103 ∷ u32], scales = f16_s, biases = f16_b }, 0, x4)
+        let list<f32> y_ga8_f16_e0 ← eb.ref_expert_matvec(sp_ga8_f16, variant eb.BankedPayload.GroupAffineU8F16BankPayload { weight = [0x21 ∷ u8, 0x43 ∷ u8, 0x13 ∷ u8, 0x24 ∷ u8], scales = f16_s, biases = f16_b }, 0, x4)
+        assert close(y_ga32_f16_e0[0], 16.125 ∷ f32)
+        assert close(y_ga8_f16_e0[0], 16.125 ∷ f32)
 
         # BlockFp8 U8 & U32 host ref eval
         let eb.BankedMatrixSpec sp_bf8_u8 ← eb.BankedMatrixSpec { kind = variant eb.ExpertWeightKind.BlockFp8, expert_count = 2, out_features = 1, in_features = 4, bits = 8, group_size = 2, packed_cols = 4, group_cols = 2, block_rows = 1, block_cols = 2, pack = variant eb.PackKind.PackU8, scales_dtype = "U8" }
