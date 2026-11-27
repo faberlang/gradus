@@ -1,10 +1,15 @@
-# Gradus is a Faber-only library, checked against the newest faber build of radix main: the rolling
-# `faber-edge` prerelease in faberlang/releases (replaced after every Build faber run, about hourly on
-# Linux). The nightly schedule is what catches a radix change that breaks gradus (11-24: radix#1753's
-# math-word rule broke gradus within the hour and nothing noticed: faberlang/gradus#54).
+# Gradus is a Faber-only library, checked against the newest faber build of radix main. It runs on the
+# studios' gradus CI lanes (operator 2026-11-27: gradus works like radix from a runner perspective): each lane
+# is a clone of this repository bound to one self-hosted runner (trees/faber-gradus-NN on a studio), so a job
+# takes no fresh checkout; .github/lane/prepare cleans the lane's clone and puts it at the commit under test.
+# faber is the studio's own Build faber `current` build (built from radix main about every 30 min; the same
+# commits as the `faber-edge` prerelease), or a faberlang/releases tag given to a manual run.
 #
-# GitHub-hosted runners only: gradus is public, so a fork's pull request must never run on our
-# self-hosted machines.
+# gradus is public: a pull request from a fork never runs here (the job's `if`, and the repository requires
+# approval for every outside contributor). macOS only for now: no Linux coverage until hub hosts lanes.
+#
+# The nightly schedule is what catches a radix change that breaks gradus (11-24: radix#1753's math-word
+# rule broke gradus within the hour and nothing noticed: faberlang/gradus#54).
 name: CI
 
 on:
@@ -16,9 +21,9 @@ on:
   workflow_dispatch:
     inputs:
       faber:
-        description: "faberlang/releases tag to test with (faber-edge, or a dated nightly)"
+        description: "faber to test with: local (the studio's Build faber build), or a faberlang/releases tag (faber-edge, a dated nightly)"
         required: false
-        default: faber-edge
+        default: local
 
 permissions:
   contents: read
@@ -29,18 +34,28 @@ concurrency:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, faber-gradus-ci]
+    # Never a fork's pull request on a self-hosted lane.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 30
     env:
-      TRIPLE: x86_64-unknown-linux-gnu
-      FABER_TAG: ${{ inputs.faber || 'faber-edge' }}
+      TRIPLE: aarch64-apple-darwin
+      FABER_TAG: ${{ inputs.faber || 'local' }}
+      WANT: ${{ github.event.pull_request.head.sha || github.sha }}
     # Each check runs even when an earlier one failed, so one run reports every red check.
     steps:
-      # Checked out under the workspace as `gradus/`, so the workspace is a library home holding
-      # gradus (faber.toml's `library_home = ".."` and check-compile's LIBRARY_HOME both see it).
-      - uses: actions/checkout@v4
-        with:
-          path: gradus
+      # The lane's clone is $LANE_REPO (named gradus/, inside the lane directory), so the lane directory is a
+      # library home holding gradus (faber.toml's `library_home = ".."` and check-compile's LIBRARY_HOME).
+      # The prepare script is read from the commit under test, so a change to it is tested by its own PR.
+      - name: Prepare the lane (${{ env.WANT }})
+        run: |
+          set -euo pipefail
+          : "${LANE_REPO:?this runner is not a lane}"
+          git -C "$LANE_REPO" fetch -q origin "$WANT" 2>/dev/null || git -C "$LANE_REPO" fetch -q origin
+          git -C "$LANE_REPO" show "$WANT:.github/lane/prepare" > "$RUNNER_TEMP/prepare"
+          repo=$(bash "$RUNNER_TEMP/prepare" "$WANT")
+          { echo "REPO_DIR=$repo"; echo "LIBRARY_HOME=$LANE_DIR"; } >> "$GITHUB_ENV"
+          echo "lane $LANE_NAME at ${WANT:0:10}" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Take faber (${{ env.FABER_TAG }})
         id: faber
@@ -48,32 +63,39 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          d="$RUNNER_TEMP/faber"; mkdir -p "$d"
-          gh release download "$FABER_TAG" --repo faberlang/releases --dir "$d" \
-            --pattern "faber-v*-$TRIPLE.tar.gz" --pattern "faber-v*-$TRIPLE.tar.gz.sha256" \
-            --pattern "faber-v*-$TRIPLE.identity.json"
-          (cd "$d" && sha256sum -c ./*.tar.gz.sha256)
-          tar xzf "$d"/*.tar.gz -C "$d"
-          echo "FABER_BIN=$d/bin/faber" >> "$GITHUB_ENV"
-          commit=$(python3 -c 'import glob, json, sys; print(json.load(open(glob.glob(sys.argv[1] + "/*.identity.json")[0]))["sourceCommit"])' "$d")
-          echo "faber from $FABER_TAG, radix ${commit:0:10}: $("$d/bin/faber" --version 2>&1 | head -n 1)" | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ "$FABER_TAG" = local ]; then
+            # Pinned for the whole job: the relay may move `current` to a newer build meanwhile.
+            d=$(cd /Volumes/Lanes/vivi/cache/faber-builds/lean/current && pwd -P)
+            [ -f "$d/ok" ] || { echo "::error::$d is not a complete build"; exit 1; }
+            echo "FABER_BIN=$d/faber" >> "$GITHUB_ENV"
+            commit=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["sha"])' "$d/meta.json")
+            echo "faber: the studio's Build faber build, radix ${commit:0:10}: $("$d/faber" --version 2>&1 | head -n 1)" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            d="$RUNNER_TEMP/faber"; rm -rf "$d"; mkdir -p "$d"
+            gh release download "$FABER_TAG" --repo faberlang/releases --dir "$d" \
+              --pattern "faber-v*-$TRIPLE.tar.gz" --pattern "faber-v*-$TRIPLE.tar.gz.sha256" \
+              --pattern "faber-v*-$TRIPLE.identity.json"
+            (cd "$d" && shasum -a 256 -c ./*.tar.gz.sha256)
+            tar xzf "$d"/*.tar.gz -C "$d"
+            echo "FABER_BIN=$d/bin/faber" >> "$GITHUB_ENV"
+            commit=$(python3 -c 'import glob, json, sys; print(json.load(open(glob.glob(sys.argv[1] + "/*.identity.json")[0]))["sourceCommit"])' "$d")
+            echo "faber from $FABER_TAG, radix ${commit:0:10}: $("$d/bin/faber" --version 2>&1 | head -n 1)" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Source rules (check-source)
-        working-directory: gradus
+        working-directory: ${{ env.REPO_DIR }}
         run: ./scripta/check-source
 
       - name: Compile the library and its exempla (check-compile)
         if: ${{ !cancelled() && steps.faber.outcome == 'success' }}
-        working-directory: gradus
-        env:
-          LIBRARY_HOME: ${{ github.workspace }}
+        working-directory: ${{ env.REPO_DIR }}
         run: ./scripta/check-compile
 
       - name: Package tests (faber test)
         if: ${{ !cancelled() && steps.faber.outcome == 'success' }}
-        working-directory: gradus
-        # Ratchet on pre-existing compiler-blocked tests (currently 111 under
-        # faber-edge: MIR tensor-extent validation on generic kernels/tests,
+        working-directory: ${{ env.REPO_DIR }}
+        # Ratchet on pre-existing compiler-blocked tests (111 under faber-edge on
+        # Linux, 11-26; recount on the studios' macOS build: MIR tensor-extent validation on generic kernels/tests,
         # 3 loss.fab multi-op mse, 2 data.fab Cranelift verifier). Fails on
         # analysis errors, any failed > 0, or any new blocked > MAX_BLOCKED.
         env:
@@ -111,5 +133,5 @@ jobs:
 
       - name: Speculative-decode corpus rows (check-corpus)
         if: ${{ !cancelled() && steps.faber.outcome == 'success' }}
-        working-directory: gradus
+        working-directory: ${{ env.REPO_DIR }}
         run: python3 scripta/check-corpus
