@@ -36,6 +36,9 @@ const int IQ4_NL_BYTES = 18
 @ public
 const list<f32> KVALUES_IQ4NL = [-127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0, 1.0, 13.0, 25.0, 38.0, 53.0, 69.0, 89.0, 113.0]
 
+# Fixed-size mirror of `KVALUES_IQ4NL` for device kernel lowering (keep in sync).
+const list<f32, size 16> KVALUES_IQ4NL_LUT = [-127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0, 1.0, 13.0, 25.0, 38.0, 53.0, 69.0, 89.0, 113.0]
+
 # The block genus. Field order is the on-disk order.
 @ public
 class IQ4_NL {
@@ -84,7 +87,7 @@ fn from_bytes(list<u8> raw) → IQ4_NL ⇥ IQ4_NLError {
 
     let u16 bits ← raw[0 ‥ 2] ↦ u16 via le ⊥ 0 ∷ u16
 
-    if ((bits ↦ int) ⇒ 10) ∧ 31 ≡ 31 {
+    if (bits ↦ int) ⇒ 10 ∧ 31 ≡ 31 {
         if (bits ↦ int) ∧ 1023 ≢ 0 {
             throw variant BadScale { message = "NaN half scale in IQ4_NL block" }
         }
@@ -111,6 +114,7 @@ fn decode_block(list<u8> raw) → list<f32> ⇥ IQ4_NLError {
     let f32 d ← b.d ↦ f32
 
     mut list<f32> y ← empty
+
     for exclusive IQ4_NL_ELEMENTS let k {
         y.append(0.0 ∷ f32)
     }
@@ -122,6 +126,24 @@ fn decode_block(list<u8> raw) → list<f32> ⇥ IQ4_NLError {
     }
 
     return y
+}
+
+# Device decoder over `tensor<IQ4_NL, [N]>`: one lane per block reads `d`
+# and `qs` directly in place with zero per-lane block copy, writing the 16
+# low-nibble weights to `[b, 0..15]` and 16 high-nibble weights to `[b, 16..31]`.
+@ public
+kernel decode_tensor<size N>(tensor<IQ4_NL, [N]> blocks, mut tensor<f32, [N, 32]> output) → void {
+    for from blocks at [b] thread lane let blk {
+        let f32 d ← blk.d ↦ f32
+
+        for exclusive 16 let j {
+            let i32 byte ← blk.qs[j] ↦ i32
+            let i32 lo ← byte % 16
+            let i32 hi ← byte / 16
+            output[[b, j]] ← KVALUES_IQ4NL_LUT[lo] * d
+            output[[b, j + 16]] ← KVALUES_IQ4NL_LUT[hi] * d
+        }
+    }
 }
 
 +++ faber test
@@ -295,4 +317,55 @@ test "IQ4_NL NaN half scale is refused" {
     assert block_result(filled_block(0, 126, 0)) ≡ "NaN half scale in IQ4_NL block"
     assert block_result(filled_block(1, 124, 0)) ≡ "NaN half scale in IQ4_NL block"
     assert block_result(filled_block(0, 124, 0)) ≡ "ok"
+}
+
+test "IQ4_NL decode_tensor matches golden bit patterns and host dequant bit for bit across all 5 blocks" {
+    mut list<u8> all_raw ← empty
+
+    for range 0 ‥ 5 let i {
+        all_raw.extend(bytes_of(GOLDEN_BLOCKS[i]))
+    }
+
+    let list<b8> all_bytes ↤ all_raw
+
+    do {
+        let tensor<iq4_nl.IQ4_NL, [5]> blocks ← all_bytes ↦ tensor<iq4_nl.IQ4_NL, [5]> via le
+        mut tensor<f32, [5, 32]> out ← tf32[5, 32] {}
+        iq4_nl.decode_tensor(blocks, mut out)
+
+        for range 0 ‥ 5 let i {
+            let list<int> h ← host_bits(bytes_of(GOLDEN_BLOCKS[i]))
+            assert h.length() ≡ 32
+
+            for range 0 ‥ 32 let j {
+                let int got ← bits_of(out[[i, j]])
+                assert got ≡ GOLDEN_BITS[i][j]
+                assert got ≡ h[j]
+            }
+        }
+    }
+    catch err {
+        assert false
+    }
+}
+
+test "IQ4_NL decode_tensor preserves IEEE-754 negative zero sign bits across codebook entries" {
+    mut list<u8> raw ← copy filled_block(0, 128, 0x80)
+    raw.extend(filled_block(0, 60, 0xf7))
+    let list<b8> buf ↤ raw
+
+    do {
+        let tensor<iq4_nl.IQ4_NL, [2]> blocks ← buf ↦ tensor<iq4_nl.IQ4_NL, [2]> via le
+        mut tensor<f32, [2, 32]> out ← tf32[2, 32] {}
+        iq4_nl.decode_tensor(blocks, mut out)
+
+        # -0.0 * -127.0 = +0.0, -0.0 * 1.0 = -0.0
+        assert bits_of(out[[0, 0]]) ≡ 0x00000000
+        assert bits_of(out[[0, 16]]) ≡ 0x80000000
+        assert out[[1, 0]] ≡ -10.0 ∷ f32
+        assert out[[1, 16]] ≡ 113.0 ∷ f32
+    }
+    catch err {
+        assert false
+    }
 }
