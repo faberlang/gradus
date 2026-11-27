@@ -238,14 +238,8 @@ fn state_equal(SgdState a, SgdState b) → bool {
     return true
 }
 
-# Identity membership over a raw slot list (the wire-assembly duplicate
-# admission; the Sgd.contains method needs an Sgd).
-fn contains_state(list<SgdState> states, string owner, string name) → bool {
-    for from states let s {
-        if s.owner ≡ owner and s.name ≡ name then return true
-    }
-
-    return false
+fn state_key(string owner, string name) → string {
+    return "§/§"(owner, name)
 }
 
 # Shared construction with full validation (used by the public constructor
@@ -324,8 +318,8 @@ class Sgd {
 # predicate (same slots, exact field-wise).
 # Order-aligned fast path (issue #80): the checkpoint round-trip (this
 # predicate's use) preserves slot order, so the common comparison is one
-# parallel walk; a misordered but equal slot set falls back to the
-# identity-resolving walk.
+# parallel walk; a misordered but equal slot set resolves in O(P) via a
+# slot-index map instead of O(P^2) linear scans.
 @ public
 fn sgd_equal(Sgd a, Sgd b) → bool {
     if a.count() ≢ b.count() then return false
@@ -345,15 +339,22 @@ fn sgd_equal(Sgd a, Sgd b) → bool {
 
     if aligned then return true
 
-    for from a.states let s {
-        do {
-            let SgdState t ← b.find(s.owner, s.name)
+    mut map<string, int> b_idx ← empty
+    mut int pos ← 0
 
-            if not state_equal(s, t) then return false
-        }
-        catch err {
-            return false
-        }
+    for from b.states let t {
+        b_idx.put(state_key(t.owner, t.name), pos)
+        pos ← pos + 1
+    }
+
+    for from a.states let s {
+        let int found ← b_idx.get(state_key(s.owner, s.name)) coalesce (-1)
+
+        if found ≺ 0 then return false
+
+        let SgdState t ← b.states.get(found) coalesce default()
+
+        if not state_equal(s, t) then return false
     }
 
     return true
@@ -523,15 +524,33 @@ fn deserialize_state(string wire) → SgdState ⇥ OptimizeError {
 
 # The whole-optimizer (checkpoint) wire: count-prefixed, ';'-separated
 # slots. The empty optimizer is "optimizer/sgd/1.0.0/0" (no slots).
+# Pairwise tree merge (issue #80) joins slot strings in O(P log P)
+# instead of O(P^2) linear accumulator copies.
 @ public
 fn serialize(Sgd o) → string {
-    mut string out ← "optimizer/sgd/§/§"(schema_version, o.count() ↦ string)
+    mut list<string> parts ← ["optimizer/sgd/§/§"(schema_version, o.count() ↦ string)]
 
     for from o.states let s {
-        out ← "§;§"(out, serialize_state(s))
+        parts.append(serialize_state(s))
     }
 
-    return out
+    while parts.length() ≻ 1 {
+        mut list<string> merged ← empty
+        mut int i ← 0
+
+        while i + 1 ≺ parts.length() {
+            merged.append("§;§"(parts.get(i) coalesce "", parts.get(i + 1) coalesce ""))
+            i ← i + 2
+        }
+
+        if i ≺ parts.length() {
+            merged.append(parts.get(i) coalesce "")
+        }
+
+        parts ← merged
+    }
+
+    return parts.get(0) coalesce ""
 }
 
 @ public
@@ -565,18 +584,21 @@ fn deserialize(string wire) → Sgd ⇥ OptimizeError {
 
     require count ≡ parts.length() - 1 throw variant BadWire { message = "slot count mismatch in optimizer wire" }
 
-    # Single-pass assembly (issue #80): slots are deserialized into one
-    # list with an inline duplicate admission — the former add-per-slot
-    # route rebuilt (and copied) the whole state list per slot, O(P^2)
-    # over a checkpoint load. Error identity is unchanged (duplicate =
-    # the add message; slot parse errors propagate in slot order).
+    # Single-pass O(P) assembly (issue #80): slots are deserialized into one
+    # list with an inline set-backed duplicate admission — replacing both the
+    # former O(P^2) add-per-slot rebuild and linear duplicate scan. Error
+    # identity is unchanged (duplicate = the add message; slot parse errors
+    # propagate in slot order).
     mut list<SgdState> states ← empty
+    mut set<string> seen ← empty
 
     for range 1 ‥ parts.length() let i {
         let SgdState s ← deserialize_state(parts.get(i) coalesce "")
+        let string key ← state_key(s.owner, s.name)
 
-        reject contains_state(states, s.owner, s.name) throw variant DuplicateName { message = "optimizer state already registered for that parameter" }
+        reject key ∈ seen throw variant DuplicateName { message = "optimizer state already registered for that parameter" }
 
+        seen.add(key)
         states.append(s)
     }
 
@@ -1102,6 +1124,23 @@ test "the lr is part of the exact-state predicate (a changed lr is not equal)" {
         assert not optimize.state_equal(a, b)
     }
     match trap_result_1 {
+        case returned let ? { }
+        case thrown let ? { assert false }
+    }
+}
+
+test "sgd_equal handles reordered equal and unequal slot sets" {
+    let _ trap_result_reordered ← trap {
+        let optimize.SgdState s1 ← optimize.construct("w1", "model", 1, 0.01 ∷ f32)
+        let optimize.SgdState s2 ← optimize.construct("b1", "model", 1, 0.001 ∷ f32)
+        let optimize.SgdState s2_diff ← optimize.construct("b1", "model", 1, 0.002 ∷ f32)
+        let optimize.Sgd o_ab ← optimize.add(optimize.add(optimize.empty_sgd(), s1), s2)
+        let optimize.Sgd o_ba ← optimize.add(optimize.add(optimize.empty_sgd(), s2), s1)
+        let optimize.Sgd o_diff ← optimize.add(optimize.add(optimize.empty_sgd(), s2_diff), s1)
+        assert optimize.sgd_equal(o_ab, o_ba)
+        assert not optimize.sgd_equal(o_ab, o_diff)
+    }
+    match trap_result_reordered {
         case returned let ? { }
         case thrown let ? { assert false }
     }
