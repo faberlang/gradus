@@ -1,0 +1,398 @@
++++ toml
+locale = "en"
+
++++ faber
+# Multi-architecture metadata-driven tests for gradus:decode_dense (issue #28).
+#
+# Tests:
+#   1. Llama-style synthetic config (tied embedding, no QKV bias, RopeKind.Pairs)
+#      admitted from ModelConfig + TensorDirectory, scheduled, and decoded
+#      across 2 layers via DenseLayerBank + SessionState.
+#   2. Qwen2-style synthetic config (untied lm_head, QKV bias, RopeKind.Half,
+#      odd 3 layers) admitted through the exact same driver.
+#   3. Fail-closed rejection on non-F32 dtype or missing untied lm_head.
+
+import from "gradus:cache/session" let sess_mod
+import from "gradus:decode_dense" let dd
+import from "gradus:decode_token" let dt
+import from "gradus:model/artifact" let artifact
+import from "gradus:model/bundle" let bundle
+import from "gradus:model/capsule" let capsule
+import from "gradus:model/config" let cfg
+import from "gradus:model/gguf_manifest" let gguf_manifest
+import from "gradus:model/schedule" let model_schedule
+import from "gradus:storage" let storage
+import from "gradus:model/tensor_directory" let td
+
+fn st_desc(string name, string dtype, list<int> shape, int start, int end, int elems) → capsule.SafetensorsTensorDescriptor {
+    return capsule.SafetensorsTensorDescriptor {
+        name = name,
+        dtype = dtype,
+        shape = shape,
+        start = start,
+        end = end,
+        elements = elems
+    }
+}
+
+fn add_layer_descs(mut list<capsule.SafetensorsTensorDescriptor> out, int l, int d, int qd, int kvd, int f, bool with_bias) → void {
+    let string p ← "model.layers.§"(l ↦ string)
+    out.append(st_desc("§.input_layernorm.weight"(p), "F32", [d], 0, d * 4, d))
+    out.append(st_desc("§.self_attn.q_proj.weight"(p), "F32", [qd, d], 0, qd * d * 4, qd * d))
+    out.append(st_desc("§.self_attn.k_proj.weight"(p), "F32", [kvd, d], 0, kvd * d * 4, kvd * d))
+    out.append(st_desc("§.self_attn.v_proj.weight"(p), "F32", [kvd, d], 0, kvd * d * 4, kvd * d))
+    out.append(st_desc("§.self_attn.o_proj.weight"(p), "F32", [d, qd], 0, d * qd * 4, d * qd))
+    out.append(st_desc("§.post_attention_layernorm.weight"(p), "F32", [d], 0, d * 4, d))
+    out.append(st_desc("§.mlp.gate_proj.weight"(p), "F32", [f, d], 0, f * d * 4, f * d))
+    out.append(st_desc("§.mlp.up_proj.weight"(p), "F32", [f, d], 0, f * d * 4, f * d))
+    out.append(st_desc("§.mlp.down_proj.weight"(p), "F32", [d, f], 0, d * f * 4, d * f))
+
+    if with_bias {
+        out.append(st_desc("§.self_attn.q_proj.bias"(p), "F32", [qd], 0, qd * 4, qd))
+        out.append(st_desc("§.self_attn.k_proj.bias"(p), "F32", [kvd], 0, kvd * 4, kvd))
+        out.append(st_desc("§.self_attn.v_proj.bias"(p), "F32", [kvd], 0, kvd * 4, kvd))
+    }
+}
+
+fn build_synthetic_directory(int layers, int v, int d, int qd, int kvd, int f, bool tied, bool with_bias, string emb_dtype) → td.TensorDirectory ∪ none {
+    mut list<capsule.SafetensorsTensorDescriptor> tensors ← empty
+    tensors.append(st_desc("model.embed_tokens.weight", emb_dtype, [v, d], 0, v * d * 4, v * d))
+    tensors.append(st_desc("model.norm.weight", "F32", [d], 0, d * 4, d))
+
+    if not tied {
+        tensors.append(st_desc("lm_head.weight", "F32", [v, d], 0, v * d * 4, v * d))
+    }
+
+    for exclusive layers let l {
+        add_layer_descs(mut tensors, l, d, qd, kvd, f, with_bias)
+    }
+
+    let int big_bytes ← 1048576
+    let capsule.SafetensorsManifest sm ← capsule.SafetensorsManifest {
+        format = "safetensors",
+        version = "1.0.0",
+        artifact_length = big_bytes,
+        data_length = big_bytes - 72,
+        metadata = [],
+        tensors = tensors
+    }
+
+    mut artifact.ContentIdentity ∪ none maybe_id ← null
+    do {
+        maybe_id ← artifact.identity("sha-256", "0000000000000000000000000000000000000000000000000000000000000000", big_bytes)
+    }
+    catch err {
+        return null
+    }
+    if maybe_id is none then return null
+    let artifact.ContentIdentity sid ← maybe_id
+
+    mut bundle.ModelBundle ∪ none maybe_b ← null
+    do {
+        maybe_b ← bundle.safetensors_unindexed([sid], null, null, null, null, null)
+    }
+    catch err {
+        return null
+    }
+    if maybe_b is none then return null
+    let bundle.ModelBundle b ← maybe_b
+
+    do {
+        let td.ShardSource src ← variant td.ShardSource.SafetensorsSource { role = variant bundle.MemberRole.Backbone, shard_index = 0, manifest = sm }
+        return td.build(b, [src], [], [])
+    }
+    catch err {
+        return null
+    }
+}
+
+fn parse_config_opt(string json_txt) → cfg.ModelConfig ∪ none {
+    do {
+        return cfg.parse_json(json_txt)
+    }
+    catch err {
+        return null
+    }
+}
+
+fn synth_val(int r, int c, int salt) → f32 {
+    return (((r * 13 + c * 7 + salt * 5) % 19 - 9) ↦ f32) * 0.03 ∷ f32
+}
+
+fn fill_vec<size N>(mut tensor<f32, [N]> dst, f32 base_val, int salt) → void {
+    for exclusive N let i {
+        dst[[i]] ← base_val + synth_val(i, 0, salt)
+    }
+}
+
+fn fill_mat<size R, size C>(mut tensor<f32, [R, C]> dst, int salt) → void {
+    for exclusive R let r {
+        for exclusive C let c {
+            dst[[r, c]] ← synth_val(r, c, salt)
+        }
+    }
+}
+
+@ public
+fn check_llama_tied_decode() → bool {
+    let string json_txt ← «{"model_type":"llama","hidden_size":4,"num_hidden_layers":2,"num_attention_heads":2,"num_key_value_heads":1,"head_dim":2,"intermediate_size":6,"vocab_size":5,"max_position_embeddings":8,"rms_norm_eps":0.00001,"rope_theta":10000.0,"tie_word_embeddings":true}»
+    let cfg.ModelConfig ∪ none maybe_mc ← parse_config_opt(json_txt)
+    if maybe_mc is none then return false
+    let cfg.ModelConfig mc ← maybe_mc
+
+    let td.TensorDirectory ∪ none maybe_dir ← build_synthetic_directory(2, 5, 4, 4, 2, 6, true, false, "F32")
+    if maybe_dir is none then return false
+    let td.TensorDirectory dir ← maybe_dir
+
+    do {
+        let dd.DenseModelSpec spec ← dd.admit_spec_from_config(mc, dir)
+        let model_schedule.ExecutionSchedule sched ← dd.build_schedule(spec)
+
+        if sched.layers.length() ≢ 2 then return false
+
+        mut tensor<f32, [5, 4]> embed ← tf32[5, 4] {}
+        mut tensor<f32, [4]> onorm ← tf32[4] {}
+        fill_mat<size 5, size 4>(mut embed, 11)
+        fill_vec<size 4>(mut onorm, 1.0 ∷ f32, 12)
+        let dd.DenseHeadWeights<size 5, size 4> head ← dd.make_head_weights<size 5, size 4>(embed, onorm, true, embed)
+
+        mut list<tensor<f32, [4]>> anorms ← empty
+        mut list<tensor<f32, [4, 4]>> wqs ← empty
+        mut list<tensor<f32, [2, 4]>> wks ← empty
+        mut list<tensor<f32, [2, 4]>> wvs ← empty
+        mut list<tensor<f32, [4, 4]>> wos ← empty
+        mut list<tensor<f32, [4]>> fnorms ← empty
+        mut list<tensor<f32, [6, 4]>> wgs ← empty
+        mut list<tensor<f32, [6, 4]>> wus ← empty
+        mut list<tensor<f32, [4, 6]>> wds ← empty
+
+        for exclusive 2 let l {
+            let int salt ← (l + 1) * 10
+            mut tensor<f32, [4]> anorm ← tf32[4] {}
+            mut tensor<f32, [4, 4]> wq ← tf32[4, 4] {}
+            mut tensor<f32, [2, 4]> wk ← tf32[2, 4] {}
+            mut tensor<f32, [2, 4]> wv ← tf32[2, 4] {}
+            mut tensor<f32, [4, 4]> wo ← tf32[4, 4] {}
+            mut tensor<f32, [4]> fnorm ← tf32[4] {}
+            mut tensor<f32, [6, 4]> wg ← tf32[6, 4] {}
+            mut tensor<f32, [6, 4]> wu ← tf32[6, 4] {}
+            mut tensor<f32, [4, 6]> wd ← tf32[4, 6] {}
+            fill_vec<size 4>(mut anorm, 1.0 ∷ f32, salt + 1)
+            fill_mat<size 4, size 4>(mut wq, salt + 2)
+            fill_mat<size 2, size 4>(mut wk, salt + 3)
+            fill_mat<size 2, size 4>(mut wv, salt + 4)
+            fill_mat<size 4, size 4>(mut wo, salt + 5)
+            fill_vec<size 4>(mut fnorm, 1.0 ∷ f32, salt + 6)
+            fill_mat<size 6, size 4>(mut wg, salt + 7)
+            fill_mat<size 6, size 4>(mut wu, salt + 8)
+            fill_mat<size 4, size 6>(mut wd, salt + 9)
+            anorms.append(anorm)
+            wqs.append(wq)
+            wks.append(wk)
+            wvs.append(wv)
+            wos.append(wo)
+            fnorms.append(fnorm)
+            wgs.append(wg)
+            wus.append(wu)
+            wds.append(wd)
+        }
+
+        let dd.DenseLayerBank<size 4, size 4, size 2, size 6> bank ← dd.make_layer_bank<size 4, size 4, size 2, size 6>(anorms, wqs, wks, wvs, wos, fnorms, wgs, wus, wds, empty, empty, empty)
+
+        mut tensor<f32, [1]> sink ← tf32[1] {}
+        mut sess_mod.SessionState<size 8, size 1, size 2> session ← dd.make_session<size 8, size 1, size 2>(sched)
+        mut dt.Workspace<size 4, size 4, size 2, size 6, size 2, size 8, size 2> ws ← dd.make_workspace<size 4, size 4, size 2, size 6, size 2, size 8, size 2>(spec, mut sink)
+        mut tensor<f32, [1]> rtcos ← tf32[1] {}
+        mut tensor<f32, [1]> rtsin ← tf32[1] {}
+
+        let list<int> gen ← dd.generate_greedy<size 5, size 4, size 4, size 2, size 6, size 2, size 8, size 1, size 2, size 1>(spec, head, bank, mut session, ws, mut rtcos, mut rtsin, [1, 3], 3)
+
+        if gen.length() ≢ 3 then return false
+
+        for from gen let tok {
+            if tok ≺ 0 or tok ≥ 5 then return false
+        }
+
+        return dd.session_valid_count<size 8, size 1, size 2>(session, 0) ≡ 4 and dd.session_valid_count<size 8, size 1, size 2>(session, 1) ≡ 4
+    }
+    catch err {
+        return false
+    }
+}
+
+@ public
+fn check_rejects_non_f32_and_missing_tensor() → bool {
+    let string json_txt ← «{"model_type":"llama","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"num_key_value_heads":1,"head_dim":2,"intermediate_size":6,"vocab_size":5,"max_position_embeddings":8,"rms_norm_eps":0.00001,"rope_theta":10000.0,"tie_word_embeddings":true}»
+    let cfg.ModelConfig ∪ none maybe_mc ← parse_config_opt(json_txt)
+    if maybe_mc is none then return false
+    let cfg.ModelConfig mc ← maybe_mc
+
+    let td.TensorDirectory ∪ none bad_dir ← build_synthetic_directory(1, 5, 4, 4, 2, 6, true, false, "BF16")
+    if bad_dir is none then return false
+
+    mut bool rejected_dtype ← false
+    do {
+        let dd.DenseModelSpec ? ← dd.admit_spec_from_config(mc, bad_dir)
+    }
+    catch err {
+        rejected_dtype ← true
+    }
+    if not rejected_dtype then return false
+
+    let string untied_json ← «{"model_type":"llama","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"num_key_value_heads":1,"head_dim":2,"intermediate_size":6,"vocab_size":5,"max_position_embeddings":8,"rms_norm_eps":0.00001,"rope_theta":10000.0,"tie_word_embeddings":false}»
+    let cfg.ModelConfig ∪ none maybe_mc2 ← parse_config_opt(untied_json)
+    if maybe_mc2 is none then return false
+    let cfg.ModelConfig mc2 ← maybe_mc2
+
+    let td.TensorDirectory ∪ none missing_dir ← build_synthetic_directory(1, 5, 4, 4, 2, 6, true, false, "F32")
+    if missing_dir is none then return false
+
+    mut bool rejected_missing ← false
+    do {
+        let dd.DenseModelSpec ? ← dd.admit_spec_from_config(mc2, missing_dir)
+    }
+    catch err {
+        rejected_missing ← true
+    }
+    return rejected_missing
+}
+
+fn append_u32_le(mut list<b8> out, u32 u) → void {
+    out.append(((u ∧ (255 ∷ u32)) ↦ u8 ⊥ (0 ∷ u8)) ↦ b8)
+    out.append((((u ⇒ (8 ∷ u32)) ∧ (255 ∷ u32)) ↦ u8 ⊥ (0 ∷ u8)) ↦ b8)
+    out.append((((u ⇒ (16 ∷ u32)) ∧ (255 ∷ u32)) ↦ u8 ⊥ (0 ∷ u8)) ↦ b8)
+    out.append((((u ⇒ (24 ∷ u32)) ∧ (255 ∷ u32)) ↦ u8 ⊥ (0 ∷ u8)) ↦ b8)
+}
+
+fn gguf_b8_u32(int v) → list<b8> {
+    mut list<b8> out ← empty
+    append_u32_le(mut out, v ↦ u32 ⊥ (0 ∷ u32))
+    return out
+}
+
+fn gguf_b8_f32(f32 v) → list<b8> {
+    let b32 b ← v ↦ b32
+    mut list<b8> out ← empty
+    append_u32_le(mut out, b ↦ u32)
+    return out
+}
+
+fn gguf_b8_str(string s) → list<b8> {
+    let list<b8> raw ← s ↦ list<b8>
+    mut list<b8> out ← gguf_b8_u32(raw.length())
+    append_u32_le(mut out, 0 ∷ u32)
+    for from raw let ch {
+        out.append(ch)
+    }
+    return out
+}
+
+fn gguf_f32_tensor(string name, list<int> ne_shape, int rel_off) → gguf_manifest.GgufTensorDescriptor {
+    mut int elems ← 1
+    for from ne_shape let d {
+        elems ← elems * d
+    }
+    let int blen ← elems * 4
+    return gguf_manifest.GgufTensorDescriptor {
+        name = name,
+        shape = ne_shape,
+        dtype_ggml = 0,
+        representation = storage.ggml_representation(0),
+        relative_offset = rel_off,
+        elements = elems,
+        layout = variant gguf_manifest.GgmlLayout.Known { elements_per_block = 1, bytes_per_block = 4, byte_length = blen },
+        block = storage.BlockMetadata { known = true, elements_per_block = 1, bytes_per_block = 4, block_count = elems, byte_length = blen }
+    }
+}
+
+@ public
+fn check_admit_spec_from_gguf() → bool {
+    let int big_bytes ← 1048576
+    mut artifact.ContentIdentity ∪ none maybe_id ← null
+    do {
+        maybe_id ← artifact.identity("sha-256", "0000000000000000000000000000000000000000000000000000000000000000", big_bytes)
+    }
+    catch err {
+        return false
+    }
+    if maybe_id is none then return false
+    let artifact.ContentIdentity sid ← maybe_id
+
+    mut bundle.ModelBundle ∪ none maybe_b ← null
+    do {
+        maybe_b ← bundle.gguf_single(sid)
+    }
+    catch err {
+        return false
+    }
+    if maybe_b is none then return false
+    let bundle.ModelBundle b ← maybe_b
+
+    mut list<gguf_manifest.GgufMetadata> meta ← empty
+    meta.append(gguf_manifest.GgufMetadata { key = "general.architecture", dtype = 8, payload_wire = gguf_b8_str("llama") })
+    meta.append(gguf_manifest.GgufMetadata { key = "llama.block_count", dtype = 4, payload_wire = gguf_b8_u32(1) })
+    meta.append(gguf_manifest.GgufMetadata { key = "llama.embedding_length", dtype = 4, payload_wire = gguf_b8_u32(4) })
+    meta.append(gguf_manifest.GgufMetadata { key = "llama.attention.head_count", dtype = 4, payload_wire = gguf_b8_u32(2) })
+    meta.append(gguf_manifest.GgufMetadata { key = "llama.attention.head_count_kv", dtype = 4, payload_wire = gguf_b8_u32(1) })
+    meta.append(gguf_manifest.GgufMetadata { key = "llama.feed_forward_length", dtype = 4, payload_wire = gguf_b8_u32(6) })
+    meta.append(gguf_manifest.GgufMetadata { key = "llama.context_length", dtype = 4, payload_wire = gguf_b8_u32(16) })
+    meta.append(gguf_manifest.GgufMetadata { key = "llama.attention.layer_norm_rms_epsilon", dtype = 6, payload_wire = gguf_b8_f32(0.00001 ∷ f32) })
+    meta.append(gguf_manifest.GgufMetadata { key = "llama.rope.freq_base", dtype = 6, payload_wire = gguf_b8_f32(100000.0 ∷ f32) })
+
+    mut list<gguf_manifest.GgufTensorDescriptor> tensors ← empty
+    tensors.append(gguf_f32_tensor("token_embd.weight", [4, 5], 0))
+    tensors.append(gguf_f32_tensor("output_norm.weight", [4], 128))
+    tensors.append(gguf_f32_tensor("blk.0.attn_norm.weight", [4], 160))
+    tensors.append(gguf_f32_tensor("blk.0.attn_q.weight", [4, 4], 192))
+    tensors.append(gguf_f32_tensor("blk.0.attn_k.weight", [4, 2], 256))
+    tensors.append(gguf_f32_tensor("blk.0.attn_v.weight", [4, 2], 288))
+    tensors.append(gguf_f32_tensor("blk.0.attn_output.weight", [4, 4], 320))
+    tensors.append(gguf_f32_tensor("blk.0.ffn_norm.weight", [4], 384))
+    tensors.append(gguf_f32_tensor("blk.0.ffn_gate.weight", [4, 6], 416))
+    tensors.append(gguf_f32_tensor("blk.0.ffn_up.weight", [4, 6], 512))
+    tensors.append(gguf_f32_tensor("blk.0.ffn_down.weight", [6, 4], 608))
+
+    let gguf_manifest.GgufManifest gm ← gguf_manifest.GgufManifest {
+        identity = sid,
+        version = 3,
+        alignment = 32,
+        data_start = 1024,
+        artifact_length = big_bytes,
+        metadata = meta,
+        tensors = tensors
+    }
+
+    mut td.TensorDirectory ∪ none maybe_dir ← null
+    do {
+        maybe_dir ← td.build(b, [variant td.ShardSource.GgufSource { role = variant bundle.MemberRole.Backbone, manifest = gm }], [], [])
+    }
+    catch err {
+        return false
+    }
+    if maybe_dir is none then return false
+    let td.TensorDirectory dir ← maybe_dir
+
+    do {
+        let dd.DenseModelSpec spec ← dd.admit_spec_from_gguf(gm, dir)
+        let model_schedule.ExecutionSchedule sched ← dd.build_schedule(spec)
+        return spec.model_type ≡ "llama" and spec.num_layers ≡ 1 and spec.hidden_size ≡ 4 and spec.q_dim ≡ 4 and spec.kv_dim ≡ 2 and spec.vocab_size ≡ 5 and spec.tie_word_embeddings and not spec.has_qkv_bias and sched.layers.length() ≡ 1
+    }
+    catch err {
+        return false
+    }
+}
+
++++ faber test
+import from "gradus:decode_dense_test" let ddt
+
+test "decode_dense drives tied llama-style config through metadata-driven decode" {
+    assert ddt.check_llama_tied_decode()
+}
+
+test "decode_dense admits GGUF metadata and canonicalized tensor directory" {
+    assert ddt.check_admit_spec_from_gguf()
+}
+
+test "decode_dense fails closed on non-F32 dtype or missing untied lm_head" {
+    assert ddt.check_rejects_non_f32_and_missing_tensor()
+}
