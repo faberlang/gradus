@@ -132,7 +132,8 @@ union SafetensorError {
 @ public
 class SelectedTensor {
     mut string name
-    mut dtype.DType dtype_tag
+    mut string raw_dtype = ""
+    mut dtype.DType ∪ none dtype_tag = null
     mut list<int> shape
     mut string artifact_digest
     mut int artifact_length
@@ -1033,10 +1034,12 @@ fn dtype_byte_width(string kind) → int ⇥ SafetensorError {
     }
 }
 
-# The public Gradus DType union covers the currently materializable floating
-# and integer types. Other standards-valid Safetensors names stay in the
-# generic manifest text and are rejected only by this typed range handoff.
-fn dtype_tag_of(string kind) → dtype.DType ⇥ SafetensorError {
+# The public Gradus DType union covers the closed compute-carrier types
+# `{F32, F16, BF16, I32, U8}`. Packed/raw checkpoint storage dtypes
+# (`U32`, `I8`, `F8_E4M3`) are validated by `dtype_byte_width`, carried on
+# `SelectedTensor.raw_dtype`, and leave `dtype_tag` as `null` rather than
+# aliasing a compute dtype.
+fn dtype_tag_of(string kind) → dtype.DType ∪ none ⇥ SafetensorError {
     switch kind {
         case "F32" {
             return dtype.f32()
@@ -1052,6 +1055,15 @@ fn dtype_tag_of(string kind) → dtype.DType ⇥ SafetensorError {
         }
         case "U8" {
             return dtype.u8()
+        }
+        case "U32" {
+            return null
+        }
+        case "I8" {
+            return null
+        }
+        case "F8_E4M3" {
+            return null
         }
         default {
             throw variant UnknownDtype { message = "unsupported materialized Safetensors dtype: §"(kind) }
@@ -1078,15 +1090,16 @@ fn admit_selected(string name, string kind, list<int> shape, list<b8> payload, s
 
     require absolute_end ≤ artifact_length throw variant BadOffset { message = "selected tensor range exceeds the artifact" }
 
-    let dtype.DType dtype_tag ← dtype_tag_of(kind)
+    let int elem_width ← dtype_byte_width(kind)
+    let dtype.DType ∪ none dtype_tag ← dtype_tag_of(kind)
     let int values ← numel(shape)
 
-    require relative_end - relative_start ≡ mul(values, dtype.width(dtype_tag)) throw variant BadShape { message = "selected tensor range does not match its shape" }
+    require relative_end - relative_start ≡ mul(values, elem_width) throw variant BadShape { message = "selected tensor range does not match its shape" }
 
     require payload.length() ≡ relative_end - relative_start throw variant BadOffset { message = "selected tensor payload length does not match its range" }
 
     let int absolute_start ← add(data_start, relative_start)
-    return SelectedTensor { name = name, dtype_tag = dtype_tag, shape = shape, artifact_digest = digest, artifact_length = artifact_length, data_start = data_start, relative_start = relative_start, relative_end = relative_end, absolute_start = absolute_start, payload = payload }
+    return SelectedTensor { name = name, raw_dtype = kind, dtype_tag = dtype_tag, shape = shape, artifact_digest = digest, artifact_length = artifact_length, data_start = data_start, relative_start = relative_start, relative_end = relative_end, absolute_start = absolute_start, payload = payload }
 }
 
 fn validate_identity(artifact.ContentIdentity id, int artifact_length) → artifact.ContentIdentity ⇥ SafetensorError {
@@ -1507,7 +1520,10 @@ test "selected admission accepts caller-supplied generic tensor facts" {
             8
         )
         assert v.name ≡ "renamed.weight"
-        assert dtype.name(v.dtype_tag) ≡ "bf16"
+        assert v.raw_dtype ≡ "BF16"
+        assert v.dtype_tag not is none
+        let dtype.DType dt ← v.dtype_tag coalesce dtype.f32()
+        assert dtype.name(dt) ≡ "bf16"
         assert v.shape.get(0) coalesce (-1) ≡ 2
         assert v.shape.get(1) coalesce (-1) ≡ 2
         assert v.absolute_start ≡ 16
@@ -1689,4 +1705,51 @@ test "uppercase hex \\uXXXX escapes and 0-D scalar tensors are admitted" {
 
     let string scalar_header ← «{"model.layers.0.self_attn.q_proj.global_scale":{"dtype":"F32","shape":[],"data_offsets":[0,4]},"model.layers.0.self_attn.q_proj._amax":{"dtype":"F32","shape":[],"data_offsets":[4,8]},"model.layers.0.self_attn.q_proj._outer_scale_denominator":{"dtype":"F32","shape":[],"data_offsets":[8,12]}}»
     assert admitted(contain_raw(scalar_header, data_pattern(12)), ALT_DIGEST) ≡ true
+}
+
+test "admit_selected supports U32, F8_E4M3, I8, and 0-D scalars without compute-dtype aliasing" {
+    let list<b8> bytes16 ↤ data_pattern(16)
+    let list<b8> bytes8 ↤ data_pattern(8)
+    let list<b8> bytes4 ↤ data_pattern(4)
+    let list<b8> bytes1 ↤ data_pattern(1)
+
+    do {
+        let safetensors.SelectedTensor u32_t ← safetensors.admit_selected("model.layers.0.self_attn.q_proj.weight", "U32", [2, 2], bytes16, ALT_DIGEST, 32, 16, 0, 16)
+        assert u32_t.raw_dtype ≡ "U32"
+        assert u32_t.dtype_tag is none
+        assert u32_t.byte_length() ≡ 16
+
+        let safetensors.SelectedTensor fp8_t ← safetensors.admit_selected("model.layers.0.linear_attn.in_proj_qkv.weight", "F8_E4M3", [2, 4], bytes8, ALT_DIGEST, 32, 16, 0, 8)
+        assert fp8_t.raw_dtype ≡ "F8_E4M3"
+        assert fp8_t.dtype_tag is none
+        assert fp8_t.byte_length() ≡ 8
+
+        let safetensors.SelectedTensor i8_t ← safetensors.admit_selected("model.layers.0.mlp.gate_proj.weight", "I8", [4], bytes4, ALT_DIGEST, 32, 16, 0, 4)
+        assert i8_t.raw_dtype ≡ "I8"
+        assert i8_t.dtype_tag is none
+        assert i8_t.byte_length() ≡ 4
+
+        let safetensors.SelectedTensor scalar_f32 ← safetensors.admit_selected("model.layers.0.self_attn.q_proj._amax", "F32", [], bytes4, ALT_DIGEST, 32, 16, 0, 4)
+        assert scalar_f32.raw_dtype ≡ "F32"
+        assert scalar_f32.dtype_tag not is none
+        let dtype.DType scalar_dt ← scalar_f32.dtype_tag coalesce dtype.u8()
+        assert dtype.name(scalar_dt) ≡ "f32"
+        assert scalar_f32.shape.length() ≡ 0
+
+        let safetensors.SelectedTensor scalar_fp8 ← safetensors.admit_selected("model.layers.0.self_attn.q_proj.scales", "F8_E4M3", [], bytes1, ALT_DIGEST, 32, 16, 0, 1)
+        assert scalar_fp8.raw_dtype ≡ "F8_E4M3"
+        assert scalar_fp8.dtype_tag is none
+        assert scalar_fp8.byte_length() ≡ 1
+    }
+    catch err {
+        assert false
+    }
+
+    do {
+        let safetensors.SelectedTensor ? ← safetensors.admit_selected("bad_u32.weight", "U32", [2, 2], bytes8, ALT_DIGEST, 32, 16, 0, 8)
+        assert false
+    }
+    catch err {
+        assert err.message ≡ "selected tensor range does not match its shape"
+    }
 }
