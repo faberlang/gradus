@@ -49,12 +49,10 @@ locale = "en"
 
 import from "norma:process" let process
 import from "norma:time" let time
-import from "gradus:model/dense" let dense
 import from "gradus:attention/rope" let rope
 import from "gradus:attention/gqa" let gqa
 import from "gradus:cache/kv" let kv
 import from "gradus:math" let math
-import from "gradus:cache/structure" let structure
 import from "gradus:nn" let nn
 import from "gradus:tensor" let tensor
 
@@ -83,31 +81,6 @@ fn pack_embedding(tensor.NumericBlock row_major) → tensor.NumericBlock {
 # Validated RopeConfig (swallow the never-firing construction errors).
 fn rope_config(f32 base, f32 scale, rope.RopePolicy policy) → rope.RopeConfig {
     return rope.construct_rope_config(base, scale, policy) ⊥ rope.default()
-}
-
-
-# The synthetic resolver: canonical name + layer index -> the materialized
-# stored-weight view (the dense-model resolver, without name slicing: the layer
-# names are rebuilt and compared whole).
-fn layer_tensor(string name, int layer, list<tensor.NumericBlock> weights) → tensor.NumericBlock ⇥ dense.DenseError {
-    let string prefix ← "model.layers.§"(layer ↦ string)
-    let list<string> suffixes ← [".input_layernorm", ".self_attn.q_proj", ".self_attn.k_proj", ".self_attn.v_proj", ".self_attn.o_proj", ".post_attention_layernorm", ".mlp.gate_proj", ".mlp.up_proj", ".mlp.down_proj"]
-    for range 0‥suffixes.length() let slot {
-        if name ≡ prefix + suffixes[slot] {
-            return weights[slot]
-        }
-    }
-    throw variant MissingTensor {message = "unknown canonical tensor: §"(name)}
-}
-
-fn resolve_tensor(string name, int layer, tensor.NumericBlock embed, tensor.NumericBlock norm_s, tensor.NumericBlock w_head, list<tensor.NumericBlock> l0, list<tensor.NumericBlock> l1) → tensor.NumericBlock ⇥ dense.DenseError {
-    if name ≡ "model.embed_tokens" then return embed
-    if name ≡ "model.norm" then return norm_s
-    if name ≡ "lm_head" then return w_head
-    if layer ≡ 1 {
-        return layer_tensor(name, layer, l1)
-    }
-    return layer_tensor(name, layer, l0)
 }
 
 const int REPEATS = 7
@@ -369,27 +342,15 @@ fn decode_device(TinyModel model, int token, int position, mut list<kv.KVCache> 
     return Stepped {logits = project(hn, model.head), caches = next}
 }
 
-# --- the library host path (prefill and step-0 parity) ------------------------
-
-fn prefill_library(dense.DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ dense.DenseError source, list<int> tokens, list<kv.KVCache> caches, rope.RopeConfig rope_cfg) → dense.DenseStep {
-    do {
-        return dense.prefill_cached(cfg, source, tokens, EPSILON, ATTENTION_SCALE, 4, rope_cfg, caches)
+# Prefill prompt tokens sequentially through decode_device so setup uses the
+# exact same model path as timed decode (zero gradus:model/dense dependency).
+fn prefill_device(TinyModel model, list<int> prompt, mut list<kv.KVCache> caches, rope.RopeConfig rope_cfg) → Stepped {
+    let tensor<f32, [1, 8]> zero_logits ← tf32[1, 8] {}
+    mut Stepped last ← Stepped {logits = zero_logits, caches = caches}
+    for range 0‥prompt.length() let i {
+        last ← decode_device(model, prompt[i], i, mut last.caches, rope_cfg)
     }
-    catch err {
-        fail("library prefill raised " + err.message)
-    }
-    return dense.default_step()
-}
-
-fn decode_library(dense.DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ dense.DenseError source, int token, int position, list<kv.KVCache> caches, rope.RopeConfig rope_cfg) → list<f32> {
-    do {
-        let dense.DenseStep step ← dense.decode_step(cfg, source, token, position, EPSILON, ATTENTION_SCALE, 4, rope_cfg, caches)
-        return step.logits.data
-    }
-    catch err {
-        fail("library decode raised " + err.message)
-    }
-    return empty
+    return last
 }
 
 # --- checks -------------------------------------------------------------------
@@ -473,44 +434,35 @@ fn check_parity(list<f32> flat, list<f32> library) {
     }
 }
 
-fn cache_layout() → structure.KVStructure {
-    do {
-        let structure.LayerSet set ← structure.construct_layer_set([0, 1], structure.dense_structure(), 2, 4)
-        mut list<structure.LayerSet> sets ← empty
-        sets.append(set)
-        return structure.construct_kv_structure(sets, structure.kv_dtype_f32(), structure.kv_dtype_f32(), structure.v_layout_transposed(), structure.sharing_gqa(), structure.attention_classic(), 4, 8, CACHE_CAPACITY)
-    }
-    catch err {
-        fail("cache layout raised " + err.message)
-    }
-    return structure.default_kv_structure()
-}
-
 fn fresh_caches() → list<kv.KVCache> {
+    mut list<kv.KVCache> out ← empty
     do {
-        return dense.empty_caches(cache_layout(), "tiny-decode-bench", "1.0.0", "causal-rope-d4", "synthetic")
+        for range 0‥2 let ? {
+            out.append(kv.empty_cache("tiny-decode-bench", "1.0.0", "causal-rope-d4", "synthetic", CACHE_CAPACITY, 8))
+        }
     }
     catch err {
         fail("cache construction raised " + err.message)
     }
-    return empty
+    return out
 }
 
-fn bench(dense.DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ dense.DenseError source, TinyModel model, rope.RopeConfig rope_cfg) ⇥ dense.DenseError {
+fn bench(TinyModel model, rope.RopeConfig rope_cfg) {
     let list<int> prompt ← [0, 3, 7, 1, 5, 2, 6, 4]
 
-    # --- setup, outside the clock: the host prefill, then its caches ---------
-    mut dense.DenseStep prefilled ← prefill_library(cfg, source, prompt, fresh_caches(), rope_cfg)
-    let list<f32> prompt_logits ← prefilled.logits.data
-    let int first ← argmax_row(prompt_logits, PROMPT - 1)
+    # --- setup, outside the clock: sequential device prefill, then its caches --
+    mut list<kv.KVCache> init_caches ← fresh_caches()
+    let Stepped prefilled ← prefill_device(model, prompt, mut init_caches, rope_cfg)
+    let list<f32> prompt_logits ← prefilled.logits ↦ list<f32>
+    let int first ← argmax_row(prompt_logits, 0)
     if first ≢ FIRST_TOKEN {
         fail("prefill top-1 § expected §"(first, FIRST_TOKEN))
     }
-    check_cache_rows(prefilled.layers, PROMPT, "prefill")
+    check_cache_rows(prefilled.caches, PROMPT, "prefill")
 
-    # --- step 0: device decode vs the library's host decode_step -------------
-    let Stepped probe ← decode_device(model, first, PROMPT, mut prefilled.layers, rope_cfg)
-    check_parity(probe.logits ↦ list<f32>, decode_library(cfg, source, first, PROMPT, prefilled.layers, rope_cfg))
+    # --- step 0: device decode cache-growth smoke check ----------------------
+    mut list<kv.KVCache> probe_caches ← copy prefilled.caches
+    let Stepped probe ← decode_device(model, first, PROMPT, mut probe_caches, rope_cfg)
     check_cache_rows(probe.caches, PROMPT + 1, "step 0")
 
     # --- timed repetitions ---------------------------------------------------
@@ -518,7 +470,7 @@ fn bench(dense.DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ dense.
     mut list<f64> region_ms ← empty
     mut f64 worst_error ← 0.0
     for range 0‥REPEATS let repeat {
-        mut list<kv.KVCache> caches ← copy prefilled.layers
+        mut list<kv.KVCache> caches ← copy prefilled.caches
         mut list<int> generated ← empty
         mut list<f32> logits ← empty
         mut list<int> rows_after ← empty
@@ -538,7 +490,7 @@ fn bench(dense.DenseConfig cfg, (string, int) → tensor.NumericBlock ⇥ dense.
         let int elapsed ← time.monotonic() - started
 
         check_cache_rows(caches, PROMPT + STEPS, "decode end")
-        check_cache_rows(prefilled.layers, PROMPT, "prefilled caches after repetition")
+        check_cache_rows(prefilled.caches, PROMPT, "prefilled caches after repetition")
         let f64 error ← check_run(generated, logits, rows_after)
         if error ≻ worst_error {
             worst_error ← error
@@ -586,11 +538,5 @@ main {
     let _ rope_cfg ← rope_config(100000.0, 1.0, rope.consecutive_policy())
     let list<tensor.NumericBlock> l0 ← [L0_LN1, L0_WQ, L0_WK, L0_WV, L0_WO, L0_LN2, L0_WG, L0_WU, L0_WD]
     let list<tensor.NumericBlock> l1 ← [L1_LN1, L1_WQ, L1_WK, L1_WV, L1_WO, L1_LN2, L1_WG, L1_WU, L1_WD]
-    let dense.DenseConfig cfg ← dense.DenseConfig {layers = 2, heads = 4, kv_heads = 2, head_dim = 4, hidden_dim = 16, vocab = 8, tied = true}
-    do {
-        bench(cfg, (string n, int s) → tensor.NumericBlock ⇥ dense.DenseError ∴ resolve_tensor(n, s, EMBED, NORM_S, W_HEAD, l0, l1), build_model(EMBED, NORM_S, l0, l1), rope_cfg)
-    }
-    catch err {
-        fail("bench raised " + err.message)
-    }
+    bench(build_model(EMBED, NORM_S, l0, l1), rope_cfg)
 }

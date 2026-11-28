@@ -82,15 +82,13 @@ One `.fab` file → one import path. Nested dirs for packages.
 | `gradus:model/tensor_payload` | Bounded per-tensor payload value and typed diagnostics |
 | `gradus:model/tensor_view` | Typed tensor views over admitted payloads |
 | `gradus:model/dequant` | CPU decoding of the currently supported GGML block types |
-| `gradus:model/dense`, `dense_llama`, `dense_qwen2` | Dense model definitions resolved from `TensorDirectory` + admitted config |
+| `gradus:model/dense_llama`, `dense_qwen2` | Dense architecture adapters resolved from `TensorDirectory` + admitted config |
 | `gradus:model/moe`, `qwen35moe`, `qwen35moe_state` (+ `full_attn` / `linear_attn` / `schedule` / `session`) | MoE and Qwen3.5-MoE state families |
-| `gradus:model/dense_load_static` | Test-only: co-located test for the typed-assembly `load` admit |
 | `gradus:quant/q8_0`, `q5_0`, `q4_1`, `iq4_nl` | GGML block genera with host decoders |
 | `gradus:quant/group_affine` | Group-affine quantized weight representation and device GEMV |
 | **Generation and speculation** | |
 | `gradus:generation/config` | GenerationConfig, GenerationError, acceleration policy |
 | `gradus:generation/decoder` | Cursor, stop policy, decoder generate |
-| `gradus:generation/dense` | DenseEngine and dense generate |
 | `gradus:sampling` | Deterministic token sampling (greedy/sample, repetition penalty, temperature/top-k/top-p/min-p, explicit `Seed` RNG seam) |
 | `gradus:speculative` | Candidate-provider seam (speculative-decode contract): adaptive-depth `AdaptiveBudget`, generalized `DrafterContext` |
 | `gradus:context_lookup` | Deterministic context-lookup search contract |
@@ -105,7 +103,7 @@ One `.fab` file → one import path. Nested dirs for packages.
 
 Package-map root files (`src/attention.fab`, `src/cache.fab`,
 `src/generation.fab`, `src/tokenizer.fab`) re-export their nested packages.
-Test-only modules: `src/generation_test.fab`, `src/model/dense_load_static.fab`
+Test-only modules: `src/generation_test.fab`
 (`+++ faber test` only) and `src/test_util.fab` (shared test helpers).
 
 Nested package dirs only with **≥2 modules** (prefer ≥3). A single nested file
