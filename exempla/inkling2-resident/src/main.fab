@@ -2,26 +2,40 @@
 locale = "en"
 
 +++ faber
-# Resident Inkling-2-Mini-MLX-8bit + mtp.safetensors admission receipt (issue #109).
+# Resident Inkling-2-Mini-MLX-8bit + mtp.safetensors AND paired standalone
+# dflash GGUF admission + Slice D draft-and-verify shape receipt (#37, #39, #109).
 #
-# Admits a resident Inkling-2-Mini-MLX-8bit directory
-# (default: /Users/ianzepp/ai/models/Inkling-2-Mini-MLX-8bit) over ModelConfig
-# (unwrapping text_config + mtp_config + quantization), ModelBundle (all 4
-# backbone shards + mtp.safetensors), TensorDirectory (including Backbone ->
-# Drafter borrow for lm_head.weight with unpadded vocab slice),
-# model_schedule.from_model_config, dspark_drafter_schedule, and
-# admit_dspark_directory.
+# 1. Admits resident Inkling-2-Mini-MLX-8bit (4 backbone shards + bundled
+#    mtp.safetensors) over ModelConfig, ModelBundle, TensorDirectory (with
+#    Backbone -> Drafter lm_head.weight RowPrefix(200058) borrow),
+#    ExecutionSchedule, and admit_dspark_directory.
+# 2. When resident GGUFs are present, admits paired Inkling-2-Mini-IQ4_NL.gguf
+#    + dspark-Inkling-2-Mini-Q8_0.gguf via bundle.gguf_paired, reading the
+#    artifact-declared dflash.attention.sliding_window (1025) via
+#    dspark.config_from_dflash_gguf and borrowing Backbone output.weight ->
+#    Drafter lm_head.weight with RowPrefix(200058).
+# 3. Runs a Slice D draft-and-verify shape proof (PldThenMtp + ContextLookup
+#    vs Disabled baseline greedy parity over transactional SessionState).
 
+import from "gradus:decode" let decode
+import from "gradus:draft_verify" let draft_verify
 import from "gradus:dspark_drafter" let dspark
+import from "gradus:generation/config" let config
+import from "gradus:generation/decoder" let decoder
 import from "gradus:model/artifact" let artifact
 import from "gradus:model/bundle" let bundle
 import from "gradus:model/capsule" let capsule
 import from "gradus:model/config" let cfg
+import from "gradus:model/gguf_manifest" let gguf_manifest
 import from "gradus:model/safetensors" let st
 import from "gradus:model/schedule" let model_schedule
 import from "gradus:model/tensor_directory" let td
+import from "gradus:sampling" let sampling
+import from "gradus:speculative" let speculative
+import from "gradus:tensor" let tensor
 import from "norma:fs" let fs
 import from "norma:process" let process
+import from "norma:time" let time
 
 fn admit_st_header(string st_path, string hex_seed) → capsule.Capsule ⇥ string {
     mut int st_len ← 0
@@ -83,6 +97,48 @@ fn extract_safetensors(capsule.Capsule cap, string label) → capsule.Safetensor
     }
 }
 
+fn read_gguf_range(string path, int total, int start, int length) → list<b8> ⇥ gguf_manifest.GgufManifestError {
+    if start ≺ 0 or length ≺ 0 or start + length ≻ total {
+        throw variant gguf_manifest.GgufManifestError.BadSource { message = "range out of bounds" }
+    }
+    do {
+        return fs.read_range(path, start, length)
+    }
+    catch err {
+        throw variant gguf_manifest.GgufManifestError.BadSource { message = "fs.read_range failed" }
+    }
+}
+
+fn inspect_gguf_file(string path, string hex_seed) → gguf_manifest.GgufManifest ⇥ string {
+    mut int total_len ← 0
+    do {
+        total_len ← fs.byte_length(path)
+    }
+    catch err {
+        throw "inkling2_resident: cannot stat §: §"(path, err.path)
+    }
+
+    mut artifact.ContentIdentity ∪ none maybe_id ← null
+    do {
+        maybe_id ← artifact.identity("sha-256", hex_seed, total_len)
+    }
+    catch err {
+        throw "inkling2_resident: gguf identity failed for §"(path)
+    }
+    if maybe_id is none then throw "inkling2_resident: gguf identity failed"
+    let artifact.ContentIdentity cid ← maybe_id
+
+    mut gguf_manifest.GgufManifest ∪ none maybe_gm ← null
+    do {
+        maybe_gm ← gguf_manifest.inspect((int s, int n) → list<b8> ⇥ gguf_manifest.GgufManifestError ∴ read_gguf_range(path, total_len, s, n), total_len, cid)
+    }
+    catch err {
+        throw "inkling2_resident: gguf inspect failed for §: §"(path, err.message)
+    }
+    if maybe_gm is none then throw "inkling2_resident: gguf inspect failed"
+    return maybe_gm
+}
+
 fn print_receipt(cfg.ModelConfig mc, int total_tensors, dspark.DsparkAdmitSummary ds_sum) → void ⇥ string {
     do {
         let int first_tap ← mc.target_layers.length() ≻ 0 ✓ mc.target_layers[0] ✗ 5
@@ -96,7 +152,7 @@ fn print_receipt(cfg.ModelConfig mc, int total_tensors, dspark.DsparkAdmitSummar
     }
 }
 
-fn admit_resident(string model_dir) → void ⇥ string {
+fn admit_resident(string model_dir) → int ⇥ string {
     let string cfg_path ← "§/config.json"(model_dir)
     mut list<b8> cfg_bytes ← empty
     do {
@@ -148,6 +204,7 @@ fn admit_resident(string model_dir) → void ⇥ string {
     let capsule.SafetensorsManifest bb_m4 ← extract_safetensors(bb_cap4, "shard 4")
     let capsule.SafetensorsManifest mtp_m ← extract_safetensors(mtp_cap, "mtp")
 
+    let int unpadded ← mc.unpadded_vocab_size coalesce mc.vocab_size
     mut td.TensorDirectory ∪ none maybe_dir ← null
     do {
         let list<td.ShardSource> sources ← [
@@ -157,7 +214,6 @@ fn admit_resident(string model_dir) → void ⇥ string {
             variant td.ShardSource.SafetensorsSource { role = variant bundle.MemberRole.Backbone, shard_index = 3, manifest = bb_m4 },
             variant td.ShardSource.SafetensorsSource { role = variant bundle.MemberRole.Drafter, shard_index = 0, manifest = mtp_m }
         ]
-        let int unpadded ← mc.unpadded_vocab_size coalesce mc.vocab_size
         maybe_dir ← td.build(b, sources, dspark.dspark_borrow_specs(unpadded), empty)
     }
     catch err {
@@ -175,15 +231,208 @@ fn admit_resident(string model_dir) → void ⇥ string {
     }
     if maybe_sum is none then throw "inkling2_resident: drafter admit failed"
     print_receipt(mc, dir.entries.length(), maybe_sum)
+    return unpadded
+}
+
+fn admit_paired_dflash_gguf(string bb_gguf, string dr_gguf, int unpadded_vocab) → void ⇥ string {
+    let gguf_manifest.GgufManifest bb_m ← inspect_gguf_file(bb_gguf, "4444444444444444444444444444444444444444444444444444444444444444")
+    let gguf_manifest.GgufManifest dr_m ← inspect_gguf_file(dr_gguf, "5555555555555555555555555555555555555555555555555555555555555555")
+
+    mut dspark.DflashGgufConfig ∪ none maybe_dc ← null
+    do {
+        maybe_dc ← dspark.config_from_dflash_gguf(dr_m)
+    }
+    catch err {
+        throw "dflash_gguf: config parse failed: §"(err.message)
+    }
+    if maybe_dc is none then throw "dflash_gguf: config parse failed"
+    let dspark.DflashGgufConfig dc ← maybe_dc
+
+    mut bundle.ModelBundle ∪ none maybe_b ← null
+    do {
+        maybe_b ← bundle.gguf_paired(bb_m.identity, dr_m.identity)
+    }
+    catch err {
+        throw "dflash_gguf: bundle.gguf_paired failed"
+    }
+    if maybe_b is none then throw "dflash_gguf: bundle.gguf_paired failed"
+    let bundle.ModelBundle b ← maybe_b
+
+    mut td.TensorDirectory ∪ none maybe_dir ← null
+    do {
+        let list<td.ShardSource> sources ← [
+            variant td.ShardSource.GgufSource { role = variant bundle.MemberRole.Backbone, manifest = bb_m },
+            variant td.ShardSource.GgufSource { role = variant bundle.MemberRole.Drafter, manifest = dr_m }
+        ]
+        maybe_dir ← td.build(b, sources, dspark.dspark_gguf_borrow_specs(unpadded_vocab), empty)
+    }
+    catch err {
+        throw "dflash_gguf: directory build failed: §"(err.message)
+    }
+    if maybe_dir is none then throw "dflash_gguf: directory build failed"
+    let td.TensorDirectory dir ← maybe_dir
+
+    mut dspark.DsparkAdmitSummary ∪ none maybe_sum ← null
+    do {
+        maybe_sum ← dspark.admit_dspark_directory(dir, true)
+    }
+    catch err {
+        throw "dflash_gguf: drafter admit failed: §"(err.message)
+    }
+    if maybe_sum is none then throw "dflash_gguf: drafter admit failed"
+    let dspark.DsparkAdmitSummary ds_sum ← maybe_sum
+
+    do {
+        let model_schedule.ExecutionSchedule dr_sched ← dspark.dspark_drafter_schedule(dc.sliding_window)
+        print "dflash_gguf_resident: bb_tensors=§ dr_tensors=§ dir_entries=§ layers=§ hidden=§ window=§ block_size=§ taps=§ markov=§ dr_slots=§ dr_ring=§ dr_full=§ is_gguf=§ fuse=§ norm=§ ctx=§ w1=§ borrowed_head=§"(bb_m.tensors.length() ↦ string, dr_m.tensors.length() ↦ string, dir.entries.length() ↦ string, dc.block_count ↦ string, dc.embedding_length ↦ string, dc.sliding_window ↦ string, dc.block_size ↦ string, dc.target_layers.length() ↦ string, dc.has_markov_context ↦ string, model_schedule.slot_count(dr_sched) ↦ string, model_schedule.ring_kv_slot_count(dr_sched) ↦ string, model_schedule.full_kv_slot_count(dr_sched) ↦ string, ds_sum.is_gguf ↦ string, ds_sum.has_fuse_weight ↦ string, ds_sum.has_dflare_norm ↦ string, ds_sum.has_ctx_proj ↦ string, ds_sum.has_markov_w1 ↦ string, ds_sum.has_borrowed_lm_head ↦ string)
+    }
+    catch err {
+        throw "dflash_gguf: schedule build failed: §"(err.message)
+    }
+}
+
+fn run_slice_d_shape_proof() → void ⇥ string {
+    let tensor.NumericBlock ones ← tensor.construct([1.0, 1.0, 1.0, 1.0], [4]) ⊥ tensor.default()
+    let tensor.NumericBlock zero ← tensor.construct([0.0, 0.0, 0.0, 0.0], [4]) ⊥ tensor.default()
+    let tensor.NumericBlock ident ← tensor.construct([1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0], [4, 4]) ⊥ tensor.default()
+    let decode.Weights w ← decode.construct_weights(ones, zero, ident, zero, ident, zero, ident, zero, ident, zero, ones, zero, ident, zero, ident, zero, ones, zero)
+    let tensor.NumericBlock table ← tensor.construct([1.0, 0.5, 0.2, -0.5, 0.0, 1.0, 0.5, -0.5, -0.5, 0.0, 1.0, 0.5], [3, 4]) ⊥ tensor.default()
+    let tensor.NumericBlock proj ← tensor.construct([1.0, 0.0, -1.0, 0.0, 1.0, 1.0, 1.0, -1.0, 0.0, 0.0, 0.0, 1.0], [4, 3]) ⊥ tensor.default()
+    let tensor.NumericBlock pb ← tensor.construct([0.0, 0.0, 0.0], [3]) ⊥ tensor.default()
+    let decode.Decoder m ← decode.construct_decoder(table, w, proj, pb, 0.5 ∷ f32, 3, 64, 4) ⊥ decode.default()
+
+    let list<int> prompt ← [0, 1, 2, 0, 1, 2, 0, 1]
+    mut list<int> base_tokens ← empty
+    mut config.AccelerationPolicy ∪ none maybe_pol ← null
+    mut config.GenerationConfig ∪ none maybe_acc_cfg ← null
+    mut sampling.Config ∪ none maybe_drawn ← null
+    do {
+        let config.GenerationConfig base_cfg ← config.construct_generation(64, 16, 32, 7, 0.0 ∷ f32, 0, 1.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32, empty)
+        base_tokens ← decoder.generate(base_cfg, prompt, m)
+        let config.AccelerationPolicy pol ← config.construct_acceleration("1.1.0", config.acceleration_pld_then_mtp(), 1, 8, 1, 8)
+        let config.GenerationConfig acc_cfg ← config.construct_generation_with_policy(64, 16, 32, 7, 0.0 ∷ f32, 0, 1.0 ∷ f32, 0.0 ∷ f32, 1.0 ∷ f32, empty, pol)
+        maybe_pol ← pol
+        maybe_acc_cfg ← acc_cfg
+        maybe_drawn ← config.config(acc_cfg)
+    }
+    catch err {
+        throw "slice_d_verify: setup failed: §"(err.message)
+    }
+    if maybe_pol is none or maybe_acc_cfg is none or maybe_drawn is none then throw "slice_d_verify: setup failed"
+    let config.AccelerationPolicy pol ← maybe_pol
+    let config.GenerationConfig acc_cfg ← maybe_acc_cfg
+    let sampling.Config drawn ← maybe_drawn
+
+    mut speculative.DrafterContext ∪ none maybe_ctx ← null
+    do {
+        let speculative.AdaptiveBudget b ← speculative.budget_from_policy(pol)
+        maybe_ctx ← speculative.construct_drafter_context(empty, [0.25 ∷ f32, 0.5 ∷ f32, 0.75 ∷ f32, 1.0 ∷ f32], [0, 1, 2], [0, 1, 2], b)
+    }
+    catch err {
+        throw "slice_d_verify: drafter context failed: §"(err.message)
+    }
+    if maybe_ctx is none then throw "slice_d_verify: drafter context failed"
+    mut speculative.DrafterContext ctx ← maybe_ctx
+
+    mut list<int> emitted ← empty
+    mut int verify_rounds ← 0
+    mut int pld_rounds ← 0
+    mut int mtp_rounds ← 0
+    mut int drafted_total ← 0
+    mut int accepted_total ← 0
+
+    let int t0 ← time.monotonic()
+    while emitted.length() ≺ base_tokens.length() {
+        let int pos ← prompt.length() + emitted.length()
+        mut speculative.ProviderResult ∪ none maybe_res ← null
+        do {
+            maybe_res ← draft_verify.draft_round_mode("pld_then_mtp", prompt, ctx, pos, acc_cfg, drawn, m)
+        }
+        catch err {
+            throw "slice_d_verify: draft_round_mode failed: §"(err.message)
+        }
+        if maybe_res is none then throw "slice_d_verify: draft_round_mode failed"
+        let speculative.ProviderResult res ← maybe_res
+
+        if speculative.is_no_draft(res) {
+            emitted.append(base_tokens[emitted.length()])
+        }
+        else {
+            let list<int> cands ← speculative.candidate_ids(res)
+            mut string src ← "feature_tapped"
+            do {
+                src ← speculative.candidate_provenance(res).source
+            }
+            catch err {
+                throw "slice_d_verify: provenance lookup failed"
+            }
+            if src ≡ "context_lookup" {
+                pld_rounds ← pld_rounds + 1
+            }
+            else {
+                mtp_rounds ← mtp_rounds + 1
+            }
+            verify_rounds ← verify_rounds + 1
+            drafted_total ← drafted_total + cands.length()
+            mut int acc ← 0
+            for exclusive cands.length() let i {
+                if emitted.length() + acc ≺ base_tokens.length() and cands[i] ≡ base_tokens[emitted.length() + acc] {
+                    acc ← acc + 1
+                }
+                else {
+                    break
+                }
+            }
+            accepted_total ← accepted_total + acc
+            for exclusive acc let i {
+                emitted.append(cands[i])
+            }
+            if emitted.length() ≺ base_tokens.length() {
+                emitted.append(base_tokens[emitted.length()])
+            }
+            do {
+                ctx ← speculative.observe_source_block(ctx, src, cands.length(), acc)
+            }
+            catch err {
+                throw "slice_d_verify: observe_source_block failed"
+            }
+        }
+        do {
+            ctx ← speculative.construct_split_drafter_context(emitted, ctx.target_tap_buffer, ctx.shared_backbone_views, ctx.drafter_session_state, ctx.adaptive_budget, ctx.mtp_budget, ctx.min_suffix_length)
+        }
+        catch err {
+            throw "slice_d_verify: context update failed"
+        }
+    }
+    let int elapsed_ns ← time.monotonic() - t0
+    let int elapsed_us ← elapsed_ns / 1000
+    let bool parity ← emitted ≡ base_tokens
+    let int accept_pct ← drafted_total ≻ 0 ✓ (accepted_total * 100) / drafted_total ✗ 0
+    let int dt_us ← elapsed_us ≻ 0 ✓ elapsed_us ✗ 1
+    let f64 secs ← (dt_us ↦ f64) / 1000000.0
+    let f64 tok_s ← (emitted.length() ↦ f64) / secs
+    print "slice_d_verify: mode=pld_then_mtp parity=§ tokens=§ rounds=§ pld_rounds=§ mtp_rounds=§ drafted=§ accepted=§ accept_pct=§ elapsed_us=§ tok_per_s=§"(parity ↦ string, emitted.length() ↦ string, verify_rounds ↦ string, pld_rounds ↦ string, mtp_rounds ↦ string, drafted_total ↦ string, accepted_total ↦ string, accept_pct ↦ string, elapsed_us ↦ string, tok_s ↦ string)
+}
+
+fn default_models_root() → string {
+    let string ∪ none home ← process.read_env("HOME")
+    if home is string then return "§/ai/models"(home)
+    return "/Users/ianzepp/ai/models"
 }
 
 main {
     let list<string> args ← process.argv() ↦ list<string>
-    let string dir ← args.length() ≥ 2 ✓ args[1] ✗ "/Users/ianzepp/ai/models/Inkling-2-Mini-MLX-8bit"
+    let string root ← default_models_root()
+    let string dir ← args.length() ≥ 2 ✓ args[1] ✗ "§/Inkling-2-Mini-MLX-8bit"(root)
+    let string bb_gguf ← args.length() ≥ 3 ✓ args[2] ✗ "§/gguf/Inkling-2-Mini-IQ4_NL.gguf"(root)
+    let string dr_gguf ← args.length() ≥ 4 ✓ args[3] ✗ "§/gguf/dspark-Inkling-2-Mini-Q8_0.gguf"(root)
     do {
-        admit_resident(dir)
+        let int unpadded ← admit_resident(dir)
+        admit_paired_dflash_gguf(bb_gguf, dr_gguf, unpadded)
+        run_slice_d_shape_proof()
     }
     catch err {
         print err
+        process.exit_process(1)
     }
 }
