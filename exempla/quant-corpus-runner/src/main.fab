@@ -52,8 +52,13 @@ const size GD_16 = 128
 const size GF_16 = 512
 
 const int MAX_GEN = 32
+const size MAX_GEN_SZ = 32
+const size PROMPT_LEN = 5
 const string PROMPT = "The capital of France is"
 
+# Bulk `list<b8> ↦ tensor<f16|bf16, ...> via le` is rejected by faber 1.25.0
+# (`SEM016:list_b8_to_tensor_element_unsupported`), and host `b16 ↦ f16|bf16` is declined by `clif-jit`
+# (`ENGINE001`). Load raw bytes as packed `tensor<u32, ...> via le` and unpack half-floats on Metal.
 @ public
 kernel u32_to_f16<size R, size HalfC, size Cols>(tensor<u32, [R, HalfC]> src, mut tensor<f16, [R, Cols]> dst) → void {
     for from dst at [r, c] thread lane {
@@ -92,6 +97,46 @@ kernel u32_to_bf16_f32_1d<size HalfN, size N>(tensor<u32, [HalfN]> src, mut tens
         let u16 bits ← (((wb ⇒ sh) ∧ ((65535 ∷ u32) ↦ b32)) ↦ u32) ↦ wrapping<u16>
         dst[[i]] ← ((bits ↦ b16) ↦ bf16) ↦ f32
     }
+}
+
+@ public
+kernel load_prompt_token(tensor<i32, [PROMPT_LEN]> prompt_t, mut tensor<i32, [1]> cur_id, i32 step) → void {
+    for from cur_id at [i] thread lane {
+        cur_id[[i]] ← prompt_t[[step]]
+    }
+}
+
+@ public
+kernel record_gen_token(tensor<i32, [1]> cur_id, mut tensor<i32, [MAX_GEN_SZ]> gen_buf, i32 gen_idx) → void {
+    for from gen_buf at [g] thread lane {
+        if g ≡ gen_idx {
+            gen_buf[[g]] ← cur_id[[0]]
+        }
+    }
+}
+
+@ public
+kernel capture_first_logit(tensor<i32, [1]> cur_id, tensor<f32, [V]> logits, mut tensor<f32, [1]> first_logit) → void {
+    for from first_logit at [i] thread lane {
+        first_logit[[i]] ← logits[[cur_id[[0]]]]
+    }
+}
+
+fn make_prompt_tensor(list<int> prompt_ids) → tensor<i32, [PROMPT_LEN]> ⇥ string {
+    require prompt_ids.length() ≡ PROMPT_LEN throw "quant_corpus: unexpected prompt length §"(prompt_ids.length() ↦ string)
+    mut tensor<i32, [PROMPT_LEN]> t ← ti32[PROMPT_LEN] {}
+    for exclusive PROMPT_LEN let i {
+        t[[i]] ← prompt_ids[i] ↦ i32 ⊥ 0
+    }
+    return t
+}
+
+fn read_gen_ids(tensor<i32, [MAX_GEN_SZ]> gen_buf) → list<int> {
+    mut list<int> out ← empty
+    for exclusive MAX_GEN_SZ let i {
+        out.append(gen_buf[[i]] ↦ int)
+    }
+    return out
 }
 
 class WorkDom {
@@ -596,16 +641,18 @@ fn run_f32(list<string> shard_paths, td.TensorDirectory dir, cfg.ModelConfig mc,
     let f32 plntheta ← ln (mc.rope_theta)
     let int load_ms ← (time.monotonic() - t_load0) / 1000000
     let int total_steps ← prompt_ids.length() + MAX_GEN - 1
-    mut list<int> gen_ids ← empty
-    mut int next_tok ← 0
-    mut int first_top1 ← -1
-    mut f32 first_logit ← 0.0 ∷ f32
+    let tensor<i32, [PROMPT_LEN]> prompt_t ← make_prompt_tensor(prompt_ids)
+    mut tensor<i32, [MAX_GEN_SZ]> gen_buf ← ti32[MAX_GEN_SZ] {}
+    mut tensor<f32, [1]> first_logit_buf ← tf32[1] {}
 
     let int t0 ← time.monotonic()
     for exclusive total_steps let step {
-        let int tok_in ← step ≺ prompt_ids.length() ✓ prompt_ids[step] ✗ next_tok
-        ids_buf[0] ← tok_in ↦ i32 ⊥ 0
         let i32 tpos ← step ↦ i32 ⊥ 0
+        if step ≺ prompt_ids.length() {
+            do device {
+                load_prompt_token(prompt_t, mut ids_buf, tpos)
+            }
+        }
         ds.gather_wide(emb, ids_buf, mut h_cur)
         ds.rope_table(mut rtcos, mut rtsin, tpos, plntheta)
 
@@ -650,21 +697,23 @@ fn run_f32(list<string> shard_paths, td.TensorDirectory dir, cfg.ModelConfig mc,
                 }
             }
         }
-        let tensor<f32, [D]> h_out ← (mc.num_hidden_layers % 2 ≡ 0) ✓ h_cur ✗ h_next
-        do device {
-            ds.rmsnorm(h_out, onorm, mut xn, peps)
-            ds.gemv(emb, xn, mut logits)
-        }
-        ds.argmax_token(logits, mut ids_buf)
-        next_tok ← ids_buf[[0]] ↦ int
-        if step ≡ prompt_ids.length() - 1 {
-            first_top1 ← next_tok
-            first_logit ← logits[[next_tok]]
-        }
         if step ≥ prompt_ids.length() - 1 {
-            gen_ids.append(next_tok)
+            let tensor<f32, [D]> h_out ← (mc.num_hidden_layers % 2 ≡ 0) ✓ h_cur ✗ h_next
+            let i32 gen_idx ← (step - (prompt_ids.length() - 1)) ↦ i32 ⊥ 0
+            do device {
+                ds.rmsnorm(h_out, onorm, mut xn, peps)
+                ds.gemv(emb, xn, mut logits)
+                ds.argmax_token(logits, mut ids_buf)
+                record_gen_token(ids_buf, mut gen_buf, gen_idx)
+                if gen_idx ≡ 0 {
+                    capture_first_logit(ids_buf, logits, mut first_logit_buf)
+                }
+            }
         }
     }
+    let list<int> gen_ids ← read_gen_ids(gen_buf)
+    let int first_top1 ← gen_ids[0]
+    let f32 first_logit ← first_logit_buf[[0]]
     report_result("f32", load_ms, t0, total_steps, first_top1, first_logit, gen_ids, tok)
 }
 
@@ -718,16 +767,18 @@ fn run_f16(list<string> shard_paths, td.TensorDirectory dir, cfg.ModelConfig mc,
     let f32 plntheta ← ln (mc.rope_theta)
     let int load_ms ← (time.monotonic() - t_load0) / 1000000
     let int total_steps ← prompt_ids.length() + MAX_GEN - 1
-    mut list<int> gen_ids ← empty
-    mut int next_tok ← 0
-    mut int first_top1 ← -1
-    mut f32 first_logit ← 0.0 ∷ f32
+    let tensor<i32, [PROMPT_LEN]> prompt_t ← make_prompt_tensor(prompt_ids)
+    mut tensor<i32, [MAX_GEN_SZ]> gen_buf ← ti32[MAX_GEN_SZ] {}
+    mut tensor<f32, [1]> first_logit_buf ← tf32[1] {}
 
     let int t0 ← time.monotonic()
     for exclusive total_steps let step {
-        let int tok_in ← step ≺ prompt_ids.length() ✓ prompt_ids[step] ✗ next_tok
-        ids_buf[0] ← tok_in ↦ i32 ⊥ 0
         let i32 tpos ← step ↦ i32 ⊥ 0
+        if step ≺ prompt_ids.length() {
+            do device {
+                load_prompt_token(prompt_t, mut ids_buf, tpos)
+            }
+        }
         ds.gather_wide_f16(emb, ids_buf, mut h_cur)
         ds.rope_table(mut rtcos, mut rtsin, tpos, plntheta)
 
@@ -778,21 +829,23 @@ fn run_f16(list<string> shard_paths, td.TensorDirectory dir, cfg.ModelConfig mc,
                 }
             }
         }
-        let tensor<f32, [D]> h_out ← (mc.num_hidden_layers % 2 ≡ 0) ✓ h_cur ✗ h_next
-        do device {
-            ds.rmsnorm(h_out, onorm, mut xn, peps)
-            ds.gemv_f16(emb, xn, mut logits)
-        }
-        ds.argmax_token(logits, mut ids_buf)
-        next_tok ← ids_buf[[0]] ↦ int
-        if step ≡ prompt_ids.length() - 1 {
-            first_top1 ← next_tok
-            first_logit ← logits[[next_tok]]
-        }
         if step ≥ prompt_ids.length() - 1 {
-            gen_ids.append(next_tok)
+            let tensor<f32, [D]> h_out ← (mc.num_hidden_layers % 2 ≡ 0) ✓ h_cur ✗ h_next
+            let i32 gen_idx ← (step - (prompt_ids.length() - 1)) ↦ i32 ⊥ 0
+            do device {
+                ds.rmsnorm(h_out, onorm, mut xn, peps)
+                ds.gemv_f16(emb, xn, mut logits)
+                ds.argmax_token(logits, mut ids_buf)
+                record_gen_token(ids_buf, mut gen_buf, gen_idx)
+                if gen_idx ≡ 0 {
+                    capture_first_logit(ids_buf, logits, mut first_logit_buf)
+                }
+            }
         }
     }
+    let list<int> gen_ids ← read_gen_ids(gen_buf)
+    let int first_top1 ← gen_ids[0]
+    let f32 first_logit ← first_logit_buf[[0]]
     report_result("f16", load_ms, t0, total_steps, first_top1, first_logit, gen_ids, tok)
 }
 
@@ -846,16 +899,18 @@ fn run_bf16(list<string> shard_paths, td.TensorDirectory dir, cfg.ModelConfig mc
     let f32 plntheta ← ln (mc.rope_theta)
     let int load_ms ← (time.monotonic() - t_load0) / 1000000
     let int total_steps ← prompt_ids.length() + MAX_GEN - 1
-    mut list<int> gen_ids ← empty
-    mut int next_tok ← 0
-    mut int first_top1 ← -1
-    mut f32 first_logit ← 0.0 ∷ f32
+    let tensor<i32, [PROMPT_LEN]> prompt_t ← make_prompt_tensor(prompt_ids)
+    mut tensor<i32, [MAX_GEN_SZ]> gen_buf ← ti32[MAX_GEN_SZ] {}
+    mut tensor<f32, [1]> first_logit_buf ← tf32[1] {}
 
     let int t0 ← time.monotonic()
     for exclusive total_steps let step {
-        let int tok_in ← step ≺ prompt_ids.length() ✓ prompt_ids[step] ✗ next_tok
-        ids_buf[0] ← tok_in ↦ i32 ⊥ 0
         let i32 tpos ← step ↦ i32 ⊥ 0
+        if step ≺ prompt_ids.length() {
+            do device {
+                load_prompt_token(prompt_t, mut ids_buf, tpos)
+            }
+        }
         ds.gather_wide_bf16(emb, ids_buf, mut h_cur)
         ds.rope_table(mut rtcos, mut rtsin, tpos, plntheta)
 
@@ -900,21 +955,23 @@ fn run_bf16(list<string> shard_paths, td.TensorDirectory dir, cfg.ModelConfig mc
                 }
             }
         }
-        let tensor<f32, [D]> h_out ← (mc.num_hidden_layers % 2 ≡ 0) ✓ h_cur ✗ h_next
-        do device {
-            ds.rmsnorm(h_out, onorm, mut xn, peps)
-            ds.gemv_bf16(emb, xn, mut logits)
-        }
-        ds.argmax_token(logits, mut ids_buf)
-        next_tok ← ids_buf[[0]] ↦ int
-        if step ≡ prompt_ids.length() - 1 {
-            first_top1 ← next_tok
-            first_logit ← logits[[next_tok]]
-        }
         if step ≥ prompt_ids.length() - 1 {
-            gen_ids.append(next_tok)
+            let tensor<f32, [D]> h_out ← (mc.num_hidden_layers % 2 ≡ 0) ✓ h_cur ✗ h_next
+            let i32 gen_idx ← (step - (prompt_ids.length() - 1)) ↦ i32 ⊥ 0
+            do device {
+                ds.rmsnorm(h_out, onorm, mut xn, peps)
+                ds.gemv_bf16(emb, xn, mut logits)
+                ds.argmax_token(logits, mut ids_buf)
+                record_gen_token(ids_buf, mut gen_buf, gen_idx)
+                if gen_idx ≡ 0 {
+                    capture_first_logit(ids_buf, logits, mut first_logit_buf)
+                }
+            }
         }
     }
+    let list<int> gen_ids ← read_gen_ids(gen_buf)
+    let int first_top1 ← gen_ids[0]
+    let f32 first_logit ← first_logit_buf[[0]]
     report_result("bf16", load_ms, t0, total_steps, first_top1, first_logit, gen_ids, tok)
 }
 
@@ -985,16 +1042,18 @@ fn run_affine<size PD, size GD, size GDH, size PF, size GF, size GFH>(string fmt
     let f32 plntheta ← ln (mc.rope_theta)
     let int load_ms ← (time.monotonic() - t_load0) / 1000000
     let int total_steps ← prompt_ids.length() + MAX_GEN - 1
-    mut list<int> gen_ids ← empty
-    mut int next_tok ← 0
-    mut int first_top1 ← -1
-    mut f32 first_logit ← 0.0 ∷ f32
+    let tensor<i32, [PROMPT_LEN]> prompt_t ← make_prompt_tensor(prompt_ids)
+    mut tensor<i32, [MAX_GEN_SZ]> gen_buf ← ti32[MAX_GEN_SZ] {}
+    mut tensor<f32, [1]> first_logit_buf ← tf32[1] {}
 
     let int t0 ← time.monotonic()
     for exclusive total_steps let step {
-        let int tok_in ← step ≺ prompt_ids.length() ✓ prompt_ids[step] ✗ next_tok
-        ids_buf[0] ← tok_in ↦ i32 ⊥ 0
         let i32 tpos ← step ↦ i32 ⊥ 0
+        if step ≺ prompt_ids.length() {
+            do device {
+                load_prompt_token(prompt_t, mut ids_buf, tpos)
+            }
+        }
         ga.gather_u32_bf16(emb_w, emb_s, emb_b, ids_buf, mut h_cur, bits, 64 ∷ i32)
         ds.rope_table(mut rtcos, mut rtsin, tpos, plntheta)
 
@@ -1045,21 +1104,23 @@ fn run_affine<size PD, size GD, size GDH, size PF, size GF, size GFH>(string fmt
                 }
             }
         }
-        let tensor<f32, [D]> h_out ← (mc.num_hidden_layers % 2 ≡ 0) ✓ h_cur ✗ h_next
-        do device {
-            ds.rmsnorm(h_out, onorm, mut xn, peps)
-            ga.linear_matvec_u32_bf16(emb_w, emb_s, emb_b, xn, mut logits, bits, 64 ∷ i32)
-        }
-        ds.argmax_token(logits, mut ids_buf)
-        next_tok ← ids_buf[[0]] ↦ int
-        if step ≡ prompt_ids.length() - 1 {
-            first_top1 ← next_tok
-            first_logit ← logits[[next_tok]]
-        }
         if step ≥ prompt_ids.length() - 1 {
-            gen_ids.append(next_tok)
+            let tensor<f32, [D]> h_out ← (mc.num_hidden_layers % 2 ≡ 0) ✓ h_cur ✗ h_next
+            let i32 gen_idx ← (step - (prompt_ids.length() - 1)) ↦ i32 ⊥ 0
+            do device {
+                ds.rmsnorm(h_out, onorm, mut xn, peps)
+                ga.linear_matvec_u32_bf16(emb_w, emb_s, emb_b, xn, mut logits, bits, 64 ∷ i32)
+                ds.argmax_token(logits, mut ids_buf)
+                record_gen_token(ids_buf, mut gen_buf, gen_idx)
+                if gen_idx ≡ 0 {
+                    capture_first_logit(ids_buf, logits, mut first_logit_buf)
+                }
+            }
         }
     }
+    let list<int> gen_ids ← read_gen_ids(gen_buf)
+    let int first_top1 ← gen_ids[0]
+    let f32 first_logit ← first_logit_buf[[0]]
     report_result(fmt_name, load_ms, t0, total_steps, first_top1, first_logit, gen_ids, tok)
 }
 
@@ -1122,16 +1183,18 @@ fn run_mxfp8(list<string> shard_paths, td.TensorDirectory dir, cfg.ModelConfig m
     let f32 plntheta ← ln (mc.rope_theta)
     let int load_ms ← (time.monotonic() - t_load0) / 1000000
     let int total_steps ← prompt_ids.length() + MAX_GEN - 1
-    mut list<int> gen_ids ← empty
-    mut int next_tok ← 0
-    mut int first_top1 ← -1
-    mut f32 first_logit ← 0.0 ∷ f32
+    let tensor<i32, [PROMPT_LEN]> prompt_t ← make_prompt_tensor(prompt_ids)
+    mut tensor<i32, [MAX_GEN_SZ]> gen_buf ← ti32[MAX_GEN_SZ] {}
+    mut tensor<f32, [1]> first_logit_buf ← tf32[1] {}
 
     let int t0 ← time.monotonic()
     for exclusive total_steps let step {
-        let int tok_in ← step ≺ prompt_ids.length() ✓ prompt_ids[step] ✗ next_tok
-        ids_buf[0] ← tok_in ↦ i32 ⊥ 0
         let i32 tpos ← step ↦ i32 ⊥ 0
+        if step ≺ prompt_ids.length() {
+            do device {
+                load_prompt_token(prompt_t, mut ids_buf, tpos)
+            }
+        }
         bf8.gather_u32(emb_w, emb_s, ids_buf, mut h_cur, 1 ∷ i32, 32 ∷ i32)
         ds.rope_table(mut rtcos, mut rtsin, tpos, plntheta)
 
@@ -1182,21 +1245,23 @@ fn run_mxfp8(list<string> shard_paths, td.TensorDirectory dir, cfg.ModelConfig m
                 }
             }
         }
-        let tensor<f32, [D]> h_out ← (mc.num_hidden_layers % 2 ≡ 0) ✓ h_cur ✗ h_next
-        do device {
-            ds.rmsnorm(h_out, onorm, mut xn, peps)
-            bf8.linear_matvec_u32(emb_w, emb_s, xn, mut logits, 1 ∷ i32, 32 ∷ i32)
-        }
-        ds.argmax_token(logits, mut ids_buf)
-        next_tok ← ids_buf[[0]] ↦ int
-        if step ≡ prompt_ids.length() - 1 {
-            first_top1 ← next_tok
-            first_logit ← logits[[next_tok]]
-        }
         if step ≥ prompt_ids.length() - 1 {
-            gen_ids.append(next_tok)
+            let tensor<f32, [D]> h_out ← (mc.num_hidden_layers % 2 ≡ 0) ✓ h_cur ✗ h_next
+            let i32 gen_idx ← (step - (prompt_ids.length() - 1)) ↦ i32 ⊥ 0
+            do device {
+                ds.rmsnorm(h_out, onorm, mut xn, peps)
+                bf8.linear_matvec_u32(emb_w, emb_s, xn, mut logits, 1 ∷ i32, 32 ∷ i32)
+                ds.argmax_token(logits, mut ids_buf)
+                record_gen_token(ids_buf, mut gen_buf, gen_idx)
+                if gen_idx ≡ 0 {
+                    capture_first_logit(ids_buf, logits, mut first_logit_buf)
+                }
+            }
         }
     }
+    let list<int> gen_ids ← read_gen_ids(gen_buf)
+    let int first_top1 ← gen_ids[0]
+    let f32 first_logit ← first_logit_buf[[0]]
     report_result("mxfp8", load_ms, t0, total_steps, first_top1, first_logit, gen_ids, tok)
 }
 
@@ -1259,16 +1324,18 @@ fn run_nvfp4(list<string> shard_paths, td.TensorDirectory dir, cfg.ModelConfig m
     let f32 plntheta ← ln (mc.rope_theta)
     let int load_ms ← (time.monotonic() - t_load0) / 1000000
     let int total_steps ← prompt_ids.length() + MAX_GEN - 1
-    mut list<int> gen_ids ← empty
-    mut int next_tok ← 0
-    mut int first_top1 ← -1
-    mut f32 first_logit ← 0.0 ∷ f32
+    let tensor<i32, [PROMPT_LEN]> prompt_t ← make_prompt_tensor(prompt_ids)
+    mut tensor<i32, [MAX_GEN_SZ]> gen_buf ← ti32[MAX_GEN_SZ] {}
+    mut tensor<f32, [1]> first_logit_buf ← tf32[1] {}
 
     let int t0 ← time.monotonic()
     for exclusive total_steps let step {
-        let int tok_in ← step ≺ prompt_ids.length() ✓ prompt_ids[step] ✗ next_tok
-        ids_buf[0] ← tok_in ↦ i32 ⊥ 0
         let i32 tpos ← step ↦ i32 ⊥ 0
+        if step ≺ prompt_ids.length() {
+            do device {
+                load_prompt_token(prompt_t, mut ids_buf, tpos)
+            }
+        }
         fp4.gather_u32(emb_w, emb_s, ids_buf, mut h_cur, 1.0 ∷ f32, 16 ∷ i32)
         ds.rope_table(mut rtcos, mut rtsin, tpos, plntheta)
 
@@ -1319,21 +1386,23 @@ fn run_nvfp4(list<string> shard_paths, td.TensorDirectory dir, cfg.ModelConfig m
                 }
             }
         }
-        let tensor<f32, [D]> h_out ← (mc.num_hidden_layers % 2 ≡ 0) ✓ h_cur ✗ h_next
-        do device {
-            ds.rmsnorm(h_out, onorm, mut xn, peps)
-            fp4.linear_matvec_u32(emb_w, emb_s, xn, mut logits, 1.0 ∷ f32, 16 ∷ i32)
-        }
-        ds.argmax_token(logits, mut ids_buf)
-        next_tok ← ids_buf[[0]] ↦ int
-        if step ≡ prompt_ids.length() - 1 {
-            first_top1 ← next_tok
-            first_logit ← logits[[next_tok]]
-        }
         if step ≥ prompt_ids.length() - 1 {
-            gen_ids.append(next_tok)
+            let tensor<f32, [D]> h_out ← (mc.num_hidden_layers % 2 ≡ 0) ✓ h_cur ✗ h_next
+            let i32 gen_idx ← (step - (prompt_ids.length() - 1)) ↦ i32 ⊥ 0
+            do device {
+                ds.rmsnorm(h_out, onorm, mut xn, peps)
+                fp4.linear_matvec_u32(emb_w, emb_s, xn, mut logits, 1.0 ∷ f32, 16 ∷ i32)
+                ds.argmax_token(logits, mut ids_buf)
+                record_gen_token(ids_buf, mut gen_buf, gen_idx)
+                if gen_idx ≡ 0 {
+                    capture_first_logit(ids_buf, logits, mut first_logit_buf)
+                }
+            }
         }
     }
+    let list<int> gen_ids ← read_gen_ids(gen_buf)
+    let int first_top1 ← gen_ids[0]
+    let f32 first_logit ← first_logit_buf[[0]]
     report_result("nvfp4", load_ms, t0, total_steps, first_top1, first_logit, gen_ids, tok)
 }
 
