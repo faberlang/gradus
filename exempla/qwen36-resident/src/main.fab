@@ -1,0 +1,165 @@
++++ toml
+locale = "en"
+
++++ faber
+# Resident Slice B Qwen3.6-35B-A3B GGUF admission receipt (issue #108).
+#
+# Admits a resident Qwen3.6-35B-A3B GGUF checkpoint
+# (default: /Users/ianzepp/ai/models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf) through
+# Seams 1-3: bounded-range gguf_manifest.inspect -> ModelBundle.gguf_single ->
+# TensorDirectory -> qwen35moe.config_from_gguf & admit_in_directory ->
+# ExecutionSchedule.interval_hybrid_schedule_with_kernel (10 Full KV + 30
+# LinearSsm with conv_kernel=4 and sectional RoPE) -> LinearWeight & mixed-GGML
+# ExpertBank bindings.
+
+import from "gradus:model/artifact" let artifact
+import from "gradus:model/bundle" let bundle
+import from "gradus:model/expert_bank" let eb
+import from "gradus:model/gguf_manifest" let gguf_manifest
+import from "gradus:model/linear_weight" let lw
+import from "gradus:model/qwen35moe" let qwen35moe
+import from "gradus:model/schedule" let model_schedule
+import from "gradus:model/tensor_directory" let td
+import from "norma:fs" let fs
+import from "norma:process" let process
+
+fn read_gguf_range(string path, int total, int start, int length) → list<b8> ⇥ gguf_manifest.GgufManifestError {
+    if start ≺ 0 or length ≺ 0 or start + length ≻ total {
+        throw variant gguf_manifest.GgufManifestError.BadSource { message = "range out of bounds" }
+    }
+    do {
+        return fs.read_range(path, start, length)
+    }
+    catch err {
+        throw variant gguf_manifest.GgufManifestError.BadSource { message = "fs.read_range failed" }
+    }
+}
+
+fn admit_resident(string path) → void ⇥ string {
+    mut int total_len ← 0
+    do {
+        total_len ← fs.byte_length(path)
+    }
+    catch err {
+        throw "qwen36_resident: cannot stat §: §"(path, err.path)
+    }
+
+    mut artifact.ContentIdentity ∪ none maybe_id ← null
+    do {
+        maybe_id ← artifact.identity("sha-256", "3333333333333333333333333333333333333333333333333333333333333333", total_len)
+    }
+    catch err {
+        throw "qwen36_resident: identity build failed"
+    }
+    if maybe_id is none then throw "qwen36_resident: identity build failed"
+    let artifact.ContentIdentity cid ← maybe_id
+
+    mut gguf_manifest.GgufManifest ∪ none maybe_gm ← null
+    do {
+        maybe_gm ← gguf_manifest.inspect((int s, int n) → list<b8> ⇥ gguf_manifest.GgufManifestError ∴ read_gguf_range(path, total_len, s, n), total_len, cid)
+    }
+    catch err {
+        throw "qwen36_resident: gguf_manifest.inspect failed: §"(err.message)
+    }
+    if maybe_gm is none then throw "qwen36_resident: gguf_manifest.inspect failed"
+    let gguf_manifest.GgufManifest gm ← maybe_gm
+
+    mut bundle.ModelBundle ∪ none maybe_b ← null
+    do {
+        maybe_b ← bundle.gguf_single(cid)
+    }
+    catch err {
+        throw "qwen36_resident: bundle.gguf_single failed"
+    }
+    if maybe_b is none then throw "qwen36_resident: bundle.gguf_single failed"
+    let bundle.ModelBundle b ← maybe_b
+
+    mut td.TensorDirectory ∪ none maybe_dir ← null
+    do {
+        let list<td.ShardSource> sources ← [variant td.ShardSource.GgufSource { role = variant bundle.MemberRole.Backbone, manifest = gm }]
+        maybe_dir ← td.build(b, sources, empty, empty)
+    }
+    catch err {
+        throw "qwen36_resident: td.build failed: §"(err.message)
+    }
+    if maybe_dir is none then throw "qwen36_resident: td.build failed"
+    let td.TensorDirectory dir ← maybe_dir
+
+    mut qwen35moe.Qwen35moeConfig ∪ none maybe_qc ← null
+    do {
+        maybe_qc ← qwen35moe.config_from_gguf(gm)
+    }
+    catch err {
+        throw "qwen36_resident: config_from_gguf failed: §"(err.message)
+    }
+    if maybe_qc is none then throw "qwen36_resident: config_from_gguf failed"
+    let qwen35moe.Qwen35moeConfig qc ← maybe_qc
+
+    mut qwen35moe.QwenTensorSummary ∪ none maybe_sum ← null
+    do {
+        maybe_sum ← qwen35moe.admit_in_directory(qc, dir)
+    }
+    catch err {
+        throw "qwen36_resident: admit_in_directory failed"
+    }
+    if maybe_sum is none then throw "qwen36_resident: admit_in_directory failed"
+    let qwen35moe.QwenTensorSummary tsum ← maybe_sum
+
+    mut model_schedule.ExecutionSchedule ∪ none maybe_sched ← null
+    do {
+        let model_schedule.RopeKind rope_kind ← qc.rope_sections.length() ≻ 0 ✓ variant model_schedule.RopeKind.Sectional { dimension_sections = qc.rope_sections } ✗ variant model_schedule.RopeKind.Standard
+        let list<model_schedule.TapBuffer> no_taps ← empty
+        maybe_sched ← model_schedule.interval_hybrid_schedule(qc.block_count, qc.nextn_predict_layers, qc.full_attention_interval, rope_kind, variant model_schedule.FfnKind.MoE, no_taps)
+    }
+    catch err {
+        throw "qwen36_resident: schedule build failed: §"(err.message)
+    }
+    if maybe_sched is none then throw "qwen36_resident: schedule build failed"
+    let model_schedule.ExecutionSchedule sched ← maybe_sched
+
+    mut int qkv0_out ← 0
+    mut int full3_q_out ← 0
+    mut int l0_experts ← 0
+    do {
+        let lw.LinearWeight qkv0 ← lw.bind(dir, variant bundle.MemberRole.Backbone, "blk.0.attn_qkv")
+        let lw.LinearWeight q3 ← lw.bind(dir, variant bundle.MemberRole.Backbone, "blk.3.attn_q")
+        let lw.LinearWeight ? ← lw.bind(dir, variant bundle.MemberRole.Backbone, "blk.3.attn_k")
+        let lw.LinearWeight ? ← lw.bind(dir, variant bundle.MemberRole.Backbone, "blk.3.attn_v")
+        let lw.LinearWeight ? ← lw.bind(dir, variant bundle.MemberRole.Backbone, "blk.3.attn_output")
+        qkv0_out ← qkv0.out_features
+        full3_q_out ← q3.out_features
+    }
+    catch err {
+        throw "qwen36_resident: linear weight bind failed: §"(err.message)
+    }
+
+    do {
+        let eb.ExpertBank bank0 ← eb.bind_split(dir, variant bundle.MemberRole.Backbone, "blk.0.ffn_gate_exps", "blk.0.ffn_up_exps", "blk.0.ffn_down_exps", eb.default_quant_hint(), false, 1)
+        l0_experts ← bank0.expert_count
+    }
+    catch err {
+        throw "qwen36_resident: expert bank bind failed: §"(err.message)
+    }
+
+    let int full_slots ← model_schedule.full_kv_slot_count(sched)
+    let int ssm_slots ← model_schedule.slot_count(sched) - full_slots
+    print "qwen36_resident: arch=§ layers=§ tensors=§ hybrid_tensors=§ full_tensors=§ slots=§ full_kv=§ linear_ssm=§ conv_kernel=§ q4k=§ q5k=§ q6k=§ q8_0=§ bf16=§ expert_rank3=§ qkv0_out=§ full3_q_out=§ l0_experts=§"(qc.architecture, qc.block_count ↦ string, tsum.total ↦ string, tsum.hybrid ↦ string, tsum.full_attention ↦ string, model_schedule.slot_count(sched) ↦ string, full_slots ↦ string, ssm_slots ↦ string, qc.conv_kernel ↦ string, tsum.storage_q4_k ↦ string, tsum.storage_q5_k ↦ string, tsum.storage_q6_k ↦ string, tsum.storage_q8_0 ↦ string, tsum.storage_bf16 ↦ string, tsum.expert_rank3 ↦ string, qkv0_out ↦ string, full3_q_out ↦ string, l0_experts ↦ string)
+}
+
+fn default_gguf_path() → string {
+    let string ∪ none home ← process.read_env("HOME")
+    if home is string then return "§/ai/models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"(home)
+    return "/Users/ianzepp/ai/models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+}
+
+main {
+    let list<string> args ← process.argv() ↦ list<string>
+    let string path ← args.length() ≥ 2 ✓ args[1] ✗ default_gguf_path()
+    do {
+        admit_resident(path)
+    }
+    catch err {
+        print err
+        process.exit_process(1)
+    }
+}
