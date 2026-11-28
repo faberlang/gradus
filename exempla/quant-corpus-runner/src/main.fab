@@ -1,0 +1,1580 @@
++++ toml
+locale = "en"
+
++++ faber
+# Universal Wave A Safetensors quant-corpus runner for SmolLM2-1.7B-Instruct.
+#
+# Supports 8 resident device formats with zero F32 weight matrix expansion:
+#   f32, f16, bf16, affine-8bit, affine-6bit, affine-4bit, mxfp8, nvfp4.
+
+import from "gradus:decode_step" let ds
+import from "gradus:model/artifact" let artifact
+import from "gradus:model/bundle" let bundle
+import from "gradus:model/capsule" let capsule
+import from "gradus:model/config" let cfg
+import from "gradus:model/safetensors" let st
+import from "gradus:model/tensor_directory" let td
+import from "gradus:quant/block_fp8" let bf8
+import from "gradus:quant/dual_scaled_fp4" let fp4
+import from "gradus:quant/group_affine" let ga
+import from "gradus:tokenizer/bpe" let bpe
+import from "norma:fs" let fs
+import from "norma:process" let process
+import from "norma:text" let text
+import from "norma:time" let time
+
+const size C = 128
+const size D = 2048
+const size QD = 2048
+const size KVD = 2048
+const size F = 8192
+const size H = 32
+const size V = 49152
+const size P = 32
+const size SPAN = 32
+const size HALF_D = 1024
+const size HALF_F = 4096
+
+const size PD_8 = 512
+const size PF_8 = 2048
+const size PD_6 = 384
+const size PF_6 = 1536
+const size PD_4 = 256
+const size PF_4 = 1024
+
+const size GD_64 = 32
+const size GDH_64 = 16
+const size GF_64 = 128
+const size GFH_64 = 64
+const size GD_32 = 64
+const size GF_32 = 256
+const size GD_16 = 128
+const size GF_16 = 512
+
+const int MAX_GEN = 32
+const string PROMPT = "The capital of France is"
+
+@ public
+kernel u32_to_f16<size R, size HalfC, size Cols>(tensor<u32, [R, HalfC]> src, mut tensor<f16, [R, Cols]> dst) → void {
+    for from dst at [r, c] thread lane {
+        let b32 wb ← src[[r, c / 2]] ↦ b32
+        let u32 sh ← ((c % 2) * 16) ↦ u32 ⊥ (0 ∷ u32)
+        let u16 bits ← (((wb ⇒ sh) ∧ ((65535 ∷ u32) ↦ b32)) ↦ u32) ↦ wrapping<u16>
+        dst[[r, c]] ← (bits ↦ b16) ↦ f16
+    }
+}
+
+@ public
+kernel u32_to_bf16<size R, size HalfC, size Cols>(tensor<u32, [R, HalfC]> src, mut tensor<bf16, [R, Cols]> dst) → void {
+    for from dst at [r, c] thread lane {
+        let b32 wb ← src[[r, c / 2]] ↦ b32
+        let u32 sh ← ((c % 2) * 16) ↦ u32 ⊥ (0 ∷ u32)
+        let u16 bits ← (((wb ⇒ sh) ∧ ((65535 ∷ u32) ↦ b32)) ↦ u32) ↦ wrapping<u16>
+        dst[[r, c]] ← (bits ↦ b16) ↦ bf16
+    }
+}
+
+@ public
+kernel u32_to_f16_f32_1d<size HalfN, size N>(tensor<u32, [HalfN]> src, mut tensor<f32, [N]> dst) → void {
+    for from dst at [i] thread lane {
+        let b32 wb ← src[[i / 2]] ↦ b32
+        let u32 sh ← ((i % 2) * 16) ↦ u32 ⊥ (0 ∷ u32)
+        let u16 bits ← (((wb ⇒ sh) ∧ ((65535 ∷ u32) ↦ b32)) ↦ u32) ↦ wrapping<u16>
+        dst[[i]] ← ((bits ↦ b16) ↦ f16) ↦ f32
+    }
+}
+
+@ public
+kernel u32_to_bf16_f32_1d<size HalfN, size N>(tensor<u32, [HalfN]> src, mut tensor<f32, [N]> dst) → void {
+    for from dst at [i] thread lane {
+        let b32 wb ← src[[i / 2]] ↦ b32
+        let u32 sh ← ((i % 2) * 16) ↦ u32 ⊥ (0 ∷ u32)
+        let u16 bits ← (((wb ⇒ sh) ∧ ((65535 ∷ u32) ↦ b32)) ↦ u32) ↦ wrapping<u16>
+        dst[[i]] ← ((bits ↦ b16) ↦ bf16) ↦ f32
+    }
+}
+
+class WorkDom {
+    let tensor<f32, [H, C]> hcdom
+    let tensor<f32, [H]> hdom
+    let tensor<f32, [QD]> qdom
+    let tensor<f32, [P, QD]> cpdom
+}
+
+class F32Layer {
+    let tensor<f32, [D]> anorm
+    let tensor<f32, [QD, D]> wq
+    let tensor<f32, [KVD, D]> wk
+    let tensor<f32, [KVD, D]> wv
+    let tensor<f32, [D, QD]> wo
+    let tensor<f32, [D]> fnorm
+    let tensor<f32, [F, D]> wg
+    let tensor<f32, [F, D]> wu
+    let tensor<f32, [D, F]> wd
+}
+
+class F16Layer {
+    let tensor<f32, [D]> anorm
+    let tensor<f16, [QD, D]> wq
+    let tensor<f16, [KVD, D]> wk
+    let tensor<f16, [KVD, D]> wv
+    let tensor<f16, [D, QD]> wo
+    let tensor<f32, [D]> fnorm
+    let tensor<f16, [F, D]> wg
+    let tensor<f16, [F, D]> wu
+    let tensor<f16, [D, F]> wd
+}
+
+class Bf16Layer {
+    let tensor<f32, [D]> anorm
+    let tensor<bf16, [QD, D]> wq
+    let tensor<bf16, [KVD, D]> wk
+    let tensor<bf16, [KVD, D]> wv
+    let tensor<bf16, [D, QD]> wo
+    let tensor<f32, [D]> fnorm
+    let tensor<bf16, [F, D]> wg
+    let tensor<bf16, [F, D]> wu
+    let tensor<bf16, [D, F]> wd
+}
+
+class AffineLayer<size PD, size GD, size PF, size GF> {
+    let tensor<f32, [D]> anorm
+    let tensor<u32, [QD, PD]> wq_w
+    let tensor<bf16, [QD, GD]> wq_s
+    let tensor<bf16, [QD, GD]> wq_b
+    let tensor<u32, [KVD, PD]> wk_w
+    let tensor<bf16, [KVD, GD]> wk_s
+    let tensor<bf16, [KVD, GD]> wk_b
+    let tensor<u32, [KVD, PD]> wv_w
+    let tensor<bf16, [KVD, GD]> wv_s
+    let tensor<bf16, [KVD, GD]> wv_b
+    let tensor<u32, [D, PD]> wo_w
+    let tensor<bf16, [D, GD]> wo_s
+    let tensor<bf16, [D, GD]> wo_b
+    let tensor<f32, [D]> fnorm
+    let tensor<u32, [F, PD]> wg_w
+    let tensor<bf16, [F, GD]> wg_s
+    let tensor<bf16, [F, GD]> wg_b
+    let tensor<u32, [F, PD]> wu_w
+    let tensor<bf16, [F, GD]> wu_s
+    let tensor<bf16, [F, GD]> wu_b
+    let tensor<u32, [D, PF]> wd_w
+    let tensor<bf16, [D, GF]> wd_s
+    let tensor<bf16, [D, GF]> wd_b
+}
+
+class FpQuantLayer<size PD, size GD, size PF, size GF> {
+    let tensor<f32, [D]> anorm
+    let tensor<u32, [QD, PD]> wq_w
+    let tensor<u8, [QD, GD]> wq_s
+    let tensor<u32, [KVD, PD]> wk_w
+    let tensor<u8, [KVD, GD]> wk_s
+    let tensor<u32, [KVD, PD]> wv_w
+    let tensor<u8, [KVD, GD]> wv_s
+    let tensor<u32, [D, PD]> wo_w
+    let tensor<u8, [D, GD]> wo_s
+    let tensor<f32, [D]> fnorm
+    let tensor<u32, [F, PD]> wg_w
+    let tensor<u8, [F, GD]> wg_s
+    let tensor<u32, [F, PD]> wu_w
+    let tensor<u8, [F, GD]> wu_s
+    let tensor<u32, [D, PF]> wd_w
+    let tensor<u8, [D, GF]> wd_s
+}
+
+# -------------------------------------------------------------------------
+# Binary / tensor loaders
+# -------------------------------------------------------------------------
+
+fn read_entry_bytes(list<string> shard_paths, td.TensorDirectory dir, string name) → list<b8> ⇥ string {
+    mut td.DirectoryEntry ∪ none maybe_e ← null
+    do {
+        maybe_e ← td.lookup_backbone(dir, name)
+    }
+    catch err {
+        throw "quant_corpus: lookup failed for §"(name)
+    }
+    if maybe_e is none then throw "quant_corpus: missing tensor §"(name)
+    let td.DirectoryEntry e ← maybe_e
+    let string st_path ← shard_paths[e.shard_index]
+    mut list<b8> bytes ← empty
+    do {
+        bytes ← fs.read_range(st_path, e.byte_offset, e.byte_length)
+    }
+    catch err {
+        throw "quant_corpus: read failed for §"(name)
+    }
+    reject bytes.length() ≢ e.byte_length throw "quant_corpus: short read for §"(name)
+    return bytes
+}
+
+fn load_f32_1d<size N>(list<string> shard_paths, td.TensorDirectory dir, string name) → tensor<f32, [N]> ⇥ string {
+    let list<b8> raw ← read_entry_bytes(shard_paths, dir, name)
+    do {
+        let tensor<f32, [N]> out ↤ raw via le
+        return out
+    }
+    catch err {
+        throw "quant_corpus: f32 1d decode failed for §"(name)
+    }
+}
+
+fn load_f16_as_f32_1d<size HalfN, size N>(list<string> shard_paths, td.TensorDirectory dir, string name) → tensor<f32, [N]> ⇥ string {
+    let list<b8> raw ← read_entry_bytes(shard_paths, dir, name)
+    mut tensor<u32, [HalfN]> packed ← tu32[HalfN] {}
+    do {
+        packed ↤ raw via le
+    }
+    catch err {
+        throw "quant_corpus: f16 1d decode failed for §"(name)
+    }
+    mut tensor<f32, [N]> out ← tf32[N] {}
+    do device {
+        u32_to_f16_f32_1d(packed, mut out)
+    }
+    return out
+}
+
+fn load_bf16_as_f32_1d<size HalfN, size N>(list<string> shard_paths, td.TensorDirectory dir, string name) → tensor<f32, [N]> ⇥ string {
+    let list<b8> raw ← read_entry_bytes(shard_paths, dir, name)
+    mut tensor<u32, [HalfN]> packed ← tu32[HalfN] {}
+    do {
+        packed ↤ raw via le
+    }
+    catch err {
+        throw "quant_corpus: bf16 1d decode failed for §"(name)
+    }
+    mut tensor<f32, [N]> out ← tf32[N] {}
+    do device {
+        u32_to_bf16_f32_1d(packed, mut out)
+    }
+    return out
+}
+
+fn load_norm_1d(list<string> shard_paths, td.TensorDirectory dir, string name) → tensor<f32, [D]> ⇥ string {
+    mut td.DirectoryEntry ∪ none maybe_e ← null
+    do {
+        maybe_e ← td.lookup_backbone(dir, name)
+    }
+    catch err {
+        throw "quant_corpus: norm lookup failed for §"(name)
+    }
+    if maybe_e is none then throw "quant_corpus: missing norm §"(name)
+    let td.DirectoryEntry e ← maybe_e
+    if e.raw_dtype ≡ "F32" {
+        return load_f32_1d<size D>(shard_paths, dir, name)
+    }
+    if e.raw_dtype ≡ "F16" {
+        return load_f16_as_f32_1d<size HALF_D, size D>(shard_paths, dir, name)
+    }
+    return load_bf16_as_f32_1d<size HALF_D, size D>(shard_paths, dir, name)
+}
+
+fn load_f32_2d<size R, size Cols>(list<string> shard_paths, td.TensorDirectory dir, string name) → tensor<f32, [R, Cols]> ⇥ string {
+    let list<b8> raw ← read_entry_bytes(shard_paths, dir, name)
+    do {
+        let tensor<f32, [R, Cols]> out ↤ raw via le
+        return out
+    }
+    catch err {
+        throw "quant_corpus: f32 2d decode failed for §"(name)
+    }
+}
+
+fn load_f16_2d_dev<size R, size HalfC, size Cols>(list<string> shard_paths, td.TensorDirectory dir, string name) → tensor<f16, [R, Cols]> ⇥ string {
+    let list<b8> raw ← read_entry_bytes(shard_paths, dir, name)
+    mut tensor<u32, [R, HalfC]> packed ← tu32[R, HalfC] {}
+    do {
+        packed ↤ raw via le
+    }
+    catch err {
+        throw "quant_corpus: f16 packed u32 decode failed for §"(name)
+    }
+    mut tensor<f16, [R, Cols]> out ← tf16[R, Cols] {}
+    do device {
+        u32_to_f16(packed, mut out)
+    }
+    return out
+}
+
+fn load_bf16_2d_dev<size R, size HalfC, size Cols>(list<string> shard_paths, td.TensorDirectory dir, string name) → tensor<bf16, [R, Cols]> ⇥ string {
+    let list<b8> raw ← read_entry_bytes(shard_paths, dir, name)
+    mut tensor<u32, [R, HalfC]> packed ← tu32[R, HalfC] {}
+    do {
+        packed ↤ raw via le
+    }
+    catch err {
+        throw "quant_corpus: bf16 packed u32 decode failed for §"(name)
+    }
+    mut tensor<bf16, [R, Cols]> out ← tbf16[R, Cols] {}
+    do device {
+        u32_to_bf16(packed, mut out)
+    }
+    return out
+}
+
+fn load_u32_2d<size R, size Cols>(list<string> shard_paths, td.TensorDirectory dir, string name) → tensor<u32, [R, Cols]> ⇥ string {
+    let list<b8> raw ← read_entry_bytes(shard_paths, dir, name)
+    do {
+        let tensor<u32, [R, Cols]> out ↤ raw via le
+        return out
+    }
+    catch err {
+        throw "quant_corpus: u32 2d decode failed for §"(name)
+    }
+}
+
+fn load_u8_2d<size R, size Cols>(list<string> shard_paths, td.TensorDirectory dir, string name) → tensor<u8, [R, Cols]> ⇥ string {
+    let list<b8> raw ← read_entry_bytes(shard_paths, dir, name)
+    do {
+        let tensor<u8, [R, Cols]> out ↤ raw
+        return out
+    }
+    catch err {
+        throw "quant_corpus: u8 2d decode failed for §"(name)
+    }
+}
+
+# -------------------------------------------------------------------------
+# Tokenizer
+# -------------------------------------------------------------------------
+
+fn hex_nibble(int b) → int {
+    if b ∈ 48 … 57 then return b - 48
+    if b ∈ 97 … 102 then return b - 87
+    if b ∈ 65 … 70 then return b - 55
+    return -1
+}
+
+fn b8_of(int v) → b8 {
+    return (v ↦ u8 ⊥ (0 ∷ u8)) ↦ b8
+}
+
+fn append_utf8_cp(mut list<b8> out, int cp) → void {
+    if cp ≺ 128 {
+        out.append(b8_of(cp))
+    }
+    elif cp ≺ 2048 {
+        out.append(b8_of(192 + (cp ⇒ 6)))
+        out.append(b8_of(128 + (cp ∧ 63)))
+    }
+    elif cp ≺ 65536 {
+        out.append(b8_of(224 + (cp ⇒ 12)))
+        out.append(b8_of(128 + ((cp ⇒ 6) ∧ 63)))
+        out.append(b8_of(128 + (cp ∧ 63)))
+    }
+    else {
+        out.append(b8_of(240 + (cp ⇒ 18)))
+        out.append(b8_of(128 + ((cp ⇒ 12) ∧ 63)))
+        out.append(b8_of(128 + ((cp ⇒ 6) ∧ 63)))
+        out.append(b8_of(128 + (cp ∧ 63)))
+    }
+}
+
+# Note: norma:json currently slices per-character via UTF-8 scan (O(N^2) on 782 KB vocab.json).
+# Scan raw bytes in O(N) until norma:json exposes a byte-cursor parser.
+fn load_bpe_tokenizer(string tok_dir) → bpe.Tokenizer ⇥ string {
+    let string vocab_path ← "§/vocab.json"(tok_dir)
+    let string merges_path ← "§/merges.txt"(tok_dir)
+
+    mut list<b8> vbytes ← empty
+    mut list<string> lines ← empty
+    do {
+        vbytes ← fs.read_bytes(vocab_path)
+        lines ← fs.read_lines(merges_path)
+    }
+    catch err {
+        throw "quant_corpus: cannot read tokenizer files in §"(tok_dir)
+    }
+
+    mut list<int> ids ← empty
+    mut list<string> tokens ← empty
+    let int n ← vbytes.length()
+    mut int pos ← 0
+    while pos ≺ n {
+        let int ch ← (vbytes[pos] ↦ u8) ↦ int
+        if ch ≡ 34 {
+            pos ↑
+            mut list<b8> tok_b ← empty
+            while pos ≺ n {
+                let int c ← (vbytes[pos] ↦ u8) ↦ int
+                if c ≡ 34 {
+                    pos ↑
+                    break
+                }
+                if c ≡ 92 and pos + 1 ≺ n {
+                    pos ↑
+                    let int e ← (vbytes[pos] ↦ u8) ↦ int
+                    pos ↑
+                    if e ∈ [34, 92, 47] {
+                        tok_b.append(b8_of(e))
+                    }
+                    else {
+                        switch e {
+                            case 110 {
+                                tok_b.append((10 ∷ u8) ↦ b8)
+                            }
+                            case 114 {
+                                tok_b.append((13 ∷ u8) ↦ b8)
+                            }
+                            case 116 {
+                                tok_b.append((9 ∷ u8) ↦ b8)
+                            }
+                            case 98 {
+                                tok_b.append((8 ∷ u8) ↦ b8)
+                            }
+                            case 102 {
+                                tok_b.append((12 ∷ u8) ↦ b8)
+                            }
+                            case 117 {
+                                if pos + 4 ≤ n {
+                                    let int h0 ← hex_nibble((vbytes[pos] ↦ u8) ↦ int)
+                                    let int h1 ← hex_nibble((vbytes[pos + 1] ↦ u8) ↦ int)
+                                    let int h2 ← hex_nibble((vbytes[pos + 2] ↦ u8) ↦ int)
+                                    let int h3 ← hex_nibble((vbytes[pos + 3] ↦ u8) ↦ int)
+                                    pos ← pos + 4
+                                    let int cp ← (h0 ⇐ 12) + (h1 ⇐ 8) + (h2 ⇐ 4) + h3
+                                    append_utf8_cp(mut tok_b, cp)
+                                }
+                            }
+                        }
+                    }
+                }
+                else {
+                    tok_b.append(vbytes[pos])
+                    pos ↑
+                }
+            }
+            while pos ≺ n {
+                let int ws ← (vbytes[pos] ↦ u8) ↦ int
+                if ws ∈ 48 … 57 then break
+                pos ↑
+            }
+            mut int id_val ← 0
+            while pos ≺ n {
+                let int d ← (vbytes[pos] ↦ u8) ↦ int
+                if d ∉ 48 … 57 then break
+                id_val ← id_val * 10 + (d - 48)
+                pos ↑
+            }
+            let string tok_str ← tok_b ↦ string ⊥ ""
+            tokens.append(tok_str)
+            ids.append(id_val)
+        }
+        else {
+            pos ↑
+        }
+    }
+
+    mut list<string> merges ← empty
+    for from lines let line {
+        let string trimmed ← line.trim()
+        if trimmed.length() ≻ 0 and not trimmed.starts_with("#") {
+            merges.append(trimmed)
+        }
+    }
+
+    let list<int> special_ids ← [0, 1, 2]
+    do {
+        return bpe.build_tables(ids, tokens, merges, special_ids)
+    }
+    catch err {
+        throw "quant_corpus: tokenizer build failed"
+    }
+}
+
+# -------------------------------------------------------------------------
+# Workspace, KV slots, and shared attention tail
+# -------------------------------------------------------------------------
+
+fn make_dom(mut tensor<f32, [1]> sink) → WorkDom {
+    let tensor<f32, [H, C]> hcdom ← tf32[H, C] {}
+    let tensor<f32, [H]> hdom ← tf32[H] {}
+    let tensor<f32, [QD]> qdom ← tf32[QD] {}
+    let tensor<f32, [P, QD]> cpdom ← tf32[P, QD] {}
+    ds.prime2(hcdom, mut sink)
+    ds.prime1(hdom, mut sink)
+    ds.prime1(qdom, mut sink)
+    ds.prime2(cpdom, mut sink)
+    return WorkDom { hcdom = hcdom, hdom = hdom, qdom = qdom, cpdom = cpdom }
+}
+
+fn make_kv_caches(int n_layers, mut tensor<f32, [1]> sink) → list<tensor<f32, [C, KVD]>> {
+    mut list<tensor<f32, [C, KVD]>> caches ← empty
+    for exclusive n_layers let ? {
+        let tensor<f32, [C, KVD]> kc ← tf32[C, KVD] {}
+        ds.prime2(kc, mut sink)
+        caches.append(kc)
+    }
+    return caches
+}
+
+fn prime1<size N>(mut tensor<f32, [1]> sink) → tensor<f32, [N]> {
+    let tensor<f32, [N]> t ← tf32[N] {}
+    ds.prime1(t, mut sink)
+    return t
+}
+
+fn prime2<size R, size Cols>(mut tensor<f32, [1]> sink) → tensor<f32, [R, Cols]> {
+    let tensor<f32, [R, Cols]> t ← tf32[R, Cols] {}
+    ds.prime2(t, mut sink)
+    return t
+}
+
+fn report_result(string fmt_name, int load_ms, int t0, int total_steps, int first_top1, f32 first_logit, list<int> gen_ids, bpe.Tokenizer tok) → void ⇥ string {
+    let int elapsed_ns ← time.monotonic() - t0
+    let int decode_ms ← elapsed_ns / 1000000
+    let f64 ms_per_tok ← (elapsed_ns ↦ f64) ÷ ((total_steps ↦ f64) * 1000000.0)
+    let f64 tok_per_s ← 1000.0 ÷ ms_per_tok
+    mut string decoded ← ""
+    do {
+        decoded ← bpe.decode(tok, gen_ids)
+    }
+    catch err {
+        throw "quant_corpus: tokenizer decode failed"
+    }
+    mut list<string> id_strs ← empty
+    for from gen_ids let gid {
+        id_strs.append(gid ↦ string)
+    }
+    let string gen_str ← "[§]"(text.join(id_strs, ", "))
+    print "quant_corpus: format=§ load_ms=§ decode_ms=§ steps=§ ms_per_tok=§ tok_per_s=§ first_top1=§ first_logit=§ gen_ids=§"(fmt_name, load_ms ↦ string, decode_ms ↦ string, total_steps ↦ string, ms_per_tok ↦ string, tok_per_s ↦ string, first_top1 ↦ string, first_logit ↦ string, gen_str)
+    print "decoded=§"(decoded)
+}
+
+# -------------------------------------------------------------------------
+# Per-format layer step + decode loops
+# -------------------------------------------------------------------------
+
+fn run_f32(list<string> shard_paths, td.TensorDirectory dir, cfg.ModelConfig mc, bpe.Tokenizer tok, list<int> prompt_ids, int t_load0) → void ⇥ string {
+    let tensor<f32, [V, D]> emb ← load_f32_2d<size V, size D>(shard_paths, dir, "model.embed_tokens.weight")
+    let tensor<f32, [D]> onorm ← load_norm_1d(shard_paths, dir, "model.norm.weight")
+    mut list<F32Layer> layers ← empty
+    for exclusive mc.num_hidden_layers let l {
+        let string base ← "model.layers.§"(l ↦ string)
+        layers.append(F32Layer {
+            anorm = load_norm_1d(shard_paths, dir, "§.input_layernorm.weight"(base)),
+            wq = load_f32_2d<size QD, size D>(shard_paths, dir, "§.self_attn.q_proj.weight"(base)),
+            wk = load_f32_2d<size KVD, size D>(shard_paths, dir, "§.self_attn.k_proj.weight"(base)),
+            wv = load_f32_2d<size KVD, size D>(shard_paths, dir, "§.self_attn.v_proj.weight"(base)),
+            wo = load_f32_2d<size D, size QD>(shard_paths, dir, "§.self_attn.o_proj.weight"(base)),
+            fnorm = load_norm_1d(shard_paths, dir, "§.post_attention_layernorm.weight"(base)),
+            wg = load_f32_2d<size F, size D>(shard_paths, dir, "§.mlp.gate_proj.weight"(base)),
+            wu = load_f32_2d<size F, size D>(shard_paths, dir, "§.mlp.up_proj.weight"(base)),
+            wd = load_f32_2d<size D, size F>(shard_paths, dir, "§.mlp.down_proj.weight"(base))
+        })
+    }
+
+    mut tensor<f32, [1]> sink ← tf32[1] {}
+    let WorkDom dom ← make_dom(mut sink)
+    mut list<tensor<f32, [C, KVD]>> kcaches ← make_kv_caches(mc.num_hidden_layers, mut sink)
+    mut list<tensor<f32, [C, KVD]>> vcaches ← make_kv_caches(mc.num_hidden_layers, mut sink)
+    mut tensor<i32, [1]> ids_buf ← ti32[1] {}
+    mut tensor<f32, [D]> xn ← prime1<size D>(mut sink)
+    mut tensor<f32, [QD]> q ← prime1<size QD>(mut sink)
+    mut tensor<f32, [KVD]> k ← prime1<size KVD>(mut sink)
+    mut tensor<f32, [KVD]> v ← prime1<size KVD>(mut sink)
+    mut tensor<f32, [QD]> qr ← prime1<size QD>(mut sink)
+    mut tensor<f32, [H, C]> sc ← prime2<size H, size C>(mut sink)
+    mut tensor<f32, [H, C]> pr ← prime2<size H, size C>(mut sink)
+    mut tensor<f32, [P, QD]> cp ← prime2<size P, size QD>(mut sink)
+    mut tensor<f32, [QD]> ctx ← prime1<size QD>(mut sink)
+    mut tensor<f32, [D]> h1 ← prime1<size D>(mut sink)
+    mut tensor<f32, [F]> gate ← prime1<size F>(mut sink)
+    mut tensor<f32, [F]> up ← prime1<size F>(mut sink)
+    mut tensor<f32, [F]> act ← prime1<size F>(mut sink)
+    mut tensor<f32, [D]> h_cur ← prime1<size D>(mut sink)
+    mut tensor<f32, [D]> h_next ← prime1<size D>(mut sink)
+    mut tensor<f32, [V]> logits ← prime1<size V>(mut sink)
+    mut tensor<f32, [SPAN]> rtcos ← prime1<size SPAN>(mut sink)
+    mut tensor<f32, [SPAN]> rtsin ← prime1<size SPAN>(mut sink)
+
+    let f32 peps ← mc.rms_norm_eps
+    let i32 pgroup ← (mc.num_attention_heads / mc.num_key_value_heads) ↦ i32 ⊥ 1
+    let i32 pdh ← mc.head_dim ↦ i32 ⊥ 64
+    let f32 pscale ← 1.0 ∷ f32 / √ (mc.head_dim ↦ f32)
+    let f32 plntheta ← ln (mc.rope_theta)
+    let int load_ms ← (time.monotonic() - t_load0) / 1000000
+    let int total_steps ← prompt_ids.length() + MAX_GEN - 1
+    mut list<int> gen_ids ← empty
+    mut int next_tok ← 0
+    mut int first_top1 ← -1
+    mut f32 first_logit ← 0.0 ∷ f32
+
+    let int t0 ← time.monotonic()
+    for exclusive total_steps let step {
+        let int tok_in ← step ≺ prompt_ids.length() ✓ prompt_ids[step] ✗ next_tok
+        ids_buf[0] ← tok_in ↦ i32 ⊥ 0
+        let i32 tpos ← step ↦ i32 ⊥ 0
+        ds.gather_wide(emb, ids_buf, mut h_cur)
+        ds.rope_table(mut rtcos, mut rtsin, tpos, plntheta)
+
+        for exclusive mc.num_hidden_layers let l {
+            let F32Layer ly ← layers[l]
+            mut tensor<f32, [C, KVD]> kc ← kcaches[l]
+            mut tensor<f32, [C, KVD]> vc ← vcaches[l]
+            if l % 2 ≡ 0 {
+                do device {
+                    ds.rmsnorm(h_cur, ly.anorm, mut xn, peps)
+                    ds.qkv_proj(ly.wq, ly.wk, ly.wv, xn, mut q, mut k, mut v)
+                    ds.rope_half_table_qk_kv_write(q, k, v, rtcos, rtsin, mut qr, mut kc, mut vc, tpos)
+                    ds.attn_scores(dom.hcdom, qr, kc, mut sc, tpos, pgroup, pdh, pscale)
+                    ds.row_softmax_prefix(dom.hdom, sc, mut pr, tpos + (1 ∷ i32))
+                    ds.context_part(dom.cpdom, pr, vc, mut cp, tpos, pgroup, pdh)
+                    ds.context_fin(dom.qdom, cp, mut ctx)
+                    ds.gemv(ly.wo, ctx, mut xn)
+                    ds.residual_add(h_cur, xn, mut h1)
+                    ds.rmsnorm(h1, ly.fnorm, mut xn, peps)
+                    ds.gate_up_proj(ly.wg, ly.wu, xn, mut gate, mut up)
+                    ds.swiglu(gate, up, mut act)
+                    ds.gemv(ly.wd, act, mut xn)
+                    ds.residual_add(h1, xn, mut h_next)
+                }
+            }
+            else {
+                do device {
+                    ds.rmsnorm(h_next, ly.anorm, mut xn, peps)
+                    ds.qkv_proj(ly.wq, ly.wk, ly.wv, xn, mut q, mut k, mut v)
+                    ds.rope_half_table_qk_kv_write(q, k, v, rtcos, rtsin, mut qr, mut kc, mut vc, tpos)
+                    ds.attn_scores(dom.hcdom, qr, kc, mut sc, tpos, pgroup, pdh, pscale)
+                    ds.row_softmax_prefix(dom.hdom, sc, mut pr, tpos + (1 ∷ i32))
+                    ds.context_part(dom.cpdom, pr, vc, mut cp, tpos, pgroup, pdh)
+                    ds.context_fin(dom.qdom, cp, mut ctx)
+                    ds.gemv(ly.wo, ctx, mut xn)
+                    ds.residual_add(h_next, xn, mut h1)
+                    ds.rmsnorm(h1, ly.fnorm, mut xn, peps)
+                    ds.gate_up_proj(ly.wg, ly.wu, xn, mut gate, mut up)
+                    ds.swiglu(gate, up, mut act)
+                    ds.gemv(ly.wd, act, mut xn)
+                    ds.residual_add(h1, xn, mut h_cur)
+                }
+            }
+        }
+        let tensor<f32, [D]> h_out ← (mc.num_hidden_layers % 2 ≡ 0) ✓ h_cur ✗ h_next
+        do device {
+            ds.rmsnorm(h_out, onorm, mut xn, peps)
+            ds.gemv(emb, xn, mut logits)
+        }
+        ds.argmax_token(logits, mut ids_buf)
+        next_tok ← ids_buf[[0]] ↦ int
+        if step ≡ prompt_ids.length() - 1 {
+            first_top1 ← next_tok
+            first_logit ← logits[[next_tok]]
+        }
+        if step ≥ prompt_ids.length() - 1 {
+            gen_ids.append(next_tok)
+        }
+    }
+    report_result("f32", load_ms, t0, total_steps, first_top1, first_logit, gen_ids, tok)
+}
+
+fn run_f16(list<string> shard_paths, td.TensorDirectory dir, cfg.ModelConfig mc, bpe.Tokenizer tok, list<int> prompt_ids, int t_load0) → void ⇥ string {
+    let tensor<f16, [V, D]> emb ← load_f16_2d_dev<size V, size HALF_D, size D>(shard_paths, dir, "model.embed_tokens.weight")
+    let tensor<f32, [D]> onorm ← load_norm_1d(shard_paths, dir, "model.norm.weight")
+    mut list<F16Layer> layers ← empty
+    for exclusive mc.num_hidden_layers let l {
+        let string base ← "model.layers.§"(l ↦ string)
+        layers.append(F16Layer {
+            anorm = load_norm_1d(shard_paths, dir, "§.input_layernorm.weight"(base)),
+            wq = load_f16_2d_dev<size QD, size HALF_D, size D>(shard_paths, dir, "§.self_attn.q_proj.weight"(base)),
+            wk = load_f16_2d_dev<size KVD, size HALF_D, size D>(shard_paths, dir, "§.self_attn.k_proj.weight"(base)),
+            wv = load_f16_2d_dev<size KVD, size HALF_D, size D>(shard_paths, dir, "§.self_attn.v_proj.weight"(base)),
+            wo = load_f16_2d_dev<size D, size HALF_D, size QD>(shard_paths, dir, "§.self_attn.o_proj.weight"(base)),
+            fnorm = load_norm_1d(shard_paths, dir, "§.post_attention_layernorm.weight"(base)),
+            wg = load_f16_2d_dev<size F, size HALF_D, size D>(shard_paths, dir, "§.mlp.gate_proj.weight"(base)),
+            wu = load_f16_2d_dev<size F, size HALF_D, size D>(shard_paths, dir, "§.mlp.up_proj.weight"(base)),
+            wd = load_f16_2d_dev<size D, size HALF_F, size F>(shard_paths, dir, "§.mlp.down_proj.weight"(base))
+        })
+    }
+
+    mut tensor<f32, [1]> sink ← tf32[1] {}
+    let WorkDom dom ← make_dom(mut sink)
+    mut list<tensor<f32, [C, KVD]>> kcaches ← make_kv_caches(mc.num_hidden_layers, mut sink)
+    mut list<tensor<f32, [C, KVD]>> vcaches ← make_kv_caches(mc.num_hidden_layers, mut sink)
+    mut tensor<i32, [1]> ids_buf ← ti32[1] {}
+    mut tensor<f32, [D]> xn ← prime1<size D>(mut sink)
+    mut tensor<f32, [QD]> q ← prime1<size QD>(mut sink)
+    mut tensor<f32, [KVD]> k ← prime1<size KVD>(mut sink)
+    mut tensor<f32, [KVD]> v ← prime1<size KVD>(mut sink)
+    mut tensor<f32, [QD]> qr ← prime1<size QD>(mut sink)
+    mut tensor<f32, [H, C]> sc ← prime2<size H, size C>(mut sink)
+    mut tensor<f32, [H, C]> pr ← prime2<size H, size C>(mut sink)
+    mut tensor<f32, [P, QD]> cp ← prime2<size P, size QD>(mut sink)
+    mut tensor<f32, [QD]> ctx ← prime1<size QD>(mut sink)
+    mut tensor<f32, [D]> h1 ← prime1<size D>(mut sink)
+    mut tensor<f32, [F]> gate ← prime1<size F>(mut sink)
+    mut tensor<f32, [F]> up ← prime1<size F>(mut sink)
+    mut tensor<f32, [F]> act ← prime1<size F>(mut sink)
+    mut tensor<f32, [D]> h_cur ← prime1<size D>(mut sink)
+    mut tensor<f32, [D]> h_next ← prime1<size D>(mut sink)
+    mut tensor<f32, [V]> logits ← prime1<size V>(mut sink)
+    mut tensor<f32, [SPAN]> rtcos ← prime1<size SPAN>(mut sink)
+    mut tensor<f32, [SPAN]> rtsin ← prime1<size SPAN>(mut sink)
+
+    let f32 peps ← mc.rms_norm_eps
+    let i32 pgroup ← (mc.num_attention_heads / mc.num_key_value_heads) ↦ i32 ⊥ 1
+    let i32 pdh ← mc.head_dim ↦ i32 ⊥ 64
+    let f32 pscale ← 1.0 ∷ f32 / √ (mc.head_dim ↦ f32)
+    let f32 plntheta ← ln (mc.rope_theta)
+    let int load_ms ← (time.monotonic() - t_load0) / 1000000
+    let int total_steps ← prompt_ids.length() + MAX_GEN - 1
+    mut list<int> gen_ids ← empty
+    mut int next_tok ← 0
+    mut int first_top1 ← -1
+    mut f32 first_logit ← 0.0 ∷ f32
+
+    let int t0 ← time.monotonic()
+    for exclusive total_steps let step {
+        let int tok_in ← step ≺ prompt_ids.length() ✓ prompt_ids[step] ✗ next_tok
+        ids_buf[0] ← tok_in ↦ i32 ⊥ 0
+        let i32 tpos ← step ↦ i32 ⊥ 0
+        ds.gather_wide_f16(emb, ids_buf, mut h_cur)
+        ds.rope_table(mut rtcos, mut rtsin, tpos, plntheta)
+
+        for exclusive mc.num_hidden_layers let l {
+            let F16Layer ly ← layers[l]
+            mut tensor<f32, [C, KVD]> kc ← kcaches[l]
+            mut tensor<f32, [C, KVD]> vc ← vcaches[l]
+            if l % 2 ≡ 0 {
+                do device {
+                    ds.rmsnorm(h_cur, ly.anorm, mut xn, peps)
+                    ds.gemv_f16(ly.wq, xn, mut q)
+                    ds.gemv_f16(ly.wk, xn, mut k)
+                    ds.gemv_f16(ly.wv, xn, mut v)
+                    ds.rope_half_table_qk_kv_write(q, k, v, rtcos, rtsin, mut qr, mut kc, mut vc, tpos)
+                    ds.attn_scores(dom.hcdom, qr, kc, mut sc, tpos, pgroup, pdh, pscale)
+                    ds.row_softmax_prefix(dom.hdom, sc, mut pr, tpos + (1 ∷ i32))
+                    ds.context_part(dom.cpdom, pr, vc, mut cp, tpos, pgroup, pdh)
+                    ds.context_fin(dom.qdom, cp, mut ctx)
+                    ds.gemv_f16(ly.wo, ctx, mut xn)
+                    ds.residual_add(h_cur, xn, mut h1)
+                    ds.rmsnorm(h1, ly.fnorm, mut xn, peps)
+                    ds.gemv_f16(ly.wg, xn, mut gate)
+                    ds.gemv_f16(ly.wu, xn, mut up)
+                    ds.swiglu(gate, up, mut act)
+                    ds.gemv_f16(ly.wd, act, mut xn)
+                    ds.residual_add(h1, xn, mut h_next)
+                }
+            }
+            else {
+                do device {
+                    ds.rmsnorm(h_next, ly.anorm, mut xn, peps)
+                    ds.gemv_f16(ly.wq, xn, mut q)
+                    ds.gemv_f16(ly.wk, xn, mut k)
+                    ds.gemv_f16(ly.wv, xn, mut v)
+                    ds.rope_half_table_qk_kv_write(q, k, v, rtcos, rtsin, mut qr, mut kc, mut vc, tpos)
+                    ds.attn_scores(dom.hcdom, qr, kc, mut sc, tpos, pgroup, pdh, pscale)
+                    ds.row_softmax_prefix(dom.hdom, sc, mut pr, tpos + (1 ∷ i32))
+                    ds.context_part(dom.cpdom, pr, vc, mut cp, tpos, pgroup, pdh)
+                    ds.context_fin(dom.qdom, cp, mut ctx)
+                    ds.gemv_f16(ly.wo, ctx, mut xn)
+                    ds.residual_add(h_next, xn, mut h1)
+                    ds.rmsnorm(h1, ly.fnorm, mut xn, peps)
+                    ds.gemv_f16(ly.wg, xn, mut gate)
+                    ds.gemv_f16(ly.wu, xn, mut up)
+                    ds.swiglu(gate, up, mut act)
+                    ds.gemv_f16(ly.wd, act, mut xn)
+                    ds.residual_add(h1, xn, mut h_cur)
+                }
+            }
+        }
+        let tensor<f32, [D]> h_out ← (mc.num_hidden_layers % 2 ≡ 0) ✓ h_cur ✗ h_next
+        do device {
+            ds.rmsnorm(h_out, onorm, mut xn, peps)
+            ds.gemv_f16(emb, xn, mut logits)
+        }
+        ds.argmax_token(logits, mut ids_buf)
+        next_tok ← ids_buf[[0]] ↦ int
+        if step ≡ prompt_ids.length() - 1 {
+            first_top1 ← next_tok
+            first_logit ← logits[[next_tok]]
+        }
+        if step ≥ prompt_ids.length() - 1 {
+            gen_ids.append(next_tok)
+        }
+    }
+    report_result("f16", load_ms, t0, total_steps, first_top1, first_logit, gen_ids, tok)
+}
+
+fn run_bf16(list<string> shard_paths, td.TensorDirectory dir, cfg.ModelConfig mc, bpe.Tokenizer tok, list<int> prompt_ids, int t_load0) → void ⇥ string {
+    let tensor<bf16, [V, D]> emb ← load_bf16_2d_dev<size V, size HALF_D, size D>(shard_paths, dir, "model.embed_tokens.weight")
+    let tensor<f32, [D]> onorm ← load_norm_1d(shard_paths, dir, "model.norm.weight")
+    mut list<Bf16Layer> layers ← empty
+    for exclusive mc.num_hidden_layers let l {
+        let string base ← "model.layers.§"(l ↦ string)
+        layers.append(Bf16Layer {
+            anorm = load_norm_1d(shard_paths, dir, "§.input_layernorm.weight"(base)),
+            wq = load_bf16_2d_dev<size QD, size HALF_D, size D>(shard_paths, dir, "§.self_attn.q_proj.weight"(base)),
+            wk = load_bf16_2d_dev<size KVD, size HALF_D, size D>(shard_paths, dir, "§.self_attn.k_proj.weight"(base)),
+            wv = load_bf16_2d_dev<size KVD, size HALF_D, size D>(shard_paths, dir, "§.self_attn.v_proj.weight"(base)),
+            wo = load_bf16_2d_dev<size D, size HALF_D, size QD>(shard_paths, dir, "§.self_attn.o_proj.weight"(base)),
+            fnorm = load_norm_1d(shard_paths, dir, "§.post_attention_layernorm.weight"(base)),
+            wg = load_bf16_2d_dev<size F, size HALF_D, size D>(shard_paths, dir, "§.mlp.gate_proj.weight"(base)),
+            wu = load_bf16_2d_dev<size F, size HALF_D, size D>(shard_paths, dir, "§.mlp.up_proj.weight"(base)),
+            wd = load_bf16_2d_dev<size D, size HALF_F, size F>(shard_paths, dir, "§.mlp.down_proj.weight"(base))
+        })
+    }
+
+    mut tensor<f32, [1]> sink ← tf32[1] {}
+    let WorkDom dom ← make_dom(mut sink)
+    mut list<tensor<f32, [C, KVD]>> kcaches ← make_kv_caches(mc.num_hidden_layers, mut sink)
+    mut list<tensor<f32, [C, KVD]>> vcaches ← make_kv_caches(mc.num_hidden_layers, mut sink)
+    mut tensor<i32, [1]> ids_buf ← ti32[1] {}
+    mut tensor<f32, [D]> xn ← prime1<size D>(mut sink)
+    mut tensor<f32, [QD]> q ← prime1<size QD>(mut sink)
+    mut tensor<f32, [KVD]> k ← prime1<size KVD>(mut sink)
+    mut tensor<f32, [KVD]> v ← prime1<size KVD>(mut sink)
+    mut tensor<f32, [QD]> qr ← prime1<size QD>(mut sink)
+    mut tensor<f32, [H, C]> sc ← prime2<size H, size C>(mut sink)
+    mut tensor<f32, [H, C]> pr ← prime2<size H, size C>(mut sink)
+    mut tensor<f32, [P, QD]> cp ← prime2<size P, size QD>(mut sink)
+    mut tensor<f32, [QD]> ctx ← prime1<size QD>(mut sink)
+    mut tensor<f32, [D]> h1 ← prime1<size D>(mut sink)
+    mut tensor<f32, [F]> gate ← prime1<size F>(mut sink)
+    mut tensor<f32, [F]> up ← prime1<size F>(mut sink)
+    mut tensor<f32, [F]> act ← prime1<size F>(mut sink)
+    mut tensor<f32, [D]> h_cur ← prime1<size D>(mut sink)
+    mut tensor<f32, [D]> h_next ← prime1<size D>(mut sink)
+    mut tensor<f32, [V]> logits ← prime1<size V>(mut sink)
+    mut tensor<f32, [SPAN]> rtcos ← prime1<size SPAN>(mut sink)
+    mut tensor<f32, [SPAN]> rtsin ← prime1<size SPAN>(mut sink)
+
+    let f32 peps ← mc.rms_norm_eps
+    let i32 pgroup ← (mc.num_attention_heads / mc.num_key_value_heads) ↦ i32 ⊥ 1
+    let i32 pdh ← mc.head_dim ↦ i32 ⊥ 64
+    let f32 pscale ← 1.0 ∷ f32 / √ (mc.head_dim ↦ f32)
+    let f32 plntheta ← ln (mc.rope_theta)
+    let int load_ms ← (time.monotonic() - t_load0) / 1000000
+    let int total_steps ← prompt_ids.length() + MAX_GEN - 1
+    mut list<int> gen_ids ← empty
+    mut int next_tok ← 0
+    mut int first_top1 ← -1
+    mut f32 first_logit ← 0.0 ∷ f32
+
+    let int t0 ← time.monotonic()
+    for exclusive total_steps let step {
+        let int tok_in ← step ≺ prompt_ids.length() ✓ prompt_ids[step] ✗ next_tok
+        ids_buf[0] ← tok_in ↦ i32 ⊥ 0
+        let i32 tpos ← step ↦ i32 ⊥ 0
+        ds.gather_wide_bf16(emb, ids_buf, mut h_cur)
+        ds.rope_table(mut rtcos, mut rtsin, tpos, plntheta)
+
+        for exclusive mc.num_hidden_layers let l {
+            let Bf16Layer ly ← layers[l]
+            mut tensor<f32, [C, KVD]> kc ← kcaches[l]
+            mut tensor<f32, [C, KVD]> vc ← vcaches[l]
+            if l % 2 ≡ 0 {
+                do device {
+                    ds.rmsnorm(h_cur, ly.anorm, mut xn, peps)
+                    ds.qkv_proj_bf16(ly.wq, ly.wk, ly.wv, xn, mut q, mut k, mut v)
+                    ds.rope_half_table_qk_kv_write(q, k, v, rtcos, rtsin, mut qr, mut kc, mut vc, tpos)
+                    ds.attn_scores(dom.hcdom, qr, kc, mut sc, tpos, pgroup, pdh, pscale)
+                    ds.row_softmax_prefix(dom.hdom, sc, mut pr, tpos + (1 ∷ i32))
+                    ds.context_part(dom.cpdom, pr, vc, mut cp, tpos, pgroup, pdh)
+                    ds.context_fin(dom.qdom, cp, mut ctx)
+                    ds.gemv_bf16(ly.wo, ctx, mut xn)
+                    ds.residual_add(h_cur, xn, mut h1)
+                    ds.rmsnorm(h1, ly.fnorm, mut xn, peps)
+                    ds.gate_up_proj_bf16(ly.wg, ly.wu, xn, mut gate, mut up)
+                    ds.swiglu(gate, up, mut act)
+                    ds.gemv_bf16(ly.wd, act, mut xn)
+                    ds.residual_add(h1, xn, mut h_next)
+                }
+            }
+            else {
+                do device {
+                    ds.rmsnorm(h_next, ly.anorm, mut xn, peps)
+                    ds.qkv_proj_bf16(ly.wq, ly.wk, ly.wv, xn, mut q, mut k, mut v)
+                    ds.rope_half_table_qk_kv_write(q, k, v, rtcos, rtsin, mut qr, mut kc, mut vc, tpos)
+                    ds.attn_scores(dom.hcdom, qr, kc, mut sc, tpos, pgroup, pdh, pscale)
+                    ds.row_softmax_prefix(dom.hdom, sc, mut pr, tpos + (1 ∷ i32))
+                    ds.context_part(dom.cpdom, pr, vc, mut cp, tpos, pgroup, pdh)
+                    ds.context_fin(dom.qdom, cp, mut ctx)
+                    ds.gemv_bf16(ly.wo, ctx, mut xn)
+                    ds.residual_add(h_next, xn, mut h1)
+                    ds.rmsnorm(h1, ly.fnorm, mut xn, peps)
+                    ds.gate_up_proj_bf16(ly.wg, ly.wu, xn, mut gate, mut up)
+                    ds.swiglu(gate, up, mut act)
+                    ds.gemv_bf16(ly.wd, act, mut xn)
+                    ds.residual_add(h1, xn, mut h_cur)
+                }
+            }
+        }
+        let tensor<f32, [D]> h_out ← (mc.num_hidden_layers % 2 ≡ 0) ✓ h_cur ✗ h_next
+        do device {
+            ds.rmsnorm(h_out, onorm, mut xn, peps)
+            ds.gemv_bf16(emb, xn, mut logits)
+        }
+        ds.argmax_token(logits, mut ids_buf)
+        next_tok ← ids_buf[[0]] ↦ int
+        if step ≡ prompt_ids.length() - 1 {
+            first_top1 ← next_tok
+            first_logit ← logits[[next_tok]]
+        }
+        if step ≥ prompt_ids.length() - 1 {
+            gen_ids.append(next_tok)
+        }
+    }
+    report_result("bf16", load_ms, t0, total_steps, first_top1, first_logit, gen_ids, tok)
+}
+
+fn run_affine<size PD, size GD, size GDH, size PF, size GF, size GFH>(string fmt_name, i32 bits, list<string> shard_paths, td.TensorDirectory dir, cfg.ModelConfig mc, bpe.Tokenizer tok, list<int> prompt_ids, int t_load0) → void ⇥ string {
+    let tensor<u32, [V, PD]> emb_w ← load_u32_2d<size V, size PD>(shard_paths, dir, "model.embed_tokens.weight")
+    let tensor<bf16, [V, GD]> emb_s ← load_bf16_2d_dev<size V, size GDH, size GD>(shard_paths, dir, "model.embed_tokens.scales")
+    let tensor<bf16, [V, GD]> emb_b ← load_bf16_2d_dev<size V, size GDH, size GD>(shard_paths, dir, "model.embed_tokens.biases")
+    let tensor<f32, [D]> onorm ← load_norm_1d(shard_paths, dir, "model.norm.weight")
+
+    mut list<AffineLayer<size PD, size GD, size PF, size GF>> layers ← empty
+    for exclusive mc.num_hidden_layers let l {
+        let string base ← "model.layers.§"(l ↦ string)
+        layers.append(AffineLayer<size PD, size GD, size PF, size GF> {
+            anorm = load_norm_1d(shard_paths, dir, "§.input_layernorm.weight"(base)),
+            wq_w = load_u32_2d<size QD, size PD>(shard_paths, dir, "§.self_attn.q_proj.weight"(base)),
+            wq_s = load_bf16_2d_dev<size QD, size GDH, size GD>(shard_paths, dir, "§.self_attn.q_proj.scales"(base)),
+            wq_b = load_bf16_2d_dev<size QD, size GDH, size GD>(shard_paths, dir, "§.self_attn.q_proj.biases"(base)),
+            wk_w = load_u32_2d<size KVD, size PD>(shard_paths, dir, "§.self_attn.k_proj.weight"(base)),
+            wk_s = load_bf16_2d_dev<size KVD, size GDH, size GD>(shard_paths, dir, "§.self_attn.k_proj.scales"(base)),
+            wk_b = load_bf16_2d_dev<size KVD, size GDH, size GD>(shard_paths, dir, "§.self_attn.k_proj.biases"(base)),
+            wv_w = load_u32_2d<size KVD, size PD>(shard_paths, dir, "§.self_attn.v_proj.weight"(base)),
+            wv_s = load_bf16_2d_dev<size KVD, size GDH, size GD>(shard_paths, dir, "§.self_attn.v_proj.scales"(base)),
+            wv_b = load_bf16_2d_dev<size KVD, size GDH, size GD>(shard_paths, dir, "§.self_attn.v_proj.biases"(base)),
+            wo_w = load_u32_2d<size D, size PD>(shard_paths, dir, "§.self_attn.o_proj.weight"(base)),
+            wo_s = load_bf16_2d_dev<size D, size GDH, size GD>(shard_paths, dir, "§.self_attn.o_proj.scales"(base)),
+            wo_b = load_bf16_2d_dev<size D, size GDH, size GD>(shard_paths, dir, "§.self_attn.o_proj.biases"(base)),
+            fnorm = load_norm_1d(shard_paths, dir, "§.post_attention_layernorm.weight"(base)),
+            wg_w = load_u32_2d<size F, size PD>(shard_paths, dir, "§.mlp.gate_proj.weight"(base)),
+            wg_s = load_bf16_2d_dev<size F, size GDH, size GD>(shard_paths, dir, "§.mlp.gate_proj.scales"(base)),
+            wg_b = load_bf16_2d_dev<size F, size GDH, size GD>(shard_paths, dir, "§.mlp.gate_proj.biases"(base)),
+            wu_w = load_u32_2d<size F, size PD>(shard_paths, dir, "§.mlp.up_proj.weight"(base)),
+            wu_s = load_bf16_2d_dev<size F, size GDH, size GD>(shard_paths, dir, "§.mlp.up_proj.scales"(base)),
+            wu_b = load_bf16_2d_dev<size F, size GDH, size GD>(shard_paths, dir, "§.mlp.up_proj.biases"(base)),
+            wd_w = load_u32_2d<size D, size PF>(shard_paths, dir, "§.mlp.down_proj.weight"(base)),
+            wd_s = load_bf16_2d_dev<size D, size GFH, size GF>(shard_paths, dir, "§.mlp.down_proj.scales"(base)),
+            wd_b = load_bf16_2d_dev<size D, size GFH, size GF>(shard_paths, dir, "§.mlp.down_proj.biases"(base))
+        })
+    }
+
+    mut tensor<f32, [1]> sink ← tf32[1] {}
+    let WorkDom dom ← make_dom(mut sink)
+    mut list<tensor<f32, [C, KVD]>> kcaches ← make_kv_caches(mc.num_hidden_layers, mut sink)
+    mut list<tensor<f32, [C, KVD]>> vcaches ← make_kv_caches(mc.num_hidden_layers, mut sink)
+    mut tensor<i32, [1]> ids_buf ← ti32[1] {}
+    mut tensor<f32, [D]> xn ← prime1<size D>(mut sink)
+    mut tensor<f32, [QD]> q ← prime1<size QD>(mut sink)
+    mut tensor<f32, [KVD]> k ← prime1<size KVD>(mut sink)
+    mut tensor<f32, [KVD]> v ← prime1<size KVD>(mut sink)
+    mut tensor<f32, [QD]> qr ← prime1<size QD>(mut sink)
+    mut tensor<f32, [H, C]> sc ← prime2<size H, size C>(mut sink)
+    mut tensor<f32, [H, C]> pr ← prime2<size H, size C>(mut sink)
+    mut tensor<f32, [P, QD]> cp ← prime2<size P, size QD>(mut sink)
+    mut tensor<f32, [QD]> ctx ← prime1<size QD>(mut sink)
+    mut tensor<f32, [D]> h1 ← prime1<size D>(mut sink)
+    mut tensor<f32, [F]> gate ← prime1<size F>(mut sink)
+    mut tensor<f32, [F]> up ← prime1<size F>(mut sink)
+    mut tensor<f32, [F]> act ← prime1<size F>(mut sink)
+    mut tensor<f32, [D]> h_cur ← prime1<size D>(mut sink)
+    mut tensor<f32, [D]> h_next ← prime1<size D>(mut sink)
+    mut tensor<f32, [V]> logits ← prime1<size V>(mut sink)
+    mut tensor<f32, [SPAN]> rtcos ← prime1<size SPAN>(mut sink)
+    mut tensor<f32, [SPAN]> rtsin ← prime1<size SPAN>(mut sink)
+
+    let f32 peps ← mc.rms_norm_eps
+    let i32 pgroup ← (mc.num_attention_heads / mc.num_key_value_heads) ↦ i32 ⊥ 1
+    let i32 pdh ← mc.head_dim ↦ i32 ⊥ 64
+    let f32 pscale ← 1.0 ∷ f32 / √ (mc.head_dim ↦ f32)
+    let f32 plntheta ← ln (mc.rope_theta)
+    let int load_ms ← (time.monotonic() - t_load0) / 1000000
+    let int total_steps ← prompt_ids.length() + MAX_GEN - 1
+    mut list<int> gen_ids ← empty
+    mut int next_tok ← 0
+    mut int first_top1 ← -1
+    mut f32 first_logit ← 0.0 ∷ f32
+
+    let int t0 ← time.monotonic()
+    for exclusive total_steps let step {
+        let int tok_in ← step ≺ prompt_ids.length() ✓ prompt_ids[step] ✗ next_tok
+        ids_buf[0] ← tok_in ↦ i32 ⊥ 0
+        let i32 tpos ← step ↦ i32 ⊥ 0
+        ga.gather_u32_bf16(emb_w, emb_s, emb_b, ids_buf, mut h_cur, bits, 64 ∷ i32)
+        ds.rope_table(mut rtcos, mut rtsin, tpos, plntheta)
+
+        for exclusive mc.num_hidden_layers let l {
+            let AffineLayer<size PD, size GD, size PF, size GF> ly ← layers[l]
+            mut tensor<f32, [C, KVD]> kc ← kcaches[l]
+            mut tensor<f32, [C, KVD]> vc ← vcaches[l]
+            if l % 2 ≡ 0 {
+                do device {
+                    ds.rmsnorm(h_cur, ly.anorm, mut xn, peps)
+                    ga.linear_matvec_u32_bf16(ly.wq_w, ly.wq_s, ly.wq_b, xn, mut q, bits, 64 ∷ i32)
+                    ga.linear_matvec_u32_bf16(ly.wk_w, ly.wk_s, ly.wk_b, xn, mut k, bits, 64 ∷ i32)
+                    ga.linear_matvec_u32_bf16(ly.wv_w, ly.wv_s, ly.wv_b, xn, mut v, bits, 64 ∷ i32)
+                    ds.rope_half_table_qk_kv_write(q, k, v, rtcos, rtsin, mut qr, mut kc, mut vc, tpos)
+                    ds.attn_scores(dom.hcdom, qr, kc, mut sc, tpos, pgroup, pdh, pscale)
+                    ds.row_softmax_prefix(dom.hdom, sc, mut pr, tpos + (1 ∷ i32))
+                    ds.context_part(dom.cpdom, pr, vc, mut cp, tpos, pgroup, pdh)
+                    ds.context_fin(dom.qdom, cp, mut ctx)
+                    ga.linear_matvec_u32_bf16(ly.wo_w, ly.wo_s, ly.wo_b, ctx, mut xn, bits, 64 ∷ i32)
+                    ds.residual_add(h_cur, xn, mut h1)
+                    ds.rmsnorm(h1, ly.fnorm, mut xn, peps)
+                    ga.linear_matvec_u32_bf16(ly.wg_w, ly.wg_s, ly.wg_b, xn, mut gate, bits, 64 ∷ i32)
+                    ga.linear_matvec_u32_bf16(ly.wu_w, ly.wu_s, ly.wu_b, xn, mut up, bits, 64 ∷ i32)
+                    ds.swiglu(gate, up, mut act)
+                    ga.linear_matvec_u32_bf16(ly.wd_w, ly.wd_s, ly.wd_b, act, mut xn, bits, 64 ∷ i32)
+                    ds.residual_add(h1, xn, mut h_next)
+                }
+            }
+            else {
+                do device {
+                    ds.rmsnorm(h_next, ly.anorm, mut xn, peps)
+                    ga.linear_matvec_u32_bf16(ly.wq_w, ly.wq_s, ly.wq_b, xn, mut q, bits, 64 ∷ i32)
+                    ga.linear_matvec_u32_bf16(ly.wk_w, ly.wk_s, ly.wk_b, xn, mut k, bits, 64 ∷ i32)
+                    ga.linear_matvec_u32_bf16(ly.wv_w, ly.wv_s, ly.wv_b, xn, mut v, bits, 64 ∷ i32)
+                    ds.rope_half_table_qk_kv_write(q, k, v, rtcos, rtsin, mut qr, mut kc, mut vc, tpos)
+                    ds.attn_scores(dom.hcdom, qr, kc, mut sc, tpos, pgroup, pdh, pscale)
+                    ds.row_softmax_prefix(dom.hdom, sc, mut pr, tpos + (1 ∷ i32))
+                    ds.context_part(dom.cpdom, pr, vc, mut cp, tpos, pgroup, pdh)
+                    ds.context_fin(dom.qdom, cp, mut ctx)
+                    ga.linear_matvec_u32_bf16(ly.wo_w, ly.wo_s, ly.wo_b, ctx, mut xn, bits, 64 ∷ i32)
+                    ds.residual_add(h_next, xn, mut h1)
+                    ds.rmsnorm(h1, ly.fnorm, mut xn, peps)
+                    ga.linear_matvec_u32_bf16(ly.wg_w, ly.wg_s, ly.wg_b, xn, mut gate, bits, 64 ∷ i32)
+                    ga.linear_matvec_u32_bf16(ly.wu_w, ly.wu_s, ly.wu_b, xn, mut up, bits, 64 ∷ i32)
+                    ds.swiglu(gate, up, mut act)
+                    ga.linear_matvec_u32_bf16(ly.wd_w, ly.wd_s, ly.wd_b, act, mut xn, bits, 64 ∷ i32)
+                    ds.residual_add(h1, xn, mut h_cur)
+                }
+            }
+        }
+        let tensor<f32, [D]> h_out ← (mc.num_hidden_layers % 2 ≡ 0) ✓ h_cur ✗ h_next
+        do device {
+            ds.rmsnorm(h_out, onorm, mut xn, peps)
+            ga.linear_matvec_u32_bf16(emb_w, emb_s, emb_b, xn, mut logits, bits, 64 ∷ i32)
+        }
+        ds.argmax_token(logits, mut ids_buf)
+        next_tok ← ids_buf[[0]] ↦ int
+        if step ≡ prompt_ids.length() - 1 {
+            first_top1 ← next_tok
+            first_logit ← logits[[next_tok]]
+        }
+        if step ≥ prompt_ids.length() - 1 {
+            gen_ids.append(next_tok)
+        }
+    }
+    report_result(fmt_name, load_ms, t0, total_steps, first_top1, first_logit, gen_ids, tok)
+}
+
+fn run_mxfp8(list<string> shard_paths, td.TensorDirectory dir, cfg.ModelConfig mc, bpe.Tokenizer tok, list<int> prompt_ids, int t_load0) → void ⇥ string {
+    let tensor<u32, [V, PD_8]> emb_w ← load_u32_2d<size V, size PD_8>(shard_paths, dir, "model.embed_tokens.weight")
+    let tensor<u8, [V, GD_32]> emb_s ← load_u8_2d<size V, size GD_32>(shard_paths, dir, "model.embed_tokens.scales")
+    let tensor<f32, [D]> onorm ← load_norm_1d(shard_paths, dir, "model.norm.weight")
+
+    mut list<FpQuantLayer<size PD_8, size GD_32, size PF_8, size GF_32>> layers ← empty
+    for exclusive mc.num_hidden_layers let l {
+        let string base ← "model.layers.§"(l ↦ string)
+        layers.append(FpQuantLayer<size PD_8, size GD_32, size PF_8, size GF_32> {
+            anorm = load_norm_1d(shard_paths, dir, "§.input_layernorm.weight"(base)),
+            wq_w = load_u32_2d<size QD, size PD_8>(shard_paths, dir, "§.self_attn.q_proj.weight"(base)),
+            wq_s = load_u8_2d<size QD, size GD_32>(shard_paths, dir, "§.self_attn.q_proj.scales"(base)),
+            wk_w = load_u32_2d<size KVD, size PD_8>(shard_paths, dir, "§.self_attn.k_proj.weight"(base)),
+            wk_s = load_u8_2d<size KVD, size GD_32>(shard_paths, dir, "§.self_attn.k_proj.scales"(base)),
+            wv_w = load_u32_2d<size KVD, size PD_8>(shard_paths, dir, "§.self_attn.v_proj.weight"(base)),
+            wv_s = load_u8_2d<size KVD, size GD_32>(shard_paths, dir, "§.self_attn.v_proj.scales"(base)),
+            wo_w = load_u32_2d<size D, size PD_8>(shard_paths, dir, "§.self_attn.o_proj.weight"(base)),
+            wo_s = load_u8_2d<size D, size GD_32>(shard_paths, dir, "§.self_attn.o_proj.scales"(base)),
+            fnorm = load_norm_1d(shard_paths, dir, "§.post_attention_layernorm.weight"(base)),
+            wg_w = load_u32_2d<size F, size PD_8>(shard_paths, dir, "§.mlp.gate_proj.weight"(base)),
+            wg_s = load_u8_2d<size F, size GD_32>(shard_paths, dir, "§.mlp.gate_proj.scales"(base)),
+            wu_w = load_u32_2d<size F, size PD_8>(shard_paths, dir, "§.mlp.up_proj.weight"(base)),
+            wu_s = load_u8_2d<size F, size GD_32>(shard_paths, dir, "§.mlp.up_proj.scales"(base)),
+            wd_w = load_u32_2d<size D, size PF_8>(shard_paths, dir, "§.mlp.down_proj.weight"(base)),
+            wd_s = load_u8_2d<size D, size GF_32>(shard_paths, dir, "§.mlp.down_proj.scales"(base))
+        })
+    }
+
+    mut tensor<f32, [1]> sink ← tf32[1] {}
+    let WorkDom dom ← make_dom(mut sink)
+    mut list<tensor<f32, [C, KVD]>> kcaches ← make_kv_caches(mc.num_hidden_layers, mut sink)
+    mut list<tensor<f32, [C, KVD]>> vcaches ← make_kv_caches(mc.num_hidden_layers, mut sink)
+    mut tensor<i32, [1]> ids_buf ← ti32[1] {}
+    mut tensor<f32, [D]> xn ← prime1<size D>(mut sink)
+    mut tensor<f32, [QD]> q ← prime1<size QD>(mut sink)
+    mut tensor<f32, [KVD]> k ← prime1<size KVD>(mut sink)
+    mut tensor<f32, [KVD]> v ← prime1<size KVD>(mut sink)
+    mut tensor<f32, [QD]> qr ← prime1<size QD>(mut sink)
+    mut tensor<f32, [H, C]> sc ← prime2<size H, size C>(mut sink)
+    mut tensor<f32, [H, C]> pr ← prime2<size H, size C>(mut sink)
+    mut tensor<f32, [P, QD]> cp ← prime2<size P, size QD>(mut sink)
+    mut tensor<f32, [QD]> ctx ← prime1<size QD>(mut sink)
+    mut tensor<f32, [D]> h1 ← prime1<size D>(mut sink)
+    mut tensor<f32, [F]> gate ← prime1<size F>(mut sink)
+    mut tensor<f32, [F]> up ← prime1<size F>(mut sink)
+    mut tensor<f32, [F]> act ← prime1<size F>(mut sink)
+    mut tensor<f32, [D]> h_cur ← prime1<size D>(mut sink)
+    mut tensor<f32, [D]> h_next ← prime1<size D>(mut sink)
+    mut tensor<f32, [V]> logits ← prime1<size V>(mut sink)
+    mut tensor<f32, [SPAN]> rtcos ← prime1<size SPAN>(mut sink)
+    mut tensor<f32, [SPAN]> rtsin ← prime1<size SPAN>(mut sink)
+
+    let f32 peps ← mc.rms_norm_eps
+    let i32 pgroup ← (mc.num_attention_heads / mc.num_key_value_heads) ↦ i32 ⊥ 1
+    let i32 pdh ← mc.head_dim ↦ i32 ⊥ 64
+    let f32 pscale ← 1.0 ∷ f32 / √ (mc.head_dim ↦ f32)
+    let f32 plntheta ← ln (mc.rope_theta)
+    let int load_ms ← (time.monotonic() - t_load0) / 1000000
+    let int total_steps ← prompt_ids.length() + MAX_GEN - 1
+    mut list<int> gen_ids ← empty
+    mut int next_tok ← 0
+    mut int first_top1 ← -1
+    mut f32 first_logit ← 0.0 ∷ f32
+
+    let int t0 ← time.monotonic()
+    for exclusive total_steps let step {
+        let int tok_in ← step ≺ prompt_ids.length() ✓ prompt_ids[step] ✗ next_tok
+        ids_buf[0] ← tok_in ↦ i32 ⊥ 0
+        let i32 tpos ← step ↦ i32 ⊥ 0
+        bf8.gather_u32(emb_w, emb_s, ids_buf, mut h_cur, 1 ∷ i32, 32 ∷ i32)
+        ds.rope_table(mut rtcos, mut rtsin, tpos, plntheta)
+
+        for exclusive mc.num_hidden_layers let l {
+            let FpQuantLayer<size PD_8, size GD_32, size PF_8, size GF_32> ly ← layers[l]
+            mut tensor<f32, [C, KVD]> kc ← kcaches[l]
+            mut tensor<f32, [C, KVD]> vc ← vcaches[l]
+            if l % 2 ≡ 0 {
+                do device {
+                    ds.rmsnorm(h_cur, ly.anorm, mut xn, peps)
+                    bf8.linear_matvec_u32(ly.wq_w, ly.wq_s, xn, mut q, 1 ∷ i32, 32 ∷ i32)
+                    bf8.linear_matvec_u32(ly.wk_w, ly.wk_s, xn, mut k, 1 ∷ i32, 32 ∷ i32)
+                    bf8.linear_matvec_u32(ly.wv_w, ly.wv_s, xn, mut v, 1 ∷ i32, 32 ∷ i32)
+                    ds.rope_half_table_qk_kv_write(q, k, v, rtcos, rtsin, mut qr, mut kc, mut vc, tpos)
+                    ds.attn_scores(dom.hcdom, qr, kc, mut sc, tpos, pgroup, pdh, pscale)
+                    ds.row_softmax_prefix(dom.hdom, sc, mut pr, tpos + (1 ∷ i32))
+                    ds.context_part(dom.cpdom, pr, vc, mut cp, tpos, pgroup, pdh)
+                    ds.context_fin(dom.qdom, cp, mut ctx)
+                    bf8.linear_matvec_u32(ly.wo_w, ly.wo_s, ctx, mut xn, 1 ∷ i32, 32 ∷ i32)
+                    ds.residual_add(h_cur, xn, mut h1)
+                    ds.rmsnorm(h1, ly.fnorm, mut xn, peps)
+                    bf8.linear_matvec_u32(ly.wg_w, ly.wg_s, xn, mut gate, 1 ∷ i32, 32 ∷ i32)
+                    bf8.linear_matvec_u32(ly.wu_w, ly.wu_s, xn, mut up, 1 ∷ i32, 32 ∷ i32)
+                    ds.swiglu(gate, up, mut act)
+                    bf8.linear_matvec_u32(ly.wd_w, ly.wd_s, act, mut xn, 1 ∷ i32, 32 ∷ i32)
+                    ds.residual_add(h1, xn, mut h_next)
+                }
+            }
+            else {
+                do device {
+                    ds.rmsnorm(h_next, ly.anorm, mut xn, peps)
+                    bf8.linear_matvec_u32(ly.wq_w, ly.wq_s, xn, mut q, 1 ∷ i32, 32 ∷ i32)
+                    bf8.linear_matvec_u32(ly.wk_w, ly.wk_s, xn, mut k, 1 ∷ i32, 32 ∷ i32)
+                    bf8.linear_matvec_u32(ly.wv_w, ly.wv_s, xn, mut v, 1 ∷ i32, 32 ∷ i32)
+                    ds.rope_half_table_qk_kv_write(q, k, v, rtcos, rtsin, mut qr, mut kc, mut vc, tpos)
+                    ds.attn_scores(dom.hcdom, qr, kc, mut sc, tpos, pgroup, pdh, pscale)
+                    ds.row_softmax_prefix(dom.hdom, sc, mut pr, tpos + (1 ∷ i32))
+                    ds.context_part(dom.cpdom, pr, vc, mut cp, tpos, pgroup, pdh)
+                    ds.context_fin(dom.qdom, cp, mut ctx)
+                    bf8.linear_matvec_u32(ly.wo_w, ly.wo_s, ctx, mut xn, 1 ∷ i32, 32 ∷ i32)
+                    ds.residual_add(h_next, xn, mut h1)
+                    ds.rmsnorm(h1, ly.fnorm, mut xn, peps)
+                    bf8.linear_matvec_u32(ly.wg_w, ly.wg_s, xn, mut gate, 1 ∷ i32, 32 ∷ i32)
+                    bf8.linear_matvec_u32(ly.wu_w, ly.wu_s, xn, mut up, 1 ∷ i32, 32 ∷ i32)
+                    ds.swiglu(gate, up, mut act)
+                    bf8.linear_matvec_u32(ly.wd_w, ly.wd_s, act, mut xn, 1 ∷ i32, 32 ∷ i32)
+                    ds.residual_add(h1, xn, mut h_cur)
+                }
+            }
+        }
+        let tensor<f32, [D]> h_out ← (mc.num_hidden_layers % 2 ≡ 0) ✓ h_cur ✗ h_next
+        do device {
+            ds.rmsnorm(h_out, onorm, mut xn, peps)
+            bf8.linear_matvec_u32(emb_w, emb_s, xn, mut logits, 1 ∷ i32, 32 ∷ i32)
+        }
+        ds.argmax_token(logits, mut ids_buf)
+        next_tok ← ids_buf[[0]] ↦ int
+        if step ≡ prompt_ids.length() - 1 {
+            first_top1 ← next_tok
+            first_logit ← logits[[next_tok]]
+        }
+        if step ≥ prompt_ids.length() - 1 {
+            gen_ids.append(next_tok)
+        }
+    }
+    report_result("mxfp8", load_ms, t0, total_steps, first_top1, first_logit, gen_ids, tok)
+}
+
+fn run_nvfp4(list<string> shard_paths, td.TensorDirectory dir, cfg.ModelConfig mc, bpe.Tokenizer tok, list<int> prompt_ids, int t_load0) → void ⇥ string {
+    let tensor<u32, [V, PD_4]> emb_w ← load_u32_2d<size V, size PD_4>(shard_paths, dir, "model.embed_tokens.weight")
+    let tensor<u8, [V, GD_16]> emb_s ← load_u8_2d<size V, size GD_16>(shard_paths, dir, "model.embed_tokens.scales")
+    let tensor<f32, [D]> onorm ← load_norm_1d(shard_paths, dir, "model.norm.weight")
+
+    mut list<FpQuantLayer<size PD_4, size GD_16, size PF_4, size GF_16>> layers ← empty
+    for exclusive mc.num_hidden_layers let l {
+        let string base ← "model.layers.§"(l ↦ string)
+        layers.append(FpQuantLayer<size PD_4, size GD_16, size PF_4, size GF_16> {
+            anorm = load_norm_1d(shard_paths, dir, "§.input_layernorm.weight"(base)),
+            wq_w = load_u32_2d<size QD, size PD_4>(shard_paths, dir, "§.self_attn.q_proj.weight"(base)),
+            wq_s = load_u8_2d<size QD, size GD_16>(shard_paths, dir, "§.self_attn.q_proj.scales"(base)),
+            wk_w = load_u32_2d<size KVD, size PD_4>(shard_paths, dir, "§.self_attn.k_proj.weight"(base)),
+            wk_s = load_u8_2d<size KVD, size GD_16>(shard_paths, dir, "§.self_attn.k_proj.scales"(base)),
+            wv_w = load_u32_2d<size KVD, size PD_4>(shard_paths, dir, "§.self_attn.v_proj.weight"(base)),
+            wv_s = load_u8_2d<size KVD, size GD_16>(shard_paths, dir, "§.self_attn.v_proj.scales"(base)),
+            wo_w = load_u32_2d<size D, size PD_4>(shard_paths, dir, "§.self_attn.o_proj.weight"(base)),
+            wo_s = load_u8_2d<size D, size GD_16>(shard_paths, dir, "§.self_attn.o_proj.scales"(base)),
+            fnorm = load_norm_1d(shard_paths, dir, "§.post_attention_layernorm.weight"(base)),
+            wg_w = load_u32_2d<size F, size PD_4>(shard_paths, dir, "§.mlp.gate_proj.weight"(base)),
+            wg_s = load_u8_2d<size F, size GD_16>(shard_paths, dir, "§.mlp.gate_proj.scales"(base)),
+            wu_w = load_u32_2d<size F, size PD_4>(shard_paths, dir, "§.mlp.up_proj.weight"(base)),
+            wu_s = load_u8_2d<size F, size GD_16>(shard_paths, dir, "§.mlp.up_proj.scales"(base)),
+            wd_w = load_u32_2d<size D, size PF_4>(shard_paths, dir, "§.mlp.down_proj.weight"(base)),
+            wd_s = load_u8_2d<size D, size GF_16>(shard_paths, dir, "§.mlp.down_proj.scales"(base))
+        })
+    }
+
+    mut tensor<f32, [1]> sink ← tf32[1] {}
+    let WorkDom dom ← make_dom(mut sink)
+    mut list<tensor<f32, [C, KVD]>> kcaches ← make_kv_caches(mc.num_hidden_layers, mut sink)
+    mut list<tensor<f32, [C, KVD]>> vcaches ← make_kv_caches(mc.num_hidden_layers, mut sink)
+    mut tensor<i32, [1]> ids_buf ← ti32[1] {}
+    mut tensor<f32, [D]> xn ← prime1<size D>(mut sink)
+    mut tensor<f32, [QD]> q ← prime1<size QD>(mut sink)
+    mut tensor<f32, [KVD]> k ← prime1<size KVD>(mut sink)
+    mut tensor<f32, [KVD]> v ← prime1<size KVD>(mut sink)
+    mut tensor<f32, [QD]> qr ← prime1<size QD>(mut sink)
+    mut tensor<f32, [H, C]> sc ← prime2<size H, size C>(mut sink)
+    mut tensor<f32, [H, C]> pr ← prime2<size H, size C>(mut sink)
+    mut tensor<f32, [P, QD]> cp ← prime2<size P, size QD>(mut sink)
+    mut tensor<f32, [QD]> ctx ← prime1<size QD>(mut sink)
+    mut tensor<f32, [D]> h1 ← prime1<size D>(mut sink)
+    mut tensor<f32, [F]> gate ← prime1<size F>(mut sink)
+    mut tensor<f32, [F]> up ← prime1<size F>(mut sink)
+    mut tensor<f32, [F]> act ← prime1<size F>(mut sink)
+    mut tensor<f32, [D]> h_cur ← prime1<size D>(mut sink)
+    mut tensor<f32, [D]> h_next ← prime1<size D>(mut sink)
+    mut tensor<f32, [V]> logits ← prime1<size V>(mut sink)
+    mut tensor<f32, [SPAN]> rtcos ← prime1<size SPAN>(mut sink)
+    mut tensor<f32, [SPAN]> rtsin ← prime1<size SPAN>(mut sink)
+
+    let f32 peps ← mc.rms_norm_eps
+    let i32 pgroup ← (mc.num_attention_heads / mc.num_key_value_heads) ↦ i32 ⊥ 1
+    let i32 pdh ← mc.head_dim ↦ i32 ⊥ 64
+    let f32 pscale ← 1.0 ∷ f32 / √ (mc.head_dim ↦ f32)
+    let f32 plntheta ← ln (mc.rope_theta)
+    let int load_ms ← (time.monotonic() - t_load0) / 1000000
+    let int total_steps ← prompt_ids.length() + MAX_GEN - 1
+    mut list<int> gen_ids ← empty
+    mut int next_tok ← 0
+    mut int first_top1 ← -1
+    mut f32 first_logit ← 0.0 ∷ f32
+
+    let int t0 ← time.monotonic()
+    for exclusive total_steps let step {
+        let int tok_in ← step ≺ prompt_ids.length() ✓ prompt_ids[step] ✗ next_tok
+        ids_buf[0] ← tok_in ↦ i32 ⊥ 0
+        let i32 tpos ← step ↦ i32 ⊥ 0
+        fp4.gather_u32(emb_w, emb_s, ids_buf, mut h_cur, 1.0 ∷ f32, 16 ∷ i32)
+        ds.rope_table(mut rtcos, mut rtsin, tpos, plntheta)
+
+        for exclusive mc.num_hidden_layers let l {
+            let FpQuantLayer<size PD_4, size GD_16, size PF_4, size GF_16> ly ← layers[l]
+            mut tensor<f32, [C, KVD]> kc ← kcaches[l]
+            mut tensor<f32, [C, KVD]> vc ← vcaches[l]
+            if l % 2 ≡ 0 {
+                do device {
+                    ds.rmsnorm(h_cur, ly.anorm, mut xn, peps)
+                    fp4.linear_matvec_u32(ly.wq_w, ly.wq_s, xn, mut q, 1.0 ∷ f32, 16 ∷ i32)
+                    fp4.linear_matvec_u32(ly.wk_w, ly.wk_s, xn, mut k, 1.0 ∷ f32, 16 ∷ i32)
+                    fp4.linear_matvec_u32(ly.wv_w, ly.wv_s, xn, mut v, 1.0 ∷ f32, 16 ∷ i32)
+                    ds.rope_half_table_qk_kv_write(q, k, v, rtcos, rtsin, mut qr, mut kc, mut vc, tpos)
+                    ds.attn_scores(dom.hcdom, qr, kc, mut sc, tpos, pgroup, pdh, pscale)
+                    ds.row_softmax_prefix(dom.hdom, sc, mut pr, tpos + (1 ∷ i32))
+                    ds.context_part(dom.cpdom, pr, vc, mut cp, tpos, pgroup, pdh)
+                    ds.context_fin(dom.qdom, cp, mut ctx)
+                    fp4.linear_matvec_u32(ly.wo_w, ly.wo_s, ctx, mut xn, 1.0 ∷ f32, 16 ∷ i32)
+                    ds.residual_add(h_cur, xn, mut h1)
+                    ds.rmsnorm(h1, ly.fnorm, mut xn, peps)
+                    fp4.linear_matvec_u32(ly.wg_w, ly.wg_s, xn, mut gate, 1.0 ∷ f32, 16 ∷ i32)
+                    fp4.linear_matvec_u32(ly.wu_w, ly.wu_s, xn, mut up, 1.0 ∷ f32, 16 ∷ i32)
+                    ds.swiglu(gate, up, mut act)
+                    fp4.linear_matvec_u32(ly.wd_w, ly.wd_s, act, mut xn, 1.0 ∷ f32, 16 ∷ i32)
+                    ds.residual_add(h1, xn, mut h_next)
+                }
+            }
+            else {
+                do device {
+                    ds.rmsnorm(h_next, ly.anorm, mut xn, peps)
+                    fp4.linear_matvec_u32(ly.wq_w, ly.wq_s, xn, mut q, 1.0 ∷ f32, 16 ∷ i32)
+                    fp4.linear_matvec_u32(ly.wk_w, ly.wk_s, xn, mut k, 1.0 ∷ f32, 16 ∷ i32)
+                    fp4.linear_matvec_u32(ly.wv_w, ly.wv_s, xn, mut v, 1.0 ∷ f32, 16 ∷ i32)
+                    ds.rope_half_table_qk_kv_write(q, k, v, rtcos, rtsin, mut qr, mut kc, mut vc, tpos)
+                    ds.attn_scores(dom.hcdom, qr, kc, mut sc, tpos, pgroup, pdh, pscale)
+                    ds.row_softmax_prefix(dom.hdom, sc, mut pr, tpos + (1 ∷ i32))
+                    ds.context_part(dom.cpdom, pr, vc, mut cp, tpos, pgroup, pdh)
+                    ds.context_fin(dom.qdom, cp, mut ctx)
+                    fp4.linear_matvec_u32(ly.wo_w, ly.wo_s, ctx, mut xn, 1.0 ∷ f32, 16 ∷ i32)
+                    ds.residual_add(h_next, xn, mut h1)
+                    ds.rmsnorm(h1, ly.fnorm, mut xn, peps)
+                    fp4.linear_matvec_u32(ly.wg_w, ly.wg_s, xn, mut gate, 1.0 ∷ f32, 16 ∷ i32)
+                    fp4.linear_matvec_u32(ly.wu_w, ly.wu_s, xn, mut up, 1.0 ∷ f32, 16 ∷ i32)
+                    ds.swiglu(gate, up, mut act)
+                    fp4.linear_matvec_u32(ly.wd_w, ly.wd_s, act, mut xn, 1.0 ∷ f32, 16 ∷ i32)
+                    ds.residual_add(h1, xn, mut h_cur)
+                }
+            }
+        }
+        let tensor<f32, [D]> h_out ← (mc.num_hidden_layers % 2 ≡ 0) ✓ h_cur ✗ h_next
+        do device {
+            ds.rmsnorm(h_out, onorm, mut xn, peps)
+            fp4.linear_matvec_u32(emb_w, emb_s, xn, mut logits, 1.0 ∷ f32, 16 ∷ i32)
+        }
+        ds.argmax_token(logits, mut ids_buf)
+        next_tok ← ids_buf[[0]] ↦ int
+        if step ≡ prompt_ids.length() - 1 {
+            first_top1 ← next_tok
+            first_logit ← logits[[next_tok]]
+        }
+        if step ≥ prompt_ids.length() - 1 {
+            gen_ids.append(next_tok)
+        }
+    }
+    report_result("nvfp4", load_ms, t0, total_steps, first_top1, first_logit, gen_ids, tok)
+}
+
+# -------------------------------------------------------------------------
+# Bundle admission + dispatch
+# -------------------------------------------------------------------------
+
+fn discover_shards(string model_dir) → list<string> ⇥ string {
+    let string single ← "§/model.safetensors"(model_dir)
+    if fs.exists(single) {
+        return [single]
+    }
+    let string two_a ← "§/model-00001-of-00002.safetensors"(model_dir)
+    let string two_b ← "§/model-00002-of-00002.safetensors"(model_dir)
+    if fs.exists(two_a) and fs.exists(two_b) {
+        return [two_a, two_b]
+    }
+    throw "quant_corpus: no supported safetensors shards found in §"(model_dir)
+}
+
+class AdmittedShard {
+    let artifact.ContentIdentity st_id
+    let capsule.SafetensorsManifest saf_m
+}
+
+fn admit_shard_header(string st_path) → AdmittedShard ⇥ string {
+    mut int st_len ← 0
+    mut list<b8> prefix8 ← empty
+    do {
+        st_len ← fs.byte_length(st_path)
+        prefix8 ← fs.read_range(st_path, 0, 8)
+    }
+    catch err {
+        throw "quant_corpus: failed reading safetensors prefix §"(st_path)
+    }
+    mut int hlen ← 0
+    do {
+        let u64 hlen_u ↤ prefix8 via le
+        hlen ↤ hlen_u
+    }
+    catch err {
+        throw "quant_corpus: invalid safetensors header length §"(st_path)
+    }
+    mut list<b8> raw_hdr ← empty
+    do {
+        raw_hdr ← fs.read_range(st_path, 0, 8 + hlen)
+    }
+    catch err {
+        throw "quant_corpus: failed reading safetensors header §"(st_path)
+    }
+
+    mut list<u8> hdr_u8 ← empty
+    for from raw_hdr let b {
+        hdr_u8.append(b ↦ u8)
+    }
+    mut artifact.ContentIdentity ∪ none maybe_id ← null
+    do {
+        maybe_id ← artifact.identity("sha-256", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", st_len)
+    }
+    catch err {
+        throw "quant_corpus: identity failed for §"(st_path)
+    }
+    if maybe_id is none then throw "quant_corpus: identity failed"
+    let artifact.ContentIdentity st_id ← maybe_id
+    mut capsule.Capsule ∪ none maybe_cap ← null
+    do {
+        maybe_cap ← st.admit_header(hdr_u8, st_len, st_id)
+    }
+    catch err {
+        throw "quant_corpus: safetensors admission failed for §"(st_path)
+    }
+    if maybe_cap is none then throw "quant_corpus: admission failed"
+    let capsule.Capsule cap ← maybe_cap
+    match cap.manifest {
+        case capsule.Manifest.Safetensors let saf_m {
+            return AdmittedShard { st_id = st_id, saf_m = saf_m }
+        }
+        default {
+            throw "quant_corpus: non-safetensors manifest"
+        }
+    }
+}
+
+fn detect_format(cfg.ModelConfig mc, td.TensorDirectory dir, string override_fmt) → string ⇥ string {
+    if override_fmt.length() ≻ 0 {
+        return override_fmt
+    }
+    if mc.quantization not is none {
+        let cfg.QuantConfig qc ← mc.quantization
+        let string mode ← qc.mode coalesce ""
+        let int bits ← qc.bits coalesce 0
+        if mode ≡ "affine" {
+            if bits ≡ 8 then return "affine-8bit"
+            if bits ≡ 6 then return "affine-6bit"
+            if bits ≡ 4 then return "affine-4bit"
+        }
+        if mode ≡ "mxfp8" then return "mxfp8"
+        if mode ≡ "nvfp4" then return "nvfp4"
+    }
+    mut td.DirectoryEntry ∪ none maybe_q ← null
+    do {
+        maybe_q ← td.lookup_backbone(dir, "model.layers.0.self_attn.q_proj.weight")
+    }
+    catch err {
+        throw "quant_corpus: q_proj lookup failed"
+    }
+    if maybe_q is none then throw "quant_corpus: missing q_proj.weight"
+    let td.DirectoryEntry q_e ← maybe_q
+    if q_e.raw_dtype ≡ "F32" then return "f32"
+    if q_e.raw_dtype ≡ "F16" then return "f16"
+    if q_e.raw_dtype ≡ "BF16" then return "bf16"
+    throw "quant_corpus: unsupported format"
+}
+
+fn run_corpus(string model_dir, string tok_dir_arg, string fmt_override) → void ⇥ string {
+    let int t_load0 ← time.monotonic()
+    let string cfg_path ← "§/config.json"(model_dir)
+    mut list<b8> cfg_bytes ← empty
+    do {
+        cfg_bytes ← fs.read_bytes(cfg_path)
+    }
+    catch err {
+        throw "quant_corpus: cannot open §"(cfg_path)
+    }
+    mut cfg.ModelConfig ∪ none maybe_mc ← null
+    do {
+        maybe_mc ← cfg.parse_bytes(cfg_bytes)
+    }
+    catch err {
+        throw "quant_corpus: config parse failed: §"(err.message)
+    }
+    if maybe_mc is none then throw "quant_corpus: config parse failed"
+    let cfg.ModelConfig mc ← maybe_mc
+
+    let list<string> shard_paths ← discover_shards(model_dir)
+    mut list<artifact.ContentIdentity> shard_ids ← empty
+    mut list<td.ShardSource> sources ← empty
+    for exclusive shard_paths.length() let idx {
+        let AdmittedShard adm ← admit_shard_header(shard_paths[idx])
+        shard_ids.append(adm.st_id)
+        sources.append(variant td.ShardSource.SafetensorsSource { role = variant bundle.MemberRole.Backbone, shard_index = idx, manifest = adm.saf_m })
+    }
+
+    mut artifact.ContentIdentity ∪ none maybe_cfg_id ← null
+    do {
+        maybe_cfg_id ← artifact.identity("sha-256", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", cfg_bytes.length())
+    }
+    catch err {
+        throw "quant_corpus: config identity failed"
+    }
+    if maybe_cfg_id is none then throw "quant_corpus: config identity failed"
+    let artifact.ContentIdentity cfg_id ← maybe_cfg_id
+    mut bundle.ModelBundle ∪ none maybe_b ← null
+    do {
+        maybe_b ← bundle.safetensors_unindexed(shard_ids, cfg_id, null, null, null, null)
+    }
+    catch err {
+        throw "quant_corpus: bundle build failed"
+    }
+    if maybe_b is none then throw "quant_corpus: bundle build failed"
+    let bundle.ModelBundle b ← maybe_b
+    mut td.TensorDirectory ∪ none maybe_dir ← null
+    do {
+        maybe_dir ← td.build(b, sources, empty, empty)
+    }
+    catch err {
+        throw "quant_corpus: directory build failed"
+    }
+    if maybe_dir is none then throw "quant_corpus: directory build failed"
+    let td.TensorDirectory dir ← maybe_dir
+
+    let string fmt_name ← detect_format(mc, dir, fmt_override)
+    let string tok_dir ← fs.exists("§/vocab.json"(model_dir)) ✓ model_dir ✗ tok_dir_arg
+    let bpe.Tokenizer tok ← load_bpe_tokenizer(tok_dir)
+    mut list<int> prompt_ids ← empty
+    do {
+        prompt_ids ← bpe.encode_prompt(tok, PROMPT)
+    }
+    catch err {
+        throw "quant_corpus: tokenizer encode failed"
+    }
+
+    if fmt_name ≡ "f32" {
+        run_f32(shard_paths, dir, mc, tok, prompt_ids, t_load0)
+    }
+    elif fmt_name ≡ "f16" {
+        run_f16(shard_paths, dir, mc, tok, prompt_ids, t_load0)
+    }
+    elif fmt_name ≡ "bf16" {
+        run_bf16(shard_paths, dir, mc, tok, prompt_ids, t_load0)
+    }
+    elif fmt_name ≡ "affine-8bit" {
+        run_affine<size PD_8, size GD_64, size GDH_64, size PF_8, size GF_64, size GFH_64>("affine-8bit", 8 ∷ i32, shard_paths, dir, mc, tok, prompt_ids, t_load0)
+    }
+    elif fmt_name ≡ "affine-6bit" {
+        run_affine<size PD_6, size GD_64, size GDH_64, size PF_6, size GF_64, size GFH_64>("affine-6bit", 6 ∷ i32, shard_paths, dir, mc, tok, prompt_ids, t_load0)
+    }
+    elif fmt_name ≡ "affine-4bit" {
+        run_affine<size PD_4, size GD_64, size GDH_64, size PF_4, size GF_64, size GFH_64>("affine-4bit", 4 ∷ i32, shard_paths, dir, mc, tok, prompt_ids, t_load0)
+    }
+    elif fmt_name ≡ "mxfp8" {
+        run_mxfp8(shard_paths, dir, mc, tok, prompt_ids, t_load0)
+    }
+    elif fmt_name ≡ "nvfp4" {
+        run_nvfp4(shard_paths, dir, mc, tok, prompt_ids, t_load0)
+    }
+    else {
+        throw "quant_corpus: unknown format §"(fmt_name)
+    }
+}
+
+fn default_base_dir() → string {
+    let string ∪ none home ← process.read_env("HOME")
+    if home is string then return "§/ai/models/quant-corpus/SmolLM2-1.7B-Instruct/base-bf16"(home)
+    return "/Users/ianzepp/ai/models/quant-corpus/SmolLM2-1.7B-Instruct/base-bf16"
+}
+
+main {
+    let list<string> args ← process.argv() ↦ list<string>
+    let string model_dir ← args.length() ≥ 1 ✓ args[0] ✗ default_base_dir()
+    mut string tok_dir ← default_base_dir()
+    mut string fmt_override ← ""
+    mut int i ← 1
+    while i ≺ args.length() {
+        if args[i] ≡ "--tokenizer-dir" and i + 1 ≺ args.length() {
+            tok_dir ← args[i + 1]
+            i ← i + 2
+        }
+        elif args[i] ≡ "--format" and i + 1 ≺ args.length() {
+            fmt_override ← args[i + 1]
+            i ← i + 2
+        }
+        else {
+            i ← i + 1
+        }
+    }
+    do {
+        run_corpus(model_dir, tok_dir, fmt_override)
+    }
+    catch err {
+        print err
+        process.exit_process(1)
+    }
+}

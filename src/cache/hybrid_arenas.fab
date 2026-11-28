@@ -402,9 +402,14 @@ fn recurrent_update<size RecRows, size RecCols>(mut RecurrentStateArena<size Rec
 fn hybrid_branch<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols>(mut HybridSession<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> hs) → HybridTxn<size C, size W, size KVD, size ConvRows, size ConvCh, size RecRows, size RecCols> ⇥ sess_mod.SessionError {
     require hs.conv.txn_depth ≡ 0 and hs.recurrent.txn_depth ≡ 0 throw variant sess_mod.SessionError.TxnOpen { message = "hybrid arena already has an open branch" }
 
-    mut sess_mod.SessionState<size C, size W, size KVD> kv ← hs.kv
-    let sess_mod.SessionTxn<size C, size W, size KVD> kv_txn ← sess_mod.branch<size C, size W, size KVD>(mut kv)
-    hs.kv ← kv
+    mut sess_mod.SessionTxn<size C, size W, size KVD> ∪ none maybe_kv_txn ← null
+    do {
+        mut sess_mod.SessionState<size C, size W, size KVD> kv ← hs.kv
+        maybe_kv_txn ← sess_mod.branch<size C, size W, size KVD>(mut kv)
+        hs.kv ← kv
+    }
+    require maybe_kv_txn not is none throw variant sess_mod.SessionError.TxnOpen { message = "kv branch failed" }
+    let sess_mod.SessionTxn<size C, size W, size KVD> kv_txn ← maybe_kv_txn
 
     mut list<tensor<f32, [ConvRows, ConvCh]>> base_conv_bufs ← empty
     mut list<int> base_conv_steps ← empty
@@ -468,9 +473,11 @@ fn hybrid_txn_conv_push<size C, size W, size KVD, size ConvRows, size ConvCh, si
     let int local_site ← site_idx - hs.conv.site_base
     require local_site ≥ 0 and local_site ≺ hs.conv.sites_per_slot throw variant sess_mod.SessionError.InvalidSlot { message = "conv site_idx out of range" }
 
-    mut ConvStateArena<size ConvRows, size ConvCh> conv ← hs.conv
-    conv_push_row_raw(mut conv, idx, site_idx, new_row)
-    hs.conv ← conv
+    do {
+        mut ConvStateArena<size ConvRows, size ConvCh> conv ← hs.conv
+        conv_push_row_raw(mut conv, idx, site_idx, new_row)
+        hs.conv ← conv
+    }
 
     txn.conv_draft_counts[idx] ← txn.conv_draft_counts[idx] + 1
     let int site_key ← idx * hs.conv.sites_per_slot + local_site
@@ -568,46 +575,50 @@ fn hybrid_commit_prefix<size C, size W, size KVD, size ConvRows, size ConvCh, si
         sess_mod.rollback(mut hs.kv, mut txn.kv_txn)
     }
 
-    mut ConvStateArena<size ConvRows, size ConvCh> conv ← hs.conv
-    restore_conv_arena<size ConvRows, size ConvCh>(mut conv, txn.base_conv_buffers, txn.base_conv_steps)
-    if accepted_tokens ≻ 0 {
-        mut list<int> site_replayed ← empty
-        for exclusive txn.conv_site_draft_counts.length() let ? {
-            site_replayed.append(0)
-        }
-        for exclusive txn.conv_journal_local_idx.length() let i {
-            let int idx ← txn.conv_journal_local_idx[i]
-            let int s_idx ← txn.conv_journal_site_idx[i]
-            let int local_site ← s_idx - conv.site_base
-            let int site_key ← idx * conv.sites_per_slot + local_site
-            if site_replayed[site_key] ≺ accepted_tokens {
-                site_replayed[site_key] ← site_replayed[site_key] + 1
-                conv_push_row_raw(mut conv, idx, s_idx, txn.conv_journal_row[i])
+    do {
+        mut ConvStateArena<size ConvRows, size ConvCh> conv ← hs.conv
+        restore_conv_arena<size ConvRows, size ConvCh>(mut conv, txn.base_conv_buffers, txn.base_conv_steps)
+        if accepted_tokens ≻ 0 {
+            mut list<int> site_replayed ← empty
+            for exclusive txn.conv_site_draft_counts.length() let ? {
+                site_replayed.append(0)
+            }
+            for exclusive txn.conv_journal_local_idx.length() let i {
+                let int idx ← txn.conv_journal_local_idx[i]
+                let int s_idx ← txn.conv_journal_site_idx[i]
+                let int local_site ← s_idx - conv.site_base
+                let int site_key ← idx * conv.sites_per_slot + local_site
+                if site_replayed[site_key] ≺ accepted_tokens {
+                    site_replayed[site_key] ← site_replayed[site_key] + 1
+                    conv_push_row_raw(mut conv, idx, s_idx, txn.conv_journal_row[i])
+                }
             }
         }
+        conv.txn_depth ← 0
+        hs.conv ← conv
     }
-    conv.txn_depth ← 0
-    hs.conv ← conv
 
-    mut RecurrentStateArena<size RecRows, size RecCols> rec ← hs.recurrent
-    restore_rec_arena<size RecRows, size RecCols>(mut rec, txn.base_rec_states, txn.base_rec_steps)
-    if accepted_tokens ≻ 0 {
-        mut list<int> rec_seen ← empty
-        for exclusive rec.slot_ids.length() let i {
-            rec_seen.append(0)
-        }
-        for exclusive txn.rec_journal_local_idx.length() let i {
-            let int idx ← txn.rec_journal_local_idx[i]
-            rec_seen[idx] ← rec_seen[idx] + 1
-            if rec_seen[idx] ≡ accepted_tokens {
-                mut tensor<f32, [RecRows, RecCols]> chosen ← copy txn.rec_journal_state[i]
-                rec.states[idx] ← chosen
-                rec.steps_written[idx] ← txn.base_rec_steps[idx] + accepted_tokens
+    do {
+        mut RecurrentStateArena<size RecRows, size RecCols> rec ← hs.recurrent
+        restore_rec_arena<size RecRows, size RecCols>(mut rec, txn.base_rec_states, txn.base_rec_steps)
+        if accepted_tokens ≻ 0 {
+            mut list<int> rec_seen ← empty
+            for exclusive rec.slot_ids.length() let i {
+                rec_seen.append(0)
+            }
+            for exclusive txn.rec_journal_local_idx.length() let i {
+                let int idx ← txn.rec_journal_local_idx[i]
+                rec_seen[idx] ← rec_seen[idx] + 1
+                if rec_seen[idx] ≡ accepted_tokens {
+                    mut tensor<f32, [RecRows, RecCols]> chosen ← copy txn.rec_journal_state[i]
+                    rec.states[idx] ← chosen
+                    rec.steps_written[idx] ← txn.base_rec_steps[idx] + accepted_tokens
+                }
             }
         }
+        rec.txn_depth ← 0
+        hs.recurrent ← rec
     }
-    rec.txn_depth ← 0
-    hs.recurrent ← rec
 
     txn.open ← false
 }
@@ -618,15 +629,19 @@ fn hybrid_rollback<size C, size W, size KVD, size ConvRows, size ConvCh, size Re
 
     sess_mod.rollback(mut hs.kv, mut txn.kv_txn)
 
-    mut ConvStateArena<size ConvRows, size ConvCh> conv ← hs.conv
-    restore_conv_arena<size ConvRows, size ConvCh>(mut conv, txn.base_conv_buffers, txn.base_conv_steps)
-    conv.txn_depth ← 0
-    hs.conv ← conv
+    do {
+        mut ConvStateArena<size ConvRows, size ConvCh> conv ← hs.conv
+        restore_conv_arena<size ConvRows, size ConvCh>(mut conv, txn.base_conv_buffers, txn.base_conv_steps)
+        conv.txn_depth ← 0
+        hs.conv ← conv
+    }
 
-    mut RecurrentStateArena<size RecRows, size RecCols> rec ← hs.recurrent
-    restore_rec_arena<size RecRows, size RecCols>(mut rec, txn.base_rec_states, txn.base_rec_steps)
-    rec.txn_depth ← 0
-    hs.recurrent ← rec
+    do {
+        mut RecurrentStateArena<size RecRows, size RecCols> rec ← hs.recurrent
+        restore_rec_arena<size RecRows, size RecCols>(mut rec, txn.base_rec_states, txn.base_rec_steps)
+        rec.txn_depth ← 0
+        hs.recurrent ← rec
+    }
 
     txn.open ← false
 }
@@ -639,9 +654,14 @@ fn hybrid_rollback<size C, size W, size KVD, size ConvRows, size ConvCh, size Re
 fn hetero_branch<size C, size W, size KVD, size KvConvRows, size PostConvRows, size D, size RecRows, size RecCols>(mut HeteroHybridSession<size C, size W, size KVD, size KvConvRows, size PostConvRows, size D, size RecRows, size RecCols> hs) → HeteroHybridTxn<size C, size W, size KVD, size KvConvRows, size PostConvRows, size D, size RecRows, size RecCols> ⇥ sess_mod.SessionError {
     require hs.kv_conv.txn_depth ≡ 0 and hs.post_conv.txn_depth ≡ 0 and hs.recurrent.txn_depth ≡ 0 throw variant sess_mod.SessionError.TxnOpen { message = "hetero hybrid arena already has an open branch" }
 
-    mut sess_mod.SessionState<size C, size W, size KVD> kv ← hs.kv
-    let sess_mod.SessionTxn<size C, size W, size KVD> kv_txn ← sess_mod.branch<size C, size W, size KVD>(mut kv)
-    hs.kv ← kv
+    mut sess_mod.SessionTxn<size C, size W, size KVD> ∪ none maybe_kv_txn ← null
+    do {
+        mut sess_mod.SessionState<size C, size W, size KVD> kv ← hs.kv
+        maybe_kv_txn ← sess_mod.branch<size C, size W, size KVD>(mut kv)
+        hs.kv ← kv
+    }
+    require maybe_kv_txn not is none throw variant sess_mod.SessionError.TxnOpen { message = "kv branch failed" }
+    let sess_mod.SessionTxn<size C, size W, size KVD> kv_txn ← maybe_kv_txn
 
     mut list<tensor<f32, [KvConvRows, KVD]>> base_kv_bufs ← empty
     mut list<int> base_kv_steps ← empty
@@ -729,9 +749,11 @@ fn hetero_txn_conv_push_kv<size C, size W, size KVD, size KvConvRows, size PostC
     let int idx ← find_slot(hs.kv_conv.slot_ids, slot_id)
     let int local_site ← site_idx - hs.kv_conv.site_base
     require local_site ≥ 0 and local_site ≺ hs.kv_conv.sites_per_slot throw variant sess_mod.SessionError.InvalidSlot { message = "kv_conv site_idx out of range" }
-    mut ConvStateArena<size KvConvRows, size KVD> arena ← hs.kv_conv
-    conv_push_row_raw(mut arena, idx, site_idx, new_row)
-    hs.kv_conv ← arena
+    do {
+        mut ConvStateArena<size KvConvRows, size KVD> arena ← hs.kv_conv
+        conv_push_row_raw(mut arena, idx, site_idx, new_row)
+        hs.kv_conv ← arena
+    }
     let int key ← idx * hs.kv_conv.sites_per_slot + local_site
     txn.kv_conv_site_draft_counts[key] ← txn.kv_conv_site_draft_counts[key] + 1
     mut tensor<f32, [KVD]> jrow ← copy new_row
@@ -746,9 +768,11 @@ fn hetero_txn_conv_push_post<size C, size W, size KVD, size KvConvRows, size Pos
     let int idx ← find_slot(hs.post_conv.slot_ids, slot_id)
     let int local_site ← site_idx - hs.post_conv.site_base
     require local_site ≥ 0 and local_site ≺ hs.post_conv.sites_per_slot throw variant sess_mod.SessionError.InvalidSlot { message = "post_conv site_idx out of range" }
-    mut ConvStateArena<size PostConvRows, size D> arena ← hs.post_conv
-    conv_push_row_raw(mut arena, idx, site_idx, new_row)
-    hs.post_conv ← arena
+    do {
+        mut ConvStateArena<size PostConvRows, size D> arena ← hs.post_conv
+        conv_push_row_raw(mut arena, idx, site_idx, new_row)
+        hs.post_conv ← arena
+    }
     let int key ← idx * hs.post_conv.sites_per_slot + local_site
     txn.post_conv_site_draft_counts[key] ← txn.post_conv_site_draft_counts[key] + 1
     mut tensor<f32, [D]> jrow ← copy new_row
@@ -827,65 +851,71 @@ fn hetero_commit_prefix<size C, size W, size KVD, size KvConvRows, size PostConv
         sess_mod.rollback(mut hs.kv, mut txn.kv_txn)
     }
 
-    mut ConvStateArena<size KvConvRows, size KVD> kv_conv ← hs.kv_conv
-    restore_conv_arena<size KvConvRows, size KVD>(mut kv_conv, txn.base_kv_conv_buffers, txn.base_kv_conv_steps)
-    if accepted_tokens ≻ 0 {
-        mut list<int> kv_replayed ← empty
-        for exclusive txn.kv_conv_site_draft_counts.length() let ? {
-            kv_replayed.append(0)
-        }
-        for exclusive txn.kv_conv_journal_local_idx.length() let i {
-            let int idx ← txn.kv_conv_journal_local_idx[i]
-            let int s_idx ← txn.kv_conv_journal_site_idx[i]
-            let int key ← idx * kv_conv.sites_per_slot + (s_idx - kv_conv.site_base)
-            if kv_replayed[key] ≺ accepted_tokens {
-                kv_replayed[key] ← kv_replayed[key] + 1
-                conv_push_row_raw(mut kv_conv, idx, s_idx, txn.kv_conv_journal_row[i])
+    do {
+        mut ConvStateArena<size KvConvRows, size KVD> kv_conv ← hs.kv_conv
+        restore_conv_arena<size KvConvRows, size KVD>(mut kv_conv, txn.base_kv_conv_buffers, txn.base_kv_conv_steps)
+        if accepted_tokens ≻ 0 {
+            mut list<int> kv_replayed ← empty
+            for exclusive txn.kv_conv_site_draft_counts.length() let ? {
+                kv_replayed.append(0)
+            }
+            for exclusive txn.kv_conv_journal_local_idx.length() let i {
+                let int idx ← txn.kv_conv_journal_local_idx[i]
+                let int s_idx ← txn.kv_conv_journal_site_idx[i]
+                let int key ← idx * kv_conv.sites_per_slot + (s_idx - kv_conv.site_base)
+                if kv_replayed[key] ≺ accepted_tokens {
+                    kv_replayed[key] ← kv_replayed[key] + 1
+                    conv_push_row_raw(mut kv_conv, idx, s_idx, txn.kv_conv_journal_row[i])
+                }
             }
         }
+        kv_conv.txn_depth ← 0
+        hs.kv_conv ← kv_conv
     }
-    kv_conv.txn_depth ← 0
-    hs.kv_conv ← kv_conv
 
-    mut ConvStateArena<size PostConvRows, size D> post_conv ← hs.post_conv
-    restore_conv_arena<size PostConvRows, size D>(mut post_conv, txn.base_post_conv_buffers, txn.base_post_conv_steps)
-    if accepted_tokens ≻ 0 {
-        mut list<int> post_replayed ← empty
-        for exclusive txn.post_conv_site_draft_counts.length() let ? {
-            post_replayed.append(0)
-        }
-        for exclusive txn.post_conv_journal_local_idx.length() let i {
-            let int idx ← txn.post_conv_journal_local_idx[i]
-            let int s_idx ← txn.post_conv_journal_site_idx[i]
-            let int key ← idx * post_conv.sites_per_slot + (s_idx - post_conv.site_base)
-            if post_replayed[key] ≺ accepted_tokens {
-                post_replayed[key] ← post_replayed[key] + 1
-                conv_push_row_raw(mut post_conv, idx, s_idx, txn.post_conv_journal_row[i])
+    do {
+        mut ConvStateArena<size PostConvRows, size D> post_conv ← hs.post_conv
+        restore_conv_arena<size PostConvRows, size D>(mut post_conv, txn.base_post_conv_buffers, txn.base_post_conv_steps)
+        if accepted_tokens ≻ 0 {
+            mut list<int> post_replayed ← empty
+            for exclusive txn.post_conv_site_draft_counts.length() let ? {
+                post_replayed.append(0)
+            }
+            for exclusive txn.post_conv_journal_local_idx.length() let i {
+                let int idx ← txn.post_conv_journal_local_idx[i]
+                let int s_idx ← txn.post_conv_journal_site_idx[i]
+                let int key ← idx * post_conv.sites_per_slot + (s_idx - post_conv.site_base)
+                if post_replayed[key] ≺ accepted_tokens {
+                    post_replayed[key] ← post_replayed[key] + 1
+                    conv_push_row_raw(mut post_conv, idx, s_idx, txn.post_conv_journal_row[i])
+                }
             }
         }
+        post_conv.txn_depth ← 0
+        hs.post_conv ← post_conv
     }
-    post_conv.txn_depth ← 0
-    hs.post_conv ← post_conv
 
-    mut RecurrentStateArena<size RecRows, size RecCols> rec ← hs.recurrent
-    restore_rec_arena<size RecRows, size RecCols>(mut rec, txn.base_rec_states, txn.base_rec_steps)
-    if accepted_tokens ≻ 0 {
-        mut list<int> rec_seen ← empty
-        for exclusive rec.slot_ids.length() let i {
-            rec_seen.append(0)
-        }
-        for exclusive txn.rec_journal_local_idx.length() let i {
-            let int idx ← txn.rec_journal_local_idx[i]
-            rec_seen[idx] ← rec_seen[idx] + 1
-            if rec_seen[idx] ≡ accepted_tokens {
-                mut tensor<f32, [RecRows, RecCols]> chosen ← copy txn.rec_journal_state[i]
-                rec.states[idx] ← chosen
-                rec.steps_written[idx] ← txn.base_rec_steps[idx] + accepted_tokens
+    do {
+        mut RecurrentStateArena<size RecRows, size RecCols> rec ← hs.recurrent
+        restore_rec_arena<size RecRows, size RecCols>(mut rec, txn.base_rec_states, txn.base_rec_steps)
+        if accepted_tokens ≻ 0 {
+            mut list<int> rec_seen ← empty
+            for exclusive rec.slot_ids.length() let i {
+                rec_seen.append(0)
+            }
+            for exclusive txn.rec_journal_local_idx.length() let i {
+                let int idx ← txn.rec_journal_local_idx[i]
+                rec_seen[idx] ← rec_seen[idx] + 1
+                if rec_seen[idx] ≡ accepted_tokens {
+                    mut tensor<f32, [RecRows, RecCols]> chosen ← copy txn.rec_journal_state[i]
+                    rec.states[idx] ← chosen
+                    rec.steps_written[idx] ← txn.base_rec_steps[idx] + accepted_tokens
+                }
             }
         }
+        rec.txn_depth ← 0
+        hs.recurrent ← rec
     }
-    rec.txn_depth ← 0
-    hs.recurrent ← rec
 
     txn.open ← false
 }
@@ -896,20 +926,26 @@ fn hetero_rollback<size C, size W, size KVD, size KvConvRows, size PostConvRows,
 
     sess_mod.rollback(mut hs.kv, mut txn.kv_txn)
 
-    mut ConvStateArena<size KvConvRows, size KVD> kv_conv ← hs.kv_conv
-    restore_conv_arena<size KvConvRows, size KVD>(mut kv_conv, txn.base_kv_conv_buffers, txn.base_kv_conv_steps)
-    kv_conv.txn_depth ← 0
-    hs.kv_conv ← kv_conv
+    do {
+        mut ConvStateArena<size KvConvRows, size KVD> kv_conv ← hs.kv_conv
+        restore_conv_arena<size KvConvRows, size KVD>(mut kv_conv, txn.base_kv_conv_buffers, txn.base_kv_conv_steps)
+        kv_conv.txn_depth ← 0
+        hs.kv_conv ← kv_conv
+    }
 
-    mut ConvStateArena<size PostConvRows, size D> post_conv ← hs.post_conv
-    restore_conv_arena<size PostConvRows, size D>(mut post_conv, txn.base_post_conv_buffers, txn.base_post_conv_steps)
-    post_conv.txn_depth ← 0
-    hs.post_conv ← post_conv
+    do {
+        mut ConvStateArena<size PostConvRows, size D> post_conv ← hs.post_conv
+        restore_conv_arena<size PostConvRows, size D>(mut post_conv, txn.base_post_conv_buffers, txn.base_post_conv_steps)
+        post_conv.txn_depth ← 0
+        hs.post_conv ← post_conv
+    }
 
-    mut RecurrentStateArena<size RecRows, size RecCols> rec ← hs.recurrent
-    restore_rec_arena<size RecRows, size RecCols>(mut rec, txn.base_rec_states, txn.base_rec_steps)
-    rec.txn_depth ← 0
-    hs.recurrent ← rec
+    do {
+        mut RecurrentStateArena<size RecRows, size RecCols> rec ← hs.recurrent
+        restore_rec_arena<size RecRows, size RecCols>(mut rec, txn.base_rec_states, txn.base_rec_steps)
+        rec.txn_depth ← 0
+        hs.recurrent ← rec
+    }
 
     txn.open ← false
 }
