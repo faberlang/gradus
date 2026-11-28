@@ -91,6 +91,7 @@ union GradientError {
 
     UnknownGradient,
     GradientVersion,
+    InvalidMask,
     ShapeMismatch,
     DtypeMismatch,
     FrozenSlot,
@@ -884,6 +885,35 @@ fn cross_entropy_logits_value_gradient<size N, size C>(tensor<f32, [N, C]> logit
     return tuple<f32, tensor<f32, [N, C]>> [value, grad]
 }
 
+# Masked next-token cross entropy forward + logits gradient (issue #21 / GT20).
+# Uses `valid_count` (count of included rows) as the mean denominator rather than
+# padded row count N, and zeroes ignored rows in both loss and logits gradient
+# via `row_mask`.
+@ public
+fn cross_entropy_masked_logits_value_gradient<size N, size C>(tensor<f32, [N, C]> logits, tensor<f32, [N, C]> masked_one_hot, tensor<f32, [N, C]> row_mask, f32 valid_count, f32 upstream) → tuple<f32, tensor<f32, [N, C]>> ⇥ GradientError {
+    require valid_count ≻ 0.0 ∷ f32 throw variant InvalidMask { message = "masked cross entropy requires at least one valid target" }
+
+    let tensor<f32, [N, C]> probs ← logits.softmax()
+    let tensor<f32, [N, C]> active_targets ← masked_one_hot ⊙ row_mask
+    let f32 inv_valid ← 1.0 ∷ f32 / valid_count
+    let f32 eps ← 0.0000001 ∷ f32
+    let f32 value ← -(active_targets ⊙ (probs + eps).ln()).sum() * inv_valid
+    let tensor<f32, [N, C]> grad ← ((probs - active_targets) ⊙ row_mask) * (upstream * inv_valid)
+    return tuple<f32, tensor<f32, [N, C]>> [value, grad]
+}
+
+# Unnormalized masked next-token cross entropy sum + gradient sum for microbatch
+# accumulation weighted by valid-token count (issue #21 / GT20).
+@ public
+fn cross_entropy_masked_logits_sum_gradient<size N, size C>(tensor<f32, [N, C]> logits, tensor<f32, [N, C]> masked_one_hot, tensor<f32, [N, C]> row_mask, f32 upstream) → tuple<f32, tensor<f32, [N, C]>> {
+    let tensor<f32, [N, C]> probs ← logits.softmax()
+    let tensor<f32, [N, C]> active_targets ← masked_one_hot ⊙ row_mask
+    let f32 eps ← 0.0000001 ∷ f32
+    let f32 loss_sum ← -(active_targets ⊙ (probs + eps).ln()).sum()
+    let tensor<f32, [N, C]> grad_sum ← ((probs - active_targets) ⊙ row_mask) * upstream
+    return tuple<f32, tensor<f32, [N, C]>> [loss_sum, grad_sum]
+}
+
 +++ faber test
 # Co-located package test for gradient.fab (PML4-U2 — the gradient-call
 # contract). Not importable; discovered only by the faber test path.
@@ -1129,6 +1159,94 @@ test "extreme finite-logit gradient oracle is finite" {
         assert dtype.finite(component)
         assert component ≡ 0.5 ∷ f32
     }
+}
+
+test "cross_entropy_masked_logits_value_gradient matches unpadded loss and zeroes ignored rows" {
+    do {
+        let _ padded_logits ← [[0.5, 1.5, 2.5], [10.0, 0.0, 5.0], [2.5, 1.5, 0.5]] ↦ tf32[3, 3]
+        let _ padded_targets ← [[0.0, 1.0, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]] ↦ tf32[3, 3]
+        let _ row_mask ← [[1.0, 1.0, 1.0], [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]] ↦ tf32[3, 3]
+        let _ masked_vg ← gradient.cross_entropy_masked_logits_value_gradient<size 3, size 3>(padded_logits, padded_targets, row_mask, 2.0 ∷ f32, 1.0 ∷ f32)
+        let [masked_val, masked_grad] ← masked_vg
+
+        let _ active_logits ← [[0.5, 1.5, 2.5], [2.5, 1.5, 0.5]] ↦ tf32[2, 3]
+        let _ active_targets ← [[0.0, 1.0, 0.0], [0.0, 1.0, 0.0]] ↦ tf32[2, 3]
+        let _ active_vg ← gradient.cross_entropy_logits_value_gradient<size 2, size 3>(active_logits, active_targets, 1.0 ∷ f32)
+        let [active_val, active_grad] ← active_vg
+
+        assert masked_val.approx(active_val, CROSS_ENTROPY_GRAD_TOLERANCE)
+        let list<f32> mg ↤ masked_grad
+        let list<f32> ag ↤ active_grad
+        assert mg[0].approx(ag[0], CROSS_ENTROPY_GRAD_TOLERANCE)
+        assert mg[1].approx(ag[1], CROSS_ENTROPY_GRAD_TOLERANCE)
+        assert mg[2].approx(ag[2], CROSS_ENTROPY_GRAD_TOLERANCE)
+        assert mg[3] ≡ 0.0 ∷ f32
+        assert mg[4] ≡ 0.0 ∷ f32
+        assert mg[5] ≡ 0.0 ∷ f32
+        assert mg[6].approx(ag[3], CROSS_ENTROPY_GRAD_TOLERANCE)
+        assert mg[7].approx(ag[4], CROSS_ENTROPY_GRAD_TOLERANCE)
+        assert mg[8].approx(ag[5], CROSS_ENTROPY_GRAD_TOLERANCE)
+    }
+    catch err {
+        assert err.message ≡ "unexpected masked ce failure"
+    }
+}
+
+test "cross_entropy_masked_logits_value_gradient stays finite on extreme logits and weights microbatches" {
+    do {
+        let _ extreme_logits ← [[1000.0, 0.0], [0.0, 1000.0]] ↦ tf32[2, 2]
+        let _ extreme_targets ← [[0.0, 1.0], [0.0, 0.0]] ↦ tf32[2, 2]
+        let _ extreme_mask ← [[1.0, 1.0], [0.0, 0.0]] ↦ tf32[2, 2]
+        let _ ex_vg ← gradient.cross_entropy_masked_logits_value_gradient<size 2, size 2>(extreme_logits, extreme_targets, extreme_mask, 1.0 ∷ f32, 1.0 ∷ f32)
+        let [ex_val, ex_grad] ← ex_vg
+        assert dtype.finite(ex_val)
+        let list<f32> ex_flat ↤ ex_grad
+        for from ex_flat let g {
+            assert dtype.finite(g)
+        }
+        assert ex_flat[2] ≡ 0.0 ∷ f32
+        assert ex_flat[3] ≡ 0.0 ∷ f32
+    }
+    catch err {
+        assert err.message ≡ "unexpected extreme masked ce failure"
+    }
+
+    let _ mb_a ← gradient.cross_entropy_masked_logits_sum_gradient<size 3, size 3>([[0.5, 1.5, 2.5], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]] ↦ tf32[3, 3], [[0.0, 1.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]] ↦ tf32[3, 3], [[1.0, 1.0, 1.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]] ↦ tf32[3, 3], 1.0 ∷ f32)
+    let _ mb_b ← gradient.cross_entropy_masked_logits_sum_gradient<size 3, size 3>([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [2.5, 1.5, 0.5]] ↦ tf32[3, 3], [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]] ↦ tf32[3, 3], [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]] ↦ tf32[3, 3], 1.0 ∷ f32)
+    let [sum_a, ?] ← mb_a
+    let [sum_b, ?] ← mb_b
+    let f32 combined_mean ← (sum_a + sum_b) / 2.0 ∷ f32
+    assert combined_mean.approx(1.407606 ∷ f32, CROSS_ENTROPY_GRAD_TOLERANCE)
+}
+
+test "cross_entropy_masked_logits_value_gradient masks non-zero ignored targets and rejects zero valid count" {
+    do {
+        let _ padded_logits ← [[0.5, 1.5, 2.5], [10.0, 0.0, 5.0], [2.5, 1.5, 0.5]] ↦ tf32[3, 3]
+        let _ unzeroed_targets ← [[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]] ↦ tf32[3, 3]
+        let _ row_mask ← [[1.0, 1.0, 1.0], [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]] ↦ tf32[3, 3]
+        let _ masked_vg ← gradient.cross_entropy_masked_logits_value_gradient<size 3, size 3>(padded_logits, unzeroed_targets, row_mask, 2.0 ∷ f32, 1.0 ∷ f32)
+        let [masked_val, masked_grad] ← masked_vg
+        assert masked_val.approx(1.407606 ∷ f32, CROSS_ENTROPY_GRAD_TOLERANCE)
+        let list<f32> mg ↤ masked_grad
+        assert mg[3] ≡ 0.0 ∷ f32
+        assert mg[4] ≡ 0.0 ∷ f32
+        assert mg[5] ≡ 0.0 ∷ f32
+    }
+    catch err {
+        assert err.message ≡ "unexpected masked ce failure"
+    }
+
+    mut string zero_msg ← ""
+    do {
+        let _ logits ← [[0.5, 1.5, 2.5]] ↦ tf32[1, 3]
+        let _ targets ← [[0.0, 1.0, 0.0]] ↦ tf32[1, 3]
+        let _ zero_mask ← [[0.0, 0.0, 0.0]] ↦ tf32[1, 3]
+        let _ ? ← gradient.cross_entropy_masked_logits_value_gradient<size 1, size 3>(logits, targets, zero_mask, 0.0 ∷ f32, 1.0 ∷ f32)
+    }
+    catch err {
+        zero_msg ← err.message
+    }
+    assert zero_msg ≡ "masked cross entropy requires at least one valid target"
 }
 
 # Masked CruxEntropia gradients are not implemented: its current VJP uses
