@@ -24,6 +24,7 @@ import from "gradus:cache/hybrid_arenas" let hybrid
 import from "gradus:model/schedule" let model_schedule
 import from "gradus:model/tensor_directory" let td
 import from "gradus:model/bundle" let bundle
+import from "gradus:model/gguf_manifest" let gguf_manifest
 
 @ public
 const int DSPARK_TAP_COUNT = 4
@@ -485,6 +486,51 @@ fn markov_rnn_block_head_w1<size B, size R, size D_DRAFT, size PADDED_V, size UN
 # ---------------------------------------------------------------------------
 
 @ public
+class DflashGgufConfig {
+    let int block_count
+    let int embedding_length
+    let int sliding_window
+    let int block_size
+    let list<int> target_layers
+    let bool has_markov_context
+}
+
+# Read DSpark / DFlash drafter metadata directly from a standalone `dflash`
+# GGUF manifest, including the artifact-declared `dflash.attention.sliding_window`
+# (e.g. 1025 on `dspark-Inkling-2-Mini-Q8_0.gguf`).
+@ public
+fn config_from_dflash_gguf(gguf_manifest.GgufManifest m) → DflashGgufConfig ⇥ gguf_manifest.GgufManifestError {
+    let string arch ← gguf_manifest.text(m, "general.architecture")
+    require arch ≡ "dflash" throw variant gguf_manifest.GgufManifestError.BadWire { message = "expected dflash GGUF architecture, got §"(arch) }
+
+    let int block_count ← gguf_manifest.number(m, "dflash.block_count")
+    let int embedding_length ← gguf_manifest.number(m, "dflash.embedding_length")
+    let int sliding_window ← gguf_manifest.number(m, "dflash.attention.sliding_window")
+    let int block_size ← gguf_manifest.number(m, "dflash.block_size")
+    let list<int> target_layers ← gguf_manifest.numbers(m, "dflash.target_layers")
+
+    mut bool has_markov ← false
+    do {
+        let gguf_manifest.GgufMetadata mk ← gguf_manifest.metadata(m, "dflash.has_markov_context")
+        if mk.payload_wire.length() ≥ 1 {
+            has_markov ← ((mk.payload_wire[0] ↦ u8) ↦ int) ≢ 0
+        }
+    }
+    catch err {
+        has_markov ← false
+    }
+
+    return DflashGgufConfig {
+        block_count = block_count,
+        embedding_length = embedding_length,
+        sliding_window = sliding_window,
+        block_size = block_size,
+        target_layers = target_layers,
+        has_markov_context = has_markov
+    }
+}
+
+@ public
 class DsparkAdmitSummary {
     let bool is_gguf
     let bool has_fuse_weight
@@ -494,8 +540,9 @@ class DsparkAdmitSummary {
     let bool has_borrowed_lm_head
 }
 
-# Construct the canonical `TensorDirectory` `BorrowSpec` list for DSpark
-# (`lm_head.weight` borrowed from Backbone into Drafter with `RowPrefix` slice).
+# Construct the canonical `TensorDirectory` `BorrowSpec` list for DSpark over
+# Safetensors (`lm_head.weight` borrowed from Backbone into Drafter with
+# `RowPrefix` slice).
 @ public
 fn dspark_borrow_specs(int unpadded_vocab) → list<td.BorrowSpec> {
     return [
@@ -509,17 +556,33 @@ fn dspark_borrow_specs(int unpadded_vocab) → list<td.BorrowSpec> {
     ]
 }
 
+# Construct the canonical `TensorDirectory` `BorrowSpec` list for a standalone
+# `dflash` GGUF paired with an `inkling2_loop` GGUF backbone (`output.weight`
+# borrowed from Backbone into Drafter as `lm_head.weight` with `RowPrefix`).
+@ public
+fn dspark_gguf_borrow_specs(int unpadded_vocab) → list<td.BorrowSpec> {
+    return [
+        td.BorrowSpec {
+            target_role = variant bundle.MemberRole.Drafter,
+            canonical_name = "lm_head.weight",
+            source_role = variant bundle.MemberRole.Backbone,
+            source_canonical_name = "output.weight",
+            view = variant td.LoadView.RowPrefix { rows = unpadded_vocab }
+        }
+    ]
+}
+
 # Validate and summarize DSpark drafter weights in a `TensorDirectory` from
 # either `mtp.safetensors` or a standalone `dflash` GGUF member under
 # `MemberRole.Drafter`, verifying borrowed `lm_head.weight` when requested.
 @ public
 fn admit_dspark_directory(td.TensorDirectory dir, bool require_borrowed_lm_head) → DsparkAdmitSummary ⇥ td.DirectoryError {
     let bool has_hf_fuse ← td.has_tensor(dir, variant bundle.MemberRole.Drafter, "fuse_weight")
-    let bool has_gg_fuse ← td.has_tensor(dir, variant bundle.MemberRole.Drafter, "dflash.fuse_weight")
+    let bool has_gg_fuse ← td.has_tensor(dir, variant bundle.MemberRole.Drafter, "dflash.fuse_weight") or td.has_tensor(dir, variant bundle.MemberRole.Drafter, "blk.0.ctx_mix.weight") or td.has_tensor(dir, variant bundle.MemberRole.Drafter, "markov_ctx_mix.weight")
     let bool has_fuse ← has_hf_fuse or has_gg_fuse
 
     let bool has_hf_norm ← td.has_tensor(dir, variant bundle.MemberRole.Drafter, "layers.0.dflare_norm.weight")
-    let bool has_gg_norm ← td.has_tensor(dir, variant bundle.MemberRole.Drafter, "blk.0.dflare_norm.weight")
+    let bool has_gg_norm ← td.has_tensor(dir, variant bundle.MemberRole.Drafter, "blk.0.dflare_norm.weight") or td.has_tensor(dir, variant bundle.MemberRole.Drafter, "blk.0.ctx_norm.weight") or td.has_tensor(dir, variant bundle.MemberRole.Drafter, "markov_ctx_norm.weight")
     let bool has_norm ← has_hf_norm or has_gg_norm
 
     let bool has_hf_ctx ← td.has_tensor(dir, variant bundle.MemberRole.Drafter, "layers.0.self_attn.k_proj_ctx.weight") and td.has_tensor(dir, variant bundle.MemberRole.Drafter, "layers.0.self_attn.v_proj_ctx.weight")
@@ -527,7 +590,7 @@ fn admit_dspark_directory(td.TensorDirectory dir, bool require_borrowed_lm_head)
     let bool has_ctx ← has_hf_ctx or has_gg_ctx
 
     let bool has_hf_w1 ← td.has_tensor(dir, variant bundle.MemberRole.Drafter, "markov_head.markov_w1.weight")
-    let bool has_gg_w1 ← td.has_tensor(dir, variant bundle.MemberRole.Drafter, "dflash.markov_w1.weight")
+    let bool has_gg_w1 ← td.has_tensor(dir, variant bundle.MemberRole.Drafter, "dflash.markov_w1.weight") or td.has_tensor(dir, variant bundle.MemberRole.Drafter, "markov_w1.weight")
     let bool has_w1 ← has_hf_w1 or has_gg_w1
 
     let bool has_head ← td.has_tensor(dir, variant bundle.MemberRole.Drafter, "lm_head.weight")
@@ -963,6 +1026,48 @@ test "DSpark TensorDirectory admission from mtp.safetensors (borrowed lm_head) a
         gg_ok ← false
     }
     assert gg_ok
+
+    # 3. Resident dflash GGUF naming (`blk.0.ctx_mix.weight`, `blk.0.ctx_norm.weight`,
+    #    `markov_w1.weight`) paired with backbone `output.weight` borrow + `RowPrefix`.
+    let ggm.GgufManifest real_dr ← ggm.GgufManifest {
+        identity = id1,
+        version = 3,
+        alignment = 32,
+        data_start = 128,
+        artifact_length = 4096,
+        metadata = empty,
+        tensors = [
+            mk_gg_desc("blk.0.ctx_mix.weight", [4], 0, 16),
+            mk_gg_desc("blk.0.ctx_norm.weight", [2304], 32, 64),
+            mk_gg_desc("blk.0.attn_k_ctx.weight", [2304, 1024], 96, 64),
+            mk_gg_desc("blk.0.attn_v_ctx.weight", [2304, 1024], 160, 64),
+            mk_gg_desc("markov_w1.weight", [256, 200058], 224, 64)
+        ]
+    }
+    mut bool real_gg_ok ← true
+    do {
+        let bundle.ModelBundle gg_bundle2 ← bundle.gguf_paired(id0, id1)
+        do {
+            let td.TensorDirectory gg_dir2 ← td.build(gg_bundle2, [
+                variant td.ShardSource.GgufSource { role = variant bundle.MemberRole.Backbone, manifest = gg_bb },
+                variant td.ShardSource.GgufSource { role = variant bundle.MemberRole.Drafter, manifest = real_dr }
+            ], dspark_gguf_borrow_specs(200058), empty)
+            let DsparkAdmitSummary rs ← admit_dspark_directory(gg_dir2, true)
+            assert rs.is_gguf
+            assert rs.has_fuse_weight
+            assert rs.has_dflare_norm
+            assert rs.has_ctx_proj
+            assert rs.has_markov_w1
+            assert rs.has_borrowed_lm_head
+        }
+        catch err {
+            real_gg_ok ← false
+        }
+    }
+    catch err {
+        real_gg_ok ← false
+    }
+    assert real_gg_ok
 }
 
 test "DSpark reuses decode_token.layer_batch(..., BlockDiffusion) over [T, F, T] SessionState" {

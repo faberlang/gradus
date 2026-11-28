@@ -44,9 +44,15 @@ Captured on `pepper` (Apple M5 Max, 128 GB unified memory, `aarch64-apple-darwin
   - `rmsnorm_heads_2pass` (Flint/Qwen3.6 QK-norm): `max_err=5.96e-8`, `25–34 µs/call`
   - `query_tiled_prefill` (B=C prefill attention): `max_err=0.0`, `1558–2025 µs/call` (`15.8k–20.5k tok/s`)
 
-## Slice C & D — `Inkling-2-Mini-MLX-8bit` + `mtp.safetensors` (Seams 1–3, 6)
+## Slice C & D — `Inkling-2-Mini-MLX-8bit` + `mtp.safetensors`, Paired Standalone `dflash` GGUF, and `PldThenMtp` Shape Proof (Seams 1–4, 6)
 
-- **Checkpoint:** `/Users/ianzepp/ai/models/Inkling-2-Mini-MLX-8bit` (4 backbone shards + bundled `mtp.safetensors`, nested `text_config` + `mtp_config` + `quantization`)
+- **Safetensors bundle checkpoint:** `/Users/ianzepp/ai/models/Inkling-2-Mini-MLX-8bit` (4 backbone shards + bundled `mtp.safetensors`, nested `text_config` + `mtp_config` + `quantization`)
+- **Paired GGUF checkpoints:** `/Users/ianzepp/ai/models/gguf/Inkling-2-Mini-IQ4_NL.gguf` (704 tensors) + `/Users/ianzepp/ai/models/gguf/dspark-Inkling-2-Mini-Q8_0.gguf` (58 tensors, `general.architecture = dflash`, artifact-declared `dflash.attention.sliding_window = 1025`)
 - **Command:** `faber run --library-home .. --device cpu exempla/inkling2-resident`
-- **Observed receipt:**
-  `inkling2_resident: model_type=inkling2_loop layers=24 hidden=2304 vocab=201024 unpadded_vocab=200058 tensors=1614 bb_slots=48 bb_visits=48 bb_full=8 bb_ring=40 dr_slots=3 dr_ring=2 dr_full=1 mtp_block=8 mtp_taps=4 mtp_fuse=true mtp_norm=true mtp_ctx=true mtp_w1=true borrowed_head=true`
+- **Observed receipts:**
+  - Bundled `mtp.safetensors` + borrowed `lm_head.weight` (`RowPrefix(200058)`):
+    `inkling2_resident: model_type=inkling2_loop layers=24 hidden=2304 vocab=201024 unpadded_vocab=200058 tensors=1614 bb_slots=48 bb_visits=48 bb_full=8 bb_ring=40 dr_slots=3 dr_ring=2 dr_full=1 mtp_block=8 mtp_taps=4 mtp_fuse=true mtp_norm=true mtp_ctx=true mtp_w1=true borrowed_head=true`
+  - Standalone `dflash` GGUF paired via `bundle.gguf_paired` + borrowed `output.weight → lm_head.weight` (`RowPrefix(200058)`) + artifact-declared ring window `1025`:
+    `dflash_gguf_resident: bb_tensors=704 dr_tensors=58 dir_entries=763 layers=3 hidden=2304 window=1025 block_size=8 taps=4 markov=true dr_slots=3 dr_ring=2 dr_full=1 is_gguf=true fuse=true norm=true ctx=true w1=true borrowed_head=true`
+  - Slice D composite `PldThenMtp` (PLD + coupled MTP fallback, adaptive depth `1..8`, exact greedy parity vs `Disabled` baseline, shape proof matching the 2026-11-23 `mlx-serve --mtp --pld` policy):
+    `slice_d_verify: mode=pld_then_mtp parity=true tokens=32 rounds=9 pld_rounds=8 mtp_rounds=1 drafted=24 accepted=23 accept_pct=95 elapsed_us=23 tok_per_s=1391304.347826087`

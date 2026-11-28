@@ -114,19 +114,20 @@ is flattened to a top-level leaf (`gradus:optimize`, not
 
 ## Inference architecture state (issue #33)
 
-The flexible-inference-and-weight-architecture seams are largely landed on
-`main`: weight admission and manifests (`model/safetensors`, `model/gguf`,
-`model/gguf_manifest`, `model/bundle`, `model/config`),
-`model/tensor_directory` + `model/linear_weight` operator binding, the quant
-block genera (`quant/*`), the `model/schedule` `ExecutionSchedule` with
-`cache/session` `SessionState`, transactional `SessionTxn`
-(`branch` / `txn_write_kv` / `commit_prefix` / `rollback`) and the hybrid
-`ConvStateArena` / `RecurrentStateArena` journal transactions
-(`cache/hybrid_arenas`, issues #51/#92), and the record-typed decode path
-(`decode_token` over `decode_step`). The speculative seam
-(`speculative`, `context_lookup`, `generation/config`) is the consumer of the
-transaction API. Still open: `NumericBlock` retirement (#6) and the
-`prepared_state` arena wire v2 (#91).
+All six seams of `docs/design/flexible-inference-and-weight-architecture.md`
+are landed on `main`: weight admission and manifests (`model/safetensors`,
+`model/gguf`, `model/gguf_manifest`, `model/bundle`, `model/config`),
+`model/tensor_directory` + `model/linear_weight` + `model/expert_bank`
+operator binding, the quant block genera (`quant/*`), `model/schedule`
+`ExecutionSchedule`, `cache/session` `SessionState` with transactional
+`SessionTxn` and `cache/hybrid_arenas` `HybridSession`/`HybridTxn` (#51/#92),
+`prepared_state` arena wire v2 (#91), record-typed regime-aware decode
+(`decode_token`, `decode_dense`, `decode_hybrid`, `decode_inkling`,
+`decode_slice_a` over `decode_step`), and the draft-and-verify / DSpark MTP
+seam (`speculative`, `context_lookup`, `draft_verify`, `dspark_drafter`).
+Live resident receipts for Slices A, B0, B, C, and D are recorded in
+[`docs/factory/six-seam-receipts.md`](docs/factory/six-seam-receipts.md).
+Still open for full retirement: `NumericBlock` removal (#6).
 
 This table is the authoritative map; [`docs/module-map.md`](docs/module-map.md)
 predates the inference-seam landings and is historical. API shape:
